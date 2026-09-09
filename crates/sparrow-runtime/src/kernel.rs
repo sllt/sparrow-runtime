@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use sparrow_model::{
     DeliveryContract, ErrorCode, JobAttemptId, MemoryOwner, PipelineId, ResourceBudget, RestoreClaim,
-    Result, Row, SparrowError, WorkBudget,
+    Result, Row, RowBatch, SparrowError, WorkBudget,
 };
 use sparrow_plan::{PhysicalPlan, PhysicalStage};
 use tokio::task::JoinHandle;
@@ -35,10 +35,37 @@ impl Default for KernelOptions {
     }
 }
 
+/// Kernel job. Live I/O is optional channels so MQTT/HTTP stay out of this crate.
 pub struct JobRequest {
     pub plan: PhysicalPlan,
     pub rows: Vec<Row>,
     pub capture: SharedCapture,
+    /// Live ingress. When set, `MemorySource` reads rows here instead of `rows`.
+    pub live_in: Option<tokio::sync::mpsc::Receiver<Row>>,
+    /// Live egress. `CaptureSink` also forwards batches here (bounded backpressure).
+    pub live_out: Option<tokio::sync::mpsc::Sender<RowBatch>>,
+}
+
+impl JobRequest {
+    pub fn new(plan: PhysicalPlan, rows: Vec<Row>, capture: SharedCapture) -> Self {
+        Self {
+            plan,
+            rows,
+            capture,
+            live_in: None,
+            live_out: None,
+        }
+    }
+
+    pub fn with_live_io(
+        mut self,
+        live_in: tokio::sync::mpsc::Receiver<Row>,
+        live_out: tokio::sync::mpsc::Sender<RowBatch>,
+    ) -> Self {
+        self.live_in = Some(live_in);
+        self.live_out = Some(live_out);
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +104,11 @@ impl Kernel {
 
     pub fn live_tasks(&self) -> usize {
         self.live_tasks.load(Ordering::SeqCst)
+    }
+
+    /// Tokio handle for composition-root connector tasks (MQTT/HTTP).
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        self.rt.handle().clone()
     }
 
     pub fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
@@ -174,6 +206,10 @@ impl JobHandle {
     pub fn live_tasks(&self) -> usize {
         self.live.load(Ordering::SeqCst)
     }
+
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
 }
 
 async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
@@ -193,8 +229,16 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
         rxs.push(Some(rx));
     }
 
+    let JobRequest {
+        plan,
+        rows,
+        capture,
+        mut live_in,
+        live_out,
+    } = req;
+
     let mut joins = Vec::new();
-    for (i, stage) in req.plan.stages.iter().cloned().enumerate() {
+    for (i, stage) in plan.stages.iter().cloned().enumerate() {
         let tx = if i + 1 < n {
             Some(txs[i].clone())
         } else {
@@ -206,13 +250,22 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
             rxs[i - 1].take()
         };
         let ctx = clone_ctx(&ctx);
-        let rows = if matches!(stage, PhysicalStage::MemorySource { .. }) {
-            req.rows.clone()
-        } else {
-            Vec::new()
-        };
-        let capture = req.capture.clone();
-        joins.push(spawn_stage(ctx, stage, rx, tx, rows, capture));
+        let is_source = matches!(stage, PhysicalStage::MemorySource { .. });
+        let is_sink = matches!(stage, PhysicalStage::CaptureSink { .. });
+        let rows = if is_source { rows.clone() } else { Vec::new() };
+        let capture = capture.clone();
+        let stage_live_in = if is_source { live_in.take() } else { None };
+        let stage_live_out = if is_sink { live_out.clone() } else { None };
+        joins.push(spawn_stage(
+            ctx,
+            stage,
+            rx,
+            tx,
+            rows,
+            capture,
+            stage_live_in,
+            stage_live_out,
+        ));
     }
     drop(txs);
 
@@ -247,7 +300,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
         attempt: ctx.attempt,
         pipeline: ctx.pipeline,
         ingested_rows: ingested,
-        captured_rows: req.capture.row_count(),
+        captured_rows: capture.row_count(),
         cancelled: ctx.cancel.is_cancelled(),
         remaining_work: ctx.work.remaining(),
         live_tasks_after: ctx.live.load(Ordering::SeqCst),
@@ -274,11 +327,13 @@ fn spawn_stage(
     tx: Option<MailboxTx>,
     rows: Vec<Row>,
     capture: SharedCapture,
+    live_in: Option<tokio::sync::mpsc::Receiver<Row>>,
+    live_out: Option<tokio::sync::mpsc::Sender<RowBatch>>,
 ) -> JoinHandle<Result<usize>> {
     ctx.live.fetch_add(1, Ordering::SeqCst);
     let live = Arc::clone(&ctx.live);
     tokio::spawn(async move {
-        let result = stage_loop(ctx, stage, rx, tx, rows, capture).await;
+        let result = stage_loop(ctx, stage, rx, tx, rows, capture, live_in, live_out).await;
         live.fetch_sub(1, Ordering::SeqCst);
         result
     })
@@ -291,13 +346,18 @@ async fn stage_loop(
     tx: Option<MailboxTx>,
     rows: Vec<Row>,
     capture: SharedCapture,
+    live_in: Option<tokio::sync::mpsc::Receiver<Row>>,
+    live_out: Option<tokio::sync::mpsc::Sender<RowBatch>>,
 ) -> Result<usize> {
     match stage {
         PhysicalStage::MemorySource { schema, .. } => {
-            let batches = build_source_batches(schema, rows, &ctx.owner, ctx.rows_per_batch)?;
             let tx = tx.ok_or_else(|| {
                 SparrowError::new(ErrorCode::Internal, "source missing mailbox")
             })?;
+            if let Some(live_in) = live_in {
+                return live_source(ctx, schema, tx, live_in).await;
+            }
+            let batches = build_source_batches(schema, rows, &ctx.owner, ctx.rows_per_batch)?;
             let mut n = 0usize;
             for b in batches {
                 n += b.num_rows();
@@ -333,8 +393,52 @@ async fn stage_loop(
                     break;
                 }
                 capture.push(&schema, env.batch.rows());
+                if let Some(out) = &live_out {
+                    tokio::select! {
+                        biased;
+                        _ = ctx.cancel.cancelled() => break,
+                        sent = out.send(env.batch.share()) => {
+                            if sent.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             Ok(0)
+        }
+    }
+}
+
+async fn live_source(
+    ctx: JobCtx,
+    schema: sparrow_model::Schema,
+    tx: MailboxTx,
+    mut live_in: tokio::sync::mpsc::Receiver<Row>,
+) -> Result<usize> {
+    let mut n = 0usize;
+    loop {
+        let first = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return Ok(n),
+            row = live_in.recv() => row,
+        };
+        let Some(first) = first else {
+            return Ok(n);
+        };
+        let mut buf = vec![first];
+        while buf.len() < ctx.rows_per_batch {
+            match live_in.try_recv() {
+                Ok(row) => buf.push(row),
+                Err(_) => break,
+            }
+        }
+        let batches = build_source_batches(schema.clone(), buf, &ctx.owner, ctx.rows_per_batch)?;
+        for b in batches {
+            n += b.num_rows();
+            if !tx.send(b).await? {
+                return Ok(n);
+            }
         }
     }
 }

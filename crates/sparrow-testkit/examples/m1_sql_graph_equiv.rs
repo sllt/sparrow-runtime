@@ -58,18 +58,18 @@ fn run() -> sparrow_model::Result<()> {
     let rows: Vec<_> = sensor_fixture().into_iter().map(|r| r.to_row()).collect();
 
     let sql_cap = SharedCapture::new();
-    kernel.run(JobRequest {
-        plan: physicalize(&sql_bound, &PlanOptions { fuse: true }),
-        rows: rows.clone(),
-        capture: sql_cap.clone(),
-    })?;
+    kernel.run(JobRequest::new(
+        physicalize(&sql_bound, &PlanOptions { fuse: true }),
+        rows.clone(),
+        sql_cap.clone(),
+    ))?;
 
     let graph_cap = SharedCapture::new();
-    kernel.run(JobRequest {
-        plan: physicalize(&graph_bound, &PlanOptions { fuse: true }),
+    kernel.run(JobRequest::new(
+        physicalize(&graph_bound, &PlanOptions { fuse: true }),
         rows,
-        capture: graph_cap.clone(),
-    })?;
+        graph_cap.clone(),
+    ))?;
 
     println!("sql captured:");
     for (i, row) in sql_cap.rows_as_debug().iter().enumerate() {

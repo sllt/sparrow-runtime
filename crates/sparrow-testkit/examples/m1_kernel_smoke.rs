@@ -66,11 +66,11 @@ fn run() -> sparrow_model::Result<()> {
 
     let kernel = Kernel::new(KernelOptions::default())?;
     let capture = SharedCapture::new();
-    let stats = kernel.run(JobRequest {
+    let stats = kernel.run(JobRequest::new(
         plan,
-        rows: sensor_fixture().into_iter().map(|r| r.to_row()).collect(),
-        capture: capture.clone(),
-    })?;
+        sensor_fixture().into_iter().map(|r| r.to_row()).collect(),
+        capture.clone(),
+    ))?;
 
     println!(
         "attempt={} ingested={} captured={} cancelled={} live_tasks={}",
@@ -99,11 +99,11 @@ fn run() -> sparrow_model::Result<()> {
     // Graceful stop of a second attempt (source still running against a stalled sink).
     let capture2 = SharedCapture::new();
     capture2.stall.stall();
-    let handle = kernel.submit(JobRequest {
-        plan: physicalize(&bound, &PlanOptions { fuse: true }),
-        rows: sensor_fixture().into_iter().map(|r| r.to_row()).collect(),
-        capture: capture2.clone(),
-    })?;
+    let handle = kernel.submit(JobRequest::new(
+        physicalize(&bound, &PlanOptions { fuse: true }),
+        sensor_fixture().into_iter().map(|r| r.to_row()).collect(),
+        capture2.clone(),
+    ))?;
     capture2.stall.release();
     let stopped = kernel.block_on(handle.stop())?;
     println!(

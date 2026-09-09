@@ -114,18 +114,8 @@ mod g2_tests {
 
         let a = SharedCapture::new();
         let b = SharedCapture::new();
-        k.run(JobRequest {
-            plan: fused,
-            rows: rows(),
-            capture: a.clone(),
-        })
-        .unwrap();
-        k.run(JobRequest {
-            plan: unfused,
-            rows: rows(),
-            capture: b.clone(),
-        })
-        .unwrap();
+        k.run(JobRequest::new(fused, rows(), a.clone())).unwrap();
+        k.run(JobRequest::new(unfused, rows(), b.clone())).unwrap();
         assert_eq!(a.rows(), b.rows());
         assert_eq!(a.row_count(), 2);
         assert_eq!(k.live_tasks(), 0);
@@ -137,11 +127,11 @@ mod g2_tests {
         let capture = SharedCapture::new();
         capture.stall.stall();
         let handle = k
-            .submit(JobRequest {
-                plan: physicalize(&bound(), &PlanOptions { fuse: true }),
-                rows: rows(),
-                capture: capture.clone(),
-            })
+            .submit(JobRequest::new(
+                physicalize(&bound(), &PlanOptions { fuse: true }),
+                rows(),
+                capture.clone(),
+            ))
             .unwrap();
         // Sink is stalled and mailbox is 1-deep; cancel must still join.
         std::thread::sleep(Duration::from_millis(30));
@@ -164,23 +154,55 @@ mod g2_tests {
         stalled.stall.stall();
         let live = SharedCapture::new();
         let a = k
-            .submit(JobRequest {
-                plan: physicalize(&bound(), &PlanOptions::default()),
-                rows: rows(),
-                capture: stalled.clone(),
-            })
+            .submit(JobRequest::new(
+                physicalize(&bound(), &PlanOptions::default()),
+                rows(),
+                stalled.clone(),
+            ))
             .unwrap();
         let b = k
-            .submit(JobRequest {
-                plan: physicalize(&bound(), &PlanOptions::default()),
-                rows: rows(),
-                capture: live.clone(),
-            })
+            .submit(JobRequest::new(
+                physicalize(&bound(), &PlanOptions::default()),
+                rows(),
+                live.clone(),
+            ))
             .unwrap();
         let b_stats = k.block_on(b.wait()).expect("peer job froze behind stalled sink");
         assert_eq!(b_stats.captured_rows, 2);
         stalled.stall.release();
         k.block_on(a.wait()).unwrap();
+        assert_eq!(k.live_tasks(), 0);
+    }
+
+    #[test]
+    fn live_channels_round_trip() {
+        let k = kernel(8);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(8);
+        let capture = SharedCapture::new();
+        let handle = k
+            .submit(
+                JobRequest::new(
+                    physicalize(&bound(), &PlanOptions { fuse: true }),
+                    Vec::new(),
+                    capture.clone(),
+                )
+                .with_live_io(rx, out_tx),
+            )
+            .unwrap();
+        let batch = k.block_on(async {
+            tx.send(rows()[1].clone()).await.unwrap();
+            tx.send(rows()[0].clone()).await.unwrap();
+            drop(tx);
+            let batch = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+                .await
+                .expect("live_out timed out")
+                .expect("live_out closed");
+            handle.wait().await.unwrap();
+            batch
+        });
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(capture.row_count(), 1);
         assert_eq!(k.live_tasks(), 0);
     }
 }
