@@ -2,6 +2,7 @@
 //! future timestamp, monotonic WM, holdback, late side output.
 
 use super::*;
+use crate::window::WindowOperator;
 use sparrow_expr::Expr;
 use sparrow_model::{
     AggFn, DataType, ErrorCode, Field, FieldId, InputId, MemoryOwner, OperatorId, ResourceBudget,
