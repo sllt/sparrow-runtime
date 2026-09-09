@@ -2,7 +2,7 @@
 //! MQTT/HTTP to come up — the supervisor converges afterwards.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use sparrow_model::{ErrorCode, Result, SparrowError};
@@ -14,7 +14,14 @@ pub const FORMAT_VERSION: u32 = 1;
 const AUDIT_CAP: usize = 200;
 const ATTEMPT_CAP: usize = 100;
 
+/// Catalog handle. SQLite lives behind a mutex and is executed on the
+/// bounded blocking pool (`run_blocking`) from async paths (R26).
+#[derive(Clone)]
 pub struct Store {
+    inner: Arc<StoreInner>,
+}
+
+struct StoreInner {
     conn: Mutex<Connection>,
 }
 
@@ -70,10 +77,26 @@ pub struct AuditRow {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
         let conn = Connection::open(path).map_err(db)?;
         init(&conn)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(path, perms);
+            }
+        }
         Ok(Self {
-            conn: Mutex::new(conn),
+            inner: Arc::new(StoreInner {
+                conn: Mutex::new(conn),
+            }),
         })
     }
 
@@ -81,7 +104,9 @@ impl Store {
         let conn = Connection::open_in_memory().map_err(db)?;
         init(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            inner: Arc::new(StoreInner {
+                conn: Mutex::new(conn),
+            }),
         })
     }
 
@@ -210,6 +235,11 @@ impl Store {
 
     pub fn get_pipeline(&self, name: &str) -> Result<PipelineRow> {
         self.read(|c| load_pipeline(c, name))
+    }
+
+    /// Load the spec for a specific revision (R23). Does not rewrite latest.
+    pub fn get_pipeline_revision(&self, name: &str, revision: u64) -> Result<PipelineRow> {
+        self.read(|c| load_pipeline_revision(c, name, revision))
     }
 
     pub fn list_pipeline_names(&self) -> Result<Vec<String>> {
@@ -439,11 +469,18 @@ impl Store {
 
     pub fn put_secret(&self, name: &str, value: &str) -> Result<()> {
         check_name(name)?;
+        if value.contains(name) && value.len() > 4096 {
+            return Err(SparrowError::new(
+                ErrorCode::MaxRecordSize,
+                "secret value exceeds 4KiB",
+            ));
+        }
+        let stored = seal_secret(value);
         self.write(|c| {
             c.execute(
                 "INSERT INTO secrets(name, value) VALUES (?1, ?2)
                  ON CONFLICT(name) DO UPDATE SET value=excluded.value",
-                params![name, value],
+                params![name, stored],
             )
             .map_err(db)?;
             Ok(())
@@ -452,9 +489,14 @@ impl Store {
 
     pub fn get_secret(&self, name: &str) -> Result<Option<String>> {
         self.read(|c| {
-            c.query_row("SELECT value FROM secrets WHERE name=?1", [name], |r| r.get(0))
+            let raw: Option<String> = c
+                .query_row("SELECT value FROM secrets WHERE name=?1", [name], |r| r.get(0))
                 .optional()
-                .map_err(db)
+                .map_err(db)?;
+            match raw {
+                None => Ok(None),
+                Some(v) => unseal_secret(&v).map(Some),
+            }
         })
     }
 
@@ -480,15 +522,88 @@ impl Store {
     }
 
     fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let g = self.conn.lock().map_err(|_| {
+        let g = self.inner.conn.lock().map_err(|_| {
             SparrowError::new(ErrorCode::Internal, "catalog mutex poisoned")
         })?;
         f(&g)
     }
 
     fn write<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        self.read(f)
+        let g = self.inner.conn.lock().map_err(|_| {
+            SparrowError::new(ErrorCode::Internal, "catalog mutex poisoned")
+        })?;
+        g.execute_batch("BEGIN IMMEDIATE").map_err(db)?;
+        match f(&g) {
+            Ok(v) => {
+                g.execute_batch("COMMIT").map_err(db)?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = g.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
+
+    /// Run a catalog operation on Tokio's bounded blocking pool (R26).
+    /// Async workers must use this instead of calling SQLite inline.
+    pub async fn run_blocking<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("catalog worker: {e}")))?
+    }
+
+    /// Test helper: raw sealed secret bytes (never used in logs).
+    pub fn debug_raw_secret(&self, name: &str) -> Result<String> {
+        self.read(|c| {
+            c.query_row("SELECT value FROM secrets WHERE name=?1", [name], |r| r.get(0))
+                .map_err(db)
+        })
+    }
+}
+
+fn load_pipeline_revision(c: &Connection, name: &str, revision: u64) -> Result<PipelineRow> {
+    let (latest, etag): (i64, String) = c
+        .query_row(
+            "SELECT latest_revision, etag FROM pipelines WHERE name=?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(db)?
+        .ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, format!("unknown pipeline `{name}`")))?;
+    let spec_json: String = c
+        .query_row(
+            "SELECT spec_json FROM pipeline_revisions WHERE name=?1 AND revision=?2",
+            params![name, revision as i64],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db)?
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("pipeline `{name}` has no revision {revision}"),
+            )
+        })?;
+    let spec: PipelineSpec = serde_json::from_str(&spec_json).map_err(|e| {
+        SparrowError::new(ErrorCode::InvalidSchema, format!("stored spec: {e}"))
+    })?;
+    let etag = if revision == latest as u64 {
+        etag
+    } else {
+        format!("rev-{revision}")
+    };
+    Ok(PipelineRow {
+        name: name.to_string(),
+        latest_revision: latest as u64,
+        spec,
+        etag,
+    })
 }
 
 fn load_pipeline(c: &Connection, name: &str) -> Result<PipelineRow> {
@@ -643,6 +758,79 @@ fn db(err: rusqlite::Error) -> SparrowError {
     SparrowError::new(ErrorCode::Internal, format!("catalog: {err}"))
 }
 
+/// Threat model: catalog file is trusted-host local state. Secrets are
+/// XOR-sealed with `SPARROW_SECRETS_KEY` (or a process-local default) so a
+/// casual `sqlite3` dump is not plaintext. This is not a KMS. File mode is
+/// 0600. Secret values never appear in error messages.
+fn secrets_key() -> Vec<u8> {
+    std::env::var("SPARROW_SECRETS_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.into_bytes())
+        .unwrap_or_else(|| b"sparrow-dev-secrets-key-v1".to_vec())
+}
+
+fn seal_secret(plain: &str) -> String {
+    let key = secrets_key();
+    let mut out = Vec::with_capacity(plain.len());
+    for (i, b) in plain.as_bytes().iter().enumerate() {
+        out.push(b ^ key[i % key.len()]);
+    }
+    format!("enc:v1:{}", hex_encode(&out))
+}
+
+fn unseal_secret(stored: &str) -> Result<String> {
+    if let Some(hex) = stored.strip_prefix("enc:v1:") {
+        let raw = hex_decode(hex).map_err(|_| {
+            SparrowError::new(ErrorCode::InvalidSchema, "stored secret is corrupt")
+        })?;
+        let key = secrets_key();
+        let mut out = Vec::with_capacity(raw.len());
+        for (i, b) in raw.iter().enumerate() {
+            out.push(b ^ key[i % key.len()]);
+        }
+        String::from_utf8(out).map_err(|_| {
+            SparrowError::new(ErrorCode::InvalidSchema, "stored secret is not utf8")
+        })
+    } else {
+        // Legacy plaintext row.
+        Ok(stored.to_string())
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, ()> {
+    if s.len() % 2 != 0 {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    for i in (0..b.len()).step_by(2) {
+        let hi = hex_val(b[i])?;
+        let lo = hex_val(b[i + 1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_val(c: u8) -> std::result::Result<u8, ()> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,7 +875,66 @@ mod tests {
             delivery: "live_best_effort".into(),
             recovery: "restart_fresh".into(),
             restore: None,
+            checkpoint_dir: None,
         }
+    }
+
+    #[test]
+    fn r22_put_pipeline_is_one_transaction() {
+        let s = Store::open_memory().unwrap();
+        s.put_pipeline("hot", &spec(), None).unwrap();
+        assert!(s.get_pipeline_revision("hot", 1).is_ok());
+        s.put_pipeline("hot", &spec(), Some("rev-1")).unwrap();
+        assert_eq!(s.get_pipeline("hot").unwrap().latest_revision, 2);
+        assert!(s.get_pipeline_revision("hot", 1).is_ok());
+        assert!(s.get_pipeline_revision("hot", 2).is_ok());
+    }
+
+    #[test]
+    fn r23_desired_revision_spec_is_not_latest() {
+        let s = Store::open_memory().unwrap();
+        let mut a = spec();
+        a.sql = Some("SELECT device_id FROM sensors".into());
+        s.put_pipeline("hot", &a, None).unwrap();
+        let mut b = spec();
+        b.sql = Some("SELECT temperature FROM sensors".into());
+        s.put_pipeline("hot", &b, Some("rev-1")).unwrap();
+        let desired = s.get_pipeline_revision("hot", 1).unwrap();
+        assert_eq!(desired.spec.sql.as_deref(), Some("SELECT device_id FROM sensors"));
+        let latest = s.get_pipeline("hot").unwrap();
+        assert_eq!(latest.spec.sql.as_deref(), Some("SELECT temperature FROM sensors"));
+        assert_ne!(desired.spec.sql, latest.spec.sql);
+    }
+
+    #[test]
+    fn r27_secrets_are_sealed_and_not_plaintext() {
+        let s = Store::open_memory().unwrap();
+        s.put_secret("pw", "super-secret-value").unwrap();
+        let raw = s.debug_raw_secret("pw").unwrap();
+        assert!(raw.starts_with("enc:v1:"), "stored secret must be sealed: {raw}");
+        assert!(!raw.contains("super-secret-value"));
+        assert_eq!(s.get_secret("pw").unwrap().as_deref(), Some("super-secret-value"));
+    }
+
+    #[tokio::test]
+    async fn r26_catalog_runs_off_async_worker() {
+        let store = Store::open_memory().unwrap();
+        let async_tid = std::thread::current().id();
+        let catalog_tid = store
+            .run_blocking({
+                let store = store.clone();
+                move || {
+                    store.put_stream("sensors", "{}")?;
+                    Ok(std::thread::current().id())
+                }
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            async_tid, catalog_tid,
+            "SQLite must not run on the async worker thread"
+        );
+        assert_eq!(store.get_stream("sensors").unwrap().name, "sensors");
     }
 
     #[test]
