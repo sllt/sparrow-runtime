@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Sparrow in-process runtime stub (M0: linear filter/project only)"
+description = "Sparrow in-process kernel: ExecutionChain, bounded mailboxes, job supervisor"
 
 [dependencies]
 sparrow-model.workspace = true
 sparrow-expr.workspace = true
 sparrow-plan.workspace = true
 sparrow-io.workspace = true
-# No Tokio, HTTP, SQLite, or SQL crates.
+tokio.workspace = true
+tokio-util.workspace = true
+# No Axum, SQLite, MQTT, or SQL parser.

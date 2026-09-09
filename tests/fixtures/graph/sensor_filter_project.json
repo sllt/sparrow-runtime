@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "pipeline_id": 1,
+  "revision_id": 1,
+  "catalog": [
+    {
+      "name": "sensor_readings",
+      "fields": [
+        { "name": "device_id", "type": "utf8", "nullable": false },
+        { "name": "temperature", "type": "float64", "nullable": true },
+        { "name": "humidity", "type": "float64", "nullable": true },
+        { "name": "ts", "type": "timestamp_micros_utc", "nullable": false },
+        { "name": "payload", "type": "dynamic", "nullable": true }
+      ]
+    }
+  ],
+  "nodes": [
+    { "id": 1, "kind": "memory_source", "table": "sensor_readings", "out": [2] },
+    {
+      "id": 2,
+      "kind": "filter",
+      "predicate": {
+        "k": "bin",
+        "op": "gt",
+        "left": { "k": "col", "name": "temperature" },
+        "right": { "k": "lit", "value": { "t": "float64", "v": 25.0 } }
+      },
+      "out": [3]
+    },
+    {
+      "id": 3,
+      "kind": "project",
+      "exprs": [
+        { "alias": "device_id", "expr": { "k": "col", "name": "device_id" } },
+        { "alias": "temperature", "expr": { "k": "col", "name": "temperature" } },
+        { "alias": "ts", "expr": { "k": "col", "name": "ts" } }
+      ],
+      "out": [4]
+    },
+    { "id": 4, "kind": "capture_sink", "name": "capture" }
+  ]
+}

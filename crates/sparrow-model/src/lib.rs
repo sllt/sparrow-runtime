@@ -8,6 +8,7 @@
 //! `experiments/` only.
 
 pub mod batch;
+pub mod budget;
 pub mod delivery;
 pub mod error;
 pub mod frame;
@@ -18,6 +19,7 @@ pub mod scalar;
 pub mod types;
 
 pub use batch::{Row, RowBatch, RowBatchBuilder};
+pub use budget::WorkBudget;
 pub use delivery::{DeliveryContract, DeliveryGuarantee, RecoveryPolicy, RestoreClaim};
 pub use error::{ErrorCode, Result, SparrowError};
 pub use frame::{CodecBounds, CodecBoundary, SourceFrame, DEFAULT_MAX_RECORD_BYTES};

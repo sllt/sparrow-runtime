@@ -6,6 +6,7 @@ members = [
     "crates/sparrow-plan",
     "crates/sparrow-io",
     "crates/sparrow-runtime",
+    "crates/sparrow-sql",
     "crates/sparrow-testkit",
     "experiments/arrow-evaluation",
     "experiments/layout-rowbatch",
@@ -16,6 +17,7 @@ default-members = [
     "crates/sparrow-plan",
     "crates/sparrow-io",
     "crates/sparrow-runtime",
+    "crates/sparrow-sql",
     "crates/sparrow-testkit",
 ]
 
@@ -33,7 +35,11 @@ sparrow-expr = { path = "crates/sparrow-expr", version = "0.1.0" }
 sparrow-plan = { path = "crates/sparrow-plan", version = "0.1.0" }
 sparrow-io = { path = "crates/sparrow-io", version = "0.1.0" }
 sparrow-runtime = { path = "crates/sparrow-runtime", version = "0.1.0" }
+sparrow-sql = { path = "crates/sparrow-sql", version = "0.1.0" }
 sparrow-testkit = { path = "crates/sparrow-testkit", version = "0.1.0" }
+
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 
 # Pinned for G0. sqlparser is a test/binder-gate dependency only.
 # It MUST NOT become a default runtime crate dependency.

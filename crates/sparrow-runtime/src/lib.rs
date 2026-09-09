@@ -1,256 +1,186 @@
-//! Minimal in-process runtime for M0.
+//! In-process streaming kernel.
 //!
-//! Executes a linear Source → Filter → Project → Sink plan against
-//! already-typed batches. Job failure is attributed with pipeline /
-//! attempt / operator context. Not a distributed scheduler.
+//! M1: ExecutionChain (one Tokio task per physical stage), bounded
+//! mailboxes, work budget, job supervisor with cancel/join. Arrow, Axum,
+//! SQLite, MQTT, and `sqlparser` stay out of this crate.
 
-use std::sync::Arc;
+pub mod capture;
+pub mod kernel;
+pub mod linear;
+pub mod mailbox;
+pub mod transform;
 
-use sparrow_expr::{eval, Expr};
-use sparrow_io::RecordSink;
-use sparrow_model::{
-    CreditKind, ErrorCode, JobAttemptId, MemoryOwner, OperatorId, PipelineId, Result, Row,
-    RowBatch, RowBatchBuilder, Scalar, Schema, SparrowError,
-};
-use sparrow_plan::{LogicalOp, LogicalPlan};
-
-pub struct RuntimeConfig {
-    pub pipeline: PipelineId,
-    pub attempt: JobAttemptId,
-    pub owner: Arc<MemoryOwner>,
-    pub credit_kind: CreditKind,
-}
-
-pub struct LinearExecutor {
-    cfg: RuntimeConfig,
-    filter: Option<Expr>,
-    project: Option<(Vec<Expr>, Schema)>,
-    filter_op: OperatorId,
-    project_op: OperatorId,
-}
-
-impl LinearExecutor {
-    pub fn from_plan(cfg: RuntimeConfig, plan: &LogicalPlan) -> Result<Self> {
-        let mut filter = None;
-        let mut project = None;
-        let mut filter_op = OperatorId::new(0);
-        let mut project_op = OperatorId::new(0);
-        for node in &plan.nodes {
-            match node {
-                LogicalOp::Filter {
-                    operator,
-                    predicate,
-                } => {
-                    filter = Some(predicate.clone());
-                    filter_op = *operator;
-                }
-                LogicalOp::Project {
-                    operator,
-                    exprs,
-                    output,
-                } => {
-                    project = Some((exprs.clone(), output.clone()));
-                    project_op = *operator;
-                }
-                LogicalOp::Source { .. } | LogicalOp::Sink { .. } => {}
-            }
-        }
-        Ok(Self {
-            cfg,
-            filter,
-            project,
-            filter_op,
-            project_op,
-        })
-    }
-
-    pub fn run_batch(&self, input: RowBatch) -> Result<RowBatch> {
-        let schema = input.schema().clone();
-        let kept: Result<Vec<Row>> = input
-            .rows()
-            .iter()
-            .filter_map(|row| match self.keep(&schema, &row.values) {
-                Ok(true) => match self.project_row(&schema, &row.values) {
-                    Ok(values) => Some(Ok(Row { values })),
-                    Err(e) => Some(Err(e)),
-                },
-                Ok(false) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect();
-        let kept = kept?;
-        let out_schema = self
-            .project
-            .as_ref()
-            .map(|(_, s)| s.clone())
-            .unwrap_or(schema);
-        let max_rows = self.cfg.owner.budget().max_rows.max(1);
-        let max_bytes = self
-            .cfg
-            .owner
-            .budget()
-            .cap(self.cfg.credit_kind)
-            .min(input.tracked_bytes().saturating_mul(2).max(64));
-        let mut builder = RowBatchBuilder::new(
-            Arc::new(out_schema),
-            Arc::clone(&self.cfg.owner),
-            self.cfg.credit_kind,
-            max_rows,
-            max_bytes.max(64),
-        )
-        .map_err(|e| self.attr(e, self.project_op))?;
-        for row in kept {
-            builder.push(row).map_err(|e| self.attr(e, self.project_op))?;
-        }
-        builder.finish().map_err(|e| self.attr(e, self.project_op))
-    }
-
-    fn keep(&self, schema: &Schema, row: &[Scalar]) -> Result<bool> {
-        let Some(pred) = &self.filter else {
-            return Ok(true);
-        };
-        match eval(pred, schema, row).map_err(|e| self.attr(e, self.filter_op))? {
-            Scalar::Bool(v) => Ok(v),
-            Scalar::Null => Ok(false),
-            other => Err(self.attr(
-                SparrowError::new(
-                    ErrorCode::TypeMismatch,
-                    format!("filter must be bool, got {}", other.data_type()),
-                ),
-                self.filter_op,
-            )),
-        }
-    }
-
-    fn project_row(&self, schema: &Schema, row: &[Scalar]) -> Result<Vec<Scalar>> {
-        let Some((exprs, _)) = &self.project else {
-            return Ok(row.to_vec());
-        };
-        exprs
-            .iter()
-            .map(|e| eval(e, schema, row).map_err(|err| self.attr(err, self.project_op)))
-            .collect()
-    }
-
-    fn attr(&self, err: SparrowError, operator: OperatorId) -> SparrowError {
-        err.at_job(self.cfg.pipeline, self.cfg.attempt)
-            .at_operator(operator)
-    }
-}
-
-/// Drive batches through an executor into a sink.
-pub fn drain<S: RecordSink>(
-    exec: &LinearExecutor,
-    batches: impl IntoIterator<Item = RowBatch>,
-    sink: &mut S,
-) -> Result<usize> {
-    let mut rows = 0usize;
-    for batch in batches {
-        rows += batch.num_rows();
-        let out = exec.run_batch(batch)?;
-        sink.send(out)?;
-    }
-    sink.flush()?;
-    Ok(rows)
-}
+pub use capture::{SharedCapture, StallGate};
+pub use kernel::{JobHandle, JobRequest, JobStats, Kernel, KernelOptions};
+pub use linear::{drain, LinearExecutor, RuntimeConfig};
+pub use mailbox::MailboxConfig;
 
 #[cfg(test)]
-mod tests {
+mod g2_tests {
     use super::*;
-    use sparrow_expr::BinaryOp;
+    use sparrow_expr::{BinaryOp, Expr};
     use sparrow_model::{
-        DataType, DeliveryContract, Field, FieldId, MemoryOwner, ResourceBudget, RestoreClaim,
-        RevisionId, SchemaId,
+        DataType, Field, FieldId, PipelineId, ResourceBudget, RevisionId, Row, Scalar, Schema,
+        SchemaId,
     };
-    use sparrow_plan::LogicalPlan;
+    use sparrow_plan::{bind_linear, physicalize, PlanOptions};
+    use std::time::Duration;
 
-    struct VecSink(Vec<RowBatch>);
-    impl RecordSink for VecSink {
-        fn send(&mut self, batch: RowBatch) -> Result<()> {
-            self.0.push(batch);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn filter_project_and_reject_restore() {
-        assert!(DeliveryContract::V0_1
-            .validate_restore(&RestoreClaim::Checkpoint {
-                snapshot_id: "snap-1".into()
-            })
-            .is_err());
-
-        let in_schema = Schema::new(
+    fn schema() -> Schema {
+        Schema::new(
             SchemaId::new(1),
             vec![
-                Field::new(FieldId::new(1), "temp", DataType::Float64, true),
-                Field::new(FieldId::new(2), "id", DataType::Int64, false),
+                Field::new(FieldId::new(1), "id", DataType::Int64, false),
+                Field::new(FieldId::new(2), "temp", DataType::Float64, true),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn rows() -> Vec<Row> {
+        vec![
+            Row {
+                values: vec![Scalar::Int64(1), Scalar::Float64(10.0)],
+            },
+            Row {
+                values: vec![Scalar::Int64(2), Scalar::Float64(30.0)],
+            },
+            Row {
+                values: vec![Scalar::Int64(3), Scalar::Float64(26.0)],
+            },
+            Row {
+                values: vec![Scalar::Int64(4), Scalar::Float64(12.0)],
+            },
+        ]
+    }
+
+    fn bound() -> sparrow_plan::BoundLogicalPlan {
+        let out = Schema::new(
+            SchemaId::new(2),
+            vec![
+                Field::new(FieldId::new(1), "id", DataType::Int64, false),
+                Field::new(FieldId::new(2), "temp", DataType::Float64, true),
             ],
         )
         .unwrap();
-        let out_schema = Schema::new(
-            SchemaId::new(2),
-            vec![Field::new(FieldId::new(2), "id", DataType::Int64, false)],
-        )
-        .unwrap();
-        let owner = MemoryOwner::new(ResourceBudget::compact());
-        let mut builder = RowBatchBuilder::new(
-            Arc::new(in_schema.clone()),
-            Arc::clone(&owner),
-            CreditKind::Reservation,
-            8,
-            1024,
-        )
-        .unwrap();
-        builder
-            .push(Row {
-                values: vec![Scalar::Float64(30.0), Scalar::Int64(1)],
-            })
-            .unwrap();
-        builder
-            .push(Row {
-                values: vec![Scalar::Float64(10.0), Scalar::Int64(2)],
-            })
-            .unwrap();
-        let batch = builder.finish().unwrap();
-
-        let plan = LogicalPlan::linear(
-            PipelineId::new(9),
+        bind_linear(
+            PipelineId::new(1),
             RevisionId::new(1),
-            LogicalOp::Source {
-                operator: OperatorId::new(1),
-                name: "s".into(),
-                schema: in_schema,
-            },
+            "t".into(),
+            schema(),
             Some(Expr::Binary {
                 op: BinaryOp::Gt,
                 left: Box::new(Expr::Column {
                     name: "temp".into(),
                 }),
-                right: Box::new(Expr::Literal(Scalar::Float64(20.0))),
+                right: Box::new(Expr::Literal(Scalar::Float64(25.0))),
             }),
             Some((
-                vec![Expr::Column { name: "id".into() }],
-                out_schema,
+                vec![
+                    Expr::Column { name: "id".into() },
+                    Expr::Column {
+                        name: "temp".into(),
+                    },
+                ],
+                out,
             )),
-            LogicalOp::Sink {
-                operator: OperatorId::new(4),
-                name: "c".into(),
-            },
-        );
-        let exec = LinearExecutor::from_plan(
-            RuntimeConfig {
-                pipeline: PipelineId::new(9),
-                attempt: JobAttemptId::new(1),
-                owner,
-                credit_kind: CreditKind::Reservation,
-            },
-            &plan,
+            None,
+            "capture".into(),
         )
+        .unwrap()
+    }
+
+    fn kernel(mailbox_items: usize) -> Kernel {
+        Kernel::new(KernelOptions {
+            budget: ResourceBudget::compact(),
+            mailbox: MailboxConfig {
+                max_items: mailbox_items,
+                max_bytes: 64 * 1024,
+            },
+            worker_threads: 2,
+            rows_per_batch: 1,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn fused_and_unfused_same_rows() {
+        let k = kernel(8);
+        let plan = bound();
+        let fused = physicalize(&plan, &PlanOptions { fuse: true });
+        let unfused = physicalize(&plan, &PlanOptions { fuse: false });
+        assert!(fused.fused());
+        assert!(!unfused.fused());
+
+        let a = SharedCapture::new();
+        let b = SharedCapture::new();
+        k.run(JobRequest {
+            plan: fused,
+            rows: rows(),
+            capture: a.clone(),
+        })
         .unwrap();
-        let mut sink = VecSink(Vec::new());
-        drain(&exec, [batch], &mut sink).unwrap();
-        assert_eq!(sink.0[0].num_rows(), 1);
-        assert_eq!(sink.0[0].rows()[0].values[0], Scalar::Int64(1));
+        k.run(JobRequest {
+            plan: unfused,
+            rows: rows(),
+            capture: b.clone(),
+        })
+        .unwrap();
+        assert_eq!(a.rows(), b.rows());
+        assert_eq!(a.row_count(), 2);
+        assert_eq!(k.live_tasks(), 0);
+    }
+
+    #[test]
+    fn full_queue_stop_does_not_deadlock() {
+        let k = kernel(1);
+        let capture = SharedCapture::new();
+        capture.stall.stall();
+        let handle = k
+            .submit(JobRequest {
+                plan: physicalize(&bound(), &PlanOptions { fuse: true }),
+                rows: rows(),
+                capture: capture.clone(),
+            })
+            .unwrap();
+        // Sink is stalled and mailbox is 1-deep; cancel must still join.
+        std::thread::sleep(Duration::from_millis(30));
+        let stats = k
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), handle.stop())
+                    .await
+                    .expect("stop timed out")
+            })
+            .unwrap();
+        capture.stall.release();
+        assert_eq!(stats.live_tasks_after, 0);
+        assert_eq!(k.live_tasks(), 0);
+    }
+
+    #[test]
+    fn stalled_job_does_not_freeze_peer() {
+        let k = kernel(2);
+        let stalled = SharedCapture::new();
+        stalled.stall.stall();
+        let live = SharedCapture::new();
+        let a = k
+            .submit(JobRequest {
+                plan: physicalize(&bound(), &PlanOptions::default()),
+                rows: rows(),
+                capture: stalled.clone(),
+            })
+            .unwrap();
+        let b = k
+            .submit(JobRequest {
+                plan: physicalize(&bound(), &PlanOptions::default()),
+                rows: rows(),
+                capture: live.clone(),
+            })
+            .unwrap();
+        let b_stats = k.block_on(b.wait()).expect("peer job froze behind stalled sink");
+        assert_eq!(b_stats.captured_rows, 2);
+        stalled.stall.release();
+        k.block_on(a.wait()).unwrap();
+        assert_eq!(k.live_tasks(), 0);
     }
 }

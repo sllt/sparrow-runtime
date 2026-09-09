@@ -21,6 +21,7 @@ pub enum ErrorCode {
     CodecViolation,
     MaxRecordSize,
     JobFailed,
+    Cancelled,
     Internal,
 }
 
@@ -38,6 +39,7 @@ impl ErrorCode {
             Self::CodecViolation => "codec_violation",
             Self::MaxRecordSize => "max_record_size",
             Self::JobFailed => "job_failed",
+            Self::Cancelled => "cancelled",
             Self::Internal => "internal",
         }
     }

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Sparrow fixtures, virtual clock, capture sink, and G0 SQL gate"
+description = "Sparrow fixtures, virtual clock, capture sink, and demos"
 
 [dependencies]
 sparrow-model.workspace = true
@@ -12,8 +12,16 @@ sparrow-expr.workspace = true
 sparrow-plan.workspace = true
 sparrow-io.workspace = true
 sparrow-runtime.workspace = true
-sqlparser.workspace = true
+sparrow-sql.workspace = true
 
 [[example]]
 name = "m0_pipeline_smoke"
 path = "examples/m0_pipeline_smoke.rs"
+
+[[example]]
+name = "m1_kernel_smoke"
+path = "examples/m1_kernel_smoke.rs"
+
+[[example]]
+name = "m1_sql_graph_equiv"
+path = "examples/m1_sql_graph_equiv.rs"

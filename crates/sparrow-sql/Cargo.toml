@@ -1,13 +1,13 @@
 [package]
-name = "sparrow-plan"
+name = "sparrow-sql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Sparrow logical/physical plan IR, GraphSpec, and shared binder"
+description = "Sparrow SQL v0 frontend: G0 gate + binder onto the shared plan IR"
 
 [dependencies]
 sparrow-model.workspace = true
 sparrow-expr.workspace = true
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+sparrow-plan.workspace = true
+sqlparser.workspace = true

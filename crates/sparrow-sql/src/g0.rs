@@ -1,8 +1,5 @@
-//! G0 Sparrow SQL v0 accept/reject gate.
-//!
-//! Parses with `sqlparser` [`GenericDialect`] then walks the AST. This is a
-//! *narrow binder*: anything not on the V0.1 allow-list is rejected. The
-//! runtime crate does not depend on `sqlparser`.
+//! G0 Sparrow SQL v0 accept/reject gate (lives here so the runtime stays
+//! free of `sqlparser`). The binder in `bind.rs` reuses this walk.
 
 use std::path::{Path, PathBuf};
 

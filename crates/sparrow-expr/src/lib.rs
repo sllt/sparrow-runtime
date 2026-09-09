@@ -6,6 +6,11 @@
 use sparrow_model::{DataType, DynamicValue, Result, Scalar, Schema, SparrowError};
 use sparrow_model::error::ErrorCode;
 
+pub mod infer;
+pub mod kernels;
+pub use infer::infer_type;
+pub use kernels::{filter_mask, SimplePred};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,

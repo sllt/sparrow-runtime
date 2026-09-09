@@ -1,0 +1,132 @@
+//! Tight numeric loops for the common `col ▷ lit` filter. Layout stays
+//! RowBatch (ADR-003); this is a kernel, not a second engine.
+
+use crate::{eval, BinaryOp, Expr};
+use sparrow_model::{Result, Row, Scalar, Schema};
+
+/// Predicate that can run without walking the full expression tree per cell.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SimplePred {
+    CmpF64 {
+        column: String,
+        op: BinaryOp,
+        thr: f64,
+    },
+}
+
+impl SimplePred {
+    pub fn from_expr(expr: &Expr) -> Option<Self> {
+        match expr {
+            Expr::Binary {
+                op,
+                left,
+                right,
+            } if matches!(
+                op,
+                BinaryOp::Gt | BinaryOp::Gte | BinaryOp::Lt | BinaryOp::Lte | BinaryOp::Eq | BinaryOp::NotEq
+            ) =>
+            {
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column { name }, Expr::Literal(lit)) => Some(Self::CmpF64 {
+                        column: name.clone(),
+                        op: *op,
+                        thr: lit.as_f64()?,
+                    }),
+                    (Expr::Literal(lit), Expr::Column { name }) => {
+                        let flipped = match op {
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::Gte => BinaryOp::Lte,
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::Lte => BinaryOp::Gte,
+                            other => *other,
+                        };
+                        Some(Self::CmpF64 {
+                            column: name.clone(),
+                            op: flipped,
+                            thr: lit.as_f64()?,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Keep-mask for a simple numeric compare. Falls back to `eval` if the
+/// column is missing or non-numeric (NULL → drop, matching filter semantics).
+pub fn filter_mask(pred: &Expr, schema: &Schema, rows: &[Row]) -> Result<Vec<bool>> {
+    if let Some(simple) = SimplePred::from_expr(pred) {
+        let SimplePred::CmpF64 { column, op, thr } = &simple;
+        if let Some(idx) = schema.index_of_name(column) {
+            return Ok(rows
+                .iter()
+                .map(|row| match row.values.get(idx).and_then(Scalar::as_f64) {
+                    Some(v) => cmp_f64(*op, v, *thr),
+                    None => false,
+                })
+                .collect());
+        }
+    }
+    rows.iter()
+        .map(|row| match eval(pred, schema, &row.values)? {
+            Scalar::Bool(v) => Ok(v),
+            Scalar::Null => Ok(false),
+            other => Err(sparrow_model::SparrowError::new(
+                sparrow_model::ErrorCode::TypeMismatch,
+                format!("filter must be bool, got {}", other.data_type()),
+            )),
+        })
+        .collect()
+}
+
+fn cmp_f64(op: BinaryOp, left: f64, right: f64) -> bool {
+    match op {
+        BinaryOp::Gt => left > right,
+        BinaryOp::Gte => left >= right,
+        BinaryOp::Lt => left < right,
+        BinaryOp::Lte => left <= right,
+        BinaryOp::Eq => left == right,
+        BinaryOp::NotEq => left != right,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparrow_model::{DataType, Field, FieldId, SchemaId};
+
+    #[test]
+    fn stride_matches_eval_for_gt() {
+        let schema = Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(FieldId::new(1), "temp", DataType::Float64, true)],
+        )
+        .unwrap();
+        let rows = vec![
+            Row {
+                values: vec![Scalar::Float64(10.0)],
+            },
+            Row {
+                values: vec![Scalar::Float64(30.0)],
+            },
+            Row {
+                values: vec![Scalar::Null],
+            },
+        ];
+        let pred = Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Column {
+                name: "temp".into(),
+            }),
+            right: Box::new(Expr::Literal(Scalar::Float64(25.0))),
+        };
+        assert_eq!(
+            filter_mask(&pred, &schema, &rows).unwrap(),
+            vec![false, true, false]
+        );
+        assert!(SimplePred::from_expr(&pred).is_some());
+    }
+}
