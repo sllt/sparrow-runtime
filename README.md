@@ -110,4 +110,6 @@ exactly-once, checkpoint restore, multi-user RBAC, claimed SLOs.
 
 See `docs/m3-report.md` for the API table, capability matrix, and honesty text.
 
+Repository: https://github.com/sllt/sparrow-runtime
+
 License: MIT
