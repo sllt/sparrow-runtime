@@ -3,11 +3,13 @@
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use sparrow_formats::{JsonCodec, JsonLimits};
 use sparrow_model::{ErrorCode, RestoreClaim, Row, Schema, SourceFrame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
@@ -17,6 +19,8 @@ use crate::policy::TargetPolicy;
 use crate::secret::SecretResolver;
 
 const MAX_INBOX: usize = 1024;
+const MAX_CONCURRENT: usize = 16;
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct HttpPushSourceConfig {
@@ -110,18 +114,27 @@ impl HttpPushSource {
     }
 
     pub async fn run(self, tx: mpsc::Sender<Row>, cancel: CancellationToken) {
+        let slots = Arc::new(Semaphore::new(MAX_CONCURRENT));
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 accept = self.listener.accept() => {
                     match accept {
                         Ok((stream, _)) => {
+                            let permit = match slots.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    let _ = write_status(stream, 503, b"busy").await;
+                                    continue;
+                                }
+                            };
                             let tx = tx.clone();
                             let diag = Arc::clone(&self.diag);
                             let codec = self.codec.clone();
                             let path = self.config.path.clone();
                             let child = cancel.clone();
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 let _ = handle_push(stream, tx, diag, codec, path, child).await;
                             });
                         }
@@ -131,6 +144,26 @@ impl HttpPushSource {
             }
         }
     }
+}
+
+async fn write_status(mut stream: TcpStream, code: u16, body: &[u8]) -> Result<()> {
+    let reason = match code {
+        202 => "Accepted",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let header = format!(
+        "HTTP/1.1 {code} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes()).await;
+    let _ = stream.write_all(body).await;
+    Ok(())
 }
 
 async fn handle_push(
@@ -145,16 +178,28 @@ async fn handle_push(
     let mut tmp = [0u8; 1024];
     let header_end = loop {
         if cancel.is_cancelled() {
+            let _ = write_status(stream, 503, b"closed").await;
             return Ok(());
         }
-        let n = stream.read(&mut tmp).await.map_err(|e| {
-            ConnectorError::new(ErrorCode::Internal, format!("HTTP push read: {e}"))
-        })?;
+        let n = match timeout(READ_TIMEOUT, stream.read(&mut tmp)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                return Err(ConnectorError::new(
+                    ErrorCode::Internal,
+                    format!("HTTP push read: {e}"),
+                ));
+            }
+            Err(_) => {
+                let _ = write_status(stream, 400, b"timeout").await;
+                return Ok(());
+            }
+        };
         if n == 0 {
             return Ok(());
         }
         buf.extend_from_slice(&tmp[..n]);
         if buf.len() > 128 * 1024 {
+            let _ = write_status(stream, 400, b"too large").await;
             return Err(ConnectorError::new(
                 ErrorCode::MaxRecordSize,
                 "HTTP push request exceeded 128KiB",
@@ -166,8 +211,21 @@ async fn handle_push(
     };
     let header = String::from_utf8_lossy(&buf[..header_end]);
     let first = header.lines().next().unwrap_or("");
-    if !first.contains(&path) && !first.contains(" / ") {
-        // still accept any path for demo robustness if bind is dedicated
+    let mut parts = first.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let req_path = parts.next().unwrap_or("");
+    if !method.eq_ignore_ascii_case("POST") {
+        let _ = write_status(stream, 405, b"POST required").await;
+        return Ok(());
+    }
+    let want = if path.starts_with('/') {
+        path.clone()
+    } else {
+        format!("/{path}")
+    };
+    if req_path != want && req_path != path {
+        let _ = write_status(stream, 404, b"not found").await;
+        return Ok(());
     }
     let content_len = header
         .lines()
@@ -178,6 +236,7 @@ async fn handle_push(
         })
         .unwrap_or(0);
     if content_len > 64 * 1024 {
+        let _ = write_status(stream, 400, b"too large").await;
         return Err(ConnectorError::new(
             ErrorCode::MaxRecordSize,
             "HTTP push body exceeds 64KiB",
@@ -185,9 +244,14 @@ async fn handle_push(
     }
     let mut body = buf[header_end + 4..].to_vec();
     while body.len() < content_len {
-        let n = stream.read(&mut tmp).await.map_err(|e| {
-            ConnectorError::new(ErrorCode::Internal, format!("HTTP push body: {e}"))
-        })?;
+        if cancel.is_cancelled() {
+            let _ = write_status(stream, 503, b"closed").await;
+            return Ok(());
+        }
+        let n = match timeout(READ_TIMEOUT, stream.read(&mut tmp)).await {
+            Ok(Ok(n)) => n,
+            _ => break,
+        };
         if n == 0 {
             break;
         }
@@ -198,21 +262,128 @@ async fn handle_push(
     let frame = SourceFrame::new(body, 0);
     match codec.decode_frame(&frame) {
         Ok(Some(row)) => match tx.try_send(row) {
-            Ok(()) => {}
+            Ok(()) => {
+                let _ = write_status(stream, 202, b"ok").await;
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 diag.http_dropped.fetch_add(1, Ordering::Relaxed);
+                let _ = write_status(stream, 429, b"full").await;
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let _ = write_status(stream, 503, b"closed").await;
+            }
         },
         Ok(None) | Err(_) => {
             diag.http_dropped.fetch_add(1, Ordering::Relaxed);
+            let _ = write_status(stream, 422, b"bad json").await;
         }
     }
-    let resp = b"HTTP/1.1 202 Accepted\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
-    let _ = stream.write_all(resp).await;
     Ok(())
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparrow_model::{DataType, Field, FieldId, SchemaId};
+    use crate::secret::MapSecretResolver;
+    use crate::policy::TargetPolicy;
+
+    fn schema() -> Schema {
+        Schema::new(
+            SchemaId::new(1),
+            vec![
+                Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+                Field::new(FieldId::new(2), "v", DataType::Int64, false),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn r20_full_queue_is_not_2xx() {
+        let cfg = HttpPushSourceConfig {
+            bind: "127.0.0.1:0".into(),
+            path: "/push".into(),
+            inbox_capacity: 1,
+            restore: RestoreClaim::None,
+            schema: schema(),
+            json_limits: JsonLimits::default(),
+        };
+        let secrets = MapSecretResolver::default();
+        let policy = TargetPolicy::deny_all();
+        let src = HttpPushSource::bind(cfg, &secrets, &policy, IoDiagnostics::new())
+            .await
+            .unwrap();
+        let url = src.url();
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(sparrow_model::Row {
+            values: vec![
+                sparrow_model::Scalar::utf8("x"),
+                sparrow_model::Scalar::Int64(1),
+            ],
+        })
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        tokio::spawn(src.run(tx, child));
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(r#"{"device_id":"d","v":2}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !resp.status().is_success(),
+            "full inbox must not return 2xx, got {}",
+            resp.status()
+        );
+        assert_eq!(resp.status().as_u16(), 429);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn r21_method_and_path_enforced() {
+        let cfg = HttpPushSourceConfig {
+            bind: "127.0.0.1:0".into(),
+            path: "/push".into(),
+            inbox_capacity: 8,
+            restore: RestoreClaim::None,
+            schema: schema(),
+            json_limits: JsonLimits::default(),
+        };
+        let secrets = MapSecretResolver::default();
+        let policy = TargetPolicy::deny_all();
+        let src = HttpPushSource::bind(cfg, &secrets, &policy, IoDiagnostics::new())
+            .await
+            .unwrap();
+        let port = src.port();
+        let (tx, _rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        tokio::spawn(src.run(tx, child));
+        let client = reqwest::Client::new();
+        let get = client
+            .get(format!("http://127.0.0.1:{port}/push"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status().as_u16(), 405);
+        let wrong = client
+            .post(format!("http://127.0.0.1:{port}/nope"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status().as_u16(), 404);
+        cancel.cancel();
+    }
 }

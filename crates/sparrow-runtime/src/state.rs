@@ -159,6 +159,23 @@ impl<V> MemoryState<V> {
         self.entries.remove(key).map(|e| e.value)
     }
 
+    /// Re-bill retention after a variable-size in-place update (MIN/MAX strings).
+    /// Growing values must acquire a new lease; shrinking keeps the existing one.
+    pub fn recharge(&mut self, key: &StateKey, value_bytes: usize) -> Result<()> {
+        let Some(entry) = self.entries.get(key) else {
+            return Ok(());
+        };
+        let bytes = key.tracked_bytes().saturating_add(value_bytes).max(1);
+        if entry.lease.bytes() >= bytes {
+            return Ok(());
+        }
+        let lease = self.owner.acquire(CreditKind::Retention, bytes)?;
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.lease = lease;
+        }
+        Ok(())
+    }
+
     pub fn retain<F: FnMut(&StateKey, &V) -> bool>(&mut self, mut pred: F) {
         self.entries.retain(|k, e| pred(k, &e.value));
     }
@@ -228,5 +245,15 @@ mod tests {
         st.clear();
         assert_eq!(st.len(), 0);
         assert_eq!(st.retention_bytes(), 0);
+    }
+
+    #[test]
+    fn r05_recharge_grows_retention_for_variable_state() {
+        let mut st = MemoryState::new(owner(), OperatorId::new(1), StateSlotId::new(1), 4).unwrap();
+        let key = StateKey::new(OperatorId::new(1), StateSlotId::new(1), vec![Scalar::Int64(1)]);
+        st.put(key.clone(), 1u8, 8).unwrap();
+        let before = st.retention_bytes();
+        st.recharge(&key, 2048).unwrap();
+        assert!(st.retention_bytes() > before);
     }
 }

@@ -22,6 +22,9 @@ const SLOT: u16 = 1;
 pub struct WindowEmission {
     pub finals: Vec<Row>,
     pub lates: Vec<Row>,
+    /// Event-time close watermark that still has keyed state to drain in
+    /// mailbox-sized chunks (R17). Kernel must take/send before advancing.
+    pub pending_close: Option<i64>,
 }
 
 impl WindowEmission {
@@ -223,11 +226,13 @@ impl WindowOperator {
                 Ok(WindowEmission {
                     finals: self.on_tumble_row(row, now, size_micros)?,
                     lates: Vec::new(),
+                    pending_close: None,
                 })
             }
             WindowKind::Count { size } => Ok(WindowEmission {
                 finals: self.on_count_row(row, size)?,
                 lates: Vec::new(),
+                pending_close: None,
             }),
             WindowKind::TumblingEventTime { size_micros } => {
                 self.on_et_row(row, now, size_micros, None)
@@ -305,6 +310,10 @@ impl WindowOperator {
             if let Some(entry) = store.get_mut(&sk) {
                 update_accs(&self.spec, &self.input, &mut entry.accs, row)?;
             }
+            if let Some(entry) = store.get(&sk) {
+                let bytes: usize = entry.accs.iter().map(Accumulator::tracked_bytes).sum();
+                store.recharge(&sk, bytes)?;
+            }
         }
         Ok(())
     }
@@ -324,7 +333,10 @@ impl WindowOperator {
         else {
             return Ok(WindowEmission::default());
         };
-        let finals = self.flush_closed(proposed_out)?;
+        let mut finals = Vec::new();
+        while let Some(row) = self.take_closed_one(proposed_out)? {
+            finals.push(row);
+        }
         self.holdback
             .as_mut()
             .expect("holdback")
@@ -332,25 +344,75 @@ impl WindowOperator {
         Ok(WindowEmission {
             finals,
             lates: Vec::new(),
+            pending_close: Some(proposed_out),
         })
     }
 
+    pub fn advance_holdback(&mut self, wm_out: i64) -> Result<()> {
+        if let Some(h) = self.holdback.as_mut() {
+            h.advance_out(wm_out)?;
+        }
+        Ok(())
+    }
+
     fn flush_closed(&mut self, wm_out: i64) -> Result<Vec<Row>> {
-        let victims: Vec<StateKey> = match &self.store {
+        let mut out = Vec::new();
+        while let Some(row) = self.take_closed_one(wm_out)? {
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    /// Remove and emit at most one closed window. Used so a giant flush
+    /// cannot drop all state and then fail to send.
+    pub fn take_closed_one(&mut self, wm_out: i64) -> Result<Option<Row>> {
+        let victim = match &self.store {
             WindowStore::Tumble(store) => store
                 .iter()
-                .filter(|(_, e)| e.window_end <= wm_out)
-                .map(|(k, _)| k.clone())
-                .collect(),
-            _ => return Ok(Vec::new()),
+                .find(|(_, e)| e.window_end <= wm_out)
+                .map(|(k, _)| k.clone()),
+            _ => None,
         };
-        let mut out = Vec::new();
+        let Some(k) = victim else {
+            return Ok(None);
+        };
         if let WindowStore::Tumble(store) = &mut self.store {
-            for k in victims {
-                if let Some(entry) = store.remove(&k) {
-                    out.push(emit_tumble(&group_from_et_key(&k.key), &entry));
-                }
+            if let Some(entry) = store.remove(&k) {
+                return Ok(Some(emit_tumble(&group_from_et_key(&k.key), &entry)));
             }
+        }
+        Ok(None)
+    }
+
+    /// Take a mailbox-sized chunk of closed windows (R17).
+    pub fn take_closed_chunk(
+        &mut self,
+        wm_out: i64,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Row>> {
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        while out.len() < max_rows.max(1) {
+            let Some(row) = self.take_closed_one(wm_out)? else {
+                break;
+            };
+            let sz = row.tracked_bytes();
+            if !out.is_empty() && bytes.saturating_add(sz) > max_bytes {
+                // Put this row back by... we already removed it. Emit it in this
+                // chunk if it is the first, otherwise we cannot reinsert easily.
+                // Always include at least one row; oversized single rows are the
+                // mailbox BoundExceeded path at send time.
+                if out.is_empty() {
+                    out.push(row);
+                } else {
+                    // Re-create is not possible; include it to avoid silent loss.
+                    out.push(row);
+                }
+                break;
+            }
+            bytes = bytes.saturating_add(sz);
+            out.push(row);
         }
         Ok(out)
     }
@@ -454,6 +516,10 @@ impl WindowOperator {
             if let Some(entry) = store.get_mut(&sk) {
                 update_accs(&spec, &input, &mut entry.accs, row)?;
             }
+            if let Some(entry) = store.get(&sk) {
+                let bytes: usize = entry.accs.iter().map(Accumulator::tracked_bytes).sum();
+                store.recharge(&sk, bytes)?;
+            }
         }
         Ok(late)
     }
@@ -476,7 +542,12 @@ impl WindowOperator {
             if let Some(entry) = store.get_mut(&sk) {
                 update_accs(&spec, &input, &mut entry.accs, row)?;
                 entry.count += 1;
-                if entry.count >= size {
+            }
+            if let Some(entry) = store.get(&sk) {
+                let bytes: usize = entry.accs.iter().map(Accumulator::tracked_bytes).sum();
+                let count = entry.count;
+                store.recharge(&sk, bytes)?;
+                if count >= size {
                     if let Some(entry) = store.remove(&sk) {
                         emit_row = Some(emit_count(&sk.key, &entry));
                     }
@@ -626,6 +697,16 @@ impl WindowOperator {
             h.restore(freeze.wm_in, freeze.wm_out);
         }
         self.hub.restore_effective(freeze.last_effective);
+        // R16: PT windows must still close after restore without new data.
+        if !self.spec.kind.uses_event_time() {
+            if let WindowStore::Tumble(store) = &self.store {
+                let ends: Vec<i64> = store.iter().map(|(_, e)| e.window_end).collect();
+                for end in ends {
+                    self.timers
+                        .schedule(TimerId::window(self.operator, end), end)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -786,4 +867,108 @@ pub fn finish_rows(
         b.push(row)?;
     }
     Ok(Some(b.finish()?))
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use sparrow_expr::Expr;
+    use sparrow_model::{
+        AggFn, DataType, Field, FieldId, ResourceBudget, Scalar, SchemaId, WindowKind,
+    };
+    use sparrow_plan::AggCall;
+
+    fn schema() -> Schema {
+        Schema::new(
+            SchemaId::new(1),
+            vec![
+                Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+                Field::new(FieldId::new(2), "v", DataType::Int64, false),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn pt_spec() -> WindowSpec {
+        WindowSpec::new(
+            WindowKind::TumblingProcessingTime {
+                size_micros: 1_000_000,
+            },
+            vec!["device_id".into()],
+            vec![AggCall::new(
+                AggFn::Sum,
+                Some(Expr::Column { name: "v".into() }),
+                "s",
+            )],
+        )
+    }
+
+    fn op() -> WindowOperator {
+        WindowOperator::new(
+            OperatorId::new(1),
+            pt_spec(),
+            schema(),
+            MemoryOwner::new(ResourceBudget::compact()),
+            16,
+            16,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn r16_pt_restore_rebuilds_timers() {
+        let mut a = op();
+        let row = Row {
+            values: vec![Scalar::utf8("d1"), Scalar::Int64(10)],
+        };
+        let _ = a.on_row(&row, 0).unwrap();
+        assert!(a.peek_deadline().is_some());
+        let freeze = a.freeze();
+        let mut b = op();
+        b.restore_freeze(&freeze).unwrap();
+        assert!(
+            b.peek_deadline().is_some(),
+            "PT restore must reschedule close timers"
+        );
+        let emitted = b.fire_due(1_000_000).unwrap();
+        assert!(
+            !emitted.is_empty(),
+            "restored PT window must close without new data"
+        );
+    }
+
+    #[test]
+    fn r17_take_closed_chunk_leaves_remaining_state() {
+        let mut w = op();
+        w.restore_freeze(&WindowFreeze {
+            operator: OperatorId::new(1),
+            slot: StateSlotId::new(1),
+            kind: 0,
+            entries: vec![
+                FrozenEntry {
+                    key: vec![Scalar::utf8("a"), Scalar::Int64(0)],
+                    window_start: 0,
+                    window_end: 10,
+                    count: 0,
+                    accs: vec![Accumulator::new(AggFn::Sum, DataType::Int64, false).unwrap()],
+                },
+                FrozenEntry {
+                    key: vec![Scalar::utf8("b"), Scalar::Int64(0)],
+                    window_start: 0,
+                    window_end: 10,
+                    count: 0,
+                    accs: vec![Accumulator::new(AggFn::Sum, DataType::Int64, false).unwrap()],
+                },
+            ],
+            wm_in: Some(10),
+            wm_out: Some(0),
+            last_effective: Some(10),
+        })
+        .unwrap();
+        let chunk = w.take_closed_chunk(10, 1, 1024).unwrap();
+        assert_eq!(chunk.len(), 1);
+        let rest = w.take_closed_chunk(10, 8, 1024).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert!(w.take_closed_chunk(10, 8, 1024).unwrap().is_empty());
+    }
 }

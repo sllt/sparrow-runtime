@@ -73,7 +73,14 @@ impl Accumulator {
     }
 
     pub fn tracked_bytes(&self) -> usize {
-        48
+        const BASE: usize = 48;
+        match self {
+            Self::Min { v } | Self::Max { v } => {
+                BASE + v.as_ref().map(Scalar::tracked_bytes).unwrap_or(0)
+            }
+            Self::Count { .. } | Self::SumI64 { .. } | Self::SumU64 { .. } | Self::SumF64 { .. }
+            | Self::Avg { .. } => BASE,
+        }
     }
 
     pub fn update(&mut self, value: &Scalar) -> Result<()> {
@@ -440,5 +447,20 @@ mod tests {
             ov.update(&Scalar::Int64(1)).unwrap_err().code,
             ErrorCode::IntegerOverflow
         );
+    }
+
+    #[test]
+    fn r05_min_max_tracked_bytes_include_payload() {
+        let mut mn = Accumulator::new(AggFn::Min, DataType::Utf8, false).unwrap();
+        assert_eq!(mn.tracked_bytes(), 48);
+        mn.update(&Scalar::utf8("xxxxxxxxxxxxxxxxxxxxxxxx")).unwrap();
+        assert!(
+            mn.tracked_bytes() > 48,
+            "MIN must bill the stored utf8 payload, got {}",
+            mn.tracked_bytes()
+        );
+        let mut mx = Accumulator::new(AggFn::Max, DataType::Utf8, false).unwrap();
+        mx.update(&Scalar::utf8("yyyyyyyyyyyyyyyyyyyyyyyy")).unwrap();
+        assert!(mx.tracked_bytes() > 48);
     }
 }
