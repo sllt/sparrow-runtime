@@ -3,7 +3,6 @@ name = "sparrow-plan"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "Sparrow logical/physical plan IR, GraphSpec, and shared binder"
 
 [dependencies]

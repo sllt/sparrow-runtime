@@ -3,7 +3,6 @@ name = "arrow-evaluation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "G1a layout comparison: provisional RowBatch vs Arrow (DataFusion optional)"
 publish = false
 

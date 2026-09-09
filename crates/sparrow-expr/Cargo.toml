@@ -3,7 +3,6 @@ name = "sparrow-expr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "Sparrow expression IR and scalar evaluator (G1a-thin in M0)"
 
 [dependencies]

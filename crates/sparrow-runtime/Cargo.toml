@@ -3,7 +3,6 @@ name = "sparrow-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "Sparrow in-process kernel: ExecutionChain, bounded mailboxes, job supervisor"
 
 [dependencies]

@@ -3,7 +3,6 @@ name = "sparrow-sql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "Sparrow SQL v0 frontend: G0 gate + binder onto the shared plan IR"
 
 [dependencies]

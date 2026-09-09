@@ -3,7 +3,6 @@ name = "sparrow-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "Authenticated V0.1 management API (Axum). Depends on control; not a sparrow-runtime dependency."
 
 [dependencies]

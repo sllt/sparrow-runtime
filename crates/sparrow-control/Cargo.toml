@@ -3,7 +3,6 @@ name = "sparrow-control"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "SQLite catalog, desired/actual supervisor, and pipeline validation (outside sparrow-runtime)"
 
 [dependencies]

@@ -3,7 +3,6 @@ name = "sparrow-connectors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "MQTT source, HTTP/Log sinks, secrets, and target policy (outside sparrow-runtime)"
 
 [dependencies]

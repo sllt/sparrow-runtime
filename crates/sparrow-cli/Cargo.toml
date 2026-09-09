@@ -3,7 +3,6 @@ name = "sparrow-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "Thin composition root: wires connectors to sparrow-runtime without adding I/O deps to the kernel"
 
 [dependencies]

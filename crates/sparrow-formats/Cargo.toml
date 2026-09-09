@@ -3,7 +3,6 @@ name = "sparrow-formats"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "Sparrow codecs: bounded JSON decode/encode and schema validation"
 
 [dependencies]

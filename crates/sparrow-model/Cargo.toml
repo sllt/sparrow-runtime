@@ -3,7 +3,6 @@ name = "sparrow-model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "Sparrow shared IDs, types, errors, delivery/resource vocabulary, and provisional RowBatch"
 
 [dependencies]

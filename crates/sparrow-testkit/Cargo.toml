@@ -3,7 +3,6 @@ name = "sparrow-testkit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "Sparrow fixtures, virtual clock, capture sink, and demos"
 
 [dependencies]
