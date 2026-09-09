@@ -122,8 +122,14 @@ fn try_decode_frame(buf: &mut Vec<u8>) -> Result<Option<Packet>> {
     Ok(Some(pkt))
 }
 
-pub async fn read_packet(stream: &mut MqttStream) -> Result<Packet> {
-    let mut reader = MqttFramedReader::new();
+/// Read the next packet using a **persistent** framed reader.
+///
+/// Creating a new `MqttFramedReader` per call drops bytes already pulled from
+/// the socket when TCP coalesces multiple MQTT packets (R19).
+pub async fn read_packet(
+    reader: &mut MqttFramedReader,
+    stream: &mut MqttStream,
+) -> Result<Packet> {
     reader.next(stream).await
 }
 

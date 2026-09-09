@@ -37,6 +37,7 @@ echo "== connectors: MQTT half-frame / silent CONNACK; HTTP push; redirect =="
 cargo test -p sparrow-connectors \
   r19_stop_completes_when_broker_silent_after_accept \
   r19_half_frame_survives_ping_select \
+  r19_coalesced_publishes_are_not_dropped \
   r20_full_queue_is_not_2xx \
   r21_method_and_path_enforced \
   r21_slow_conn_times_out \
