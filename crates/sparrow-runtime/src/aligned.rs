@@ -45,7 +45,9 @@ impl AlignedSession {
     }
 
     fn layout_for(operator: OperatorId, spec: &WindowSpec, table: Option<&TableRevisionBind>) -> PlanLayout {
-        let mut layout = PlanLayout::from_window(operator, StateSlotId::new(1), spec);
+        // R12: from_window now fingerprints size/slide and agg inputs.
+        // R12: where_fingerprint is set (0 when no WHERE is attached).
+        let mut layout = PlanLayout::from_window(operator, StateSlotId::new(1), spec).with_where(None);
         if let Some(t) = table {
             layout = layout.with_table(&t.name, t.version);
         }
@@ -191,15 +193,24 @@ impl AlignedSession {
     }
 
     fn operator_wm_in(&self) -> Option<i64> {
-        self.operator.freeze().wm_in
+        self.operator.wm_in()
     }
 
     fn operator_wm_out(&self) -> Option<i64> {
-        self.operator.freeze().wm_out
+        self.operator.wm_out()
     }
 
     fn input_schema(&self) -> Schema {
         self.operator.input_schema().clone()
+    }
+
+    /// Flush a sink (or durable outbox) then take the barrier (R11).
+    pub fn checkpoint_barrier_after_flush<F>(&mut self, mut flush: F) -> Result<u64>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        flush()?;
+        self.checkpoint_barrier()
     }
 
     /// Barrier: coordinator begin → freeze + chunk write + manifest commit.
@@ -218,13 +229,20 @@ impl AlignedSession {
             layout: self.layout.clone(),
             table: self.table.clone(),
         };
-        let payload_len = snap.encode()?.len() as u64;
+        let encoded = match snap.encode() {
+            Ok(b) => b,
+            Err(e) => {
+                self.coordinator.abort_now("encode failed");
+                self.metrics.record_checkpoint_abort();
+                return Err(e);
+            }
+        };
+        let payload_len = encoded.len() as u64;
         match self.store.commit(&snap) {
             Ok(id) => {
-                if let Err(e) = self.coordinator.complete() {
-                    self.metrics.record_checkpoint_abort();
-                    return Err(e);
-                }
+                // CURRENT published — must not report aborted (R13).
+                self.coordinator.force_committed();
+                let _ = self.coordinator.complete();
                 self.next_checkpoint = id.saturating_add(1);
                 self.metrics.record_checkpoint(started.elapsed(), payload_len);
                 eprintln!(
@@ -674,5 +692,69 @@ mod tests {
         assert_eq!(r.values[1], Scalar::Int64(10));
         let e = decode_sensor_line(br#"{"device_id":"d1","temperature":80.0,"ts":1000}"#).unwrap();
         assert_eq!(e.values[1], Scalar::Float64(80.0));
+    }
+
+    #[test]
+    fn r11_checkpoint_runs_flush_before_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "sparrow-r11-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = CheckpointStore::open(&dir).unwrap();
+        let owned = lines();
+        let text: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let src = MemoryReplaySource::from_lines("demo", &text);
+        let mut session = AlignedSession::open(
+            store,
+            count_spec(),
+            count_schema(),
+            OperatorId::new(1),
+            ResourceBudget::compact(),
+            src.position(),
+        )
+        .unwrap();
+        let mut flushed = false;
+        session
+            .checkpoint_barrier_after_flush(|| {
+                flushed = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(flushed, "sink flush must run before the source cut is committed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v03_wm_getters_do_not_require_freeze() {
+        let dir = std::env::temp_dir().join(format!(
+            "sparrow-v03-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = CheckpointStore::open(&dir).unwrap();
+        let owned = lines();
+        let text: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let src = MemoryReplaySource::from_lines("demo", &text);
+        let session = AlignedSession::open(
+            store,
+            count_spec(),
+            count_schema(),
+            OperatorId::new(1),
+            ResourceBudget::compact(),
+            src.position(),
+        )
+        .unwrap();
+        let _ = session.operator.wm_in();
+        let _ = session.operator.wm_out();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

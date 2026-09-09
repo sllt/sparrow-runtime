@@ -72,17 +72,23 @@ impl CheckpointCoordinator {
     }
 
     /// Leave Checkpointing after a successful commit.
+    ///
+    /// R13: if CURRENT is already published, this must not report aborted
+    /// even if stop/timeout raced during the publish.
     pub fn complete(&mut self) -> Result<CheckpointPhase> {
-        self.arbitrate()?;
-        if self.phase != CheckpointPhase::Checkpointing {
-            return Err(SparrowError::new(
-                ErrorCode::Internal,
-                format!("complete() in phase {:?}", self.phase),
-            ));
+        if self.phase == CheckpointPhase::Committed {
+            return Ok(self.phase);
         }
         self.phase = CheckpointPhase::Committed;
         self.started = None;
+        self.abort.store(false, Ordering::SeqCst);
         Ok(self.phase)
+    }
+
+    /// Mark published without re-entering abort arbitration.
+    pub fn force_committed(&mut self) {
+        self.phase = CheckpointPhase::Committed;
+        self.started = None;
     }
 
     /// Leave Checkpointing without committing (caller already failed or aborted).
@@ -173,6 +179,15 @@ mod tests {
     fn complete_returns_to_committed() {
         let mut c = CheckpointCoordinator::with_default_timeout();
         c.begin().unwrap();
+        c.complete().unwrap();
+        assert_eq!(c.phase(), CheckpointPhase::Committed);
+    }
+
+    #[test]
+    fn r13_complete_after_stop_still_committed_if_published() {
+        let mut c = CheckpointCoordinator::with_default_timeout();
+        c.begin().unwrap();
+        c.request_stop();
         c.complete().unwrap();
         assert_eq!(c.phase(), CheckpointPhase::Committed);
     }

@@ -2,8 +2,8 @@
 //! Focus: ReplayableSource (file) vs MQTT unsupported, and Sink flush.
 
 use sparrow_connectors::{
-    refuse_durable_recovery, refuse_unsupported_recovery, ConnectorCapabilities, FileReplayConfig,
-    FileReplaySource, LogSink, LogSinkConfig, MqttSourceConfig, ReplaySupport,
+    refuse_durable_recovery, refuse_unsupported_recovery, ConnectorCapabilities, FileContract,
+    FileReplayConfig, FileReplaySource, LogSink, LogSinkConfig, MqttSourceConfig, ReplaySupport,
 };
 use sparrow_io::{RecordSink, RecordSource, ReplayableSource};
 use sparrow_model::{
@@ -66,6 +66,7 @@ fn file_source_declares_replayable_and_seeks() {
             snapshot_id: "1".into(),
         },
         recovery: RecoveryPolicy::Aligned,
+        contract: FileContract::Immutable,
     };
     cfg.validate().unwrap();
     let mut src = FileReplaySource::open(&cfg).unwrap();

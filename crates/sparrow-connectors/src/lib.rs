@@ -21,7 +21,7 @@ pub use capabilities::{
     refuse_delivery_name, refuse_durable_recovery, refuse_qos_durable, refuse_unsupported_recovery,
     ConnectorCapabilities, ReplaySupport,
 };
-pub use file_replay::{FileReplayConfig, FileReplaySource};
+pub use file_replay::{FileContract, FileReplayConfig, FileReplaySource};
 pub use diag::{IoDiagnostics, IoSnapshot};
 pub use error::{ConnectorError, Result};
 pub use http::{HttpCapture, HttpSink, HttpSinkConfig};
