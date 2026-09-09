@@ -1,23 +1,22 @@
 # Sparrow
 
-Single-node **IoT/Edge streaming dataflow runtime**, V0.3.
+Single-node **IoT/Edge streaming dataflow runtime**, V0.4.
 
 Sparrow is dataflow-first: SQL and Graph share one typed IR. It is **not** a
 distributed Flink clone and **not** a Rust eKuiper clone.
 
-**Delivery is `live_best_effort` + `restart_fresh` (`recovery=none`).**
+**Default delivery is `live_best_effort` + `restart_fresh` (`recovery=none`).**
 
 - Event-time tumbling + hopping windows, watermarks, holdback, late side output
 - Processing-time tumbling windows and count windows (arrival-order; they do **not** impersonate event-time)
 - Incremental COUNT/SUM/AVG/MIN/MAX (checked integer overflow)
-- Versioned as-of-event-time lookup (beyond V0.2 static freeze)
-- No checkpoint recovery (V0.4+)
-- MQTT replay is **unsupported**
-- A process restart is a **fresh attempt**, not restore
-- Window results are **not** crash-identical
+- Versioned as-of-event-time lookup
+- **Experimental** aligned single-job checkpoint (`experimental_aligned`) for a Replayable **File** source only — **not** default exactly-once, **not** production-ready
+- MQTT replay is **unsupported**; MQTT cannot pretend durable restore
+- A default process restart is a **fresh attempt**, not restore
 - Exactly-once / at-least-once configs are **rejected**
 
-当前里程碑 / current milestone: **V0.3**（event-time + watermark + holdback + hop + versioned lookup）。
+当前里程碑 / current milestone: **V0.4**（experimental recovery + Graph explain + connector SDK conformance）。
 
 ## Quick start
 
@@ -43,10 +42,24 @@ curl -s -H "Authorization: Bearer $SPARROW_TOKEN" \
 `POST /start` commits **desired** state immediately. The supervisor starts
 MQTT/HTTP afterwards. That is not crash recovery.
 
+Graph validate / explain (offline-friendly; catalog may be embedded):
+
+```bash
+curl -s -H "Authorization: Bearer $SPARROW_TOKEN" \
+  -X POST http://127.0.0.1:43180/v1/graphs/explain \
+  --data-binary @graph.json
+```
+
 ## Build & test
 
 ```bash
 cargo test --workspace
+
+# V0.4 process demos (file checkpoint kill/restore, MQTT reject, Graph explain)
+bash scripts/v04-demo.sh
+cargo run -p sparrow-cli --bin v04_file_checkpoint -- --data FILE --chk DIR --mode gold
+cargo run -p sparrow-cli --bin v04_mqtt_reject
+cargo run -p sparrow-cli --bin v04_graph_author -- explain graph.json
 
 # V0.1 API demo (starts a real sparrow-server, curl happy path + rejects + restart)
 bash scripts/m3-demo.sh
@@ -61,35 +74,30 @@ cargo run -p sparrow-testkit --example m0_pipeline_smoke
 
 # V0.2 process demos (virtual-clock windows, dedup, table, HTTP→MQTT)
 bash scripts/v02-demo.sh
-cargo run -p sparrow-cli --bin v02_pt_tumble_avg
-cargo run -p sparrow-cli --bin v02_count_window
-cargo run -p sparrow-cli --bin v02_bounded_dedup
-cargo run -p sparrow-cli --bin v02_static_table
-cargo run -p sparrow-cli --bin v02_http_mqtt_loop
 
 # V0.3 process demos (injected event times — not wall clock)
 bash scripts/v03-demo.sh
-cargo run -p sparrow-cli --bin v03_et_tumble_avg
-cargo run -p sparrow-cli --bin v03_hop_overlap
-cargo run -p sparrow-cli --bin v03_idle_active
-cargo run -p sparrow-cli --bin v03_versioned_lookup
 
 bash scripts/test.sh
 ```
 
-## V0.3 (honest)
+## V0.4 (honest)
 
-Shipped: event-time binding, per-input watermarks (idle/active, no
-backward WM), final-only lateness with output holdback
-(`wm_out ≤ wm_in - L`), ET tumble + hopping (planner overlap cap),
-versioned as-of-event-time lookup, SQL/Graph for that subset.
+Shipped: File/replay test Source (message-boundary cuts, identity/rotation),
+**experimental** aligned single-job checkpoint (barrier, freeze+chunk write,
+manifest commit, recover from committed only, crash-cut tests), Graph
+validate/explain (physical / fusion / time / state / guarantee) plus a
+minimal offline authoring CLI, Connector SDK conformance
+(ReplayableSource / Sink flush), capability matrix rejects.
 
-**Not shipped:** checkpoint restore, session late merge, retract,
-stream-stream join, exactly-once, NATS, WASM, Graph Designer UI.
-Graph/SQL remain single-source; multi-input WM is the `WatermarkHub` API
-(`v03_idle_active`). Count / PT windows cannot silently use event-time.
+**Experimental — not production-ready:** checkpoint durability, exactly-once,
+MQTT restore, unaligned/multi-job barriers, incremental checkpoints.
 
-See `docs/v03-report.md`.
+**Not shipped:** WASM operator runtime (optional spike under
+`experiments/wasm-spike/`, off default build), Graph Designer UI, session
+late merge, retract, stream-stream join, NATS.
+
+See `docs/v04-report.md`.
 
 `sqlparser = "=0.62.0"` is used only by `sparrow-sql`.
 `sparrow-runtime` does **not** depend on HTTP, SQLite, MQTT, Axum, Arrow, or SQL crates.
@@ -112,37 +120,38 @@ Flags: `--bind` `--token` `--catalog` `--safe-mode` `--demo-io` `--allow-remote`
 ```
 crates/sparrow-model        IDs, types, errors, RowBatch, MemoryLease, WorkBudget
 crates/sparrow-expr         expression IR, eval, numeric stride kernels
-crates/sparrow-plan         GraphSpec, catalog, BoundLogical, physical fusion
+crates/sparrow-plan         GraphSpec, catalog, BoundLogical, physical fusion, explain
 crates/sparrow-sql          G0 gate + SQL → same BoundLogicalPlan
-crates/sparrow-io           I/O contracts (no connectors)
+crates/sparrow-io           I/O contracts + ReplayableSource
 crates/sparrow-formats      bounded JSON codec
-crates/sparrow-connectors   MQTT source/sink, HTTP push + HTTP/Log sinks
-crates/sparrow-runtime      Kernel, MemoryState, watermarks, windows (no MQTT/HTTP/SQLite/Axum)
+crates/sparrow-connectors   MQTT source/sink, HTTP, File/replay source
+crates/sparrow-runtime      Kernel, MemoryState, windows, experimental checkpoint
 crates/sparrow-control      SQLite catalog + desired→actual supervisor
 crates/sparrow-server       authenticated /v1 API + sparrow-server binary
-crates/sparrow-cli          M2 composition-root demo
+crates/sparrow-cli          composition-root demos
 crates/sparrow-testkit      fixtures, virtual clock, M0/M1 demos
-experiments/               G1a only
-docs/                      architecture, ADRs, M0–M3 reports
+experiments/               G1a + optional WASM spike (not a workspace member)
+docs/                      architecture, ADRs, milestone reports
 ```
 
 ## Invariants
 
 - All buffers bounded (bytes + rows + work budget + mailbox items/bytes + keys + timers)
-- V0.3 delivery: `live_best_effort` + `restart_fresh` (`recovery=none` for PT/ET windows)
+- V0.4 default delivery: `live_best_effort` + `restart_fresh` (`recovery=none` for PT/ET windows)
+- `experimental_aligned` is opt-in, File/replay only, **not** exactly-once
 - MQTT replay is **unsupported**; durable recovery configs are rejected
 - Job-level failure attribution in-process; stop joins every chain task
 - One engine; Compact / Performance are budgets
 - `RowBatch` is the V0.1 default (ADR-003)
 - Control plane and connectors stay **outside** `sparrow-runtime`
 
-## Non-goals (V0.3)
+## Non-goals (V0.4)
 
-Graph Designer UI, WASM, distributed execution, exactly-once, checkpoint
-restore, session late merge, retract, stream-stream join, NATS,
-multi-user RBAC, claimed SLOs.
+Graph Designer UI product, production checkpoint, WASM operator runtime,
+distributed execution, exactly-once, session late merge, retract,
+stream-stream join, NATS, multi-user RBAC, claimed SLOs.
 
-See `docs/v03-report.md` and `docs/v02-report.md`.
+See `docs/v04-report.md`.
 
 Repository: https://github.com/sllt/sparrow-runtime
 

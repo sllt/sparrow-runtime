@@ -9,6 +9,7 @@ description = "Thin composition root: wires connectors to sparrow-runtime withou
 sparrow-model = { path = "../sparrow-model" }
 sparrow-expr = { path = "../sparrow-expr" }
 sparrow-plan = { path = "../sparrow-plan" }
+sparrow-io = { path = "../sparrow-io" }
 sparrow-runtime = { path = "../sparrow-runtime" }
 sparrow-formats = { path = "../sparrow-formats" }
 sparrow-connectors = { path = "../sparrow-connectors" }
@@ -55,3 +56,15 @@ path = "src/bin/v03_idle_active.rs"
 [[bin]]
 name = "v03_versioned_lookup"
 path = "src/bin/v03_versioned_lookup.rs"
+
+[[bin]]
+name = "v04_file_checkpoint"
+path = "src/bin/v04_file_checkpoint.rs"
+
+[[bin]]
+name = "v04_mqtt_reject"
+path = "src/bin/v04_mqtt_reject.rs"
+
+[[bin]]
+name = "v04_graph_author"
+path = "src/bin/v04_graph_author.rs"

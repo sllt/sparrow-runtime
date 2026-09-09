@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use sparrow_connectors::{
     refuse_delivery_name, refuse_durable_recovery, refuse_qos_durable, ConnectorCapabilities,
-    HttpPushSourceConfig, HttpSinkConfig, MqttSinkConfig, MqttSourceConfig, ReplaySupport,
-    SecretResolver, TargetPolicy, TlsConfig,
+    FileReplayConfig, HttpPushSourceConfig, HttpSinkConfig, MqttSinkConfig, MqttSourceConfig,
+    ReplaySupport, SecretResolver, TargetPolicy, TlsConfig,
 };
 use sparrow_model::{
     DeliveryGuarantee, ErrorCode, PipelineId, RecoveryPolicy, RestoreClaim, Result, RevisionId,
     Schema, SchemaId, SparrowError,
 };
 use sparrow_plan::catalog::schema_from_fields;
-use sparrow_plan::{bind_graph, physicalize, Catalog, PhysicalPlan, PhysicalStage, PlanOptions};
+use sparrow_plan::{bind_graph, physicalize, Catalog, PhysicalPlan, PlanOptions};
 use sparrow_sql::bind_sql;
 
 use crate::spec::{PipelineSpec, SinkSpec, SourceSpec, StreamSpec};
@@ -34,16 +34,25 @@ pub struct ExplainReport {
     pub recovery: &'static str,
     pub replay: &'static str,
     pub honesty: &'static str,
+    pub physical: Vec<String>,
+    pub fusion: String,
+    pub time: String,
+    pub state: String,
+    pub guarantee: String,
+    pub experimental: bool,
 }
 
 pub const HONESTY: &str =
-    "V0.2 is live_best_effort + restart_fresh (recovery=none). Processing-time windows are not crash-identical. MQTT replay, checkpoint restore, event-time, and exactly-once are unsupported.";
+    "V0.4 default is live_best_effort + restart_fresh (recovery=none). experimental_aligned is an opt-in single-job checkpoint (not exactly-once). MQTT replay remains unsupported; MQTT cannot pretend durable restore.";
 
 pub fn honesty_json() -> serde_json::Value {
     serde_json::json!({
         "delivery": DeliveryGuarantee::LiveBestEffort.as_str(),
         "recovery": RecoveryPolicy::RestartFresh.as_str(),
-        "replay": ReplaySupport::Unsupported.as_str(),
+        "recovery_experimental": RecoveryPolicy::ExperimentalAligned.as_str(),
+        "replay_mqtt": ReplaySupport::Unsupported.as_str(),
+        "replay_file": ReplaySupport::Replayable.as_str(),
+        "exactly_once": "rejected",
         "honesty": HONESTY,
     })
 }
@@ -87,37 +96,22 @@ pub fn bind_plan(spec: &PipelineSpec, catalog: &Catalog, name: &str, revision: u
 }
 
 pub fn explain_plan(plan: &PhysicalPlan) -> ExplainReport {
-    let stages = plan
-        .stages
-        .iter()
-        .map(|s| match s {
-            PhysicalStage::MemorySource { name, .. } => format!("source:{name}"),
-            PhysicalStage::Transform { steps } => {
-                let kinds: Vec<&str> = steps
-                    .iter()
-                    .map(|st| match st {
-                        sparrow_plan::TransformStep::Filter { .. } => "filter",
-                        sparrow_plan::TransformStep::Project { .. } => "project",
-                        sparrow_plan::TransformStep::Map { .. } => "map",
-                    })
-                    .collect();
-                format!("transform:{}", kinds.join("+"))
-            }
-            PhysicalStage::CaptureSink { name, .. } => format!("sink:{name}"),
-            PhysicalStage::WindowAgg { spec, .. } => format!("window:{:?}", spec.kind),
-            PhysicalStage::Deduplicate { .. } => "dedup".into(),
-            PhysicalStage::Lookup { spec, .. } => format!("lookup:{}", spec.table),
-        })
-        .collect();
+    let g = sparrow_plan::GraphExplain::from_plan(plan);
     ExplainReport {
-        accepted: true,
-        stages,
-        fused: plan.fused(),
-        mailbox_count: plan.mailbox_count(),
-        delivery: DeliveryGuarantee::LiveBestEffort.as_str(),
-        recovery: plan.recovery_label(),
-        replay: ReplaySupport::Unsupported.as_str(),
-        honesty: plan.honesty(),
+        accepted: g.accepted,
+        stages: g.stages,
+        fused: g.fused,
+        mailbox_count: g.mailbox_count,
+        delivery: g.delivery,
+        recovery: g.recovery,
+        replay: g.replay,
+        honesty: g.honesty,
+        physical: g.physical,
+        fusion: g.fusion,
+        time: g.time,
+        state: g.state,
+        guarantee: g.guarantee,
+        experimental: g.experimental,
     }
 }
 
@@ -173,20 +167,34 @@ pub fn validate_io(
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
     spec.check_delivery()?;
-    refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
     match spec.source.kind.as_str() {
         "mqtt" => {
+            refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
             let mqtt = mqtt_config(&spec.source, schema.clone(), demo)?;
             mqtt.validate(secrets, policy).map_err(io)?;
         }
         "http_push" => {
+            refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
             let push = http_push_config(&spec.source, schema.clone())?;
             push.validate(secrets, policy).map_err(io)?;
+        }
+        "file" | "file_replay" | "replay" => {
+            let path = spec.source.path.clone().ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "file source requires source.path",
+                )
+            })?;
+            let recovery = RecoveryPolicy::parse(&spec.recovery)?;
+            let mut cfg = FileReplayConfig::new(path, schema.clone());
+            cfg.restore = spec.restore_claim()?;
+            cfg.recovery = recovery;
+            cfg.validate().map_err(io)?;
         }
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("source kind `{other}` is not supported in V0.2 (mqtt|http_push)"),
+                format!("source kind `{other}` is not supported (mqtt|http_push|file)"),
             ));
         }
     }
@@ -339,10 +347,13 @@ pub fn capabilities_json() -> serde_json::Value {
     let http = ConnectorCapabilities::HTTP_SINK;
     let push = ConnectorCapabilities::HTTP_PUSH;
     let mqtt_sink = ConnectorCapabilities::MQTT_SINK;
+    let file = ConnectorCapabilities::FILE_REPLAY;
     serde_json::json!({
         "delivery": DeliveryGuarantee::LiveBestEffort.as_str(),
         "recovery": RecoveryPolicy::RestartFresh.as_str(),
         "recovery_pt_window": RecoveryPolicy::RestartFresh.none_label(),
+        "recovery_experimental": RecoveryPolicy::ExperimentalAligned.as_str(),
+        "exactly_once": "rejected",
         "connectors": [
             {
                 "kind": mqtt.kind,
@@ -367,6 +378,13 @@ pub fn capabilities_json() -> serde_json::Value {
                 "replay": mqtt_sink.replay.as_str(),
                 "delivery": mqtt_sink.delivery.as_str(),
                 "recovery": mqtt_sink.recovery.as_str(),
+            },
+            {
+                "kind": file.kind,
+                "replay": file.replay.as_str(),
+                "delivery": file.delivery.as_str(),
+                "recovery": file.recovery.as_str(),
+                "experimental": true,
             }
         ],
         "honesty": HONESTY,
@@ -454,5 +472,14 @@ mod tests {
             spec.check_delivery().unwrap_err().code,
             ErrorCode::UnsupportedRestore
         );
+        spec.recovery = "experimental_aligned".into();
+        assert_eq!(
+            spec.check_delivery().unwrap_err().code,
+            ErrorCode::UnsupportedRestore,
+            "MQTT + experimental checkpoint must still reject"
+        );
+        spec.source.kind = "file".into();
+        spec.source.path = Some("/tmp/events.ndjson".into());
+        assert!(spec.check_delivery().is_ok());
     }
 }

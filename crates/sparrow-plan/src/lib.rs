@@ -10,6 +10,7 @@ use sparrow_model::{OperatorId, PipelineId, RevisionId, Schema};
 pub mod bind;
 pub mod bound;
 pub mod catalog;
+pub mod explain;
 pub mod expr_spec;
 pub mod graph;
 pub mod physical;
@@ -20,6 +21,9 @@ pub use bind::{
 };
 pub use bound::{BoundKind, BoundLogicalPlan, BoundNode};
 pub use catalog::Catalog;
+pub use explain::{
+    et_tumble_template, explain_bound, explain_graph, validate_graph, GraphExplain,
+};
 pub use graph::{GraphSpec, GRAPH_SPEC_VERSION};
 pub use physical::{physicalize, PhysicalPlan, PhysicalStage, PlanOptions, TransformStep};
 pub use stateful::{

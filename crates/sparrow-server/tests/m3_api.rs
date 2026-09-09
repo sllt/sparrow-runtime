@@ -133,6 +133,33 @@ fn restore_and_at_least_once_rejected() {
         assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["error"]["code"], "unsupported_restore");
         assert_eq!(body["recovery"], "restart_fresh");
+
+        let mut bad = spec();
+        bad["recovery"] = json!("experimental_aligned");
+        bad["restore"] = json!({"kind":"checkpoint","snapshot_id":"snap-1"});
+        let (st, body) = call(&state, auth_post("/v1/validate", bad.to_string())).await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "unsupported_restore");
+    });
+}
+
+#[test]
+fn graph_explain_v03_et_window() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let graph = sparrow_plan::et_tumble_template();
+        let (st, body) = call(&state, auth_post("/v1/graphs/validate", graph)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["accepted"], true);
+        let (st, body) = call(&state, auth_post("/v1/graphs/explain", graph)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body["time"].as_str().unwrap().contains("event-time"));
+        assert!(body["state"].as_str().unwrap().contains("window_agg"));
+        assert!(body["guarantee"].as_str().unwrap().contains("live_best_effort"));
+        assert!(body["physical"].as_array().unwrap().iter().any(|s| {
+            s.as_str().unwrap().contains("window")
+        }));
     });
 }
 

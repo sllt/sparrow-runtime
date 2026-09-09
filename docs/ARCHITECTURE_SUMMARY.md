@@ -1,4 +1,4 @@
-# Sparrow architecture summary (V0.3)
+# Sparrow architecture summary (V0.4)
 
 Sparrow is a **single-node IoT/Edge streaming dataflow runtime**. It is not a
 distributed Flink clone and not a Rust eKuiper clone.
@@ -10,9 +10,10 @@ distributed Flink clone and not a Rust eKuiper clone.
    are that shared surface (thin in M0).
 2. **All buffers are bounded** in bytes, rows, and a work budget. Compact and
    Performance are *budget profiles*, not two engines.
-3. **Delivery is explicit.** V0.1 is `live_best_effort` + `restart_fresh`.
-   Exactly-once, MQTT session resume, and checkpoint restore are rejected at
-   the contract boundary (`RestoreClaim::validate`).
+3. **Delivery is explicit.** Default is `live_best_effort` + `restart_fresh`.
+   Exactly-once and MQTT session resume are rejected. V0.4 adds
+   **experimental** aligned checkpoint (`experimental_aligned`) for
+   ReplayableSource only; it is not default exactly-once.
 4. **Failure attribution is in-process** (pipeline / job attempt / operator).
    There is no process isolation in V0.1.
 5. **The runtime must not depend on HTTP, SQLite, MQTT, or SQL crates.**
@@ -35,7 +36,7 @@ distributed Flink clone and not a Rust eKuiper clone.
 | `sparrow-server` | Bearer-token `/v1` API; `sparrow-server` binary |
 | `sparrow-cli` | M2 composition-root demo |
 | `sparrow-testkit` | Fixtures, virtual clock, M0/M1 demos |
-| `experiments/*` | G1a only |
+| `experiments/*` | G1a + optional WASM spike (not a workspace member) |
 
 ## Memory model
 
@@ -96,8 +97,19 @@ idle/active, and never go backward. Output holdback is
 output). Hopping overlap is planner-capped. Versioned lookup is
 as-of-event-time. Graph/SQL stay single-source.
 
-## Out of scope after V0.3
+## V0.4 (experimental recovery + Graph explain)
 
-Graph Designer UI, WASM, checkpoint restore, distributed fan-in/fan-out,
-exactly-once, session late merge, retract, stream-stream join, NATS,
-claimed performance SLOs. Do not put those deps in `sparrow-runtime`.
+Aligned single-job checkpoint lives in `sparrow-runtime`
+(`checkpoint.rs`, `aligned.rs`): barrier between records, freeze, chunk
+write, ACK, manifest commit, recover from CURRENT+MANIFEST only.
+File/replay source lives in `sparrow-connectors` (`replay=replayable`).
+MQTT remains `replay=unsupported`. Graph validate/explain covers
+physical, fusion, time, state, and guarantee. WASM is an optional
+off-build spike.
+
+## Out of scope after V0.4
+
+Graph Designer UI product, production (non-experimental) checkpoint,
+WASM operator runtime, distributed fan-in/fan-out, exactly-once, session
+late merge, retract, stream-stream join, NATS, claimed performance SLOs.
+Do not put MQTT/HTTP/SQLite/Axum deps in `sparrow-runtime`.

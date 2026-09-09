@@ -140,7 +140,7 @@ impl PhysicalPlan {
         } else if self.has_processing_time_window() {
             DeliveryContract::PT_WINDOW_HONESTY
         } else {
-            "V0.3 is live_best_effort + restart_fresh. Checkpoint restore and exactly-once are rejected."
+            "V0.4 default is live_best_effort + restart_fresh. Experimental aligned checkpoint is opt-in (not exactly-once). MQTT without replay cannot pretend durable restore."
         }
     }
 }

@@ -128,6 +128,10 @@ impl WindowOperator {
         &self.output
     }
 
+    pub fn input_schema(&self) -> &Schema {
+        &self.input
+    }
+
     pub fn honesty() -> &'static str {
         DeliveryContract::ET_WINDOW_HONESTY
     }
@@ -523,6 +527,147 @@ impl WindowOperator {
             WindowStore::Count(s) => s.clear(),
         }
         self.timers.cancel_all();
+    }
+
+    /// Freeze open keyed state for an experimental aligned checkpoint.
+    pub fn freeze(&self) -> WindowFreeze {
+        let mut entries = Vec::new();
+        let kind = match &self.store {
+            WindowStore::Tumble(store) => {
+                for (k, e) in store.iter() {
+                    entries.push(FrozenEntry {
+                        key: k.key.clone(),
+                        window_start: e.window_start,
+                        window_end: e.window_end,
+                        count: 0,
+                        accs: e.accs.clone(),
+                    });
+                }
+                0u8
+            }
+            WindowStore::Count(store) => {
+                for (k, e) in store.iter() {
+                    entries.push(FrozenEntry {
+                        key: k.key.clone(),
+                        window_start: 0,
+                        window_end: 0,
+                        count: e.count,
+                        accs: e.accs.clone(),
+                    });
+                }
+                1u8
+            }
+        };
+        entries.sort_by(|a, b| a.key_bytes().cmp(&b.key_bytes()));
+        WindowFreeze {
+            operator: self.operator,
+            kind,
+            entries,
+            wm_in: self.wm_in(),
+            wm_out: self.wm_out(),
+            last_effective: self.hub.last_effective(),
+        }
+    }
+
+    /// Replace in-memory state from a committed freeze (experimental).
+    pub fn restore_freeze(&mut self, freeze: &WindowFreeze) -> Result<()> {
+        if freeze.operator != self.operator {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "checkpoint operator id does not match this window",
+            ));
+        }
+        self.cleanup();
+        match (&mut self.store, freeze.kind) {
+            (WindowStore::Tumble(store), 0) => {
+                for e in &freeze.entries {
+                    let sk = StateKey::new(self.operator, StateSlotId::new(SLOT), e.key.clone());
+                    let bytes: usize = e.accs.iter().map(Accumulator::tracked_bytes).sum();
+                    store.put(
+                        sk,
+                        TumbleEntry {
+                            window_start: e.window_start,
+                            window_end: e.window_end,
+                            accs: e.accs.clone(),
+                        },
+                        bytes,
+                    )?;
+                }
+            }
+            (WindowStore::Count(store), 1) => {
+                for e in &freeze.entries {
+                    let sk = StateKey::new(self.operator, StateSlotId::new(SLOT), e.key.clone());
+                    let bytes: usize = e.accs.iter().map(Accumulator::tracked_bytes).sum();
+                    store.put(
+                        sk,
+                        CountEntry {
+                            count: e.count,
+                            accs: e.accs.clone(),
+                        },
+                        bytes,
+                    )?;
+                }
+            }
+            _ => {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "checkpoint window kind does not match this operator",
+                ));
+            }
+        }
+        if let Some(h) = self.holdback.as_mut() {
+            h.restore(freeze.wm_in, freeze.wm_out);
+        }
+        self.hub.restore_effective(freeze.last_effective);
+        Ok(())
+    }
+
+    /// Stable fingerprint of open state (demo / tests).
+    pub fn state_fingerprint(&self) -> String {
+        let f = self.freeze();
+        format!(
+            "keys={} kind={} wm_in={:?} wm_out={:?} accs={}",
+            f.entries.len(),
+            f.kind,
+            f.wm_in,
+            f.wm_out,
+            f.entries
+                .iter()
+                .map(|e| e.accs.iter().map(|a| format!("{:?}", a.finish())).collect::<Vec<_>>().join("+"))
+                .collect::<Vec<_>>()
+                .join(";")
+        )
+    }
+}
+
+/// Frozen window operator state (experimental checkpoint payload).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowFreeze {
+    pub operator: OperatorId,
+    pub kind: u8,
+    pub entries: Vec<FrozenEntry>,
+    pub wm_in: Option<i64>,
+    pub wm_out: Option<i64>,
+    pub last_effective: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrozenEntry {
+    pub key: Vec<Scalar>,
+    pub window_start: i64,
+    pub window_end: i64,
+    pub count: u64,
+    pub accs: Vec<Accumulator>,
+}
+
+impl FrozenEntry {
+    fn key_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        for s in &self.key {
+            s.encode_key(&mut b);
+            b.push(0xff);
+        }
+        b
     }
 }
 

@@ -1,11 +1,12 @@
 //! In-process streaming kernel.
 //!
-//! V0.3: event-time / watermark / holdback / hopping on top of V0.2
-//! MemoryState windows. Arrow, Axum, SQLite, MQTT, and `sqlparser`
-//! stay out of this crate.
+//! V0.4: experimental aligned checkpoint on top of V0.3 event-time.
+//! Arrow, Axum, SQLite, MQTT, and `sqlparser` stay out of this crate.
 
 pub mod aggregate;
+pub mod aligned;
 pub mod capture;
+pub mod checkpoint;
 pub mod clock;
 pub mod dedup;
 pub mod kernel;
@@ -18,7 +19,9 @@ pub mod transform;
 pub mod watermark;
 pub mod window;
 
+pub use aligned::{run_until, AlignedSession};
 pub use capture::{SharedCapture, StallGate};
+pub use checkpoint::{CheckpointSnapshot, CheckpointStore, FaultHook, FaultPoint};
 pub use clock::RuntimeClock;
 pub use kernel::{JobHandle, JobRequest, JobStats, Kernel, KernelOptions};
 pub use linear::{drain, LinearExecutor, RuntimeConfig};
@@ -26,6 +29,7 @@ pub use lookup::{ReferenceTable, VersionedReferenceTable};
 pub use mailbox::{MailboxConfig, StreamControl};
 pub use state::{MemoryState, StateKey};
 pub use watermark::{OutputHoldback, WatermarkHub};
+pub use window::{FrozenEntry, WindowFreeze};
 
 #[cfg(test)]
 mod time_tests;

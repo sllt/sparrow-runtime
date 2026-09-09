@@ -122,6 +122,91 @@ impl Scalar {
         }
     }
 
+    /// Reversible value encoding used by experimental checkpoint snapshots.
+    /// Dynamic values are rejected (not a V0.4 state key type).
+    pub fn encode_value(&self, out: &mut Vec<u8>) -> crate::error::Result<()> {
+        use crate::error::{ErrorCode, SparrowError};
+        if matches!(self, Self::Dynamic(_)) {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "Dynamic scalars cannot be snapshotted in V0.4 experimental checkpoint",
+            ));
+        }
+        self.encode_key(out);
+        Ok(())
+    }
+
+    pub fn decode_value(src: &mut &[u8]) -> crate::error::Result<Self> {
+        use crate::error::{ErrorCode, SparrowError};
+        let take = |src: &mut &[u8], n: usize| -> crate::error::Result<Vec<u8>> {
+            if src.len() < n {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "truncated scalar in checkpoint snapshot",
+                ));
+            }
+            let (head, rest) = src.split_at(n);
+            *src = rest;
+            Ok(head.to_vec())
+        };
+        if src.is_empty() {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "empty scalar in checkpoint snapshot",
+            ));
+        }
+        let tag = src[0];
+        *src = &src[1..];
+        match tag {
+            0 => Ok(Self::Null),
+            1 => {
+                let b = take(src, 1)?;
+                Ok(Self::Bool(b[0] != 0))
+            }
+            2 => {
+                let b = take(src, 8)?;
+                Ok(Self::Int64(i64::from_le_bytes(b.try_into().unwrap())))
+            }
+            3 => {
+                let b = take(src, 8)?;
+                Ok(Self::UInt64(u64::from_le_bytes(b.try_into().unwrap())))
+            }
+            4 => {
+                let b = take(src, 8)?;
+                Ok(Self::Float64(f64::from_bits(u64::from_le_bytes(
+                    b.try_into().unwrap(),
+                ))))
+            }
+            5 => {
+                let n = u32::from_le_bytes(take(src, 4)?.try_into().unwrap()) as usize;
+                let bytes = take(src, n)?;
+                let s = std::str::from_utf8(&bytes).map_err(|_| {
+                    SparrowError::new(ErrorCode::CodecViolation, "utf8 scalar not valid UTF-8")
+                })?;
+                Ok(Self::utf8(s))
+            }
+            6 => {
+                let n = u32::from_le_bytes(take(src, 4)?.try_into().unwrap()) as usize;
+                let bytes = take(src, n)?;
+                Ok(Self::bytes(bytes))
+            }
+            7 => {
+                let b = take(src, 8)?;
+                Ok(Self::TimestampMicrosUTC(i64::from_le_bytes(
+                    b.try_into().unwrap(),
+                )))
+            }
+            8 => Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "Dynamic scalars cannot be restored from V0.4 experimental checkpoint",
+            )),
+            other => Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                format!("unknown scalar tag {other}"),
+            )),
+        }
+    }
+
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Self::Int64(v) => Some(*v as f64),
