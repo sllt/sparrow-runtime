@@ -113,19 +113,34 @@ impl PhysicalPlan {
         })
     }
 
+    pub fn has_event_time_window(&self) -> bool {
+        self.stages.iter().any(|s| {
+            matches!(s, PhysicalStage::WindowAgg { spec, .. } if spec.kind.uses_event_time())
+        })
+    }
+
+    pub fn event_time_binding(&self) -> Option<sparrow_model::EventTimeBinding> {
+        self.stages.iter().find_map(|s| match s {
+            PhysicalStage::WindowAgg { spec, .. } => spec.binding(),
+            _ => None,
+        })
+    }
+
     pub fn recovery_label(&self) -> &'static str {
-        if self.has_processing_time_window() {
-            DeliveryContract::V0_2.recovery.none_label()
+        if self.has_processing_time_window() || self.has_event_time_window() {
+            DeliveryContract::V0_3.recovery.none_label()
         } else {
-            DeliveryContract::V0_2.recovery.as_str()
+            DeliveryContract::V0_3.recovery.as_str()
         }
     }
 
     pub fn honesty(&self) -> &'static str {
-        if self.has_processing_time_window() {
+        if self.has_event_time_window() {
+            DeliveryContract::ET_WINDOW_HONESTY
+        } else if self.has_processing_time_window() {
             DeliveryContract::PT_WINDOW_HONESTY
         } else {
-            "V0.2 is live_best_effort + restart_fresh. Checkpoint restore and exactly-once are rejected."
+            "V0.3 is live_best_effort + restart_fresh. Checkpoint restore and exactly-once are rejected."
         }
     }
 }

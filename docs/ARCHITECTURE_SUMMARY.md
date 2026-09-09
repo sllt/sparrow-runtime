@@ -1,4 +1,4 @@
-# Sparrow architecture summary (V0.2)
+# Sparrow architecture summary (V0.3)
 
 Sparrow is a **single-node IoT/Edge streaming dataflow runtime**. It is not a
 distributed Flink clone and not a Rust eKuiper clone.
@@ -30,7 +30,7 @@ distributed Flink clone and not a Rust eKuiper clone.
 | `sparrow-io` | Decoder / Source / Sink *contracts* only |
 | `sparrow-formats` | Bounded JSON decode/encode, schema + bad-record policy |
 | `sparrow-connectors` | MQTT source/sink, HTTP push + HTTP/Log sinks, `SecretResolver`, `TargetPolicy` |
-| `sparrow-runtime` | `Kernel`: ExecutionChain, MemoryState, PT/count windows (no MQTT/HTTP/SQLite/Axum) |
+| `sparrow-runtime` | `Kernel`: ExecutionChain, MemoryState, PT/count/ET windows, watermarks (no MQTT/HTTP/SQLite/Axum) |
 | `sparrow-control` | SQLite catalog, desired vs actual, supervisor (no Axum) |
 | `sparrow-server` | Bearer-token `/v1` API; `sparrow-server` binary |
 | `sparrow-cli` | M2 composition-root demo |
@@ -88,8 +88,16 @@ and capped. PT windows are `recovery=none`: restart is empty, not restore.
 
 HTTP Push Source and MQTT Sink live in `sparrow-connectors` only.
 
-## Out of scope after V0.2
+## V0.3 (event time)
 
-Graph Designer UI, WASM, event-time / watermark, checkpoint, distributed
-fan-in/fan-out, exactly-once, claimed performance SLOs. Do not put those
-deps in `sparrow-runtime`.
+Event-time columns bind on the stream. Watermarks are per-input,
+idle/active, and never go backward. Output holdback is
+`wm_out ≤ wm_in - L` (final-only; late events after close go to a side
+output). Hopping overlap is planner-capped. Versioned lookup is
+as-of-event-time. Graph/SQL stay single-source.
+
+## Out of scope after V0.3
+
+Graph Designer UI, WASM, checkpoint restore, distributed fan-in/fan-out,
+exactly-once, session late merge, retract, stream-stream join, NATS,
+claimed performance SLOs. Do not put those deps in `sparrow-runtime`.

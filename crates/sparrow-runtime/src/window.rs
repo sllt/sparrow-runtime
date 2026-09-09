@@ -1,11 +1,12 @@
-//! Processing-time tumbling windows and count windows with incremental aggs.
+//! Processing-time, count, event-time tumble, and hopping windows.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use sparrow_expr::eval;
 use sparrow_model::{
-    CreditKind, DeliveryContract, ErrorCode, Field, FieldId, MemoryOwner, OperatorId, Result, Row,
-    RowBatch, RowBatchBuilder, Scalar, Schema, SchemaId, SparrowError, StateSlotId, WindowKind,
+    CreditKind, DeliveryContract, ErrorCode, InputId, MemoryOwner, OperatorId, Result, Row,
+    RowBatch, RowBatchBuilder, Scalar, Schema, SparrowError, StateSlotId, WindowKind,
 };
 use sparrow_plan::WindowSpec;
 
@@ -13,8 +14,21 @@ use crate::aggregate::Accumulator;
 use crate::clock::RuntimeClock;
 use crate::state::{MemoryState, StateKey};
 use crate::timer::{BoundedTimers, TimerId};
+use crate::watermark::{OutputHoldback, WatermarkHub};
 
 const SLOT: u16 = 1;
+
+#[derive(Clone, Debug, Default)]
+pub struct WindowEmission {
+    pub finals: Vec<Row>,
+    pub lates: Vec<Row>,
+}
+
+impl WindowEmission {
+    pub fn is_empty(&self) -> bool {
+        self.finals.is_empty() && self.lates.is_empty()
+    }
+}
 
 #[derive(Clone, Debug)]
 struct TumbleEntry {
@@ -38,11 +52,15 @@ pub struct WindowOperator {
     operator: OperatorId,
     spec: WindowSpec,
     group_idx: Vec<usize>,
+    event_time_idx: Option<usize>,
     input: Schema,
     output: Schema,
     store: WindowStore,
     timers: BoundedTimers,
     owner: Arc<MemoryOwner>,
+    hub: WatermarkHub,
+    holdback: Option<OutputHoldback>,
+    default_input: InputId,
 }
 
 impl WindowOperator {
@@ -56,30 +74,53 @@ impl WindowOperator {
     ) -> Result<Self> {
         spec.validate()?;
         let group_idx = resolve_keys(&input, &spec.keys)?;
+        let event_time_idx = match &spec.event_time_field {
+            Some(name) => Some(input.index_of_name(name).ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown event-time field '{name}'"),
+                )
+            })?),
+            None => None,
+        };
         let output = sparrow_plan::window_output_schema(&input, &spec)?;
         let store = match spec.kind {
-            WindowKind::TumblingProcessingTime { .. } => WindowStore::Tumble(MemoryState::new(
-                Arc::clone(&owner),
-                operator,
-                StateSlotId::new(SLOT),
-                max_keys,
-            )?),
             WindowKind::Count { .. } => WindowStore::Count(MemoryState::new(
                 Arc::clone(&owner),
                 operator,
                 StateSlotId::new(SLOT),
                 max_keys,
             )?),
+            _ => WindowStore::Tumble(MemoryState::new(
+                Arc::clone(&owner),
+                operator,
+                StateSlotId::new(SLOT),
+                max_keys,
+            )?),
+        };
+        let mut hub = WatermarkHub::new();
+        if let Some(bind) = spec.binding() {
+            hub = hub.with_binding(bind)?;
+        }
+        hub.register(InputId(0))?;
+        let holdback = if spec.kind.uses_event_time() {
+            Some(OutputHoldback::new(spec.lateness_micros)?)
+        } else {
+            None
         };
         Ok(Self {
             operator,
             spec,
             group_idx,
+            event_time_idx,
             input,
             output,
             store,
             timers: BoundedTimers::new(operator, max_timers)?,
             owner,
+            hub,
+            holdback,
+            default_input: InputId(0),
         })
     }
 
@@ -88,7 +129,7 @@ impl WindowOperator {
     }
 
     pub fn honesty() -> &'static str {
-        DeliveryContract::PT_WINDOW_HONESTY
+        DeliveryContract::ET_WINDOW_HONESTY
     }
 
     pub fn key_count(&self) -> usize {
@@ -117,32 +158,221 @@ impl WindowOperator {
         self.timers.peek_deadline()
     }
 
-    pub fn on_batch(&mut self, batch: &RowBatch, now: i64) -> Result<Vec<Row>> {
-        let mut emitted = Vec::new();
-        emitted.extend(self.fire_due(now)?);
+    pub fn hub(&self) -> &WatermarkHub {
+        &self.hub
+    }
+
+    pub fn wm_out(&self) -> Option<i64> {
+        self.holdback.as_ref().and_then(|h| h.wm_out())
+    }
+
+    pub fn wm_in(&self) -> Option<i64> {
+        self.holdback.as_ref().and_then(|h| h.wm_in())
+    }
+
+    pub fn register_input(&mut self, id: InputId) -> Result<()> {
+        self.hub.register(id)
+    }
+
+    pub fn mark_idle(&mut self, id: InputId) -> Result<WindowEmission> {
+        self.hub.mark_idle(id)?;
+        self.drain_watermark()
+    }
+
+    pub fn mark_active(&mut self, id: InputId) -> Result<WindowEmission> {
+        self.hub.mark_active(id)?;
+        self.drain_watermark()
+    }
+
+    pub fn observe_watermark(&mut self, id: InputId, wm: i64) -> Result<WindowEmission> {
+        self.hub.set_watermark(id, wm)?;
+        self.drain_watermark()
+    }
+
+    pub fn on_batch(&mut self, batch: &RowBatch, now: i64) -> Result<WindowEmission> {
+        let mut out = WindowEmission::default();
+        let due = self.fire_due(now)?;
+        out.finals.extend(due);
         for row in batch.rows() {
-            emitted.extend(self.on_row(row, now)?);
+            let one = self.on_row(row, now)?;
+            out.finals.extend(one.finals);
+            out.lates.extend(one.lates);
         }
-        Ok(emitted)
+        Ok(out)
     }
 
     pub fn fire_due(&mut self, now: i64) -> Result<Vec<Row>> {
+        if self.spec.kind.uses_event_time() {
+            return Ok(Vec::new());
+        }
         let due = self.timers.fire_due(now);
         if due.is_empty() {
             return Ok(Vec::new());
         }
-        let ends: std::collections::HashSet<i64> =
-            due.iter().map(|id| id.namespace as i64).collect();
+        let ends: HashSet<i64> = due.iter().map(|id| id.namespace as i64).collect();
         self.flush_tumble_ends(&ends)
     }
 
-    fn on_row(&mut self, row: &Row, now: i64) -> Result<Vec<Row>> {
+    fn on_row(&mut self, row: &Row, now: i64) -> Result<WindowEmission> {
         match self.spec.kind {
             WindowKind::TumblingProcessingTime { size_micros } => {
-                self.on_tumble_row(row, now, size_micros)
+                Ok(WindowEmission {
+                    finals: self.on_tumble_row(row, now, size_micros)?,
+                    lates: Vec::new(),
+                })
             }
-            WindowKind::Count { size } => self.on_count_row(row, size),
+            WindowKind::Count { size } => Ok(WindowEmission {
+                finals: self.on_count_row(row, size)?,
+                lates: Vec::new(),
+            }),
+            WindowKind::TumblingEventTime { size_micros } => {
+                self.on_et_row(row, now, size_micros, None)
+            }
+            WindowKind::HoppingEventTime {
+                size_micros,
+                slide_micros,
+            } => self.on_et_row(row, now, size_micros, Some(slide_micros)),
         }
+    }
+
+    fn on_et_row(
+        &mut self,
+        row: &Row,
+        now: i64,
+        size: i64,
+        slide: Option<i64>,
+    ) -> Result<WindowEmission> {
+        let ts = self.row_event_time(row)?;
+        self.hub
+            .observe_event(self.default_input, ts, now)?;
+        let assigned = if let Some(slide) = slide {
+            WindowKind::assign_hop(ts, size, slide, self.spec.max_overlap)?
+        } else {
+            vec![WindowKind::assign_tumble(ts, size)?]
+        };
+        let wm_out = self.wm_out();
+        let mut lates = Vec::new();
+        let mut any_open = false;
+        let group = self.group_key(row);
+        for (start, end) in assigned {
+            if let Some(out) = wm_out {
+                if end <= out {
+                    continue;
+                }
+            }
+            any_open = true;
+            self.upsert_et_window(&group, start, end, row)?;
+        }
+        if !any_open {
+            lates.push(Row {
+                values: row.values.iter().map(Scalar::detach_copy).collect(),
+            });
+        }
+        let mut out = self.drain_watermark()?;
+        out.lates.extend(lates);
+        Ok(out)
+    }
+
+    fn upsert_et_window(
+        &mut self,
+        group: &[Scalar],
+        start: i64,
+        end: i64,
+        row: &Row,
+    ) -> Result<()> {
+        let sk = self.et_state_key(group, start);
+        let missing = matches!(&self.store, WindowStore::Tumble(s) if s.get(&sk).is_none());
+        if missing {
+            let accs = empty_accs(&self.spec, &self.input)?;
+            let bytes: usize = accs.iter().map(Accumulator::tracked_bytes).sum();
+            if let WindowStore::Tumble(store) = &mut self.store {
+                store.put(
+                    sk.clone(),
+                    TumbleEntry {
+                        window_start: start,
+                        window_end: end,
+                        accs,
+                    },
+                    bytes,
+                )?;
+            }
+        }
+        if let WindowStore::Tumble(store) = &mut self.store {
+            if let Some(entry) = store.get_mut(&sk) {
+                update_accs(&self.spec, &self.input, &mut entry.accs, row)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_watermark(&mut self) -> Result<WindowEmission> {
+        if self.holdback.is_none() {
+            return Ok(WindowEmission::default());
+        }
+        let Some(wm_in) = self.hub.progress() else {
+            return Ok(WindowEmission::default());
+        };
+        let Some(proposed_out) = self
+            .holdback
+            .as_mut()
+            .expect("holdback")
+            .on_wm_in(wm_in)?
+        else {
+            return Ok(WindowEmission::default());
+        };
+        let finals = self.flush_closed(proposed_out)?;
+        self.holdback
+            .as_mut()
+            .expect("holdback")
+            .advance_out(proposed_out)?;
+        Ok(WindowEmission {
+            finals,
+            lates: Vec::new(),
+        })
+    }
+
+    fn flush_closed(&mut self, wm_out: i64) -> Result<Vec<Row>> {
+        let victims: Vec<StateKey> = match &self.store {
+            WindowStore::Tumble(store) => store
+                .iter()
+                .filter(|(_, e)| e.window_end <= wm_out)
+                .map(|(k, _)| k.clone())
+                .collect(),
+            _ => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        if let WindowStore::Tumble(store) = &mut self.store {
+            for k in victims {
+                if let Some(entry) = store.remove(&k) {
+                    out.push(emit_tumble(&group_from_et_key(&k.key), &entry));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn row_event_time(&self, row: &Row) -> Result<i64> {
+        let idx = self.event_time_idx.ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "event-time window missing event_time_field binding",
+            )
+        })?;
+        let v = row.values.get(idx).ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidArgument, "event-time column missing on row")
+        })?;
+        v.as_event_time_micros().ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::TypeMismatch,
+                format!("event-time field must be Int64 or TimestampMicrosUTC, got {v:?}"),
+            )
+        })
+    }
+
+    fn et_state_key(&self, group: &[Scalar], start: i64) -> StateKey {
+        let mut key = group.to_vec();
+        key.push(Scalar::Int64(start));
+        StateKey::new(self.operator, StateSlotId::new(SLOT), key)
     }
 
     fn on_tumble_row(&mut self, row: &Row, now: i64, size: i64) -> Result<Vec<Row>> {
@@ -252,7 +482,7 @@ impl WindowOperator {
         Ok(emit_row.into_iter().collect())
     }
 
-    fn flush_tumble_ends(&mut self, ends: &std::collections::HashSet<i64>) -> Result<Vec<Row>> {
+    fn flush_tumble_ends(&mut self, ends: &HashSet<i64>) -> Result<Vec<Row>> {
         let victims: Vec<StateKey> = match &self.store {
             WindowStore::Tumble(store) => store
                 .iter()
@@ -283,6 +513,10 @@ impl WindowOperator {
         finish_rows(&self.output, rows, &self.owner)
     }
 
+    pub fn build_late_batch(&self, rows: Vec<Row>) -> Result<Option<RowBatch>> {
+        finish_rows(&self.input, rows, &self.owner)
+    }
+
     pub fn cleanup(&mut self) {
         match &mut self.store {
             WindowStore::Tumble(s) => s.clear(),
@@ -290,6 +524,13 @@ impl WindowOperator {
         }
         self.timers.cancel_all();
     }
+}
+
+fn group_from_et_key(key: &[Scalar]) -> Vec<Scalar> {
+    if key.is_empty() {
+        return Vec::new();
+    }
+    key[..key.len() - 1].to_vec()
 }
 
 fn empty_accs(spec: &WindowSpec, input: &Schema) -> Result<Vec<Accumulator>> {
@@ -366,35 +607,7 @@ pub fn resolve_keys(schema: &Schema, keys: &[String]) -> Result<Vec<usize>> {
 }
 
 pub fn window_output_schema(input: &Schema, spec: &WindowSpec) -> Result<Schema> {
-    let mut fields = Vec::new();
-    let mut id = 1u16;
-    for k in &spec.keys {
-        let f = input.field_by_name(k).ok_or_else(|| {
-            SparrowError::new(ErrorCode::InvalidArgument, format!("unknown key '{k}'"))
-        })?;
-        fields.push(Field::new(FieldId::new(id), f.name.clone(), f.data_type.clone(), f.nullable));
-        id += 1;
-    }
-    fields.push(Field::new(
-        FieldId::new(id),
-        "window_start",
-        sparrow_model::DataType::Int64,
-        false,
-    ));
-    id += 1;
-    fields.push(Field::new(
-        FieldId::new(id),
-        "window_end",
-        sparrow_model::DataType::Int64,
-        false,
-    ));
-    id += 1;
-    for agg in &spec.aggs {
-        let ty = agg.result_type(input)?;
-        fields.push(Field::new(FieldId::new(id), agg.alias.clone(), ty, true));
-        id += 1;
-    }
-    Schema::new(SchemaId::new(input.id.raw().saturating_add(50)), fields)
+    sparrow_plan::window_output_schema(input, spec)
 }
 
 pub fn finish_rows(
@@ -411,7 +624,10 @@ pub fn finish_rows(
         Arc::clone(owner),
         CreditKind::Reservation,
         rows.len().max(1),
-        owner.budget().cap(CreditKind::Reservation).min(bytes.saturating_mul(2).max(64)),
+        owner
+            .budget()
+            .cap(CreditKind::Reservation)
+            .min(bytes.saturating_mul(2).max(64)),
     )?;
     for row in rows {
         b.push(row)?;

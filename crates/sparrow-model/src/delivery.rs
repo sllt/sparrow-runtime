@@ -68,7 +68,7 @@ impl RecoveryPolicy {
             "restart_fresh" | "RestartFresh" | "none" | "None" => Ok(Self::RestartFresh),
             "checkpoint" | "aligned" | "restore" => Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                format!("recovery policy '{name}' is not supported in V0.2 (checkpoint restore is V0.4+)"),
+                format!("recovery policy '{name}' is not supported in V0.3 (checkpoint restore is V0.4+)"),
             )
             .context("supported", "none | restart_fresh")),
             other => Err(SparrowError::new(
@@ -137,8 +137,19 @@ impl DeliveryContract {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// V0.3 live contract. Event-time windows are still `recovery=none`:
+    /// watermarks, open windows, and versioned-table handles are discarded
+    /// on restart. Checkpoint restore remains rejected.
+    pub const V0_3: Self = Self {
+        guarantee: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     pub const PT_WINDOW_HONESTY: &'static str =
         "processing-time windows are recovery=none / restart_fresh; a process restart opens empty windows and does not replay. Results are not crash-identical.";
+
+    pub const ET_WINDOW_HONESTY: &'static str =
+        "event-time windows are recovery=none / restart_fresh; watermarks and open windows are not restored. Final-only lateness uses output holdback; late events after close go to the late side output. Checkpoint restore and exactly-once are rejected.";
 
     pub fn validate_restore(&self, claim: &RestoreClaim) -> Result<()> {
         let _ = self;

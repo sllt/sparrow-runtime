@@ -50,12 +50,12 @@ fn run() -> sparrow_model::Result<()> {
     )?;
     println!("snapshot v1 site=west; snapshot v2 site=east");
 
-    let spec = LookupSpec {
-        table: "sites".into(),
-        stream_keys: vec!["device_id".into()],
-        table_keys: vec!["device_id".into()],
-        keep: vec!["site".into()],
-    };
+    let spec = LookupSpec::static_table(
+        "sites",
+        vec!["device_id".into()],
+        vec!["device_id".into()],
+        vec!["site".into()],
+    );
     let bound = bind_lookup_linear(
         PipelineId::new(1),
         RevisionId::new(1),

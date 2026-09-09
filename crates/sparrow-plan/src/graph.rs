@@ -65,6 +65,14 @@ pub struct NodeSpec {
     pub on: Option<Vec<JoinOnSpec>>,
     #[serde(default)]
     pub keep: Option<Vec<String>>,
+    #[serde(default)]
+    pub event_time_field: Option<String>,
+    #[serde(default)]
+    pub lateness_micros: Option<i64>,
+    #[serde(default)]
+    pub temporal: Option<bool>,
+    #[serde(default)]
+    pub as_of_field: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -74,6 +82,14 @@ pub struct WindowNodeSpec {
     pub size_micros: Option<i64>,
     #[serde(default)]
     pub size: Option<u64>,
+    #[serde(default)]
+    pub slide_micros: Option<i64>,
+    #[serde(default)]
+    pub event_time_field: Option<String>,
+    #[serde(default)]
+    pub lateness_micros: Option<i64>,
+    #[serde(default)]
+    pub max_overlap: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

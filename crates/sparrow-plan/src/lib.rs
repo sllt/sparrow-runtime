@@ -94,6 +94,7 @@ mod tests {
     use super::*;
     use sparrow_expr::{BinaryOp, Expr};
     use sparrow_model::{DataType, Field, FieldId, Scalar, SchemaId};
+    use crate::stateful::{AggCall, WindowSpec};
 
     fn sensor_catalog() -> Catalog {
         let mut c = Catalog::new();
@@ -146,7 +147,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_join_kind() {
+    fn binds_event_time_tumble() {
+        let mut c = sensor_catalog();
+        c.insert(
+            "sensor_readings",
+            Schema::new(
+                SchemaId::new(1),
+                vec![
+                    Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+                    Field::new(FieldId::new(2), "temperature", DataType::Float64, true),
+                    Field::new(FieldId::new(3), "ts", DataType::Int64, false),
+                ],
+            )
+            .unwrap(),
+        );
+        let spec = GraphSpec::from_json(
+            r#"{
+              "version": 1, "pipeline_id": 1, "revision_id": 1,
+              "nodes": [
+                {"id": 1, "kind": "memory_source", "table": "sensor_readings", "out": [2]},
+                {"id": 2, "kind": "window_agg",
+                  "keys": ["device_id"],
+                  "event_time_field": "ts",
+                  "lateness_micros": 3000000,
+                  "window": {"kind": "tumble_et", "size_micros": 10000000},
+                  "aggs": [{"fn": "avg", "expr": {"k": "col", "name": "temperature"}, "alias": "avg_t"}],
+                  "out": [3]},
+                {"id": 3, "kind": "capture_sink"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let bound = bind_graph(&spec, &c).unwrap();
+        assert!(matches!(
+            bound.nodes.iter().find(|n| matches!(n.kind, BoundKind::WindowAgg { .. })),
+            Some(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_hop_overlap() {
+        let spec = WindowSpec::new(
+            sparrow_model::WindowKind::hopping_et(90_000_000, 10_000_000).unwrap(),
+            vec!["device_id".into()],
+            vec![AggCall::count_star("n")],
+        )
+        .event_time("ts", 0);
+        assert_eq!(
+            spec.validate().unwrap_err().code,
+            sparrow_model::ErrorCode::BoundExceeded
+        );
+    }
+
+    #[test]
+    fn rejects_session_and_join() {
         let spec = GraphSpec::from_json(
             r#"{
               "version": 1, "pipeline_id": 1, "revision_id": 1,

@@ -2,7 +2,8 @@
 
 use sparrow_expr::Expr;
 use sparrow_model::{
-    AggFn, DataType, ErrorCode, Field, FieldId, Result, Schema, SchemaId, SparrowError, WindowKind,
+    check_hop_overlap_bound, AggFn, DataType, ErrorCode, EventTimeBinding, Field, FieldId, Result,
+    Schema, SchemaId, SparrowError, WindowKind, DEFAULT_MAX_HOP_OVERLAP,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,9 +51,40 @@ pub struct WindowSpec {
     pub kind: WindowKind,
     pub keys: Vec<String>,
     pub aggs: Vec<AggCall>,
+    /// Required for event-time assigners. Forbidden on PT/count (no silent impersonation).
+    pub event_time_field: Option<String>,
+    /// Output holdback L: `wm_out <= wm_in - L`. Event-time only.
+    pub lateness_micros: i64,
+    /// Planner cap for hopping overlap (`ceil(size/slide)`).
+    pub max_overlap: u32,
 }
 
 impl WindowSpec {
+    pub fn new(kind: WindowKind, keys: Vec<String>, aggs: Vec<AggCall>) -> Self {
+        Self {
+            kind,
+            keys,
+            aggs,
+            event_time_field: None,
+            lateness_micros: 0,
+            max_overlap: DEFAULT_MAX_HOP_OVERLAP,
+        }
+    }
+
+    pub fn event_time(mut self, field: impl Into<String>, lateness_micros: i64) -> Self {
+        self.event_time_field = Some(field.into());
+        self.lateness_micros = lateness_micros;
+        self
+    }
+
+    pub fn binding(&self) -> Option<EventTimeBinding> {
+        self.event_time_field.as_ref().map(|f| EventTimeBinding {
+            field: f.clone(),
+            out_of_orderness_micros: 0,
+            max_future_skew_micros: None,
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.aggs.is_empty() {
             return Err(SparrowError::new(
@@ -60,19 +92,59 @@ impl WindowSpec {
                 "window aggregate requires at least one aggregate",
             ));
         }
+        if self.lateness_micros < 0 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "lateness_micros / holdback L must be >= 0",
+            ));
+        }
         match self.kind {
             WindowKind::TumblingProcessingTime { size_micros } if size_micros <= 0 => {
-                Err(SparrowError::new(
+                return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
                     "tumbling size_micros must be > 0",
-                ))
+                ));
             }
-            WindowKind::Count { size } if size == 0 => Err(SparrowError::new(
-                ErrorCode::InvalidArgument,
-                "count window size must be > 0",
-            )),
-            _ => Ok(()),
+            WindowKind::Count { size } if size == 0 => {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "count window size must be > 0",
+                ));
+            }
+            WindowKind::TumblingEventTime { size_micros } if size_micros <= 0 => {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "event-time tumbling size_micros must be > 0",
+                ));
+            }
+            WindowKind::HoppingEventTime {
+                size_micros,
+                slide_micros,
+            } => {
+                check_hop_overlap_bound(size_micros, slide_micros, self.max_overlap)?;
+            }
+            _ => {}
         }
+        // Hard rule: arrival-order / count windows must not impersonate event-time.
+        if !self.kind.uses_event_time() {
+            if self.event_time_field.is_some() || self.lateness_micros > 0 {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "count / processing-time windows must not impersonate event-time: omit event_time_field and lateness, or reassign to TUMBLE/HOP event-time with holdback",
+                ));
+            }
+        } else if self
+            .event_time_field
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "event-time window requires event_time_field (stream event-time binding)",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -114,9 +186,28 @@ pub struct LookupSpec {
     pub stream_keys: Vec<String>,
     pub table_keys: Vec<String>,
     pub keep: Vec<String>,
+    /// V0.3 versioned / as-of-event-time lookup. V0.2 static freeze is `false`.
+    pub temporal: bool,
+    pub as_of_field: Option<String>,
 }
 
 impl LookupSpec {
+    pub fn static_table(
+        table: impl Into<String>,
+        stream_keys: Vec<String>,
+        table_keys: Vec<String>,
+        keep: Vec<String>,
+    ) -> Self {
+        Self {
+            table: table.into(),
+            stream_keys,
+            table_keys,
+            keep,
+            temporal: false,
+            as_of_field: None,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.table.is_empty() {
             return Err(SparrowError::new(
@@ -130,6 +221,18 @@ impl LookupSpec {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
                 "lookup ON keys must be non-empty and aligned",
+            ));
+        }
+        if self.temporal
+            && self
+                .as_of_field
+                .as_deref()
+                .map(str::is_empty)
+                .unwrap_or(true)
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "versioned lookup requires as_of_field (FOR SYSTEM_TIME AS OF event-time)",
             ));
         }
         Ok(())

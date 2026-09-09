@@ -37,17 +37,17 @@ fn kernel() -> Kernel {
 }
 
 fn avg_spec() -> WindowSpec {
-    WindowSpec {
-        kind: WindowKind::tumbling_pt(1_000_000).unwrap(),
-        keys: vec!["device_id".into()],
-        aggs: vec![AggCall::new(
+    WindowSpec::new(
+        WindowKind::tumbling_pt(1_000_000).unwrap(),
+        vec!["device_id".into()],
+        vec![AggCall::new(
             AggFn::Avg,
             Some(Expr::Column {
                 name: "temperature".into(),
             }),
             "avg_temp",
         )],
-    }
+    )
 }
 
 #[test]
@@ -225,11 +225,11 @@ fn virtual_clock_pt_tumble_avg() {
 #[test]
 fn count_window_emits_on_size() {
     let k = kernel();
-    let spec = WindowSpec {
-        kind: WindowKind::count(2).unwrap(),
-        keys: vec!["device_id".into()],
-        aggs: vec![AggCall::count_star("n")],
-    };
+    let spec = WindowSpec::new(
+        WindowKind::count(2).unwrap(),
+        vec!["device_id".into()],
+        vec![AggCall::count_star("n")],
+    );
     let bound = bind_window_linear(
         PipelineId::new(1),
         RevisionId::new(1),
@@ -305,12 +305,12 @@ fn static_table_snapshot_is_job_local() {
         &owner,
     )
     .unwrap();
-    let spec = LookupSpec {
-        table: "sites".into(),
-        stream_keys: vec!["device_id".into()],
-        table_keys: vec!["device_id".into()],
-        keep: vec!["site".into()],
-    };
+    let spec = LookupSpec::static_table(
+        "sites",
+        vec!["device_id".into()],
+        vec!["device_id".into()],
+        vec!["site".into()],
+    );
     let bound = bind_lookup_linear(
         PipelineId::new(1),
         RevisionId::new(1),

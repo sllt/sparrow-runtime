@@ -37,6 +37,7 @@ impl StallGate {
 #[derive(Clone, Default)]
 pub struct SharedCapture {
     rows: Arc<Mutex<Vec<Vec<Scalar>>>>,
+    late: Arc<Mutex<Vec<Vec<Scalar>>>>,
     schema: Arc<Mutex<Option<Schema>>>,
     pub stall: StallGate,
 }
@@ -54,12 +55,27 @@ impl SharedCapture {
         *self.schema.lock().expect("schema") = Some(schema.clone());
     }
 
+    pub fn push_late(&self, batch_rows: &[Row]) {
+        let mut g = self.late.lock().expect("late");
+        for r in batch_rows {
+            g.push(r.values.clone());
+        }
+    }
+
     pub fn row_count(&self) -> usize {
         self.rows.lock().expect("capture").len()
     }
 
+    pub fn late_count(&self) -> usize {
+        self.late.lock().expect("late").len()
+    }
+
     pub fn rows(&self) -> Vec<Vec<Scalar>> {
         self.rows.lock().expect("capture").clone()
+    }
+
+    pub fn late_rows(&self) -> Vec<Vec<Scalar>> {
+        self.late.lock().expect("late").clone()
     }
 
     pub fn rows_as_debug(&self) -> Vec<Vec<String>> {

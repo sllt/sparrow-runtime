@@ -39,3 +39,19 @@ path = "src/bin/v02_static_table.rs"
 [[bin]]
 name = "v02_http_mqtt_loop"
 path = "src/bin/v02_http_mqtt_loop.rs"
+
+[[bin]]
+name = "v03_et_tumble_avg"
+path = "src/bin/v03_et_tumble_avg.rs"
+
+[[bin]]
+name = "v03_hop_overlap"
+path = "src/bin/v03_hop_overlap.rs"
+
+[[bin]]
+name = "v03_idle_active"
+path = "src/bin/v03_idle_active.rs"
+
+[[bin]]
+name = "v03_versioned_lookup"
+path = "src/bin/v03_versioned_lookup.rs"
