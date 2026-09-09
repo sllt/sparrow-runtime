@@ -85,7 +85,8 @@ sparrow-server — Sparrow V0.1 control plane
   --demo-io           start in-process MQTT broker + HTTP capture
   --allow-remote      allow a non-loopback bind
 
-Delivery: live_best_effort + restart_fresh. No windows, no checkpoint restore.
+Delivery: live_best_effort + restart_fresh by default.
+  File/replay may use recovery=aligned (not exactly-once). MQTT cannot restore.
 "
     );
 }

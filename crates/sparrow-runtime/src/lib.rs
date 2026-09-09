@@ -1,6 +1,6 @@
 //! In-process streaming kernel.
 //!
-//! V0.4: experimental aligned checkpoint on top of V0.3 event-time.
+//! V1: production aligned checkpoint on top of V0.3 event-time.
 //! Arrow, Axum, SQLite, MQTT, and `sqlparser` stay out of this crate.
 
 pub mod aggregate;
@@ -8,11 +8,13 @@ pub mod aligned;
 pub mod capture;
 pub mod checkpoint;
 pub mod clock;
+pub mod coordinator;
 pub mod dedup;
 pub mod kernel;
 pub mod linear;
 pub mod lookup;
 pub mod mailbox;
+pub mod metrics;
 pub mod state;
 pub mod timer;
 pub mod transform;
@@ -21,12 +23,16 @@ pub mod window;
 
 pub use aligned::{run_until, AlignedSession};
 pub use capture::{SharedCapture, StallGate};
-pub use checkpoint::{CheckpointSnapshot, CheckpointStore, FaultHook, FaultPoint};
+pub use checkpoint::{
+    CheckpointSnapshot, CheckpointStore, FaultHook, FaultPoint, TableRevisionBind,
+};
 pub use clock::RuntimeClock;
+pub use coordinator::{CheckpointCoordinator, CheckpointPhase};
 pub use kernel::{JobHandle, JobRequest, JobStats, Kernel, KernelOptions};
 pub use linear::{drain, LinearExecutor, RuntimeConfig};
 pub use lookup::{ReferenceTable, VersionedReferenceTable};
 pub use mailbox::{MailboxConfig, StreamControl};
+pub use metrics::{MetricsSnapshot, RuntimeMetrics};
 pub use state::{MemoryState, StateKey};
 pub use watermark::{OutputHoldback, WatermarkHub};
 pub use window::{FrozenEntry, WindowFreeze};

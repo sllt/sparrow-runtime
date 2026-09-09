@@ -55,7 +55,7 @@ impl ConnectorCapabilities {
         kind: "file",
         replay: ReplaySupport::Replayable,
         delivery: DeliveryGuarantee::LiveBestEffort,
-        recovery: RecoveryPolicy::ExperimentalAligned,
+        recovery: RecoveryPolicy::Aligned,
     };
 }
 
@@ -93,7 +93,7 @@ pub fn refuse_qos_durable(qos: u8) -> Result<()> {
         Err(ConnectorError::new(
             ErrorCode::UnsupportedDelivery,
             format!(
-                "MQTT QoS {qos} implies durable / at-least-once delivery; V0.4 is live_best_effort QoS 0 only (replay={})",
+                "MQTT QoS {qos} implies durable / at-least-once delivery; V1 is live_best_effort QoS 0 only (replay={})",
                 ReplaySupport::Unsupported.as_str()
             ),
         ))
@@ -134,7 +134,7 @@ mod tests {
         assert!(refuse_unsupported_recovery(
             "mqtt",
             false,
-            RecoveryPolicy::ExperimentalAligned,
+            RecoveryPolicy::Aligned,
             &RestoreClaim::Checkpoint {
                 snapshot_id: "x".into()
             },
@@ -143,7 +143,7 @@ mod tests {
         assert!(refuse_unsupported_recovery(
             "file",
             true,
-            RecoveryPolicy::ExperimentalAligned,
+            RecoveryPolicy::Aligned,
             &RestoreClaim::Checkpoint {
                 snapshot_id: "x".into()
             },

@@ -68,3 +68,15 @@ path = "src/bin/v04_mqtt_reject.rs"
 [[bin]]
 name = "v04_graph_author"
 path = "src/bin/v04_graph_author.rs"
+
+[[bin]]
+name = "v1_file_checkpoint"
+path = "src/bin/v1_file_checkpoint.rs"
+
+[[bin]]
+name = "v1_mqtt_reject"
+path = "src/bin/v1_mqtt_reject.rs"
+
+[[bin]]
+name = "v1_soak"
+path = "src/bin/v1_soak.rs"

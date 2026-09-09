@@ -135,11 +135,78 @@ fn restore_and_at_least_once_rejected() {
         assert_eq!(body["recovery"], "restart_fresh");
 
         let mut bad = spec();
-        bad["recovery"] = json!("experimental_aligned");
+        bad["recovery"] = json!("aligned");
         bad["restore"] = json!({"kind":"checkpoint","snapshot_id":"snap-1"});
         let (st, body) = call(&state, auth_post("/v1/validate", bad.to_string())).await;
         assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(st.as_u16(), 422);
         assert_eq!(body["error"]["code"], "unsupported_restore");
+    });
+}
+
+#[test]
+fn v1_file_aligned_validate_and_metrics() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        call(&state, auth_put("/v1/streams/sensors", STREAM.to_string())).await;
+        let ok = json!({
+            "version": 1,
+            "stream": "sensors",
+            "sql": "SELECT device_id FROM sensors",
+            "source": { "kind": "file", "path": "/tmp/sparrow-v1-events.ndjson" },
+            "sink": { "kind": "log" },
+            "delivery": "live_best_effort",
+            "recovery": "aligned",
+            "restore": { "kind": "checkpoint", "snapshot_id": "1" }
+        });
+        let (st, body) = call(&state, auth_post("/v1/validate", ok.to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["recovery_aligned"], "aligned");
+
+        let (st, metrics) = call(&state, auth_get("/v1/metrics")).await;
+        assert_eq!(st, StatusCode::OK, "{metrics}");
+        assert!(metrics.get("jobs_started").is_some());
+        assert!(metrics["log"].as_str().unwrap().contains("sparrow_metrics"));
+        assert_eq!(metrics["label_budget"], "job_and_connector_only; no per-event labels");
+
+        let (st, _) = call(
+            &state,
+            Request::builder()
+                .uri("/v1/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        let huge = "x".repeat(70 * 1024);
+        let (st, body) = call(
+            &state,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/validate")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(huge))
+                .unwrap(),
+        )
+        .await;
+        assert!(st.as_u16() == 413 || st.as_u16() == 400, "{st} {body}");
+
+        let denied = json!({
+            "version": 1,
+            "stream": "sensors",
+            "sql": "SELECT device_id FROM sensors",
+            "source": { "kind": "mqtt", "host": "127.0.0.1", "port": 1883, "topic": "t" },
+            "sink": { "kind": "http", "url": "http://evil.example:9/" },
+            "delivery": "live_best_effort",
+            "recovery": "restart_fresh"
+        });
+        let (st, body) = call(&state, auth_post("/v1/validate", denied.to_string())).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["code"], "policy_denied");
     });
 }
 
@@ -228,6 +295,9 @@ fn api_mqtt_http_loop_and_fresh_restart() {
         let actual = state.store.actual("hot").unwrap();
         assert_eq!(actual.status, "stopped");
         assert_eq!(st_json["recovery"], "restart_fresh");
+        assert_eq!(st_json["effective"]["recovery"], "restart_fresh");
+        assert_eq!(st_json["effective"]["exactly_once"], false);
+        assert!(st_json["effective"]["recovery_risk"].as_str().unwrap().contains("no_durable_restore"));
         assert_eq!(st_json["honesty"].as_str().unwrap().contains("fresh"), true);
 
         // Start again → new attempt, not compute recovery.

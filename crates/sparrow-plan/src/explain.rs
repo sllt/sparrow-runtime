@@ -63,7 +63,7 @@ impl GraphExplain {
         let experimental = false;
         let recovery = plan.recovery_label();
         let guarantee = format!(
-            "{} + recovery={} (experimental checkpoint is opt-in, not exactly-once)",
+            "{} + recovery={} (aligned checkpoint is opt-in for ReplayableSource, not exactly-once)",
             DeliveryGuarantee::LiveBestEffort.as_str(),
             recovery
         );

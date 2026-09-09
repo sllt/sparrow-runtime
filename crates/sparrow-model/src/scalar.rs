@@ -122,14 +122,14 @@ impl Scalar {
         }
     }
 
-    /// Reversible value encoding used by experimental checkpoint snapshots.
-    /// Dynamic values are rejected (not a V0.4 state key type).
+    /// Reversible value encoding used by aligned checkpoint snapshots.
+    /// Dynamic values are rejected (not a V1 state key type).
     pub fn encode_value(&self, out: &mut Vec<u8>) -> crate::error::Result<()> {
         use crate::error::{ErrorCode, SparrowError};
         if matches!(self, Self::Dynamic(_)) {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                "Dynamic scalars cannot be snapshotted in V0.4 experimental checkpoint",
+                "Dynamic scalars cannot be snapshotted in V1 aligned checkpoint",
             ));
         }
         self.encode_key(out);

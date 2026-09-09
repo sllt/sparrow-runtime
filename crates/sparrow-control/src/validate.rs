@@ -43,13 +43,13 @@ pub struct ExplainReport {
 }
 
 pub const HONESTY: &str =
-    "V0.4 default is live_best_effort + restart_fresh (recovery=none). experimental_aligned is an opt-in single-job checkpoint (not exactly-once). MQTT replay remains unsupported; MQTT cannot pretend durable restore.";
+    "V1 default is live_best_effort + restart_fresh (recovery=none). aligned is the production ReplayableSource checkpoint path (not exactly-once; recover from verified committed manifests only). MQTT replay remains unsupported; MQTT cannot pretend durable restore.";
 
 pub fn honesty_json() -> serde_json::Value {
     serde_json::json!({
         "delivery": DeliveryGuarantee::LiveBestEffort.as_str(),
         "recovery": RecoveryPolicy::RestartFresh.as_str(),
-        "recovery_experimental": RecoveryPolicy::ExperimentalAligned.as_str(),
+        "recovery_aligned": RecoveryPolicy::Aligned.as_str(),
         "replay_mqtt": ReplaySupport::Unsupported.as_str(),
         "replay_file": ReplaySupport::Replayable.as_str(),
         "exactly_once": "rejected",
@@ -352,7 +352,7 @@ pub fn capabilities_json() -> serde_json::Value {
         "delivery": DeliveryGuarantee::LiveBestEffort.as_str(),
         "recovery": RecoveryPolicy::RestartFresh.as_str(),
         "recovery_pt_window": RecoveryPolicy::RestartFresh.none_label(),
-        "recovery_experimental": RecoveryPolicy::ExperimentalAligned.as_str(),
+        "recovery_aligned": RecoveryPolicy::Aligned.as_str(),
         "exactly_once": "rejected",
         "connectors": [
             {
@@ -384,7 +384,7 @@ pub fn capabilities_json() -> serde_json::Value {
                 "replay": file.replay.as_str(),
                 "delivery": file.delivery.as_str(),
                 "recovery": file.recovery.as_str(),
-                "experimental": true,
+                "aligned": true,
             }
         ],
         "honesty": HONESTY,
@@ -393,6 +393,33 @@ pub fn capabilities_json() -> serde_json::Value {
 
 pub fn reject_named_delivery(name: &str) -> Result<DeliveryGuarantee> {
     refuse_delivery_name(name).map_err(io)
+}
+
+/// Effective delivery + recovery + risk for a stored pipeline spec.
+pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
+    let recovery = RecoveryPolicy::parse(&spec.recovery).unwrap_or(RecoveryPolicy::RestartFresh);
+    let replayable = matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay");
+    let replay = if replayable {
+        ReplaySupport::Replayable.as_str()
+    } else {
+        ReplaySupport::Unsupported.as_str()
+    };
+    let recovery_risk = if recovery.is_aligned() && replayable {
+        "committed_checkpoint_only"
+    } else if replayable {
+        "restart_fresh_loses_in_memory_state"
+    } else {
+        "no_durable_restore; live_best_effort_drops_ok"
+    };
+    serde_json::json!({
+        "delivery": DeliveryGuarantee::LiveBestEffort.as_str(),
+        "recovery": recovery.as_str(),
+        "replay": replay,
+        "exactly_once": false,
+        "recovery_risk": recovery_risk,
+        "aligned_eligible": replayable,
+        "honesty": HONESTY,
+    })
 }
 
 fn io(err: sparrow_connectors::ConnectorError) -> SparrowError {
@@ -472,14 +499,17 @@ mod tests {
             spec.check_delivery().unwrap_err().code,
             ErrorCode::UnsupportedRestore
         );
-        spec.recovery = "experimental_aligned".into();
+        spec.recovery = "aligned".into();
         assert_eq!(
             spec.check_delivery().unwrap_err().code,
             ErrorCode::UnsupportedRestore,
-            "MQTT + experimental checkpoint must still reject"
+            "MQTT + aligned checkpoint must still reject"
         );
         spec.source.kind = "file".into();
         spec.source.path = Some("/tmp/events.ndjson".into());
         assert!(spec.check_delivery().is_ok());
+        let g = effective_guarantees(&spec);
+        assert_eq!(g["recovery"], "aligned");
+        assert_eq!(g["recovery_risk"], "committed_checkpoint_only");
     }
 }

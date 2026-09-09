@@ -1,30 +1,34 @@
-//! Experimental aligned single-job checkpoint store.
+//! Versioned production aligned single-job checkpoint store.
 //!
 //! Protocol:
 //! 1. Barrier alignment (caller freezes operators; no in-flight rows).
 //! 2. Freeze + chunk write (`*.bin.part` → `*.bin`).
 //! 3. ACK after every chunk is renamed.
-//! 4. Manifest commit (`MANIFEST.tmp` → `MANIFEST`, then `CURRENT.tmp` → `CURRENT`).
-//! 5. Recover from a **committed** CURRENT+MANIFEST only.
+//! 4. Versioned manifest commit (`MANIFEST.tmp` → `MANIFEST`, then `CURRENT.tmp` → `CURRENT`).
+//! 5. Recover from a **verified committed** CURRENT+MANIFEST only.
 //!
-//! This path is **experimental**. It is not default exactly-once.
+//! This path is **not** exactly-once. Missing or corrupt checkpoints are
+//! rejected — never a silent empty-state continue.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-
 use sparrow_io::{SourceIdentity, SourcePosition};
 use sparrow_model::{
     DeliveryContract, ErrorCode, OperatorId, RecoveryPolicy, Result, Scalar, SparrowError,
+    StateSlotId,
 };
+use sparrow_plan::PlanLayout;
 
 use crate::aggregate::Accumulator;
 use crate::window::{FrozenEntry, WindowFreeze};
 
-pub const CHECKPOINT_LABEL: &str = "experimental";
+pub const CHECKPOINT_LABEL: &str = "aligned";
 pub const CHUNK_SIZE: usize = 4096;
-pub const MAGIC: &[u8; 4] = b"SP04";
+pub const MAGIC: &[u8; 4] = b"SPV1";
 pub const SNAPSHOT_VERSION: u16 = 1;
+pub const MANIFEST_MAGIC: &[u8; 4] = b"MAN2";
+pub const MANIFEST_VERSION: u16 = 1;
 
 /// Fault injection points for crash-cut / disk-full tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,11 +60,19 @@ impl Default for FaultPoint {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct TableRevisionBind {
+    pub name: String,
+    pub version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CheckpointSnapshot {
     pub checkpoint_id: u64,
     pub source: SourcePosition,
     pub window: WindowFreeze,
     pub ingested_rows: u64,
+    pub layout: PlanLayout,
+    pub table: Option<TableRevisionBind>,
 }
 
 impl CheckpointSnapshot {
@@ -72,6 +84,15 @@ impl CheckpointSnapshot {
         out.extend_from_slice(&self.ingested_rows.to_le_bytes());
         encode_position(&self.source, &mut out)?;
         encode_freeze(&self.window, &mut out)?;
+        encode_layout(&self.layout, &mut out)?;
+        match &self.table {
+            None => out.push(0),
+            Some(t) => {
+                out.push(1);
+                encode_str(&t.name, &mut out);
+                out.extend_from_slice(&t.version.to_le_bytes());
+            }
+        }
         Ok(out)
     }
 
@@ -79,7 +100,7 @@ impl CheckpointSnapshot {
         if src.len() < 4 + 2 + 8 + 8 || &src[..4] != MAGIC {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
-                "checkpoint snapshot magic/header mismatch",
+                "checkpoint snapshot magic/header mismatch (want SPV1 production codec)",
             ));
         }
         src = &src[4..];
@@ -88,7 +109,7 @@ impl CheckpointSnapshot {
         if ver != SNAPSHOT_VERSION {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("checkpoint snapshot version {ver} unsupported"),
+                format!("checkpoint snapshot version {ver} unsupported (V1 codec is {SNAPSHOT_VERSION})"),
             ));
         }
         let checkpoint_id = u64::from_le_bytes(src[..8].try_into().unwrap());
@@ -97,12 +118,53 @@ impl CheckpointSnapshot {
         src = &src[8..];
         let source = decode_position(&mut src)?;
         let window = decode_freeze(&mut src)?;
+        let layout = decode_layout(&mut src)?;
+        if layout.operator != window.operator || layout.slot != window.slot {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "snapshot OperatorId/StateSlotKey does not match frozen window",
+            ));
+        }
+        let table = if src.is_empty() {
+            None
+        } else {
+            let tag = src[0];
+            src = &src[1..];
+            match tag {
+                0 => None,
+                1 => {
+                    let name = decode_str(&mut src)?;
+                    if src.len() < 8 {
+                        return Err(SparrowError::new(
+                            ErrorCode::CodecViolation,
+                            "truncated table revision",
+                        ));
+                    }
+                    let version = u64::from_le_bytes(src[..8].try_into().unwrap());
+                    src = &src[8..];
+                    let _ = src;
+                    Some(TableRevisionBind { name, version })
+                }
+                _ => {
+                    return Err(SparrowError::new(
+                        ErrorCode::CodecViolation,
+                        "invalid table revision tag",
+                    ));
+                }
+            }
+        };
         Ok(Self {
             checkpoint_id,
             source,
             window,
             ingested_rows,
+            layout,
+            table,
         })
+    }
+
+    pub fn check_compatible(&self, live: &PlanLayout) -> Result<()> {
+        sparrow_plan::decide_state_reuse(&self.layout, live).into_result()
     }
 }
 
@@ -133,11 +195,11 @@ impl CheckpointStore {
     }
 
     pub fn honesty() -> &'static str {
-        DeliveryContract::EXPERIMENTAL_CHECKPOINT_HONESTY
+        DeliveryContract::ALIGNED_CHECKPOINT_HONESTY
     }
 
     pub fn policy() -> RecoveryPolicy {
-        RecoveryPolicy::ExperimentalAligned
+        RecoveryPolicy::Aligned
     }
 
     pub fn label() -> &'static str {
@@ -180,6 +242,7 @@ impl CheckpointStore {
             n_chunks: chunks.len() as u32,
             bytes: payload.len() as u64,
             checksums: chunks.iter().map(|c| crc32(c)).collect(),
+            codec_version: MANIFEST_VERSION,
         };
         if self.fault.point == FaultPoint::CorruptChecksum && !manifest.checksums.is_empty() {
             manifest.checksums[0] ^= 0xffff_ffff;
@@ -205,6 +268,9 @@ impl CheckpointStore {
 
     /// Load the last **committed** checkpoint. Partial chunks / missing
     /// MANIFEST / checksum mismatch are not restored.
+    ///
+    /// `Ok(None)` means no CURRENT file — callers that *claimed* restore
+    /// must treat this as a hard error (see [`Self::recover_required`]).
     pub fn recover_committed(&self) -> Result<Option<CheckpointSnapshot>> {
         let Some(id) = read_current(&self.dir)? else {
             return Ok(None);
@@ -267,6 +333,18 @@ impl CheckpointStore {
         Ok(Some(CheckpointSnapshot::decode(&payload)?))
     }
 
+    /// Restore entry point: never continue with empty state when a restore
+    /// was claimed. Missing CURRENT or an unverified store is a reject.
+    pub fn recover_required(&self) -> Result<CheckpointSnapshot> {
+        match self.recover_committed()? {
+            Some(snap) => Ok(snap),
+            None => Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "no verified committed checkpoint; refusing silent empty-state continue",
+            )),
+        }
+    }
+
     pub fn has_committed(&self) -> bool {
         matches!(self.recover_committed(), Ok(Some(_)))
     }
@@ -278,12 +356,14 @@ struct Manifest {
     n_chunks: u32,
     bytes: u64,
     checksums: Vec<u32>,
+    codec_version: u16,
 }
 
 impl Manifest {
     fn encode(&self) -> Vec<u8> {
         let mut o = Vec::new();
-        o.extend_from_slice(b"MAN1");
+        o.extend_from_slice(MANIFEST_MAGIC);
+        o.extend_from_slice(&self.codec_version.to_le_bytes());
         o.extend_from_slice(&self.checkpoint_id.to_le_bytes());
         o.extend_from_slice(&self.n_chunks.to_le_bytes());
         o.extend_from_slice(&self.bytes.to_le_bytes());
@@ -295,13 +375,21 @@ impl Manifest {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 4 + 8 + 4 + 8 + 4 || &bytes[..4] != b"MAN1" {
+        if bytes.len() < 4 + 2 + 8 + 4 + 8 + 4 || &bytes[..4] != MANIFEST_MAGIC {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
-                "MANIFEST header invalid",
+                "MANIFEST header invalid (want versioned MAN2)",
             ));
         }
         let mut s = &bytes[4..];
+        let codec_version = u16::from_le_bytes(s[..2].try_into().unwrap());
+        s = &s[2..];
+        if codec_version != MANIFEST_VERSION {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                format!("MANIFEST codec version {codec_version} unsupported"),
+            ));
+        }
         let checkpoint_id = u64::from_le_bytes(s[..8].try_into().unwrap());
         s = &s[8..];
         let n_chunks = u32::from_le_bytes(s[..4].try_into().unwrap());
@@ -326,6 +414,7 @@ impl Manifest {
             n_chunks,
             bytes: nbytes,
             checksums,
+            codec_version,
         })
     }
 }
@@ -523,8 +612,133 @@ fn decode_opt_i64(src: &mut &[u8]) -> Result<Option<i64>> {
     }
 }
 
+fn encode_layout(l: &PlanLayout, out: &mut Vec<u8>) -> Result<()> {
+    out.extend_from_slice(&l.operator.raw().to_le_bytes());
+    out.extend_from_slice(&l.slot.raw().to_le_bytes());
+    out.push(l.window_kind);
+    out.extend_from_slice(&(l.keys.len() as u16).to_le_bytes());
+    for k in &l.keys {
+        encode_str(k, out);
+    }
+    out.extend_from_slice(&(l.aggs.len() as u16).to_le_bytes());
+    for a in &l.aggs {
+        encode_str(a, out);
+    }
+    match &l.event_time_field {
+        None => out.push(0),
+        Some(f) => {
+            out.push(1);
+            encode_str(f, out);
+        }
+    }
+    out.extend_from_slice(&l.lateness_micros.to_le_bytes());
+    out.extend_from_slice(&l.where_fingerprint.to_le_bytes());
+    match &l.table_name {
+        None => out.push(0),
+        Some(n) => {
+            out.push(1);
+            encode_str(n, out);
+        }
+    }
+    encode_opt_i64(l.table_revision.map(|v| v as i64), out);
+    Ok(())
+}
+
+fn decode_layout(src: &mut &[u8]) -> Result<PlanLayout> {
+    if src.len() < 4 + 2 + 1 + 2 {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "truncated plan layout",
+        ));
+    }
+    let operator = OperatorId::new(u32::from_le_bytes(src[..4].try_into().unwrap()));
+    *src = &src[4..];
+    let slot = StateSlotId::new(u16::from_le_bytes(src[..2].try_into().unwrap()));
+    *src = &src[2..];
+    let window_kind = src[0];
+    *src = &src[1..];
+    let nk = u16::from_le_bytes(src[..2].try_into().unwrap()) as usize;
+    *src = &src[2..];
+    let mut keys = Vec::with_capacity(nk);
+    for _ in 0..nk {
+        keys.push(decode_str(src)?);
+    }
+    if src.len() < 2 {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "truncated plan layout aggs",
+        ));
+    }
+    let na = u16::from_le_bytes(src[..2].try_into().unwrap()) as usize;
+    *src = &src[2..];
+    let mut aggs = Vec::with_capacity(na);
+    for _ in 0..na {
+        aggs.push(decode_str(src)?);
+    }
+    if src.is_empty() {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "truncated plan layout event-time",
+        ));
+    }
+    let tag = src[0];
+    *src = &src[1..];
+    let event_time_field = match tag {
+        0 => None,
+        1 => Some(decode_str(src)?),
+        _ => {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "invalid event-time tag",
+            ))
+        }
+    };
+    if src.len() < 8 + 8 {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "truncated plan layout fingerprints",
+        ));
+    }
+    let lateness_micros = i64::from_le_bytes(src[..8].try_into().unwrap());
+    *src = &src[8..];
+    let where_fingerprint = u64::from_le_bytes(src[..8].try_into().unwrap());
+    *src = &src[8..];
+    if src.is_empty() {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "truncated plan layout table",
+        ));
+    }
+    let ttag = src[0];
+    *src = &src[1..];
+    let table_name = match ttag {
+        0 => None,
+        1 => Some(decode_str(src)?),
+        _ => {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "invalid table name tag",
+            ))
+        }
+    };
+    let table_revision = decode_opt_i64(src)?.map(|v| v as u64);
+    Ok(PlanLayout {
+        operator,
+        slot,
+        window_kind,
+        keys,
+        aggs,
+        event_time_field,
+        lateness_micros,
+        where_fingerprint,
+        table_name,
+        table_revision,
+    })
+}
+
 fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>) -> Result<()> {
     out.extend_from_slice(&f.operator.raw().to_le_bytes());
+    out.extend_from_slice(&f.slot.raw().to_le_bytes());
     out.push(f.kind);
     out.extend_from_slice(&(f.entries.len() as u32).to_le_bytes());
     for e in &f.entries {
@@ -553,8 +767,16 @@ fn decode_freeze(src: &mut &[u8]) -> Result<WindowFreeze> {
             "truncated window freeze",
         ));
     }
+    if src.len() < 4 + 2 + 1 + 4 {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "truncated window freeze",
+        ));
+    }
     let operator = OperatorId::new(u32::from_le_bytes(src[..4].try_into().unwrap()));
     *src = &src[4..];
+    let slot = StateSlotId::new(u16::from_le_bytes(src[..2].try_into().unwrap()));
+    *src = &src[2..];
     let kind = src[0];
     *src = &src[1..];
     let n = u32::from_le_bytes(src[..4].try_into().unwrap()) as usize;
@@ -601,6 +823,7 @@ fn decode_freeze(src: &mut &[u8]) -> Result<WindowFreeze> {
     }
     Ok(WindowFreeze {
         operator,
+        slot,
         kind,
         entries,
         wm_in: decode_opt_i64(src)?,
@@ -657,7 +880,7 @@ mod tests {
         let owner = MemoryOwner::new(ResourceBudget::compact());
         let mut op = WindowOperator::new(
             OperatorId::new(7),
-            spec,
+            spec.clone(),
             schema.clone(),
             owner.clone(),
             16,
@@ -682,11 +905,14 @@ mod tests {
         .unwrap();
         let batch = b.finish().unwrap();
         let _ = op.on_batch(&batch, 0).unwrap();
+        let window = op.freeze();
         CheckpointSnapshot {
             checkpoint_id: id,
             source: SourcePosition::start(SourceIdentity::memory("demo", 32, 1)),
-            window: op.freeze(),
+            window: window.clone(),
             ingested_rows: 2,
+            layout: PlanLayout::from_window(OperatorId::new(7), window.slot, &spec),
+            table: None,
         }
     }
 
@@ -790,6 +1016,7 @@ mod tests {
             source: pos.clone(),
             window: WindowFreeze {
                 operator: OperatorId::new(1),
+                slot: StateSlotId::new(1),
                 kind: 1,
                 entries: Vec::new(),
                 wm_in: None,
@@ -797,16 +1024,65 @@ mod tests {
                 last_effective: None,
             },
             ingested_rows: 1,
+            layout: PlanLayout {
+                operator: OperatorId::new(1),
+                slot: StateSlotId::new(1),
+                window_kind: 1,
+                keys: vec!["device_id".into()],
+                aggs: vec!["sum:s".into()],
+                event_time_field: None,
+                lateness_micros: 0,
+                where_fingerprint: 0,
+                table_name: None,
+                table_revision: None,
+            },
+            table: None,
         };
         let bytes = snap.encode().unwrap();
         let got = CheckpointSnapshot::decode(&bytes).unwrap();
         assert_eq!(got.source, pos);
+        assert_eq!(got.layout.operator.raw(), 1);
     }
 
     #[test]
-    fn experimental_not_exactly_once() {
-        assert_eq!(CheckpointStore::policy(), RecoveryPolicy::ExperimentalAligned);
-        assert!(CheckpointStore::honesty().contains("not default exactly-once") || CheckpointStore::honesty().contains("Not default exactly-once") || CheckpointStore::honesty().contains("not exactly-once") || CheckpointStore::honesty().contains("Not default"));
-        assert_eq!(CheckpointStore::label(), "experimental");
+    fn aligned_not_exactly_once() {
+        assert_eq!(CheckpointStore::policy(), RecoveryPolicy::Aligned);
+        assert!(
+            CheckpointStore::honesty().contains("not default exactly-once")
+                || CheckpointStore::honesty().contains("Not default exactly-once")
+                || CheckpointStore::honesty().contains("not exactly-once")
+                || CheckpointStore::honesty().contains("Not default")
+        );
+        assert_eq!(CheckpointStore::label(), "aligned");
+    }
+
+    #[test]
+    fn recover_required_rejects_empty_store() {
+        let dir = tmp();
+        let store = CheckpointStore::open(&dir).unwrap();
+        let err = store.recover_required().unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedRestore);
+        assert!(err.message.contains("silent empty-state"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operator_slot_mismatch_rejects_reuse() {
+        let snap = sample_snapshot(1);
+        let mut live = snap.layout.clone();
+        live.operator = OperatorId::new(99);
+        assert!(snap.check_compatible(&live).is_err());
+    }
+
+    #[test]
+    fn soak_commit_restore_loops_are_finite() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        for i in 1..=8 {
+            store.commit(&sample_snapshot(i)).unwrap();
+            let got = store.recover_required().unwrap();
+            assert_eq!(got.checkpoint_id, i);
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

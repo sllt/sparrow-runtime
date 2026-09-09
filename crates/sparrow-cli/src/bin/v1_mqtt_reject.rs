@@ -1,4 +1,4 @@
-//! Prove MQTT live_best_effort still rejects restore / experimental claims.
+//! Prove MQTT live_best_effort still rejects aligned / restore claims.
 
 use sparrow_connectors::{
     refuse_durable_recovery, refuse_unsupported_recovery, ConnectorCapabilities, MqttSourceConfig,
@@ -18,20 +18,22 @@ fn schema() -> Schema {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("v04_mqtt_reject failed: {e}");
+        eprintln!("v1_mqtt_reject failed: {e}");
         std::process::exit(1);
     }
 }
 
 fn run() -> sparrow_model::Result<()> {
-    println!("=== Sparrow V0.4 MQTT restore reject ===");
+    println!("=== Sparrow V1 MQTT restore reject ===");
     println!(
-        "delivery={} replay={}",
+        "delivery={} replay={} recovery_default={}",
         DeliveryGuarantee::LiveBestEffort.as_str(),
-        ReplaySupport::Unsupported.as_str()
+        ReplaySupport::Unsupported.as_str(),
+        RecoveryPolicy::RestartFresh.as_str()
     );
     let cap = ConnectorCapabilities::MQTT_SOURCE;
     assert_eq!(cap.replay, ReplaySupport::Unsupported);
+    assert_eq!(cap.recovery, RecoveryPolicy::RestartFresh);
 
     let mqtt_session = refuse_durable_recovery(&RestoreClaim::MqttSession {
         client_id: "edge-1".into(),
@@ -46,7 +48,7 @@ fn run() -> sparrow_model::Result<()> {
         }
     }
 
-    let exp = refuse_unsupported_recovery(
+    let aligned = refuse_unsupported_recovery(
         "mqtt",
         false,
         RecoveryPolicy::Aligned,
@@ -54,12 +56,12 @@ fn run() -> sparrow_model::Result<()> {
             snapshot_id: "chk-1".into(),
         },
     );
-    match exp {
+    match aligned {
         Err(e) => println!("REJECT mqtt+aligned checkpoint: {e}"),
         Ok(()) => {
             return Err(sparrow_model::SparrowError::new(
                 sparrow_model::ErrorCode::Internal,
-                "MQTT experimental restore must be rejected",
+                "MQTT aligned restore must be rejected",
             ));
         }
     }
@@ -81,6 +83,6 @@ fn run() -> sparrow_model::Result<()> {
     }
 
     println!("MQTT live_best_effort cannot pretend durable restore");
-    println!("v04_mqtt_reject: ok");
+    println!("v1_mqtt_reject: ok");
     Ok(())
 }
