@@ -107,13 +107,26 @@ pub fn eval(expr: &Expr, schema: &Schema, row: &[Scalar]) -> Result<Scalar> {
 }
 
 fn eval_call(name: &str, args: &[Expr], schema: &Schema, row: &[Scalar]) -> Result<Scalar> {
+    check_call_arity(name, args.len())?;
     let vals: Result<Vec<Scalar>> = args.iter().map(|a| eval(a, schema, row)).collect();
     let vals = vals?;
     match name.to_ascii_lowercase().as_str() {
         "abs" => match vals.first() {
-            Some(Scalar::Int64(v)) => Ok(Scalar::Int64(v.saturating_abs())),
+            Some(Scalar::Int64(v)) => {
+                let abs = v.checked_abs().ok_or_else(|| {
+                    SparrowError::new(
+                        ErrorCode::IntegerOverflow,
+                        "abs(Int64::MIN) overflows",
+                    )
+                })?;
+                Ok(Scalar::Int64(abs))
+            }
             Some(Scalar::Float64(v)) => Ok(Scalar::Float64(v.abs())),
             Some(Scalar::Null) => Ok(Scalar::Null),
+            None => Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "abs requires 1 argument",
+            )),
             _ => Err(SparrowError::new(ErrorCode::TypeMismatch, "abs expects numeric")),
         },
         "lower" => match vals.first() {
@@ -131,12 +144,61 @@ fn eval_call(name: &str, args: &[Expr], schema: &Schema, row: &[Scalar]) -> Resu
             Some(Scalar::Null) => Ok(Scalar::Null),
             _ => Err(SparrowError::new(ErrorCode::TypeMismatch, "length expects utf8")),
         },
-        "coalesce" => Ok(vals.into_iter().find(|v| !v.is_null()).unwrap_or(Scalar::Null)),
+        "coalesce" => {
+            if vals.is_empty() {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "coalesce requires at least 1 argument",
+                ));
+            }
+            Ok(vals.into_iter().find(|v| !v.is_null()).unwrap_or(Scalar::Null))
+        }
         other => Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
             format!("unknown function '{other}'"),
         )),
     }
+}
+
+fn check_call_arity(name: &str, argc: usize) -> Result<()> {
+    match name.to_ascii_lowercase().as_str() {
+        "abs" | "lower" | "upper" | "length" | "char_length" => {
+            if argc != 1 {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("{name} requires 1 argument, got {argc}"),
+                ));
+            }
+        }
+        "coalesce" => {
+            if argc == 0 {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "coalesce requires at least 1 argument",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn eval_int_arith(op: BinaryOp, left: i64, right: i64) -> Result<Scalar> {
+    let v = match op {
+        BinaryOp::Add => left.checked_add(right),
+        BinaryOp::Sub => left.checked_sub(right),
+        BinaryOp::Mul => left.checked_mul(right),
+        BinaryOp::Div => {
+            if right == 0 {
+                return Ok(Scalar::Null);
+            }
+            left.checked_div(right)
+        }
+        _ => None,
+    };
+    v.map(Scalar::Int64).ok_or_else(|| {
+        SparrowError::new(ErrorCode::IntegerOverflow, "checked integer arithmetic overflow")
+    })
 }
 
 fn eval_binary(op: BinaryOp, left: &Scalar, right: &Scalar) -> Result<Scalar> {
@@ -154,32 +216,65 @@ fn eval_binary(op: BinaryOp, left: &Scalar, right: &Scalar) -> Result<Scalar> {
                     "dynamic arithmetic requires an explicit CAST/TRY_CAST",
                 ));
             }
-            let l = left.as_f64().ok_or_else(|| {
-                SparrowError::new(ErrorCode::TypeMismatch, "arithmetic expects numeric")
-            })?;
-            let r = right.as_f64().ok_or_else(|| {
-                SparrowError::new(ErrorCode::TypeMismatch, "arithmetic expects numeric")
-            })?;
-            let v = match op {
-                BinaryOp::Add => l + r,
-                BinaryOp::Sub => l - r,
-                BinaryOp::Mul => l * r,
-                BinaryOp::Div => {
-                    if r == 0.0 {
-                        return Ok(Scalar::Null);
-                    }
-                    l / r
+            match (left, right) {
+                (Scalar::Int64(l), Scalar::Int64(r)) => eval_int_arith(op, *l, *r),
+                (Scalar::UInt64(l), Scalar::UInt64(r)) => {
+                    let v = match op {
+                        BinaryOp::Add => l.checked_add(*r),
+                        BinaryOp::Sub => l.checked_sub(*r),
+                        BinaryOp::Mul => l.checked_mul(*r),
+                        BinaryOp::Div => {
+                            if *r == 0 {
+                                return Ok(Scalar::Null);
+                            }
+                            l.checked_div(*r)
+                        }
+                        _ => None,
+                    };
+                    v.map(Scalar::UInt64).ok_or_else(|| {
+                        SparrowError::new(
+                            ErrorCode::IntegerOverflow,
+                            "checked unsigned integer arithmetic overflow",
+                        )
+                    })
                 }
-                _ => unreachable!(),
-            };
-            if matches!(left, Scalar::Float64(_)) || matches!(right, Scalar::Float64(_)) {
-                Ok(Scalar::Float64(v))
-            } else {
-                Ok(Scalar::Int64(v as i64))
+                (Scalar::Int64(l), Scalar::UInt64(r)) if *r <= i64::MAX as u64 => {
+                    eval_int_arith(op, *l, *r as i64)
+                }
+                (Scalar::UInt64(l), Scalar::Int64(r)) if *l <= i64::MAX as u64 => {
+                    eval_int_arith(op, *l as i64, *r)
+                }
+                _ => {
+                    let l = left.as_f64().ok_or_else(|| {
+                        SparrowError::new(ErrorCode::TypeMismatch, "arithmetic expects numeric")
+                    })?;
+                    let r = right.as_f64().ok_or_else(|| {
+                        SparrowError::new(ErrorCode::TypeMismatch, "arithmetic expects numeric")
+                    })?;
+                    if !matches!(left, Scalar::Float64(_)) && !matches!(right, Scalar::Float64(_)) {
+                        return Err(SparrowError::new(
+                            ErrorCode::TypeMismatch,
+                            "integer arithmetic must not go through f64",
+                        ));
+                    }
+                    let v = match op {
+                        BinaryOp::Add => l + r,
+                        BinaryOp::Sub => l - r,
+                        BinaryOp::Mul => l * r,
+                        BinaryOp::Div => {
+                            if r == 0.0 {
+                                return Ok(Scalar::Null);
+                            }
+                            l / r
+                        }
+                        _ => unreachable!(),
+                    };
+                    Ok(Scalar::Float64(v))
+                }
             }
         }
-        BinaryOp::Eq => Ok(Scalar::Bool(left == right)),
-        BinaryOp::NotEq => Ok(Scalar::Bool(left != right)),
+        BinaryOp::Eq => Ok(Scalar::Bool(scalars_eq(left, right))),
+        BinaryOp::NotEq => Ok(Scalar::Bool(!scalars_eq(left, right))),
         cmp => {
             let l = left.as_f64().ok_or_else(|| {
                 SparrowError::new(ErrorCode::TypeMismatch, "comparison expects numeric")
@@ -272,6 +367,18 @@ fn cast(value: &Scalar, target: &DataType, try_cast: bool) -> Result<Scalar> {
     }
 }
 
+/// Evaluator equality: integers compare as integers, not via f64.
+fn scalars_eq(left: &Scalar, right: &Scalar) -> bool {
+    match (left, right) {
+        (Scalar::Int64(a), Scalar::Int64(b)) => a == b,
+        (Scalar::UInt64(a), Scalar::UInt64(b)) => a == b,
+        (Scalar::Int64(a), Scalar::UInt64(b)) => *a >= 0 && *a as u64 == *b,
+        (Scalar::UInt64(a), Scalar::Int64(b)) => *b >= 0 && *a == *b as u64,
+        (Scalar::Float64(a), Scalar::Float64(b)) => a == b,
+        _ => left == right,
+    }
+}
+
 fn dynamic_from_scalar(value: &Scalar) -> DynamicValue {
     match value {
         Scalar::Null => DynamicValue::Null,
@@ -342,5 +449,81 @@ mod tests {
             eval(&expr, &schema, &row).unwrap_err().code,
             ErrorCode::TypeMismatch
         );
+    }
+
+    #[test]
+    fn r06_int_add_does_not_go_through_f64() {
+        let schema = schema();
+        let row = vec![Scalar::Float64(0.0), Scalar::Dynamic(DynamicValue::Null)];
+        let expr = Expr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::Literal(Scalar::Int64(9_007_199_254_740_993))),
+            right: Box::new(Expr::Literal(Scalar::Int64(1))),
+        };
+        assert_eq!(
+            eval(&expr, &schema, &row).unwrap(),
+            Scalar::Int64(9_007_199_254_740_994)
+        );
+    }
+
+    #[test]
+    fn r06_checked_int_overflow() {
+        let schema = schema();
+        let row = vec![Scalar::Float64(0.0), Scalar::Dynamic(DynamicValue::Null)];
+        let expr = Expr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::Literal(Scalar::Int64(i64::MAX))),
+            right: Box::new(Expr::Literal(Scalar::Int64(1))),
+        };
+        assert_eq!(
+            eval(&expr, &schema, &row).unwrap_err().code,
+            ErrorCode::IntegerOverflow
+        );
+    }
+
+    #[test]
+    fn r07_empty_abs_and_coalesce_are_errors() {
+        let schema = schema();
+        let row = vec![Scalar::Float64(0.0), Scalar::Dynamic(DynamicValue::Null)];
+        assert_eq!(
+            eval(
+                &Expr::Call {
+                    name: "abs".into(),
+                    args: vec![],
+                },
+                &schema,
+                &row
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            eval(
+                &Expr::Call {
+                    name: "coalesce".into(),
+                    args: vec![],
+                },
+                &schema,
+                &row
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn r07_recursive_not_is_null() {
+        let schema = schema();
+        let row = vec![Scalar::Null, Scalar::Dynamic(DynamicValue::Null)];
+        let expr = Expr::Not(Box::new(Expr::IsNull(Box::new(Expr::Column {
+            name: "temp".into(),
+        }))));
+        assert_eq!(eval(&expr, &schema, &row).unwrap(), Scalar::Bool(false));
+        let expr = Expr::IsNotNull(Box::new(Expr::IsNull(Box::new(Expr::Column {
+            name: "temp".into(),
+        }))));
+        assert_eq!(eval(&expr, &schema, &row).unwrap(), Scalar::Bool(true));
     }
 }

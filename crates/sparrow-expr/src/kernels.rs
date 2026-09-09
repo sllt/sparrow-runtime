@@ -15,6 +15,12 @@ pub enum SimplePred {
 }
 
 impl SimplePred {
+    pub fn op(&self) -> BinaryOp {
+        match self {
+            Self::CmpF64 { op, .. } => *op,
+        }
+    }
+
     pub fn from_expr(expr: &Expr) -> Option<Self> {
         match expr {
             Expr::Binary {
@@ -58,13 +64,29 @@ impl SimplePred {
 /// column is missing or non-numeric (NULL → drop, matching filter semantics).
 pub fn filter_mask(pred: &Expr, schema: &Schema, rows: &[Row]) -> Result<Vec<bool>> {
     if let Some(simple) = SimplePred::from_expr(pred) {
+        if matches!(simple.op(), BinaryOp::Eq | BinaryOp::NotEq) {
+            // Integer equality must match evaluator semantics, not f64.
+            return rows
+                .iter()
+                .map(|row| match eval(pred, schema, &row.values)? {
+                    Scalar::Bool(v) => Ok(v),
+                    Scalar::Null => Ok(false),
+                    other => Err(sparrow_model::SparrowError::new(
+                        sparrow_model::ErrorCode::TypeMismatch,
+                        format!("filter must be bool, got {}", other.data_type()),
+                    )),
+                })
+                .collect();
+        }
         let SimplePred::CmpF64 { column, op, thr } = &simple;
         if let Some(idx) = schema.index_of_name(column) {
             return Ok(rows
                 .iter()
-                .map(|row| match row.values.get(idx).and_then(Scalar::as_f64) {
-                    Some(v) => cmp_f64(*op, v, *thr),
-                    None => false,
+                .map(|row| match row.values.get(idx) {
+                    Some(Scalar::Float64(v)) => cmp_f64(*op, *v, *thr),
+                    Some(Scalar::Int64(v)) => cmp_f64(*op, *v as f64, *thr),
+                    Some(Scalar::UInt64(v)) => cmp_f64(*op, *v as f64, *thr),
+                    _ => false,
                 })
                 .collect());
         }
@@ -128,5 +150,38 @@ mod tests {
             vec![false, true, false]
         );
         assert!(SimplePred::from_expr(&pred).is_some());
+    }
+
+    #[test]
+    fn r06_fast_filter_eq_matches_evaluator_for_large_ints() {
+        let schema = Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(FieldId::new(1), "id", DataType::Int64, false)],
+        )
+        .unwrap();
+        let big = 9_007_199_254_740_993i64;
+        let rows = vec![
+            Row {
+                values: vec![Scalar::Int64(big)],
+            },
+            Row {
+                values: vec![Scalar::Int64(big + 1)],
+            },
+        ];
+        let pred = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column { name: "id".into() }),
+            right: Box::new(Expr::Literal(Scalar::Int64(big))),
+        };
+        let mask = filter_mask(&pred, &schema, &rows).unwrap();
+        let evaled: Vec<bool> = rows
+            .iter()
+            .map(|r| match eval(&pred, &schema, &r.values).unwrap() {
+                Scalar::Bool(v) => v,
+                _ => false,
+            })
+            .collect();
+        assert_eq!(mask, evaled);
+        assert_eq!(mask, vec![true, false]);
     }
 }
