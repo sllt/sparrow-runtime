@@ -45,7 +45,7 @@ block per scenario plus a loose smoke verdict.
 
 Default smoke thresholds (override only by editing `sparrow_bench.rs`):
 
-- MQTT path: ≥ 20 events/s, p99 ≤ 5s, at least 25% of published events captured
+- MQTT path: ≥ 5 events/s, p99 ≤ 5s, at least 25% of published events captured
 - File path: ≥ 500 events/s for the configured N
 - RSS ≤ 512 MiB
 

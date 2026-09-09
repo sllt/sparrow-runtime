@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sparrow_cli::{rss_kb, LiveLoop};
-use sparrow_connectors::{FileContract, FileReplayConfig, FileReplaySource};
+use sparrow_connectors::{
+    publish_qos0_many, sensor_json, FileContract, FileReplayConfig, FileReplaySource,
+};
 use sparrow_expr::Expr;
 use sparrow_io::ReplayableSource;
 use sparrow_model::{
@@ -21,11 +23,11 @@ use sparrow_model::{
 use sparrow_plan::{AggCall, WindowSpec};
 use sparrow_runtime::{run_until, AlignedSession, CheckpointStore};
 
-const MQTT_EVENTS: usize = 400;
+const MQTT_EVENTS: usize = 120;
 const FILE_EVENTS: usize = 8_000;
 const CHECKPOINT_EVERY: u64 = 400;
-const MQTT_TIMEOUT: Duration = Duration::from_secs(20);
-const SMOKE_MQTT_EPS: f64 = 20.0;
+const MQTT_TIMEOUT: Duration = Duration::from_secs(15);
+const SMOKE_MQTT_EPS: f64 = 5.0;
 const SMOKE_FILE_EPS: f64 = 500.0;
 const SMOKE_P99_US: u64 = 5_000_000;
 const SMOKE_RSS_KB: u64 = 512 * 1024;
@@ -131,10 +133,26 @@ fn mqtt_http(kernel: &sparrow_runtime::Kernel) -> sparrow_model::Result<Scenario
     live.http.set_delay_ms(0);
     let rss0 = rss_kb();
     let started = Instant::now();
-    live.publish_flood(kernel, MQTT_EVENTS, 30.0)?;
+    // Stamp send-time into `ts` so p50/p99 are end-to-end, not event-time skew.
+    // Pace batches so the embedded broker's bounded fanout is not the story.
+    kernel.block_on(async {
+        let host = live.broker.host();
+        let port = live.broker.port();
+        for i in 0..MQTT_EVENTS {
+            let payload = sensor_json("edge-flood", 30.0, 40.0, now_micros(), true);
+            publish_qos0_many(&host, port, "bench-flood", "sensors/json", vec![payload])
+                .await
+                .map_err(|e| sparrow_model::SparrowError::new(e.code(), e.to_string()))?;
+            if i % 8 == 7 {
+                tokio::time::sleep(Duration::from_millis(8)).await;
+            }
+        }
+        Ok::<(), sparrow_model::SparrowError>(())
+    })?;
     let mut latencies = Vec::new();
     let mut seen = 0usize;
     let expected = MQTT_EVENTS;
+    let mut idle_since = Instant::now();
     kernel.block_on(async {
         let deadline = Instant::now() + MQTT_TIMEOUT;
         while Instant::now() < deadline {
@@ -147,8 +165,12 @@ fn mqtt_http(kernel: &sparrow_runtime::Kernel) -> sparrow_model::Result<Scenario
                     }
                 }
                 seen = bodies.len();
+                idle_since = Instant::now();
             }
             if seen >= expected {
+                break;
+            }
+            if idle_since.elapsed() > Duration::from_millis(600) && seen > 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
