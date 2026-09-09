@@ -45,7 +45,9 @@ curl -s -H "Authorization: Bearer $SPARROW_TOKEN" \
 MQTT/HTTP afterwards. MQTT pipelines are still `restart_fresh`.
 
 File/replay pipelines may set `"recovery":"aligned"` and restore from a
-committed checkpoint only.
+committed checkpoint via the **HTTP API** (`/start`, `/checkpoint`,
+`/restore`, `/kill`). This is **not** exactly-once. MQTT + `aligned` is
+still rejected.
 
 ## Build & test
 
@@ -54,9 +56,12 @@ cargo test --workspace
 
 # V1 process demos (production aligned file checkpoint, MQTT reject, soak, API)
 bash scripts/v1-demo.sh
+bash scripts/review-fix-demo.sh
+bash scripts/bench.sh
 cargo run -p sparrow-cli --bin v1_file_checkpoint -- --data FILE --chk DIR --mode gold
 cargo run -p sparrow-cli --bin v1_mqtt_reject
 cargo run -p sparrow-cli --bin v1_soak
+cargo run -p sparrow-cli --bin sparrow_bench --release
 
 # V0.4 process demos (same File path; policy name is now aligned)
 bash scripts/v04-demo.sh

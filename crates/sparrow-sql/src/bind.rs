@@ -325,6 +325,21 @@ fn map_function(func: &Function) -> Result<Expr> {
             ));
         }
     }
+    match name.to_ascii_lowercase().as_str() {
+        "abs" | "lower" | "upper" | "length" | "char_length" if args.len() != 1 => {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("{name} requires 1 argument, got {}", args.len()),
+            ));
+        }
+        "coalesce" if args.is_empty() => {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "coalesce requires at least 1 argument",
+            ));
+        }
+        _ => {}
+    }
     Ok(Expr::Call { name, args })
 }
 
@@ -448,6 +463,92 @@ mod tests {
             .nodes
             .iter()
             .any(|n| matches!(n.kind, BoundKind::Project { .. })));
+    }
+
+    fn join_catalog() -> Catalog {
+        let mut c = catalog();
+        c.insert(
+            "devices",
+            Schema::new(
+                SchemaId::new(2),
+                vec![
+                    Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+                    Field::new(FieldId::new(2), "site", DataType::Utf8, true),
+                ],
+            )
+            .unwrap(),
+        );
+        c
+    }
+
+    #[test]
+    fn r08_join_where_is_applied_not_dropped() {
+        let plan = bind_sql(
+            "SELECT * FROM sensor_readings JOIN devices ON device_id = device_id WHERE temperature > 25",
+            &join_catalog(),
+            PipelineId::new(1),
+            RevisionId::new(1),
+        )
+        .unwrap();
+        assert!(
+            plan.nodes
+                .iter()
+                .any(|n| matches!(n.kind, BoundKind::Filter { .. })),
+            "JOIN WHERE must produce a Filter node: {:?}",
+            plan.nodes.iter().map(|n| format!("{:?}", n.kind)).collect::<Vec<_>>()
+        );
+        assert!(plan
+            .nodes
+            .iter()
+            .any(|n| matches!(n.kind, BoundKind::Lookup { .. })));
+    }
+
+    #[test]
+    fn r07_empty_abs_rejected_at_bind() {
+        let err = bind_sql(
+            "SELECT abs() FROM sensor_readings",
+            &catalog(),
+            PipelineId::new(1),
+            RevisionId::new(1),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn r09_window_select_keeps_alias_order() {
+        let plan = bind_sql(
+            "SELECT AVG(temperature) AS avg_t, device_id FROM sensor_readings GROUP BY device_id, TUMBLE(PROCESSING_TIME, INTERVAL '1' SECOND)",
+            &catalog(),
+            PipelineId::new(1),
+            RevisionId::new(1),
+        )
+        .unwrap();
+        let project = plan.nodes.iter().find_map(|n| match &n.kind {
+            BoundKind::Project { exprs, output, .. } => Some((exprs, output)),
+            _ => None,
+        });
+        let Some((exprs, output)) = project else {
+            panic!("window SELECT must apply a final projection");
+        };
+        assert_eq!(output.fields[0].name, "avg_t");
+        assert_eq!(output.fields[1].name, "device_id");
+        assert!(matches!(exprs[0], Expr::Column { .. }));
+    }
+
+    #[test]
+    fn r09_window_without_agg_is_rejected() {
+        let err = bind_sql(
+            "SELECT device_id FROM sensor_readings GROUP BY device_id, TUMBLE(PROCESSING_TIME, INTERVAL '1' SECOND)",
+            &catalog(),
+            PipelineId::new(1),
+            RevisionId::new(1),
+        )
+        .unwrap_err();
+        assert!(
+            err.code == ErrorCode::FeatureUnavailable || err.message.contains("aggregate"),
+            "{err}"
+        );
     }
 
     #[test]

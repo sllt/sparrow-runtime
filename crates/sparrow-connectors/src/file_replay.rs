@@ -24,12 +24,22 @@ const PREFIX: usize = 4096;
 const MAX_RECORD: usize = 64 * 1024;
 const MAX_PENDING: usize = MAX_RECORD;
 
+/// How the file may change after a checkpoint cut (R28).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileContract {
+    /// Size and content fingerprint must match exactly.
+    Immutable,
+    /// The file may grow; bytes `[0, cut)` must stay identical.
+    AppendOnly,
+}
+
 #[derive(Clone, Debug)]
 pub struct FileReplayConfig {
     pub path: PathBuf,
     pub schema: Schema,
     pub restore: RestoreClaim,
     pub recovery: RecoveryPolicy,
+    pub contract: FileContract,
 }
 
 impl FileReplayConfig {
@@ -39,6 +49,7 @@ impl FileReplayConfig {
             schema,
             restore: RestoreClaim::None,
             recovery: RecoveryPolicy::RestartFresh,
+            contract: FileContract::Immutable,
         }
     }
 
@@ -67,6 +78,7 @@ pub struct FileReplaySource {
     record_index: u64,
     pending: Vec<u8>,
     codec: JsonCodec,
+    contract: FileContract,
 }
 
 impl FileReplaySource {
@@ -80,14 +92,13 @@ impl FileReplaySource {
         let mut f = File::open(&path).map_err(|e| {
             ConnectorError::new(ErrorCode::InvalidArgument, format!("open {}: {e}", path.display()))
         })?;
-        let mut prefix = vec![0u8; PREFIX.min(size as usize)];
-        f.read_exact(&mut prefix).map_err(|e| {
+        let fingerprint = content_fingerprint(&mut f, size).map_err(|e| {
             ConnectorError::new(ErrorCode::Internal, format!("fingerprint {}: {e}", path.display()))
         })?;
         f.seek(SeekFrom::Start(0)).map_err(|e| {
             ConnectorError::new(ErrorCode::Internal, format!("rewind {}: {e}", path.display()))
         })?;
-        let identity = SourceIdentity::file(path.to_string_lossy().into_owned(), size, fnv1a64(&prefix));
+        let identity = SourceIdentity::file(path.to_string_lossy().into_owned(), size, fingerprint);
         Ok(Self {
             path,
             identity,
@@ -96,6 +107,7 @@ impl FileReplaySource {
             record_index: 0,
             pending: Vec::new(),
             codec: JsonCodec::new(cfg.schema.clone()),
+            contract: cfg.contract,
         })
     }
 
@@ -121,17 +133,13 @@ impl FileReplaySource {
                 format!("reopen {}: {e}", self.path.display()),
             )
         })?;
-        let n = PREFIX.min(size as usize);
-        let mut prefix = vec![0u8; n];
-        if n > 0 {
-            f.read_exact(&mut prefix).map_err(|e| {
-                ConnectorError::new(ErrorCode::UnsupportedRestore, format!("fingerprint: {e}"))
-            })?;
-        }
+        let fingerprint = content_fingerprint(&mut f, size).map_err(|e| {
+            ConnectorError::new(ErrorCode::UnsupportedRestore, format!("fingerprint: {e}"))
+        })?;
         Ok(SourceIdentity::file(
             self.path.to_string_lossy().into_owned(),
             size,
-            fnv1a64(&prefix),
+            fingerprint,
         ))
     }
 
@@ -143,17 +151,75 @@ impl FileReplaySource {
                 "file path identity mismatch",
             ));
         }
-        if stored.fingerprint != live.fingerprint {
-            return Err(ConnectorError::new(
-                ErrorCode::UnsupportedRestore,
-                format!(
-                    "file '{}' was replaced or rotated (fingerprint changed)",
-                    self.path.display()
-                ),
-            ));
+        match self.contract {
+            FileContract::Immutable => {
+                if stored.size != live.size || stored.fingerprint != live.fingerprint {
+                    return Err(ConnectorError::new(
+                        ErrorCode::UnsupportedRestore,
+                        format!(
+                            "file '{}' was replaced or rotated (immutable contract)",
+                            self.path.display()
+                        ),
+                    ));
+                }
+            }
+            FileContract::AppendOnly => {
+                if live.size < stored.size {
+                    return Err(ConnectorError::new(
+                        ErrorCode::UnsupportedRestore,
+                        format!(
+                            "file '{}' truncated under append contract ({} < {})",
+                            self.path.display(),
+                            live.size,
+                            stored.size
+                        ),
+                    ));
+                }
+                let mut f = File::open(&self.path).map_err(|e| {
+                    ConnectorError::new(ErrorCode::UnsupportedRestore, format!("reopen: {e}"))
+                })?;
+                let cut_fp = content_fingerprint(&mut f, stored.size).map_err(|e| {
+                    ConnectorError::new(ErrorCode::UnsupportedRestore, format!("cut fingerprint: {e}"))
+                })?;
+                if cut_fp != stored.fingerprint {
+                    return Err(ConnectorError::new(
+                        ErrorCode::UnsupportedRestore,
+                        format!(
+                            "file '{}' prefix before cut changed (append contract)",
+                            self.path.display()
+                        ),
+                    ));
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// Prefix + mid + suffix + size. First 4KiB alone is not enough (R28).
+fn content_fingerprint(file: &mut File, size: u64) -> std::io::Result<u64> {
+    let mut mix = Vec::new();
+    mix.extend_from_slice(&size.to_le_bytes());
+    let windows = [
+        0u64,
+        size / 2,
+        size.saturating_sub(PREFIX as u64),
+    ];
+    for start in windows {
+        if size == 0 {
+            break;
+        }
+        let start = start.min(size.saturating_sub(1));
+        file.seek(SeekFrom::Start(start))?;
+        let n = PREFIX.min(size.saturating_sub(start) as usize);
+        let mut buf = vec![0u8; n];
+        if n > 0 {
+            file.read_exact(&mut buf)?;
+        }
+        mix.extend_from_slice(&start.to_le_bytes());
+        mix.extend_from_slice(&fnv1a64(&buf).to_le_bytes());
+    }
+    Ok(fnv1a64(&mix))
 }
 
 impl RecordSource for FileReplaySource {
@@ -343,6 +409,63 @@ mod tests {
         let mut pos = src.position();
         pos.offset_bytes = 3;
         assert_eq!(src.seek(&pos).unwrap_err().code, ErrorCode::InvalidArgument);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn r28_identity_sees_bytes_after_first_4kib() {
+        let path_a = tmp("id-a");
+        let path_b = tmp("id-b");
+        let mut a = vec![b'A'; 8192];
+        a[8000] = b'X';
+        let mut b = vec![b'A'; 8192];
+        b[8000] = b'Y';
+        std::fs::write(&path_a, &a).unwrap();
+        std::fs::write(&path_b, &b).unwrap();
+        let sa = FileReplaySource::open(&FileReplayConfig::new(&path_a, schema())).unwrap();
+        let sb = FileReplaySource::open(&FileReplayConfig::new(&path_b, schema())).unwrap();
+        assert_ne!(
+            sa.identity().fingerprint,
+            sb.identity().fingerprint,
+            "files that differ after 4KiB must not share a fingerprint"
+        );
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn r28_append_contract_allows_growth() {
+        let path = tmp("append");
+        std::fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n").unwrap();
+        let mut cfg = FileReplayConfig::new(&path, schema());
+        cfg.contract = FileContract::AppendOnly;
+        let mut src = FileReplaySource::open(&cfg).unwrap();
+        let pos = src.position();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n",
+        )
+        .unwrap();
+        src.seek(&pos).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn r28_immutable_rejects_append() {
+        let path = tmp("imm");
+        std::fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n").unwrap();
+        let cfg = FileReplayConfig::new(&path, schema());
+        let mut src = FileReplaySource::open(&cfg).unwrap();
+        let pos = src.position();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            src.seek(&pos).unwrap_err().code,
+            ErrorCode::UnsupportedRestore
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

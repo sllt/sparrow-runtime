@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Process / API evidence for the static-review fix set (R01–R28 / V01–V03).
+# Covers the failure/edge matrix, not only happy-path units.
+# cargo test accepts only ONE TESTNAME filter per invocation.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+run_filter() {
+  local filter="$1"
+  echo "== filter ${filter} =="
+  cargo test --workspace "${filter}" -- --test-threads=8
+}
+
+echo "== named rxx/vxx regressions (one cargo filter each) =="
+for f in r01_ r02_ r03_ r04_ r05_ r06_ r07_ r08_ r09_ r10_ \
+         r11_ r12_ r13_ r14_ r15_ r16_ r17_ r18_ r19_ r20_ \
+         r21_ r22_ r23_ r24_ r25_ r26_ r27_ r28_ v01_ v02_ v03_; do
+  run_filter "$f"
+done
+
+echo "== HTTP API recovery + metrics (review_api integration) =="
+cargo test -p sparrow-server --test review_api -- --nocapture
+
+echo "== review-fix-demo: ok =="

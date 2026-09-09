@@ -44,21 +44,59 @@ pub async fn write_packet(stream: &mut MqttStream, packet: &Packet) -> Result<()
         .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("MQTT flush: {e}")))
 }
 
-pub async fn read_packet(stream: &mut MqttStream) -> Result<Packet> {
-    let mut first = [0u8; 1];
-    stream
-        .read_exact(&mut first)
-        .await
-        .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("MQTT read header: {e}")))?;
+/// Cancel-safe framed reader. Bytes already pulled from the socket stay in
+/// `buf` when a `select!` branch (ping / cancel) wins (R19).
+#[derive(Default)]
+pub struct MqttFramedReader {
+    buf: Vec<u8>,
+}
+
+impl MqttFramedReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn next(&mut self, stream: &mut MqttStream) -> Result<Packet> {
+        loop {
+            if let Some(pkt) = try_decode_frame(&mut self.buf)? {
+                return Ok(pkt);
+            }
+            let mut tmp = [0u8; 1024];
+            let n = stream.read(&mut tmp).await.map_err(|e| {
+                ConnectorError::new(ErrorCode::Internal, format!("MQTT read: {e}"))
+            })?;
+            if n == 0 {
+                return Err(ConnectorError::new(
+                    ErrorCode::Internal,
+                    "MQTT connection closed",
+                ));
+            }
+            self.buf.extend_from_slice(&tmp[..n]);
+            if self.buf.len() > MAX_PACKET_BYTES + 8 {
+                return Err(ConnectorError::new(
+                    ErrorCode::MaxRecordSize,
+                    "MQTT framed buffer exceeded",
+                ));
+            }
+        }
+    }
+}
+
+fn try_decode_frame(buf: &mut Vec<u8>) -> Result<Option<Packet>> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let first = buf[0];
+    let mut used = 1usize;
     let mut len_buf = Vec::new();
     loop {
-        let mut b = [0u8; 1];
-        stream
-            .read_exact(&mut b)
-            .await
-            .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("MQTT read length: {e}")))?;
-        len_buf.push(b[0]);
-        if b[0] & 0x80 == 0 {
+        if used >= buf.len() {
+            return Ok(None);
+        }
+        let b = buf[used];
+        used += 1;
+        len_buf.push(b);
+        if b & 0x80 == 0 {
             break;
         }
         if len_buf.len() > 4 {
@@ -75,12 +113,42 @@ pub async fn read_packet(stream: &mut MqttStream) -> Result<Packet> {
             format!("MQTT packet {len}B exceeds {MAX_PACKET_BYTES}"),
         ));
     }
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("MQTT read payload: {e}")))?;
+    if buf.len() < used + len {
+        return Ok(None);
     }
-    decode(first[0], &payload)
+    let payload = buf[used..used + len].to_vec();
+    let pkt = decode(first, &payload)?;
+    buf.drain(..used + len);
+    Ok(Some(pkt))
+}
+
+/// Read the next packet using a **persistent** framed reader.
+///
+/// Creating a new `MqttFramedReader` per call drops bytes already pulled from
+/// the socket when TCP coalesces multiple MQTT packets (R19).
+pub async fn read_packet(
+    reader: &mut MqttFramedReader,
+    stream: &mut MqttStream,
+) -> Result<Packet> {
+    reader.next(stream).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mqtt::codec::encode;
+    use crate::mqtt::codec::Packet;
+
+    #[test]
+    fn r19_partial_frame_is_retained() {
+        let pkt = Packet::PingResp;
+        let bytes = encode(&pkt).unwrap();
+        let mut buf = bytes[..1].to_vec();
+        assert!(try_decode_frame(&mut buf).unwrap().is_none());
+        assert_eq!(buf.len(), 1, "half-frame must stay in the reader buffer");
+        buf.extend_from_slice(&bytes[1..]);
+        let got = try_decode_frame(&mut buf).unwrap().unwrap();
+        assert!(matches!(got, Packet::PingResp));
+        assert!(buf.is_empty());
+    }
 }

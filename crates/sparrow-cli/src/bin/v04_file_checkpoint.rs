@@ -94,6 +94,7 @@ fn run() -> sparrow_model::Result<()> {
             snapshot_id: "aligned".into(),
         },
         recovery: RecoveryPolicy::Aligned,
+        contract: sparrow_connectors::FileContract::Immutable,
     };
     let mut source = FileReplaySource::open(&cfg).map_err(|e| {
         sparrow_model::SparrowError::new(e.code(), e.to_string())

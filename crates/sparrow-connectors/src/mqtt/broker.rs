@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::codec::{Connect, Packet, Publish};
-use super::io::{read_packet, write_packet, MqttStream};
+use super::io::{read_packet, write_packet, MqttFramedReader, MqttStream};
 use crate::error::{ConnectorError, Result};
 
 const PER_CONN_OUTBOX: usize = 32;
@@ -119,9 +119,10 @@ impl EmbeddedBroker {
 async fn handle_conn(stream: TcpStream, hub: Hub, cancel: CancellationToken) -> Result<()> {
     let _ = stream.set_nodelay(true);
     let mut stream: MqttStream = Box::pin(stream);
+    let mut reader = MqttFramedReader::new();
     let first = tokio::select! {
         _ = cancel.cancelled() => return Ok(()),
-        p = read_packet(&mut stream) => p?,
+        p = read_packet(&mut reader, &mut stream) => p?,
     };
     let Packet::Connect(Connect { .. }) = first else {
         return Err(ConnectorError::new(
@@ -143,7 +144,7 @@ async fn handle_conn(stream: TcpStream, hub: Hub, cancel: CancellationToken) -> 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            incoming = read_packet(&mut stream) => {
+            incoming = read_packet(&mut reader, &mut stream) => {
                 match incoming {
                     Ok(Packet::Subscribe { packet_id, topics }) => {
                         let mut codes = Vec::new();
@@ -217,7 +218,8 @@ pub async fn publish_qos0_many(
         }),
     )
     .await?;
-    match read_packet(&mut stream).await? {
+    let mut reader = MqttFramedReader::new();
+    match read_packet(&mut reader, &mut stream).await? {
         Packet::ConnAck { return_code: 0, .. } => {}
         other => {
             return Err(ConnectorError::new(
@@ -253,5 +255,21 @@ mod tests {
         assert!(topic_matches("sensors/json", "sensors/json"));
         assert!(topic_matches("sensors/#", "sensors/json"));
         assert!(!topic_matches("other", "sensors/json"));
+    }
+
+    #[tokio::test]
+    async fn r19_coalesced_publishes_are_not_dropped() {
+        let broker = EmbeddedBroker::start().await.unwrap();
+        let payloads: Vec<Vec<u8>> = (0..48).map(|i| format!("{i}").into_bytes()).collect();
+        publish_qos0_many(
+            &broker.host(),
+            broker.port(),
+            "flood",
+            "sensors/json",
+            payloads,
+        )
+        .await
+        .expect("broker must accept a coalesced QoS0 flood without resetting the publisher");
+        broker.stop().await;
     }
 }

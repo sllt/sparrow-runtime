@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::codec::{Connect, Packet, Publish};
-use super::io::{connect_plain, read_packet, write_packet};
+use super::io::{connect_plain, read_packet, write_packet, MqttFramedReader};
 use crate::capabilities::{
     refuse_dirty_session, refuse_durable_recovery, refuse_qos_durable, ConnectorCapabilities,
 };
@@ -140,7 +140,8 @@ impl MqttSink {
             }),
         )
         .await?;
-        match read_packet(&mut stream).await? {
+        let mut reader = MqttFramedReader::new();
+        match read_packet(&mut reader, &mut stream).await? {
             Packet::ConnAck { return_code: 0, .. } => {}
             other => {
                 return Err(ConnectorError::new(

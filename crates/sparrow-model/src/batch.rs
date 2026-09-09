@@ -37,10 +37,13 @@ impl Row {
 }
 
 /// Row-oriented batch. Layout is provisional (G1a).
+///
+/// Rows are `Arc` so [`RowBatch::share`] does not clone payloads. Detach
+/// copies onto a new physical allocation.
 #[derive(Debug)]
 pub struct RowBatch {
     schema: Arc<Schema>,
-    rows: Vec<Row>,
+    rows: Arc<Vec<Row>>,
     lease: MemoryLease,
 }
 
@@ -54,7 +57,7 @@ impl RowBatch {
     }
 
     pub fn rows(&self) -> &[Row] {
-        &self.rows
+        self.rows.as_slice()
     }
 
     pub fn lease(&self) -> &MemoryLease {
@@ -65,11 +68,11 @@ impl RowBatch {
         self.lease.bytes()
     }
 
-    /// Fan-out: same physical allocation, extra handle.
+    /// Fan-out: same physical allocation, extra handle. Row payload is shared.
     pub fn share(&self) -> Self {
         Self {
             schema: Arc::clone(&self.schema),
-            rows: self.rows.clone(),
+            rows: Arc::clone(&self.rows),
             lease: self.lease.share(),
         }
     }
@@ -80,13 +83,14 @@ impl RowBatch {
         let lease = self.lease.detach(kind)?;
         Ok(Self {
             schema: Arc::clone(&self.schema),
-            rows,
+            rows: Arc::new(rows),
             lease,
         })
     }
 
     pub fn into_rows(self) -> (Arc<Schema>, Vec<Row>, MemoryLease) {
-        (self.schema, self.rows, self.lease)
+        let rows = Arc::try_unwrap(self.rows).unwrap_or_else(|a| (*a).clone());
+        (self.schema, rows, self.lease)
     }
 }
 
@@ -157,6 +161,15 @@ impl RowBatchBuilder {
             ));
         }
         for (value, field) in row.values.iter().zip(self.schema.fields.iter()) {
+            if value.is_null() && !field.nullable {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    format!(
+                        "field '{}' is non-nullable but the row has Null",
+                        field.name
+                    ),
+                ));
+            }
             if !value.is_null()
                 && value.data_type() != field.data_type
                 && !matches!(field.data_type, DataType::Dynamic)
@@ -201,7 +214,7 @@ impl RowBatchBuilder {
         let lease = self.owner.acquire(self.kind, bytes)?;
         Ok(RowBatch {
             schema: self.schema,
-            rows: self.rows,
+            rows: Arc::new(self.rows),
             lease,
         })
     }
@@ -262,6 +275,38 @@ mod tests {
         }
         assert!(owner.peak_builder_bytes() <= 80 + 64);
         assert!(pushes < 8);
+    }
+
+    #[test]
+    fn r07_nonnullable_null_rejected_at_batch_build() {
+        let owner = pool();
+        let mut b = RowBatchBuilder::new(schema(), Arc::clone(&owner), CreditKind::Reservation, 4, 1024)
+            .unwrap();
+        let err = b
+            .push(Row {
+                values: vec![Scalar::Null, Scalar::utf8("x")],
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::TypeMismatch);
+        assert!(err.message.contains("non-nullable"));
+    }
+
+    #[test]
+    fn r04_share_does_not_clone_row_payload() {
+        let owner = pool();
+        let mut b = RowBatchBuilder::new(schema(), Arc::clone(&owner), CreditKind::Reservation, 4, 1024)
+            .unwrap();
+        b.push(Row {
+            values: vec![Scalar::Int64(7), Scalar::utf8("edge")],
+        })
+        .unwrap();
+        let live = b.finish().unwrap();
+        let shared = live.share();
+        assert_eq!(live.lease().alloc_id(), shared.lease().alloc_id());
+        assert_eq!(owner.usage().physical_bytes, live.tracked_bytes());
+        drop(shared);
+        drop(live);
+        assert_eq!(owner.usage().physical_bytes, 0);
     }
 
     #[test]

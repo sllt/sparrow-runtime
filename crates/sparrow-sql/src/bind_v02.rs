@@ -67,15 +67,17 @@ fn bind_select_v02(
     }
 
     if let Some(spec) = window_from_group(&select.group_by, &select.projection, &source_schema)? {
-        return bind_window_linear(
+        let mut plan = bind_window_linear(
             pipeline,
             revision,
             stream,
-            source_schema,
+            source_schema.clone(),
             filter,
             spec,
             "capture".into(),
-        );
+        )?;
+        apply_window_select(&mut plan, &select.projection)?;
+        return Ok(plan);
     }
 
     // Fallback: projection-only (should have been G0).
@@ -139,8 +141,16 @@ fn bind_join(
         "capture".into(),
     )?;
     if let Some(predicate) = filter {
-        // insert filter after source
-        let _ = predicate;
+        let lookup_out = plan
+            .nodes
+            .iter()
+            .find_map(|n| match &n.kind {
+                BoundKind::Lookup { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| source_schema.clone());
+        sparrow_plan::validate_predicate(&predicate, &lookup_out)?;
+        insert_filter_before_sink(&mut plan, predicate)?;
     }
     // If SELECT is not *, project after lookup.
     if !matches!(select.projection.first(), Some(SelectItem::Wildcard(_))) {
@@ -164,6 +174,13 @@ fn bind_join(
         insert_project_before_sink(&mut plan, exprs, output)?;
     }
     Ok(plan)
+}
+
+pub(crate) fn insert_filter_before_sink_pub(
+    plan: &mut BoundLogicalPlan,
+    predicate: Expr,
+) -> Result<()> {
+    insert_filter_before_sink(plan, predicate)
 }
 
 pub(crate) fn insert_project_before_sink_pub(
@@ -224,7 +241,10 @@ fn insert_project_before_sink(
 
 fn join_keys(op: &JoinOperator) -> Result<(String, String)> {
     let on = match op {
-        JoinOperator::Inner(JoinConstraint::On(e)) | JoinOperator::LeftOuter(JoinConstraint::On(e)) => e,
+        JoinOperator::Join(JoinConstraint::On(e))
+        | JoinOperator::Inner(JoinConstraint::On(e))
+        | JoinOperator::Left(JoinConstraint::On(e))
+        | JoinOperator::LeftOuter(JoinConstraint::On(e)) => e,
         _ => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
@@ -414,9 +434,135 @@ fn aggs_from_projection(projection: &[SelectItem], _schema: &Schema) -> Result<V
         }
     }
     if aggs.is_empty() {
-        aggs.push(AggCall::count_star("count"));
+        return Err(SparrowError::new(
+            ErrorCode::FeatureUnavailable,
+            "window SELECT must include an aggregate; default COUNT is not invented",
+        ));
     }
     Ok(aggs)
+}
+
+pub(crate) fn apply_window_select_pub(
+    plan: &mut BoundLogicalPlan,
+    projection: &[SelectItem],
+) -> Result<()> {
+    apply_window_select(plan, projection)
+}
+
+fn apply_window_select(plan: &mut BoundLogicalPlan, projection: &[SelectItem]) -> Result<()> {
+    if matches!(projection.first(), Some(SelectItem::Wildcard(_))) {
+        return Ok(());
+    }
+    let win_out = plan
+        .nodes
+        .iter()
+        .find_map(|n| match &n.kind {
+            BoundKind::WindowAgg { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "window plan missing output"))?;
+    let mut exprs = Vec::new();
+    let mut names = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::UnnamedExpr(e) => {
+                let (expr, name) = window_select_item(e, None, &win_out)?;
+                exprs.push(expr);
+                names.push(name);
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let (e, _) = window_select_item(expr, Some(&alias.value), &win_out)?;
+                exprs.push(e);
+                names.push(alias.value.clone());
+            }
+            SelectItem::Wildcard(_) => {
+                return Err(SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "mixed wildcard in window SELECT is not supported",
+                ));
+            }
+            _ => {
+                return Err(SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "unsupported window SELECT item",
+                ));
+            }
+        }
+    }
+    if exprs.is_empty() {
+        return Ok(());
+    }
+    let fields: Result<Vec<(String, DataType, bool)>> = exprs
+        .iter()
+        .zip(names.iter())
+        .map(|(e, n)| Ok((n.clone(), infer_type(e, &win_out)?, true)))
+        .collect();
+    let output = project_schema(SchemaId::new(4), &fields?)?;
+    insert_project_before_sink(plan, exprs, output)
+}
+
+fn window_select_item(
+    e: &SqlExpr,
+    alias: Option<&str>,
+    win_out: &Schema,
+) -> Result<(Expr, String)> {
+    if let Some(agg) = agg_from_expr(e, alias.unwrap_or("expr"))? {
+        let name = alias.unwrap_or(&agg.alias).to_string();
+        if win_out.field_by_name(&agg.alias).is_none() && win_out.field_by_name(&name).is_none() {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                format!("window SELECT aggregate '{name}' is not in the window output"),
+            ));
+        }
+        let col = if win_out.field_by_name(&agg.alias).is_some() {
+            agg.alias
+        } else {
+            name.clone()
+        };
+        return Ok((Expr::Column { name: col }, name));
+    }
+    if let Ok(col) = col_name(e) {
+        if win_out.field_by_name(&col).is_none() {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                format!(
+                    "window SELECT column '{col}' is not a group key, window bound, or aggregate alias"
+                ),
+            ));
+        }
+        return Ok((
+            Expr::Column { name: col.clone() },
+            alias.unwrap_or(&col).to_string(),
+        ));
+    }
+    Err(SparrowError::new(
+        ErrorCode::FeatureUnavailable,
+        "unsupported window SELECT projection",
+    ))
+}
+
+fn insert_filter_before_sink(plan: &mut BoundLogicalPlan, predicate: Expr) -> Result<()> {
+    let sink_idx = plan
+        .nodes
+        .iter()
+        .position(|n| matches!(n.kind, BoundKind::CaptureSink { .. }))
+        .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "no sink"))?;
+    let pred_id = plan.nodes[sink_idx - 1].id;
+    let sink_id = plan.nodes[sink_idx].id;
+    let fid = sparrow_model::OperatorId::new(sink_id.raw() + 40);
+    let input = plan.nodes[sink_idx - 1].kind.output_schema().clone();
+    if let Some(n) = plan.nodes.iter_mut().find(|n| n.id == pred_id) {
+        n.downstream = vec![fid];
+    }
+    plan.nodes.insert(
+        sink_idx,
+        sparrow_plan::BoundNode {
+            id: fid,
+            kind: BoundKind::Filter { predicate, input },
+            downstream: vec![sink_id],
+        },
+    );
+    Ok(())
 }
 
 fn agg_from_expr(e: &SqlExpr, alias: &str) -> Result<Option<AggCall>> {

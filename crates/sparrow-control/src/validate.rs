@@ -170,7 +170,7 @@ pub fn validate_io(
     match spec.source.kind.as_str() {
         "mqtt" => {
             refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
-            let mqtt = mqtt_config(&spec.source, schema.clone(), demo)?;
+            let mqtt = mqtt_config(&spec.source, schema.clone(), demo, "validate")?;
             mqtt.validate(secrets, policy).map_err(io)?;
         }
         "http_push" => {
@@ -222,6 +222,7 @@ pub fn mqtt_config(
     source: &SourceSpec,
     schema: Schema,
     demo: Option<&DemoEndpoints>,
+    instance_id: &str,
 ) -> Result<MqttSourceConfig> {
     refuse_qos_durable(source.qos).map_err(io)?;
     if source.skip_verify {
@@ -249,10 +250,16 @@ pub fn mqtt_config(
     };
     let mut cfg = MqttSourceConfig::demo(host, port, schema);
     cfg.topic = source.topic.clone();
-    cfg.client_id = source
-        .client_id
-        .clone()
-        .unwrap_or_else(|| "sparrow-source".into());
+    cfg.client_id = source.client_id.clone().unwrap_or_else(|| {
+        format!(
+            "sparrow-{instance_id}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    });
     cfg.qos = source.qos;
     cfg.clean_session = source.clean_session;
     cfg.username_secret = source.username_secret.clone();
@@ -484,6 +491,7 @@ mod tests {
             delivery: "at_least_once".into(),
             recovery: "restart_fresh".into(),
             restore: None,
+            checkpoint_dir: None,
         };
         assert_eq!(
             spec.check_delivery().unwrap_err().code,
@@ -511,5 +519,42 @@ mod tests {
         let g = effective_guarantees(&spec);
         assert_eq!(g["recovery"], "aligned");
         assert_eq!(g["recovery_risk"], "committed_checkpoint_only");
+    }
+
+    #[test]
+    fn v02_default_mqtt_client_id_is_unique_per_instance() {
+        let src = SourceSpec {
+            kind: "mqtt".into(),
+            host: Some("127.0.0.1".into()),
+            port: Some(1883),
+            topic: "t".into(),
+            client_id: None,
+            qos: 0,
+            clean_session: true,
+            username_secret: None,
+            password_secret: None,
+            skip_verify: false,
+            inbox_capacity: 8,
+            use_demo_io: false,
+            bind: None,
+            path: None,
+        };
+        let schema = Schema::new(
+            SchemaId::new(1),
+            vec![sparrow_model::Field::new(
+                sparrow_model::FieldId::new(1),
+                "device_id",
+                sparrow_model::DataType::Utf8,
+                false,
+            )],
+        )
+        .unwrap();
+        let a = mqtt_config(&src, schema.clone(), None, "pipe-a").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let b = mqtt_config(&src, schema, None, "pipe-b").unwrap();
+        assert_ne!(a.client_id, b.client_id);
+        assert!(a.client_id.contains("pipe-a"));
+        assert!(b.client_id.contains("pipe-b"));
+        assert!(!a.client_id.eq("sparrow-source"));
     }
 }

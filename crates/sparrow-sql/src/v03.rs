@@ -129,7 +129,9 @@ fn join_reject(from: &TableWithJoins) -> Result<Option<G0Verdict>> {
                     "FULL/RIGHT/CROSS JOIN is not part of V0.3 (stream-stream join is out)",
                 )));
             }
-            JoinOperator::Inner(JoinConstraint::On(_))
+            JoinOperator::Join(JoinConstraint::On(_))
+            | JoinOperator::Inner(JoinConstraint::On(_))
+            | JoinOperator::Left(JoinConstraint::On(_))
             | JoinOperator::LeftOuter(JoinConstraint::On(_)) => {}
             _ => {
                 return Ok(Some(rejected(

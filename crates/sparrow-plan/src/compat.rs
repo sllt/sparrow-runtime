@@ -62,6 +62,8 @@ pub struct PlanLayout {
     pub where_fingerprint: u64,
     pub table_name: Option<String>,
     pub table_revision: Option<u64>,
+    /// Fingerprint of window size / slide / duration (R12).
+    pub window_params_fingerprint: u64,
 }
 
 impl PlanLayout {
@@ -78,13 +80,26 @@ impl PlanLayout {
             aggs: spec
                 .aggs
                 .iter()
-                .map(|a| format!("{}:{}", a.func.as_str(), a.alias))
+                .map(|a| {
+                    let input = a
+                        .input
+                        .as_ref()
+                        .map(|e| format!("{e:?}"))
+                        .unwrap_or_else(|| "*".into());
+                    let ty = a
+                        .input
+                        .as_ref()
+                        .map(|e| format!("{e:?}"))
+                        .unwrap_or_default();
+                    format!("{}:{}:{input}:{ty}", a.func.as_str(), a.alias)
+                })
                 .collect(),
             event_time_field: spec.event_time_field.clone(),
             lateness_micros: spec.lateness_micros,
             where_fingerprint: 0,
             table_name: None,
             table_revision: None,
+            window_params_fingerprint: window_params_fingerprint(&spec.kind),
         }
     }
 
@@ -124,9 +139,12 @@ pub fn decide_state_reuse(saved: &PlanLayout, live: &PlanLayout) -> StateReuse {
             ),
         };
     }
-    if saved.window_kind != live.window_kind {
+    if saved.window_kind != live.window_kind
+        || saved.window_params_fingerprint != live.window_params_fingerprint
+    {
         return StateReuse::Reject {
-            reason: "window kind is not a white-listed compatible change".into(),
+            reason: "window kind or size/slide/duration is not a white-listed compatible change"
+                .into(),
         };
     }
     if saved.keys != live.keys || saved.aggs != live.aggs {
@@ -160,6 +178,19 @@ pub fn decide_state_reuse(saved: &PlanLayout, live: &PlanLayout) -> StateReuse {
         };
     }
     StateReuse::Reuse
+}
+
+pub fn window_params_fingerprint(kind: &WindowKind) -> u64 {
+    let s = match kind {
+        WindowKind::TumblingProcessingTime { size_micros } => format!("pt:{size_micros}"),
+        WindowKind::Count { size } => format!("count:{size}"),
+        WindowKind::TumblingEventTime { size_micros } => format!("et:{size_micros}"),
+        WindowKind::HoppingEventTime {
+            size_micros,
+            slide_micros,
+        } => format!("hop:{size_micros}:{slide_micros}"),
+    };
+    fnv1a64(s.as_bytes())
 }
 
 pub fn window_kind_tag(kind: WindowKind) -> u8 {
@@ -233,6 +264,40 @@ mod tests {
         assert!(matches!(
             decide_state_reuse(&saved, &live),
             StateReuse::ResetReplay { .. }
+        ));
+    }
+
+    #[test]
+    fn r12_window_size_change_is_reject() {
+        let saved = layout();
+        let mut live = layout();
+        live.window_params_fingerprint = window_params_fingerprint(&WindowKind::Count { size: 9 });
+        assert!(matches!(
+            decide_state_reuse(&saved, &live),
+            StateReuse::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn r12_agg_input_change_is_reject() {
+        let saved = layout();
+        let mut live = PlanLayout::from_window(
+            OperatorId::new(2),
+            StateSlotId::new(1),
+            &WindowSpec::new(
+                WindowKind::Count { size: 3 },
+                vec!["device_id".into()],
+                vec![AggCall::new(
+                    AggFn::Sum,
+                    Some(Expr::Column { name: "v2".into() }),
+                    "s",
+                )],
+            ),
+        );
+        live.operator = saved.operator;
+        assert!(matches!(
+            decide_state_reuse(&saved, &live),
+            StateReuse::Reject { .. }
         ));
     }
 

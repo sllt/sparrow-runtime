@@ -62,10 +62,25 @@ pub fn infer_type(expr: &Expr, schema: &Schema) -> Result<DataType> {
 
 fn eval_call_sig(
     name: &str,
-    _argc: usize,
+    argc: usize,
     schema: &Schema,
     args: &[Expr],
 ) -> Result<DataType> {
+    match name.to_ascii_lowercase().as_str() {
+        "abs" | "lower" | "upper" | "length" | "char_length" if argc != 1 => {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("{name} requires 1 argument, got {argc}"),
+            ));
+        }
+        "coalesce" if argc == 0 => {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "coalesce requires at least 1 argument",
+            ));
+        }
+        _ => {}
+    }
     for a in args {
         infer_type(a, schema)?;
     }

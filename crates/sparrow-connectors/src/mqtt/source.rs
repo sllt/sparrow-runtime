@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::codec::{Connect, Packet, Publish};
-use super::io::{connect_plain, read_packet, write_packet};
+use super::io::{connect_plain, write_packet, MqttFramedReader};
 use crate::capabilities::{
     refuse_dirty_session, refuse_durable_recovery, refuse_qos_durable, ConnectorCapabilities,
 };
@@ -174,49 +174,76 @@ impl MqttSource {
             self.config.connect_timeout,
         )
         .await?;
-        write_packet(
-            &mut stream,
-            &Packet::Connect(Connect {
-                client_id: self.config.client_id.clone(),
-                clean_session: self.config.clean_session,
-                keepalive: self.config.keepalive.as_secs() as u16,
-                username: self.username.clone(),
-                password: self.password.clone(),
-            }),
-        )
-        .await?;
-        match read_packet(&mut stream).await? {
-            Packet::ConnAck { return_code: 0, .. } => {}
-            Packet::ConnAck { return_code, .. } => {
-                return Err(ConnectorError::new(
-                    ErrorCode::Internal,
-                    format!("MQTT CONNACK {return_code}"),
-                ));
+        let handshake = async {
+            write_packet(
+                &mut stream,
+                &Packet::Connect(Connect {
+                    client_id: self.config.client_id.clone(),
+                    clean_session: self.config.clean_session,
+                    keepalive: self.config.keepalive.as_secs() as u16,
+                    username: self.username.clone(),
+                    password: self.password.clone(),
+                }),
+            )
+            .await?;
+            let mut reader = MqttFramedReader::new();
+            match reader.next(&mut stream).await? {
+                Packet::ConnAck { return_code: 0, .. } => {}
+                Packet::ConnAck { return_code, .. } => {
+                    return Err(ConnectorError::new(
+                        ErrorCode::Internal,
+                        format!("MQTT CONNACK {return_code}"),
+                    ));
+                }
+                other => {
+                    return Err(ConnectorError::new(
+                        ErrorCode::CodecViolation,
+                        format!("expected CONNACK, got {other:?}"),
+                    ));
+                }
             }
-            other => {
-                return Err(ConnectorError::new(
-                    ErrorCode::CodecViolation,
-                    format!("expected CONNACK, got {other:?}"),
-                ));
+            write_packet(
+                &mut stream,
+                &Packet::Subscribe {
+                    packet_id: 1,
+                    topics: vec![(self.config.topic.clone(), 0)],
+                },
+            )
+            .await?;
+            match reader.next(&mut stream).await? {
+                Packet::SubAck { .. } => {}
+                other => {
+                    return Err(ConnectorError::new(
+                        ErrorCode::CodecViolation,
+                        format!("expected SUBACK, got {other:?}"),
+                    ));
+                }
             }
-        }
-        write_packet(
-            &mut stream,
-            &Packet::Subscribe {
-                packet_id: 1,
-                topics: vec![(self.config.topic.clone(), 0)],
-            },
-        )
-        .await?;
-        match read_packet(&mut stream).await? {
-            Packet::SubAck { .. } => {}
-            other => {
-                return Err(ConnectorError::new(
-                    ErrorCode::CodecViolation,
-                    format!("expected SUBACK, got {other:?}"),
-                ));
+            Ok::<_, ConnectorError>(reader)
+        };
+
+        let mut reader = tokio::select! {
+            _ = cancel.cancelled() => {
+                close_mqtt(&mut stream).await;
+                return Ok(());
             }
-        }
+            r = tokio::time::timeout(self.config.connect_timeout, handshake) => {
+                match r {
+                    Ok(Ok(reader)) => reader,
+                    Ok(Err(e)) => {
+                        close_mqtt(&mut stream).await;
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        close_mqtt(&mut stream).await;
+                        return Err(ConnectorError::new(
+                            ErrorCode::Internal,
+                            "MQTT handshake timeout",
+                        ));
+                    }
+                }
+            }
+        };
 
         let ping = self.config.keepalive / 2;
         let ping = if ping.is_zero() {
@@ -227,14 +254,15 @@ impl MqttSource {
 
         loop {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {
-                    let _ = write_packet(&mut stream, &Packet::Disconnect).await;
+                    close_mqtt(&mut stream).await;
                     return Ok(());
                 }
                 _ = tokio::time::sleep(ping) => {
                     write_packet(&mut stream, &Packet::PingReq).await?;
                 }
-                pkt = read_packet(&mut stream) => {
+                pkt = reader.next(&mut stream) => {
                     match pkt? {
                         Packet::Publish(Publish { payload, .. }) => {
                             self.diag.mqtt_received.fetch_add(1, Ordering::Relaxed);
@@ -247,23 +275,156 @@ impl MqttSource {
                                         Err(mpsc::error::TrySendError::Full(_)) => {
                                             self.diag.mqtt_dropped_full.fetch_add(1, Ordering::Relaxed);
                                         }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            close_mqtt(&mut stream).await;
+                                            return Ok(());
+                                        }
                                     }
                                 }
-                                Ok(None) => {
-                                    self.diag.mqtt_dropped_bad.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(_) => {
+                                Ok(None) | Err(_) => {
                                     self.diag.mqtt_dropped_bad.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                         }
                         Packet::PingResp => {}
-                        Packet::Disconnect => return Ok(()),
+                        Packet::Disconnect => {
+                            close_mqtt(&mut stream).await;
+                            return Ok(());
+                        }
                         _ => {}
                     }
                 }
             }
         }
+    }
+}
+
+const MQTT_STOP_DEADLINE: Duration = Duration::from_millis(400);
+
+async fn close_mqtt(stream: &mut super::io::MqttStream) {
+    let _ = tokio::time::timeout(MQTT_STOP_DEADLINE, async {
+        let _ = write_packet(stream, &Packet::Disconnect).await;
+        use tokio::io::AsyncWriteExt;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+    // Dropping the stream closes the TCP socket even if the peer is silent.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::TargetPolicy;
+    use crate::secret::MapSecretResolver;
+    use sparrow_model::{DataType, Field, FieldId, SchemaId};
+    use tokio::net::TcpListener;
+
+    fn schema() -> Schema {
+        Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(FieldId::new(1), "device_id", DataType::Utf8, false)],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn r19_stop_completes_when_broker_silent_after_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((s, _)) = listener.accept().await {
+                // Accept then stay silent (no CONNACK).
+                let _ = tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(s);
+            }
+        });
+        let mut cfg = MqttSourceConfig::demo("127.0.0.1", port, schema());
+        cfg.connect_timeout = Duration::from_secs(5);
+        cfg.client_id = format!("r19-{}", std::process::id());
+        let src = MqttSource::bind(
+            cfg,
+            &MapSecretResolver::empty(),
+            &TargetPolicy::allow("127.0.0.1", port),
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(async move { src.run(tx, child).await });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(800), task)
+            .await
+            .expect("MQTT stop must finish while broker is silent")
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stop exceeded deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn r19_half_frame_survives_ping_select() {
+        use crate::mqtt::codec::{encode, Packet, Publish};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 256];
+            let _ = s.read(&mut buf).await; // CONNECT
+            let _ = s
+                .write_all(&encode(&Packet::ConnAck {
+                    session_present: false,
+                    return_code: 0,
+                }).unwrap())
+                .await;
+            let _ = s.read(&mut buf).await; // SUBSCRIBE
+            let _ = s
+                .write_all(&encode(&Packet::SubAck {
+                    packet_id: 1,
+                    codes: vec![0],
+                }).unwrap())
+                .await;
+            let pub_bytes = encode(&Packet::Publish(Publish {
+                dup: false,
+                qos: 0,
+                retain: false,
+                topic: "sensors/json".into(),
+                packet_id: None,
+                payload: br#"{"device_id":"d1"}"#.to_vec(),
+            }))
+            .unwrap();
+            s.write_all(&pub_bytes[..1]).await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            s.write_all(&pub_bytes[1..]).await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let mut cfg = MqttSourceConfig::demo("127.0.0.1", port, schema());
+        cfg.keepalive = Duration::from_millis(80);
+        cfg.connect_timeout = Duration::from_secs(2);
+        cfg.client_id = format!("r19-hf-{}", std::process::id());
+        let src = MqttSource::bind(
+            cfg,
+            &MapSecretResolver::empty(),
+            &TargetPolicy::allow("127.0.0.1", port),
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        tokio::spawn(async move { src.run(tx, child).await });
+        let row = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("half-frame must complete after ping interval")
+            .expect("row");
+        assert_eq!(row.values[0], sparrow_model::Scalar::utf8("d1"));
+        cancel.cancel();
     }
 }

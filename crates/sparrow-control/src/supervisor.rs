@@ -6,11 +6,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sparrow_connectors::{
-    HttpPushSource, HttpSink, IoDiagnostics, LogSink, MqttSink, MqttSource, publish_qos0,
-    sensor_json, EmbeddedBroker, HttpCapture,
+    FileReplayConfig, FileReplaySource, HttpPushSource, HttpSink, IoDiagnostics, LogSink, MqttSink,
+    MqttSource, publish_qos0, sensor_json, EmbeddedBroker, HttpCapture,
 };
-use sparrow_model::{ResourceBudget, Result, SparrowError};
-use sparrow_runtime::{JobHandle, JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture};
+use sparrow_io::{RecordSource, ReplayableSource};
+use sparrow_model::{RecoveryPolicy, ResourceBudget, Result, SparrowError};
+use sparrow_plan::{PhysicalPlan, PhysicalStage};
+use sparrow_runtime::{
+    AlignedSession, CheckpointStore, JobHandle, JobRequest, Kernel, KernelOptions, MailboxConfig,
+    SharedCapture,
+};
+use tokio_util::sync::CancellationToken;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
@@ -65,11 +71,38 @@ impl DemoHarness {
     }
 }
 
+enum AlignedCmd {
+    Checkpoint {
+        reply: tokio::sync::oneshot::Sender<Result<u64>>,
+    },
+}
+
+enum RunningKind {
+    Live {
+        handle: JobHandle,
+        source: JoinHandle<()>,
+        sink: JoinHandle<()>,
+    },
+    Aligned {
+        cancel: CancellationToken,
+        cmd: tokio::sync::mpsc::Sender<AlignedCmd>,
+        task: JoinHandle<Result<()>>,
+        sink: JoinHandle<()>,
+    },
+}
+
 struct RunningJob {
-    handle: JobHandle,
-    mqtt: JoinHandle<()>,
-    sink: JoinHandle<()>,
+    kind: RunningKind,
     revision: u64,
+}
+
+impl RunningJob {
+    fn is_finished(&self) -> bool {
+        match &self.kind {
+            RunningKind::Live { handle, .. } => handle.is_finished(),
+            RunningKind::Aligned { task, .. } => task.is_finished(),
+        }
+    }
 }
 
 pub struct Supervisor {
@@ -129,11 +162,17 @@ impl Supervisor {
     }
 
     pub async fn converge_once(&self) -> Result<()> {
+        self.reap_finished().await;
         let desired = self.store.list_desired()?;
         for d in desired {
             if d.status == "running" {
                 if self.should_hold_failed(&d.name)? {
                     continue;
+                }
+                if let Ok(a) = self.store.actual(&d.name) {
+                    if a.status == "completed" && a.revision == d.revision {
+                        continue;
+                    }
                 }
                 let rev = d.revision.unwrap_or(1);
                 let already = {
@@ -161,6 +200,45 @@ impl Supervisor {
         Ok(())
     }
 
+    async fn reap_finished(&self) {
+        let names: Vec<String> = {
+            let g = self.running.lock().await;
+            g.iter()
+                .filter(|(_, j)| j.is_finished())
+                .map(|(n, _)| n.clone())
+                .collect()
+        };
+        for name in names {
+            let Some(job) = self.running.lock().await.remove(&name) else {
+                continue;
+            };
+            let rev = job.revision;
+            let outcome = self.join_job(job).await;
+            match outcome {
+                Ok(()) => {
+                    let _ = self.store.set_actual(
+                        &name,
+                        "completed",
+                        Some(rev),
+                        self.next_attempt(&name),
+                        None,
+                    );
+                    let _ = self.store.insert_attempt(&name, rev, "completed", None);
+                }
+                Err(e) => {
+                    let _ = self.store.set_actual(
+                        &name,
+                        "failed",
+                        Some(rev),
+                        self.next_attempt(&name),
+                        Some(&e.message),
+                    );
+                    let _ = self.store.insert_attempt(&name, rev, "failed", Some(&e.message));
+                }
+            }
+        }
+    }
+
     fn should_hold_failed(&self, name: &str) -> Result<bool> {
         if !self.safe_mode {
             return Ok(false);
@@ -181,7 +259,7 @@ impl Supervisor {
     }
 
     async fn start_named(&self, name: &str, revision: u64) -> Result<()> {
-        let row = self.store.get_pipeline(name)?;
+        let row = self.store.get_pipeline_revision(name, revision)?;
         let spec = row.spec;
         let stream = self.store.get_stream(&spec.stream)?;
         let schema = stream_to_schema(&stream)?;
@@ -193,72 +271,405 @@ impl Supervisor {
 
         let attempt = self.next_attempt(name);
         self.store.set_actual(name, "starting", Some(revision), attempt, None)?;
-        self.store.insert_attempt(name, revision, "starting", Some("restart_fresh"))?;
+        let recovery = RecoveryPolicy::parse(&spec.recovery)?;
+        let note = if recovery.is_aligned() {
+            "aligned; not exactly-once"
+        } else {
+            "restart_fresh"
+        };
+        self.store.insert_attempt(name, revision, "starting", Some(note))?;
 
+        let job = match spec.source.kind.as_str() {
+            "file" | "file_replay" | "replay" => {
+                self.start_file(name, &spec, schema, plan, recovery).await?
+            }
+            kind => self.start_live(name, &spec, schema, plan, kind, demo, &policy).await?,
+        };
+
+        if let Some(old) = self.running.lock().await.insert(name.to_string(), {
+            let mut j = job;
+            j.revision = revision;
+            j
+        }) {
+            self.stop_job(old).await;
+        }
+        self.store.set_actual(name, "running", Some(revision), attempt, None)?;
+        self.store.insert_attempt(name, revision, "running", Some(note))?;
+        Ok(())
+    }
+
+    async fn start_live(
+        &self,
+        name: &str,
+        spec: &crate::spec::PipelineSpec,
+        schema: sparrow_model::Schema,
+        plan: PhysicalPlan,
+        kind: &str,
+        demo: Option<DemoEndpoints>,
+        policy: &sparrow_connectors::TargetPolicy,
+    ) -> Result<RunningJob> {
         let diag = IoDiagnostics::new();
         let inbox = spec.source.inbox_capacity.max(1);
         let outbox = spec.sink.outbox_capacity.max(1);
         let (tx_in, rx_in) = tokio::sync::mpsc::channel(inbox);
         let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox);
-        let capture = SharedCapture::new();
+        let capture = SharedCapture::disabled();
         let job = self.kernel.submit(
             JobRequest::new(plan, Vec::new(), capture).with_live_io(rx_in, tx_out),
         )?;
         let cancel = job.cancellation();
-        let mqtt_task = match spec.source.kind.as_str() {
+        let source = match kind {
             "http_push" => {
                 let cfg = http_push_config(&spec.source, schema)?;
-                let push = HttpPushSource::bind(cfg, &self.secrets, &policy, Arc::clone(&diag))
+                let push = HttpPushSource::bind(cfg, &self.secrets, policy, Arc::clone(&diag))
                     .await
                     .map_err(SparrowError::from)?;
                 self.kernel.handle().spawn(push.run(tx_in, cancel.clone()))
             }
-            _ => {
-                let mqtt_cfg = mqtt_config(&spec.source, schema, demo.as_ref())?;
-                let mqtt = MqttSource::bind(mqtt_cfg, &self.secrets, &policy, Arc::clone(&diag))
+            "mqtt" => {
+                let mqtt_cfg = mqtt_config(&spec.source, schema, demo.as_ref(), name)?;
+                let mqtt = MqttSource::bind(mqtt_cfg, &self.secrets, policy, Arc::clone(&diag))
                     .map_err(SparrowError::from)?;
                 self.kernel.handle().spawn(mqtt.run(tx_in, cancel.clone()))
             }
+            other => {
+                return Err(SparrowError::new(
+                    sparrow_model::ErrorCode::FeatureUnavailable,
+                    format!("source kind `{other}` is not wired on the live path"),
+                ));
+            }
         };
-        let sink_task = match spec.sink.kind.as_str() {
+        let sink = self.spawn_sink(spec, rx_out, cancel, diag, demo.as_ref(), policy)?;
+        Ok(RunningJob {
+            kind: RunningKind::Live {
+                handle: job,
+                source,
+                sink,
+            },
+            revision: 0,
+        })
+    }
+
+    async fn start_file(
+        &self,
+        name: &str,
+        spec: &crate::spec::PipelineSpec,
+        schema: sparrow_model::Schema,
+        plan: PhysicalPlan,
+        recovery: RecoveryPolicy,
+    ) -> Result<RunningJob> {
+        let path = spec.source.path.clone().ok_or_else(|| {
+            SparrowError::new(
+                sparrow_model::ErrorCode::InvalidArgument,
+                "file source requires source.path",
+            )
+        })?;
+        if recovery.is_aligned() {
+            return self.start_file_aligned(name, spec, schema, plan, path).await;
+        }
+        let cfg = FileReplayConfig::new(&path, schema.clone());
+        let mut src = FileReplaySource::open(&cfg).map_err(|e| {
+            SparrowError::new(e.code(), e.to_string())
+        })?;
+        let inbox = spec.source.inbox_capacity.max(1);
+        let outbox = spec.sink.outbox_capacity.max(1);
+        let (tx_in, rx_in) = tokio::sync::mpsc::channel(inbox);
+        let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox);
+        let capture = SharedCapture::disabled();
+        let job = self.kernel.submit(
+            JobRequest::new(plan, Vec::new(), capture).with_live_io(rx_in, tx_out),
+        )?;
+        let cancel = job.cancellation();
+        let source = self.kernel.handle().spawn({
+            let cancel = cancel.clone();
+            async move {
+                loop {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    match src.next_frame() {
+                        Ok(Some(frame)) => {
+                            if let Ok(Some(row)) = src.decode_frame(&frame) {
+                                if tx_in.send(row).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            tokio::time::sleep(Duration::from_millis(40)).await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        let diag = IoDiagnostics::new();
+        let sink = self.spawn_sink(spec, rx_out, cancel, diag, self.demo_endpoints().as_ref(), &store_policy(&self.store, self.demo_endpoints().as_ref())?)?;
+        Ok(RunningJob {
+            kind: RunningKind::Live {
+                handle: job,
+                source,
+                sink,
+            },
+            revision: 0,
+        })
+    }
+
+    async fn start_file_aligned(
+        &self,
+        _name: &str,
+        spec: &crate::spec::PipelineSpec,
+        schema: sparrow_model::Schema,
+        plan: PhysicalPlan,
+        path: String,
+    ) -> Result<RunningJob> {
+        let (op, win, input) = window_from_plan(&plan)?;
+        let chk = spec
+            .checkpoint_dir
+            .clone()
+            .unwrap_or_else(|| format!("{path}.sparrow-chk"));
+        let store = CheckpointStore::open(std::path::Path::new(&chk))?;
+        let cfg = FileReplayConfig::new(&path, schema.clone());
+        let mut cfg = cfg;
+        cfg.recovery = RecoveryPolicy::Aligned;
+        cfg.restore = spec.restore_claim()?;
+        let mut source = FileReplaySource::open(&cfg).map_err(|e| {
+            SparrowError::new(e.code(), e.to_string())
+        })?;
+        let metrics = Arc::clone(&self.kernel.metrics);
+        let mut session = if matches!(
+            spec.restore.as_ref().map(|r| r.kind.as_str()),
+            Some("checkpoint")
+        ) {
+            AlignedSession::restore(store, win, input, op, ResourceBudget::compact(), &mut source)?
+        } else {
+            AlignedSession::open(
+                store,
+                win,
+                input,
+                op,
+                ResourceBudget::compact(),
+                source.position(),
+            )?
+        };
+        session.metrics = metrics;
+        let outbox = spec.sink.outbox_capacity.max(1);
+        let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<AlignedCmd>(4);
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        let task = self.kernel.handle().spawn(async move {
+            let tx_out = tx_out;
+            loop {
+                if child.is_cancelled() {
+                    return Ok(());
+                }
+                tokio::select! {
+                    biased;
+                    _ = child.cancelled() => return Ok(()),
+                    cmd = cmd_rx.recv() => {
+                        if let Some(AlignedCmd::Checkpoint { reply }) = cmd {
+                            // R11: wait until the sink has drained the outbox
+                            // (closed-window outputs) before committing the cut.
+                            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                            let flush_ok = loop {
+                                if tx_out.capacity() >= tx_out.max_capacity() {
+                                    break true;
+                                }
+                                if tokio::time::Instant::now() >= deadline {
+                                    break false;
+                                }
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            };
+                            let r = if flush_ok {
+                                session.checkpoint_barrier_after_flush(|| Ok(()))
+                            } else {
+                                Err(SparrowError::new(
+                                    sparrow_model::ErrorCode::ResourceExhausted,
+                                    "sink flush timeout before checkpoint commit",
+                                ))
+                            };
+                            let _ = reply.send(r);
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                    _ = tokio::task::yield_now() => {
+                        match source.next_frame() {
+                            Ok(Some(frame)) => {
+                                if let Ok(Some(row)) = source.decode_frame(&frame) {
+                                    let pos = source.position();
+                                    let emission = session.ingest_rows(&[row], 0, pos)?;
+                                    let mut rows = emission.finals;
+                                    if let Some(wm) = emission.pending_close {
+                                        loop {
+                                            let chunk = session.operator.take_closed_chunk(
+                                                wm,
+                                                8,
+                                                64 * 1024,
+                                            )?;
+                                            if chunk.is_empty() {
+                                                break;
+                                            }
+                                            rows.extend(chunk);
+                                        }
+                                        session.operator.advance_holdback(wm)?;
+                                    }
+                                    if !rows.is_empty() {
+                                        if let Some(b) = session.operator.build_batch(rows)? {
+                                            if tx_out.send(b).await.is_err() {
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                tokio::time::sleep(Duration::from_millis(40)).await;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            }
+        });
+        let diag = IoDiagnostics::new();
+        let sink = self.spawn_sink(
+            spec,
+            rx_out,
+            cancel.clone(),
+            diag,
+            self.demo_endpoints().as_ref(),
+            &store_policy(&self.store, self.demo_endpoints().as_ref())?,
+        )?;
+        Ok(RunningJob {
+            kind: RunningKind::Aligned {
+                cancel,
+                cmd: cmd_tx,
+                task,
+                sink,
+            },
+            revision: 0,
+        })
+    }
+
+    fn spawn_sink(
+        &self,
+        spec: &crate::spec::PipelineSpec,
+        rx_out: tokio::sync::mpsc::Receiver<sparrow_model::RowBatch>,
+        cancel: CancellationToken,
+        diag: Arc<IoDiagnostics>,
+        demo: Option<&DemoEndpoints>,
+        policy: &sparrow_connectors::TargetPolicy,
+    ) -> Result<JoinHandle<()>> {
+        Ok(match spec.sink.kind.as_str() {
             "log" => {
                 let log = LogSink::new(diag, 64);
                 self.kernel.handle().spawn(log.run(rx_out, cancel))
             }
             "mqtt" => {
-                let cfg = mqtt_sink_config(&spec.sink, demo.as_ref())?;
-                let sink = MqttSink::bind(cfg, &self.secrets, &policy, diag)
+                let cfg = mqtt_sink_config(&spec.sink, demo)?;
+                let sink = MqttSink::bind(cfg, &self.secrets, policy, diag)
                     .map_err(SparrowError::from)?;
                 self.kernel.handle().spawn(sink.run(rx_out, cancel))
             }
             _ => {
-                let http_cfg = http_config(&spec.sink, demo.as_ref())?;
-                let sink = HttpSink::bind(http_cfg, &self.secrets, &policy, diag)
+                let http_cfg = http_config(&spec.sink, demo)?;
+                let sink = HttpSink::bind(http_cfg, &self.secrets, policy, diag)
                     .map_err(SparrowError::from)?;
                 self.kernel.handle().spawn(sink.run(rx_out, cancel))
             }
-        };
-
-        if let Some(old) = self.running.lock().await.insert(
-            name.to_string(),
-            RunningJob {
-                handle: job,
-                mqtt: mqtt_task,
-                sink: sink_task,
-                revision,
-            },
-        ) {
-            self.stop_job(old).await;
-        }
-        self.store.set_actual(name, "running", Some(revision), attempt, None)?;
-        self.store.insert_attempt(name, revision, "running", Some("live_best_effort; restart_fresh"))?;
-        Ok(())
+        })
     }
 
     async fn stop_job(&self, job: RunningJob) {
-        let _ = job.handle.stop().await;
-        let _ = job.mqtt.await;
-        let _ = job.sink.await;
+        match job.kind {
+            RunningKind::Live {
+                handle,
+                source,
+                sink,
+            } => {
+                let _ = handle.stop().await;
+                let _ = source.await;
+                let _ = sink.await;
+            }
+            RunningKind::Aligned {
+                cancel,
+                task,
+                sink,
+                ..
+            } => {
+                cancel.cancel();
+                let _ = task.await;
+                let _ = sink.await;
+            }
+        }
+    }
+
+    async fn join_job(&self, job: RunningJob) -> Result<()> {
+        match job.kind {
+            RunningKind::Live {
+                handle,
+                source,
+                sink,
+            } => {
+                let r = handle.wait().await;
+                let _ = source.await;
+                let _ = sink.await;
+                r.map(|_| ())
+            }
+            RunningKind::Aligned { task, sink, .. } => {
+                let r = task.await.map_err(|e| {
+                    SparrowError::new(
+                        sparrow_model::ErrorCode::JobFailed,
+                        format!("aligned task panicked: {e}"),
+                    )
+                })?;
+                let _ = sink.await;
+                r
+            }
+        }
+    }
+
+    pub async fn checkpoint_named(&self, name: &str) -> Result<u64> {
+        let cmd = {
+            let g = self.running.lock().await;
+            match g.get(name) {
+                Some(RunningJob {
+                    kind: RunningKind::Aligned { cmd, .. },
+                    ..
+                }) => cmd.clone(),
+                Some(_) => {
+                    return Err(SparrowError::new(
+                        sparrow_model::ErrorCode::FeatureUnavailable,
+                        "checkpoint is only available for aligned File/replay jobs",
+                    ));
+                }
+                None => {
+                    return Err(SparrowError::new(
+                        sparrow_model::ErrorCode::InvalidArgument,
+                        format!("pipeline `{name}` is not running"),
+                    ));
+                }
+            }
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        cmd.send(AlignedCmd::Checkpoint { reply: tx })
+            .await
+            .map_err(|_| {
+                SparrowError::new(sparrow_model::ErrorCode::Cancelled, "aligned job ended")
+            })?;
+        rx.await.map_err(|_| {
+            SparrowError::new(sparrow_model::ErrorCode::Cancelled, "checkpoint reply dropped")
+        })?
+    }
+
+    pub async fn kill_named(&self, name: &str) -> Result<()> {
+        if let Some(job) = self.running.lock().await.remove(name) {
+            self.stop_job(job).await;
+            let _ = self.store.set_actual(name, "stopped", None, self.next_attempt(name), Some("killed"));
+        }
+        Ok(())
     }
 
     pub async fn stop_all(&self) {
@@ -284,14 +695,59 @@ pub fn compact_kernel() -> Result<Kernel> {
     })
 }
 
+fn window_from_plan(
+    plan: &PhysicalPlan,
+) -> Result<(
+    sparrow_model::OperatorId,
+    sparrow_plan::WindowSpec,
+    sparrow_model::Schema,
+)> {
+    for s in &plan.stages {
+        if let PhysicalStage::WindowAgg {
+            operator,
+            spec,
+            input,
+            ..
+        } = s
+        {
+            return Ok((*operator, spec.clone(), input.clone()));
+        }
+    }
+    Err(SparrowError::new(
+        sparrow_model::ErrorCode::FeatureUnavailable,
+        "aligned recovery requires a window operator in the plan",
+    ))
+}
+
 /// Request start: write desired state and return immediately.
 pub fn request_start(store: &Store, name: &str, actor: &str) -> Result<()> {
+    request_start_at(store, name, actor, None)
+}
+
+pub fn request_start_at(
+    store: &Store,
+    name: &str,
+    actor: &str,
+    revision: Option<u64>,
+) -> Result<()> {
     let row = store.get_pipeline(name)?;
-    store.set_desired(name, "running", Some(row.latest_revision))?;
-    // Clear a previous failed actual so converge will retry.
+    let rev = match revision {
+        Some(r) => {
+            let _ = store.get_pipeline_revision(name, r)?;
+            r
+        }
+        None => row.latest_revision,
+    };
+    store.set_desired(name, "running", Some(rev))?;
     let attempt = store.actual(name).map(|a| a.attempt_id).unwrap_or(0);
     store.set_actual(name, "stopped", None, attempt, None)?;
-    store.audit(actor, "start", Some(name), Some("desired=running; catalog committed before I/O"), "accepted")?;
+    store.audit(
+        actor,
+        "start",
+        Some(name),
+        Some(&format!("desired=running; revision={rev}; catalog committed before I/O")),
+        "accepted",
+    )?;
     Ok(())
 }
 

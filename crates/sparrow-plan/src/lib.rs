@@ -20,7 +20,7 @@ pub mod stateful;
 pub use bind::{
     bind_dedup_linear, bind_graph, bind_linear, bind_lookup_linear, bind_window_linear,
 };
-pub use bound::{BoundKind, BoundLogicalPlan, BoundNode};
+pub use bound::{validate_predicate, BoundKind, BoundLogicalPlan, BoundNode};
 pub use catalog::Catalog;
 pub use explain::{
     et_tumble_template, explain_bound, explain_graph, validate_graph, GraphExplain,

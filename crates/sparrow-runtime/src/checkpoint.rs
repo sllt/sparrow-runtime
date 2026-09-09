@@ -29,6 +29,14 @@ pub const MAGIC: &[u8; 4] = b"SPV1";
 pub const SNAPSHOT_VERSION: u16 = 1;
 pub const MANIFEST_MAGIC: &[u8; 4] = b"MAN2";
 pub const MANIFEST_VERSION: u16 = 1;
+/// Reject encode/commit payloads above this (R15).
+pub const MAX_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
+/// Reject MANIFEST files before allocating the checksum table (R15).
+pub const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+pub const MAX_MANIFEST_CHUNKS: u32 = 4096;
+/// Keep this many committed generations on disk (R15).
+pub const KEEP_GENERATIONS: u64 = 3;
+pub const MAX_STORE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Fault injection points for crash-cut / disk-full tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,9 +219,25 @@ impl CheckpointStore {
     pub fn commit(&mut self, snapshot: &CheckpointSnapshot) -> Result<u64> {
         let id = snapshot.checkpoint_id.max(self.next_id);
         let payload = snapshot.encode()?;
+        if payload.len() as u64 > MAX_SNAPSHOT_BYTES {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "checkpoint snapshot {}B exceeds {MAX_SNAPSHOT_BYTES}B quota",
+                    payload.len()
+                ),
+            ));
+        }
         let chk = self.dir.join(format!("chk-{id:08}"));
         fs::create_dir_all(&chk).map_err(io_err)?;
+        fsync_dir(&self.dir)?;
         let chunks = chunk_payload(&payload);
+        if chunks.len() as u32 > MAX_MANIFEST_CHUNKS {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!("checkpoint would write {} chunks (max {MAX_MANIFEST_CHUNKS})", chunks.len()),
+            ));
+        }
         for (i, chunk) in chunks.iter().enumerate() {
             let part = chk.join(format!("{i:04}.bin.part"));
             let final_path = chk.join(format!("{i:04}.bin"));
@@ -229,6 +253,7 @@ impl CheckpointStore {
             }
             write_all_sync(&part, chunk)?;
             fs::rename(&part, &final_path).map_err(io_err)?;
+            fsync_dir(&chk)?;
         }
         if self.fault.point == FaultPoint::AfterChunkWrite {
             return Err(cut("AfterChunkWrite", id));
@@ -255,6 +280,7 @@ impl CheckpointStore {
             return Err(cut("AfterManifestTmp", id));
         }
         fs::rename(&man_tmp, &man).map_err(io_err)?;
+        fsync_dir(&chk)?;
         if self.fault.point == FaultPoint::AfterManifestRename {
             return Err(cut("AfterManifestRename", id));
         }
@@ -262,7 +288,9 @@ impl CheckpointStore {
         let cur = self.dir.join("CURRENT");
         write_all_sync(&cur_tmp, format!("chk-{id:08}\n").as_bytes())?;
         fs::rename(&cur_tmp, &cur).map_err(io_err)?;
+        fsync_dir(&self.dir)?;
         self.next_id = id.saturating_add(1);
+        gc_generations(&self.dir, id)?;
         Ok(id)
     }
 
@@ -288,6 +316,16 @@ impl CheckpointStore {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
                 "checkpoint ACK missing; not committed",
+            ));
+        }
+        let man_meta = fs::metadata(&man_path).map_err(io_err)?;
+        if man_meta.len() > MAX_MANIFEST_BYTES {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "MANIFEST {}B exceeds {MAX_MANIFEST_BYTES}B; refusing to allocate",
+                    man_meta.len()
+                ),
             ));
         }
         let man_bytes = fs::read(&man_path).map_err(io_err)?;
@@ -396,7 +434,20 @@ impl Manifest {
         s = &s[4..];
         let nbytes = u64::from_le_bytes(s[..8].try_into().unwrap());
         s = &s[8..];
-        let nsum = u32::from_le_bytes(s[..4].try_into().unwrap()) as usize;
+        let nsum = u32::from_le_bytes(s[..4].try_into().unwrap());
+        if n_chunks > MAX_MANIFEST_CHUNKS || nsum > MAX_MANIFEST_CHUNKS {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!("MANIFEST chunk count {n_chunks}/{nsum} exceeds {MAX_MANIFEST_CHUNKS}"),
+            ));
+        }
+        if nbytes > MAX_SNAPSHOT_BYTES {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!("MANIFEST payload {nbytes}B exceeds {MAX_SNAPSHOT_BYTES}B"),
+            ));
+        }
+        let nsum = nsum as usize;
         s = &s[4..];
         if s.len() < nsum * 4 {
             return Err(SparrowError::new(
@@ -424,6 +475,53 @@ fn chunk_payload(payload: &[u8]) -> Vec<Vec<u8>> {
         return vec![Vec::new()];
     }
     payload.chunks(CHUNK_SIZE).map(|c| c.to_vec()).collect()
+}
+
+fn fsync_dir(path: &Path) -> Result<()> {
+    let dir = File::open(path).map_err(io_err)?;
+    dir.sync_all().map_err(io_err)?;
+    Ok(())
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(rd) = fs::read_dir(path) else {
+        return 0;
+    };
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if p.is_dir() {
+            total = total.saturating_add(dir_size(&p));
+        } else if let Ok(m) = ent.metadata() {
+            total = total.saturating_add(m.len());
+        }
+    }
+    total
+}
+
+fn gc_generations(dir: &Path, keep_id: u64) -> Result<()> {
+    let floor = keep_id.saturating_sub(KEEP_GENERATIONS.saturating_sub(1));
+    if let Ok(rd) = fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let Some(s) = name.to_str() else {
+                continue;
+            };
+            let Some(id) = s.strip_prefix("chk-").and_then(|x| x.parse::<u64>().ok()) else {
+                continue;
+            };
+            if id < floor {
+                let _ = fs::remove_dir_all(ent.path());
+            }
+        }
+    }
+    if dir_size(dir) > MAX_STORE_BYTES {
+        return Err(SparrowError::new(
+            ErrorCode::ResourceExhausted,
+            format!("checkpoint store exceeds {MAX_STORE_BYTES}B after GC"),
+        ));
+    }
+    Ok(())
 }
 
 fn write_all_sync(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -641,6 +739,7 @@ fn encode_layout(l: &PlanLayout, out: &mut Vec<u8>) -> Result<()> {
         }
     }
     encode_opt_i64(l.table_revision.map(|v| v as i64), out);
+    out.extend_from_slice(&l.window_params_fingerprint.to_le_bytes());
     Ok(())
 }
 
@@ -722,6 +821,13 @@ fn decode_layout(src: &mut &[u8]) -> Result<PlanLayout> {
         }
     };
     let table_revision = decode_opt_i64(src)?.map(|v| v as u64);
+    let window_params_fingerprint = if src.len() >= 8 {
+        let v = u64::from_le_bytes(src[..8].try_into().unwrap());
+        *src = &src[8..];
+        v
+    } else {
+        0
+    };
     Ok(PlanLayout {
         operator,
         slot,
@@ -733,6 +839,7 @@ fn decode_layout(src: &mut &[u8]) -> Result<PlanLayout> {
         where_fingerprint,
         table_name,
         table_revision,
+        window_params_fingerprint,
     })
 }
 
@@ -1035,6 +1142,7 @@ mod tests {
                 where_fingerprint: 0,
                 table_name: None,
                 table_revision: None,
+                window_params_fingerprint: 0,
             },
             table: None,
         };
@@ -1083,6 +1191,63 @@ mod tests {
             let got = store.recover_required().unwrap();
             assert_eq!(got.checkpoint_id, i);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r14_commit_dirents_survive_rename() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        store.commit(&sample_snapshot(1)).unwrap();
+        assert!(dir.join("CURRENT").exists());
+        assert!(dir.join("chk-00000001/MANIFEST").exists());
+        assert!(store.recover_committed().unwrap().is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r15_oversized_manifest_file_rejected_before_decode_alloc() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        store.commit(&sample_snapshot(1)).unwrap();
+        let huge = vec![b'X'; (MAX_MANIFEST_BYTES as usize) + 16];
+        fs::write(dir.join("chk-00000001/MANIFEST"), huge).unwrap();
+        let err = store.recover_committed().unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoundExceeded);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r15_manifest_claims_too_many_chunks() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        store.commit(&sample_snapshot(1)).unwrap();
+        let mut huge = Vec::from(*MANIFEST_MAGIC);
+        huge.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
+        huge.extend_from_slice(&1u64.to_le_bytes());
+        huge.extend_from_slice(&(MAX_MANIFEST_CHUNKS + 1).to_le_bytes());
+        huge.extend_from_slice(&8u64.to_le_bytes());
+        huge.extend_from_slice(&(MAX_MANIFEST_CHUNKS + 1).to_le_bytes());
+        fs::write(dir.join("chk-00000001/MANIFEST"), huge).unwrap();
+        let err = store.recover_committed().unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoundExceeded);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r15_old_generations_are_garbage_collected() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        for i in 1..=5 {
+            store.commit(&sample_snapshot(i)).unwrap();
+        }
+        assert!(!dir.join("chk-00000001").exists());
+        assert!(!dir.join("chk-00000002").exists());
+        assert!(dir.join("chk-00000005").exists());
+        assert_eq!(
+            store.recover_committed().unwrap().unwrap().checkpoint_id,
+            5
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
