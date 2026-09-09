@@ -365,4 +365,66 @@ mod tests {
             started.elapsed()
         );
     }
+
+    #[tokio::test]
+    async fn r19_half_frame_survives_ping_select() {
+        use crate::mqtt::codec::{encode, Packet, Publish};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 256];
+            let _ = s.read(&mut buf).await; // CONNECT
+            let _ = s
+                .write_all(&encode(&Packet::ConnAck {
+                    session_present: false,
+                    return_code: 0,
+                }).unwrap())
+                .await;
+            let _ = s.read(&mut buf).await; // SUBSCRIBE
+            let _ = s
+                .write_all(&encode(&Packet::SubAck {
+                    packet_id: 1,
+                    codes: vec![0],
+                }).unwrap())
+                .await;
+            let pub_bytes = encode(&Packet::Publish(Publish {
+                dup: false,
+                qos: 0,
+                retain: false,
+                topic: "sensors/json".into(),
+                packet_id: None,
+                payload: br#"{"device_id":"d1"}"#.to_vec(),
+            }))
+            .unwrap();
+            s.write_all(&pub_bytes[..1]).await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            s.write_all(&pub_bytes[1..]).await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let mut cfg = MqttSourceConfig::demo("127.0.0.1", port, schema());
+        cfg.keepalive = Duration::from_millis(80);
+        cfg.connect_timeout = Duration::from_secs(2);
+        cfg.client_id = format!("r19-hf-{}", std::process::id());
+        let src = MqttSource::bind(
+            cfg,
+            &MapSecretResolver::empty(),
+            &TargetPolicy::allow("127.0.0.1", port),
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        tokio::spawn(async move { src.run(tx, child).await });
+        let row = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("half-frame must complete after ping interval")
+            .expect("row");
+        assert_eq!(row.values[0], sparrow_model::Scalar::utf8("d1"));
+        cancel.cancel();
+    }
 }

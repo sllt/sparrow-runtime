@@ -971,4 +971,50 @@ mod review_tests {
         assert_eq!(rest.len(), 1);
         assert!(w.take_closed_chunk(10, 8, 1024).unwrap().is_empty());
     }
+
+    #[test]
+    fn r17_many_keys_closing_chunk_within_mailbox() {
+        let mut entries = Vec::new();
+        for i in 0..32 {
+            entries.push(FrozenEntry {
+                key: vec![Scalar::utf8(&format!("k{i}")), Scalar::Int64(0)],
+                window_start: 0,
+                window_end: 10,
+                count: 0,
+                accs: vec![Accumulator::new(AggFn::Sum, DataType::Int64, false).unwrap()],
+            });
+        }
+        let mut w = op();
+        w.restore_freeze(&WindowFreeze {
+            operator: OperatorId::new(1),
+            slot: StateSlotId::new(1),
+            kind: 0,
+            entries,
+            wm_in: Some(10),
+            wm_out: Some(0),
+            last_effective: Some(10),
+        })
+        .unwrap();
+        let mailbox_items = 4usize;
+        let mailbox_bytes = 256usize;
+        let mut total = 0usize;
+        let mut rounds = 0usize;
+        loop {
+            let chunk = w
+                .take_closed_chunk(10, mailbox_items, mailbox_bytes)
+                .unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            assert!(
+                chunk.len() <= mailbox_items,
+                "closed-key flush must stay within mailbox item limit"
+            );
+            total += chunk.len();
+            rounds += 1;
+            assert!(rounds <= 64, "chunked flush must make progress");
+        }
+        assert_eq!(total, 32, "every closed key must be emitted");
+        assert!(rounds > 1, "32 keys must not flush as a single mailbox burst");
+    }
 }

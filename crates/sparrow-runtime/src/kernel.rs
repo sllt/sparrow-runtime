@@ -63,6 +63,8 @@ pub struct JobRequest {
     pub live_ctrl: Option<tokio::sync::mpsc::Receiver<StreamControl>>,
     /// Single ordered ingress (row | punctuation). Preferred over split channels.
     pub live_events: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
+    /// Test-only: panic inside the first non-source stage.
+    pub inject_panic: bool,
 }
 
 /// Ordered live ingress envelope (R18).
@@ -86,7 +88,13 @@ impl JobRequest {
             trailing_controls: Vec::new(),
             live_ctrl: None,
             live_events: None,
+            inject_panic: false,
         }
+    }
+
+    pub fn with_inject_panic(mut self) -> Self {
+        self.inject_panic = true;
+        self
     }
 
     pub fn with_live_events(
@@ -347,6 +355,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
         trailing_controls,
         mut live_ctrl,
         mut live_events,
+        inject_panic,
     } = req;
 
     let mut set = JoinSet::new();
@@ -388,6 +397,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
             stage_live_ctrl,
             stage_live_events,
             stage_controls,
+            inject_panic && !is_source,
         );
     }
     drop(txs);
@@ -476,6 +486,7 @@ fn spawn_stage(
     live_ctrl: Option<tokio::sync::mpsc::Receiver<StreamControl>>,
     live_events: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
     trailing_controls: Vec<StreamControl>,
+    inject_panic: bool,
 ) {
     ctx.live.fetch_add(1, Ordering::SeqCst);
     let guard = LiveTaskGuard {
@@ -483,6 +494,9 @@ fn spawn_stage(
     };
     set.spawn(async move {
         let _guard = guard;
+        if inject_panic {
+            panic!("injected stage panic");
+        }
         stage_loop(
             ctx,
             stage,

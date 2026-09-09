@@ -2,6 +2,7 @@
 //! MQTT/HTTP to come up — the supervisor converges afterwards.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -23,6 +24,7 @@ pub struct Store {
 
 struct StoreInner {
     conn: Mutex<Connection>,
+    fail_before_commit: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +98,7 @@ impl Store {
         Ok(Self {
             inner: Arc::new(StoreInner {
                 conn: Mutex::new(conn),
+                fail_before_commit: AtomicBool::new(false),
             }),
         })
     }
@@ -106,6 +109,7 @@ impl Store {
         Ok(Self {
             inner: Arc::new(StoreInner {
                 conn: Mutex::new(conn),
+                fail_before_commit: AtomicBool::new(false),
             }),
         })
     }
@@ -535,6 +539,13 @@ impl Store {
         g.execute_batch("BEGIN IMMEDIATE").map_err(db)?;
         match f(&g) {
             Ok(v) => {
+                if self.inner.fail_before_commit.swap(false, Ordering::SeqCst) {
+                    let _ = g.execute_batch("ROLLBACK");
+                    return Err(SparrowError::new(
+                        ErrorCode::Internal,
+                        "injected catalog crash before COMMIT",
+                    ));
+                }
                 g.execute_batch("COMMIT").map_err(db)?;
                 Ok(v)
             }
@@ -555,6 +566,11 @@ impl Store {
         tokio::task::spawn_blocking(f)
             .await
             .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("catalog worker: {e}")))?
+    }
+
+    /// Next write runs to completion then rolls back (simulates crash mid-commit).
+    pub fn debug_fail_next_commit(&self) {
+        self.inner.fail_before_commit.store(true, Ordering::SeqCst);
     }
 
     /// Test helper: raw sealed secret bytes (never used in logs).
@@ -914,6 +930,46 @@ mod tests {
         assert!(raw.starts_with("enc:v1:"), "stored secret must be sealed: {raw}");
         assert!(!raw.contains("super-secret-value"));
         assert_eq!(s.get_secret("pw").unwrap().as_deref(), Some("super-secret-value"));
+    }
+
+    #[test]
+    fn r22_crash_before_commit_keeps_old_revision() {
+        let s = Store::open_memory().unwrap();
+        s.put_pipeline("hot", &spec(), None).unwrap();
+        assert_eq!(s.get_pipeline("hot").unwrap().latest_revision, 1);
+        s.debug_fail_next_commit();
+        let err = s.put_pipeline("hot", &spec(), Some("rev-1")).unwrap_err();
+        assert!(err.message.contains("injected") || err.message.contains("crash"));
+        let row = s.get_pipeline("hot").unwrap();
+        assert_eq!(row.latest_revision, 1, "partial write must roll back");
+        assert!(s.get_pipeline_revision("hot", 2).is_err());
+        s.put_pipeline("hot", &spec(), Some("rev-1")).unwrap();
+        assert_eq!(s.get_pipeline("hot").unwrap().latest_revision, 2);
+        assert!(s.get_pipeline_revision("hot", 1).is_ok());
+        assert!(s.get_pipeline_revision("hot", 2).is_ok());
+    }
+
+    #[tokio::test]
+    async fn r26_slow_catalog_does_not_freeze_runtime() {
+        let store = Store::open_memory().unwrap();
+        let progressed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = progressed.clone();
+        let slow = store.run_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            Ok(())
+        });
+        let tick = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        let start = std::time::Instant::now();
+        let (slow_r, _) = tokio::join!(slow, tick);
+        slow_r.unwrap();
+        assert!(
+            progressed.load(std::sync::atomic::Ordering::SeqCst),
+            "sibling async work must proceed while catalog is on the blocking pool"
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]

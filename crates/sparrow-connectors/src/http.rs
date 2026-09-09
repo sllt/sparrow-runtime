@@ -334,3 +334,69 @@ async fn handle_http(
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secret::MapSecretResolver;
+    use sparrow_model::{
+        CreditKind, DataType, Field, FieldId, MemoryOwner, ResourceBudget, Row, RowBatchBuilder,
+        Scalar, Schema, SchemaId,
+    };
+
+    #[tokio::test]
+    async fn v01_http_sink_does_not_follow_redirect_to_disallowed() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let evil = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let evil_port = evil.local_addr().unwrap().port();
+        let hits2 = Arc::clone(&hits);
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = evil.accept().await {
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 64];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
+            }
+        });
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_port = front.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = front.accept().await {
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf).await;
+                let loc = format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{evil_port}/secret\r\nContent-Length: 0\r\n\r\n");
+                let _ = s.write_all(loc.as_bytes()).await;
+            }
+        });
+        let url = format!("http://127.0.0.1:{front_port}/ingest");
+        let cfg = HttpSinkConfig::demo(&url);
+        let policy = TargetPolicy::allow("127.0.0.1", front_port);
+        let sink = HttpSink::bind(cfg, &MapSecretResolver::empty(), &policy, IoDiagnostics::new())
+            .unwrap();
+        let schema = Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(FieldId::new(1), "device_id", DataType::Utf8, false)],
+        )
+        .unwrap();
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let mut b = RowBatchBuilder::new(std::sync::Arc::new(schema), owner, CreditKind::Reservation, 1, 1024)
+            .unwrap();
+        b.push(Row {
+            values: vec![Scalar::utf8("d")],
+        })
+        .unwrap();
+        let batch = b.finish().unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        tokio::spawn(sink.run(rx, child));
+        tx.send(batch).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "redirect hop to a disallowed target must not be followed"
+        );
+        cancel.cancel();
+    }
+}

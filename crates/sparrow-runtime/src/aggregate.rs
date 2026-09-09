@@ -463,4 +463,38 @@ mod tests {
         mx.update(&Scalar::utf8("yyyyyyyyyyyyyyyyyyyyyyyy")).unwrap();
         assert!(mx.tracked_bytes() > 48);
     }
+
+    #[test]
+    fn r05_small_retention_rejects_minmax_growth() {
+        use crate::state::{MemoryState, StateKey};
+        use sparrow_model::{MemoryOwner, OperatorId, ResourceBudget, StateSlotId};
+        let owner = MemoryOwner::new(ResourceBudget {
+            retention_bytes: 200,
+            ..ResourceBudget::compact()
+        });
+        let mut st = MemoryState::<Accumulator>::new(
+            owner,
+            OperatorId::new(1),
+            StateSlotId::new(1),
+            16,
+        )
+        .unwrap();
+        let mut acc = Accumulator::new(AggFn::Min, DataType::Utf8, false).unwrap();
+        acc.update(&Scalar::utf8(&"z".repeat(400))).unwrap();
+        let err = st
+            .put(
+                StateKey::new(
+                    OperatorId::new(1),
+                    StateSlotId::new(1),
+                    vec![Scalar::utf8("k")],
+                ),
+                acc,
+                400,
+            )
+            .unwrap_err();
+        assert!(
+            err.code == ErrorCode::BoundExceeded || err.code == ErrorCode::ResourceExhausted,
+            "{err}"
+        );
+    }
 }

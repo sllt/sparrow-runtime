@@ -20,7 +20,7 @@ use crate::secret::SecretResolver;
 
 const MAX_INBOX: usize = 1024;
 const MAX_CONCURRENT: usize = 16;
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct HttpPushSourceConfig {
@@ -30,6 +30,8 @@ pub struct HttpPushSourceConfig {
     pub restore: RestoreClaim,
     pub schema: Schema,
     pub json_limits: JsonLimits,
+    pub read_timeout: Duration,
+    pub max_concurrent: usize,
 }
 
 impl HttpPushSourceConfig {
@@ -45,6 +47,8 @@ impl HttpPushSourceConfig {
             restore: RestoreClaim::None,
             schema,
             json_limits: JsonLimits::default(),
+            read_timeout: DEFAULT_READ_TIMEOUT,
+            max_concurrent: MAX_CONCURRENT,
         }
     }
 
@@ -114,7 +118,7 @@ impl HttpPushSource {
     }
 
     pub async fn run(self, tx: mpsc::Sender<Row>, cancel: CancellationToken) {
-        let slots = Arc::new(Semaphore::new(MAX_CONCURRENT));
+        let slots = Arc::new(Semaphore::new(self.config.max_concurrent.max(1)));
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -132,10 +136,20 @@ impl HttpPushSource {
                             let diag = Arc::clone(&self.diag);
                             let codec = self.codec.clone();
                             let path = self.config.path.clone();
+                            let read_timeout = self.config.read_timeout;
                             let child = cancel.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                let _ = handle_push(stream, tx, diag, codec, path, child).await;
+                                let _ = handle_push(
+                                    stream,
+                                    tx,
+                                    diag,
+                                    codec,
+                                    path,
+                                    child,
+                                    read_timeout,
+                                )
+                                .await;
                             });
                         }
                         Err(_) => break,
@@ -173,6 +187,7 @@ async fn handle_push(
     codec: JsonCodec,
     path: String,
     cancel: CancellationToken,
+    read_timeout: Duration,
 ) -> Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -181,7 +196,7 @@ async fn handle_push(
             let _ = write_status(stream, 503, b"closed").await;
             return Ok(());
         }
-        let n = match timeout(READ_TIMEOUT, stream.read(&mut tmp)).await {
+        let n = match timeout(read_timeout, stream.read(&mut tmp)).await {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
                 return Err(ConnectorError::new(
@@ -248,7 +263,7 @@ async fn handle_push(
             let _ = write_status(stream, 503, b"closed").await;
             return Ok(());
         }
-        let n = match timeout(READ_TIMEOUT, stream.read(&mut tmp)).await {
+        let n = match timeout(read_timeout, stream.read(&mut tmp)).await {
             Ok(Ok(n)) => n,
             _ => break,
         };
@@ -312,6 +327,8 @@ mod tests {
             restore: RestoreClaim::None,
             schema: schema(),
             json_limits: JsonLimits::default(),
+            read_timeout: Duration::from_millis(200),
+            max_concurrent: 4,
         };
         let secrets = MapSecretResolver::default();
         let policy = TargetPolicy::deny_all();
@@ -359,6 +376,8 @@ mod tests {
             restore: RestoreClaim::None,
             schema: schema(),
             json_limits: JsonLimits::default(),
+            read_timeout: Duration::from_millis(200),
+            max_concurrent: 4,
         };
         let secrets = MapSecretResolver::default();
         let policy = TargetPolicy::deny_all();
@@ -385,5 +404,99 @@ mod tests {
             .unwrap();
         assert_eq!(wrong.status().as_u16(), 404);
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn r21_slow_conn_times_out() {
+        let mut cfg = HttpPushSourceConfig::demo(schema());
+        cfg.read_timeout = Duration::from_millis(150);
+        let src = HttpPushSource::bind(
+            cfg,
+            &MapSecretResolver::default(),
+            &TargetPolicy::deny_all(),
+            IoDiagnostics::new(),
+        )
+        .await
+        .unwrap();
+        let port = src.port();
+        let (tx, _rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        tokio::spawn(src.run(tx, child));
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(b"POST /push HTTP/1.1\r\n").await.unwrap();
+        s.flush().await.unwrap();
+        let started = std::time::Instant::now();
+        let mut buf = [0u8; 128];
+        let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
+            .await
+            .expect("slow push read must finish")
+            .unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.contains("400") || resp.contains("timeout"), "{resp}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn r21_over_concurrency_is_503() {
+        let mut cfg = HttpPushSourceConfig::demo(schema());
+        cfg.max_concurrent = 1;
+        cfg.read_timeout = Duration::from_secs(2);
+        let src = HttpPushSource::bind(
+            cfg,
+            &MapSecretResolver::default(),
+            &TargetPolicy::deny_all(),
+            IoDiagnostics::new(),
+        )
+        .await
+        .unwrap();
+        let port = src.port();
+        let (tx, _rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        tokio::spawn(src.run(tx, child));
+        let mut hold = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        hold.write_all(b"POST /push HTTP/1.1\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/push"))
+            .body(r#"{"device_id":"d","v":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 503);
+        cancel.cancel();
+        drop(hold);
+    }
+
+    #[tokio::test]
+    async fn r21_stop_drains_in_flight_tasks() {
+        let mut cfg = HttpPushSourceConfig::demo(schema());
+        cfg.read_timeout = Duration::from_millis(80);
+        let src = HttpPushSource::bind(
+            cfg,
+            &MapSecretResolver::default(),
+            &TargetPolicy::deny_all(),
+            IoDiagnostics::new(),
+        )
+        .await
+        .unwrap();
+        let port = src.port();
+        let (tx, _rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        let task = tokio::spawn(src.run(tx, child));
+        let mut hold = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let _ = hold.write_all(b"POST /push HTTP/1.1\r\n").await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .expect("push source must stop and drain")
+            .unwrap();
     }
 }

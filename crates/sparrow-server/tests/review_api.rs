@@ -202,3 +202,308 @@ fn r24_aligned_without_window_is_failed_not_stuck_running() {
         let _ = std::fs::remove_file(&path);
     });
 }
+
+fn auth_get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[test]
+fn r12_window_size_change_rejects_restore_via_api() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let path = tmp("r12.ndjson");
+        let chk = tmp("r12chk");
+        std::fs::create_dir_all(&chk).unwrap();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n{\"device_id\":\"d1\",\"v\":3}\n",
+        )
+        .unwrap();
+        call(&state, auth_put("/v1/streams/sensors", STREAM)).await;
+        let spec = json!({
+            "version": 1,
+            "stream": "sensors",
+            "sql": "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, COUNT_WINDOW(2)",
+            "source": { "kind": "file", "path": path.to_string_lossy() },
+            "sink": { "kind": "log" },
+            "delivery": "live_best_effort",
+            "recovery": "aligned",
+            "checkpoint_dir": chk.to_string_lossy()
+        });
+        call(&state, auth_put("/v1/pipelines/r12", spec.to_string())).await;
+        call(&state, auth_post("/v1/pipelines/r12/start", "{}")).await;
+        wait_status(&state, "r12", "running", Duration::from_secs(5)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        call(&state, auth_post("/v1/pipelines/r12/checkpoint", "{}")).await;
+        call(&state, auth_post("/v1/pipelines/r12/kill", "{}")).await;
+        let spec2 = json!({
+            "version": 1,
+            "stream": "sensors",
+            "sql": "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, COUNT_WINDOW(8)",
+            "source": { "kind": "file", "path": path.to_string_lossy() },
+            "sink": { "kind": "log" },
+            "delivery": "live_best_effort",
+            "recovery": "aligned",
+            "checkpoint_dir": chk.to_string_lossy()
+        });
+        call(
+            &state,
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/pipelines/r12")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .header("if-match", "rev-1")
+                .body(Body::from(spec2.to_string()))
+                .unwrap(),
+        )
+        .await;
+        let (st, body) = call(&state, auth_post("/v1/pipelines/r12/restore", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        wait_status(&state, "r12", "failed", Duration::from_secs(6))
+            .await
+            .expect("window size change must reject snapshot reuse");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+#[test]
+fn r15_oversize_manifest_restore_fails_via_api() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let path = tmp("r15.ndjson");
+        let chk = tmp("r15chk");
+        std::fs::create_dir_all(&chk).unwrap();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n",
+        )
+        .unwrap();
+        call(&state, auth_put("/v1/streams/sensors", STREAM)).await;
+        let spec = file_window_spec(&path.to_string_lossy(), &chk.to_string_lossy());
+        call(&state, auth_put("/v1/pipelines/r15", spec.to_string())).await;
+        call(&state, auth_post("/v1/pipelines/r15/start", "{}")).await;
+        wait_status(&state, "r15", "running", Duration::from_secs(5)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        call(&state, auth_post("/v1/pipelines/r15/checkpoint", "{}")).await;
+        call(&state, auth_post("/v1/pipelines/r15/kill", "{}")).await;
+        std::fs::write(chk.join("MANIFEST"), vec![b'X'; 300 * 1024]).unwrap();
+        let (st, body) = call(&state, auth_post("/v1/pipelines/r15/restore", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        wait_status(&state, "r15", "failed", Duration::from_secs(6))
+            .await
+            .expect("oversize MANIFEST must reject restore");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+#[test]
+fn r28_same_prefix_different_suffix_rejects_restore() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let path = tmp("r28.ndjson");
+        let chk = tmp("r28chk");
+        std::fs::create_dir_all(&chk).unwrap();
+        let mut body = String::new();
+        for i in 0..400 {
+            body.push_str(&format!("{{\"device_id\":\"d1\",\"v\":{i}}}\n"));
+        }
+        std::fs::write(&path, body.as_bytes()).unwrap();
+        call(&state, auth_put("/v1/streams/sensors", STREAM)).await;
+        let spec = file_window_spec(&path.to_string_lossy(), &chk.to_string_lossy());
+        call(&state, auth_put("/v1/pipelines/r28", spec.to_string())).await;
+        call(&state, auth_post("/v1/pipelines/r28/start", "{}")).await;
+        wait_status(&state, "r28", "running", Duration::from_secs(5)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        call(&state, auth_post("/v1/pipelines/r28/checkpoint", "{}")).await;
+        call(&state, auth_post("/v1/pipelines/r28/kill", "{}")).await;
+        let mut data = std::fs::read(&path).unwrap();
+        *data.last_mut().unwrap() = b'Z';
+        std::fs::write(&path, data).unwrap();
+        let (st, body) = call(&state, auth_post("/v1/pipelines/r28/restore", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        wait_status(&state, "r28", "failed", Duration::from_secs(6))
+            .await
+            .expect("same-prefix different-suffix file must reject restore");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+const LIVE_STREAM: &str = r#"{"fields":[
+  {"name":"device_id","type":"utf8","nullable":false},
+  {"name":"temperature","type":"float64","nullable":true},
+  {"name":"humidity","type":"float64","nullable":true},
+  {"name":"ts","type":"timestamp_micros_utc","nullable":false},
+  {"name":"payload","type":"dynamic","nullable":true}
+]}"#;
+
+#[test]
+fn r11_checkpoint_via_api_flushes_then_commits() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let path = tmp("r11.ndjson");
+        let chk = tmp("r11chk");
+        std::fs::create_dir_all(&chk).unwrap();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n{\"device_id\":\"d1\",\"v\":3}\n",
+        )
+        .unwrap();
+        call(&state, auth_put("/v1/streams/sensors", STREAM)).await;
+        let spec = file_window_spec(&path.to_string_lossy(), &chk.to_string_lossy());
+        call(&state, auth_put("/v1/pipelines/r11", spec.to_string())).await;
+        call(&state, auth_post("/v1/pipelines/r11/start", "{}")).await;
+        wait_status(&state, "r11", "running", Duration::from_secs(5))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (st, body) = call(&state, auth_post("/v1/pipelines/r11/checkpoint", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["exactly_once"], false);
+        assert!(body["checkpoint_id"].as_u64().unwrap() >= 1);
+        assert!(
+            chk.join("CURRENT").exists(),
+            "flush-then-commit must publish CURRENT"
+        );
+        let (_, metrics) = call(&state, auth_get("/v1/metrics")).await;
+        assert!(
+            metrics["checkpoint_commits"].as_u64().unwrap_or(0) >= 1,
+            "API checkpoint must increment commits: {metrics}"
+        );
+        call(&state, auth_post("/v1/pipelines/r11/kill", "{}")).await;
+        let (st, body) = call(&state, auth_post("/v1/pipelines/r11/restore", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        wait_status(&state, "r11", "running", Duration::from_secs(5))
+            .await
+            .expect("restore after flushed checkpoint must run");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+#[test]
+fn r12_where_change_rejects_restore_via_api() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let path = tmp("r12w.ndjson");
+        let chk = tmp("r12wchk");
+        std::fs::create_dir_all(&chk).unwrap();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n{\"device_id\":\"d1\",\"v\":3}\n",
+        )
+        .unwrap();
+        call(&state, auth_put("/v1/streams/sensors", STREAM)).await;
+        let spec = json!({
+            "version": 1,
+            "stream": "sensors",
+            "sql": "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, COUNT_WINDOW(2)",
+            "source": { "kind": "file", "path": path.to_string_lossy() },
+            "sink": { "kind": "log" },
+            "delivery": "live_best_effort",
+            "recovery": "aligned",
+            "checkpoint_dir": chk.to_string_lossy()
+        });
+        call(&state, auth_put("/v1/pipelines/r12w", spec.to_string())).await;
+        call(&state, auth_post("/v1/pipelines/r12w/start", "{}")).await;
+        wait_status(&state, "r12w", "running", Duration::from_secs(5))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        call(&state, auth_post("/v1/pipelines/r12w/checkpoint", "{}")).await;
+        call(&state, auth_post("/v1/pipelines/r12w/kill", "{}")).await;
+        let spec2 = json!({
+            "version": 1,
+            "stream": "sensors",
+            "sql": "SELECT COUNT(*) AS n, device_id FROM sensors WHERE v > 0 GROUP BY device_id, COUNT_WINDOW(2)",
+            "source": { "kind": "file", "path": path.to_string_lossy() },
+            "sink": { "kind": "log" },
+            "delivery": "live_best_effort",
+            "recovery": "aligned",
+            "checkpoint_dir": chk.to_string_lossy()
+        });
+        call(
+            &state,
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/pipelines/r12w")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .header("if-match", "rev-1")
+                .body(Body::from(spec2.to_string()))
+                .unwrap(),
+        )
+        .await;
+        let (st, body) = call(&state, auth_post("/v1/pipelines/r12w/restore", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        wait_status(&state, "r12w", "failed", Duration::from_secs(6))
+            .await
+            .expect("WHERE change must refuse snapshot reuse");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+#[test]
+fn r25_mqtt_http_ingest_moves_metrics() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        let job_kernel = Arc::new(compact_kernel().unwrap());
+        let (state, _) = boot(store, job_kernel, TOKEN.into(), false, true)
+            .await
+            .unwrap();
+        let (st, _) = call(&state, auth_put("/v1/streams/sensors", LIVE_STREAM)).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let spec = json!({
+            "version": 1,
+            "stream": "sensors",
+            "sql": "SELECT device_id, temperature, ts FROM sensors WHERE temperature > 25",
+            "source": { "kind": "mqtt", "use_demo_io": true, "topic": "sensors/json", "client_id": "r25" },
+            "sink": { "kind": "http", "use_demo_io": true },
+            "delivery": "live_best_effort",
+            "recovery": "restart_fresh"
+        });
+        call(&state, auth_put("/v1/pipelines/r25", spec.to_string())).await;
+        let (st, body) = call(&state, auth_post("/v1/pipelines/r25/start", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        wait_status(&state, "r25", "running", Duration::from_secs(5))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (st, pubd) = call(&state, auth_post("/v1/demo/publish-fixture", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{pubd}");
+        let start = std::time::Instant::now();
+        let body = loop {
+            let (_, m) = call(&state, auth_get("/v1/metrics")).await;
+            let ingested = m["ingested_rows"].as_u64().unwrap_or(0);
+            let emitted = m["emitted_rows"].as_u64().unwrap_or(0);
+            if ingested > 0 || emitted > 0 {
+                break m;
+            }
+            if start.elapsed() > Duration::from_secs(6) {
+                panic!("MQTT/HTTP ingest must move counters: {m}");
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        };
+        assert!(
+            body["ingested_rows"].as_u64().unwrap_or(0) > 0
+                || body["emitted_rows"].as_u64().unwrap_or(0) > 0,
+            "{body}"
+        );
+        let _ = call(&state, auth_post("/v1/pipelines/r25/stop", "{}")).await;
+    });
+}

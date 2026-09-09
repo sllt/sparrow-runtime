@@ -757,4 +757,50 @@ mod tests {
         let _ = session.operator.wm_out();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn r13_abort_after_current_keeps_committed() {
+        use crate::checkpoint::FaultPoint;
+        use crate::coordinator::CheckpointPhase;
+        let dir = std::env::temp_dir().join(format!(
+            "sparrow-r13-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let owned = lines();
+        let text: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let mut src = MemoryReplaySource::from_lines("r13", &text);
+        let mut session = AlignedSession::open(
+            CheckpointStore::open(&dir).unwrap(),
+            count_spec(),
+            count_schema(),
+            OperatorId::new(1),
+            ResourceBudget::compact(),
+            src.position(),
+        )
+        .unwrap();
+        run_until(&mut session, &mut src, 0, Some(2)).unwrap();
+        let id = session.checkpoint_barrier().unwrap();
+        assert!(dir.join("CURRENT").exists());
+        assert_eq!(session.coordinator.phase(), CheckpointPhase::Committed);
+        session.store.fault.point = FaultPoint::DuringChunkWrite;
+        run_until(&mut session, &mut src, 0, Some(1)).unwrap();
+        assert!(session.checkpoint_barrier().is_err());
+        assert_ne!(
+            session.coordinator.phase(),
+            CheckpointPhase::Checkpointing,
+            "abort must not leave the coordinator stuck"
+        );
+        let recovered = CheckpointStore::open(&dir)
+            .unwrap()
+            .recover_committed()
+            .unwrap()
+            .expect("previous CURRENT must survive a later abort");
+        assert_eq!(recovered.checkpoint_id, id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
