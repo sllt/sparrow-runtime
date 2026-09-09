@@ -1,4 +1,4 @@
-# Sparrow architecture summary (M1)
+# Sparrow architecture summary (M2)
 
 Sparrow is a **single-node IoT/Edge streaming dataflow runtime**. It is not a
 distributed Flink clone and not a Rust eKuiper clone.
@@ -21,14 +21,17 @@ distributed Flink clone and not a Rust eKuiper clone.
 
 ## Crate map
 
-| Crate | Role in M1 |
+| Crate | Role in M2 |
 |---|---|
 | `sparrow-model` | IDs, types, errors, delivery/resource, `RowBatch`, `MemoryLease`, `WorkBudget` |
 | `sparrow-expr` | Scalar IR + eval + numeric filter stride |
 | `sparrow-plan` | GraphSpec, catalog, `BoundLogicalPlan`, physical fusion |
 | `sparrow-sql` | G0 gate + SQL binder onto the same IR (not a runtime dep) |
 | `sparrow-io` | Decoder / Source / Sink *contracts* only |
-| `sparrow-runtime` | `Kernel`: ExecutionChain, bounded mailboxes, supervisor |
+| `sparrow-formats` | Bounded JSON decode/encode, schema + bad-record policy |
+| `sparrow-connectors` | MQTT source, HTTP/Log sinks, `SecretResolver`, `TargetPolicy` |
+| `sparrow-runtime` | `Kernel`: ExecutionChain, bounded mailboxes, `live_in`/`live_out` channels |
+| `sparrow-cli` | Composition root (MQTT/HTTP stay out of the runtime crate) |
 | `sparrow-testkit` | Fixtures, virtual clock, M0/M1 demos |
 | `experiments/*` | G1a only |
 
@@ -51,7 +54,18 @@ bytes; send/recv select on a cancellation token so a full queue cannot
 deadlock `stop()`. Two jobs do not share mailboxes, so a stalled sink on job A
 does not freeze job B.
 
-## Out of scope until M2
+## I/O (M2)
 
-MQTT and HTTP production connectors, SQLite catalog, Axum server, WASM, windows,
-checkpoint, UI, fan-in/fan-out, claimed performance SLOs.
+MQTT JSON frames are decoded in `sparrow-connectors` and pushed through a
+**bounded** `mpsc` into `JobRequest.live_in`. The kernel still only runs
+MemorySource / Transform / CaptureSink. CaptureSink also forwards batches on
+`live_out` so an HTTP or Log sink (again outside the runtime crate) can POST
+or print. Target hosts are deny-by-default; TLS `skip_verify` is rejected.
+MQTT declares `replay=unsupported`. Delivery is still `live_best_effort` +
+`restart_fresh`.
+
+## Out of scope until M3
+
+SQLite catalog, full auth API, Axum control plane, WASM, windows, checkpoint,
+UI, fan-in/fan-out, claimed performance SLOs. Do not put those deps in
+`sparrow-runtime`.

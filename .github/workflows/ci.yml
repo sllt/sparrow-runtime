@@ -18,5 +18,7 @@ jobs:
         run: cargo run -p sparrow-testkit --example m1_kernel_smoke
       - name: M1 SQL/Graph equivalence
         run: cargo run -p sparrow-testkit --example m1_sql_graph_equiv
+      - name: M2 MQTT/HTTP closed loop
+        run: cargo run -p sparrow-cli --bin m2_mqtt_http_loop
       - name: G1a experiment
         run: cargo run -p arrow-evaluation
