@@ -1,19 +1,33 @@
 //! In-process streaming kernel.
 //!
-//! M1: ExecutionChain (one Tokio task per physical stage), bounded
-//! mailboxes, work budget, job supervisor with cancel/join. Arrow, Axum,
-//! SQLite, MQTT, and `sqlparser` stay out of this crate.
+//! V0.2: ExecutionChain plus task-owned MemoryState, bounded timers,
+//! processing-time / count windows, incremental aggregates, bounded
+//! dedup, and static lookup. Arrow, Axum, SQLite, MQTT, and `sqlparser`
+//! stay out of this crate.
 
+pub mod aggregate;
 pub mod capture;
+pub mod clock;
+pub mod dedup;
 pub mod kernel;
 pub mod linear;
+pub mod lookup;
 pub mod mailbox;
+pub mod state;
+pub mod timer;
 pub mod transform;
+pub mod window;
 
 pub use capture::{SharedCapture, StallGate};
+pub use clock::RuntimeClock;
 pub use kernel::{JobHandle, JobRequest, JobStats, Kernel, KernelOptions};
 pub use linear::{drain, LinearExecutor, RuntimeConfig};
+pub use lookup::ReferenceTable;
 pub use mailbox::MailboxConfig;
+pub use state::{MemoryState, StateKey};
+
+#[cfg(test)]
+mod g3_tests;
 
 #[cfg(test)]
 mod g2_tests {

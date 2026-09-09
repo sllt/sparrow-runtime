@@ -9,6 +9,7 @@
 
 pub mod batch;
 pub mod budget;
+pub mod clock;
 pub mod delivery;
 pub mod error;
 pub mod frame;
@@ -17,17 +18,24 @@ pub mod memory;
 pub mod resource;
 pub mod scalar;
 pub mod types;
+pub mod window;
 
 pub use batch::{Row, RowBatch, RowBatchBuilder};
 pub use budget::WorkBudget;
+pub use clock::{InstantSource, SharedVirtualClock, WallClock};
 pub use delivery::{DeliveryContract, DeliveryGuarantee, RecoveryPolicy, RestoreClaim};
 pub use error::{ErrorCode, Result, SparrowError};
 pub use frame::{CodecBounds, CodecBoundary, SourceFrame, DEFAULT_MAX_RECORD_BYTES};
-pub use ids::{FieldId, JobAttemptId, OperatorId, PipelineId, RevisionId, SchemaId};
+pub use ids::{
+    FieldId, JobAttemptId, OperatorId, PipelineId, RevisionId, SchemaId, StateSlotId,
+};
 pub use memory::{MemoryLease, MemoryOwner};
 pub use resource::{CreditKind, CreditUsage, ResourceBudget};
 pub use scalar::{DynamicValue, Scalar};
 pub use types::{DataType, Field, Schema};
+pub use window::{
+    AggFn, TimeDomain, WindowKind, INTEGER_OVERFLOW_POLICY,
+};
 
 #[cfg(test)]
 mod ownership_proptests;

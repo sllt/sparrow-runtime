@@ -3,6 +3,8 @@
 use sparrow_expr::{infer_type, Expr};
 use sparrow_model::{OperatorId, PipelineId, RevisionId, Schema};
 
+use crate::stateful::{DedupSpec, LookupSpec, WindowSpec};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundLogicalPlan {
     pub pipeline: PipelineId,
@@ -41,6 +43,20 @@ pub enum BoundKind {
         name: String,
         schema: Schema,
     },
+    WindowAgg {
+        spec: WindowSpec,
+        input: Schema,
+        output: Schema,
+    },
+    Deduplicate {
+        spec: DedupSpec,
+        input: Schema,
+    },
+    Lookup {
+        spec: LookupSpec,
+        input: Schema,
+        output: Schema,
+    },
 }
 
 impl BoundKind {
@@ -50,6 +66,8 @@ impl BoundKind {
             Self::Filter { input, .. } => input,
             Self::Project { output, .. } | Self::Map { output, .. } => output,
             Self::CaptureSink { schema, .. } => schema,
+            Self::WindowAgg { output, .. } | Self::Lookup { output, .. } => output,
+            Self::Deduplicate { input, .. } => input,
         }
     }
 }

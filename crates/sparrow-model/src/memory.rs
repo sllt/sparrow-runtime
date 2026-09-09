@@ -200,6 +200,8 @@ mod tests {
             queue_bytes: 1024,
             max_rows: 16,
             work_units: 100,
+            max_state_keys: 32,
+            max_timers: 32,
         })
     }
 

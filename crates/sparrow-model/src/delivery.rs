@@ -44,6 +44,10 @@ impl DeliveryGuarantee {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RecoveryPolicy {
     /// Start empty. No in-flight replay, no MQTT resume, no checkpoint load.
+    ///
+    /// V0.2 processing-time windows use this policy and advertise it as
+    /// `recovery=none`: a restart is **not** crash-identical. Open windows,
+    /// timers, and keyed state are discarded.
     RestartFresh,
 }
 
@@ -54,14 +58,24 @@ impl RecoveryPolicy {
         }
     }
 
+    /// Honesty label for PT-window pipelines (`none` ≡ `restart_fresh`).
+    pub const fn none_label(self) -> &'static str {
+        "none"
+    }
+
     pub fn parse(name: &str) -> Result<Self> {
         match name {
-            "restart_fresh" | "RestartFresh" => Ok(Self::RestartFresh),
+            "restart_fresh" | "RestartFresh" | "none" | "None" => Ok(Self::RestartFresh),
+            "checkpoint" | "aligned" | "restore" => Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                format!("recovery policy '{name}' is not supported in V0.2 (checkpoint restore is V0.4+)"),
+            )
+            .context("supported", "none | restart_fresh")),
             other => Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                format!("recovery policy '{other}' is not supported in V0.1"),
+                format!("recovery policy '{other}' is not supported in V0.2"),
             )
-            .context("supported", Self::RestartFresh.as_str())),
+            .context("supported", "none | restart_fresh")),
         }
     }
 }
@@ -116,6 +130,16 @@ impl DeliveryContract {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// V0.2 live contract. Processing-time windows are `recovery=none`
+    /// (`restart_fresh`): results after a crash are **not** identical.
+    pub const V0_2: Self = Self {
+        guarantee: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    pub const PT_WINDOW_HONESTY: &'static str =
+        "processing-time windows are recovery=none / restart_fresh; a process restart opens empty windows and does not replay. Results are not crash-identical.";
+
     pub fn validate_restore(&self, claim: &RestoreClaim) -> Result<()> {
         let _ = self;
         claim.validate()
@@ -141,5 +165,12 @@ mod tests {
         assert!(RestoreClaim::None.validate().is_ok());
         assert_eq!(DeliveryContract::V0_1.guarantee.as_str(), "live_best_effort");
         assert_eq!(DeliveryContract::V0_1.recovery.as_str(), "restart_fresh");
+        assert_eq!(RecoveryPolicy::parse("none").unwrap(), RecoveryPolicy::RestartFresh);
+        assert_eq!(
+            RecoveryPolicy::parse("checkpoint").unwrap_err().code,
+            ErrorCode::UnsupportedRestore
+        );
+        assert!(DeliveryContract::V0_2.recovery.as_str() == "restart_fresh");
+        assert!(DeliveryContract::PT_WINDOW_HONESTY.contains("recovery=none"));
     }
 }

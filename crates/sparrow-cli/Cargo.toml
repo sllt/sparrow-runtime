@@ -19,3 +19,23 @@ tokio-util = { workspace = true }
 [[bin]]
 name = "m2_mqtt_http_loop"
 path = "src/bin/m2_mqtt_http_loop.rs"
+
+[[bin]]
+name = "v02_pt_tumble_avg"
+path = "src/bin/v02_pt_tumble_avg.rs"
+
+[[bin]]
+name = "v02_count_window"
+path = "src/bin/v02_count_window.rs"
+
+[[bin]]
+name = "v02_bounded_dedup"
+path = "src/bin/v02_bounded_dedup.rs"
+
+[[bin]]
+name = "v02_static_table"
+path = "src/bin/v02_static_table.rs"
+
+[[bin]]
+name = "v02_http_mqtt_loop"
+path = "src/bin/v02_http_mqtt_loop.rs"

@@ -13,12 +13,19 @@ pub mod catalog;
 pub mod expr_spec;
 pub mod graph;
 pub mod physical;
+pub mod stateful;
 
-pub use bind::{bind_graph, bind_linear};
+pub use bind::{
+    bind_dedup_linear, bind_graph, bind_linear, bind_lookup_linear, bind_window_linear,
+};
 pub use bound::{BoundKind, BoundLogicalPlan, BoundNode};
 pub use catalog::Catalog;
 pub use graph::{GraphSpec, GRAPH_SPEC_VERSION};
 pub use physical::{physicalize, PhysicalPlan, PhysicalStage, PlanOptions, TransformStep};
+pub use stateful::{
+    agg_result_type, lookup_output_schema, window_output_schema, AggCall, DedupSpec, LookupSpec,
+    WindowSpec,
+};
 
 /// M0 linear stub, still used by the sync `LinearExecutor`.
 #[derive(Clone, Debug, PartialEq)]

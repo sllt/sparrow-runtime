@@ -234,6 +234,8 @@ mod tests {
             queue_bytes: 4096,
             max_rows: 8,
             work_units: 100,
+            max_state_keys: 32,
+            max_timers: 32,
         })
     }
 

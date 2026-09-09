@@ -1,4 +1,4 @@
-# Sparrow architecture summary (V0.1 / M3)
+# Sparrow architecture summary (V0.2)
 
 Sparrow is a **single-node IoT/Edge streaming dataflow runtime**. It is not a
 distributed Flink clone and not a Rust eKuiper clone.
@@ -29,8 +29,8 @@ distributed Flink clone and not a Rust eKuiper clone.
 | `sparrow-sql` | G0 gate + SQL binder onto the same IR (not a runtime dep) |
 | `sparrow-io` | Decoder / Source / Sink *contracts* only |
 | `sparrow-formats` | Bounded JSON decode/encode, schema + bad-record policy |
-| `sparrow-connectors` | MQTT source, HTTP/Log sinks, `SecretResolver`, `TargetPolicy` |
-| `sparrow-runtime` | `Kernel`: ExecutionChain, bounded mailboxes, `live_in`/`live_out` channels |
+| `sparrow-connectors` | MQTT source/sink, HTTP push + HTTP/Log sinks, `SecretResolver`, `TargetPolicy` |
+| `sparrow-runtime` | `Kernel`: ExecutionChain, MemoryState, PT/count windows (no MQTT/HTTP/SQLite/Axum) |
 | `sparrow-control` | SQLite catalog, desired vs actual, supervisor (no Axum) |
 | `sparrow-server` | Bearer-token `/v1` API; `sparrow-server` binary |
 | `sparrow-cli` | M2 composition-root demo |
@@ -79,8 +79,17 @@ pipelines whose last attempt failed.
 a loopback default bind. It depends on control/runtime/connectors.
 `sparrow-runtime` must not depend on the server, SQLite, or Axum.
 
-## Out of scope after V0.1
+## V0.2 (state + windows)
 
-Graph Designer UI, WASM, windows, checkpoint, distributed fan-in/fan-out,
-exactly-once, claimed performance SLOs. Do not put those deps in
-`sparrow-runtime`.
+Stateful stages (`WindowAgg`, `Deduplicate`, `Lookup`) each own a
+`MemoryState` on the **retention** ledger. Values are detached copies;
+input `RowBatch` buffers are never pinned. Timers are generation-cancelled
+and capped. PT windows are `recovery=none`: restart is empty, not restore.
+
+HTTP Push Source and MQTT Sink live in `sparrow-connectors` only.
+
+## Out of scope after V0.2
+
+Graph Designer UI, WASM, event-time / watermark, checkpoint, distributed
+fan-in/fan-out, exactly-once, claimed performance SLOs. Do not put those
+deps in `sparrow-runtime`.

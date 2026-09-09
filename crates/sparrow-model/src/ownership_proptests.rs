@@ -26,6 +26,8 @@ fn random_share_detach_returns_to_zero() {
         queue_bytes: 50_000,
         max_rows: 64,
         work_units: 10_000,
+        max_state_keys: 64,
+        max_timers: 64,
     });
     for seed in 1u64..=32 {
         let mut rng = Lcg(seed * 17);
@@ -78,6 +80,8 @@ fn expansion_peak_never_silently_unbounded() {
         queue_bytes: 2048,
         max_rows: 128,
         work_units: 100,
+        max_state_keys: 64,
+        max_timers: 64,
     });
     let schema = Arc::new(
         Schema::new(1, vec![Field::new(1, "s", DataType::Utf8, true)]).unwrap(),

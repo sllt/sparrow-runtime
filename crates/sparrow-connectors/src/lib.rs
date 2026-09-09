@@ -8,6 +8,7 @@ pub mod capabilities;
 pub mod diag;
 pub mod error;
 pub mod http;
+pub mod http_push;
 pub mod log;
 pub mod mqtt;
 pub mod policy;
@@ -21,8 +22,12 @@ pub use capabilities::{
 pub use diag::{IoDiagnostics, IoSnapshot};
 pub use error::{ConnectorError, Result};
 pub use http::{HttpCapture, HttpSink, HttpSinkConfig};
+pub use http_push::{HttpPushSource, HttpPushSourceConfig};
 pub use log::{LogSink, LogSinkConfig};
-pub use mqtt::{publish_qos0, publish_qos0_many, EmbeddedBroker, MqttSource, MqttSourceConfig};
+pub use mqtt::{
+    publish_qos0, publish_qos0_many, EmbeddedBroker, MqttSink, MqttSinkConfig, MqttSource,
+    MqttSourceConfig,
+};
 pub use policy::{AllowedTarget, TargetPolicy};
 pub use secret::{MapSecretResolver, SecretResolver};
 pub use tls::TlsConfig;

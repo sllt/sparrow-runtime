@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sparrow_connectors::{
-    HttpSink, IoDiagnostics, LogSink, MqttSource, publish_qos0, sensor_json, EmbeddedBroker,
-    HttpCapture,
+    HttpPushSource, HttpSink, IoDiagnostics, LogSink, MqttSink, MqttSource, publish_qos0,
+    sensor_json, EmbeddedBroker, HttpCapture,
 };
 use sparrow_model::{ResourceBudget, Result, SparrowError};
 use sparrow_runtime::{JobHandle, JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture};
@@ -16,8 +16,8 @@ use tokio::task::JoinHandle;
 
 use crate::store::Store;
 use crate::validate::{
-    bind_plan, binder_catalog, http_config, mqtt_config, store_policy, stream_to_schema,
-    validate_io, DemoEndpoints, StoreSecrets,
+    bind_plan, binder_catalog, http_config, http_push_config, mqtt_config, mqtt_sink_config,
+    store_policy, stream_to_schema, validate_io, DemoEndpoints, StoreSecrets,
 };
 
 pub struct DemoHarness {
@@ -195,10 +195,7 @@ impl Supervisor {
         self.store.set_actual(name, "starting", Some(revision), attempt, None)?;
         self.store.insert_attempt(name, revision, "starting", Some("restart_fresh"))?;
 
-        let mqtt_cfg = mqtt_config(&spec.source, schema, demo.as_ref())?;
         let diag = IoDiagnostics::new();
-        let mqtt = MqttSource::bind(mqtt_cfg, &self.secrets, &policy, Arc::clone(&diag))
-            .map_err(SparrowError::from)?;
         let inbox = spec.source.inbox_capacity.max(1);
         let outbox = spec.sink.outbox_capacity.max(1);
         let (tx_in, rx_in) = tokio::sync::mpsc::channel(inbox);
@@ -208,15 +205,38 @@ impl Supervisor {
             JobRequest::new(plan, Vec::new(), capture).with_live_io(rx_in, tx_out),
         )?;
         let cancel = job.cancellation();
-        let mqtt_task = self.kernel.handle().spawn(mqtt.run(tx_in, cancel.clone()));
-        let sink_task = if spec.sink.kind == "log" {
-            let log = LogSink::new(diag, 64);
-            self.kernel.handle().spawn(log.run(rx_out, cancel))
-        } else {
-            let http_cfg = http_config(&spec.sink, demo.as_ref())?;
-            let sink = HttpSink::bind(http_cfg, &self.secrets, &policy, diag)
-                .map_err(SparrowError::from)?;
-            self.kernel.handle().spawn(sink.run(rx_out, cancel))
+        let mqtt_task = match spec.source.kind.as_str() {
+            "http_push" => {
+                let cfg = http_push_config(&spec.source, schema)?;
+                let push = HttpPushSource::bind(cfg, &self.secrets, &policy, Arc::clone(&diag))
+                    .await
+                    .map_err(SparrowError::from)?;
+                self.kernel.handle().spawn(push.run(tx_in, cancel.clone()))
+            }
+            _ => {
+                let mqtt_cfg = mqtt_config(&spec.source, schema, demo.as_ref())?;
+                let mqtt = MqttSource::bind(mqtt_cfg, &self.secrets, &policy, Arc::clone(&diag))
+                    .map_err(SparrowError::from)?;
+                self.kernel.handle().spawn(mqtt.run(tx_in, cancel.clone()))
+            }
+        };
+        let sink_task = match spec.sink.kind.as_str() {
+            "log" => {
+                let log = LogSink::new(diag, 64);
+                self.kernel.handle().spawn(log.run(rx_out, cancel))
+            }
+            "mqtt" => {
+                let cfg = mqtt_sink_config(&spec.sink, demo.as_ref())?;
+                let sink = MqttSink::bind(cfg, &self.secrets, &policy, diag)
+                    .map_err(SparrowError::from)?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel))
+            }
+            _ => {
+                let http_cfg = http_config(&spec.sink, demo.as_ref())?;
+                let sink = HttpSink::bind(http_cfg, &self.secrets, &policy, diag)
+                    .map_err(SparrowError::from)?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel))
+            }
         };
 
         if let Some(old) = self.running.lock().await.insert(

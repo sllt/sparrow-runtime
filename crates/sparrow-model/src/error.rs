@@ -24,6 +24,8 @@ pub enum ErrorCode {
     Cancelled,
     PolicyDenied,
     SecretMissing,
+    /// Checked integer overflow in incremental SUM/COUNT (never wrap, never silent).
+    IntegerOverflow,
     Internal,
 }
 
@@ -44,6 +46,7 @@ impl ErrorCode {
             Self::Cancelled => "cancelled",
             Self::PolicyDenied => "policy_denied",
             Self::SecretMissing => "secret_missing",
+            Self::IntegerOverflow => "integer_overflow",
             Self::Internal => "internal",
         }
     }

@@ -48,6 +48,20 @@ impl ConnectorCapabilities {
         delivery: DeliveryGuarantee::LiveBestEffort,
         recovery: RecoveryPolicy::RestartFresh,
     };
+
+    pub const HTTP_PUSH: Self = Self {
+        kind: "http_push",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    pub const MQTT_SINK: Self = Self {
+        kind: "mqtt_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
 }
 
 /// Rejects at-least-once, checkpoint, MQTT session, or any restore claim.

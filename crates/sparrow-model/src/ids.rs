@@ -67,6 +67,12 @@ id_newtype!(
     FieldId,
     u16
 );
+id_newtype!(
+    /// Stateful slot inside an operator. Stable across attempts so V0.4
+    /// recovery can address the same map (V0.2 does not restore it).
+    StateSlotId,
+    u16
+);
 
 #[cfg(test)]
 mod tests {
