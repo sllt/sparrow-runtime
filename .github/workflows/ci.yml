@@ -20,5 +20,7 @@ jobs:
         run: cargo run -p sparrow-testkit --example m1_sql_graph_equiv
       - name: M2 MQTT/HTTP closed loop
         run: cargo run -p sparrow-cli --bin m2_mqtt_http_loop
+      - name: M3 / V0.1 server demo
+        run: bash scripts/m3-demo.sh
       - name: G1a experiment
         run: cargo run -p arrow-evaluation

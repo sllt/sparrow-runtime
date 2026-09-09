@@ -1,4 +1,6 @@
 /target
+*.db
+sparrow.v01.db
 **/*.rs.bk
 .idea/
 .vscode/

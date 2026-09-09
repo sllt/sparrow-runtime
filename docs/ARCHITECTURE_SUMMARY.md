@@ -1,4 +1,4 @@
-# Sparrow architecture summary (M2)
+# Sparrow architecture summary (V0.1 / M3)
 
 Sparrow is a **single-node IoT/Edge streaming dataflow runtime**. It is not a
 distributed Flink clone and not a Rust eKuiper clone.
@@ -21,7 +21,7 @@ distributed Flink clone and not a Rust eKuiper clone.
 
 ## Crate map
 
-| Crate | Role in M2 |
+| Crate | Role in V0.1 |
 |---|---|
 | `sparrow-model` | IDs, types, errors, delivery/resource, `RowBatch`, `MemoryLease`, `WorkBudget` |
 | `sparrow-expr` | Scalar IR + eval + numeric filter stride |
@@ -31,7 +31,9 @@ distributed Flink clone and not a Rust eKuiper clone.
 | `sparrow-formats` | Bounded JSON decode/encode, schema + bad-record policy |
 | `sparrow-connectors` | MQTT source, HTTP/Log sinks, `SecretResolver`, `TargetPolicy` |
 | `sparrow-runtime` | `Kernel`: ExecutionChain, bounded mailboxes, `live_in`/`live_out` channels |
-| `sparrow-cli` | Composition root (MQTT/HTTP stay out of the runtime crate) |
+| `sparrow-control` | SQLite catalog, desired vs actual, supervisor (no Axum) |
+| `sparrow-server` | Bearer-token `/v1` API; `sparrow-server` binary |
+| `sparrow-cli` | M2 composition-root demo |
 | `sparrow-testkit` | Fixtures, virtual clock, M0/M1 demos |
 | `experiments/*` | G1a only |
 
@@ -64,8 +66,21 @@ or print. Target hosts are deny-by-default; TLS `skip_verify` is rejected.
 MQTT declares `replay=unsupported`. Delivery is still `live_best_effort` +
 `restart_fresh`.
 
-## Out of scope until M3
+## Control plane (M3)
 
-SQLite catalog, full auth API, Axum control plane, WASM, windows, checkpoint,
-UI, fan-in/fan-out, claimed performance SLOs. Do not put those deps in
+`sparrow-control` stores pipeline revisions and **desired** state in SQLite.
+A `start` call commits and returns; the supervisor later starts kernel +
+MQTT + HTTP. That split is intentional: catalog commit must not wait on the
+network. Process restart resets **actual** to stopped and, if desired is
+still running, opens a new attempt (`restart_fresh`). `--safe-mode` skips
+pipelines whose last attempt failed.
+
+`sparrow-server` is Axum under `/v1` with a bearer token, 64KiB bodies, and
+a loopback default bind. It depends on control/runtime/connectors.
+`sparrow-runtime` must not depend on the server, SQLite, or Axum.
+
+## Out of scope after V0.1
+
+Graph Designer UI, WASM, windows, checkpoint, distributed fan-in/fan-out,
+exactly-once, claimed performance SLOs. Do not put those deps in
 `sparrow-runtime`.

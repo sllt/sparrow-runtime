@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CI-friendly M0+M1+M2 checks. MQTT/HTTP use in-process test servers.
+# CI-friendly M0–M3 checks. MQTT/HTTP use in-process test servers.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -20,8 +20,11 @@ cargo run -p sparrow-testkit --example m1_sql_graph_equiv
 echo "== M2 closed loop =="
 cargo run -p sparrow-cli --bin m2_mqtt_http_loop
 
+echo "== M3 / V0.1 server demo =="
+bash scripts/m3-demo.sh
+
 echo "== G1a experiments =="
 cargo run -p layout-rowbatch
 cargo run -p arrow-evaluation
 
-echo "all M0+M1+M2 checks passed"
+echo "all M0–M3 / V0.1 checks passed"
