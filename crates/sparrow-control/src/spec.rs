@@ -25,6 +25,9 @@ pub struct PipelineSpec {
     pub recovery: String,
     #[serde(default)]
     pub restore: Option<RestoreSpec>,
+    /// Directory for aligned File/replay checkpoints. Defaults to `{path}.sparrow-chk`.
+    #[serde(default)]
+    pub checkpoint_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

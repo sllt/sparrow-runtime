@@ -1644,6 +1644,7 @@ dependencies = [
  "sparrow-connectors",
  "sparrow-expr",
  "sparrow-formats",
+ "sparrow-io",
  "sparrow-model",
  "sparrow-plan",
  "sparrow-runtime",

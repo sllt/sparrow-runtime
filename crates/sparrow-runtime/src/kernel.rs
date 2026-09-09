@@ -11,7 +11,7 @@ use sparrow_model::{
     Result, Row, RowBatch, SparrowError, WorkBudget,
 };
 use sparrow_plan::{PhysicalPlan, PhysicalStage};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::capture::SharedCapture;
@@ -61,6 +61,15 @@ pub struct JobRequest {
     pub trailing_controls: Vec<StreamControl>,
     /// Live watermark / idle marks (optional; alongside `live_in`).
     pub live_ctrl: Option<tokio::sync::mpsc::Receiver<StreamControl>>,
+    /// Single ordered ingress (row | punctuation). Preferred over split channels.
+    pub live_events: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
+}
+
+/// Ordered live ingress envelope (R18).
+#[derive(Debug)]
+pub enum IngressEvent {
+    Row(Row),
+    Control(StreamControl),
 }
 
 impl JobRequest {
@@ -76,7 +85,16 @@ impl JobRequest {
             versioned_tables: HashMap::new(),
             trailing_controls: Vec::new(),
             live_ctrl: None,
+            live_events: None,
         }
+    }
+
+    pub fn with_live_events(
+        mut self,
+        live_events: tokio::sync::mpsc::Receiver<IngressEvent>,
+    ) -> Self {
+        self.live_events = Some(live_events);
+        self
     }
 
     pub fn with_clock(mut self, clock: RuntimeClock) -> Self {
@@ -198,6 +216,7 @@ impl Kernel {
             versioned_tables: req.versioned_tables.clone(),
             max_state_keys: self.opts.budget.max_state_keys,
             max_timers: self.opts.budget.max_timers,
+            metrics: Arc::clone(&self.metrics),
         };
         let handle = self.rt.spawn(run_job(ctx, req));
         Ok(JobHandle {
@@ -245,6 +264,7 @@ struct JobCtx {
     versioned_tables: HashMap<String, VersionedReferenceTable>,
     max_state_keys: usize,
     max_timers: usize,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 pub struct JobHandle {
@@ -275,13 +295,22 @@ impl JobHandle {
         self.metrics
             .jobs_stopped
             .fetch_add(1, Ordering::Relaxed);
-        let mut stats = self.wait().await?;
-        stats.cancelled = true;
-        Ok(stats)
+        match self.wait().await {
+            Ok(mut stats) => {
+                stats.cancelled = true;
+                Ok(stats)
+            }
+            Err(e) if e.code == ErrorCode::Cancelled => Err(e),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn live_tasks(&self) -> usize {
         self.live.load(Ordering::SeqCst)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
     }
 
     pub fn cancellation(&self) -> CancellationToken {
@@ -317,9 +346,10 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
         versioned_tables: _,
         trailing_controls,
         mut live_ctrl,
+        mut live_events,
     } = req;
 
-    let mut joins = Vec::new();
+    let mut set = JoinSet::new();
     for (i, stage) in plan.stages.iter().cloned().enumerate() {
         let tx = if i + 1 < n {
             Some(txs[i].clone())
@@ -339,12 +369,14 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
         let stage_live_in = if is_source { live_in.take() } else { None };
         let stage_live_out = if is_sink { live_out.clone() } else { None };
         let stage_live_ctrl = if is_source { live_ctrl.take() } else { None };
+        let stage_live_events = if is_source { live_events.take() } else { None };
         let stage_controls = if is_source {
             trailing_controls.clone()
         } else {
             Vec::new()
         };
-        joins.push(spawn_stage(
+        spawn_stage(
+            &mut set,
             ctx,
             stage,
             rx,
@@ -354,26 +386,27 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
             stage_live_in,
             stage_live_out,
             stage_live_ctrl,
+            stage_live_events,
             stage_controls,
-        ));
+        );
     }
     drop(txs);
 
     let mut ingested = 0usize;
-    let mut first_err = None;
-    for j in joins {
-        match j.await {
+    let mut primary_err = None;
+    while let Some(joined) = set.join_next().await {
+        match joined {
             Ok(Ok(n)) => ingested += n,
             Ok(Err(e)) => {
                 ctx.cancel.cancel();
-                if first_err.is_none() {
-                    first_err = Some(e);
+                if e.code != ErrorCode::Cancelled && primary_err.is_none() {
+                    primary_err = Some(e);
                 }
             }
             Err(e) => {
                 ctx.cancel.cancel();
-                if first_err.is_none() {
-                    first_err = Some(SparrowError::new(
+                if primary_err.is_none() {
+                    primary_err = Some(SparrowError::new(
                         ErrorCode::JobFailed,
                         format!("stage panicked: {e}"),
                     ));
@@ -381,11 +414,11 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
             }
         }
     }
-    if let Some(e) = first_err {
-        if e.code != ErrorCode::Cancelled && !ctx.cancel.is_cancelled() {
-            return Err(e.at_job(ctx.pipeline, ctx.attempt));
-        }
+    if let Some(e) = primary_err {
+        ctx.metrics.jobs_failed.fetch_add(1, Ordering::Relaxed);
+        return Err(e.at_job(ctx.pipeline, ctx.attempt));
     }
+    ctx.metrics.record_ingest(ingested as u64);
     Ok(JobStats {
         attempt: ctx.attempt,
         pipeline: ctx.pipeline,
@@ -394,8 +427,8 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
         cancelled: ctx.cancel.is_cancelled(),
         remaining_work: ctx.work.remaining(),
         live_tasks_after: ctx.live.load(Ordering::SeqCst),
-        state_keys: 0,
-        state_bytes: 0,
+        state_keys: ctx.metrics.state_keys.load(Ordering::Relaxed) as usize,
+        state_bytes: ctx.metrics.state_bytes.load(Ordering::Relaxed) as usize,
         timers_live: 0,
         timers_cancelled: 0,
     })
@@ -416,10 +449,22 @@ fn clone_ctx(ctx: &JobCtx) -> JobCtx {
         versioned_tables: ctx.versioned_tables.clone(),
         max_state_keys: ctx.max_state_keys,
         max_timers: ctx.max_timers,
+        metrics: Arc::clone(&ctx.metrics),
+    }
+}
+
+struct LiveTaskGuard {
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for LiveTaskGuard {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 fn spawn_stage(
+    set: &mut JoinSet<Result<usize>>,
     ctx: JobCtx,
     stage: PhysicalStage,
     rx: Option<MailboxRx>,
@@ -429,12 +474,16 @@ fn spawn_stage(
     live_in: Option<tokio::sync::mpsc::Receiver<Row>>,
     live_out: Option<tokio::sync::mpsc::Sender<RowBatch>>,
     live_ctrl: Option<tokio::sync::mpsc::Receiver<StreamControl>>,
+    live_events: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
     trailing_controls: Vec<StreamControl>,
-) -> JoinHandle<Result<usize>> {
+) {
     ctx.live.fetch_add(1, Ordering::SeqCst);
-    let live = Arc::clone(&ctx.live);
-    tokio::spawn(async move {
-        let result = stage_loop(
+    let guard = LiveTaskGuard {
+        live: Arc::clone(&ctx.live),
+    };
+    set.spawn(async move {
+        let _guard = guard;
+        stage_loop(
             ctx,
             stage,
             rx,
@@ -444,12 +493,11 @@ fn spawn_stage(
             live_in,
             live_out,
             live_ctrl,
+            live_events,
             trailing_controls,
         )
-        .await;
-        live.fetch_sub(1, Ordering::SeqCst);
-        result
-    })
+        .await
+    });
 }
 
 async fn stage_loop(
@@ -462,6 +510,7 @@ async fn stage_loop(
     live_in: Option<tokio::sync::mpsc::Receiver<Row>>,
     live_out: Option<tokio::sync::mpsc::Sender<RowBatch>>,
     live_ctrl: Option<tokio::sync::mpsc::Receiver<StreamControl>>,
+    live_events: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
     trailing_controls: Vec<StreamControl>,
 ) -> Result<usize> {
     match stage {
@@ -469,6 +518,9 @@ async fn stage_loop(
             let tx = tx.ok_or_else(|| {
                 SparrowError::new(ErrorCode::Internal, "source missing mailbox")
             })?;
+            if let Some(events) = live_events {
+                return live_source_ordered(ctx, schema, tx, events).await;
+            }
             if let Some(live_in) = live_in {
                 return live_source(ctx, schema, tx, live_in, live_ctrl).await;
             }
@@ -495,6 +547,7 @@ async fn stage_loop(
                 SparrowError::new(ErrorCode::Internal, "transform missing rx")
             })?;
             while let Some(mut env) = rx.recv().await? {
+                ctx.work.begin_quantum();
                 let (batch, ctrl) = env.take();
                 if let Some(ctrl) = ctrl {
                     if !tx.send_control(ctrl).await? {
@@ -522,6 +575,7 @@ async fn stage_loop(
                 }
                 let (batch, _) = env.take();
                 if let Some(batch) = batch {
+                    ctx.metrics.record_emit(batch.num_rows() as u64);
                     capture.push(&schema, batch.rows());
                     if let Some(out) = &live_out {
                         tokio::select! {
@@ -573,6 +627,7 @@ async fn stage_loop(
             })?;
             let mut op = DedupOperator::new(operator, spec, input, Arc::clone(&ctx.owner))?;
             while let Some(mut env) = rx.recv().await? {
+                ctx.work.begin_quantum();
                 let (batch, ctrl) = env.take();
                 if let Some(ctrl) = ctrl {
                     if !tx.send_control(ctrl).await? {
@@ -619,6 +674,7 @@ async fn stage_loop(
                 LookupOperator::new(spec, table, input, Arc::clone(&ctx.owner))?
             };
             while let Some(mut env) = rx.recv().await? {
+                ctx.work.begin_quantum();
                 let (batch, ctrl) = env.take();
                 if let Some(ctrl) = ctrl {
                     if !tx.send_control(ctrl).await? {
@@ -641,7 +697,8 @@ async fn stage_loop(
 }
 
 async fn emit_window(
-    op: &WindowOperator,
+    ctx: &JobCtx,
+    op: &mut WindowOperator,
     tx: &MailboxTx,
     capture: &SharedCapture,
     emission: crate::window::WindowEmission,
@@ -649,7 +706,56 @@ async fn emit_window(
     if !emission.lates.is_empty() {
         capture.push_late(&emission.lates);
     }
-    if let Some(out) = op.build_batch(emission.finals)? {
+    if !send_rows_chunked(ctx, op, tx, emission.finals).await? {
+        return Ok(false);
+    }
+    if let Some(wm) = emission.pending_close {
+        if !tx
+            .send_control(StreamControl::Watermark {
+                input: 0,
+                wm_micros: wm,
+            })
+            .await?
+        {
+            return Ok(false);
+        }
+    }
+    ctx.metrics.record_state(
+        ctx.owner.usage().live_handles as u64,
+        ctx.owner.usage().retention_bytes as u64,
+    );
+    if let (Some(wm_in), Some(wm_out)) = (op.wm_in(), op.wm_out()) {
+        ctx.metrics.record_watermark_lag(wm_in.saturating_sub(wm_out));
+    }
+    Ok(true)
+}
+
+async fn send_rows_chunked(
+    ctx: &JobCtx,
+    op: &WindowOperator,
+    tx: &MailboxTx,
+    rows: Vec<Row>,
+) -> Result<bool> {
+    let max_rows = ctx.mailbox.max_items.max(1);
+    let max_bytes = ctx.mailbox.max_bytes.max(1);
+    let mut chunk = Vec::new();
+    let mut bytes = 0usize;
+    for row in rows {
+        let sz = row.tracked_bytes().max(1);
+        if !chunk.is_empty() && (chunk.len() >= max_rows || bytes.saturating_add(sz) > max_bytes) {
+            if let Some(out) = op.build_batch(std::mem::take(&mut chunk))? {
+                ctx.metrics.record_emit(out.num_rows() as u64);
+                if !tx.send(out).await? {
+                    return Ok(false);
+                }
+            }
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(sz);
+        chunk.push(row);
+    }
+    if let Some(out) = op.build_batch(chunk)? {
+        ctx.metrics.record_emit(out.num_rows() as u64);
         if !tx.send(out).await? {
             return Ok(false);
         }
@@ -683,12 +789,14 @@ async fn window_stage(
             let rows = op.fire_due(ctx.clock.now_micros())?;
             n += rows.len();
             if !emit_window(
+                ctx,
                 op,
                 tx,
                 capture,
                 crate::window::WindowEmission {
                     finals: rows,
                     lates: Vec::new(),
+                    pending_close: None,
                 },
             )
             .await?
@@ -703,6 +811,7 @@ async fn window_stage(
             env = rx.recv() => {
                 match env? {
                     Some(mut env) => {
+                        ctx.work.begin_quantum();
                         let (batch, ctrl) = env.take();
                         if let Some(ctrl) = ctrl {
                             let emission = match ctrl {
@@ -723,7 +832,7 @@ async fn window_stage(
                                 }
                             };
                             n += emission.finals.len();
-                            if !emit_window(op, tx, capture, emission).await? {
+                            if !emit_window(ctx, op, tx, capture, emission).await? {
                                 input_closed = true;
                             }
                         }
@@ -731,7 +840,7 @@ async fn window_stage(
                             ctx.work.consume(batch.num_rows() as u64)?;
                             let emission = op.on_batch(&batch, ctx.clock.now_micros())?;
                             n += emission.finals.len();
-                            if !emit_window(op, tx, capture, emission).await? {
+                            if !emit_window(ctx, op, tx, capture, emission).await? {
                                 input_closed = true;
                             }
                         }
@@ -743,12 +852,14 @@ async fn window_stage(
                 let rows = op.fire_due(ctx.clock.now_micros())?;
                 n += rows.len();
                 if !emit_window(
+                    ctx,
                     op,
                     tx,
                     capture,
                     crate::window::WindowEmission {
                         finals: rows,
                         lates: Vec::new(),
+                        pending_close: None,
                     },
                 )
                 .await?
@@ -784,6 +895,7 @@ async fn live_source(
                 let Some(first) = row else {
                     return Ok(n);
                 };
+                ctx.work.begin_quantum();
                 let mut buf = vec![first];
                 while buf.len() < ctx.rows_per_batch {
                     match live_in.try_recv() {
@@ -794,7 +906,14 @@ async fn live_source(
                 let batches = build_source_batches(schema.clone(), buf, &ctx.owner, ctx.rows_per_batch)?;
                 for b in batches {
                     n += b.num_rows();
+                    ctx.metrics.record_ingest(b.num_rows() as u64);
                     if !tx.send(b).await? {
+                        return Ok(n);
+                    }
+                }
+                // Sequenced cut: after a data batch, drain any already-ready marks.
+                while let Some(c) = live_ctrl.as_mut().and_then(|ch| ch.try_recv().ok()) {
+                    if !tx.send_control(c).await? {
                         return Ok(n);
                     }
                 }
@@ -806,6 +925,77 @@ async fn live_source(
                     }
                 } else if live_ctrl.is_some() {
                     live_ctrl = None;
+                }
+            }
+        }
+    }
+}
+
+async fn live_source_ordered(
+    ctx: JobCtx,
+    schema: sparrow_model::Schema,
+    tx: MailboxTx,
+    mut events: tokio::sync::mpsc::Receiver<IngressEvent>,
+) -> Result<usize> {
+    let mut n = 0usize;
+    loop {
+        tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return Ok(n),
+            ev = events.recv() => {
+                let Some(ev) = ev else {
+                    return Ok(n);
+                };
+                ctx.work.begin_quantum();
+                match ev {
+                    IngressEvent::Row(first) => {
+                        let mut buf = vec![first];
+                        while buf.len() < ctx.rows_per_batch {
+                            match events.try_recv() {
+                                Ok(IngressEvent::Row(row)) => buf.push(row),
+                                Ok(IngressEvent::Control(c)) => {
+                                    let batches = build_source_batches(
+                                        schema.clone(),
+                                        std::mem::take(&mut buf),
+                                        &ctx.owner,
+                                        ctx.rows_per_batch,
+                                    )?;
+                                    for b in batches {
+                                        n += b.num_rows();
+                                        ctx.metrics.record_ingest(b.num_rows() as u64);
+                                        if !tx.send(b).await? {
+                                            return Ok(n);
+                                        }
+                                    }
+                                    if !tx.send_control(c).await? {
+                                        return Ok(n);
+                                    }
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if !buf.is_empty() {
+                            let batches = build_source_batches(
+                                schema.clone(),
+                                buf,
+                                &ctx.owner,
+                                ctx.rows_per_batch,
+                            )?;
+                            for b in batches {
+                                n += b.num_rows();
+                                ctx.metrics.record_ingest(b.num_rows() as u64);
+                                if !tx.send(b).await? {
+                                    return Ok(n);
+                                }
+                            }
+                        }
+                    }
+                    IngressEvent::Control(c) => {
+                        if !tx.send_control(c).await? {
+                            return Ok(n);
+                        }
+                    }
                 }
             }
         }

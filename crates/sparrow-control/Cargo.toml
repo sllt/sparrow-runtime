@@ -13,10 +13,11 @@ sparrow-sql = { path = "../sparrow-sql" }
 sparrow-runtime = { path = "../sparrow-runtime" }
 sparrow-connectors = { path = "../sparrow-connectors" }
 sparrow-formats = { path = "../sparrow-formats" }
+sparrow-io = { path = "../sparrow-io" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { workspace = true, features = ["sync", "time", "macros"] }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]

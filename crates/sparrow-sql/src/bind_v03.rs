@@ -67,7 +67,7 @@ fn bind_select_v03(
     }
 
     if let Some(spec) = window_from_group(&select.group_by, &select.projection, &source_schema)? {
-        return bind_window_linear(
+        let mut plan = bind_window_linear(
             pipeline,
             revision,
             stream,
@@ -75,7 +75,9 @@ fn bind_select_v03(
             filter,
             spec,
             "capture".into(),
-        );
+        )?;
+        crate::bind_v02::apply_window_select_pub(&mut plan, &select.projection)?;
+        return Ok(plan);
     }
 
     let (exprs, names) = crate::bind::project_list_pub(&select.projection, &source_schema)?;
@@ -102,7 +104,7 @@ fn bind_join(
     join: &sqlparser::ast::Join,
     stream: String,
     source_schema: Schema,
-    _filter: Option<Expr>,
+    filter: Option<Expr>,
     catalog: &Catalog,
     pipeline: PipelineId,
     revision: RevisionId,
@@ -134,6 +136,18 @@ fn bind_join(
         table_schema,
         "capture".into(),
     )?;
+    if let Some(predicate) = filter {
+        let lookup_out = plan
+            .nodes
+            .iter()
+            .find_map(|n| match &n.kind {
+                BoundKind::Lookup { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| source_schema.clone());
+        sparrow_plan::validate_predicate(&predicate, &lookup_out)?;
+        crate::bind_v02::insert_filter_before_sink_pub(&mut plan, predicate)?;
+    }
     if !matches!(select.projection.first(), Some(SelectItem::Wildcard(_))) {
         let lookup_out = plan
             .nodes
@@ -167,7 +181,10 @@ fn versioned_as_of(factor: &TableFactor) -> Result<(bool, Option<String>)> {
 
 fn join_keys(op: &JoinOperator) -> Result<(String, String)> {
     let on = match op {
-        JoinOperator::Inner(JoinConstraint::On(e)) | JoinOperator::LeftOuter(JoinConstraint::On(e)) => e,
+        JoinOperator::Join(JoinConstraint::On(e))
+        | JoinOperator::Inner(JoinConstraint::On(e))
+        | JoinOperator::Left(JoinConstraint::On(e))
+        | JoinOperator::LeftOuter(JoinConstraint::On(e)) => e,
         _ => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,

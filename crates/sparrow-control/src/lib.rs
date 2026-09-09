@@ -13,10 +13,13 @@ pub use store::{
     ActualState, AuditRow, DesiredState, PipelineRow, Store, CATALOG_SCHEMA_VERSION, FORMAT_VERSION,
 };
 pub use supervisor::{
-    compact_kernel, request_start, request_stop, DemoHarness, Supervisor,
+    compact_kernel, request_start, request_start_at, request_stop, DemoHarness, Supervisor,
 };
 pub use validate::{
     bind_plan, binder_catalog, capabilities_json, effective_guarantees, explain_plan, honesty_json,
     store_policy, stream_schema, stream_to_schema, validate_io, DemoEndpoints, ExplainReport,
     StoreSecrets, HONESTY,
 };
+
+#[cfg(test)]
+mod review_tests;

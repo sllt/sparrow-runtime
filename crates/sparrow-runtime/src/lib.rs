@@ -22,13 +22,15 @@ pub mod watermark;
 pub mod window;
 
 pub use aligned::{run_until, AlignedSession};
-pub use capture::{SharedCapture, StallGate};
+pub use capture::{CaptureMode, SharedCapture, StallGate};
 pub use checkpoint::{
     CheckpointSnapshot, CheckpointStore, FaultHook, FaultPoint, TableRevisionBind,
 };
 pub use clock::RuntimeClock;
 pub use coordinator::{CheckpointCoordinator, CheckpointPhase};
-pub use kernel::{JobHandle, JobRequest, JobStats, Kernel, KernelOptions};
+pub use kernel::{
+    IngressEvent, JobHandle, JobRequest, JobStats, Kernel, KernelOptions,
+};
 pub use linear::{drain, LinearExecutor, RuntimeConfig};
 pub use lookup::{ReferenceTable, VersionedReferenceTable};
 pub use mailbox::{MailboxConfig, StreamControl};
@@ -42,6 +44,9 @@ mod time_tests;
 
 #[cfg(test)]
 mod g3_tests;
+
+#[cfg(test)]
+mod review_tests;
 
 #[cfg(test)]
 mod g2_tests {

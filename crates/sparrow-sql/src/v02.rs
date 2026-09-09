@@ -128,9 +128,13 @@ fn join_reject(from: &TableWithJoins) -> Result<Option<G0Verdict>> {
                     "FULL/RIGHT/CROSS JOIN is not part of V0.2 (stream-stream join is out)",
                 )));
             }
-            JoinOperator::Inner(JoinConstraint::On(_))
+            JoinOperator::Join(JoinConstraint::On(_))
+            | JoinOperator::Inner(JoinConstraint::On(_))
+            | JoinOperator::Left(JoinConstraint::On(_))
             | JoinOperator::LeftOuter(JoinConstraint::On(_)) => {}
-            JoinOperator::Inner(JoinConstraint::None)
+            JoinOperator::Join(JoinConstraint::None)
+            | JoinOperator::Inner(JoinConstraint::None)
+            | JoinOperator::Left(JoinConstraint::None)
             | JoinOperator::LeftOuter(JoinConstraint::None) => {
                 return Ok(Some(rejected("lookup JOIN requires ON")));
             }
