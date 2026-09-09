@@ -21,6 +21,9 @@ pub fn bind_sql(
     pipeline: PipelineId,
     revision: RevisionId,
 ) -> Result<BoundLogicalPlan> {
+    if looks_like_v02(sql) {
+        return crate::bind_v02::bind_sql_v02(sql, catalog, pipeline, revision);
+    }
     let verdict = check_sql(sql)?;
     if !verdict.accepted {
         return Err(SparrowError::new(ErrorCode::FeatureUnavailable, verdict.reason)
@@ -36,6 +39,14 @@ pub fn bind_sql(
         ));
     };
     bind_query(query, catalog, pipeline, revision)
+}
+
+fn looks_like_v02(sql: &str) -> bool {
+    let u = sql.to_ascii_uppercase();
+    u.contains("GROUP BY")
+        || u.contains("TUMBLE")
+        || u.contains("COUNT_WINDOW")
+        || u.contains(" JOIN ")
 }
 
 fn bind_query(
@@ -85,6 +96,18 @@ fn bind_select(
         None,
         "capture".into(),
     )
+}
+
+pub(crate) fn table_name_pub(rel: &TableFactor) -> Result<String> {
+    table_name(rel)
+}
+
+pub(crate) fn sql_expr_pub(expr: &SqlExpr) -> Result<Expr> {
+    sql_expr(expr)
+}
+
+pub(crate) fn project_list_pub(items: &[SelectItem], schema: &Schema) -> Result<(Vec<Expr>, Vec<String>)> {
+    project_list(items, schema)
 }
 
 fn table_name(rel: &TableFactor) -> Result<String> {

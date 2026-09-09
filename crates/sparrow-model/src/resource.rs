@@ -33,6 +33,10 @@ pub struct ResourceBudget {
     pub max_rows: usize,
     /// Abstract kernel steps (compare / project / extract).
     pub work_units: u64,
+    /// Max distinct keyed state entries per operator (windows / dedup).
+    pub max_state_keys: usize,
+    /// Max pending timers per operator. Stale generations are cancelled.
+    pub max_timers: usize,
 }
 
 impl ResourceBudget {
@@ -43,6 +47,8 @@ impl ResourceBudget {
             queue_bytes: 2 * 1024 * 1024,
             max_rows: 256,
             work_units: 50_000,
+            max_state_keys: 1_024,
+            max_timers: 2_048,
         }
     }
 
@@ -53,6 +59,8 @@ impl ResourceBudget {
             queue_bytes: 32 * 1024 * 1024,
             max_rows: 4_096,
             work_units: 2_000_000,
+            max_state_keys: 16_384,
+            max_timers: 32_768,
         }
     }
 

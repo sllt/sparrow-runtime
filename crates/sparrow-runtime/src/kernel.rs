@@ -4,6 +4,8 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use sparrow_model::{
     DeliveryContract, ErrorCode, JobAttemptId, MemoryOwner, PipelineId, ResourceBudget, RestoreClaim,
     Result, Row, RowBatch, SparrowError, WorkBudget,
@@ -13,8 +15,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::capture::SharedCapture;
+use crate::clock::RuntimeClock;
+use crate::dedup::DedupOperator;
+use crate::lookup::{LookupOperator, ReferenceTable};
 use crate::mailbox::{channel, MailboxConfig, MailboxRx, MailboxTx};
 use crate::transform::{apply_steps, build_source_batches};
+use crate::window::WindowOperator;
 
 #[derive(Clone, Debug)]
 pub struct KernelOptions {
@@ -44,6 +50,10 @@ pub struct JobRequest {
     pub live_in: Option<tokio::sync::mpsc::Receiver<Row>>,
     /// Live egress. `CaptureSink` also forwards batches here (bounded backpressure).
     pub live_out: Option<tokio::sync::mpsc::Sender<RowBatch>>,
+    /// Process clock. Virtual clocks are required for deterministic PT windows.
+    pub clock: RuntimeClock,
+    /// Static reference-table snapshots frozen at submit. Running jobs keep these Arcs.
+    pub tables: HashMap<String, std::sync::Arc<ReferenceTable>>,
 }
 
 impl JobRequest {
@@ -54,7 +64,19 @@ impl JobRequest {
             capture,
             live_in: None,
             live_out: None,
+            clock: RuntimeClock::wall(),
+            tables: HashMap::new(),
         }
+    }
+
+    pub fn with_clock(mut self, clock: RuntimeClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn with_tables(mut self, tables: HashMap<String, std::sync::Arc<ReferenceTable>>) -> Self {
+        self.tables = tables;
+        self
     }
 
     pub fn with_live_io(
@@ -77,6 +99,10 @@ pub struct JobStats {
     pub cancelled: bool,
     pub remaining_work: u64,
     pub live_tasks_after: usize,
+    pub state_keys: usize,
+    pub state_bytes: usize,
+    pub timers_live: usize,
+    pub timers_cancelled: u64,
 }
 
 pub struct Kernel {
@@ -116,7 +142,7 @@ impl Kernel {
     }
 
     pub fn submit(&self, req: JobRequest) -> Result<JobHandle> {
-        DeliveryContract::V0_1.validate_restore(&RestoreClaim::None)?;
+        DeliveryContract::V0_2.validate_restore(&RestoreClaim::None)?;
         admit(&self.opts, &req.plan)?;
         let attempt = JobAttemptId::new(self.next_attempt.fetch_add(1, Ordering::SeqCst));
         let cancel = CancellationToken::new();
@@ -131,6 +157,10 @@ impl Kernel {
             live: Arc::clone(&self.live_tasks),
             mailbox: self.opts.mailbox,
             rows_per_batch: self.opts.rows_per_batch,
+            clock: req.clock.clone(),
+            tables: req.tables.clone(),
+            max_state_keys: self.opts.budget.max_state_keys,
+            max_timers: self.opts.budget.max_timers,
         };
         let handle = self.rt.spawn(run_job(ctx, req));
         Ok(JobHandle {
@@ -172,6 +202,10 @@ struct JobCtx {
     live: Arc<AtomicUsize>,
     mailbox: MailboxConfig,
     rows_per_batch: usize,
+    clock: RuntimeClock,
+    tables: HashMap<String, std::sync::Arc<ReferenceTable>>,
+    max_state_keys: usize,
+    max_timers: usize,
 }
 
 pub struct JobHandle {
@@ -235,6 +269,8 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
         capture,
         mut live_in,
         live_out,
+        clock: _,
+        tables: _,
     } = req;
 
     let mut joins = Vec::new();
@@ -304,6 +340,10 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
         cancelled: ctx.cancel.is_cancelled(),
         remaining_work: ctx.work.remaining(),
         live_tasks_after: ctx.live.load(Ordering::SeqCst),
+        state_keys: 0,
+        state_bytes: 0,
+        timers_live: 0,
+        timers_cancelled: 0,
     })
 }
 
@@ -317,6 +357,10 @@ fn clone_ctx(ctx: &JobCtx) -> JobCtx {
         live: Arc::clone(&ctx.live),
         mailbox: ctx.mailbox,
         rows_per_batch: ctx.rows_per_batch,
+        clock: ctx.clock.clone(),
+        tables: ctx.tables.clone(),
+        max_state_keys: ctx.max_state_keys,
+        max_timers: ctx.max_timers,
     }
 }
 
@@ -407,7 +451,150 @@ async fn stage_loop(
             }
             Ok(0)
         }
+        PhysicalStage::WindowAgg {
+            operator,
+            spec,
+            input,
+            output: _,
+        } => {
+            let tx = tx.ok_or_else(|| {
+                SparrowError::new(ErrorCode::Internal, "window missing tx")
+            })?;
+            let rx = rx.as_mut().ok_or_else(|| {
+                SparrowError::new(ErrorCode::Internal, "window missing rx")
+            })?;
+            let mut op = WindowOperator::new(
+                operator,
+                spec,
+                input,
+                Arc::clone(&ctx.owner),
+                ctx.max_state_keys,
+                ctx.max_timers,
+            )?;
+            window_stage(&ctx, &mut op, rx, &tx).await
+        }
+        PhysicalStage::Deduplicate {
+            operator,
+            spec,
+            input,
+        } => {
+            let tx = tx.ok_or_else(|| {
+                SparrowError::new(ErrorCode::Internal, "dedup missing tx")
+            })?;
+            let rx = rx.as_mut().ok_or_else(|| {
+                SparrowError::new(ErrorCode::Internal, "dedup missing rx")
+            })?;
+            let mut op = DedupOperator::new(operator, spec, input, Arc::clone(&ctx.owner))?;
+            while let Some(env) = rx.recv().await? {
+                ctx.work.consume(env.batch.num_rows() as u64)?;
+                let rows = op.on_batch(&env.batch, ctx.clock.now_micros())?;
+                if let Some(out) = op.build_batch(rows)? {
+                    if !tx.send(out).await? {
+                        break;
+                    }
+                }
+            }
+            op.cleanup();
+            Ok(0)
+        }
+        PhysicalStage::Lookup {
+            spec,
+            input,
+            output: _,
+            ..
+        } => {
+            let tx = tx.ok_or_else(|| {
+                SparrowError::new(ErrorCode::Internal, "lookup missing tx")
+            })?;
+            let rx = rx.as_mut().ok_or_else(|| {
+                SparrowError::new(ErrorCode::Internal, "lookup missing rx")
+            })?;
+            let table = ctx.tables.get(&spec.table).cloned().ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "reference table '{}' was not attached to this Job (static snapshot required)",
+                        spec.table
+                    ),
+                )
+            })?;
+            let op = LookupOperator::new(spec, table, input, Arc::clone(&ctx.owner))?;
+            while let Some(env) = rx.recv().await? {
+                ctx.work.consume(env.batch.num_rows() as u64)?;
+                let rows = op.on_batch(&env.batch)?;
+                if let Some(out) = op.build_batch(rows)? {
+                    if !tx.send(out).await? {
+                        break;
+                    }
+                }
+            }
+            Ok(0)
+        }
     }
+}
+
+async fn window_stage(
+    ctx: &JobCtx,
+    op: &mut WindowOperator,
+    rx: &mut MailboxRx,
+    tx: &MailboxTx,
+) -> Result<usize> {
+    let mut input_closed = false;
+    let mut n = 0usize;
+    loop {
+        if ctx.cancel.is_cancelled() {
+            break;
+        }
+        let deadline = op.peek_deadline();
+        if input_closed {
+            if deadline.is_none() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => break,
+                _ = ctx.clock.sleep_until(deadline) => {}
+            }
+            let rows = op.fire_due(ctx.clock.now_micros())?;
+            n += rows.len();
+            if let Some(out) = op.build_batch(rows)? {
+                if !tx.send(out).await? {
+                    break;
+                }
+            }
+            continue;
+        }
+        tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => break,
+            env = rx.recv() => {
+                match env? {
+                    Some(env) => {
+                        ctx.work.consume(env.batch.num_rows() as u64)?;
+                        let rows = op.on_batch(&env.batch, ctx.clock.now_micros())?;
+                        n += rows.len();
+                        if let Some(out) = op.build_batch(rows)? {
+                            if !tx.send(out).await? {
+                                input_closed = true;
+                            }
+                        }
+                    }
+                    None => input_closed = true,
+                }
+            }
+            _ = ctx.clock.sleep_until(deadline) => {
+                let rows = op.fire_due(ctx.clock.now_micros())?;
+                n += rows.len();
+                if let Some(out) = op.build_batch(rows)? {
+                    if !tx.send(out).await? {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    op.cleanup();
+    Ok(n)
 }
 
 async fn live_source(

@@ -5,9 +5,12 @@ use std::collections::{HashMap, HashSet};
 use crate::bound::{validate_predicate, BoundKind, BoundLogicalPlan, BoundNode};
 use crate::catalog::{project_schema, Catalog};
 use crate::graph::{GraphSpec, NodeSpec};
+use crate::stateful::{
+    lookup_output_schema, window_output_schema, AggCall, DedupSpec, LookupSpec, WindowSpec,
+};
 use sparrow_expr::{infer_type, Expr};
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
-use sparrow_model::{OperatorId, PipelineId, RevisionId, Schema, SchemaId};
+use sparrow_model::{AggFn, OperatorId, PipelineId, RevisionId, Schema, SchemaId, TimeDomain, WindowKind};
 
 pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPlan> {
     let mut cat = catalog.clone();
@@ -124,10 +127,78 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     schema,
                 }
             }
+            "window_agg" | "tumble_pt" | "count_window" => {
+                let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
+                    SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("window {id} has no input"),
+                    )
+                })?;
+                let spec = bind_window_node(node, &input)?;
+                spec.validate()?;
+                let output = window_output_schema(&input, &spec)?;
+                incoming_schema.insert(id, output.clone());
+                BoundKind::WindowAgg {
+                    spec,
+                    input,
+                    output,
+                }
+            }
+            "dedup" | "deduplicate" => {
+                let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
+                    SparrowError::new(ErrorCode::InvalidArgument, format!("dedup {id} has no input"))
+                })?;
+                let spec = bind_dedup_node(node)?;
+                spec.validate()?;
+                incoming_schema.insert(id, input.clone());
+                BoundKind::Deduplicate { spec, input }
+            }
+            "lookup" => {
+                let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
+                    SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("lookup {id} has no input"),
+                    )
+                })?;
+                let spec = bind_lookup_node(node)?;
+                spec.validate()?;
+                let table_schema = cat.get(&spec.table)?.clone();
+                let keep = if spec.keep.is_empty() {
+                    table_schema
+                        .fields
+                        .iter()
+                        .filter(|f| !spec.table_keys.iter().any(|k| k == &f.name))
+                        .map(|f| f.name.clone())
+                        .collect()
+                } else {
+                    spec.keep.clone()
+                };
+                let mut spec = spec;
+                spec.keep = keep.clone();
+                let output = lookup_output_schema(&input, &table_schema, &keep)?;
+                incoming_schema.insert(id, output.clone());
+                BoundKind::Lookup {
+                    spec,
+                    input,
+                    output,
+                }
+            }
+            "hop" | "session" | "watermark" | "event_time_window" => {
+                return Err(SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    format!("node kind '{}' is not part of V0.2 (event-time / hop / session / watermark are V0.3+)", node.kind),
+                ));
+            }
+            "join" => {
+                return Err(SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "stream-stream join is not part of V0.2; use kind=lookup for static ReferenceTable",
+                ));
+            }
             other => {
                 return Err(SparrowError::new(
                     ErrorCode::FeatureUnavailable,
-                    format!("node kind '{other}' is not part of V0.1"),
+                    format!("node kind '{other}' is not part of V0.2"),
                 ));
             }
         };
@@ -161,7 +232,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
     if sources != 1 || sinks != 1 {
         return Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
-            format!("V0.1 plans must have exactly one source and one sink (got {sources}/{sinks})"),
+            format!("V0.2 plans must have exactly one source and one sink (got {sources}/{sinks})"),
         ));
     }
 
@@ -269,6 +340,249 @@ pub fn bind_linear(
     })
 }
 
+/// Source → optional filter → V0.2 stateful op → sink.
+pub fn bind_window_linear(
+    pipeline: PipelineId,
+    revision: RevisionId,
+    source_name: String,
+    source_schema: Schema,
+    filter: Option<Expr>,
+    spec: WindowSpec,
+    sink_name: String,
+) -> Result<BoundLogicalPlan> {
+    spec.validate()?;
+    let output = window_output_schema(&source_schema, &spec)?;
+    bind_after_source(
+        pipeline,
+        revision,
+        source_name,
+        source_schema.clone(),
+        filter,
+        BoundKind::WindowAgg {
+            spec,
+            input: source_schema,
+            output,
+        },
+        sink_name,
+    )
+}
+
+pub fn bind_dedup_linear(
+    pipeline: PipelineId,
+    revision: RevisionId,
+    source_name: String,
+    source_schema: Schema,
+    spec: DedupSpec,
+    sink_name: String,
+) -> Result<BoundLogicalPlan> {
+    spec.validate()?;
+    bind_after_source(
+        pipeline,
+        revision,
+        source_name,
+        source_schema.clone(),
+        None,
+        BoundKind::Deduplicate {
+            spec,
+            input: source_schema,
+        },
+        sink_name,
+    )
+}
+
+pub fn bind_lookup_linear(
+    pipeline: PipelineId,
+    revision: RevisionId,
+    source_name: String,
+    source_schema: Schema,
+    spec: LookupSpec,
+    table_schema: Schema,
+    sink_name: String,
+) -> Result<BoundLogicalPlan> {
+    spec.validate()?;
+    let keep = if spec.keep.is_empty() {
+        table_schema
+            .fields
+            .iter()
+            .filter(|f| !spec.table_keys.iter().any(|k| k == &f.name))
+            .map(|f| f.name.clone())
+            .collect()
+    } else {
+        spec.keep.clone()
+    };
+    let mut spec = spec;
+    spec.keep = keep.clone();
+    let output = lookup_output_schema(&source_schema, &table_schema, &keep)?;
+    bind_after_source(
+        pipeline,
+        revision,
+        source_name,
+        source_schema.clone(),
+        None,
+        BoundKind::Lookup {
+            spec,
+            input: source_schema,
+            output,
+        },
+        sink_name,
+    )
+}
+
+fn bind_after_source(
+    pipeline: PipelineId,
+    revision: RevisionId,
+    source_name: String,
+    source_schema: Schema,
+    filter: Option<Expr>,
+    mid: BoundKind,
+    sink_name: String,
+) -> Result<BoundLogicalPlan> {
+    let mut nodes = Vec::new();
+    let mut id = 1u32;
+    let source_id = OperatorId::new(id);
+    id += 1;
+    let mut pending = source_id;
+    nodes.push(BoundNode {
+        id: source_id,
+        kind: BoundKind::MemorySource {
+            name: source_name,
+            schema: source_schema.clone(),
+        },
+        downstream: Vec::new(),
+    });
+    if let Some(predicate) = filter {
+        validate_predicate(&predicate, &source_schema)?;
+        let fid = OperatorId::new(id);
+        id += 1;
+        link(&mut nodes, pending, fid);
+        nodes.push(BoundNode {
+            id: fid,
+            kind: BoundKind::Filter {
+                predicate,
+                input: source_schema.clone(),
+            },
+            downstream: Vec::new(),
+        });
+        pending = fid;
+    }
+    let mid_id = OperatorId::new(id);
+    id += 1;
+    link(&mut nodes, pending, mid_id);
+    let out_schema = mid.output_schema().clone();
+    nodes.push(BoundNode {
+        id: mid_id,
+        kind: mid,
+        downstream: Vec::new(),
+    });
+    let sid = OperatorId::new(id);
+    link(&mut nodes, mid_id, sid);
+    nodes.push(BoundNode {
+        id: sid,
+        kind: BoundKind::CaptureSink {
+            name: sink_name,
+            schema: out_schema,
+        },
+        downstream: Vec::new(),
+    });
+    Ok(BoundLogicalPlan {
+        pipeline,
+        revision,
+        nodes,
+    })
+}
+
+fn bind_window_node(node: &NodeSpec, _input: &Schema) -> Result<WindowSpec> {
+    if node
+        .window
+        .as_ref()
+        .map(|w| {
+            let k = w.kind.to_ascii_lowercase();
+            k.contains("event") || k == "hop" || k == "session"
+        })
+        .unwrap_or(false)
+    {
+        TimeDomain::EventTime.require_processing_time()?;
+    }
+    let kind = if let Some(w) = &node.window {
+        match w.kind.to_ascii_lowercase().as_str() {
+            "tumble_pt" | "tumbling_pt" | "tumbling_processing_time" | "processing_time" => {
+                WindowKind::tumbling_pt(w.size_micros.unwrap_or(0))?
+            }
+            "count" | "count_window" => WindowKind::count(w.size.unwrap_or(0))?,
+            "tumble" | "event_time" | "hop" | "session" => {
+                return Err(SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    format!("window kind '{}' is not part of V0.2 (event-time is V0.3)", w.kind),
+                ));
+            }
+            other => {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown window kind '{other}'"),
+                ));
+            }
+        }
+    } else if node.kind == "count_window" {
+        let size = node
+            .window
+            .as_ref()
+            .and_then(|w| w.size)
+            .or_else(|| node.max_keys.map(|n| n as u64))
+            .unwrap_or(0);
+        WindowKind::count(size)?
+    } else {
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "window_agg needs window {kind, size_micros|size}",
+        ));
+    };
+    let keys = node.keys.clone().unwrap_or_default();
+    let aggs = node
+        .aggs
+        .as_ref()
+        .ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, "window_agg needs aggs"))?
+        .iter()
+        .map(|a| {
+            let func = AggFn::parse(&a.func)?;
+            let input = match &a.expr {
+                Some(e) => Some(e.clone().into_expr()?),
+                None => None,
+            };
+            Ok(AggCall::new(func, input, a.alias.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(WindowSpec { kind, keys, aggs })
+}
+
+fn bind_dedup_node(node: &NodeSpec) -> Result<DedupSpec> {
+    let keys = node.keys.clone().ok_or_else(|| {
+        SparrowError::new(ErrorCode::InvalidArgument, "dedup needs keys")
+    })?;
+    let spec = DedupSpec {
+        keys,
+        ttl_micros: node.ttl_micros.unwrap_or(0),
+        max_keys: node.max_keys.unwrap_or(0),
+    };
+    spec.validate()?;
+    Ok(spec)
+}
+
+fn bind_lookup_node(node: &NodeSpec) -> Result<LookupSpec> {
+    let table = node
+        .table
+        .clone()
+        .ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, "lookup needs table"))?;
+    let on = node.on.as_ref().ok_or_else(|| {
+        SparrowError::new(ErrorCode::InvalidArgument, "lookup needs on: [{stream, table}]")
+    })?;
+    Ok(LookupSpec {
+        table,
+        stream_keys: on.iter().map(|o| o.stream.clone()).collect(),
+        table_keys: on.iter().map(|o| o.table.clone()).collect(),
+        keep: node.keep.clone().unwrap_or_default(),
+    })
+}
+
 fn link(nodes: &mut [BoundNode], from: OperatorId, to: OperatorId) {
     if let Some(n) = nodes.iter_mut().find(|n| n.id == from) {
         n.downstream.push(to);
@@ -283,14 +597,14 @@ fn reject_fan_in(spec: &GraphSpec) -> Result<()> {
             if inbound[d] > 1 {
                 return Err(SparrowError::new(
                     ErrorCode::FeatureUnavailable,
-                    format!("fan-in on node {d} is not part of V0.1"),
+                    format!("fan-in on node {d} is not part of V0.2"),
                 ));
             }
         }
         if n.out.len() > 1 {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("fan-out on node {} is not part of V0.1", n.id),
+                    format!("fan-out on node {} is not part of V0.2", n.id),
             ));
         }
     }

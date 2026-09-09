@@ -23,6 +23,9 @@ cargo run -p sparrow-cli --bin m2_mqtt_http_loop
 echo "== M3 / V0.1 server demo =="
 bash scripts/m3-demo.sh
 
+echo "== V0.2 process demos =="
+bash scripts/v02-demo.sh
+
 echo "== G1a experiments =="
 cargo run -p layout-rowbatch
 cargo run -p arrow-evaluation

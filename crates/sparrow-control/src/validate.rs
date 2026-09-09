@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use sparrow_connectors::{
     refuse_delivery_name, refuse_durable_recovery, refuse_qos_durable, ConnectorCapabilities,
-    HttpSinkConfig, MqttSourceConfig, ReplaySupport, SecretResolver, TargetPolicy, TlsConfig,
+    HttpPushSourceConfig, HttpSinkConfig, MqttSinkConfig, MqttSourceConfig, ReplaySupport,
+    SecretResolver, TargetPolicy, TlsConfig,
 };
 use sparrow_model::{
     DeliveryGuarantee, ErrorCode, PipelineId, RecoveryPolicy, RestoreClaim, Result, RevisionId,
@@ -36,7 +37,7 @@ pub struct ExplainReport {
 }
 
 pub const HONESTY: &str =
-    "V0.1 is live_best_effort + restart_fresh. MQTT replay is unsupported. A process restart is a fresh attempt, not checkpoint restore.";
+    "V0.2 is live_best_effort + restart_fresh (recovery=none). Processing-time windows are not crash-identical. MQTT replay, checkpoint restore, event-time, and exactly-once are unsupported.";
 
 pub fn honesty_json() -> serde_json::Value {
     serde_json::json!({
@@ -103,6 +104,9 @@ pub fn explain_plan(plan: &PhysicalPlan) -> ExplainReport {
                 format!("transform:{}", kinds.join("+"))
             }
             PhysicalStage::CaptureSink { name, .. } => format!("sink:{name}"),
+            PhysicalStage::WindowAgg { spec, .. } => format!("window:{:?}", spec.kind),
+            PhysicalStage::Deduplicate { .. } => "dedup".into(),
+            PhysicalStage::Lookup { spec, .. } => format!("lookup:{}", spec.table),
         })
         .collect();
     ExplainReport {
@@ -111,9 +115,9 @@ pub fn explain_plan(plan: &PhysicalPlan) -> ExplainReport {
         fused: plan.fused(),
         mailbox_count: plan.mailbox_count(),
         delivery: DeliveryGuarantee::LiveBestEffort.as_str(),
-        recovery: RecoveryPolicy::RestartFresh.as_str(),
+        recovery: plan.recovery_label(),
         replay: ReplaySupport::Unsupported.as_str(),
-        honesty: HONESTY,
+        honesty: plan.honesty(),
     }
 }
 
@@ -170,23 +174,38 @@ pub fn validate_io(
 ) -> Result<()> {
     spec.check_delivery()?;
     refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
-    if spec.source.kind != "mqtt" {
-        return Err(SparrowError::new(
-            ErrorCode::FeatureUnavailable,
-            format!("source kind `{}` is not supported in V0.1 (mqtt only)", spec.source.kind),
-        ));
+    match spec.source.kind.as_str() {
+        "mqtt" => {
+            let mqtt = mqtt_config(&spec.source, schema.clone(), demo)?;
+            mqtt.validate(secrets, policy).map_err(io)?;
+        }
+        "http_push" => {
+            let push = http_push_config(&spec.source, schema.clone())?;
+            push.validate(secrets, policy).map_err(io)?;
+        }
+        other => {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                format!("source kind `{other}` is not supported in V0.2 (mqtt|http_push)"),
+            ));
+        }
     }
-    if spec.sink.kind != "http" && spec.sink.kind != "log" {
-        return Err(SparrowError::new(
-            ErrorCode::FeatureUnavailable,
-            format!("sink kind `{}` is not supported (http|log)", spec.sink.kind),
-        ));
-    }
-    let mqtt = mqtt_config(&spec.source, schema.clone(), demo)?;
-    mqtt.validate(secrets, policy).map_err(io)?;
-    if spec.sink.kind == "http" {
-        let http = http_config(&spec.sink, demo)?;
-        http.validate(secrets, policy).map_err(io)?;
+    match spec.sink.kind.as_str() {
+        "http" => {
+            let http = http_config(&spec.sink, demo)?;
+            http.validate(secrets, policy).map_err(io)?;
+        }
+        "log" => {}
+        "mqtt" => {
+            let mqtt = mqtt_sink_config(&spec.sink, demo)?;
+            mqtt.validate(secrets, policy).map_err(io)?;
+        }
+        other => {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                format!("sink kind `{other}` is not supported (http|log|mqtt)"),
+            ));
+        }
     }
     Ok(())
 }
@@ -270,12 +289,60 @@ pub fn http_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<Http
     Ok(cfg)
 }
 
+pub fn http_push_config(source: &SourceSpec, schema: Schema) -> Result<HttpPushSourceConfig> {
+    let mut cfg = HttpPushSourceConfig::demo(schema);
+    if let Some(bind) = &source.bind {
+        cfg.bind = bind.clone();
+    }
+    if let Some(path) = &source.path {
+        cfg.path = path.clone();
+    }
+    cfg.inbox_capacity = source.inbox_capacity;
+    cfg.restore = RestoreClaim::None;
+    Ok(cfg)
+}
+
+pub fn mqtt_sink_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<MqttSinkConfig> {
+    let (host, port) = if sink.use_demo_io {
+        let d = demo.ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "sink.use_demo_io requires sparrow-server --demo-io",
+            )
+        })?;
+        (d.mqtt_host.clone(), d.mqtt_port)
+    } else {
+        let host = sink.host.clone().ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidArgument, "MQTT sink host is required")
+        })?;
+        let port = sink.port.ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidArgument, "MQTT sink port is required")
+        })?;
+        (host, port)
+    };
+    let mut cfg = MqttSinkConfig::demo(host, port);
+    if let Some(t) = &sink.topic {
+        cfg.topic = t.clone();
+    }
+    if let Some(id) = &sink.client_id {
+        cfg.client_id = id.clone();
+    }
+    cfg.qos = sink.qos;
+    cfg.clean_session = sink.clean_session;
+    cfg.outbox_capacity = sink.outbox_capacity;
+    cfg.restore = RestoreClaim::None;
+    Ok(cfg)
+}
+
 pub fn capabilities_json() -> serde_json::Value {
     let mqtt = ConnectorCapabilities::MQTT_SOURCE;
     let http = ConnectorCapabilities::HTTP_SINK;
+    let push = ConnectorCapabilities::HTTP_PUSH;
+    let mqtt_sink = ConnectorCapabilities::MQTT_SINK;
     serde_json::json!({
         "delivery": DeliveryGuarantee::LiveBestEffort.as_str(),
         "recovery": RecoveryPolicy::RestartFresh.as_str(),
+        "recovery_pt_window": RecoveryPolicy::RestartFresh.none_label(),
         "connectors": [
             {
                 "kind": mqtt.kind,
@@ -288,6 +355,18 @@ pub fn capabilities_json() -> serde_json::Value {
                 "replay": http.replay.as_str(),
                 "delivery": http.delivery.as_str(),
                 "recovery": http.recovery.as_str(),
+            },
+            {
+                "kind": push.kind,
+                "replay": push.replay.as_str(),
+                "delivery": push.delivery.as_str(),
+                "recovery": push.recovery.as_str(),
+            },
+            {
+                "kind": mqtt_sink.kind,
+                "replay": mqtt_sink.replay.as_str(),
+                "delivery": mqtt_sink.delivery.as_str(),
+                "recovery": mqtt_sink.recovery.as_str(),
             }
         ],
         "honesty": HONESTY,
@@ -340,6 +419,8 @@ mod tests {
                 skip_verify: false,
                 inbox_capacity: 8,
                 use_demo_io: false,
+                bind: None,
+                path: None,
             },
             sink: crate::spec::SinkSpec {
                 kind: "http".into(),
@@ -348,6 +429,12 @@ mod tests {
                 outbox_capacity: 8,
                 use_demo_io: false,
                 header_secret: None,
+                host: None,
+                port: None,
+                topic: None,
+                client_id: None,
+                qos: 0,
+                clean_session: true,
             },
             delivery: "at_least_once".into(),
             recovery: "restart_fresh".into(),

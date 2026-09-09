@@ -5,7 +5,11 @@
 //! This crate is not a `sparrow-runtime` dependency.
 
 pub mod bind;
+pub mod bind_v02;
 pub mod g0;
+pub mod v02;
 
 pub use bind::bind_sql;
+pub use bind_v02::bind_sql_v02;
 pub use g0::{check_sql, default_g0_root, run_g0_corpus, G0Verdict};
+pub use v02::check_sql_v02;

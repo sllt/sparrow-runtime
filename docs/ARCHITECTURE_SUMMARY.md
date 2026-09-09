@@ -1,4 +1,4 @@
-# Sparrow architecture summary (V0.1 / M3)
+# Sparrow architecture summary (V0.2)
 
 Sparrow is a **single-node IoT/Edge streaming dataflow runtime**. It is not a
 distributed Flink clone and not a Rust eKuiper clone.
@@ -79,8 +79,17 @@ pipelines whose last attempt failed.
 a loopback default bind. It depends on control/runtime/connectors.
 `sparrow-runtime` must not depend on the server, SQLite, or Axum.
 
-## Out of scope after V0.1
+## V0.2 (state + windows)
 
-Graph Designer UI, WASM, windows, checkpoint, distributed fan-in/fan-out,
-exactly-once, claimed performance SLOs. Do not put those deps in
-`sparrow-runtime`.
+Stateful stages (`WindowAgg`, `Deduplicate`, `Lookup`) each own a
+`MemoryState` on the **retention** ledger. Values are detached copies;
+input `RowBatch` buffers are never pinned. Timers are generation-cancelled
+and capped. PT windows are `recovery=none`: restart is empty, not restore.
+
+HTTP Push Source and MQTT Sink live in `sparrow-connectors` only.
+
+## Out of scope after V0.2
+
+Graph Designer UI, WASM, event-time / watermark, checkpoint, distributed
+fan-in/fan-out, exactly-once, claimed performance SLOs. Do not put those
+deps in `sparrow-runtime`.

@@ -2,8 +2,9 @@
 //! Filter → Project → Map fuse into one transform stage.
 
 use crate::bound::{BoundKind, BoundLogicalPlan, BoundNode};
+use crate::stateful::{DedupSpec, LookupSpec, WindowSpec};
 use sparrow_expr::Expr;
-use sparrow_model::{OperatorId, PipelineId, RevisionId, Schema};
+use sparrow_model::{DeliveryContract, OperatorId, PipelineId, RevisionId, Schema};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlanOptions {
@@ -37,6 +38,23 @@ pub enum PhysicalStage {
         operator: OperatorId,
         name: String,
         schema: Schema,
+    },
+    WindowAgg {
+        operator: OperatorId,
+        spec: WindowSpec,
+        input: Schema,
+        output: Schema,
+    },
+    Deduplicate {
+        operator: OperatorId,
+        spec: DedupSpec,
+        input: Schema,
+    },
+    Lookup {
+        operator: OperatorId,
+        spec: LookupSpec,
+        input: Schema,
+        output: Schema,
     },
 }
 
@@ -78,6 +96,37 @@ impl PhysicalPlan {
             PhysicalStage::Transform { steps } => steps.len() > 1,
             _ => false,
         })
+    }
+
+    pub fn has_processing_time_window(&self) -> bool {
+        self.stages.iter().any(|s| {
+            matches!(
+                s,
+                PhysicalStage::WindowAgg {
+                    spec: WindowSpec {
+                        kind: sparrow_model::WindowKind::TumblingProcessingTime { .. },
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+    }
+
+    pub fn recovery_label(&self) -> &'static str {
+        if self.has_processing_time_window() {
+            DeliveryContract::V0_2.recovery.none_label()
+        } else {
+            DeliveryContract::V0_2.recovery.as_str()
+        }
+    }
+
+    pub fn honesty(&self) -> &'static str {
+        if self.has_processing_time_window() {
+            DeliveryContract::PT_WINDOW_HONESTY
+        } else {
+            "V0.2 is live_best_effort + restart_fresh. Checkpoint restore and exactly-once are rejected."
+        }
     }
 }
 
@@ -161,6 +210,40 @@ pub fn physicalize(plan: &BoundLogicalPlan, opts: &PlanOptions) -> PhysicalPlan 
                     flush(&mut pending, &mut stages);
                     stages.push(PhysicalStage::Transform { steps: vec![step] });
                 }
+            }
+            BoundKind::WindowAgg {
+                spec,
+                input,
+                output,
+            } => {
+                flush(&mut pending, &mut stages);
+                stages.push(PhysicalStage::WindowAgg {
+                    operator: node.id,
+                    spec: spec.clone(),
+                    input: input.clone(),
+                    output: output.clone(),
+                });
+            }
+            BoundKind::Deduplicate { spec, input } => {
+                flush(&mut pending, &mut stages);
+                stages.push(PhysicalStage::Deduplicate {
+                    operator: node.id,
+                    spec: spec.clone(),
+                    input: input.clone(),
+                });
+            }
+            BoundKind::Lookup {
+                spec,
+                input,
+                output,
+            } => {
+                flush(&mut pending, &mut stages);
+                stages.push(PhysicalStage::Lookup {
+                    operator: node.id,
+                    spec: spec.clone(),
+                    input: input.clone(),
+                    output: output.clone(),
+                });
             }
         }
     }

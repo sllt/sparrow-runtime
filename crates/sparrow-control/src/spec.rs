@@ -52,6 +52,10 @@ pub struct SourceSpec {
     pub inbox_capacity: usize,
     #[serde(default)]
     pub use_demo_io: bool,
+    #[serde(default)]
+    pub bind: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -67,6 +71,18 @@ pub struct SinkSpec {
     pub use_demo_io: bool,
     #[serde(default)]
     pub header_secret: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub qos: u8,
+    #[serde(default = "default_true")]
+    pub clean_session: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -51,6 +51,44 @@ pub struct NodeSpec {
     pub exprs: Option<Vec<NamedExprSpec>>,
     #[serde(default)]
     pub out: Vec<u32>,
+    #[serde(default)]
+    pub window: Option<WindowNodeSpec>,
+    #[serde(default)]
+    pub keys: Option<Vec<String>>,
+    #[serde(default)]
+    pub aggs: Option<Vec<AggNodeSpec>>,
+    #[serde(default)]
+    pub ttl_micros: Option<i64>,
+    #[serde(default)]
+    pub max_keys: Option<usize>,
+    #[serde(default)]
+    pub on: Option<Vec<JoinOnSpec>>,
+    #[serde(default)]
+    pub keep: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowNodeSpec {
+    pub kind: String,
+    #[serde(default)]
+    pub size_micros: Option<i64>,
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AggNodeSpec {
+    #[serde(rename = "fn")]
+    pub func: String,
+    #[serde(default)]
+    pub expr: Option<ExprSpec>,
+    pub alias: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct JoinOnSpec {
+    pub stream: String,
+    pub table: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

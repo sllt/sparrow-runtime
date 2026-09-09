@@ -71,6 +71,47 @@ impl Scalar {
         }
     }
 
+    /// Stable key encoding for keyed state (NaN-safe via to_bits).
+    pub fn encode_key(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Null => out.push(0),
+            Self::Bool(v) => {
+                out.push(1);
+                out.push(u8::from(*v));
+            }
+            Self::Int64(v) => {
+                out.push(2);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Self::UInt64(v) => {
+                out.push(3);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Self::Float64(v) => {
+                out.push(4);
+                out.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+            Self::Utf8(s) => {
+                out.push(5);
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            Self::Bytes(b) => {
+                out.push(6);
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
+            }
+            Self::TimestampMicrosUTC(v) => {
+                out.push(7);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Self::Dynamic(_) => {
+                out.push(8);
+                out.extend_from_slice(&(self.tracked_bytes() as u64).to_le_bytes());
+            }
+        }
+    }
+
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Self::Int64(v) => Some(*v as f64),
