@@ -31,17 +31,17 @@ fn run() -> sparrow_model::Result<()> {
     println!("recovery={} ({})", DeliveryContract::V0_2.recovery.none_label(), DeliveryContract::V0_2.recovery.as_str());
     println!("{}", DeliveryContract::PT_WINDOW_HONESTY);
 
-    let spec = WindowSpec {
-        kind: WindowKind::tumbling_pt(1_000_000)?,
-        keys: vec!["device_id".into()],
-        aggs: vec![AggCall::new(
+    let spec = WindowSpec::new(
+        WindowKind::tumbling_pt(1_000_000)?,
+        vec!["device_id".into()],
+        vec![AggCall::new(
             AggFn::Avg,
             Some(Expr::Column {
                 name: "temperature".into(),
             }),
             "avg_temp",
         )],
-    };
+    );
     let bound = bind_window_linear(
         PipelineId::new(1),
         RevisionId::new(1),

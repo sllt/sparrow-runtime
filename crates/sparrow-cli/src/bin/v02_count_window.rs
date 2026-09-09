@@ -24,17 +24,17 @@ fn run() -> sparrow_model::Result<()> {
             Field::new(FieldId::new(2), "temperature", DataType::Float64, true),
         ],
     )?;
-    let spec = WindowSpec {
-        kind: WindowKind::count(2)?,
-        keys: vec!["device_id".into()],
-        aggs: vec![AggCall::new(
+    let spec = WindowSpec::new(
+        WindowKind::count(2)?,
+        vec!["device_id".into()],
+        vec![AggCall::new(
             AggFn::Avg,
             Some(Expr::Column {
                 name: "temperature".into(),
             }),
             "avg_temp",
         )],
-    };
+    );
     let bound = bind_window_linear(
         PipelineId::new(1),
         RevisionId::new(1),

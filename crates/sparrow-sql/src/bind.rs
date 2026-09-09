@@ -21,6 +21,9 @@ pub fn bind_sql(
     pipeline: PipelineId,
     revision: RevisionId,
 ) -> Result<BoundLogicalPlan> {
+    if looks_like_v03(sql) {
+        return crate::bind_v03::bind_sql_v03(sql, catalog, pipeline, revision);
+    }
     if looks_like_v02(sql) {
         return crate::bind_v02::bind_sql_v02(sql, catalog, pipeline, revision);
     }
@@ -39,6 +42,17 @@ pub fn bind_sql(
         ));
     };
     bind_query(query, catalog, pipeline, revision)
+}
+
+fn looks_like_v03(sql: &str) -> bool {
+    let u = sql.to_ascii_uppercase();
+    u.contains("HOP(")
+        || u.contains("FOR SYSTEM_TIME")
+        || u.contains("WATERMARK")
+        || (u.contains("TUMBLE(")
+            && !u.contains("PROCESSING_TIME")
+            && !u.contains("PROCTIME")
+            && !u.contains("PROC_TIME"))
 }
 
 fn looks_like_v02(sql: &str) -> bool {

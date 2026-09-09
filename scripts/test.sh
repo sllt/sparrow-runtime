@@ -26,8 +26,11 @@ bash scripts/m3-demo.sh
 echo "== V0.2 process demos =="
 bash scripts/v02-demo.sh
 
+echo "== V0.3 process demos =="
+bash scripts/v03-demo.sh
+
 echo "== G1a experiments =="
 cargo run -p layout-rowbatch
 cargo run -p arrow-evaluation
 
-echo "all M0–M3 / V0.1 / V0.2 checks passed"
+echo "all M0–M3 / V0.1 / V0.2 / V0.3 checks passed"

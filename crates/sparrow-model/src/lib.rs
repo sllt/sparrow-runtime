@@ -18,6 +18,7 @@ pub mod memory;
 pub mod resource;
 pub mod scalar;
 pub mod types;
+pub mod watermark;
 pub mod window;
 
 pub use batch::{Row, RowBatch, RowBatchBuilder};
@@ -33,8 +34,12 @@ pub use memory::{MemoryLease, MemoryOwner};
 pub use resource::{CreditKind, CreditUsage, ResourceBudget};
 pub use scalar::{DynamicValue, Scalar};
 pub use types::{DataType, Field, Schema};
+pub use watermark::{
+    holdback_wm_out, EventTimeBinding, InputActivity, InputId, Watermark,
+    DEFAULT_MAX_HOP_OVERLAP, DEFAULT_MAX_WATERMARK_INPUTS,
+};
 pub use window::{
-    AggFn, TimeDomain, WindowKind, INTEGER_OVERFLOW_POLICY,
+    check_hop_overlap_bound, hop_overlap, AggFn, TimeDomain, WindowKind, INTEGER_OVERFLOW_POLICY,
 };
 
 #[cfg(test)]

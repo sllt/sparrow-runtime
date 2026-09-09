@@ -1,8 +1,11 @@
-//! Static [`ReferenceTable`] enrichment. Snapshot is frozen at job submit.
-//! A new Job sees a new table; a running Job keeps the old Arc.
+//! Static and versioned [`ReferenceTable`] enrichment.
+//!
+//! V0.2: a finite snapshot frozen at job submit (running Job keeps the Arc).
+//! V0.3: [`VersionedReferenceTable`] — as-of-event-time lookup; new versions
+//! can be published with `valid_from` without replacing the job handle.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use sparrow_model::{
     CreditKind, DataType, ErrorCode, Field, FieldId, MemoryOwner, Result, Row, RowBatch,
@@ -88,13 +91,124 @@ fn encode_scalars(key: &[Scalar]) -> Vec<u8> {
     out
 }
 
+/// One temporal version of a reference table: valid on `[valid_from, valid_to)`.
+#[derive(Clone, Debug)]
+pub struct TableVersion {
+    pub version: u64,
+    pub valid_from: i64,
+    pub valid_to: Option<i64>,
+    pub table: Arc<ReferenceTable>,
+}
+
+/// Versioned table handle. Publishing a new version is visible to a running job.
+#[derive(Clone, Debug)]
+pub struct VersionedReferenceTable {
+    name: String,
+    max_versions: usize,
+    inner: Arc<RwLock<Vec<TableVersion>>>,
+}
+
+impl VersionedReferenceTable {
+    pub fn new(name: impl Into<String>, max_versions: usize) -> Result<Self> {
+        if max_versions == 0 {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "versioned table max_versions must be > 0",
+            ));
+        }
+        Ok(Self {
+            name: name.into(),
+            max_versions,
+            inner: Arc::new(RwLock::new(Vec::new())),
+        })
+    }
+
+    pub fn from_static(table: Arc<ReferenceTable>, max_versions: usize) -> Result<Self> {
+        let v = Self::new(table.name.clone(), max_versions)?;
+        v.publish(0, i64::MIN / 4, table)?;
+        Ok(v)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn version_count(&self) -> usize {
+        self.inner.read().expect("versioned table").len()
+    }
+
+    /// Publish a new slice. Previous open version is closed at `valid_from`.
+    pub fn publish(&self, version: u64, valid_from: i64, table: Arc<ReferenceTable>) -> Result<()> {
+        if table.name != self.name {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("versioned table '{}' != snapshot '{}'", self.name, table.name),
+            ));
+        }
+        let mut g = self.inner.write().expect("versioned table");
+        if let Some(last) = g.last() {
+            if valid_from < last.valid_from {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "versioned table valid_from must not go backward",
+                ));
+            }
+        }
+        if let Some(last) = g.last_mut() {
+            if last.valid_to.is_none() {
+                last.valid_to = Some(valid_from);
+            }
+        }
+        if g.len() >= self.max_versions {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "versioned table '{}' exceeds max_versions {}",
+                    self.name, self.max_versions
+                ),
+            ));
+        }
+        g.push(TableVersion {
+            version,
+            valid_from,
+            valid_to: None,
+            table,
+        });
+        Ok(())
+    }
+
+    pub fn lookup_as_of(&self, key: &[Scalar], as_of: i64) -> Option<Row> {
+        let g = self.inner.read().expect("versioned table");
+        g.iter()
+            .rev()
+            .find(|v| {
+                as_of >= v.valid_from && v.valid_to.map(|to| as_of < to).unwrap_or(true)
+            })
+            .and_then(|v| v.table.get(key).cloned())
+    }
+
+    pub fn latest(&self) -> Option<Arc<ReferenceTable>> {
+        self.inner
+            .read()
+            .expect("versioned table")
+            .last()
+            .map(|v| Arc::clone(&v.table))
+    }
+}
+
+enum LookupSource {
+    Static(Arc<ReferenceTable>),
+    Versioned(VersionedReferenceTable),
+}
+
 pub struct LookupOperator {
     /// Kept so OperatorId / table identity stay reconstructible for future recovery.
     #[allow(dead_code)]
     spec: LookupSpec,
-    table: Arc<ReferenceTable>,
+    source: LookupSource,
     stream_idx: Vec<usize>,
     keep_idx: Vec<usize>,
+    as_of_idx: Option<usize>,
     #[allow(dead_code)]
     input: Schema,
     output: Schema,
@@ -108,32 +222,77 @@ impl LookupOperator {
         input: Schema,
         owner: Arc<MemoryOwner>,
     ) -> Result<Self> {
+        if spec.temporal {
+            let ver = VersionedReferenceTable::from_static(table, 16)?;
+            return Self::new_versioned(spec, ver, input, owner);
+        }
+        Self::from_source(spec, LookupSource::Static(table), input, owner)
+    }
+
+    pub fn new_versioned(
+        spec: LookupSpec,
+        table: VersionedReferenceTable,
+        input: Schema,
+        owner: Arc<MemoryOwner>,
+    ) -> Result<Self> {
+        Self::from_source(spec, LookupSource::Versioned(table), input, owner)
+    }
+
+    fn from_source(
+        spec: LookupSpec,
+        source: LookupSource,
+        input: Schema,
+        owner: Arc<MemoryOwner>,
+    ) -> Result<Self> {
         spec.validate()?;
-        if spec.table != table.name {
+        let (name, schema, key_fields) = match &source {
+            LookupSource::Static(t) => (t.name.clone(), t.schema.clone(), t.key_fields.clone()),
+            LookupSource::Versioned(t) => {
+                let latest = t.latest().ok_or_else(|| {
+                    SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("versioned table '{}' has no versions", t.name()),
+                    )
+                })?;
+                (t.name().to_string(), latest.schema.clone(), latest.key_fields.clone())
+            }
+        };
+        if spec.table != name {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
-                format!("lookup table '{}' != snapshot '{}'", spec.table, table.name),
+                format!("lookup table '{}' != snapshot '{}'", spec.table, name),
             ));
         }
         let stream_idx = resolve_keys(&input, &spec.stream_keys)?;
         let keep = if spec.keep.is_empty() {
-            table
-                .schema
+            schema
                 .fields
                 .iter()
-                .filter(|f| !table.key_fields.iter().any(|k| k == &f.name))
+                .filter(|f| !key_fields.iter().any(|k| k == &f.name))
                 .map(|f| f.name.clone())
                 .collect()
         } else {
             spec.keep.clone()
         };
-        let keep_idx = resolve_keys(&table.schema, &keep)?;
-        let output = lookup_output_schema(&input, &table.schema, &keep)?;
+        let keep_idx = resolve_keys(&schema, &keep)?;
+        let as_of_idx = if spec.temporal {
+            let field = spec.as_of_field.as_deref().unwrap_or("");
+            Some(input.index_of_name(field).ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown as-of event-time field '{field}'"),
+                )
+            })?)
+        } else {
+            None
+        };
+        let output = lookup_output_schema(&input, &schema, &keep)?;
         Ok(Self {
             spec,
-            table,
+            source,
             stream_idx,
             keep_idx,
+            as_of_idx,
             input,
             output,
             owner,
@@ -141,7 +300,13 @@ impl LookupOperator {
     }
 
     pub fn table_version(&self) -> u64 {
-        self.table.version
+        match &self.source {
+            LookupSource::Static(t) => t.version,
+            LookupSource::Versioned(t) => t
+                .latest()
+                .map(|x| x.version)
+                .unwrap_or(0),
+        }
     }
 
     pub fn output_schema(&self) -> &Schema {
@@ -156,8 +321,27 @@ impl LookupOperator {
                 .iter()
                 .map(|&i| row.values[i].detach_copy())
                 .collect();
+            let hit = match &self.source {
+                LookupSource::Static(t) => t.get(&key).cloned(),
+                LookupSource::Versioned(t) => {
+                    let as_of = if let Some(i) = self.as_of_idx {
+                        row.values
+                            .get(i)
+                            .and_then(Scalar::as_event_time_micros)
+                            .ok_or_else(|| {
+                                SparrowError::new(
+                                    ErrorCode::TypeMismatch,
+                                    "versioned lookup as-of field must be event-time",
+                                )
+                            })?
+                    } else {
+                        i64::MAX
+                    };
+                    t.lookup_as_of(&key, as_of)
+                }
+            };
             let mut values: Vec<Scalar> = row.values.iter().map(Scalar::detach_copy).collect();
-            match self.table.get(&key) {
+            match hit {
                 Some(hit) => {
                     for &i in &self.keep_idx {
                         values.push(hit.values[i].detach_copy());

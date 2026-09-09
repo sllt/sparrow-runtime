@@ -22,6 +22,16 @@ pub enum Scalar {
 }
 
 impl Scalar {
+    /// Event-time micros from Int64 or TimestampMicrosUTC. Other types are None.
+    pub fn as_event_time_micros(&self) -> Option<i64> {
+        match self {
+            Self::Int64(v) => Some(*v),
+            Self::TimestampMicrosUTC(v) => Some(*v),
+            Self::UInt64(v) if *v <= i64::MAX as u64 => Some(*v as i64),
+            _ => None,
+        }
+    }
+
     pub fn utf8(s: impl AsRef<str>) -> Self {
         Self::Utf8(Arc::from(s.as_ref()))
     }

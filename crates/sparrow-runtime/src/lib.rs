@@ -1,8 +1,7 @@
 //! In-process streaming kernel.
 //!
-//! V0.2: ExecutionChain plus task-owned MemoryState, bounded timers,
-//! processing-time / count windows, incremental aggregates, bounded
-//! dedup, and static lookup. Arrow, Axum, SQLite, MQTT, and `sqlparser`
+//! V0.3: event-time / watermark / holdback / hopping on top of V0.2
+//! MemoryState windows. Arrow, Axum, SQLite, MQTT, and `sqlparser`
 //! stay out of this crate.
 
 pub mod aggregate;
@@ -16,15 +15,20 @@ pub mod mailbox;
 pub mod state;
 pub mod timer;
 pub mod transform;
+pub mod watermark;
 pub mod window;
 
 pub use capture::{SharedCapture, StallGate};
 pub use clock::RuntimeClock;
 pub use kernel::{JobHandle, JobRequest, JobStats, Kernel, KernelOptions};
 pub use linear::{drain, LinearExecutor, RuntimeConfig};
-pub use lookup::ReferenceTable;
-pub use mailbox::MailboxConfig;
+pub use lookup::{ReferenceTable, VersionedReferenceTable};
+pub use mailbox::{MailboxConfig, StreamControl};
 pub use state::{MemoryState, StateKey};
+pub use watermark::{OutputHoldback, WatermarkHub};
+
+#[cfg(test)]
+mod time_tests;
 
 #[cfg(test)]
 mod g3_tests;

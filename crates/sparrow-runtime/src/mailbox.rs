@@ -22,8 +22,17 @@ impl Default for MailboxConfig {
     }
 }
 
+/// Watermark / idle punctuation travelling with the dataflow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamControl {
+    Watermark { input: u16, wm_micros: i64 },
+    Idle { input: u16 },
+    Active { input: u16 },
+}
+
 pub struct Envelope {
-    pub batch: RowBatch,
+    pub batch: Option<RowBatch>,
+    pub control: Option<StreamControl>,
     bytes: usize,
     permits: Arc<Semaphore>,
 }
@@ -31,6 +40,12 @@ pub struct Envelope {
 impl Drop for Envelope {
     fn drop(&mut self) {
         self.permits.add_permits(self.bytes.max(1));
+    }
+}
+
+impl Envelope {
+    pub fn take(&mut self) -> (Option<RowBatch>, Option<StreamControl>) {
+        (self.batch.take(), self.control.take())
     }
 }
 
@@ -86,7 +101,35 @@ impl MailboxTx {
         })?;
         permit.forget();
         let env = Envelope {
-            batch,
+            batch: Some(batch),
+            control: None,
+            bytes: n,
+            permits: Arc::clone(&self.bytes),
+        };
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Ok(false),
+            r = self.tx.send(env) => {
+                r.map_err(|_| SparrowError::new(ErrorCode::Cancelled, "mailbox closed"))?;
+                Ok(true)
+            }
+        }
+    }
+
+    pub async fn send_control(&self, control: StreamControl) -> Result<bool> {
+        let n = 1usize;
+        let permit = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Ok(false),
+            p = self.bytes.acquire_many(n as u32) => p,
+        };
+        let permit = permit.map_err(|_| {
+            SparrowError::new(ErrorCode::Cancelled, "mailbox closed")
+        })?;
+        permit.forget();
+        let env = Envelope {
+            batch: None,
+            control: Some(control),
             bytes: n,
             permits: Arc::clone(&self.bytes),
         };

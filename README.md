@@ -1,22 +1,23 @@
 # Sparrow
 
-Single-node **IoT/Edge streaming dataflow runtime**, V0.2.
+Single-node **IoT/Edge streaming dataflow runtime**, V0.3.
 
 Sparrow is dataflow-first: SQL and Graph share one typed IR. It is **not** a
 distributed Flink clone and **not** a Rust eKuiper clone.
 
 **Delivery is `live_best_effort` + `restart_fresh` (`recovery=none`).**
 
-- Processing-time tumbling windows and count windows
+- Event-time tumbling + hopping windows, watermarks, holdback, late side output
+- Processing-time tumbling windows and count windows (arrival-order; they do **not** impersonate event-time)
 - Incremental COUNT/SUM/AVG/MIN/MAX (checked integer overflow)
-- No event-time / watermark (V0.3)
+- Versioned as-of-event-time lookup (beyond V0.2 static freeze)
 - No checkpoint recovery (V0.4+)
 - MQTT replay is **unsupported**
 - A process restart is a **fresh attempt**, not restore
-- PT window results are **not** crash-identical
+- Window results are **not** crash-identical
 - Exactly-once / at-least-once configs are **rejected**
 
-当前里程碑 / current milestone: **V0.2**（PT/count windows + MemoryState + HTTP Push / MQTT Sink）。
+当前里程碑 / current milestone: **V0.3**（event-time + watermark + holdback + hop + versioned lookup）。
 
 ## Quick start
 
@@ -66,21 +67,29 @@ cargo run -p sparrow-cli --bin v02_bounded_dedup
 cargo run -p sparrow-cli --bin v02_static_table
 cargo run -p sparrow-cli --bin v02_http_mqtt_loop
 
+# V0.3 process demos (injected event times — not wall clock)
+bash scripts/v03-demo.sh
+cargo run -p sparrow-cli --bin v03_et_tumble_avg
+cargo run -p sparrow-cli --bin v03_hop_overlap
+cargo run -p sparrow-cli --bin v03_idle_active
+cargo run -p sparrow-cli --bin v03_versioned_lookup
+
 bash scripts/test.sh
 ```
 
-## V0.2 (honest)
+## V0.3 (honest)
 
-Shipped: PT tumbling + count windows, incremental aggregates, task-owned
-`MemoryState` with detach + quotas, bounded timers (generation cancel),
-bounded Deduplicate (TTL + max_keys required), static ReferenceTable
-snapshots (new Job = new table; running Job keeps the old Arc), HTTP Push
-Source and MQTT Sink (connectors crate only).
+Shipped: event-time binding, per-input watermarks (idle/active, no
+backward WM), final-only lateness with output holdback
+(`wm_out ≤ wm_in - L`), ET tumble + hopping (planner overlap cap),
+versioned as-of-event-time lookup, SQL/Graph for that subset.
 
-**Not shipped:** event-time / watermark, checkpoint restore, session merge,
-retract, stream-stream join, WASM, Graph Designer UI.
+**Not shipped:** checkpoint restore, session late merge, retract,
+stream-stream join, exactly-once, NATS, WASM, Graph Designer UI.
+Graph/SQL remain single-source; multi-input WM is the `WatermarkHub` API
+(`v03_idle_active`). Count / PT windows cannot silently use event-time.
 
-See `docs/v02-report.md`.
+See `docs/v03-report.md`.
 
 `sqlparser = "=0.62.0"` is used only by `sparrow-sql`.
 `sparrow-runtime` does **not** depend on HTTP, SQLite, MQTT, Axum, Arrow, or SQL crates.
@@ -108,7 +117,7 @@ crates/sparrow-sql          G0 gate + SQL → same BoundLogicalPlan
 crates/sparrow-io           I/O contracts (no connectors)
 crates/sparrow-formats      bounded JSON codec
 crates/sparrow-connectors   MQTT source/sink, HTTP push + HTTP/Log sinks
-crates/sparrow-runtime      Kernel, MemoryState, windows (no MQTT/HTTP/SQLite/Axum)
+crates/sparrow-runtime      Kernel, MemoryState, watermarks, windows (no MQTT/HTTP/SQLite/Axum)
 crates/sparrow-control      SQLite catalog + desired→actual supervisor
 crates/sparrow-server       authenticated /v1 API + sparrow-server binary
 crates/sparrow-cli          M2 composition-root demo
@@ -120,19 +129,20 @@ docs/                      architecture, ADRs, M0–M3 reports
 ## Invariants
 
 - All buffers bounded (bytes + rows + work budget + mailbox items/bytes + keys + timers)
-- V0.2 delivery: `live_best_effort` + `restart_fresh` (`recovery=none` for PT windows)
+- V0.3 delivery: `live_best_effort` + `restart_fresh` (`recovery=none` for PT/ET windows)
 - MQTT replay is **unsupported**; durable recovery configs are rejected
 - Job-level failure attribution in-process; stop joins every chain task
 - One engine; Compact / Performance are budgets
 - `RowBatch` is the V0.1 default (ADR-003)
 - Control plane and connectors stay **outside** `sparrow-runtime`
 
-## Non-goals (V0.2)
+## Non-goals (V0.3)
 
-Graph Designer UI, WASM, event-time / watermarks, distributed execution,
-exactly-once, checkpoint restore, multi-user RBAC, claimed SLOs.
+Graph Designer UI, WASM, distributed execution, exactly-once, checkpoint
+restore, session late merge, retract, stream-stream join, NATS,
+multi-user RBAC, claimed SLOs.
 
-See `docs/v02-report.md` and `docs/m3-report.md`.
+See `docs/v03-report.md` and `docs/v02-report.md`.
 
 Repository: https://github.com/sllt/sparrow-runtime
 

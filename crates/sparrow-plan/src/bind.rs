@@ -10,7 +10,7 @@ use crate::stateful::{
 };
 use sparrow_expr::{infer_type, Expr};
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
-use sparrow_model::{AggFn, OperatorId, PipelineId, RevisionId, Schema, SchemaId, TimeDomain, WindowKind};
+use sparrow_model::{AggFn, OperatorId, PipelineId, RevisionId, Schema, SchemaId, WindowKind};
 
 pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPlan> {
     let mut cat = catalog.clone();
@@ -183,22 +183,42 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     output,
                 }
             }
-            "hop" | "session" | "watermark" | "event_time_window" => {
+            "hop" | "tumble_et" | "event_time_window" => {
+                let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
+                    SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("window {id} has no input"),
+                    )
+                })?;
+                let spec = bind_window_node(node, &input)?;
+                spec.validate()?;
+                let output = window_output_schema(&input, &spec)?;
+                incoming_schema.insert(id, output.clone());
+                BoundKind::WindowAgg {
+                    spec,
+                    input,
+                    output,
+                }
+            }
+            "session" | "retract" | "late_merge" => {
                 return Err(SparrowError::new(
                     ErrorCode::FeatureUnavailable,
-                    format!("node kind '{}' is not part of V0.2 (event-time / hop / session / watermark are V0.3+)", node.kind),
+                    format!(
+                        "node kind '{}' is not part of V0.3 (session late merge / retract are out)",
+                        node.kind
+                    ),
                 ));
             }
             "join" => {
                 return Err(SparrowError::new(
                     ErrorCode::FeatureUnavailable,
-                    "stream-stream join is not part of V0.2; use kind=lookup for static ReferenceTable",
+                    "stream-stream join is not part of V0.3; use kind=lookup for reference / versioned tables",
                 ));
             }
             other => {
                 return Err(SparrowError::new(
                     ErrorCode::FeatureUnavailable,
-                    format!("node kind '{other}' is not part of V0.2"),
+                    format!("node kind '{other}' is not part of V0.3"),
                 ));
             }
         };
@@ -232,7 +252,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
     if sources != 1 || sinks != 1 {
         return Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
-            format!("V0.2 plans must have exactly one source and one sink (got {sources}/{sinks})"),
+            format!("V0.3 linear plans must have exactly one source and one sink (got {sources}/{sinks})"),
         ));
     }
 
@@ -495,13 +515,14 @@ fn bind_window_node(node: &NodeSpec, _input: &Schema) -> Result<WindowSpec> {
     if node
         .window
         .as_ref()
-        .map(|w| {
-            let k = w.kind.to_ascii_lowercase();
-            k.contains("event") || k == "hop" || k == "session"
-        })
+        .map(|w| w.kind.to_ascii_lowercase() == "session")
         .unwrap_or(false)
+        || node.kind == "session"
     {
-        TimeDomain::EventTime.require_processing_time()?;
+        return Err(SparrowError::new(
+            ErrorCode::FeatureUnavailable,
+            "SESSION windows and late merge are not part of V0.3",
+        ));
     }
     let kind = if let Some(w) = &node.window {
         match w.kind.to_ascii_lowercase().as_str() {
@@ -509,10 +530,17 @@ fn bind_window_node(node: &NodeSpec, _input: &Schema) -> Result<WindowSpec> {
                 WindowKind::tumbling_pt(w.size_micros.unwrap_or(0))?
             }
             "count" | "count_window" => WindowKind::count(w.size.unwrap_or(0))?,
-            "tumble" | "event_time" | "hop" | "session" => {
+            "tumble_et" | "tumbling_et" | "tumbling_event_time" | "event_time" | "tumble" => {
+                WindowKind::tumbling_et(w.size_micros.unwrap_or(0))?
+            }
+            "hop" | "hopping" | "hopping_event_time" => WindowKind::hopping_et(
+                w.size_micros.unwrap_or(0),
+                w.slide_micros.unwrap_or(0),
+            )?,
+            "session" => {
                 return Err(SparrowError::new(
                     ErrorCode::FeatureUnavailable,
-                    format!("window kind '{}' is not part of V0.2 (event-time is V0.3)", w.kind),
+                    "SESSION windows are not part of V0.3",
                 ));
             }
             other => {
@@ -530,6 +558,17 @@ fn bind_window_node(node: &NodeSpec, _input: &Schema) -> Result<WindowSpec> {
             .or_else(|| node.max_keys.map(|n| n as u64))
             .unwrap_or(0);
         WindowKind::count(size)?
+    } else if node.kind == "hop" {
+        let w = node.window.as_ref().ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "hop needs window {size_micros, slide_micros}",
+            )
+        })?;
+        WindowKind::hopping_et(w.size_micros.unwrap_or(0), w.slide_micros.unwrap_or(0))?
+    } else if node.kind == "tumble_et" || node.kind == "event_time_window" {
+        let size = node.window.as_ref().and_then(|w| w.size_micros).unwrap_or(0);
+        WindowKind::tumbling_et(size)?
     } else {
         return Err(SparrowError::new(
             ErrorCode::InvalidArgument,
@@ -551,7 +590,29 @@ fn bind_window_node(node: &NodeSpec, _input: &Schema) -> Result<WindowSpec> {
             Ok(AggCall::new(func, input, a.alias.clone()))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(WindowSpec { kind, keys, aggs })
+    let event_time_field = node
+        .event_time_field
+        .clone()
+        .or_else(|| node.window.as_ref().and_then(|w| w.event_time_field.clone()));
+    let lateness_micros = node
+        .lateness_micros
+        .or_else(|| node.window.as_ref().and_then(|w| w.lateness_micros))
+        .unwrap_or(0);
+    let max_overlap = node
+        .window
+        .as_ref()
+        .and_then(|w| w.max_overlap)
+        .unwrap_or(sparrow_model::DEFAULT_MAX_HOP_OVERLAP);
+    let spec = WindowSpec {
+        kind,
+        keys,
+        aggs,
+        event_time_field,
+        lateness_micros,
+        max_overlap,
+    };
+    spec.validate()?;
+    Ok(spec)
 }
 
 fn bind_dedup_node(node: &NodeSpec) -> Result<DedupSpec> {
@@ -580,6 +641,8 @@ fn bind_lookup_node(node: &NodeSpec) -> Result<LookupSpec> {
         stream_keys: on.iter().map(|o| o.stream.clone()).collect(),
         table_keys: on.iter().map(|o| o.table.clone()).collect(),
         keep: node.keep.clone().unwrap_or_default(),
+        temporal: node.temporal.unwrap_or(false),
+        as_of_field: node.as_of_field.clone(),
     })
 }
 
@@ -597,14 +660,14 @@ fn reject_fan_in(spec: &GraphSpec) -> Result<()> {
             if inbound[d] > 1 {
                 return Err(SparrowError::new(
                     ErrorCode::FeatureUnavailable,
-                    format!("fan-in on node {d} is not part of V0.2"),
+                    format!("fan-in on node {d} is not part of V0.3 (multi-input watermark is an operator API, not Graph fan-in)"),
                 ));
             }
         }
         if n.out.len() > 1 {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                    format!("fan-out on node {} is not part of V0.2", n.id),
+                    format!("fan-out on node {} is not part of V0.3", n.id),
             ));
         }
     }
