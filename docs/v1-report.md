@@ -1,7 +1,7 @@
 # Sparrow V1 report
 
 Date: 2026-09-09  
-Host: `cargo test --workspace` + `scripts/v1-demo.sh`
+Host: `cargo test --workspace` + `scripts/v1-demo.sh` + `scripts/review-fix-demo.sh`
 
 V1 is a **long-running Edge Runtime** with **explicit, capability-conditioned
 recovery**. It is **not** distributed and **not** a stream database.
@@ -34,7 +34,8 @@ stabilizes.
 | Lookup table revision bind | `TableRevisionBind` on snapshot | Restore requires the same table name+revision |
 | State-reuse white-list | `sparrow-plan` `compat.rs` | WHERE-before-window → reset/replay |
 | Status effective guarantees | `GET /v1/pipelines/{name}/status` | `effective.recovery` + `recovery_risk` |
-| Metrics | `GET /v1/metrics` | Job/connector counters; no per-event labels |
+| File/aligned via HTTP API | `Supervisor` + `/v1/pipelines/{name}/start\|checkpoint\|restore\|kill` | Not CLI-only; MQTT+aligned still rejected |
+| Metrics | `GET /v1/metrics` | Live ingest/emit/queue/state; missing samples are not silently “healthy zero” |
 | Security | server + tests | Bearer token, loopback default, 64KiB body, target policy |
 | Soak / fault | `v1_soak` + unit tests | Finite start/stop, kill/restore, disk-full, corrupt MANIFEST |
 
@@ -82,9 +83,9 @@ operator must reset/replay. There is no automatic remapping table in V1.
 
 `GET /v1/metrics` (bearer token) and structured log lines:
 
-- `jobs_started` / `jobs_stopped`
+- `jobs_started` / `jobs_stopped` / `jobs_failed`
 - `ingested_rows` / `emitted_rows`
-- `queue_items` / `queue_bytes`
+- `queue_items` / `queue_bytes` / `state_keys` / `state_bytes` / `live_samples`
 - `watermark_lag_micros` (where a watermark exists)
 - `checkpoint_duration_micros` / `checkpoint_bytes` / commits / aborts
 
@@ -96,7 +97,12 @@ No per-event or per-key labels.
 - Default bind `127.0.0.1:43180`; non-loopback needs `--allow-remote`
 - Request bodies capped at 64KiB
 - `TargetPolicy` deny-by-default; unauthorized HTTP/MQTT hosts are 403
-- TLS `skip_verify` rejected
+- TLS `skip_verify` rejected; outbound HTTP does **not** auto-follow redirects
+- Catalog SQLite file is `0600`. Secrets are XOR-sealed (`enc:v1:…`, key from `SPARROW_SECRETS_KEY` or a process-local default) and never echoed in errors. **Threat model:** this is disk-at-rest obfuscation + permissions, not a HSM. Anyone who can read the DB and the key can recover secrets. Prefer `env:` refs for production.
+
+## Secrets (R27)
+
+SQLite is a local single-node catalog. The threat is an untrusted process reading the catalog file. Mitigations: file mode `0600`, sealed blobs, no secret values in logs/errors. This is **not** multi-tenant secret management.
 
 ## Optional / incomplete (do not block V1)
 
@@ -118,6 +124,7 @@ No per-event or per-key labels.
 cargo test --workspace
 
 bash scripts/v1-demo.sh
+bash scripts/review-fix-demo.sh
 
 cargo run -p sparrow-cli --bin v1_file_checkpoint -- --data FILE --chk DIR --mode gold
 cargo run -p sparrow-cli --bin v1_file_checkpoint -- --data FILE --chk DIR --mode checkpoint --until 2
@@ -133,3 +140,4 @@ cargo run -p sparrow-cli --bin v1_soak
 | `v1_mqtt_reject` | MQTT stays `live_best_effort` + `replay=unsupported` |
 | `v1_soak` | Finite start/stop, checkpoint/restore loops, disk-full and corrupt MANIFEST rejects |
 | `scripts/v1-demo.sh` | Above plus `/v1/status` effective guarantees, `/v1/metrics`, unsupported configs 4xx |
+| `scripts/review-fix-demo.sh` | Kernel failure→Failed, HTTP Push 429, JOIN WHERE, File/aligned HTTP API, desired revision, MQTT stop deadline, work quantum, capture bounds |
