@@ -295,7 +295,11 @@ fn r15_oversize_manifest_restore_fails_via_api() {
         tokio::time::sleep(Duration::from_millis(80)).await;
         call(&state, auth_post("/v1/pipelines/r15/checkpoint", "{}")).await;
         call(&state, auth_post("/v1/pipelines/r15/kill", "{}")).await;
-        std::fs::write(chk.join("MANIFEST"), vec![b'X'; 300 * 1024]).unwrap();
+        let current = std::fs::read_to_string(chk.join("CURRENT")).unwrap();
+        let gen = current.trim();
+        let manifest = chk.join(gen).join("MANIFEST");
+        assert!(manifest.exists(), "expected {manifest:?}");
+        std::fs::write(&manifest, vec![b'X'; 300 * 1024]).unwrap();
         let (st, body) = call(&state, auth_post("/v1/pipelines/r15/restore", "{}")).await;
         assert_eq!(st, StatusCode::OK, "{body}");
         wait_status(&state, "r15", "failed", Duration::from_secs(6))

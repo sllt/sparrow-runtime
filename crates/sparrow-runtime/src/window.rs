@@ -984,7 +984,15 @@ mod review_tests {
                 accs: vec![Accumulator::new(AggFn::Sum, DataType::Int64, false).unwrap()],
             });
         }
-        let mut w = op();
+        let mut w = WindowOperator::new(
+            OperatorId::new(1),
+            pt_spec(),
+            schema(),
+            MemoryOwner::new(ResourceBudget::compact()),
+            64,
+            64,
+        )
+        .unwrap();
         w.restore_freeze(&WindowFreeze {
             operator: OperatorId::new(1),
             slot: StateSlotId::new(1),
