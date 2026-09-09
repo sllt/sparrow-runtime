@@ -122,13 +122,6 @@ fn join_reject(from: &TableWithJoins) -> Result<Option<G0Verdict>> {
         return Ok(Some(rejected("only one static lookup JOIN is part of V0.2")));
     }
     if let Some(j) = from.joins.first() {
-        match j.join_operator {
-            JoinOperator::Inner(_) | JoinOperator::LeftOuter(_) | JoinOperator::LeftAnti(_) => {}
-            JoinOperator::Inner(JoinConstraint::None) => {}
-            _ => {
-                // allow Inner/Left with constraint; reject others below
-            }
-        }
         match &j.join_operator {
             JoinOperator::FullOuter(_) | JoinOperator::RightOuter(_) | JoinOperator::CrossJoin(_) => {
                 return Ok(Some(rejected(

@@ -3,8 +3,6 @@
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
-
 use sparrow_formats::{JsonCodec, JsonLimits};
 use sparrow_model::{ErrorCode, RestoreClaim, Row, Schema, SourceFrame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities, ReplaySupport};
+use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
 use crate::error::{ConnectorError, Result};
 use crate::policy::TargetPolicy;

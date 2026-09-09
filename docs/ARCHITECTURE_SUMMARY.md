@@ -29,8 +29,8 @@ distributed Flink clone and not a Rust eKuiper clone.
 | `sparrow-sql` | G0 gate + SQL binder onto the same IR (not a runtime dep) |
 | `sparrow-io` | Decoder / Source / Sink *contracts* only |
 | `sparrow-formats` | Bounded JSON decode/encode, schema + bad-record policy |
-| `sparrow-connectors` | MQTT source, HTTP/Log sinks, `SecretResolver`, `TargetPolicy` |
-| `sparrow-runtime` | `Kernel`: ExecutionChain, bounded mailboxes, `live_in`/`live_out` channels |
+| `sparrow-connectors` | MQTT source/sink, HTTP push + HTTP/Log sinks, `SecretResolver`, `TargetPolicy` |
+| `sparrow-runtime` | `Kernel`: ExecutionChain, MemoryState, PT/count windows (no MQTT/HTTP/SQLite/Axum) |
 | `sparrow-control` | SQLite catalog, desired vs actual, supervisor (no Axum) |
 | `sparrow-server` | Bearer-token `/v1` API; `sparrow-server` binary |
 | `sparrow-cli` | M2 composition-root demo |

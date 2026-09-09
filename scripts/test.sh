@@ -30,4 +30,4 @@ echo "== G1a experiments =="
 cargo run -p layout-rowbatch
 cargo run -p arrow-evaluation
 
-echo "all M0–M3 / V0.1 checks passed"
+echo "all M0–M3 / V0.1 / V0.2 checks passed"

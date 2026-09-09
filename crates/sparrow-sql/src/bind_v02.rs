@@ -2,14 +2,14 @@
 
 use sqlparser::ast::{
     BinaryOperator, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr, Statement,
-    TableFactor, ValueWithSpan,
+    GroupByExpr, JoinConstraint, JoinOperator, Select, SelectItem, SetExpr, Statement,
+    ValueWithSpan,
 };
 use sqlparser::parser::Parser;
 use sparrow_expr::{infer_type, BinaryOp, Expr};
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sparrow_model::{
-    AggFn, DataType, PipelineId, RevisionId, Scalar, Schema, SchemaId, WindowKind,
+    AggFn, DataType, PipelineId, RevisionId, Schema, SchemaId, WindowKind,
 };
 use sparrow_plan::catalog::project_schema;
 use sparrow_plan::{
@@ -162,10 +162,6 @@ fn bind_join(
         insert_project_before_sink(&mut plan, exprs, output)?;
     }
     Ok(plan)
-}
-
-fn spec_table_key_placeholder() -> String {
-    String::new()
 }
 
 fn insert_project_before_sink(

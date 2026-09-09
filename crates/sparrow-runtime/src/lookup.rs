@@ -89,10 +89,13 @@ fn encode_scalars(key: &[Scalar]) -> Vec<u8> {
 }
 
 pub struct LookupOperator {
+    /// Kept so OperatorId / table identity stay reconstructible for future recovery.
+    #[allow(dead_code)]
     spec: LookupSpec,
     table: Arc<ReferenceTable>,
     stream_idx: Vec<usize>,
     keep_idx: Vec<usize>,
+    #[allow(dead_code)]
     input: Schema,
     output: Schema,
     owner: Arc<MemoryOwner>,

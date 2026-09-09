@@ -23,13 +23,6 @@ impl TimerId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct HeapItem {
-    at: i64,
-    gen: u64,
-    id: u64,
-}
-
 /// One pending timer per [`TimerId`]. Old generations are cancelled, not leaked.
 pub struct BoundedTimers {
     operator: OperatorId,
