@@ -125,6 +125,7 @@ cargo test --workspace
 
 bash scripts/v1-demo.sh
 bash scripts/review-fix-demo.sh
+bash scripts/bench.sh
 
 cargo run -p sparrow-cli --bin v1_file_checkpoint -- --data FILE --chk DIR --mode gold
 cargo run -p sparrow-cli --bin v1_file_checkpoint -- --data FILE --chk DIR --mode checkpoint --until 2
@@ -140,4 +141,5 @@ cargo run -p sparrow-cli --bin v1_soak
 | `v1_mqtt_reject` | MQTT stays `live_best_effort` + `replay=unsupported` |
 | `v1_soak` | Finite start/stop, checkpoint/restore loops, disk-full and corrupt MANIFEST rejects |
 | `scripts/v1-demo.sh` | Above plus `/v1/status` effective guarantees, `/v1/metrics`, unsupported configs 4xx |
-| `scripts/review-fix-demo.sh` | Kernel failure→Failed, HTTP Push 429, JOIN WHERE, File/aligned HTTP API, desired revision, MQTT stop deadline, work quantum, capture bounds |
+| `scripts/review-fix-demo.sh` | Failure/edge matrix: kernel Failed vs cancel, resources, SQL, MQTT/HTTP I/O, catalog crash, File/aligned HTTP API restore rejects, metrics |
+| `scripts/bench.sh` | Host-specific end-to-end MQTT→HTTP and File/window throughput (not SLOs; not exactly-once). See `docs/bench.md` |

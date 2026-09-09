@@ -80,3 +80,7 @@ path = "src/bin/v1_mqtt_reject.rs"
 [[bin]]
 name = "v1_soak"
 path = "src/bin/v1_soak.rs"
+
+[[bin]]
+name = "sparrow_bench"
+path = "src/bin/sparrow_bench.rs"
