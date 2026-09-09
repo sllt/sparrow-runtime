@@ -1,0 +1,22 @@
+[package]
+name = "sparrow-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Thin composition root: wires connectors to sparrow-runtime without adding I/O deps to the kernel"
+
+[dependencies]
+sparrow-model = { path = "../sparrow-model" }
+sparrow-expr = { path = "../sparrow-expr" }
+sparrow-plan = { path = "../sparrow-plan" }
+sparrow-runtime = { path = "../sparrow-runtime" }
+sparrow-formats = { path = "../sparrow-formats" }
+sparrow-connectors = { path = "../sparrow-connectors" }
+sparrow-testkit = { path = "../sparrow-testkit" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-util = { workspace = true }
+
+[[bin]]
+name = "m2_mqtt_http_loop"
+path = "src/bin/m2_mqtt_http_loop.rs"

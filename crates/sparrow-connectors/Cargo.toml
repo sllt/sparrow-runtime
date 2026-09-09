@@ -1,0 +1,24 @@
+[package]
+name = "sparrow-connectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "MQTT source, HTTP/Log sinks, secrets, and target policy (outside sparrow-runtime)"
+
+[dependencies]
+sparrow-model = { path = "../sparrow-model" }
+sparrow-io = { path = "../sparrow-io" }
+sparrow-formats = { path = "../sparrow-formats" }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "macros", "rt", "time"] }
+tokio-util = { workspace = true }
+serde_json = "1"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+sparrow-expr = { path = "../sparrow-expr" }
+sparrow-plan = { path = "../sparrow-plan" }
+sparrow-runtime = { path = "../sparrow-runtime" }
+sparrow-testkit = { path = "../sparrow-testkit" }

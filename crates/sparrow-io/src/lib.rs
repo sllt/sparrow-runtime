@@ -1,4 +1,4 @@
-//! I/O *contracts* for M0. No MQTT, HTTP, or filesystem connectors.
+//! I/O *contracts*. Live MQTT/HTTP implementations live in `sparrow-connectors`.
 //!
 //! Codecs convert [`SourceFrame`] bytes into typed [`RowBatch`] records.
 //! Implementations in this crate are test doubles only.
