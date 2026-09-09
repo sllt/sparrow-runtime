@@ -704,6 +704,12 @@ async fn window_stage(
                                 StreamControl::Active { input } => {
                                     op.mark_active(sparrow_model::InputId(input))?
                                 }
+                                StreamControl::CheckpointBarrier { .. } => {
+                                    if !tx.send_control(ctrl).await? {
+                                        return Ok(n);
+                                    }
+                                    crate::window::WindowEmission::default()
+                                }
                             };
                             n += emission.finals.len();
                             if !emit_window(op, tx, capture, emission).await? {

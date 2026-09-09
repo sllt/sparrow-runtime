@@ -1,0 +1,14 @@
+[package]
+name = "sparrow-wasm-spike"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Optional WASM spike (not a V0.4 release blocker; off default build)"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Intentionally empty: this spike must not pull sparrow-runtime,
+# MQTT, Axum, SQLite, or Arrow.

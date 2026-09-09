@@ -183,7 +183,9 @@ impl PipelineSpec {
     pub fn check_delivery(&self) -> Result<(DeliveryGuarantee, RecoveryPolicy)> {
         let g = DeliveryGuarantee::parse(&self.delivery)?;
         let r = RecoveryPolicy::parse(&self.recovery)?;
-        self.restore_claim()?.validate()?;
+        let claim = self.restore_claim()?;
+        let replayable = matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay");
+        sparrow_model::check_recovery_capabilities(&self.source.kind, replayable, r, &claim)?;
         Ok((g, r))
     }
 }

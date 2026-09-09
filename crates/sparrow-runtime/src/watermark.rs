@@ -255,6 +255,11 @@ impl WatermarkHub {
             timestamp_micros: self.last_effective.unwrap_or(0),
         }
     }
+
+    /// Restore the last committed effective watermark (experimental).
+    pub fn restore_effective(&mut self, last: Option<i64>) {
+        self.last_effective = last;
+    }
 }
 
 impl Default for WatermarkHub {
@@ -334,6 +339,12 @@ impl OutputHoldback {
         }
         self.wm_out = Some(wm_out);
         Ok(())
+    }
+
+    /// Restore holdback from a committed snapshot (experimental).
+    pub fn restore(&mut self, wm_in: Option<i64>, wm_out: Option<i64>) {
+        self.wm_in = wm_in;
+        self.wm_out = wm_out;
     }
 }
 

@@ -28,6 +28,8 @@ pub enum StreamControl {
     Watermark { input: u16, wm_micros: i64 },
     Idle { input: u16 },
     Active { input: u16 },
+    /// Experimental aligned checkpoint barrier (single-job). Not exactly-once.
+    CheckpointBarrier { checkpoint_id: u64 },
 }
 
 pub struct Envelope {

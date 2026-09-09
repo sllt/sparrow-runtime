@@ -24,7 +24,9 @@ pub mod window;
 pub use batch::{Row, RowBatch, RowBatchBuilder};
 pub use budget::WorkBudget;
 pub use clock::{InstantSource, SharedVirtualClock, WallClock};
-pub use delivery::{DeliveryContract, DeliveryGuarantee, RecoveryPolicy, RestoreClaim};
+pub use delivery::{
+    check_recovery_capabilities, DeliveryContract, DeliveryGuarantee, RecoveryPolicy, RestoreClaim,
+};
 pub use error::{ErrorCode, Result, SparrowError};
 pub use frame::{CodecBounds, CodecBoundary, SourceFrame, DEFAULT_MAX_RECORD_BYTES};
 pub use ids::{

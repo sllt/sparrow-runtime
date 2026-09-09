@@ -57,6 +57,13 @@ impl LogSink {
         Arc::clone(&self.lines)
     }
 
+    /// Connector SDK flush. Log lines are already in the ring; this is a
+    /// barrier no-op so experimental checkpoint can wait on sink flush.
+    pub fn flush(&self) -> Result<()> {
+        drop(self.lines.lock().expect("log"));
+        Ok(())
+    }
+
     pub async fn run(self, mut rx: mpsc::Receiver<RowBatch>, cancel: CancellationToken) {
         loop {
             tokio::select! {

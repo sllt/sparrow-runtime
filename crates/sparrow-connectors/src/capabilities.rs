@@ -1,23 +1,11 @@
 use sparrow_model::{
-    DeliveryContract, DeliveryGuarantee, ErrorCode, RecoveryPolicy, RestoreClaim,
+    check_recovery_capabilities, DeliveryContract, DeliveryGuarantee, ErrorCode, RecoveryPolicy,
+    RestoreClaim,
 };
 
 use crate::error::{ConnectorError, Result};
 
-/// Replay is not available for MQTT in V0.1. Declared so capability
-/// negotiation can refuse durable-recovery configs instead of lying.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplaySupport {
-    Unsupported,
-}
-
-impl ReplaySupport {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unsupported => "unsupported",
-        }
-    }
-}
+pub use sparrow_io::ReplaySupport;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorCapabilities {
@@ -62,12 +50,31 @@ impl ConnectorCapabilities {
         delivery: DeliveryGuarantee::LiveBestEffort,
         recovery: RecoveryPolicy::RestartFresh,
     };
+
+    pub const FILE_REPLAY: Self = Self {
+        kind: "file",
+        replay: ReplaySupport::Replayable,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::ExperimentalAligned,
+    };
 }
 
-/// Rejects at-least-once, checkpoint, MQTT session, or any restore claim.
+/// Rejects at-least-once, MQTT session, or any restore claim on the
+/// default (non-experimental) path. MQTT/HTTP still use this.
 pub fn refuse_durable_recovery(claim: &RestoreClaim) -> Result<()> {
-    DeliveryContract::V0_1
+    DeliveryContract::V0_4
         .validate_restore(claim)
+        .map_err(|e| ConnectorError::new(e.code, e.to_string()))
+}
+
+/// Capability matrix entry point used by File replay and pipeline validate.
+pub fn refuse_unsupported_recovery(
+    source_kind: &str,
+    replayable: bool,
+    recovery: RecoveryPolicy,
+    claim: &RestoreClaim,
+) -> Result<()> {
+    check_recovery_capabilities(source_kind, replayable, recovery, claim)
         .map_err(|e| ConnectorError::new(e.code, e.to_string()))
 }
 
@@ -86,7 +93,7 @@ pub fn refuse_qos_durable(qos: u8) -> Result<()> {
         Err(ConnectorError::new(
             ErrorCode::UnsupportedDelivery,
             format!(
-                "MQTT QoS {qos} implies durable / at-least-once delivery; V0.1 is live_best_effort QoS 0 only (replay={})",
+                "MQTT QoS {qos} implies durable / at-least-once delivery; V0.4 is live_best_effort QoS 0 only (replay={})",
                 ReplaySupport::Unsupported.as_str()
             ),
         ))
@@ -99,7 +106,7 @@ pub fn refuse_dirty_session(clean_session: bool) -> Result<()> {
     } else {
         Err(ConnectorError::new(
             ErrorCode::UnsupportedRestore,
-            "MQTT clean_session=false requests session restore; V0.1 is restart_fresh (replay=unsupported)",
+            "MQTT clean_session=false requests session restore; replay=unsupported so durable restore is rejected",
         ))
     }
 }
@@ -124,5 +131,23 @@ mod tests {
             .code(),
             ErrorCode::UnsupportedRestore
         );
+        assert!(refuse_unsupported_recovery(
+            "mqtt",
+            false,
+            RecoveryPolicy::ExperimentalAligned,
+            &RestoreClaim::Checkpoint {
+                snapshot_id: "x".into()
+            },
+        )
+        .is_err());
+        assert!(refuse_unsupported_recovery(
+            "file",
+            true,
+            RecoveryPolicy::ExperimentalAligned,
+            &RestoreClaim::Checkpoint {
+                snapshot_id: "x".into()
+            },
+        )
+        .is_ok());
     }
 }

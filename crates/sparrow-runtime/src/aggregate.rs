@@ -229,6 +229,155 @@ impl Accumulator {
             Self::Min { v } | Self::Max { v } => v.clone().unwrap_or(Scalar::Null),
         }
     }
+
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Self::Count {
+                rows,
+                non_null,
+                star,
+            } => {
+                out.push(1);
+                out.extend_from_slice(&rows.to_le_bytes());
+                out.extend_from_slice(&non_null.to_le_bytes());
+                out.push(u8::from(*star));
+            }
+            Self::SumI64 { sum, n } => {
+                out.push(2);
+                out.extend_from_slice(&sum.to_le_bytes());
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Self::SumU64 { sum, n } => {
+                out.push(3);
+                out.extend_from_slice(&sum.to_le_bytes());
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Self::SumF64 { sum, n } => {
+                out.push(4);
+                out.extend_from_slice(&sum.to_bits().to_le_bytes());
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Self::Avg { sum, n, saw_float } => {
+                out.push(5);
+                out.extend_from_slice(&sum.to_bits().to_le_bytes());
+                out.extend_from_slice(&n.to_le_bytes());
+                out.push(u8::from(*saw_float));
+            }
+            Self::Min { v } => {
+                out.push(6);
+                encode_opt_scalar(v, out)?;
+            }
+            Self::Max { v } => {
+                out.push(7);
+                encode_opt_scalar(v, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn decode(src: &mut &[u8]) -> Result<Self> {
+        if src.is_empty() {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "truncated accumulator",
+            ));
+        }
+        let tag = src[0];
+        *src = &src[1..];
+        match tag {
+            1 => {
+                let rows = take_u64(src)?;
+                let non_null = take_u64(src)?;
+                let star = take_u8(src)? != 0;
+                Ok(Self::Count {
+                    rows,
+                    non_null,
+                    star,
+                })
+            }
+            2 => Ok(Self::SumI64 {
+                sum: take_i64(src)?,
+                n: take_u64(src)?,
+            }),
+            3 => Ok(Self::SumU64 {
+                sum: take_u64(src)?,
+                n: take_u64(src)?,
+            }),
+            4 => Ok(Self::SumF64 {
+                sum: f64::from_bits(take_u64(src)?),
+                n: take_u64(src)?,
+            }),
+            5 => Ok(Self::Avg {
+                sum: f64::from_bits(take_u64(src)?),
+                n: take_u64(src)?,
+                saw_float: take_u8(src)? != 0,
+            }),
+            6 => Ok(Self::Min {
+                v: decode_opt_scalar(src)?,
+            }),
+            7 => Ok(Self::Max {
+                v: decode_opt_scalar(src)?,
+            }),
+            other => Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                format!("unknown accumulator tag {other}"),
+            )),
+        }
+    }
+}
+
+fn take_u8(src: &mut &[u8]) -> Result<u8> {
+    if src.is_empty() {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "truncated accumulator byte",
+        ));
+    }
+    let v = src[0];
+    *src = &src[1..];
+    Ok(v)
+}
+
+fn take_bytes<'a>(src: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+    if src.len() < n {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "truncated accumulator integer",
+        ));
+    }
+    let (head, rest) = src.split_at(n);
+    *src = rest;
+    Ok(head)
+}
+
+fn take_u64(src: &mut &[u8]) -> Result<u64> {
+    Ok(u64::from_le_bytes(take_bytes(src, 8)?.try_into().unwrap()))
+}
+
+fn take_i64(src: &mut &[u8]) -> Result<i64> {
+    Ok(i64::from_le_bytes(take_bytes(src, 8)?.try_into().unwrap()))
+}
+
+fn encode_opt_scalar(v: &Option<Scalar>, out: &mut Vec<u8>) -> Result<()> {
+    match v {
+        None => out.push(0),
+        Some(s) => {
+            out.push(1);
+            s.encode_value(out)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_opt_scalar(src: &mut &[u8]) -> Result<Option<Scalar>> {
+    match take_u8(src)? {
+        0 => Ok(None),
+        1 => Ok(Some(Scalar::decode_value(src)?)),
+        _ => Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "invalid optional scalar tag",
+        )),
+    }
 }
 
 fn overflow() -> SparrowError {

@@ -40,6 +40,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/validate", post(validate))
         .route("/v1/explain", post(explain))
+        .route("/v1/graphs/validate", post(graph_validate))
+        .route("/v1/graphs/explain", post(graph_explain))
         .route("/v1/test", post(test_plan))
         .route("/v1/streams", get(list_streams))
         .route("/v1/streams/{name}", put(put_stream).get(get_stream))
@@ -137,11 +139,14 @@ async fn root() -> Json<Value> {
         "bind_default": DEFAULT_BIND,
         "delivery": "live_best_effort",
         "recovery": "restart_fresh",
+        "recovery_experimental": "experimental_aligned",
         "honesty": HONESTY,
         "endpoints": [
             "GET /v1/health",
             "POST /v1/validate",
             "POST /v1/explain",
+            "POST /v1/graphs/validate",
+            "POST /v1/graphs/explain",
             "PUT /v1/streams/{name}",
             "PUT /v1/pipelines/{name}",
             "POST /v1/pipelines/{name}/start",
@@ -160,6 +165,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "format_version": sparrow_control::FORMAT_VERSION,
         "delivery": "live_best_effort",
         "recovery": "restart_fresh",
+        "recovery_experimental": "experimental_aligned",
         "replay": "unsupported",
         "honesty": HONESTY,
     }))
@@ -228,13 +234,73 @@ fn run_explain(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
     Ok(json!({
         "accepted": e.accepted,
         "stages": e.stages,
+        "physical": e.physical,
+        "fusion": e.fusion,
+        "time": e.time,
+        "state": e.state,
+        "guarantee": e.guarantee,
         "fused": e.fused,
         "mailbox_count": e.mailbox_count,
         "delivery": e.delivery,
         "recovery": e.recovery,
         "replay": e.replay,
         "honesty": e.honesty,
+        "experimental": e.experimental,
     }))
+}
+
+async fn graph_validate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    let _ = require_auth(&state, &headers)?;
+    let text = std::str::from_utf8(&body).map_err(|_| {
+        ApiError::from(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "GraphSpec must be UTF-8 JSON",
+        ))
+    })?;
+    let spec = sparrow_plan::GraphSpec::from_json(text).map_err(ApiError::from)?;
+    let catalog = sparrow_plan::Catalog::new();
+    let bound = sparrow_plan::validate_graph(&spec, &catalog).map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "accepted": true,
+        "nodes": bound.nodes.len(),
+        "honesty": HONESTY,
+    })))
+}
+
+async fn graph_explain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    let _ = require_auth(&state, &headers)?;
+    let text = std::str::from_utf8(&body).map_err(|_| {
+        ApiError::from(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "GraphSpec must be UTF-8 JSON",
+        ))
+    })?;
+    let spec = sparrow_plan::GraphSpec::from_json(text).map_err(ApiError::from)?;
+    let report = sparrow_plan::explain_graph(&spec, &sparrow_plan::Catalog::new())
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "accepted": report.accepted,
+        "stages": report.stages,
+        "physical": report.physical,
+        "fusion": report.fusion,
+        "time": report.time,
+        "state": report.state,
+        "guarantee": report.guarantee,
+        "fused": report.fused,
+        "mailbox_count": report.mailbox_count,
+        "delivery": report.delivery,
+        "recovery": report.recovery,
+        "honesty": report.honesty,
+        "experimental": report.experimental,
+    })))
 }
 
 async fn put_stream(

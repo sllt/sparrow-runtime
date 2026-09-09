@@ -8,6 +8,13 @@ use sparrow_model::{
 };
 use sparrow_model::error::ErrorCode;
 
+pub mod replay;
+
+pub use replay::{
+    fnv1a64, MemoryReplaySource, ReplayCapabilities, ReplaySupport, ReplayableSource,
+    SourceIdentity, SourcePosition,
+};
+
 /// Bytes-in → typed-records-out boundary.
 pub trait Decoder {
     fn decode(&mut self, frame: &SourceFrame, bounds: &CodecBounds) -> Result<RowBatch>;
@@ -18,7 +25,8 @@ pub trait RecordSource {
     fn next_frame(&mut self) -> Result<Option<SourceFrame>>;
 }
 
-/// Push-style sink. The capture sink in `sparrow-testkit` is the M0 impl.
+/// Push-style sink. [`RecordSink::flush`] is part of the Connector SDK
+/// conformance surface (experimental checkpoint waits for flush).
 pub trait RecordSink {
     fn send(&mut self, batch: RowBatch) -> Result<()>;
     fn flush(&mut self) -> Result<()> {
