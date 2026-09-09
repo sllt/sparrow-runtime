@@ -22,6 +22,8 @@ pub enum ErrorCode {
     MaxRecordSize,
     JobFailed,
     Cancelled,
+    PolicyDenied,
+    SecretMissing,
     Internal,
 }
 
@@ -40,6 +42,8 @@ impl ErrorCode {
             Self::MaxRecordSize => "max_record_size",
             Self::JobFailed => "job_failed",
             Self::Cancelled => "cancelled",
+            Self::PolicyDenied => "policy_denied",
+            Self::SecretMissing => "secret_missing",
             Self::Internal => "internal",
         }
     }
