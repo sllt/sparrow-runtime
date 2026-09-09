@@ -1,4 +1,4 @@
-# Sparrow architecture summary (M0)
+# Sparrow architecture summary (M1)
 
 Sparrow is a **single-node IoT/Edge streaming dataflow runtime**. It is not a
 distributed Flink clone and not a Rust eKuiper clone.
@@ -15,22 +15,22 @@ distributed Flink clone and not a Rust eKuiper clone.
    the contract boundary (`RestoreClaim::validate`).
 4. **Failure attribution is in-process** (pipeline / job attempt / operator).
    There is no process isolation in V0.1.
-5. **The runtime must not depend on HTTP, SQLite, or SQL crates.**
-   `sqlparser` is pinned for the G0 gate in `sparrow-testkit` only.
-   Arrow / DataFusion live only under `experiments/`.
+5. **The runtime must not depend on HTTP, SQLite, MQTT, or SQL crates.**
+   `sqlparser` lives in `sparrow-sql` only. Arrow lives under `experiments/`.
+   Tokio is allowed in `sparrow-runtime` for ExecutionChain tasks (M1).
 
 ## Crate map
 
-| Crate | Role in M0 |
+| Crate | Role in M1 |
 |---|---|
-| `sparrow-model` | IDs, `DataType`/`Schema`, structured errors, frames, delivery + resource vocabulary, provisional `RowBatch` + `MemoryLease` |
-| `sparrow-expr` | Scalar expression IR + evaluator (CAST/TRY_CAST, IS NULL, limited builtins, Dynamic extract) |
-| `sparrow-plan` | Linear logical plan stub (Source → Filter → Project → Sink) |
+| `sparrow-model` | IDs, types, errors, delivery/resource, `RowBatch`, `MemoryLease`, `WorkBudget` |
+| `sparrow-expr` | Scalar IR + eval + numeric filter stride |
+| `sparrow-plan` | GraphSpec, catalog, `BoundLogicalPlan`, physical fusion |
+| `sparrow-sql` | G0 gate + SQL binder onto the same IR (not a runtime dep) |
 | `sparrow-io` | Decoder / Source / Sink *contracts* only |
-| `sparrow-runtime` | In-process linear executor, job-level error attribution |
-| `sparrow-testkit` | Fixtures, virtual clock, capture sink, G0 SQL corpus runner |
-| `experiments/arrow-evaluation` | G1a RowBatch vs Arrow (optional DataFusion feature) |
-| `experiments/layout-rowbatch` | G1a RowBatch-only candidate timings |
+| `sparrow-runtime` | `Kernel`: ExecutionChain, bounded mailboxes, supervisor |
+| `sparrow-testkit` | Fixtures, virtual clock, M0/M1 demos |
+| `experiments/*` | G1a only |
 
 ## Memory model
 
@@ -42,7 +42,16 @@ distributed Flink clone and not a Rust eKuiper clone.
 
 `RowBatch` is the **V0.1 default** (`docs/adr/003-layout-decision.md`). Arrow is experiments-only.
 
-## Out of scope for M0 / V0.1
+## Execution (M1)
 
-MQTT and HTTP connectors, SQLite catalog, Axum server, WASM, windows,
-checkpoint, UI, claimed performance SLOs.
+`GraphSpec` JSON and SQL text both bind to `BoundLogicalPlan`. `physicalize`
+emits a linear chain; adjacent Filter→Project→Map become one transform stage
+(one Tokio task, no intermediate mailbox). Mailboxes are bounded in items and
+bytes; send/recv select on a cancellation token so a full queue cannot
+deadlock `stop()`. Two jobs do not share mailboxes, so a stalled sink on job A
+does not freeze job B.
+
+## Out of scope until M2
+
+MQTT and HTTP production connectors, SQLite catalog, Axum server, WASM, windows,
+checkpoint, UI, fan-in/fan-out, claimed performance SLOs.
