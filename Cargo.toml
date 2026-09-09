@@ -10,6 +10,8 @@ members = [
     "crates/sparrow-formats",
     "crates/sparrow-connectors",
     "crates/sparrow-cli",
+    "crates/sparrow-control",
+    "crates/sparrow-server",
     "crates/sparrow-testkit",
     "experiments/arrow-evaluation",
     "experiments/layout-rowbatch",
@@ -24,6 +26,8 @@ default-members = [
     "crates/sparrow-formats",
     "crates/sparrow-connectors",
     "crates/sparrow-cli",
+    "crates/sparrow-control",
+    "crates/sparrow-server",
     "crates/sparrow-testkit",
 ]
 
@@ -45,6 +49,8 @@ sparrow-sql = { path = "crates/sparrow-sql", version = "0.1.0" }
 sparrow-formats = { path = "crates/sparrow-formats", version = "0.1.0" }
 sparrow-connectors = { path = "crates/sparrow-connectors", version = "0.1.0" }
 sparrow-cli = { path = "crates/sparrow-cli", version = "0.1.0" }
+sparrow-control = { path = "crates/sparrow-control", version = "0.1.0" }
+sparrow-server = { path = "crates/sparrow-server", version = "0.1.0" }
 sparrow-testkit = { path = "crates/sparrow-testkit", version = "0.1.0" }
 
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "sync", "time"] }

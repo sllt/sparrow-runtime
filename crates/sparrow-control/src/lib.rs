@@ -1,0 +1,22 @@
+//! Thin control plane: SQLite catalog + desired→actual supervisor.
+//!
+//! This crate depends on runtime/connectors/sql. `sparrow-runtime` must not
+//! depend on this crate, SQLite, or Axum.
+
+pub mod spec;
+pub mod store;
+pub mod supervisor;
+pub mod validate;
+
+pub use spec::{PipelineSpec, RestoreSpec, SinkSpec, SourceSpec, StreamSpec};
+pub use store::{
+    ActualState, AuditRow, DesiredState, PipelineRow, Store, CATALOG_SCHEMA_VERSION, FORMAT_VERSION,
+};
+pub use supervisor::{
+    compact_kernel, request_start, request_stop, DemoHarness, Supervisor,
+};
+pub use validate::{
+    bind_plan, binder_catalog, capabilities_json, explain_plan, honesty_json, store_policy,
+    stream_schema, stream_to_schema, validate_io, DemoEndpoints, ExplainReport, StoreSecrets,
+    HONESTY,
+};

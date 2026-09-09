@@ -1,0 +1,25 @@
+[package]
+name = "sparrow-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SQLite catalog, desired/actual supervisor, and pipeline validation (outside sparrow-runtime)"
+
+[dependencies]
+sparrow-model = { path = "../sparrow-model" }
+sparrow-expr = { path = "../sparrow-expr" }
+sparrow-plan = { path = "../sparrow-plan" }
+sparrow-sql = { path = "../sparrow-sql" }
+sparrow-runtime = { path = "../sparrow-runtime" }
+sparrow-connectors = { path = "../sparrow-connectors" }
+sparrow-formats = { path = "../sparrow-formats" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+sparrow-testkit = { path = "../sparrow-testkit" }
