@@ -17,7 +17,7 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 
 ## Quick start
 
-Requires Rust 1.88+ (edition 2021).
+Requires a recent stable Rust toolchain (edition 2021). Uses the host default toolchain (no pinned rust-toolchain.toml).
 
 ```bash
 export SPARROW_TOKEN=dev-token
