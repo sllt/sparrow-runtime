@@ -30,7 +30,7 @@ pub use delivery::{
 pub use error::{ErrorCode, Result, SparrowError};
 pub use frame::{CodecBounds, CodecBoundary, SourceFrame, DEFAULT_MAX_RECORD_BYTES};
 pub use ids::{
-    FieldId, JobAttemptId, OperatorId, PipelineId, RevisionId, SchemaId, StateSlotId,
+    FieldId, JobAttemptId, OperatorId, PipelineId, RevisionId, SchemaId, StateSlotId, StateSlotKey,
 };
 pub use memory::{MemoryLease, MemoryOwner};
 pub use resource::{CreditKind, CreditUsage, ResourceBudget};

@@ -16,7 +16,7 @@ pub use supervisor::{
     compact_kernel, request_start, request_stop, DemoHarness, Supervisor,
 };
 pub use validate::{
-    bind_plan, binder_catalog, capabilities_json, explain_plan, honesty_json, store_policy,
-    stream_schema, stream_to_schema, validate_io, DemoEndpoints, ExplainReport, StoreSecrets,
-    HONESTY,
+    bind_plan, binder_catalog, capabilities_json, effective_guarantees, explain_plan, honesty_json,
+    store_policy, stream_schema, stream_to_schema, validate_io, DemoEndpoints, ExplainReport,
+    StoreSecrets, HONESTY,
 };

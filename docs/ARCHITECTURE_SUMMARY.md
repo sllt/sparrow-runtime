@@ -1,4 +1,4 @@
-# Sparrow architecture summary (V0.4)
+# Sparrow architecture summary (V1)
 
 Sparrow is a **single-node IoT/Edge streaming dataflow runtime**. It is not a
 distributed Flink clone and not a Rust eKuiper clone.
@@ -11,9 +11,9 @@ distributed Flink clone and not a Rust eKuiper clone.
 2. **All buffers are bounded** in bytes, rows, and a work budget. Compact and
    Performance are *budget profiles*, not two engines.
 3. **Delivery is explicit.** Default is `live_best_effort` + `restart_fresh`.
-   Exactly-once and MQTT session resume are rejected. V0.4 adds
-   **experimental** aligned checkpoint (`experimental_aligned`) for
-   ReplayableSource only; it is not default exactly-once.
+   Exactly-once and MQTT session resume are rejected. V1 adds production
+   aligned checkpoint (`aligned`) for ReplayableSource only; it is not
+   default exactly-once.
 4. **Failure attribution is in-process** (pipeline / job attempt / operator).
    There is no process isolation in V0.1.
 5. **The runtime must not depend on HTTP, SQLite, MQTT, or SQL crates.**
@@ -107,9 +107,21 @@ MQTT remains `replay=unsupported`. Graph validate/explain covers
 physical, fusion, time, state, and guarantee. WASM is an optional
 off-build spike.
 
-## Out of scope after V0.4
+## V1 (production aligned recovery)
 
-Graph Designer UI product, production (non-experimental) checkpoint,
-WASM operator runtime, distributed fan-in/fan-out, exactly-once, session
-late merge, retract, stream-stream join, NATS, claimed performance SLOs.
-Do not put MQTT/HTTP/SQLite/Axum deps in `sparrow-runtime`.
+`experimental_aligned` is replaced by the production policy name
+`aligned`. Codecs are versioned (`SPV1` / `MAN2`). Restore checks
+OperatorId / StateSlotKey and bound lookup table revision. A coordinator
+arbitrates timeout / abort / stop so a barrier cannot stay stuck in
+`Checkpointing`. Missing or corrupt checkpoints are rejected.
+
+Status exposes `effective` delivery + recovery + `recovery_risk`.
+`GET /v1/metrics` is budgeted (no per-event labels). WHERE-before-window
+changes default to reset/replay.
+
+## Out of scope after V1
+
+Graph Designer UI product, WASM operator runtime, distributed
+fan-in/fan-out, exactly-once, session late merge, retract, stream-stream
+join, NATS, claimed performance SLOs. Do not put MQTT/HTTP/SQLite/Axum
+deps in `sparrow-runtime`.

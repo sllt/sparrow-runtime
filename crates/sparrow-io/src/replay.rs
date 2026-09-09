@@ -1,4 +1,4 @@
-//! Replayable source contract for experimental recovery.
+//! Replayable source contract for V1 aligned recovery.
 //!
 //! A ReplayableSource can seek to a previously committed *message boundary*.
 //! Mid-record cuts are never treated as a valid restore position.

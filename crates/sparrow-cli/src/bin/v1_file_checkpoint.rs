@@ -1,5 +1,5 @@
-//! Experimental file/replay checkpoint: take a committed snapshot, restore
-//! in a new process, prove position + state match. Not exactly-once.
+//! V1 production file/replay checkpoint: committed snapshot, restore in a
+//! new process, prove count / ET window state match gold. Not exactly-once.
 
 use std::path::PathBuf;
 
@@ -13,7 +13,7 @@ use sparrow_model::{
 use sparrow_plan::{AggCall, WindowSpec};
 use sparrow_runtime::{run_until, AlignedSession, CheckpointStore};
 
-fn schema() -> Schema {
+fn count_schema() -> Schema {
     Schema::new(
         SchemaId::new(1),
         vec![
@@ -24,7 +24,7 @@ fn schema() -> Schema {
     .unwrap()
 }
 
-fn spec() -> WindowSpec {
+fn count_spec() -> WindowSpec {
     WindowSpec::new(
         WindowKind::Count { size: 3 },
         vec!["device_id".into()],
@@ -36,16 +36,45 @@ fn spec() -> WindowSpec {
     )
 }
 
+fn et_schema() -> Schema {
+    Schema::new(
+        SchemaId::new(2),
+        vec![
+            Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+            Field::new(FieldId::new(2), "temperature", DataType::Float64, false),
+            Field::new(FieldId::new(3), "ts", DataType::Int64, false),
+        ],
+    )
+    .unwrap()
+}
+
+fn et_spec() -> WindowSpec {
+    WindowSpec::new(
+        WindowKind::TumblingEventTime {
+            size_micros: 1_000_000,
+        },
+        vec!["device_id".into()],
+        vec![AggCall::new(
+            AggFn::Avg,
+            Some(Expr::Column {
+                name: "temperature".into(),
+            }),
+            "avg_t",
+        )],
+    )
+    .event_time("ts", 0)
+}
+
 fn usage() -> ! {
     eprintln!(
-        "usage: v04_file_checkpoint --data FILE --chk DIR --mode gold|checkpoint|restore [--until N]"
+        "usage: v1_file_checkpoint --data FILE --chk DIR --mode gold|checkpoint|restore [--until N] [--window count|et]"
     );
     std::process::exit(2);
 }
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("v04_file_checkpoint failed: {e}");
+        eprintln!("v1_file_checkpoint failed: {e}");
         std::process::exit(1);
     }
 }
@@ -56,6 +85,7 @@ fn run() -> sparrow_model::Result<()> {
     let mut chk = None;
     let mut mode = "gold".to_string();
     let mut until = None;
+    let mut window = "count".to_string();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -75,21 +105,32 @@ fn run() -> sparrow_model::Result<()> {
                 until = Some(args[i + 1].parse::<u64>().unwrap_or(0));
                 i += 2;
             }
+            "--window" => {
+                window = args[i + 1].clone();
+                i += 2;
+            }
             _ => usage(),
         }
     }
     let data = data.unwrap_or_else(|| usage());
     let chk = chk.unwrap_or_else(|| usage());
 
-    println!("=== Sparrow V0.4 file/replay checkpoint (V1 aligned alias) ===");
+    println!("=== Sparrow V1 production file/replay checkpoint ===");
     println!("label={}", CheckpointStore::label());
     println!("recovery={}", RecoveryPolicy::Aligned.as_str());
     println!("{}", DeliveryContract::ALIGNED_CHECKPOINT_HONESTY);
     println!("exactly-once=rejected");
+    println!("window={window}");
+
+    let (schema, spec) = if window == "et" {
+        (et_schema(), et_spec())
+    } else {
+        (count_schema(), count_spec())
+    };
 
     let cfg = FileReplayConfig {
         path: data.clone(),
-        schema: schema(),
+        schema: schema.clone(),
         restore: sparrow_model::RestoreClaim::Checkpoint {
             snapshot_id: "aligned".into(),
         },
@@ -103,8 +144,8 @@ fn run() -> sparrow_model::Result<()> {
     let mut session = if mode == "restore" {
         AlignedSession::restore(
             store,
-            spec(),
-            schema(),
+            spec,
+            schema,
             OperatorId::new(2),
             ResourceBudget::compact(),
             &mut source,
@@ -113,8 +154,8 @@ fn run() -> sparrow_model::Result<()> {
         let start = source.position();
         AlignedSession::open(
             store,
-            spec(),
-            schema(),
+            spec,
+            schema,
             OperatorId::new(2),
             ResourceBudget::compact(),
             start,
@@ -129,6 +170,10 @@ fn run() -> sparrow_model::Result<()> {
             session.ingested
         );
         println!("RESTORE state {}", session.state_fingerprint());
+        println!(
+            "METRICS {}",
+            session.metrics.snapshot().log_line()
+        );
     }
 
     let lim = match mode.as_str() {
@@ -136,6 +181,9 @@ fn run() -> sparrow_model::Result<()> {
         _ => None,
     };
     run_until(&mut session, &mut source, 0, lim)?;
+    if window == "et" && mode != "checkpoint" {
+        session.observe_watermark(0, 3_000_000)?;
+    }
 
     if mode == "checkpoint" {
         let id = session.checkpoint_barrier()?;
@@ -146,7 +194,11 @@ fn run() -> sparrow_model::Result<()> {
             session.ingested
         );
         println!("CHECKPOINT state {}", session.state_fingerprint());
-        println!("v04_file_checkpoint: checkpoint ok");
+        println!(
+            "METRICS {}",
+            session.metrics.snapshot().log_line()
+        );
+        println!("v1_file_checkpoint: checkpoint ok");
         return Ok(());
     }
 
@@ -159,6 +211,7 @@ fn run() -> sparrow_model::Result<()> {
     for r in &session.finals {
         println!("FINAL {:?}", r.values);
     }
-    println!("v04_file_checkpoint: {mode} ok");
+    println!("METRICS {}", session.metrics.snapshot().log_line());
+    println!("v1_file_checkpoint: {mode} ok");
     Ok(())
 }

@@ -68,11 +68,25 @@ id_newtype!(
     u16
 );
 id_newtype!(
-    /// Stateful slot inside an operator. Stable across attempts so V0.4
-    /// recovery can address the same map (V0.2 does not restore it).
+    /// Stateful slot inside an operator. Stable across attempts so V1
+    /// recovery can address the same map.
     StateSlotId,
     u16
 );
+
+/// Compatibility address for a stateful slot: operator + slot.
+/// Restore rejects a checkpoint whose slot key does not match the live plan.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct StateSlotKey {
+    pub operator: OperatorId,
+    pub slot: StateSlotId,
+}
+
+impl StateSlotKey {
+    pub const fn new(operator: OperatorId, slot: StateSlotId) -> Self {
+        Self { operator, slot }
+    }
+}
 
 #[cfg(test)]
 mod tests {

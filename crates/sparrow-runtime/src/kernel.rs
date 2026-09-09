@@ -20,6 +20,7 @@ use crate::dedup::DedupOperator;
 use crate::lookup::{LookupOperator, ReferenceTable, VersionedReferenceTable};
 use crate::mailbox::{channel, MailboxConfig, MailboxRx, MailboxTx, StreamControl};
 use crate::transform::{apply_steps, build_source_batches};
+use crate::metrics::RuntimeMetrics;
 use crate::window::WindowOperator;
 
 #[derive(Clone, Debug)]
@@ -140,6 +141,7 @@ pub struct Kernel {
     opts: KernelOptions,
     next_attempt: AtomicU64,
     live_tasks: Arc<AtomicUsize>,
+    pub metrics: Arc<RuntimeMetrics>,
 }
 
 impl Kernel {
@@ -155,6 +157,7 @@ impl Kernel {
             opts,
             next_attempt: AtomicU64::new(1),
             live_tasks: Arc::new(AtomicUsize::new(0)),
+            metrics: RuntimeMetrics::new(),
         })
     }
 
@@ -174,6 +177,9 @@ impl Kernel {
     pub fn submit(&self, req: JobRequest) -> Result<JobHandle> {
         DeliveryContract::V0_3.validate_restore(&RestoreClaim::None)?;
         admit(&self.opts, &req.plan)?;
+        self.metrics
+            .jobs_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let attempt = JobAttemptId::new(self.next_attempt.fetch_add(1, Ordering::SeqCst));
         let cancel = CancellationToken::new();
         let owner = MemoryOwner::new(self.opts.budget);
@@ -199,6 +205,7 @@ impl Kernel {
             cancel,
             handle,
             live: Arc::clone(&self.live_tasks),
+            metrics: Arc::clone(&self.metrics),
         })
     }
 
@@ -245,6 +252,7 @@ pub struct JobHandle {
     cancel: CancellationToken,
     handle: JoinHandle<Result<JobStats>>,
     live: Arc<AtomicUsize>,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 impl JobHandle {
@@ -264,6 +272,9 @@ impl JobHandle {
 
     pub async fn stop(self) -> Result<JobStats> {
         self.cancel.cancel();
+        self.metrics
+            .jobs_stopped
+            .fetch_add(1, Ordering::Relaxed);
         let mut stats = self.wait().await?;
         stats.cancelled = true;
         Ok(stats)

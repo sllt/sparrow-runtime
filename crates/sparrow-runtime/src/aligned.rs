@@ -1,22 +1,26 @@
-//! Aligned single-job experimental checkpoint session.
+//! Aligned single-job production checkpoint session.
 //!
 //! One job, one ReplayableSource, one window operator. A checkpoint barrier
 //! is taken **between** records: freeze operators, flush the sink, write
-//! chunks, commit the manifest. Restore loads committed state only.
+//! chunks, commit the manifest. Restore loads **verified committed** state
+//! only and never continues from empty state.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use sparrow_io::{ReplayableSource, SourcePosition};
 use sparrow_model::{
     DeliveryContract, ErrorCode, MemoryOwner, OperatorId, RecoveryPolicy, ResourceBudget, Result,
-    RestoreClaim, Row, Schema, SparrowError,
+    RestoreClaim, Row, Schema, SparrowError, StateSlotId,
 };
-use sparrow_plan::WindowSpec;
+use sparrow_plan::{PlanLayout, WindowSpec};
 
-use crate::checkpoint::{CheckpointSnapshot, CheckpointStore};
+use crate::checkpoint::{CheckpointSnapshot, CheckpointStore, TableRevisionBind};
+use crate::coordinator::CheckpointCoordinator;
+use crate::metrics::RuntimeMetrics;
 use crate::window::{WindowEmission, WindowOperator};
 
-/// Experimental aligned checkpoint session (not exactly-once).
+/// Production aligned checkpoint session (not exactly-once).
 pub struct AlignedSession {
     pub operator: WindowOperator,
     pub store: CheckpointStore,
@@ -24,16 +28,28 @@ pub struct AlignedSession {
     pub ingested: u64,
     pub finals: Vec<Row>,
     pub lates: Vec<Row>,
+    pub coordinator: CheckpointCoordinator,
+    pub metrics: Arc<RuntimeMetrics>,
+    layout: PlanLayout,
+    table: Option<TableRevisionBind>,
     next_checkpoint: u64,
 }
 
 impl AlignedSession {
     pub fn honesty() -> &'static str {
-        DeliveryContract::EXPERIMENTAL_CHECKPOINT_HONESTY
+        DeliveryContract::ALIGNED_CHECKPOINT_HONESTY
     }
 
     pub fn policy() -> RecoveryPolicy {
-        RecoveryPolicy::ExperimentalAligned
+        RecoveryPolicy::Aligned
+    }
+
+    fn layout_for(operator: OperatorId, spec: &WindowSpec, table: Option<&TableRevisionBind>) -> PlanLayout {
+        let mut layout = PlanLayout::from_window(operator, StateSlotId::new(1), spec);
+        if let Some(t) = table {
+            layout = layout.with_table(&t.name, t.version);
+        }
+        layout
     }
 
     pub fn open(
@@ -44,19 +60,32 @@ impl AlignedSession {
         budget: ResourceBudget,
         start_pos: SourcePosition,
     ) -> Result<Self> {
+        Self::open_with_table(store, spec, input, operator, budget, start_pos, None)
+    }
+
+    pub fn open_with_table(
+        store: CheckpointStore,
+        spec: WindowSpec,
+        input: Schema,
+        operator: OperatorId,
+        budget: ResourceBudget,
+        start_pos: SourcePosition,
+        table: Option<TableRevisionBind>,
+    ) -> Result<Self> {
         RestoreClaim::Checkpoint {
-            snapshot_id: "experimental".into(),
+            snapshot_id: "aligned".into(),
         }
-        .validate_with_policy(RecoveryPolicy::ExperimentalAligned)?;
+        .validate_with_policy(RecoveryPolicy::Aligned)?;
         let owner = MemoryOwner::new(budget);
         let op = WindowOperator::new(
             operator,
-            spec,
+            spec.clone(),
             input,
             Arc::clone(&owner),
             budget.max_state_keys,
             budget.max_timers,
         )?;
+        let layout = Self::layout_for(operator, &spec, table.as_ref());
         Ok(Self {
             operator: op,
             store,
@@ -64,11 +93,16 @@ impl AlignedSession {
             ingested: 0,
             finals: Vec::new(),
             lates: Vec::new(),
+            coordinator: CheckpointCoordinator::with_default_timeout(),
+            metrics: RuntimeMetrics::new(),
+            layout,
+            table,
             next_checkpoint: 1,
         })
     }
 
-    /// Restore from the last committed checkpoint, then seek the source.
+    /// Restore from the last **verified committed** checkpoint, then seek.
+    /// Missing CURRENT / corrupt MANIFEST / layout mismatch are hard errors.
     pub fn restore(
         store: CheckpointStore,
         spec: WindowSpec,
@@ -77,25 +111,42 @@ impl AlignedSession {
         budget: ResourceBudget,
         source: &mut dyn ReplayableSource,
     ) -> Result<Self> {
-        let snap = store.recover_committed()?.ok_or_else(|| {
-            SparrowError::new(
+        Self::restore_with_table(store, spec, input, operator, budget, source, None)
+    }
+
+    pub fn restore_with_table(
+        store: CheckpointStore,
+        spec: WindowSpec,
+        input: Schema,
+        operator: OperatorId,
+        budget: ResourceBudget,
+        source: &mut dyn ReplayableSource,
+        table: Option<TableRevisionBind>,
+    ) -> Result<Self> {
+        let snap = store.recover_required()?;
+        let live = Self::layout_for(operator, &spec, table.as_ref());
+        snap.check_compatible(&live)?;
+        if snap.window.operator != operator {
+            return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                "no committed experimental checkpoint to restore",
-            )
-        })?;
+                "checkpoint OperatorId does not match the live plan",
+            ));
+        }
         source.seek(&snap.source)?;
-        let mut session = Self::open(
+        let mut session = Self::open_with_table(
             store,
             spec,
             input,
             operator,
             budget,
             snap.source.clone(),
+            table,
         )?;
         session.operator.restore_freeze(&snap.window)?;
         session.ingested = snap.ingested_rows;
         session.next_checkpoint = snap.checkpoint_id.saturating_add(1);
         session.source_pos = snap.source;
+        session.metrics.record_ingest(session.ingested);
         Ok(session)
     }
 
@@ -131,27 +182,67 @@ impl AlignedSession {
         self.lates.extend(emission.lates.clone());
         self.ingested = self.ingested.saturating_add(rows.len() as u64);
         self.source_pos = pos_after;
+        self.metrics.record_ingest(rows.len() as u64);
+        self.metrics.record_emit(emission.finals.len() as u64);
+        if let (Some(wm_in), Some(wm_out)) = (self.operator_wm_in(), self.operator_wm_out()) {
+            self.metrics.record_watermark_lag(wm_in.saturating_sub(wm_out));
+        }
         Ok(emission)
     }
 
+    fn operator_wm_in(&self) -> Option<i64> {
+        self.operator.freeze().wm_in
+    }
+
+    fn operator_wm_out(&self) -> Option<i64> {
+        self.operator.freeze().wm_out
+    }
+
     fn input_schema(&self) -> Schema {
-        // WindowOperator does not expose input; freeze path uses output_schema.
-        // We stash input on the operator via a getter added below.
         self.operator.input_schema().clone()
     }
 
-    /// Barrier: freeze + chunk write + manifest commit. Sink flush is the
-    /// caller's responsibility (`RecordSink::flush`) before this returns.
+    /// Barrier: coordinator begin → freeze + chunk write + manifest commit.
+    /// Stop/abort/timeout leave the store uncommitted (no stuck Checkpointing).
     pub fn checkpoint_barrier(&mut self) -> Result<u64> {
+        if let Err(e) = self.coordinator.begin() {
+            self.metrics.record_checkpoint_abort();
+            return Err(e);
+        }
+        let started = Instant::now();
         let snap = CheckpointSnapshot {
             checkpoint_id: self.next_checkpoint,
             source: self.source_pos.clone(),
             window: self.operator.freeze(),
             ingested_rows: self.ingested,
+            layout: self.layout.clone(),
+            table: self.table.clone(),
         };
-        let id = self.store.commit(&snap)?;
-        self.next_checkpoint = id.saturating_add(1);
-        Ok(id)
+        let payload_len = snap.encode()?.len() as u64;
+        match self.store.commit(&snap) {
+            Ok(id) => {
+                if let Err(e) = self.coordinator.complete() {
+                    self.metrics.record_checkpoint_abort();
+                    return Err(e);
+                }
+                self.next_checkpoint = id.saturating_add(1);
+                self.metrics.record_checkpoint(started.elapsed(), payload_len);
+                eprintln!(
+                    "{{\"event\":\"checkpoint_commit\",\"checkpoint_id\":{id},\"bytes\":{payload_len},\"duration_micros\":{}}}",
+                    started.elapsed().as_micros()
+                );
+                Ok(id)
+            }
+            Err(e) => {
+                self.coordinator.abort_now("commit failed");
+                self.metrics.record_checkpoint_abort();
+                Err(e)
+            }
+        }
+    }
+
+    pub fn request_stop(&self) {
+        self.coordinator.request_stop();
     }
 
     pub fn state_fingerprint(&self) -> String {
@@ -170,6 +261,7 @@ impl AlignedSession {
             .observe_watermark(sparrow_model::InputId(input), wm)?;
         self.finals.extend(emission.finals.clone());
         self.lates.extend(emission.lates.clone());
+        self.metrics.record_emit(emission.finals.len() as u64);
         Ok(emission)
     }
 }
@@ -184,6 +276,12 @@ pub fn run_until(
 ) -> Result<u64> {
     let start = session.ingested;
     loop {
+        if session.coordinator.is_stop_requested() {
+            return Err(SparrowError::new(
+                ErrorCode::Cancelled,
+                "aligned session stopped",
+            ));
+        }
         if let Some(lim) = until_records {
             if session.ingested.saturating_sub(start) >= lim {
                 break;
@@ -202,7 +300,7 @@ pub fn run_until(
 }
 
 fn decode_sensor_line(bytes: &[u8]) -> Result<Row> {
-    // Minimal NDJSON object: device_id + v (int) used by the V0.4 demo.
+    // Minimal NDJSON object: device_id + v (int) used by the V1 demo.
     let text = std::str::from_utf8(bytes).map_err(|_| {
         SparrowError::new(ErrorCode::CodecViolation, "replay line is not utf8")
     })?;
@@ -274,9 +372,50 @@ mod tests {
         )
     }
 
+    fn et_schema() -> Schema {
+        Schema::new(
+            SchemaId::new(2),
+            vec![
+                Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+                Field::new(FieldId::new(2), "temperature", DataType::Float64, false),
+                Field::new(FieldId::new(3), "ts", DataType::Int64, false),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn et_spec() -> WindowSpec {
+        WindowSpec::new(
+            WindowKind::TumblingEventTime {
+                size_micros: 1_000_000,
+            },
+            vec!["device_id".into()],
+            vec![AggCall::new(
+                AggFn::Avg,
+                Some(Expr::Column {
+                    name: "temperature".into(),
+                }),
+                "avg_t",
+            )],
+        )
+        .event_time("ts", 0)
+    }
+
     fn lines() -> Vec<String> {
         (1..=6)
             .map(|i| format!(r#"{{"device_id":"d1","v":{}}}"#, i * 10))
+            .collect()
+    }
+
+    fn et_lines() -> Vec<String> {
+        (0..6)
+            .map(|i| {
+                format!(
+                    r#"{{"device_id":"d1","temperature":{}.0,"ts":{}}}"#,
+                    70 + i,
+                    i * 400_000
+                )
+            })
             .collect()
     }
 
@@ -330,7 +469,6 @@ mod tests {
         assert_eq!(restored.ingested, 6);
         assert_eq!(restored.finals.len(), 2);
 
-        // Gold: run all six without a crash.
         let mut gold_src = MemoryReplaySource::from_lines("demo", &text);
         let gold_store = CheckpointStore::open(dir.join("gold")).unwrap();
         let mut gold = AlignedSession::open(
@@ -344,6 +482,173 @@ mod tests {
         .unwrap();
         run_until(&mut gold, &mut gold_src, 0, None).unwrap();
         assert_eq!(gold.finals, restored.finals);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_without_committed_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "sparrow-aligned-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CheckpointStore::open(&dir).unwrap();
+        let owned = lines();
+        let text: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let mut src = MemoryReplaySource::from_lines("demo", &text);
+        let err = match AlignedSession::restore(
+            store,
+            count_spec(),
+            count_schema(),
+            OperatorId::new(2),
+            ResourceBudget::compact(),
+            &mut src,
+        ) {
+            Ok(_) => panic!("empty restore must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, ErrorCode::UnsupportedRestore);
+        assert!(err.message.contains("silent empty-state") || err.message.contains("no verified"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_aborts_in_flight_checkpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "sparrow-aligned-stop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CheckpointStore::open(&dir).unwrap();
+        let mut session = AlignedSession::open(
+            store,
+            count_spec(),
+            count_schema(),
+            OperatorId::new(2),
+            ResourceBudget::compact(),
+            SourcePosition::start(sparrow_io::SourceIdentity::memory("d", 0, 0)),
+        )
+        .unwrap();
+        session.request_stop();
+        assert!(session.checkpoint_barrier().is_err());
+        assert_ne!(
+            session.coordinator.phase(),
+            crate::coordinator::CheckpointPhase::Checkpointing
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn et_window_restore_matches_gold() {
+        let dir = std::env::temp_dir().join(format!(
+            "sparrow-aligned-et-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let owned = et_lines();
+        let text: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let mut src = MemoryReplaySource::from_lines("et", &text);
+        let mut session = AlignedSession::open(
+            CheckpointStore::open(&dir).unwrap(),
+            et_spec(),
+            et_schema(),
+            OperatorId::new(2),
+            ResourceBudget::compact(),
+            src.position(),
+        )
+        .unwrap();
+        run_until(&mut session, &mut src, 0, Some(3)).unwrap();
+        session.checkpoint_barrier().unwrap();
+
+        let mut src2 = MemoryReplaySource::from_lines("et", &text);
+        let mut restored = AlignedSession::restore(
+            CheckpointStore::open(&dir).unwrap(),
+            et_spec(),
+            et_schema(),
+            OperatorId::new(2),
+            ResourceBudget::compact(),
+            &mut src2,
+        )
+        .unwrap();
+        run_until(&mut restored, &mut src2, 0, None).unwrap();
+        restored.observe_watermark(0, 3_000_000).unwrap();
+
+        let mut gold_src = MemoryReplaySource::from_lines("et", &text);
+        let mut gold = AlignedSession::open(
+            CheckpointStore::open(dir.join("gold")).unwrap(),
+            et_spec(),
+            et_schema(),
+            OperatorId::new(2),
+            ResourceBudget::compact(),
+            gold_src.position(),
+        )
+        .unwrap();
+        run_until(&mut gold, &mut gold_src, 0, None).unwrap();
+        gold.observe_watermark(0, 3_000_000).unwrap();
+        assert_eq!(gold.finals, restored.finals);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn table_revision_mismatch_rejects_restore() {
+        let dir = std::env::temp_dir().join(format!(
+            "sparrow-aligned-tbl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let owned = lines();
+        let text: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let mut src = MemoryReplaySource::from_lines("demo", &text);
+        let table = TableRevisionBind {
+            name: "sites".into(),
+            version: 3,
+        };
+        let mut session = AlignedSession::open_with_table(
+            CheckpointStore::open(&dir).unwrap(),
+            count_spec(),
+            count_schema(),
+            OperatorId::new(2),
+            ResourceBudget::compact(),
+            src.position(),
+            Some(table),
+        )
+        .unwrap();
+        run_until(&mut session, &mut src, 0, Some(2)).unwrap();
+        session.checkpoint_barrier().unwrap();
+
+        let mut src2 = MemoryReplaySource::from_lines("demo", &text);
+        let err = match AlignedSession::restore_with_table(
+            CheckpointStore::open(&dir).unwrap(),
+            count_spec(),
+            count_schema(),
+            OperatorId::new(2),
+            ResourceBudget::compact(),
+            &mut src2,
+            Some(TableRevisionBind {
+                name: "sites".into(),
+                version: 4,
+            }),
+        ) {
+            Ok(_) => panic!("table revision mismatch must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, ErrorCode::UnsupportedRestore);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

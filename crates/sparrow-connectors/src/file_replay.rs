@@ -1,8 +1,8 @@
-//! File / replay test Source for experimental recovery.
+//! File / replay test Source for V1 aligned recovery.
 //!
 //! NDJSON, message-boundary cuts, identity + rotation checks.
-//! Declares `replay=replayable`. This is the only V0.4 source that may
-//! participate in experimental aligned checkpoint restore.
+//! Declares `replay=replayable`. This is the only V1 source that may
+//! participate in production aligned checkpoint restore.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};

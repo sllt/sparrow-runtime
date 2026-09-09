@@ -14,9 +14,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sparrow_control::{
-    bind_plan, binder_catalog, capabilities_json, explain_plan, honesty_json, request_start,
-    request_stop, stream_schema, validate_io, DemoHarness, PipelineSpec, Store, StreamSpec,
-    Supervisor, HONESTY,
+    bind_plan, binder_catalog, capabilities_json, effective_guarantees, explain_plan, honesty_json,
+    request_start, request_stop, stream_schema, validate_io, DemoHarness, PipelineSpec, Store,
+    StreamSpec, Supervisor, HONESTY,
 };
 use sparrow_runtime::Kernel;
 use sparrow_model::{ErrorCode, SparrowError};
@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/allowlist", put(put_allow))
         .route("/v1/secrets/{name}", put(put_secret))
         .route("/v1/audit", get(list_audit))
+        .route("/v1/metrics", get(metrics))
         .route("/v1/demo/io", get(demo_io))
         .route("/v1/demo/publish-fixture", post(demo_publish))
         .route("/v1/demo/capture", get(demo_capture))
@@ -139,10 +140,11 @@ async fn root() -> Json<Value> {
         "bind_default": DEFAULT_BIND,
         "delivery": "live_best_effort",
         "recovery": "restart_fresh",
-        "recovery_experimental": "experimental_aligned",
+        "recovery_aligned": "aligned",
         "honesty": HONESTY,
         "endpoints": [
             "GET /v1/health",
+            "GET /v1/metrics",
             "POST /v1/validate",
             "POST /v1/explain",
             "POST /v1/graphs/validate",
@@ -165,7 +167,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "format_version": sparrow_control::FORMAT_VERSION,
         "delivery": "live_best_effort",
         "recovery": "restart_fresh",
-        "recovery_experimental": "experimental_aligned",
+        "recovery_aligned": "aligned",
         "replay": "unsupported",
         "honesty": HONESTY,
     }))
@@ -433,10 +435,36 @@ fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
             "last_error": a.last_error,
         })),
         "delivery": "live_best_effort",
-        "recovery": "restart_fresh",
-        "replay": "unsupported",
+        "recovery": row.spec.recovery.clone(),
+        "replay": if matches!(row.spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
+            "replayable"
+        } else {
+            "unsupported"
+        },
         "honesty": HONESTY,
+        "effective": effective_guarantees(&row.spec),
     }))
+}
+
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    require_auth(&state, &headers)?;
+    let snap = state.supervisor.kernel().metrics.snapshot();
+    Ok(Json(json!({
+        "jobs_started": snap.jobs_started,
+        "jobs_stopped": snap.jobs_stopped,
+        "ingested_rows": snap.ingested_rows,
+        "emitted_rows": snap.emitted_rows,
+        "queue_items": snap.queue_items,
+        "queue_bytes": snap.queue_bytes,
+        "watermark_lag_micros": snap.watermark_lag_micros,
+        "checkpoint_duration_micros": snap.checkpoint_duration_micros,
+        "checkpoint_bytes": snap.checkpoint_bytes,
+        "checkpoint_commits": snap.checkpoint_commits,
+        "checkpoint_aborts": snap.checkpoint_aborts,
+        "log": snap.log_line(),
+        "label_budget": "job_and_connector_only; no per-event labels",
+        "honesty": HONESTY,
+    })))
 }
 
 async fn list_pipelines(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {

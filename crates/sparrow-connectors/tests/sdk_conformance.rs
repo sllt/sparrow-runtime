@@ -65,7 +65,7 @@ fn file_source_declares_replayable_and_seeks() {
         restore: RestoreClaim::Checkpoint {
             snapshot_id: "1".into(),
         },
-        recovery: RecoveryPolicy::ExperimentalAligned,
+        recovery: RecoveryPolicy::Aligned,
     };
     cfg.validate().unwrap();
     let mut src = FileReplaySource::open(&cfg).unwrap();
@@ -93,7 +93,7 @@ fn mqtt_declares_unsupported_and_rejects_restore() {
     assert!(refuse_unsupported_recovery(
         "mqtt",
         false,
-        RecoveryPolicy::ExperimentalAligned,
+        RecoveryPolicy::Aligned,
         &RestoreClaim::Checkpoint {
             snapshot_id: "1".into()
         },
@@ -149,7 +149,7 @@ fn capability_matrix_rejects_unsupported_recovery() {
     assert!(refuse_unsupported_recovery(
         "http_push",
         false,
-        RecoveryPolicy::ExperimentalAligned,
+        RecoveryPolicy::Aligned,
         &RestoreClaim::None,
     )
     .is_err());

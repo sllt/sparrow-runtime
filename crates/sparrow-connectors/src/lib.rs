@@ -2,7 +2,7 @@
 //! `sparrow-runtime` or `sparrow-model`.
 //!
 //! Default delivery is `live_best_effort` + `restart_fresh`. MQTT replay is
-//! declared unsupported. File/replay source is Replayable for experimental
+//! declared unsupported. File/replay source is Replayable for V1 aligned
 //! checkpoint only. Buffers are bounded; a full inbox drops.
 
 pub mod capabilities;

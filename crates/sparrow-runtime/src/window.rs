@@ -561,6 +561,7 @@ impl WindowOperator {
         entries.sort_by(|a, b| a.key_bytes().cmp(&b.key_bytes()));
         WindowFreeze {
             operator: self.operator,
+            slot: StateSlotId::new(SLOT),
             kind,
             entries,
             wm_in: self.wm_in(),
@@ -575,6 +576,12 @@ impl WindowOperator {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
                 "checkpoint operator id does not match this window",
+            ));
+        }
+        if freeze.slot != StateSlotId::new(SLOT) {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "checkpoint StateSlotKey does not match this window",
             ));
         }
         self.cleanup();
@@ -640,10 +647,11 @@ impl WindowOperator {
     }
 }
 
-/// Frozen window operator state (experimental checkpoint payload).
+/// Frozen window operator state (V1 aligned checkpoint payload).
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowFreeze {
     pub operator: OperatorId,
+    pub slot: StateSlotId,
     pub kind: u8,
     pub entries: Vec<FrozenEntry>,
     pub wm_in: Option<i64>,
