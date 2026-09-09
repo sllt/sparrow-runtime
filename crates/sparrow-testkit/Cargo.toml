@@ -1,0 +1,19 @@
+[package]
+name = "sparrow-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Sparrow fixtures, virtual clock, capture sink, and G0 SQL gate"
+
+[dependencies]
+sparrow-model.workspace = true
+sparrow-expr.workspace = true
+sparrow-plan.workspace = true
+sparrow-io.workspace = true
+sparrow-runtime.workspace = true
+sqlparser.workspace = true
+
+[[example]]
+name = "m0_pipeline_smoke"
+path = "examples/m0_pipeline_smoke.rs"

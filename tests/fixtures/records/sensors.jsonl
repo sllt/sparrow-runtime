@@ -1,0 +1,6 @@
+{"device_id":"edge-a","temperature":18.5,"humidity":41.0,"ts":1700000000000000,"alert":false}
+{"device_id":"edge-a","temperature":26.2,"humidity":39.0,"ts":1700000001000000,"alert":false}
+{"device_id":"edge-b","temperature":31.0,"humidity":55.0,"ts":1700000002000000,"alert":true}
+{"device_id":"edge-b","temperature":22.0,"humidity":48.0,"ts":1700000003000000,"alert":false}
+{"device_id":"edge-c","temperature":29.4,"humidity":33.0,"ts":1700000004000000,"alert":true}
+{"device_id":"edge-c","temperature":12.0,"humidity":70.0,"ts":1700000005000000,"alert":false}

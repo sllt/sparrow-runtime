@@ -1,0 +1,10 @@
+[package]
+name = "sparrow-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Sparrow I/O contracts only in M0 (no MQTT/HTTP connectors)"
+
+[dependencies]
+sparrow-model.workspace = true

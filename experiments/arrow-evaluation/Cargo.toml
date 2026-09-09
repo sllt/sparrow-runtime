@@ -1,0 +1,18 @@
+[package]
+name = "arrow-evaluation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "G1a layout comparison: provisional RowBatch vs Arrow (DataFusion optional)"
+publish = false
+
+[dependencies]
+sparrow-model.workspace = true
+sparrow-expr.workspace = true
+# Arrow is an experiments-only dependency. It must not enter sparrow-runtime.
+arrow = "54.2.1"
+
+# DataFusion is intentionally NOT a Cargo dependency: it would pull a second
+# engine into resolution and is not needed for the G1a layout decision.
+# A tiny snippet is documented in src/datafusion_snippet.rs for later opt-in.

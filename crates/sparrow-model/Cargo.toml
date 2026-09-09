@@ -1,0 +1,14 @@
+[package]
+name = "sparrow-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Sparrow shared IDs, types, errors, delivery/resource vocabulary, and provisional RowBatch"
+
+[dependencies]
+# Intentionally empty: no Tokio, no HTTP, no SQLite, no SQL parser.
+# The model crate is usable in no-async, in-process contexts.
+
+[dev-dependencies]
+# Keep model tests lightweight and deterministic.

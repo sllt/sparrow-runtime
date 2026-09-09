@@ -1,0 +1,12 @@
+[package]
+name = "layout-rowbatch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "G1a candidate: provisional RowBatch kernel microbench"
+publish = false
+
+[dependencies]
+sparrow-model.workspace = true
+sparrow-expr.workspace = true

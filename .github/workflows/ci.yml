@@ -1,0 +1,18 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: M0 workspace tests
+        run: cargo test --workspace
+      - name: M0 smoke demo
+        run: cargo run -p sparrow-testkit --example m0_pipeline_smoke
+      - name: G1a experiment
+        run: cargo run -p arrow-evaluation

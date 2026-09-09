@@ -1,0 +1,11 @@
+[package]
+name = "sparrow-plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Sparrow logical plan IR stub (SQL and Graph share this)"
+
+[dependencies]
+sparrow-model.workspace = true
+sparrow-expr.workspace = true

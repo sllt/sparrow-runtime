@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sparrow-model",
+    "crates/sparrow-expr",
+    "crates/sparrow-plan",
+    "crates/sparrow-io",
+    "crates/sparrow-runtime",
+    "crates/sparrow-testkit",
+    "experiments/arrow-evaluation",
+    "experiments/layout-rowbatch",
+]
+default-members = [
+    "crates/sparrow-model",
+    "crates/sparrow-expr",
+    "crates/sparrow-plan",
+    "crates/sparrow-io",
+    "crates/sparrow-runtime",
+    "crates/sparrow-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.88"
+repository = "https://github.com/sparrow-runtime/sparrow"
+description = "Sparrow: single-node IoT/Edge streaming dataflow runtime"
+
+[workspace.dependencies]
+sparrow-model = { path = "crates/sparrow-model", version = "0.1.0" }
+sparrow-expr = { path = "crates/sparrow-expr", version = "0.1.0" }
+sparrow-plan = { path = "crates/sparrow-plan", version = "0.1.0" }
+sparrow-io = { path = "crates/sparrow-io", version = "0.1.0" }
+sparrow-runtime = { path = "crates/sparrow-runtime", version = "0.1.0" }
+sparrow-testkit = { path = "crates/sparrow-testkit", version = "0.1.0" }
+
+# Pinned for G0. sqlparser is a test/binder-gate dependency only.
+# It MUST NOT become a default runtime crate dependency.
+# Pinned. Testkit/G0 only — never a sparrow-runtime dependency.
+sqlparser = "=0.62.0"
+
+# Experiments-only. Never add these to sparrow-runtime / sparrow-model.
+arrow = "54.2.1"
