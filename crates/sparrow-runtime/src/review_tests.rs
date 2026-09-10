@@ -622,13 +622,12 @@ fn n10_nan_compare_does_not_fail_job() {
     assert_eq!(capture.row_count(), 1, "COUNT_WINDOW(3) emits one row");
     let out = capture.rows();
     let mn = out[0]
-        .values
         .iter()
         .find_map(|s| match s {
             Scalar::Float64(v) if !v.is_nan() => Some(*v),
             _ => None,
         })
-        .expect(&format!("MIN must skip NaN and emit a finite min: {out:?}"));
+        .unwrap_or_else(|| panic!("MIN must skip NaN and emit a finite min: {out:?}"));
     assert!(
         (mn - 10.0).abs() < 1e-9,
         "MIN skips NaN and keeps 10.0, got {mn} from {out:?}"
