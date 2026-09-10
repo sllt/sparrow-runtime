@@ -98,7 +98,7 @@ enum AlignedCmd {
 enum RunningKind {
     Live {
         handle: JobHandle,
-        source: JoinHandle<()>,
+        source: JoinHandle<Result<()>>,
         sink: JoinHandle<()>,
     },
     Aligned {
@@ -519,13 +519,28 @@ impl Supervisor {
                 let push = HttpPushSource::bind(cfg, &self.secrets, policy, Arc::clone(&diag))
                     .await
                     .map_err(SparrowError::from)?;
-                self.kernel.handle().spawn(push.run(tx_in, cancel.clone()))
+                let cancel_src = cancel.clone();
+                self.kernel.handle().spawn(async move {
+                    push.run(tx_in, cancel_src).await;
+                    Ok(())
+                })
             }
             "mqtt" => {
-                let mqtt_cfg = mqtt_config(&spec.source, schema, demo.as_ref(), name)?;
+                let mut mqtt_cfg = mqtt_config(&spec.source, schema, demo.as_ref(), name)?;
+                mqtt_cfg.fail_on_decode = spec.effective_fail_on_decode();
+                mqtt_cfg
+                    .check_inbox_budget(self.kernel.budget().queue_bytes)
+                    .map_err(SparrowError::from)?;
                 let mqtt = MqttSource::bind(mqtt_cfg, &self.secrets, policy, Arc::clone(&diag))
                     .map_err(SparrowError::from)?;
-                self.kernel.handle().spawn(mqtt.run(tx_in, cancel.clone()))
+                let cancel_job = cancel.clone();
+                self.kernel.handle().spawn(async move {
+                    let r = mqtt.run(tx_in, cancel_job.clone()).await.map_err(SparrowError::from);
+                    if r.is_err() {
+                        cancel_job.cancel();
+                    }
+                    r
+                })
             }
             other => {
                 return Err(SparrowError::new(
@@ -574,8 +589,10 @@ impl Supervisor {
                 .await;
         }
         let contract = crate::validate::resolve_file_contract(spec, recovery)?;
+        let fail_on_decode = spec.effective_fail_on_decode();
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.contract = contract;
+        cfg.fail_on_decode = fail_on_decode;
         let src =
             FileReplaySource::open(&cfg).map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
         let inbox = spec.source.inbox_capacity.max(1);
@@ -594,10 +611,21 @@ impl Supervisor {
         let source = self.kernel.handle().spawn({
             let cancel = cancel.clone();
             async move {
-                let _ = crate::file_source::run_file_source(
-                    src, contract, tx_ev, cancel, diag_src, None, None,
+                let r = crate::file_source::run_file_source(
+                    src,
+                    contract,
+                    tx_ev,
+                    cancel.clone(),
+                    diag_src,
+                    None,
+                    None,
+                    fail_on_decode,
                 )
                 .await;
+                if r.is_err() {
+                    cancel.cancel();
+                }
+                r
             }
         });
         let sink = self.spawn_sink(
@@ -640,9 +668,11 @@ impl Supervisor {
             std::path::Path::new(&chk),
             self.kernel.budget().max_state_keys,
         )?;
+        let fail_on_decode = spec.effective_fail_on_decode();
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.recovery = RecoveryPolicy::Aligned;
         cfg.restore = spec.restore_claim()?;
+        cfg.fail_on_decode = fail_on_decode;
         // Aligned growing files default to AppendOnly (N5): EOF polls, no
         // terminal MAX watermark. Finite fixtures set source.file_contract=sealed.
         let contract = crate::validate::resolve_file_contract(spec, RecoveryPolicy::Aligned)?;
@@ -808,6 +838,7 @@ impl Supervisor {
                                 &diag_src,
                                 &mut terminal_sent,
                                 Some(&ingested_r),
+                                fail_on_decode,
                             )
                             .await?
                             {
@@ -904,9 +935,20 @@ impl Supervisor {
                 sink,
             } => {
                 let r = handle.wait().await;
-                let _ = source.await;
+                let src = match source.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(SparrowError::new(
+                        sparrow_model::ErrorCode::JobFailed,
+                        format!("source task panicked: {e}"),
+                    )),
+                };
                 let _ = sink.await;
-                r.map(|_| ())
+                match (r, src) {
+                    (_, Err(e)) => Err(e),
+                    (Err(e), _) => Err(e),
+                    (Ok(_), Ok(())) => Ok(()),
+                }
             }
             RunningKind::Aligned {
                 handle,

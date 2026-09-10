@@ -1178,6 +1178,7 @@ mod tests {
             recovery: "restart_fresh".into(),
             restore: None,
             checkpoint_dir: None,
+            fail_on_decode: false,
         }
     }
 

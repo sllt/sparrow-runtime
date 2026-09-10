@@ -100,6 +100,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
         recovery: recovery.into(),
         restore: None,
         checkpoint_dir: chk.map(|s| s.to_string()),
+        fail_on_decode: false,
     }
 }
 
@@ -239,6 +240,7 @@ fn mqtt_aligned_still_rejected() {
         recovery: "aligned".into(),
         restore: None,
         checkpoint_dir: None,
+        fail_on_decode: false,
     };
     assert_eq!(
         spec.check_delivery().unwrap_err().code,
@@ -1101,6 +1103,57 @@ fn n5_restart_fresh_decode_errors_counted() {
         );
 
         sup.kill_named("n5rfd").await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+#[test]
+fn p1_17_fail_on_decode_fails_the_job() {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM_ET).unwrap();
+        let path = tmp("p117-fail-dec.ndjson");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"device_id":"d1","v":1,"ts":1000000}"#,
+                "\n",
+                "this is not json\n",
+            ),
+        )
+        .unwrap();
+        let mut spec = file_spec(
+            &path.to_string_lossy(),
+            ET_TUMBLE_SQL,
+            "restart_fresh",
+            None,
+        );
+        spec.source.file_contract = Some("append_only".into());
+        spec.fail_on_decode = true;
+        store.put_pipeline("p117", &spec, None).unwrap();
+        request_start(&store, "p117", "test").unwrap();
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        let _ = sup.converge_once().await;
+        let t0 = std::time::Instant::now();
+        let mut failed = false;
+        while t0.elapsed() < std::time::Duration::from_secs(3) {
+            let _ = sup.converge_once().await;
+            if let Ok(a) = store.actual("p117") {
+                if a.status == "failed" {
+                    failed = true;
+                    let err = a.last_error.unwrap_or_default();
+                    assert!(
+                        err.contains("decode") || err.contains("fail_on_decode") || err.contains("codec"),
+                        "failed for decode, got: {err}"
+                    );
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        assert!(failed, "fail_on_decode must fail the job, not only count: {:?}", store.actual("p117"));
+        let _ = sup.kill_named("p117").await;
         let _ = std::fs::remove_file(&path);
     });
 }

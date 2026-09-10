@@ -37,6 +37,7 @@ pub(crate) async fn apply_file_poll(
     diag: &IoDiagnostics,
     terminal_sent: &mut bool,
     ingested: Option<&AtomicU64>,
+    fail_on_decode: bool,
 ) -> Result<bool> {
     match poll {
         FilePoll::Row(row) => {
@@ -47,6 +48,12 @@ pub(crate) async fn apply_file_poll(
         }
         FilePoll::DecodeError => {
             diag.decode_errors.fetch_add(1, Ordering::Relaxed);
+            if fail_on_decode {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "file decode failed (fail_on_decode)",
+                ));
+            }
             Ok(false)
         }
         FilePoll::Eof => {
@@ -77,6 +84,7 @@ pub(crate) async fn run_file_source(
     diag: Arc<IoDiagnostics>,
     pos: Option<Arc<Mutex<SourcePosition>>>,
     ingested: Option<Arc<AtomicU64>>,
+    fail_on_decode: bool,
 ) -> Result<()> {
     let mut terminal_sent = false;
     loop {
@@ -96,6 +104,7 @@ pub(crate) async fn run_file_source(
                 &diag,
                 &mut terminal_sent,
                 ingested.as_deref(),
+                fail_on_decode,
             )
             .await?
             {

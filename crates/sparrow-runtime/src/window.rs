@@ -673,9 +673,126 @@ impl WindowOperator {
         self.timers.cancel_all();
     }
 
-    /// Freeze open keyed state. This clones in-memory keys; the clone is
-    /// bounded by the job `max_state_keys` quota (P1-14). Not a streaming
-    /// snapshot — production jobs stay within that cap.
+    pub fn max_state_keys(&self) -> usize {
+        match &self.store {
+            WindowStore::Tumble(s) => s.max_keys(),
+            WindowStore::Count(s) => s.max_keys(),
+        }
+    }
+
+    /// Estimated encoded freeze body (keys + accs + per-entry headers).
+    /// Walks live state by reference — does not clone entries.
+    pub fn estimated_freeze_bytes(&self) -> usize {
+        const ENTRY_OVERHEAD: usize = 2 + 8 + 8 + 8 + 2;
+        match &self.store {
+            WindowStore::Tumble(s) => s
+                .iter()
+                .map(|(k, e)| {
+                    k.tracked_bytes()
+                        + e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>()
+                        + ENTRY_OVERHEAD
+                })
+                .sum(),
+            WindowStore::Count(s) => s
+                .iter()
+                .map(|(k, e)| {
+                    k.tracked_bytes()
+                        + e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>()
+                        + ENTRY_OVERHEAD
+                })
+                .sum(),
+        }
+    }
+
+    /// Fail closed before encode / CURRENT publish when the freeze would
+    /// exceed the entry cap, snapshot byte quota, or live+encoded working set.
+    pub fn check_freeze_encode_bound(&self, max_entries: usize) -> Result<()> {
+        let n = self.key_count();
+        if n > max_entries {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "freeze entry count {n} exceeds max_state_keys {max_entries}; refusing encode (would publish unrecoverable CURRENT)"
+                ),
+            ));
+        }
+        let estimate = self.estimated_freeze_bytes().saturating_add(256);
+        if estimate as u64 > crate::checkpoint::MAX_SNAPSHOT_BYTES {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "estimated freeze {estimate}B exceeds {}B snapshot quota; refusing encode before CURRENT",
+                    crate::checkpoint::MAX_SNAPSHOT_BYTES
+                ),
+            ));
+        }
+        let live = self.retention_bytes();
+        let peak = live.saturating_add(estimate);
+        let cap = self
+            .owner
+            .budget()
+            .retention_bytes
+            .saturating_add(self.owner.budget().reservation_bytes);
+        if peak > cap {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "freeze encode working set {peak}B (live+encoded) exceeds retention+reservation {cap}B; refusing encode before CURRENT (P1-14)"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Incremental freeze encode: sort key refs only, write each live entry
+    /// into `out`. Peak is live retention + the output buffer — no
+    /// `Vec<FrozenEntry>` clone of all accs/keys (P1-14).
+    pub fn encode_freeze_into(&self, out: &mut Vec<u8>, max_entries: usize) -> Result<()> {
+        self.check_freeze_encode_bound(max_entries)?;
+        let n = self.key_count();
+        out.extend_from_slice(&self.operator.raw().to_le_bytes());
+        out.extend_from_slice(&StateSlotId::new(SLOT).raw().to_le_bytes());
+        let kind = match &self.store {
+            WindowStore::Tumble(_) => 0u8,
+            WindowStore::Count(_) => 1u8,
+        };
+        out.push(kind);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+        match &self.store {
+            WindowStore::Tumble(store) => {
+                let mut keys: Vec<&crate::state::StateKey> = store.keys().collect();
+                keys.sort_by(|a, b| a.encoded_bytes().cmp(b.encoded_bytes()));
+                for k in keys {
+                    let e = store.get(k).expect("freeze key");
+                    write_freeze_entry(out, &k.key, e.window_start, e.window_end, 0, &e.accs)?;
+                }
+            }
+            WindowStore::Count(store) => {
+                let mut keys: Vec<&crate::state::StateKey> = store.keys().collect();
+                keys.sort_by(|a, b| a.encoded_bytes().cmp(b.encoded_bytes()));
+                for k in keys {
+                    let e = store.get(k).expect("freeze key");
+                    write_freeze_entry(out, &k.key, 0, 0, e.count, &e.accs)?;
+                }
+            }
+        }
+        write_opt_i64(self.wm_in(), out);
+        write_opt_i64(self.wm_out(), out);
+        write_opt_i64(self.hub.last_effective(), out);
+        Ok(())
+    }
+
+    /// Materialize a [`WindowFreeze`] after the encode bound check.
+    /// Residual (P1-14): this still clones entries. The aligned session
+    /// encode path uses [`Self::encode_freeze_into`] instead.
+    pub fn try_freeze(&self) -> Result<WindowFreeze> {
+        self.check_freeze_encode_bound(self.max_state_keys())?;
+        Ok(self.freeze())
+    }
+
+    /// Freeze open keyed state. Prefer [`Self::encode_freeze_into`] /
+    /// [`Self::try_freeze`] on the publish path so oversized freezes fail
+    /// closed before CURRENT.
     pub fn freeze(&self) -> WindowFreeze {
         let mut entries = Vec::new();
         let kind = match &self.store {
@@ -823,6 +940,38 @@ pub struct FrozenEntry {
     pub window_end: i64,
     pub count: u64,
     pub accs: Vec<Accumulator>,
+}
+
+pub(crate) fn write_freeze_entry(
+    out: &mut Vec<u8>,
+    key: &[Scalar],
+    window_start: i64,
+    window_end: i64,
+    count: u64,
+    accs: &[Accumulator],
+) -> Result<()> {
+    out.extend_from_slice(&(key.len() as u16).to_le_bytes());
+    for s in key {
+        s.encode_value(out)?;
+    }
+    out.extend_from_slice(&window_start.to_le_bytes());
+    out.extend_from_slice(&window_end.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&(accs.len() as u16).to_le_bytes());
+    for a in accs {
+        a.encode(out)?;
+    }
+    Ok(())
+}
+
+fn write_opt_i64(v: Option<i64>, out: &mut Vec<u8>) {
+    match v {
+        None => out.push(0),
+        Some(x) => {
+            out.push(1);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
 }
 
 impl FrozenEntry {

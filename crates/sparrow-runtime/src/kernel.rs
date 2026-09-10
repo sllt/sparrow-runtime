@@ -176,11 +176,32 @@ pub struct JobStats {
     pub timers_cancelled: u64,
 }
 
+/// Process-wide queue reservation released when the job task ends.
+struct QueueAdmit {
+    reserved: Arc<AtomicUsize>,
+    jobs: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for QueueAdmit {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.reserved.fetch_sub(self.bytes, Ordering::SeqCst);
+        }
+        self.jobs.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct Kernel {
     rt: tokio::runtime::Runtime,
     opts: KernelOptions,
     next_attempt: AtomicU64,
     live_tasks: Arc<AtomicUsize>,
+    /// Shared by every job. N jobs must not each get an independent
+    /// compact [`ResourceBudget`] (P1-20).
+    process_owner: Arc<MemoryOwner>,
+    queue_reserved: Arc<AtomicUsize>,
+    admitted_jobs: Arc<AtomicUsize>,
     pub metrics: Arc<RuntimeMetrics>,
 }
 
@@ -192,11 +213,15 @@ impl Kernel {
             .thread_name("sparrow-kernel")
             .build()
             .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("tokio runtime: {e}")))?;
+        let process_owner = MemoryOwner::new(opts.budget);
         Ok(Self {
             rt,
             opts,
             next_attempt: AtomicU64::new(1),
             live_tasks: Arc::new(AtomicUsize::new(0)),
+            process_owner,
+            queue_reserved: Arc::new(AtomicUsize::new(0)),
+            admitted_jobs: Arc::new(AtomicUsize::new(0)),
             metrics: RuntimeMetrics::new(),
         })
     }
@@ -207,6 +232,19 @@ impl Kernel {
 
     pub fn budget(&self) -> ResourceBudget {
         self.opts.budget
+    }
+
+    /// Process-wide memory owner shared by every job on this kernel (P1-20).
+    pub fn process_owner(&self) -> &Arc<MemoryOwner> {
+        &self.process_owner
+    }
+
+    pub fn admitted_jobs(&self) -> usize {
+        self.admitted_jobs.load(Ordering::SeqCst)
+    }
+
+    pub fn queue_reserved(&self) -> usize {
+        self.queue_reserved.load(Ordering::SeqCst)
     }
 
     /// Tokio handle for composition-root connector tasks (MQTT/HTTP).
@@ -220,13 +258,25 @@ impl Kernel {
 
     pub fn submit(&self, req: JobRequest) -> Result<JobHandle> {
         DeliveryContract::V0_3.validate_restore(&RestoreClaim::None)?;
-        admit(&self.opts, &req.plan)?;
+        let queue_need = admit_process(
+            &self.opts,
+            &req.plan,
+            &self.process_owner,
+            &self.queue_reserved,
+        )?;
+        self.queue_reserved.fetch_add(queue_need, Ordering::SeqCst);
+        self.admitted_jobs.fetch_add(1, Ordering::SeqCst);
+        let admit = QueueAdmit {
+            reserved: Arc::clone(&self.queue_reserved),
+            jobs: Arc::clone(&self.admitted_jobs),
+            bytes: queue_need,
+        };
         self.metrics
             .jobs_started
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let attempt = JobAttemptId::new(self.next_attempt.fetch_add(1, Ordering::SeqCst));
         let cancel = CancellationToken::new();
-        let owner = MemoryOwner::new(self.opts.budget);
+        let owner = Arc::clone(&self.process_owner);
         let work = Arc::new(WorkBudget::new(self.opts.budget.work_units));
         let ctx = JobCtx {
             pipeline: req.plan.pipeline,
@@ -245,7 +295,7 @@ impl Kernel {
             metrics: Arc::clone(&self.metrics),
             aligned: req.aligned.clone(),
         };
-        let handle = self.rt.spawn(run_job(ctx, req));
+        let handle = self.rt.spawn(run_job(ctx, req, admit));
         Ok(JobHandle {
             attempt,
             cancel,
@@ -261,7 +311,12 @@ impl Kernel {
     }
 }
 
-fn admit(opts: &KernelOptions, plan: &PhysicalPlan) -> Result<()> {
+fn admit_process(
+    opts: &KernelOptions,
+    plan: &PhysicalPlan,
+    process: &MemoryOwner,
+    queue_reserved: &AtomicUsize,
+) -> Result<usize> {
     let mailboxes = plan.mailbox_count().max(1);
     let need = opts.mailbox.max_bytes.saturating_mul(mailboxes);
     if need > opts.budget.queue_bytes {
@@ -274,7 +329,33 @@ fn admit(opts: &KernelOptions, plan: &PhysicalPlan) -> Result<()> {
         )
         .retryable(true));
     }
-    Ok(())
+    let live_q = queue_reserved.load(Ordering::SeqCst);
+    if live_q.saturating_add(need) > opts.budget.queue_bytes {
+        return Err(SparrowError::new(
+            ErrorCode::ResourceExhausted,
+            format!(
+                "process queue admit: live reserved {live_q}B + job {need}B > queue cap {}",
+                opts.budget.queue_bytes
+            ),
+        )
+        .retryable(true));
+    }
+    let usage = process.usage();
+    let live_held = usage.retention_bytes.saturating_add(usage.queue_bytes);
+    let process_cap = opts
+        .budget
+        .retention_bytes
+        .saturating_add(opts.budget.queue_bytes);
+    if live_held.saturating_add(need) > process_cap {
+        return Err(SparrowError::new(
+            ErrorCode::ResourceExhausted,
+            format!(
+                "process memory admit: live retained+queue {live_held}B + job mailbox {need}B > process cap {process_cap}B"
+            ),
+        )
+        .retryable(true));
+    }
+    Ok(need)
 }
 
 struct JobCtx {
@@ -346,7 +427,7 @@ impl JobHandle {
     }
 }
 
-async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
+async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<JobStats> {
     let n = req.plan.stages.len();
     if n < 2 {
         return Err(SparrowError::new(
@@ -910,7 +991,7 @@ async fn window_stage(
                                 }
                                 StreamControl::CheckpointBarrier { checkpoint_id } => {
                                     if let Some(aj) = &ctx.aligned {
-                                        let freeze = op.freeze();
+                                        let freeze = op.try_freeze()?;
                                         let _ = aj
                                             .acks
                                             .send(AlignedAck::WindowFrozen {

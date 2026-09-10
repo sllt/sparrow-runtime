@@ -19,7 +19,10 @@ struct AllocInner {
     handles: AtomicUsize,
 }
 
-/// Process-local owner of tracked allocations for one job attempt.
+/// Process- or job-scoped owner of tracked allocations.
+///
+/// R2 batch 8: the Kernel holds one process-wide owner. Jobs share it so
+/// N concurrent jobs cannot each draw an independent full [`ResourceBudget`].
 #[derive(Debug)]
 pub struct MemoryOwner {
     budget: ResourceBudget,
@@ -69,6 +72,32 @@ impl MemoryOwner {
 
     pub fn peak_builder_bytes(&self) -> usize {
         self.peak_builder_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Fail closed if `used + bytes` would exceed `kind`'s cap.
+    /// Does not charge a lease (A2 leftover: no arena on [`crate::scalar::Scalar`]).
+    pub fn ensure_headroom(&self, kind: CreditKind, bytes: usize) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let _gate = self.lock.lock().expect("memory owner lock");
+        let used = self.ledger(kind).load(Ordering::SeqCst);
+        let cap = self.budget.cap(kind);
+        if used.saturating_add(bytes) > cap {
+            return Err(SparrowError::new(
+                ErrorCode::ResourceExhausted,
+                format!(
+                    "{kind} headroom exhausted: used={used} request={bytes} cap={cap}",
+                    kind = kind.as_str()
+                ),
+            )
+            .retryable(true)
+            .context("credit", kind.as_str())
+            .context("used", used.to_string())
+            .context("request", bytes.to_string())
+            .context("cap", cap.to_string()));
+        }
+        Ok(())
     }
 
     pub(crate) fn note_builder_peak(&self, bytes: usize) {
@@ -267,5 +296,17 @@ mod tests {
         let err = pool.acquire(CreditKind::Reservation, 25).unwrap_err();
         assert_eq!(err.code, ErrorCode::ResourceExhausted);
         assert!(err.retryable);
+    }
+
+    #[test]
+    fn a2_ensure_headroom_does_not_charge() {
+        let pool = owner();
+        pool.ensure_headroom(CreditKind::Reservation, 100).unwrap();
+        assert_eq!(pool.usage().reservation_bytes, 0);
+        let _held = pool.acquire(CreditKind::Reservation, 1000).unwrap();
+        let err = pool
+            .ensure_headroom(CreditKind::Reservation, 50)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
     }
 }

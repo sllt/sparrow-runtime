@@ -79,7 +79,7 @@ pub struct LiveLoop {
     pub broker: EmbeddedBroker,
     pub http: HttpCapture,
     pub job: JobHandle,
-    pub mqtt_task: tokio::task::JoinHandle<()>,
+    pub mqtt_task: tokio::task::JoinHandle<sparrow_connectors::Result<()>>,
     pub http_task: tokio::task::JoinHandle<()>,
     pub diag: Arc<IoDiagnostics>,
     pub capture: SharedCapture,

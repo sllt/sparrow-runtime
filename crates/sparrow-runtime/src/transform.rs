@@ -18,23 +18,27 @@ pub fn apply_steps(
     if steps.is_empty() {
         return Ok(None);
     }
-    let mut working: Option<Vec<Row>> = None;
-    let mut schema = batch.schema().clone();
+    // Each step builds into a charged [`RowBatchBuilder`]. No unaccounted
+    // `to_vec()` of the whole batch (A2 / P1-16).
+    let mut working: Option<RowBatch> = None;
     for step in steps {
         match step {
             TransformStep::Filter {
                 predicate, input, ..
             } => {
-                let src = working.as_deref().unwrap_or(batch.rows());
-                work.consume(src.len() as u64)?;
-                let mask = filter_mask(predicate, input, src)?;
-                let next: Vec<Row> = src
-                    .iter()
-                    .zip(mask)
-                    .filter_map(|(r, keep)| keep.then(|| r.clone()))
-                    .collect();
-                working = Some(next);
-                schema = input.clone();
+                let src = working.as_ref().unwrap_or(batch);
+                work.consume(src.num_rows() as u64)?;
+                let mask = filter_mask(predicate, input, src.rows())?;
+                let mut b = step_builder(input.clone(), owner, src.num_rows(), src.tracked_bytes())?;
+                for (row, keep) in src.rows().iter().zip(mask) {
+                    if keep {
+                        b.push(row.clone())?;
+                    }
+                }
+                working = finish_step(b)?;
+                if working.is_none() {
+                    return Ok(None);
+                }
             }
             TransformStep::Project {
                 exprs,
@@ -48,44 +52,52 @@ pub fn apply_steps(
                 output,
                 ..
             } => {
-                let src = working.as_deref().unwrap_or(batch.rows());
-                work.consume(src.len() as u64 * exprs.len().max(1) as u64)?;
-                let mut next = Vec::with_capacity(src.len());
-                for row in src {
+                let src = working.as_ref().unwrap_or(batch);
+                work.consume(src.num_rows() as u64 * exprs.len().max(1) as u64)?;
+                let mut b = step_builder(
+                    output.clone(),
+                    owner,
+                    src.num_rows(),
+                    src.tracked_bytes().saturating_mul(2).max(64),
+                )?;
+                for row in src.rows() {
                     let values: Result<Vec<Scalar>> =
                         exprs.iter().map(|e| eval(e, input, &row.values)).collect();
-                    next.push(Row { values: values? });
+                    b.push(Row { values: values? })?;
                 }
-                working = Some(next);
-                schema = output.clone();
+                working = finish_step(b)?;
+                if working.is_none() {
+                    return Ok(None);
+                }
             }
         }
     }
-    let Some(rows) = working else {
-        return Ok(None);
-    };
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    build_batch(schema, rows, owner)
+    Ok(working)
 }
 
-fn build_batch(schema: Schema, rows: Vec<Row>, owner: &Arc<MemoryOwner>) -> Result<Option<RowBatch>> {
-    let max_rows = owner.budget().max_rows.max(rows.len()).max(1);
-    let bytes: usize = rows.iter().map(Row::tracked_bytes).sum();
+fn step_builder(
+    schema: Schema,
+    owner: &Arc<MemoryOwner>,
+    rows_hint: usize,
+    bytes_hint: usize,
+) -> Result<RowBatchBuilder> {
+    let max_rows = owner.budget().max_rows.max(rows_hint).max(1);
     let max_bytes = owner
         .budget()
         .cap(CreditKind::Reservation)
-        .min(bytes.saturating_mul(2).max(64));
-    let mut b = RowBatchBuilder::new(
+        .min(bytes_hint.saturating_mul(2).max(64));
+    RowBatchBuilder::new(
         Arc::new(schema),
         Arc::clone(owner),
         CreditKind::Reservation,
         max_rows,
         max_bytes.max(64),
-    )?;
-    for row in rows {
-        b.push(row)?;
+    )
+}
+
+fn finish_step(b: RowBatchBuilder) -> Result<Option<RowBatch>> {
+    if b.num_rows() == 0 {
+        return Ok(None);
     }
     Ok(Some(b.finish()?))
 }

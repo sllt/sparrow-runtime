@@ -22,6 +22,21 @@ async workers.
 `host_kernel()` still uses `ResourceBudget::compact()` (`max_state_keys = 1024`).
 R2 batch 6 does not raise that production budget.
 
+R2 batch 8: that budget is **process-wide**. `Kernel` holds one
+`MemoryOwner`; jobs share it. Admit also tracks live mailbox reservations
+so N jobs cannot each take a full compact queue. See
+`docs/REVIEW_R2_BATCH8.md` (P1-20).
+
+Aligned freeze encode writes from the live store (no full entry clone)
+and refuses an oversized snapshot before CURRENT (P1-14). Residual: the
+Kernel ACK still sends a `WindowFreeze` value.
+
+Decode errors stay counted by default. `fail_on_decode` on the pipeline
+spec, or `SPARROW_FAIL_ON_DECODE=1`, fails the job (P1-17).
+
+MQTT `inbox_capacity × max_record` is rejected above 4 MiB **or** the
+process `queue_bytes` (P1-27).
+
 `sparrow-server` installs a stderr `tracing` subscriber (`RUST_LOG`, default
 `info`). Aligned checkpoint commits log `checkpoint_commit` at info with id /
 bytes / duration.

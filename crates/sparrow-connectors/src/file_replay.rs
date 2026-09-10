@@ -89,6 +89,8 @@ pub struct FileReplayConfig {
     pub restore: RestoreClaim,
     pub recovery: RecoveryPolicy,
     pub contract: FileContract,
+    /// P1-17: decode errors fail the source (and the job) instead of only counting.
+    pub fail_on_decode: bool,
 }
 
 impl FileReplayConfig {
@@ -99,6 +101,7 @@ impl FileReplayConfig {
             restore: RestoreClaim::None,
             recovery: RecoveryPolicy::RestartFresh,
             contract: FileContract::Immutable,
+            fail_on_decode: false,
         }
     }
 
@@ -163,7 +166,7 @@ impl FileReplaySource {
             offset: 0,
             record_index: 0,
             pending: Vec::new(),
-            codec: JsonCodec::new(cfg.schema.clone()),
+            codec: JsonCodec::new(cfg.schema.clone()).with_fail_on_decode(cfg.fail_on_decode),
             contract: cfg.contract,
         })
     }
