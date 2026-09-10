@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use sparrow_connectors::{
-    refuse_delivery_name, refuse_durable_recovery, refuse_qos_durable, ConnectorCapabilities,
-    FileReplayConfig, HttpPushSourceConfig, HttpSinkConfig, MqttSinkConfig, MqttSourceConfig,
-    ReplaySupport, SecretResolver, TargetPolicy, TlsConfig,
+    check_data_path, refuse_delivery_name, refuse_durable_recovery, refuse_qos_durable,
+    ConnectorCapabilities, FileReplayConfig, HttpPushSourceConfig, HttpSinkConfig, MqttSinkConfig,
+    MqttSourceConfig, ReplaySupport, SecretResolver, TargetPolicy, TlsConfig,
 };
 use sparrow_model::{
     DeliveryGuarantee, ErrorCode, PipelineId, RecoveryPolicy, RestoreClaim, Result, RevisionId,
@@ -186,6 +186,10 @@ pub fn validate_io(
                 )
             })?;
             let recovery = RecoveryPolicy::parse(&spec.recovery)?;
+            sparrow_connectors::check_data_path(std::path::Path::new(&path)).map_err(io)?;
+            if let Some(dir) = &spec.checkpoint_dir {
+                check_data_path(std::path::Path::new(dir)).map_err(io)?;
+            }
             let mut cfg = FileReplayConfig::new(path, schema.clone());
             cfg.restore = spec.restore_claim()?;
             cfg.recovery = recovery;
@@ -264,8 +268,15 @@ pub fn mqtt_config(
     cfg.clean_session = source.clean_session;
     cfg.username_secret = source.username_secret.clone();
     cfg.password_secret = source.password_secret.clone();
+    let tls_enabled = source.tls && !source.use_demo_io;
+    if (source.username_secret.is_some() || source.password_secret.is_some()) && !tls_enabled {
+        return Err(SparrowError::new(
+            ErrorCode::PolicyDenied,
+            "MQTT username/password require TLS (refusing plaintext credentials)",
+        ));
+    }
     cfg.tls = TlsConfig {
-        enabled: false,
+        enabled: tls_enabled,
         skip_verify: source.skip_verify,
     };
     cfg.inbox_capacity = source.inbox_capacity;
@@ -293,11 +304,11 @@ pub fn http_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<Http
             SparrowError::new(ErrorCode::InvalidArgument, "HTTP sink url is required")
         })?
     };
-    let mut cfg = HttpSinkConfig::demo(url);
+    let mut cfg = HttpSinkConfig::demo(url.clone());
     cfg.outbox_capacity = sink.outbox_capacity;
     cfg.header_secret = sink.header_secret.clone();
     cfg.tls = TlsConfig {
-        enabled: false,
+        enabled: sink.tls && url.starts_with("https://"),
         skip_verify: sink.skip_verify,
     };
     cfg.restore = RestoreClaim::None;
@@ -345,8 +356,65 @@ pub fn mqtt_sink_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result
     cfg.qos = sink.qos;
     cfg.clean_session = sink.clean_session;
     cfg.outbox_capacity = sink.outbox_capacity;
+    cfg.tls = TlsConfig {
+        enabled: sink.tls && !sink.use_demo_io,
+        skip_verify: false,
+    };
     cfg.restore = RestoreClaim::None;
     Ok(cfg)
+}
+
+/// Aligned recovery: honor Filter/Project on the Kernel path; reject
+/// dishonest plans (PT windows, Dedup, Lookup) rather than strip stages (P0-1/P0-2/A1).
+pub fn validate_aligned_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> sparrow_model::Result<()> {
+    let recovery = RecoveryPolicy::parse(&spec.recovery)?;
+    if !recovery.is_aligned() {
+        return Ok(());
+    }
+    if !matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "aligned recovery requires a ReplayableSource (file); MQTT replay remains unsupported",
+        ));
+    }
+    if let Some(path) = &spec.source.path {
+        check_data_path(std::path::Path::new(path)).map_err(io)?;
+    }
+    if let Some(dir) = &spec.checkpoint_dir {
+        check_data_path(std::path::Path::new(dir)).map_err(io)?;
+    }
+    let mut has_window = false;
+    for stage in &plan.stages {
+        match stage {
+            sparrow_plan::PhysicalStage::WindowAgg { spec: w, .. } => {
+                has_window = true;
+                if matches!(
+                    w.kind,
+                    sparrow_model::WindowKind::TumblingProcessingTime { .. }
+                ) {
+                    return Err(SparrowError::new(
+                        ErrorCode::UnsupportedRestore,
+                        "processing-time windows cannot use recovery=aligned (capabilities: recovery_pt_window=restart_fresh; no PT timer on the aligned path)",
+                    ));
+                }
+            }
+            sparrow_plan::PhysicalStage::Deduplicate { .. }
+            | sparrow_plan::PhysicalStage::Lookup { .. } => {
+                return Err(SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "aligned recovery does not snapshot Dedup/Lookup; refuse dishonest strip",
+                ));
+            }
+            _ => {}
+        }
+    }
+    if !has_window {
+        return Err(SparrowError::new(
+            ErrorCode::FeatureUnavailable,
+            "aligned recovery requires a window operator in the plan",
+        ));
+    }
+    Ok(())
 }
 
 pub fn capabilities_json() -> serde_json::Value {
@@ -473,6 +541,7 @@ mod tests {
                 use_demo_io: false,
                 bind: None,
                 path: None,
+                tls: false,
             },
             sink: crate::spec::SinkSpec {
                 kind: "http".into(),
@@ -487,6 +556,7 @@ mod tests {
                 client_id: None,
                 qos: 0,
                 clean_session: true,
+                tls: false,
             },
             delivery: "at_least_once".into(),
             recovery: "restart_fresh".into(),
@@ -538,6 +608,7 @@ mod tests {
             use_demo_io: false,
             bind: None,
             path: None,
+            tls: false,
         };
         let schema = Schema::new(
             SchemaId::new(1),
@@ -556,5 +627,41 @@ mod tests {
         assert!(a.client_id.contains("pipe-a"));
         assert!(b.client_id.contains("pipe-b"));
         assert!(!a.client_id.eq("sparrow-source"));
+    }
+
+    #[test]
+    fn p0_11_mqtt_credentials_require_tls() {
+        let mut src = SourceSpec {
+            kind: "mqtt".into(),
+            host: Some("127.0.0.1".into()),
+            port: Some(1883),
+            topic: "t".into(),
+            client_id: None,
+            qos: 0,
+            clean_session: true,
+            username_secret: Some("user".into()),
+            password_secret: Some("pw".into()),
+            skip_verify: false,
+            inbox_capacity: 8,
+            use_demo_io: false,
+            bind: None,
+            path: None,
+            tls: false,
+        };
+        let schema = Schema::new(
+            SchemaId::new(1),
+            vec![sparrow_model::Field::new(
+                sparrow_model::FieldId::new(1),
+                "device_id",
+                sparrow_model::DataType::Utf8,
+                false,
+            )],
+        )
+        .unwrap();
+        let err = mqtt_config(&src, schema.clone(), None, "cred").unwrap_err();
+        assert_eq!(err.code, ErrorCode::PolicyDenied);
+        src.tls = true;
+        let cfg = mqtt_config(&src, schema, None, "cred").unwrap();
+        assert!(cfg.tls.enabled, "tls:true must be wired into MQTT config");
     }
 }

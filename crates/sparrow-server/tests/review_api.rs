@@ -511,3 +511,98 @@ fn r25_mqtt_http_ingest_moves_metrics() {
         let _ = call(&state, auth_post("/v1/pipelines/r25/stop", "{}")).await;
     });
 }
+
+#[test]
+fn p0_3_restore_after_prior_start_restores_checkpoint() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let path = tmp("p03.ndjson");
+        let chk = tmp("p03-chk");
+        std::fs::create_dir_all(&chk).unwrap();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n{\"device_id\":\"d1\",\"v\":3}\n",
+        )
+        .unwrap();
+        let http = sparrow_connectors::HttpCapture::start().await.unwrap();
+        call(
+            &state,
+            auth_put(
+                "/v1/allowlist",
+                json!({"host":"127.0.0.1","port": http.port()}).to_string(),
+            ),
+        )
+        .await;
+        let (st, _) = call(&state, auth_put("/v1/streams/sensors", STREAM)).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let spec = json!({
+            "version": 1,
+            "stream": "sensors",
+            "sql": "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, COUNT_WINDOW(3)",
+            "source": { "kind": "file", "path": path.to_string_lossy() },
+            "sink": { "kind": "http", "url": http.url() },
+            "delivery": "live_best_effort",
+            "recovery": "aligned",
+            "checkpoint_dir": chk.to_string_lossy(),
+        });
+        let (st, body) = call(&state, auth_put("/v1/pipelines/p03", spec.to_string())).await;
+        assert_eq!(st, StatusCode::CREATED, "{body}");
+        let (st, body) = call(&state, auth_post("/v1/pipelines/p03/start", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        wait_status(&state, "p03", "running", Duration::from_secs(5))
+            .await
+            .expect("first start");
+        let start = std::time::Instant::now();
+        while http.bodies().is_empty() && start.elapsed() < Duration::from_secs(4) {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert_eq!(http.bodies().len(), 1, "first run must emit the completed window");
+        let (st, body) = call(&state, auth_post("/v1/pipelines/p03/checkpoint", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let (st, _) = call(&state, auth_post("/v1/pipelines/p03/kill", "{}")).await;
+        assert_eq!(st, StatusCode::OK);
+        let mut more = std::fs::read(&path).unwrap();
+        more.extend_from_slice(b"{\"device_id\":\"d1\",\"v\":4}\n");
+        std::fs::write(&path, more).unwrap();
+        let (st, body) = call(&state, auth_post("/v1/pipelines/p03/restore", "{}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        wait_status(&state, "p03", "running", Duration::from_secs(5))
+            .await
+            .expect("restore must start the revision that contains restore=checkpoint");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            http.bodies().len(),
+            1,
+            "restore must resume empty window + v=4 (no complete window); fresh open would re-emit n=3: {:?}",
+            http.body_strings()
+        );
+        let row = state.store.get_pipeline("p03").unwrap();
+        assert_eq!(
+            row.spec.restore.as_ref().map(|r| r.kind.as_str()),
+            Some("checkpoint"),
+            "latest revision must contain restore=checkpoint"
+        );
+        http.stop().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+#[test]
+fn p1_29_unauthenticated_does_not_write_audit() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let before = state.store.list_audit(200).unwrap().len();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/audit")
+            .body(Body::empty())
+            .unwrap();
+        let (st, _) = call(&state, req).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let after = state.store.list_audit(200).unwrap().len();
+        assert_eq!(before, after, "auth failure must not touch the audit ledger");
+    });
+}

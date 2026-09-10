@@ -117,7 +117,7 @@ impl LiveLoop {
         )?;
         let cancel = job.cancellation();
         let mqtt_task = kernel.handle().spawn(mqtt.run(tx_in, cancel.clone()));
-        let http_task = kernel.handle().spawn(sink.run(rx_out, cancel));
+        let http_task = kernel.handle().spawn(sink.run(rx_out, cancel, None));
         // Give the subscriber time to CONNECT/SUBSCRIBE before publishes.
         tokio::time::sleep(Duration::from_millis(80)).await;
         Ok(Self {

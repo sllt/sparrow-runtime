@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sparrow_control::{compact_kernel, Store};
+use sparrow_control::{host_kernel, Store};
 use sparrow_model::{ErrorCode, SparrowError};
 use sparrow_server::{boot, serve, DEFAULT_BIND};
 
@@ -106,7 +106,7 @@ fn run() -> Result<(), SparrowError> {
         Store::open(&opts.catalog)?
     };
     let store = Arc::new(store);
-    let kernel = Arc::new(compact_kernel()?);
+    let kernel = Arc::new(host_kernel()?);
     let bind = opts.bind;
     let token = opts.token.clone();
     let safe = opts.safe_mode;
