@@ -23,6 +23,8 @@ pub struct RuntimeMetrics {
     pub state_bytes: AtomicU64,
     /// Set when a live path records a real sample (not just defaults).
     pub live_samples: AtomicU64,
+    /// Event-time rows dropped because `event_time > now + max_future_skew`.
+    pub future_dropped: AtomicU64,
 }
 
 impl RuntimeMetrics {
@@ -68,6 +70,14 @@ impl RuntimeMetrics {
         self.checkpoint_aborts.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_future_dropped(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.future_dropped.fetch_add(n, Ordering::Relaxed);
+        self.live_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             jobs_started: self.jobs_started.load(Ordering::Relaxed),
@@ -85,6 +95,7 @@ impl RuntimeMetrics {
             state_keys: self.state_keys.load(Ordering::Relaxed),
             state_bytes: self.state_bytes.load(Ordering::Relaxed),
             live_samples: self.live_samples.load(Ordering::Relaxed),
+            future_dropped: self.future_dropped.load(Ordering::Relaxed),
         }
     }
 }
@@ -106,13 +117,14 @@ pub struct MetricsSnapshot {
     pub state_keys: u64,
     pub state_bytes: u64,
     pub live_samples: u64,
+    pub future_dropped: u64,
 }
 
 impl MetricsSnapshot {
     /// Structured log line (budgeted labels only).
     pub fn log_line(&self) -> String {
         format!(
-            "{{\"event\":\"sparrow_metrics\",\"jobs_started\":{},\"jobs_stopped\":{},\"jobs_failed\":{},\"ingested_rows\":{},\"emitted_rows\":{},\"queue_items\":{},\"queue_bytes\":{},\"watermark_lag_micros\":{},\"checkpoint_duration_micros\":{},\"checkpoint_bytes\":{},\"checkpoint_commits\":{},\"checkpoint_aborts\":{},\"state_keys\":{},\"state_bytes\":{},\"live_samples\":{}}}",
+            "{{\"event\":\"sparrow_metrics\",\"jobs_started\":{},\"jobs_stopped\":{},\"jobs_failed\":{},\"ingested_rows\":{},\"emitted_rows\":{},\"queue_items\":{},\"queue_bytes\":{},\"watermark_lag_micros\":{},\"checkpoint_duration_micros\":{},\"checkpoint_bytes\":{},\"checkpoint_commits\":{},\"checkpoint_aborts\":{},\"state_keys\":{},\"state_bytes\":{},\"live_samples\":{},\"future_dropped\":{}}}",
             self.jobs_started,
             self.jobs_stopped,
             self.jobs_failed,
@@ -127,7 +139,8 @@ impl MetricsSnapshot {
             self.checkpoint_aborts,
             self.state_keys,
             self.state_bytes,
-            self.live_samples
+            self.live_samples,
+            self.future_dropped
         )
     }
 }

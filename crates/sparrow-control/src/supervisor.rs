@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sparrow_connectors::{
     publish_qos0, sensor_json, EmbeddedBroker, FileReplayConfig, FileReplaySource, HttpCapture,
@@ -32,6 +32,13 @@ use crate::validate::{
 /// Cap on **consecutive** start failures. Lifetime `attempt_id` still
 /// increments on start/stop/running/failed; it must not trigger this hold.
 pub(crate) const MAX_PIPELINE_ATTEMPTS: u64 = 16;
+
+/// Per-pipeline restart backoff: `40ms << min(consecutive_failures, 6)`.
+/// Cap is 2.56s. Must never be awaited inside the shared converge loop.
+pub(crate) fn retry_backoff(consecutive_failures: u64) -> Duration {
+    let shift = consecutive_failures.min(6) as u32;
+    Duration::from_millis(40u64.saturating_mul(1u64 << shift))
+}
 
 pub struct DemoHarness {
     pub broker: EmbeddedBroker,
@@ -120,6 +127,9 @@ pub struct Supervisor {
     store: Arc<Store>,
     kernel: Arc<Kernel>,
     running: Mutex<HashMap<String, RunningJob>>,
+    /// When a failed pipeline may be retried. Checked with `continue`;
+    /// the shared converge loop must not sleep on this map.
+    next_retry_at: Mutex<HashMap<String, Instant>>,
     wake: Notify,
     safe_mode: bool,
     demo: Option<Arc<DemoHarness>>,
@@ -139,6 +149,7 @@ impl Supervisor {
             store,
             kernel,
             running: Mutex::new(HashMap::new()),
+            next_retry_at: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             safe_mode,
             demo,
@@ -209,11 +220,16 @@ impl Supervisor {
                         continue;
                     }
                     if a.status == "failed" && a.consecutive_failures > 0 {
-                        let shift = a.consecutive_failures.min(6) as u32;
-                        tokio::time::sleep(Duration::from_millis(
-                            40u64.saturating_mul(1u64 << shift),
-                        ))
-                        .await;
+                        // N8: per-pipeline due time. Never sleep here —
+                        // a failed sibling must not stall healthy start/stop.
+                        if !self
+                            .retry_is_due(&d.name, a.consecutive_failures)
+                            .await
+                        {
+                            continue;
+                        }
+                    } else {
+                        self.clear_retry(&d.name).await;
                     }
                 }
                 let rev = d.revision.unwrap_or(1);
@@ -228,15 +244,21 @@ impl Supervisor {
                     let name = d.name.clone();
                     let msg = e.message.clone();
                     let _ = self
-                        .catalog(move |s| {
-                            let attempt = s
-                                .actual(&name)
-                                .map(|a| a.attempt_id.saturating_add(1))
-                                .unwrap_or(1);
-                            s.set_actual(&name, "failed", Some(rev), attempt, Some(&msg))?;
-                            s.insert_attempt(&name, rev, "failed", Some(&msg))
+                        .catalog({
+                            let name = name.clone();
+                            move |s| {
+                                let attempt = s
+                                    .actual(&name)
+                                    .map(|a| a.attempt_id.saturating_add(1))
+                                    .unwrap_or(1);
+                                s.set_actual(&name, "failed", Some(rev), attempt, Some(&msg))?;
+                                s.insert_attempt(&name, rev, "failed", Some(&msg))
+                            }
                         })
                         .await;
+                    self.schedule_retry(&name).await;
+                } else {
+                    self.clear_retry(&d.name).await;
                 }
             } else if let Some(job) = self.running.lock().await.remove(&d.name) {
                 self.stop_job(job).await;
@@ -288,18 +310,51 @@ impl Supervisor {
                     let n = name.clone();
                     let msg = e.message.clone();
                     let _ = self
-                        .catalog(move |s| {
-                            let attempt = s
-                                .actual(&n)
-                                .map(|a| a.attempt_id.saturating_add(1))
-                                .unwrap_or(1);
-                            s.set_actual(&n, "failed", Some(rev), attempt, Some(&msg))?;
-                            s.insert_attempt(&n, rev, "failed", Some(&msg))
+                        .catalog({
+                            let n = n.clone();
+                            move |s| {
+                                let attempt = s
+                                    .actual(&n)
+                                    .map(|a| a.attempt_id.saturating_add(1))
+                                    .unwrap_or(1);
+                                s.set_actual(&n, "failed", Some(rev), attempt, Some(&msg))?;
+                                s.insert_attempt(&n, rev, "failed", Some(&msg))
+                            }
                         })
                         .await;
+                    self.schedule_retry(&n).await;
                 }
             }
         }
+    }
+
+    async fn retry_is_due(&self, name: &str, consecutive_failures: u64) -> bool {
+        if consecutive_failures == 0 {
+            self.clear_retry(name).await;
+            return true;
+        }
+        let mut map = self.next_retry_at.lock().await;
+        let due = *map
+            .entry(name.to_string())
+            .or_insert_with(|| Instant::now() + retry_backoff(consecutive_failures));
+        Instant::now() >= due
+    }
+
+    async fn schedule_retry(&self, name: &str) {
+        let cf = self
+            .catalog({
+                let name = name.to_string();
+                move |s| Ok(s.actual(&name).map(|a| a.consecutive_failures).unwrap_or(1))
+            })
+            .await
+            .unwrap_or(1)
+            .max(1);
+        let due = Instant::now() + retry_backoff(cf);
+        self.next_retry_at.lock().await.insert(name.to_string(), due);
+    }
+
+    async fn clear_retry(&self, name: &str) {
+        self.next_retry_at.lock().await.remove(name);
     }
 
     async fn should_hold_failed(&self, name: &str) -> Result<bool> {

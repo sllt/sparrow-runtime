@@ -58,6 +58,16 @@ impl Scalar {
         matches!(self, Self::Null) || matches!(self, Self::Dynamic(DynamicValue::Null))
     }
 
+    /// IEEE NaN (typed Float64 or Dynamic float). Comparisons treat this as
+    /// unordered; MIN/MAX skip it like NULL.
+    pub fn is_nan(&self) -> bool {
+        match self {
+            Self::Float64(v) => v.is_nan(),
+            Self::Dynamic(DynamicValue::Float64(v)) => v.is_nan(),
+            _ => false,
+        }
+    }
+
     /// Estimated tracked size, including string/bytes payload.
     pub fn tracked_bytes(&self) -> usize {
         const TAG: usize = 16;

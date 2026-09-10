@@ -776,6 +776,9 @@ async fn emit_window(
     capture: &SharedCapture,
     emission: crate::window::WindowEmission,
 ) -> Result<bool> {
+    if emission.future_dropped > 0 {
+        ctx.metrics.record_future_dropped(emission.future_dropped);
+    }
     if !emission.lates.is_empty() {
         capture.push_late(&emission.lates);
     }
@@ -878,8 +881,7 @@ async fn window_stage(
                 capture,
                 crate::window::WindowEmission {
                     finals: rows,
-                    lates: Vec::new(),
-                    pending_close: None,
+                    ..crate::window::WindowEmission::default()
                 },
             )
             .await?
@@ -955,8 +957,7 @@ async fn window_stage(
                     capture,
                     crate::window::WindowEmission {
                         finals: rows,
-                        lates: Vec::new(),
-                        pending_close: None,
+                        ..crate::window::WindowEmission::default()
                     },
                 )
                 .await?

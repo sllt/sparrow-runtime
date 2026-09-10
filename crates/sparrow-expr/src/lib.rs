@@ -194,25 +194,23 @@ fn eval_call(name: &str, args: &[Expr], schema: &Schema, row: &[Scalar]) -> Resu
             }
             let mut acc: Option<Scalar> = None;
             for v in vals {
-                if v.is_null() {
+                if v.is_null() || v.is_nan() {
                     continue;
                 }
                 acc = Some(match acc {
                     None => v,
-                    Some(prev) => {
-                        let ord = cmp_scalars(&prev, &v)?;
-                        if name.eq_ignore_ascii_case("greatest") {
+                    Some(prev) => match cmp_scalars(&prev, &v)? {
+                        None => prev,
+                        Some(ord) if name.eq_ignore_ascii_case("greatest") => {
                             if ord == std::cmp::Ordering::Less {
                                 v
                             } else {
                                 prev
                             }
-                        } else if ord == std::cmp::Ordering::Greater {
-                            v
-                        } else {
-                            prev
                         }
-                    }
+                        Some(ord) if ord == std::cmp::Ordering::Greater => v,
+                        Some(_) => prev,
+                    },
                 });
             }
             Ok(acc.unwrap_or(Scalar::Null))
@@ -339,7 +337,12 @@ fn eval_binary(op: BinaryOp, left: &Scalar, right: &Scalar) -> Result<Scalar> {
         }
         BinaryOp::Eq => Ok(Scalar::Bool(scalars_eq(left, right))),
         BinaryOp::NotEq => Ok(Scalar::Bool(!scalars_eq(left, right))),
-        cmp => Ok(Scalar::Bool(cmp_ord_op(cmp, cmp_scalars(left, right)?)?)),
+        cmp => match cmp_scalars(left, right)? {
+            Some(ord) => Ok(Scalar::Bool(cmp_ord_op(cmp, ord)?)),
+            // SQL-ish / IEEE: ordered compare with NaN is unknown → false.
+            // Must not abort the job (N10).
+            None => Ok(Scalar::Bool(false)),
+        },
     }
 }
 
@@ -432,31 +435,22 @@ fn cmp_ord_op(op: BinaryOp, ord: std::cmp::Ordering) -> Result<bool> {
     })
 }
 
-fn cmp_scalars(left: &Scalar, right: &Scalar) -> Result<std::cmp::Ordering> {
+/// Ordered compare. `Ok(None)` is unordered (NaN) — not Equal, not an error.
+fn cmp_scalars(left: &Scalar, right: &Scalar) -> Result<Option<std::cmp::Ordering>> {
     match (left, right) {
-        (Scalar::Int64(a), Scalar::Int64(b)) => Ok(a.cmp(b)),
-        (Scalar::UInt64(a), Scalar::UInt64(b)) => Ok(a.cmp(b)),
-        (Scalar::Int64(a), Scalar::UInt64(b)) if *a >= 0 => Ok((*a as u64).cmp(b)),
-        (Scalar::UInt64(a), Scalar::Int64(b)) if *b >= 0 => Ok(a.cmp(&(*b as u64))),
-        (Scalar::TimestampMicrosUTC(a), Scalar::TimestampMicrosUTC(b)) => Ok(a.cmp(b)),
-        (Scalar::TimestampMicrosUTC(a), Scalar::Int64(b)) => Ok(a.cmp(b)),
-        (Scalar::Int64(a), Scalar::TimestampMicrosUTC(b)) => Ok(a.cmp(b)),
-        (Scalar::Float64(a), Scalar::Float64(b)) => a.partial_cmp(b).ok_or_else(|| {
-            SparrowError::new(
-                ErrorCode::InvalidArgument,
-                "NaN comparison is unordered; no implicit Equal",
-            )
-        }),
-        (Scalar::Utf8(a), Scalar::Utf8(b)) => Ok(a.as_ref().cmp(b.as_ref())),
+        (Scalar::Int64(a), Scalar::Int64(b)) => Ok(Some(a.cmp(b))),
+        (Scalar::UInt64(a), Scalar::UInt64(b)) => Ok(Some(a.cmp(b))),
+        (Scalar::Int64(a), Scalar::UInt64(b)) if *a >= 0 => Ok(Some((*a as u64).cmp(b))),
+        (Scalar::UInt64(a), Scalar::Int64(b)) if *b >= 0 => Ok(Some(a.cmp(&(*b as u64)))),
+        (Scalar::TimestampMicrosUTC(a), Scalar::TimestampMicrosUTC(b)) => Ok(Some(a.cmp(b))),
+        (Scalar::TimestampMicrosUTC(a), Scalar::Int64(b)) => Ok(Some(a.cmp(b))),
+        (Scalar::Int64(a), Scalar::TimestampMicrosUTC(b)) => Ok(Some(a.cmp(b))),
+        (Scalar::Float64(a), Scalar::Float64(b)) => Ok(a.partial_cmp(b)),
+        (Scalar::Utf8(a), Scalar::Utf8(b)) => Ok(Some(a.as_ref().cmp(b.as_ref()))),
         _ => {
             if let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) {
                 if matches!(left, Scalar::Float64(_)) || matches!(right, Scalar::Float64(_)) {
-                    return a.partial_cmp(&b).ok_or_else(|| {
-                        SparrowError::new(
-                            ErrorCode::InvalidArgument,
-                            "NaN comparison is unordered; no implicit Equal",
-                        )
-                    });
+                    return Ok(a.partial_cmp(&b));
                 }
             }
             Err(SparrowError::new(
@@ -664,9 +658,9 @@ mod tests {
             right: Box::new(Expr::Literal(Scalar::Float64(1.0))),
         };
         assert_eq!(
-            eval(&nan_lt, &schema, &row).unwrap_err().code,
-            ErrorCode::InvalidArgument,
-            "ordered compare must not treat NaN as Equal"
+            eval(&nan_lt, &schema, &row).unwrap(),
+            Scalar::Bool(false),
+            "ordered compare with NaN is false/unknown, not a job-killing error"
         );
         let tmin = Expr::Call {
             name: "least".into(),

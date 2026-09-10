@@ -7,7 +7,7 @@ use sparrow_model::ErrorCode;
 use crate::spec::{PipelineSpec, SinkSpec, SourceSpec};
 use crate::store::Store;
 use crate::supervisor::{
-    compact_kernel, request_start, request_start_at, request_stop, Supervisor,
+    compact_kernel, request_start, request_start_at, request_stop, retry_backoff, Supervisor,
     MAX_PIPELINE_ATTEMPTS,
 };
 
@@ -353,6 +353,91 @@ fn n1_consecutive_failure_cap_holds_with_error() {
             "request_start must clear the hold: {after:?}"
         );
         let _ = std::fs::remove_file(&path);
+    });
+}
+
+#[test]
+fn n8_failed_pipeline_backoff_does_not_block_healthy_converge() {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+
+        // Failed sibling first so list_desired yields it before the healthy job.
+        // Aligned without a window operator fails start (same as r24).
+        let fail_path = tmp("n8-fail.ndjson");
+        std::fs::write(&fail_path, b"{\"device_id\":\"d1\",\"v\":1}\n").unwrap();
+        let fail_spec = file_spec(
+            &fail_path.to_string_lossy(),
+            "SELECT device_id FROM sensors",
+            "aligned",
+            None,
+        );
+        store.put_pipeline("n8fail", &fail_spec, None).unwrap();
+        let ok_path = tmp("n8-ok.ndjson");
+        std::fs::write(&ok_path, b"{\"device_id\":\"d1\",\"v\":1}\n").unwrap();
+        let ok_spec = file_spec(
+            &ok_path.to_string_lossy(),
+            "SELECT device_id FROM sensors",
+            "restart_fresh",
+            None,
+        );
+        store.put_pipeline("n8ok", &ok_spec, None).unwrap();
+
+        // reset_actual_after_process_restart rewrites status to stopped.
+        // Seed the failed sibling *after* Supervisor::new so backoff applies.
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        for _ in 0..6 {
+            let attempt = store
+                .actual("n8fail")
+                .map(|a| a.attempt_id.saturating_add(1))
+                .unwrap_or(1);
+            store
+                .set_actual("n8fail", "failed", Some(1), attempt, Some("boom"))
+                .unwrap();
+        }
+        let failed = store.actual("n8fail").unwrap();
+        assert_eq!(failed.consecutive_failures, 6, "{failed:?}");
+        assert!(
+            retry_backoff(6) >= std::time::Duration::from_millis(2_000),
+            "fixture must sit in the old 2.56s sleep window, got {:?}",
+            retry_backoff(6)
+        );
+        store.set_desired("n8fail", "running", Some(1)).unwrap();
+        request_start(&store, "n8ok", "test").unwrap();
+
+        let t0 = std::time::Instant::now();
+        let _ = sup.converge_once().await;
+        let started = store.actual("n8ok").unwrap();
+        assert_eq!(
+            started.status, "running",
+            "healthy start must not wait on the failed sibling backoff: {started:?}"
+        );
+        let start_elapsed = t0.elapsed();
+        assert!(
+            start_elapsed < std::time::Duration::from_millis(800),
+            "healthy start took {start_elapsed:?}; old shared sleep is {:?}",
+            retry_backoff(6)
+        );
+
+        request_stop(&store, "n8ok", "test").unwrap();
+        let _ = sup.converge_once().await;
+        let stopped = store.actual("n8ok").unwrap();
+        assert_eq!(stopped.status, "stopped", "healthy stop: {stopped:?}");
+        let total = t0.elapsed();
+        assert!(
+            total < std::time::Duration::from_secs(2),
+            "healthy start+stop during the would-be sleep window took {total:?}"
+        );
+
+        let still_failed = store.actual("n8fail").unwrap();
+        assert_ne!(
+            still_failed.status, "running",
+            "failed pipeline must stay deferred, not start in the same loop: {still_failed:?}"
+        );
+
+        let _ = std::fs::remove_file(&fail_path);
+        let _ = std::fs::remove_file(&ok_path);
     });
 }
 
