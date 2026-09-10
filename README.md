@@ -19,6 +19,10 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 
 当前里程碑 / current milestone: **V1**（production aligned recovery + coordinator + observability）。
 
+Runtime contracts and compatibility notes: [`docs/RUNTIME.md`](docs/RUNTIME.md).
+Count-window boundary columns are now `count_start` / `count_end` (arrival
+ordinals, not timestamps); PT/ET retain `window_start` / `window_end`.
+
 ## Quick start
 
 Requires a recent stable Rust toolchain (edition 2021). Uses the host default toolchain (no pinned rust-toolchain.toml).
@@ -34,7 +38,7 @@ curl -s http://127.0.0.1:43180/v1/health
 curl -s -H "Authorization: Bearer $SPARROW_TOKEN" http://127.0.0.1:43180/v1/metrics
 ```
 
-Then create a stream and a pipeline (see `docs/m3-report.md`) and:
+Then create a stream and a pipeline (see the curl examples in `scripts/m3-demo.sh`) and:
 
 ```bash
 curl -s -H "Authorization: Bearer $SPARROW_TOKEN" \
@@ -43,6 +47,13 @@ curl -s -H "Authorization: Bearer $SPARROW_TOKEN" \
 
 `POST /start` commits **desired** state immediately. The supervisor starts
 MQTT/HTTP afterwards. MQTT pipelines are still `restart_fresh`.
+
+Host capacity defaults to **16 jobs**. Set `SPARROW_MAX_JOBS=32` or
+`--max-jobs 32` (CLI wins; range 1–256) to scale process memory quotas.
+Each job keeps a Compact quota: 4 MiB reservation, 4 MiB retention,
+2 MiB queue and 1024 state keys per operator. Capacity-full pipelines show
+`actual.status=waiting` and retry with 0.5–5 s backoff, without consuming
+the crash cap. These are accounted-memory limits, not an RSS guarantee.
 
 File/replay pipelines may set `"recovery":"aligned"` and restore from a
 committed checkpoint via the **HTTP API** (`/start`, `/checkpoint`,
@@ -119,9 +130,14 @@ See `docs/v1-report.md`.
 
 Production / `--no-default-features`: `EmbeddedBroker`, `HttpCapture`, and `DemoHarness` are compiled out (`#[cfg(feature = "demo-io")]`). Runtime `--demo-io` then fails with `feature_unavailable`. Default features stay on so demos and `cargo test --workspace` keep the in-process broker.
 
-Flags: `--bind` `--token` `--catalog` `--safe-mode` `--demo-io` `--allow-remote`.
+Flags: `--bind` `--token` `--catalog` `--max-jobs` `--safe-mode` `--demo-io` `--allow-remote`.
 
-**File path allowlist (N3):** `check_data_path` compares a *normalized* path (lexical `..` / `.`, then canonicalize when the prefix exists). The original path is never used as a `starts_with` fallback. CWD is never a default root (systemd cwd can be `/`). When `SPARROW_DATA_ROOTS` is unset, the only default is `{temp_dir}/sparrow` — not `/tmp` as a whole. `--safe-mode` / `SPARROW_SAFE_MODE=1` without `SPARROW_DATA_ROOTS` denies file paths. Demos should export `SPARROW_DATA_ROOTS` to their workdir.
+**Safe-mode restart protection:** failure holds survive history pruning and process
+restarts; an explicit `/start` clears the hold. Catalog schema v1 is automatically
+migrated to **v2** on open. Back up the catalog before upgrading; older binaries
+cannot open v2. See [`docs/RUNTIME.md`](docs/RUNTIME.md) for migration and retry semantics.
+
+**File path allowlist (N3/R3):** `check_data_path` rejects every `..` component, then canonicalizes the existing prefix before comparing roots. The original path is never used as a `starts_with` fallback. This avoids symlink-plus-parent traversal ambiguities. CWD is never a default root (systemd cwd can be `/`). When `SPARROW_DATA_ROOTS` is unset, the only default is `{temp_dir}/sparrow` — not `/tmp` as a whole. `--safe-mode` / `SPARROW_SAFE_MODE=1` without `SPARROW_DATA_ROOTS` denies file paths. Demos should export `SPARROW_DATA_ROOTS` to their workdir.
 
 **Secrets key (N12):** `SPARROW_SECRETS_KEY` (32 bytes or 64 hex chars) or `SPARROW_SECRETS_KEY_FILE`. Unset → process-local random key and a warning at catalog/server open (dev only). `--safe-mode` / `SPARROW_SAFE_MODE=1` / `SPARROW_REQUIRE_SECRETS_KEY=1` refuse. HTTP `header_secret` requires `https://` (same posture as MQTT credentials + TLS).
 
@@ -143,7 +159,7 @@ crates/sparrow-server       authenticated /v1 API + sparrow-server binary
 crates/sparrow-cli          composition-root demos
 crates/sparrow-testkit      fixtures, virtual clock, M0/M1 demos
 experiments/               G1a + optional WASM spike (not a workspace member)
-docs/                      architecture, ADRs, milestone reports
+docs/                      architecture, runtime contracts, ADRs, V1 report, benchmarks
 ```
 
 ## Invariants
