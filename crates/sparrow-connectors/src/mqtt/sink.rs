@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sparrow_formats::{encode_json_row, JsonLimits};
-use sparrow_model::{ErrorCode, RestoreClaim, RowBatch};
+use sparrow_model::{ErrorCode, InflightCounter, RestoreClaim, RowBatch};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -99,12 +99,17 @@ impl MqttSink {
         Ok(Self { config, diag })
     }
 
-    pub async fn run(self, mut rx: mpsc::Receiver<RowBatch>, cancel: CancellationToken) {
+    pub async fn run(
+        self,
+        mut rx: mpsc::Receiver<RowBatch>,
+        cancel: CancellationToken,
+        outbox: Option<Arc<InflightCounter>>,
+    ) {
         loop {
             if cancel.is_cancelled() {
                 break;
             }
-            match self.session(&mut rx, &cancel).await {
+            match self.session(&mut rx, &cancel, outbox.as_ref()).await {
                 Ok(()) => break,
                 Err(_) => {
                     self.diag.mqtt_reconnects.fetch_add(1, Ordering::Relaxed);
@@ -121,6 +126,7 @@ impl MqttSink {
         &self,
         rx: &mut mpsc::Receiver<RowBatch>,
         cancel: &CancellationToken,
+        outbox: Option<&Arc<InflightCounter>>,
     ) -> Result<()> {
         let mut stream = connect_plain(
             &self.config.host,
@@ -182,6 +188,9 @@ impl MqttSink {
                                 )
                                 .await?;
                                 self.diag.mqtt_decoded.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if let Some(o) = outbox {
+                                o.ack();
                             }
                         }
                         None => {

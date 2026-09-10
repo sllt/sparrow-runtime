@@ -65,6 +65,7 @@ impl FileReplayConfig {
             &self.restore,
         )
         .map_err(|e| ConnectorError::new(e.code, e.to_string()))?;
+        crate::policy::check_data_path(&self.path)?;
         Ok(())
     }
 }

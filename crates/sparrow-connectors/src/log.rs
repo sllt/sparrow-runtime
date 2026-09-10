@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use sparrow_formats::encode_json_row;
-use sparrow_model::{RestoreClaim, RowBatch};
+use sparrow_model::{InflightCounter, RestoreClaim, RowBatch};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -64,13 +64,23 @@ impl LogSink {
         Ok(())
     }
 
-    pub async fn run(self, mut rx: mpsc::Receiver<RowBatch>, cancel: CancellationToken) {
+    pub async fn run(
+        self,
+        mut rx: mpsc::Receiver<RowBatch>,
+        cancel: CancellationToken,
+        outbox: Option<Arc<InflightCounter>>,
+    ) {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 next = rx.recv() => {
                     match next {
-                        Some(batch) => self.write_batch(&batch),
+                        Some(batch) => {
+                            self.write_batch(&batch);
+                            if let Some(o) = &outbox {
+                                o.ack();
+                            }
+                        }
                         None => break,
                     }
                 }

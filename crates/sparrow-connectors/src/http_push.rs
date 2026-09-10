@@ -52,8 +52,9 @@ impl HttpPushSourceConfig {
         }
     }
 
-    pub fn validate(&self, _secrets: &dyn SecretResolver, _policy: &TargetPolicy) -> Result<()> {
+    pub fn validate(&self, _secrets: &dyn SecretResolver, policy: &TargetPolicy) -> Result<()> {
         refuse_durable_recovery(&self.restore)?;
+        crate::policy::check_bind_addr(&self.bind, policy)?;
         if self.inbox_capacity == 0 || self.inbox_capacity > MAX_INBOX {
             return Err(ConnectorError::new(
                 ErrorCode::BoundExceeded,

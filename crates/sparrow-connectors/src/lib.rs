@@ -31,7 +31,9 @@ pub use mqtt::{
     publish_qos0, publish_qos0_many, EmbeddedBroker, MqttSink, MqttSinkConfig, MqttSource,
     MqttSourceConfig,
 };
-pub use policy::{AllowedTarget, TargetPolicy};
+pub use policy::{
+    check_bind_addr, check_data_path, data_roots, AllowedTarget, TargetPolicy,
+};
 pub use secret::{MapSecretResolver, SecretResolver};
 pub use tls::TlsConfig;
 

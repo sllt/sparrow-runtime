@@ -60,7 +60,7 @@ async fn http_sink_posts_to_capture() {
     .unwrap();
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(sink.run(rx, cancel.clone()));
+    let task = tokio::spawn(sink.run(rx, cancel.clone(), None));
 
     let schema = Arc::new(sensor_schema());
     let owner = MemoryOwner::new(ResourceBudget::compact());
