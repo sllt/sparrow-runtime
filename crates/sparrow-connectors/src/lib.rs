@@ -23,7 +23,7 @@ pub use capabilities::{
 };
 pub use diag::{IoDiagnostics, IoSnapshot};
 pub use error::{ConnectorError, Result};
-pub use file_replay::{FileContract, FileReplayConfig, FileReplaySource};
+pub use file_replay::{FileContract, FilePoll, FileReplayConfig, FileReplaySource};
 pub use http::{HttpCapture, HttpSink, HttpSinkConfig};
 pub use http_push::{HttpPushSource, HttpPushSourceConfig};
 pub use log::{LogSink, LogSinkConfig};

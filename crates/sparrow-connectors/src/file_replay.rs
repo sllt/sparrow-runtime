@@ -24,13 +24,62 @@ const PREFIX: usize = 4096;
 const MAX_RECORD: usize = 64 * 1024;
 const MAX_PENDING: usize = MAX_RECORD;
 
-/// How the file may change after a checkpoint cut (R28).
+/// How the file may change after a checkpoint cut (R28), and what EOF
+/// means for event-time watermarks (N5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileContract {
-    /// Size and content fingerprint must match exactly.
+    /// Size and content fingerprint must match exactly. Finite/replay fixture.
+    /// EOF is end of stream: inject a terminal watermark and finish the source.
     Immutable,
+    /// Finite fixture (same identity rules as [`Self::Immutable`]). Preferred
+    /// name when the job must emit final ET windows and then complete.
+    Sealed,
     /// The file may grow; bytes `[0, cut)` must stay identical.
+    /// EOF is a poll/sleep only — never inject a terminal watermark.
     AppendOnly,
+}
+
+/// One `next_frame` + decode. Shared by aligned and restart_fresh file loops.
+#[derive(Debug)]
+pub enum FilePoll {
+    Row(sparrow_model::Row),
+    DecodeError,
+    Eof,
+}
+
+impl FileContract {
+    /// Terminal watermark for a sealed/finite file. Large enough to close
+    /// every open ET window. Must never be injected on [`Self::AppendOnly`].
+    pub const TERMINAL_WM_MICROS: i64 = i64::MAX / 4;
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "append_only" | "append-only" | "appendonly" => Ok(Self::AppendOnly),
+            "sealed" => Ok(Self::Sealed),
+            "immutable" => Ok(Self::Immutable),
+            other => Err(ConnectorError::new(
+                ErrorCode::InvalidArgument,
+                format!("file contract `{other}` is not supported (append_only|sealed|immutable)"),
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AppendOnly => "append_only",
+            Self::Sealed => "sealed",
+            Self::Immutable => "immutable",
+        }
+    }
+
+    /// EOF is end-of-stream: inject [`Self::TERMINAL_WM_MICROS`] and finish.
+    pub fn eof_is_terminal(self) -> bool {
+        !matches!(self, Self::AppendOnly)
+    }
+
+    pub fn allows_growth(self) -> bool {
+        matches!(self, Self::AppendOnly)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +176,43 @@ impl FileReplaySource {
         self.codec.decode_frame(frame)
     }
 
+    fn reopen_for_append(&mut self) -> ModelResult<bool> {
+        if !self.contract.allows_growth() {
+            return Ok(false);
+        }
+        let mut f = File::open(&self.path).map_err(|e| {
+            SparrowError::new(
+                ErrorCode::Internal,
+                format!("reopen {}: {e}", self.path.display()),
+            )
+        })?;
+        f.seek(SeekFrom::Start(self.offset))
+            .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("reopen seek: {e}")))?;
+        self.file = f;
+        let mut buf = [0u8; 1024];
+        let n = self
+            .file
+            .read(&mut buf)
+            .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("reopen read: {e}")))?;
+        if n == 0 {
+            return Ok(false);
+        }
+        self.pending.extend_from_slice(&buf[..n]);
+        Ok(true)
+    }
+
+    /// Read one NDJSON record and decode it. Decode failures are
+    /// [`FilePoll::DecodeError`] (caller increments `IoDiagnostics`).
+    pub fn poll_decoded(&mut self) -> ModelResult<FilePoll> {
+        match self.next_frame()? {
+            Some(frame) => match self.decode_frame(&frame) {
+                Ok(Some(row)) => Ok(FilePoll::Row(row)),
+                Ok(None) | Err(_) => Ok(FilePoll::DecodeError),
+            },
+            None => Ok(FilePoll::Eof),
+        }
+    }
+
     fn refresh_identity(&self) -> Result<SourceIdentity> {
         let meta = fs::metadata(&self.path).map_err(|e| {
             ConnectorError::new(
@@ -160,13 +246,14 @@ impl FileReplaySource {
             ));
         }
         match self.contract {
-            FileContract::Immutable => {
+            FileContract::Immutable | FileContract::Sealed => {
                 if stored.size != live.size || stored.fingerprint != live.fingerprint {
                     return Err(ConnectorError::new(
                         ErrorCode::UnsupportedRestore,
                         format!(
-                            "file '{}' was replaced or rotated (immutable contract)",
-                            self.path.display()
+                            "file '{}' was replaced or rotated ({} contract)",
+                            self.path.display(),
+                            self.contract.as_str()
                         ),
                     ));
                 }
@@ -258,6 +345,11 @@ impl RecordSource for FileReplaySource {
                 .read(&mut buf)
                 .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("read file: {e}")))?;
             if n == 0 {
+                // AppendOnly: reopen at the last message boundary so a
+                // growing file is visible even if this fd stopped at EOF.
+                if self.reopen_for_append()? {
+                    continue;
+                }
                 // EOF with incomplete line: do not emit (message-boundary cut).
                 return Ok(None);
             }
@@ -479,6 +571,86 @@ mod tests {
             src.seek(&pos).unwrap_err().code,
             ErrorCode::UnsupportedRestore
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn n5_contract_parse_and_eof_policy() {
+        assert_eq!(
+            FileContract::parse("append_only").unwrap(),
+            FileContract::AppendOnly
+        );
+        assert_eq!(FileContract::parse("sealed").unwrap(), FileContract::Sealed);
+        assert_eq!(
+            FileContract::parse("immutable").unwrap(),
+            FileContract::Immutable
+        );
+        assert!(!FileContract::AppendOnly.eof_is_terminal());
+        assert!(FileContract::Sealed.eof_is_terminal());
+        assert!(FileContract::Immutable.eof_is_terminal());
+        assert!(FileContract::parse("poison").is_err());
+    }
+
+    #[test]
+    fn n5_sealed_rejects_append_like_immutable() {
+        let path = tmp("sealed");
+        std::fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n").unwrap();
+        let mut cfg = FileReplayConfig::new(&path, schema());
+        cfg.contract = FileContract::Sealed;
+        let mut src = FileReplaySource::open(&cfg).unwrap();
+        let pos = src.position();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            src.seek(&pos).unwrap_err().code,
+            ErrorCode::UnsupportedRestore
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn n5_append_only_reads_rows_written_after_eof() {
+        use std::io::Write;
+        let path = tmp("append-eof");
+        std::fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n").unwrap();
+        let mut cfg = FileReplayConfig::new(&path, schema());
+        cfg.contract = FileContract::AppendOnly;
+        let mut src = FileReplaySource::open(&cfg).unwrap();
+        assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Row(_)));
+        assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Eof));
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, r#"{{"device_id":"d1","v":2}}"#).unwrap();
+            f.flush().unwrap();
+        }
+        let again = src.poll_decoded().unwrap();
+        assert!(
+            matches!(again, FilePoll::Row(_)),
+            "AppendOnly must see rows written after EOF, got {again:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn n5_poll_decoded_counts_bad_json() {
+        let path = tmp("decode");
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\nnot-json\n{\"device_id\":\"d1\",\"v\":2}\n",
+        )
+        .unwrap();
+        let cfg = FileReplayConfig::new(&path, schema());
+        let mut src = FileReplaySource::open(&cfg).unwrap();
+        assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Row(_)));
+        assert!(matches!(src.poll_decoded().unwrap(), FilePoll::DecodeError));
+        assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Row(_)));
+        assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Eof));
         let _ = std::fs::remove_file(&path);
     }
 }

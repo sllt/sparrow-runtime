@@ -8,6 +8,8 @@ pub mod store;
 pub mod supervisor;
 pub mod validate;
 
+mod file_source;
+
 pub use spec::{PipelineSpec, RestoreSpec, SinkSpec, SourceSpec, StreamSpec};
 pub use store::{
     ActualState, AuditRow, DesiredState, PipelineRow, Store, CATALOG_SCHEMA_VERSION, FORMAT_VERSION,
@@ -18,8 +20,8 @@ pub use supervisor::{
 };
 pub use validate::{
     bind_plan, binder_catalog, capabilities_json, effective_guarantees, explain_plan, honesty_json,
-    store_policy, stream_schema, stream_to_schema, validate_aligned_plan, validate_io,
-    DemoEndpoints, ExplainReport, StoreSecrets, HONESTY,
+    resolve_file_contract, store_policy, stream_schema, stream_to_schema, validate_aligned_plan,
+    validate_io, DemoEndpoints, ExplainReport, StoreSecrets, HONESTY,
 };
 
 #[cfg(test)]

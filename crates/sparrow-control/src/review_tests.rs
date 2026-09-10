@@ -16,6 +16,34 @@ const STREAM: &str = r#"{"fields":[
   {"name":"v","type":"int64","nullable":false}
 ]}"#;
 
+const STREAM_ET: &str = r#"{"fields":[
+  {"name":"device_id","type":"utf8","nullable":false},
+  {"name":"v","type":"int64","nullable":false},
+  {"name":"ts","type":"int64","nullable":false}
+]}"#;
+
+const ET_TUMBLE_SQL: &str =
+    "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, TUMBLE(ts, INTERVAL '10' SECOND)";
+
+fn http_window_rows(http: &sparrow_connectors::HttpCapture) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for body in http.body_strings() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            match v {
+                serde_json::Value::Array(items) => out.extend(items),
+                other => out.push(other),
+            }
+        }
+    }
+    out
+}
+
+fn window_counts(rows: &[serde_json::Value]) -> Vec<i64> {
+    rows.iter()
+        .filter_map(|r| r.get("n").and_then(|v| v.as_i64()))
+        .collect()
+}
+
 fn tmp(name: &str) -> std::path::PathBuf {
     sparrow_connectors::ensure_default_data_root().join(format!(
         "sparrow-ctl-{name}-{}-{}",
@@ -49,6 +77,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
             bind: None,
             path: Some(path.into()),
             tls: false,
+            file_contract: None,
         },
         sink: SinkSpec {
             kind: "log".into(),
@@ -187,6 +216,7 @@ fn mqtt_aligned_still_rejected() {
             bind: None,
             path: None,
             tls: false,
+            file_contract: None,
         },
         sink: SinkSpec {
             kind: "log".into(),
@@ -677,5 +707,307 @@ fn n7_aligned_checkpoint_refuses_after_sink_4xx() {
         http.stop().await;
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+#[test]
+fn n5_append_only_et_window_accepts_rows_after_eof_poll() {
+    use std::io::Write;
+
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM_ET).unwrap();
+        let path = tmp("n5-ao.ndjson");
+        let chk = tmp("n5-ao-chk");
+        std::fs::create_dir_all(&chk).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"device_id":"d1","v":1,"ts":1000000}"#,
+                "\n",
+                r#"{"device_id":"d1","v":2,"ts":4000000}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let http = sparrow_connectors::HttpCapture::start().await.unwrap();
+        store.put_allow("127.0.0.1", http.port()).unwrap();
+        let mut spec = file_spec(
+            &path.to_string_lossy(),
+            ET_TUMBLE_SQL,
+            "aligned",
+            Some(&chk.to_string_lossy()),
+        );
+        spec.source.file_contract = Some("append_only".into());
+        spec.sink.kind = "http".into();
+        spec.sink.url = Some(http.url());
+        store.put_pipeline("n5ao", &spec, None).unwrap();
+        request_start(&store, "n5ao", "test").unwrap();
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        let _ = sup.converge_once().await;
+        let actual = store.actual("n5ao").unwrap();
+        assert_eq!(actual.status, "running", "{:?}", actual.last_error);
+
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(2) {
+            if kernel.metrics.snapshot().ingested_rows >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            kernel.metrics.snapshot().ingested_rows >= 2,
+            "seed rows never ingested"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            http_window_rows(&http).is_empty(),
+            "AppendOnly must not inject a terminal watermark at first EOF (that would close [0,10s) and poison later rows): {:?}",
+            http_window_rows(&http)
+        );
+
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, r#"{{"device_id":"d1","v":3,"ts":12000000}}"#).unwrap();
+            writeln!(f, r#"{{"device_id":"d1","v":4,"ts":22000000}}"#).unwrap();
+            f.flush().unwrap();
+        }
+
+        let t1 = std::time::Instant::now();
+        let mut saw_second = false;
+        while t1.elapsed() < std::time::Duration::from_secs(3) {
+            let ns = window_counts(&http_window_rows(&http));
+            // 12s closes [0,10s) n=2; 22s closes [10s,20s) n=1.
+            // A poisoned MAX watermark would emit only n=2 at first EOF
+            // and drop the later window.
+            if ns.iter().any(|&n| n == 1) {
+                saw_second = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        assert!(
+            saw_second,
+            "rows appended after EOF poll must still produce ET finals (not all late): bodies={:?} ingested={}",
+            http_window_rows(&http),
+            kernel.metrics.snapshot().ingested_rows
+        );
+        let after = store.actual("n5ao").unwrap();
+        assert_eq!(
+            after.status, "running",
+            "AppendOnly must keep polling, not complete on EOF: {:?}",
+            after.last_error
+        );
+
+        sup.kill_named("n5ao").await.unwrap();
+        http.stop().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+#[test]
+fn n5_sealed_eof_emits_final_et_windows() {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM_ET).unwrap();
+        let path = tmp("n5-seal.ndjson");
+        let chk = tmp("n5-seal-chk");
+        std::fs::create_dir_all(&chk).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"device_id":"d1","v":1,"ts":1000000}"#,
+                "\n",
+                r#"{"device_id":"d1","v":2,"ts":4000000}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let http = sparrow_connectors::HttpCapture::start().await.unwrap();
+        store.put_allow("127.0.0.1", http.port()).unwrap();
+        let mut spec = file_spec(
+            &path.to_string_lossy(),
+            ET_TUMBLE_SQL,
+            "aligned",
+            Some(&chk.to_string_lossy()),
+        );
+        spec.source.file_contract = Some("sealed".into());
+        spec.sink.kind = "http".into();
+        spec.sink.url = Some(http.url());
+        store.put_pipeline("n5s", &spec, None).unwrap();
+        request_start(&store, "n5s", "test").unwrap();
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        let _ = sup.converge_once().await;
+        let actual = store.actual("n5s").unwrap();
+        assert_eq!(actual.status, "running", "{:?}", actual.last_error);
+
+        let t0 = std::time::Instant::now();
+        let mut saw_final = false;
+        while t0.elapsed() < std::time::Duration::from_secs(3) {
+            if window_counts(&http_window_rows(&http))
+                .iter()
+                .any(|&n| n == 2)
+            {
+                saw_final = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        assert!(
+            saw_final,
+            "Sealed EOF must emit the last ET window: {:?}",
+            http_window_rows(&http)
+        );
+
+        let t1 = std::time::Instant::now();
+        let mut completed = false;
+        while t1.elapsed() < std::time::Duration::from_secs(3) {
+            let _ = sup.converge_once().await;
+            if store.actual("n5s").unwrap().status == "completed" {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        assert!(
+            completed,
+            "Sealed file job must complete honestly after terminal watermark: {:?}",
+            store.actual("n5s")
+        );
+
+        http.stop().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+#[test]
+fn n5_restart_fresh_sealed_emits_final_et_windows() {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM_ET).unwrap();
+        let path = tmp("n5-rf-seal.ndjson");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"device_id":"d1","v":1,"ts":1000000}"#,
+                "\n",
+                r#"{"device_id":"d1","v":2,"ts":4000000}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let http = sparrow_connectors::HttpCapture::start().await.unwrap();
+        store.put_allow("127.0.0.1", http.port()).unwrap();
+        let mut spec = file_spec(
+            &path.to_string_lossy(),
+            ET_TUMBLE_SQL,
+            "restart_fresh",
+            None,
+        );
+        spec.source.file_contract = Some("sealed".into());
+        spec.sink.kind = "http".into();
+        spec.sink.url = Some(http.url());
+        store.put_pipeline("n5rfs", &spec, None).unwrap();
+        request_start(&store, "n5rfs", "test").unwrap();
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        let _ = sup.converge_once().await;
+        let actual = store.actual("n5rfs").unwrap();
+        assert_eq!(actual.status, "running", "{:?}", actual.last_error);
+
+        let t0 = std::time::Instant::now();
+        let mut saw_final = false;
+        while t0.elapsed() < std::time::Duration::from_secs(3) {
+            if window_counts(&http_window_rows(&http))
+                .iter()
+                .any(|&n| n == 2)
+            {
+                saw_final = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        assert!(
+            saw_final,
+            "restart_fresh + Sealed must emit the last ET window: {:?}",
+            http_window_rows(&http)
+        );
+
+        let t1 = std::time::Instant::now();
+        let mut completed = false;
+        while t1.elapsed() < std::time::Duration::from_secs(3) {
+            let _ = sup.converge_once().await;
+            if store.actual("n5rfs").unwrap().status == "completed" {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        assert!(
+            completed,
+            "restart_fresh + Sealed must complete after EOF: {:?}",
+            store.actual("n5rfs")
+        );
+
+        http.stop().await;
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+#[test]
+fn n5_restart_fresh_decode_errors_counted() {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM_ET).unwrap();
+        let path = tmp("n5-rf-dec.ndjson");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"device_id":"d1","v":1,"ts":1000000}"#,
+                "\n",
+                "this is not json\n",
+                r#"{"device_id":"d1","v":2,"ts":4000000}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut spec = file_spec(
+            &path.to_string_lossy(),
+            ET_TUMBLE_SQL,
+            "restart_fresh",
+            None,
+        );
+        spec.source.file_contract = Some("append_only".into());
+        store.put_pipeline("n5rfd", &spec, None).unwrap();
+        request_start(&store, "n5rfd", "test").unwrap();
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        let _ = sup.converge_once().await;
+        let actual = store.actual("n5rfd").unwrap();
+        assert_eq!(actual.status, "running", "{:?}", actual.last_error);
+
+        let t0 = std::time::Instant::now();
+        let mut errs = 0u64;
+        while t0.elapsed() < std::time::Duration::from_secs(2) {
+            errs = sup.io_snapshot().await.decode_errors;
+            if errs >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            errs >= 1,
+            "restart_fresh file decode errors must increment IoDiagnostics.decode_errors (got {errs})"
+        );
+
+        sup.kill_named("n5rfd").await.unwrap();
+        let _ = std::fs::remove_file(&path);
     });
 }

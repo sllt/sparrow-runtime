@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use sparrow_connectors::{
     check_data_path, refuse_delivery_name, refuse_durable_recovery, refuse_qos_durable,
-    ConnectorCapabilities, FileReplayConfig, HttpPushSourceConfig, HttpSinkConfig, MqttSinkConfig,
-    MqttSourceConfig, ReplaySupport, SecretResolver, TargetPolicy, TlsConfig,
+    ConnectorCapabilities, FileContract, FileReplayConfig, HttpPushSourceConfig, HttpSinkConfig,
+    MqttSinkConfig, MqttSourceConfig, ReplaySupport, SecretResolver, TargetPolicy, TlsConfig,
 };
 use sparrow_model::{
     DeliveryGuarantee, ErrorCode, PipelineId, RecoveryPolicy, RestoreClaim, Result, RevisionId,
@@ -63,9 +63,8 @@ pub fn stream_schema(name: &str, spec: &StreamSpec) -> Result<Schema> {
 }
 
 pub fn stream_to_schema(row: &StreamRow) -> Result<Schema> {
-    let spec: StreamSpec = serde_json::from_str(&row.schema_json).map_err(|e| {
-        SparrowError::new(ErrorCode::InvalidSchema, format!("stream schema: {e}"))
-    })?;
+    let spec: StreamSpec = serde_json::from_str(&row.schema_json)
+        .map_err(|e| SparrowError::new(ErrorCode::InvalidSchema, format!("stream schema: {e}")))?;
     stream_schema(&row.name, &spec)
 }
 
@@ -77,7 +76,12 @@ pub fn binder_catalog(store: &Store) -> Result<Catalog> {
     Ok(cat)
 }
 
-pub fn bind_plan(spec: &PipelineSpec, catalog: &Catalog, name: &str, revision: u64) -> Result<PhysicalPlan> {
+pub fn bind_plan(
+    spec: &PipelineSpec,
+    catalog: &Catalog,
+    name: &str,
+    revision: u64,
+) -> Result<PhysicalPlan> {
     spec.basic_check()?;
     spec.check_delivery()?;
     let pipeline = PipelineId::new(fnv(name) as u64);
@@ -193,6 +197,7 @@ pub fn validate_io(
             let mut cfg = FileReplayConfig::new(path, schema.clone());
             cfg.restore = spec.restore_claim()?;
             cfg.recovery = recovery;
+            cfg.contract = resolve_file_contract(spec, recovery)?;
             cfg.validate().map_err(io)?;
         }
         other => {
@@ -364,9 +369,34 @@ pub fn mqtt_sink_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result
     Ok(cfg)
 }
 
+/// Resolve the file growth / EOF contract (N5).
+///
+/// Explicit `source.file_contract` wins. Unspecified defaults to
+/// [`FileContract::AppendOnly`]: EOF is poll-only (no terminal watermark,
+/// job stays up for growing files). Finite fixtures that must emit last
+/// ET windows set `sealed` / `immutable`.
+pub fn resolve_file_contract(
+    spec: &PipelineSpec,
+    _recovery: RecoveryPolicy,
+) -> Result<FileContract> {
+    match spec
+        .source
+        .file_contract
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => FileContract::parse(raw).map_err(io),
+        None => Ok(FileContract::AppendOnly),
+    }
+}
+
 /// Aligned recovery: honor Filter/Project on the Kernel path; reject
 /// dishonest plans (PT windows, Dedup, Lookup) rather than strip stages (P0-1/P0-2/A1).
-pub fn validate_aligned_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> sparrow_model::Result<()> {
+pub fn validate_aligned_plan(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+) -> sparrow_model::Result<()> {
     let recovery = RecoveryPolicy::parse(&spec.recovery)?;
     if !recovery.is_aligned() {
         return Ok(());
@@ -542,6 +572,7 @@ mod tests {
                 bind: None,
                 path: None,
                 tls: false,
+                file_contract: None,
             },
             sink: crate::spec::SinkSpec {
                 kind: "http".into(),
@@ -609,6 +640,7 @@ mod tests {
             bind: None,
             path: None,
             tls: false,
+            file_contract: None,
         };
         let schema = Schema::new(
             SchemaId::new(1),
@@ -647,6 +679,7 @@ mod tests {
             bind: None,
             path: None,
             tls: false,
+            file_contract: None,
         };
         let schema = Schema::new(
             SchemaId::new(1),

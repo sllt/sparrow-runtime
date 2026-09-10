@@ -204,6 +204,11 @@ impl WindowOperator {
             let one = self.on_row(row, now)?;
             out.finals.extend(one.finals);
             out.lates.extend(one.lates);
+            // ET close is signaled via pending_close (N5). Dropping it
+            // means later event times never emit finals on the live path.
+            if let Some(wm) = one.pending_close {
+                out.pending_close = Some(out.pending_close.map(|p| p.max(wm)).unwrap_or(wm));
+            }
         }
         Ok(out)
     }
