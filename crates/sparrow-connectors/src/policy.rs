@@ -381,15 +381,14 @@ mod tests {
     #[test]
     fn n3_path_traversal_rejected() {
         let tmp_root = vec![PathBuf::from("/tmp")];
-        let cases = [
+        // These normalize *out of* /tmp (the old lexical starts_with bypass).
+        let escape_tmp = [
             PathBuf::from("/tmp/../etc/passwd"),
             PathBuf::from("/tmp/foo/../../etc/passwd"),
             PathBuf::from("/tmp/./../etc/passwd"),
-            default_data_root().join("../etc/passwd"),
-            default_data_root().join("nested/../../etc/passwd"),
             default_data_root().join("a/../../../etc/passwd"),
         ];
-        for p in cases {
+        for p in escape_tmp {
             let err = check_data_path_in(&p, &tmp_root).expect_err(&format!(
                 "traversal must be rejected even when /tmp is a root: {}",
                 p.display()
@@ -403,6 +402,24 @@ mod tests {
             );
         }
         let sparrow = default_data_roots();
+        // Nested `../` that leaves the sparrow dir (may still be under /tmp).
+        let escape_sparrow = [
+            default_data_root().join("../etc/passwd"),
+            default_data_root().join("nested/../../etc/passwd"),
+        ];
+        for p in escape_sparrow {
+            let err = check_data_path_in(&p, &sparrow).expect_err(&format!(
+                "nested ../ must leave the sparrow root: {}",
+                p.display()
+            ));
+            assert_eq!(
+                err.code(),
+                ErrorCode::PolicyDenied,
+                "{} => {}",
+                p.display(),
+                err
+            );
+        }
         let under = ensure_default_data_root().join("n3-ok.ndjson");
         check_data_path_in(&under, &sparrow).expect("path inside default sparrow root");
         let sibling = std::env::temp_dir().join("n3-not-under-sparrow.ndjson");
