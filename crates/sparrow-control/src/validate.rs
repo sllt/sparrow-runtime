@@ -371,12 +371,13 @@ pub fn mqtt_sink_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result
 
 /// Resolve the file growth / EOF contract (N5).
 ///
-/// Explicit `source.file_contract` wins. Otherwise aligned growing files
-/// default to [`FileContract::AppendOnly`] (poll, no terminal watermark)
-/// and restart_fresh finite files default to [`FileContract::Sealed`].
+/// Explicit `source.file_contract` wins. Unspecified defaults to
+/// [`FileContract::AppendOnly`]: EOF is poll-only (no terminal watermark,
+/// job stays up for growing files). Finite fixtures that must emit last
+/// ET windows set `sealed` / `immutable`.
 pub fn resolve_file_contract(
     spec: &PipelineSpec,
-    recovery: RecoveryPolicy,
+    _recovery: RecoveryPolicy,
 ) -> Result<FileContract> {
     match spec
         .source
@@ -386,8 +387,7 @@ pub fn resolve_file_contract(
         .filter(|s| !s.is_empty())
     {
         Some(raw) => FileContract::parse(raw).map_err(io),
-        None if recovery.is_aligned() => Ok(FileContract::AppendOnly),
-        None => Ok(FileContract::Sealed),
+        None => Ok(FileContract::AppendOnly),
     }
 }
 

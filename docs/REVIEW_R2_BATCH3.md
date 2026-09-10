@@ -21,9 +21,12 @@ on count, not watermark.
 
 Defaults:
 
-- Aligned file jobs: `append_only` (growing files; no terminal MAX watermark).
-- Restart-fresh file jobs: `sealed` (finite fixtures emit last ET windows).
-- Override with `source.file_contract`: `append_only` \| `sealed` \| `immutable`.
+- Unspecified `source.file_contract` is `append_only` for both aligned and
+  restart_fresh (growing files; poll on EOF; job stays up). This matches
+  the historical restart_fresh file loop and does not auto-complete a
+  live job just because the current file ended.
+- Finite fixtures that need last ET windows set
+  `source.file_contract`: `sealed` or `immutable`.
 
 Aligned and restart_fresh share `FileReplaySource::poll_decoded` plus
 `file_source::{take_file_poll, apply_file_poll, run_file_source}`.

@@ -65,9 +65,9 @@ pub struct SourceSpec {
     #[serde(default)]
     pub tls: bool,
     /// File growth + EOF contract: `append_only`, `sealed`, or `immutable`.
-    /// Aligned file jobs default to `append_only` (poll on EOF, no terminal
-    /// watermark). Restart-fresh file jobs default to `sealed` (EOF closes
-    /// final ET windows and the job may complete).
+    /// Default is `append_only` (poll on EOF, no terminal watermark) for both
+    /// aligned and restart_fresh. Set `sealed` on finite fixtures that must
+    /// emit final ET windows and then complete.
     #[serde(default)]
     pub file_contract: Option<String>,
 }
