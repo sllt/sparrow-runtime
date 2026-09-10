@@ -479,6 +479,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "mqtt_dropped_full": io.mqtt_dropped_full,
             "http_posted": io.http_posted,
             "http_failed": io.http_failed,
+            "http_dropped": io.http_dropped,
             "http_inflight": io.http_inflight,
             "log_written": io.log_written,
             "decode_errors": io.decode_errors,

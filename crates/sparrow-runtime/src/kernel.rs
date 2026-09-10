@@ -640,10 +640,20 @@ async fn stage_loop(
                 }
                 if let Some(StreamControl::CheckpointBarrier { checkpoint_id }) = ctrl {
                     if let Some(aj) = &ctx.aligned {
-                        wait_outbox(&aj.outbox, std::time::Duration::from_secs(5)).await?;
+                        // Timeout or drop is a failed flush, not a job death.
+                        // The supervisor refuses commit; late acks keep their id.
+                        let flush =
+                            wait_outbox(&aj.outbox, std::time::Duration::from_secs(5)).await;
+                        // Consume this cut's drop window so the next barrier
+                        // only sees drops that belong to it.
+                        aj.outbox.mark();
                         let _ = aj
                             .acks
-                            .send(AlignedAck::SinkFlushed { checkpoint_id })
+                            .send(AlignedAck::SinkFlushed {
+                                checkpoint_id,
+                                ok: flush.ok,
+                                dropped: flush.dropped,
+                            })
                             .await;
                     }
                 }
