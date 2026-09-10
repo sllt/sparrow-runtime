@@ -266,6 +266,8 @@ pub fn window_output_schema(input: &Schema, spec: &WindowSpec) -> Result<Schema>
         ));
         id += 1;
     }
+    // Tumble: event-time or processing-time micros. Count: in-window
+    // arrival ordinals [0, count) — not timestamps (P3-47).
     fields.push(Field::new(
         FieldId::new(id),
         "window_start",
@@ -313,7 +315,23 @@ pub fn agg_result_type(agg: &AggCall, schema: &Schema) -> Result<DataType> {
     Ok(match agg.func {
         AggFn::Count => DataType::Int64,
         AggFn::Avg => DataType::Float64,
-        AggFn::Sum | AggFn::Min | AggFn::Max => {
+        AggFn::Sum => {
+            if agg.count_star || agg.input.is_none() {
+                DataType::Int64
+            } else {
+                let ty = sparrow_expr::infer_type(agg.input.as_ref().unwrap(), schema)?;
+                match ty {
+                    DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Null => ty,
+                    other => {
+                        return Err(SparrowError::new(
+                            ErrorCode::TypeMismatch,
+                            format!("SUM does not accept {other}"),
+                        ))
+                    }
+                }
+            }
+        }
+        AggFn::Min | AggFn::Max => {
             if agg.count_star || agg.input.is_none() {
                 DataType::Int64
             } else {
@@ -321,4 +339,64 @@ pub fn agg_result_type(agg: &AggCall, schema: &Schema) -> Result<DataType> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparrow_expr::Expr;
+    use sparrow_model::FieldId;
+
+    fn schema() -> Schema {
+        Schema::new(
+            SchemaId::new(1),
+            vec![
+                Field::new(FieldId::new(1), "flag", DataType::Bool, false),
+                Field::new(FieldId::new(2), "name", DataType::Utf8, false),
+                Field::new(FieldId::new(3), "v", DataType::Int64, false),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn p3_45_sum_rejects_bool_and_utf8() {
+        let s = schema();
+        let err = agg_result_type(
+            &AggCall::new(
+                AggFn::Sum,
+                Some(Expr::Column {
+                    name: "flag".into(),
+                }),
+                "s",
+            ),
+            &s,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::TypeMismatch);
+        let err = agg_result_type(
+            &AggCall::new(
+                AggFn::Sum,
+                Some(Expr::Column {
+                    name: "name".into(),
+                }),
+                "s",
+            ),
+            &s,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::TypeMismatch);
+        assert_eq!(
+            agg_result_type(
+                &AggCall::new(
+                    AggFn::Sum,
+                    Some(Expr::Column { name: "v".into() }),
+                    "s",
+                ),
+                &s,
+            )
+            .unwrap(),
+            DataType::Int64
+        );
+    }
 }

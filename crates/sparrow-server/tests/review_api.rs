@@ -528,6 +528,7 @@ fn r25_mqtt_http_ingest_moves_metrics() {
     });
 }
 
+#[cfg(feature = "demo-io")]
 #[test]
 fn p0_3_restore_after_prior_start_restores_checkpoint() {
     let kernel = compact_kernel().unwrap();
@@ -667,6 +668,33 @@ fn n2_put_empty_sql_is_4xx() {
             StatusCode::OK,
             "connection must stay up after empty SQL PUT"
         );
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+#[test]
+fn p3_56_start_rejects_unparseable_body() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let (st, _) = call(&state, auth_put("/v1/streams/sensors", STREAM)).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let path = tmp("p356.ndjson");
+        std::fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n").unwrap();
+        let spec = json!({
+            "version": 1,
+            "stream": "sensors",
+            "sql": "SELECT device_id, v FROM sensors",
+            "source": { "kind": "file", "path": path.to_string_lossy() },
+            "sink": { "kind": "log" },
+            "delivery": "live_best_effort",
+            "recovery": "restart_fresh"
+        });
+        let (st, body) = call(&state, auth_put("/v1/pipelines/p356", spec.to_string())).await;
+        assert_eq!(st, StatusCode::CREATED, "{body}");
+        let (st, body) = call(&state, auth_post("/v1/pipelines/p356/start", "{not-json")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_argument");
         let _ = std::fs::remove_file(&path);
     });
 }

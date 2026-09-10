@@ -128,6 +128,64 @@ fn eval_call_sig(
     }
 }
 
+/// Whether evaluating `expr` can produce NULL when the input row is valid.
+///
+/// Column nullability is copied. Non-null literals stay non-null. `TRY_CAST`
+/// and `NULLIF` / dynamic extract can introduce NULL. `IS NULL` / `IS NOT NULL`
+/// are never null.
+pub fn infer_nullable(expr: &Expr, schema: &Schema) -> Result<bool> {
+    match expr {
+        Expr::Column { name } => schema
+            .field_by_name(name)
+            .map(|f| f.nullable)
+            .ok_or_else(|| {
+                SparrowError::new(ErrorCode::InvalidArgument, format!("unknown column '{name}'"))
+            }),
+        Expr::Literal(s) => Ok(s.is_null()),
+        Expr::Cast { expr, .. } => infer_nullable(expr, schema),
+        Expr::TryCast { .. } => Ok(true),
+        Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(false),
+        Expr::Not(inner) => infer_nullable(inner, schema),
+        Expr::Binary { left, right, .. } => {
+            Ok(infer_nullable(left, schema)? || infer_nullable(right, schema)?)
+        }
+        Expr::Call { name, args } => match name.to_ascii_lowercase().as_str() {
+            "nullif" => Ok(true),
+            "coalesce" => {
+                if args.is_empty() {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        "coalesce requires at least 1 argument",
+                    ));
+                }
+                let mut all_null = true;
+                for a in args {
+                    if !infer_nullable(a, schema)? {
+                        all_null = false;
+                        break;
+                    }
+                }
+                Ok(all_null)
+            }
+            "greatest" | "least" => {
+                let mut any = false;
+                for a in args {
+                    any |= infer_nullable(a, schema)?;
+                }
+                Ok(any)
+            }
+            _ => {
+                if args.is_empty() {
+                    Ok(true)
+                } else {
+                    infer_nullable(&args[0], schema)
+                }
+            }
+        },
+        Expr::DynamicGet { .. } => Ok(true),
+    }
+}
+
 fn is_numeric(t: &DataType) -> bool {
     matches!(
         t,
@@ -137,4 +195,42 @@ fn is_numeric(t: &DataType) -> bool {
 
 fn is_intish(t: &DataType) -> bool {
     matches!(t, DataType::Int64 | DataType::UInt64 | DataType::TimestampMicrosUTC)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Expr;
+    use sparrow_model::{Field, FieldId, Scalar, SchemaId};
+
+    fn schema() -> Schema {
+        Schema::new(
+            SchemaId::new(1),
+            vec![
+                Field::new(FieldId::new(1), "id", DataType::Utf8, false),
+                Field::new(FieldId::new(2), "temp", DataType::Float64, true),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn p3_46_project_nullable_follows_input_and_expr() {
+        let s = schema();
+        let id = Expr::Column { name: "id".into() };
+        assert!(!infer_nullable(&id, &s).unwrap(), "non-null column stays non-null");
+        let temp = Expr::Column {
+            name: "temp".into(),
+        };
+        assert!(infer_nullable(&temp, &s).unwrap(), "nullable column stays nullable");
+        let lit = Expr::Literal(Scalar::Int64(1));
+        assert!(!infer_nullable(&lit, &s).unwrap());
+        let try_cast = Expr::TryCast {
+            expr: Box::new(id.clone()),
+            target: DataType::Int64,
+        };
+        assert!(infer_nullable(&try_cast, &s).unwrap());
+        let is_null = Expr::IsNull(Box::new(temp));
+        assert!(!infer_nullable(&is_null, &s).unwrap());
+    }
 }

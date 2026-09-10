@@ -1,6 +1,6 @@
 //! Bind V0.3 SQL: event-time TUMBLE/HOP, holdback, versioned lookup.
 
-use sparrow_expr::{infer_type, Expr};
+use sparrow_expr::Expr;
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sparrow_model::{
     DataType, PipelineId, RevisionId, Schema, SchemaId, WindowKind, DEFAULT_MAX_HOP_OVERLAP,
@@ -17,7 +17,7 @@ use sqlparser::ast::{
 };
 use sqlparser::parser::Parser;
 
-use crate::bind::{sql_expr_pub, table_name_pub};
+use crate::bind::{sql_expr_pub, table_name_pub, typed_project_field};
 use crate::g0::g0_dialect;
 use crate::v03::check_sql_v03;
 
@@ -101,7 +101,7 @@ fn bind_select_v03(
     let fields: Result<Vec<(String, DataType, bool)>> = exprs
         .iter()
         .zip(names.iter())
-        .map(|(e, n)| Ok((n.clone(), infer_type(e, &source_schema)?, true)))
+        .map(|(e, n)| typed_project_field(e, n, &source_schema))
         .collect();
     let output = project_schema(SchemaId::new(2), &fields?)?;
     bind_linear(
@@ -178,7 +178,7 @@ fn bind_join(
         let fields: Result<Vec<(String, DataType, bool)>> = exprs
             .iter()
             .zip(names.iter())
-            .map(|(e, n)| Ok((n.clone(), infer_type(e, &lookup_out)?, true)))
+            .map(|(e, n)| typed_project_field(e, n, &lookup_out))
             .collect();
         let output = project_schema(SchemaId::new(3), &fields?)?;
         crate::bind_v02::insert_project_before_sink_pub(&mut plan, exprs, output)?;

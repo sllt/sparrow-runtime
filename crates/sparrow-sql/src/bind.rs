@@ -1,6 +1,6 @@
 //! Bind G0-accepted SQL onto the shared logical IR.
 
-use sparrow_expr::{infer_type, BinaryOp, Expr};
+use sparrow_expr::{infer_nullable, infer_type, BinaryOp, Expr};
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sparrow_model::{DataType, PipelineId, RevisionId, Scalar, Schema, SchemaId};
 use sparrow_plan::catalog::project_schema;
@@ -199,10 +199,7 @@ fn bind_select(
     let fields: Result<Vec<(String, DataType, bool)>> = exprs
         .iter()
         .zip(names.iter())
-        .map(|(e, n)| {
-            let ty = infer_type(e, &source_schema)?;
-            Ok((n.clone(), ty, true))
-        })
+        .map(|(e, n)| typed_project_field(e, n, &source_schema))
         .collect();
     let output = project_schema(SchemaId::new(2), &fields?)?;
     bind_linear(
@@ -230,6 +227,18 @@ pub(crate) fn project_list_pub(
     schema: &Schema,
 ) -> Result<(Vec<Expr>, Vec<String>)> {
     project_list(items, schema)
+}
+
+pub(crate) fn typed_project_field(
+    expr: &Expr,
+    name: &str,
+    schema: &Schema,
+) -> Result<(String, DataType, bool)> {
+    Ok((
+        name.to_string(),
+        infer_type(expr, schema)?,
+        infer_nullable(expr, schema)?,
+    ))
 }
 
 fn table_name(rel: &TableFactor) -> Result<String> {

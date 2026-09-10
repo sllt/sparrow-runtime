@@ -5,13 +5,17 @@ edition.workspace = true
 license.workspace = true
 description = "SQLite catalog, desired/actual supervisor, and pipeline validation (outside sparrow-runtime)"
 
+[features]
+default = ["demo-io"]
+demo-io = ["sparrow-connectors/demo-io"]
+
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }
 sparrow-expr = { path = "../sparrow-expr" }
 sparrow-plan = { path = "../sparrow-plan" }
 sparrow-sql = { path = "../sparrow-sql" }
 sparrow-runtime = { path = "../sparrow-runtime" }
-sparrow-connectors = { path = "../sparrow-connectors" }
+sparrow-connectors = { path = "../sparrow-connectors", default-features = false }
 sparrow-formats = { path = "../sparrow-formats" }
 sparrow-io = { path = "../sparrow-io" }
 rusqlite = { version = "0.32", features = ["bundled"] }

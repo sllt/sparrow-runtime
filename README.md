@@ -114,8 +114,10 @@ See `docs/v1-report.md`.
 | Auth | `Authorization: Bearer <token>` (`--token` / `SPARROW_TOKEN`) |
 | Catalog | `--catalog PATH` (SQLite) |
 | Safe mode | `--safe-mode` — do not auto-start pipelines whose last attempt failed; file paths require `SPARROW_DATA_ROOTS`; secrets key required |
-| Demo I/O | `--demo-io` — embedded MQTT + HTTP capture |
+| Demo I/O | `--demo-io` — embedded MQTT + HTTP capture (requires the `demo-io` Cargo feature, **default on**) |
 | Data roots | `SPARROW_DATA_ROOTS` — colon-separated file/checkpoint allowlist |
+
+Production / `--no-default-features`: `EmbeddedBroker`, `HttpCapture`, and `DemoHarness` are compiled out (`#[cfg(feature = "demo-io")]`). Runtime `--demo-io` then fails with `feature_unavailable`. Default features stay on so demos and `cargo test --workspace` keep the in-process broker.
 
 Flags: `--bind` `--token` `--catalog` `--safe-mode` `--demo-io` `--allow-remote`.
 

@@ -108,13 +108,6 @@ impl Accumulator {
                 let v = match value {
                     Scalar::Int64(v) => *v,
                     Scalar::UInt64(v) if *v <= i64::MAX as u64 => *v as i64,
-                    Scalar::Bool(b) => {
-                        if *b {
-                            1
-                        } else {
-                            0
-                        }
-                    }
                     other => {
                         return Err(SparrowError::new(
                             ErrorCode::TypeMismatch,

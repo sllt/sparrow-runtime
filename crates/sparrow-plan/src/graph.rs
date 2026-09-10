@@ -9,6 +9,7 @@ use sparrow_model::error::{ErrorCode, Result, SparrowError};
 pub const GRAPH_SPEC_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphSpec {
     pub version: u32,
     pub pipeline_id: u64,
@@ -19,12 +20,14 @@ pub struct GraphSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogTableSpec {
     pub name: String,
     pub fields: Vec<FieldSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FieldSpec {
     pub name: String,
     #[serde(rename = "type")]
@@ -38,6 +41,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeSpec {
     pub id: u32,
     pub kind: String,
@@ -76,6 +80,7 @@ pub struct NodeSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WindowNodeSpec {
     pub kind: String,
     #[serde(default)]
@@ -95,6 +100,7 @@ pub struct WindowNodeSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AggNodeSpec {
     #[serde(rename = "fn")]
     pub func: String,
@@ -104,12 +110,14 @@ pub struct AggNodeSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JoinOnSpec {
     pub stream: String,
     pub table: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NamedExprSpec {
     pub expr: ExprSpec,
     pub alias: String,
@@ -136,5 +144,48 @@ impl GraphSpec {
         serde_json::to_string_pretty(self).map_err(|e| {
             SparrowError::new(ErrorCode::Internal, format!("serialize GraphSpec: {e}"))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a8_graph_and_node_spec_deny_unknown_fields() {
+        let err = GraphSpec::from_json(
+            r#"{
+              "version": 1,
+              "pipeline_id": 1,
+              "revision_id": 1,
+              "experimental": true,
+              "nodes": []
+            }"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(
+            err.message.contains("unknown field") || err.message.contains("experimental"),
+            "{}",
+            err.message
+        );
+
+        let err = GraphSpec::from_json(
+            r#"{
+              "version": 1,
+              "pipeline_id": 1,
+              "revision_id": 1,
+              "nodes": [
+                {"id": 1, "kind": "memory_source", "table": "s", "mystery": 1}
+              ]
+            }"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(
+            err.message.contains("unknown field") || err.message.contains("mystery"),
+            "{}",
+            err.message
+        );
     }
 }

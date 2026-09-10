@@ -1,6 +1,6 @@
 //! Bind V0.2 SQL (PT/count windows, aggregates, static lookup JOIN).
 
-use sparrow_expr::{infer_type, BinaryOp, Expr};
+use sparrow_expr::{BinaryOp, Expr};
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sparrow_model::{AggFn, DataType, PipelineId, RevisionId, Schema, SchemaId, WindowKind};
 use sparrow_plan::catalog::project_schema;
@@ -15,7 +15,7 @@ use sqlparser::ast::{
 };
 use sqlparser::parser::Parser;
 
-use crate::bind::{sql_expr_pub, table_name_pub};
+use crate::bind::{sql_expr_pub, table_name_pub, typed_project_field};
 use crate::g0::g0_dialect;
 use crate::v02::check_sql_v02;
 
@@ -100,7 +100,7 @@ fn bind_select_v02(
     let fields: Result<Vec<(String, DataType, bool)>> = exprs
         .iter()
         .zip(names.iter())
-        .map(|(e, n)| Ok((n.clone(), infer_type(e, &source_schema)?, true)))
+        .map(|(e, n)| typed_project_field(e, n, &source_schema))
         .collect();
     let output = project_schema(SchemaId::new(2), &fields?)?;
     bind_linear(
@@ -181,7 +181,7 @@ fn bind_join(
         let fields: Result<Vec<(String, DataType, bool)>> = exprs
             .iter()
             .zip(names.iter())
-            .map(|(e, n)| Ok((n.clone(), infer_type(e, &lookup_out)?, true)))
+            .map(|(e, n)| typed_project_field(e, n, &lookup_out))
             .collect();
         let output = project_schema(SchemaId::new(3), &fields?)?;
         // Rebuild: source → lookup → project → sink via bind_linear is wrong.
@@ -509,7 +509,7 @@ fn apply_window_select(plan: &mut BoundLogicalPlan, projection: &[SelectItem]) -
     let fields: Result<Vec<(String, DataType, bool)>> = exprs
         .iter()
         .zip(names.iter())
-        .map(|(e, n)| Ok((n.clone(), infer_type(e, &win_out)?, true)))
+        .map(|(e, n)| typed_project_field(e, n, &win_out))
         .collect();
     let output = project_schema(SchemaId::new(4), &fields?)?;
     insert_project_before_sink(plan, exprs, output)

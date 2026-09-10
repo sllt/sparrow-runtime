@@ -877,8 +877,18 @@ fn emit_tumble(key: &[Scalar], entry: &TumbleEntry) -> Row {
     Row { values }
 }
 
+/// Count-window bounds are **in-window arrival ordinals**, not event-time.
+///
+/// A closed window of `size` events emits the half-open range `[0, count)`
+/// (`window_start = 0`, `window_end = count`, and `count == size` at emit).
+/// These columns share names with tumble `window_start` / `window_end` but
+/// must not be read as timestamps (P3-47).
+pub const COUNT_WINDOW_BOUNDS: &str =
+    "count-window window_start/window_end are 0-based half-open arrival ordinals [0, count) within the closed window, not event-time micros";
+
 fn emit_count(key: &[Scalar], entry: &CountEntry) -> Row {
     let mut values = key.to_vec();
+    // Honest ordinals: [0, count) in this window. Not a timestamp (P3-47).
     values.push(Scalar::Int64(0));
     values.push(Scalar::Int64(entry.count as i64));
     for a in &entry.accs {
@@ -1100,6 +1110,41 @@ mod review_tests {
         }
         assert_eq!(total, 32, "every closed key must be emitted");
         assert!(rounds > 1, "32 keys must not flush as a single mailbox burst");
+    }
+
+    #[test]
+    fn p3_47_count_window_bounds_are_ordinals_not_event_time() {
+        let spec = WindowSpec::new(
+            WindowKind::Count { size: 2 },
+            vec!["device_id".into()],
+            vec![AggCall::new(
+                AggFn::Sum,
+                Some(Expr::Column { name: "v".into() }),
+                "s",
+            )],
+        );
+        let mut w = WindowOperator::new(
+            OperatorId::new(1),
+            spec,
+            schema(),
+            MemoryOwner::new(ResourceBudget::compact()),
+            16,
+            16,
+        )
+        .unwrap();
+        let r1 = Row {
+            values: vec![Scalar::utf8("a"), Scalar::Int64(1)],
+        };
+        let r2 = Row {
+            values: vec![Scalar::utf8("a"), Scalar::Int64(2)],
+        };
+        assert!(w.on_row(&r1, 0).unwrap().finals.is_empty());
+        let out = w.on_row(&r2, 0).unwrap();
+        assert_eq!(out.finals.len(), 1);
+        let row = &out.finals[0];
+        assert_eq!(row.values[1], Scalar::Int64(0), "{COUNT_WINDOW_BOUNDS}");
+        assert_eq!(row.values[2], Scalar::Int64(2), "window_end is in-window count");
+        assert_eq!(row.values[3], Scalar::Int64(3));
     }
 
     #[test]

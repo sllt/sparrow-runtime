@@ -221,6 +221,7 @@ fn run() -> Result<(), SparrowError> {
         if safe {
             println!("safe-mode: on (failing pipelines will not auto-activate)");
         }
+        #[cfg(feature = "demo-io")]
         if let Some(h) = harness {
             println!(
                 "demo-io mqtt={}:{} http={}",
@@ -229,6 +230,8 @@ fn run() -> Result<(), SparrowError> {
                 h.http.url()
             );
         }
+        #[cfg(not(feature = "demo-io"))]
+        let _ = harness;
         if opts.allow_remote {
             println!("warning: non-loopback bind; mutating calls still require a bearer token");
         }

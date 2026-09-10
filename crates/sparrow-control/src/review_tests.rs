@@ -25,6 +25,7 @@ const STREAM_ET: &str = r#"{"fields":[
 const ET_TUMBLE_SQL: &str =
     "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, TUMBLE(ts, INTERVAL '10' SECOND)";
 
+#[cfg(feature = "demo-io")]
 fn http_window_rows(http: &sparrow_connectors::HttpCapture) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     for body in http.body_strings() {
@@ -38,6 +39,7 @@ fn http_window_rows(http: &sparrow_connectors::HttpCapture) -> Vec<serde_json::V
     out
 }
 
+#[cfg(feature = "demo-io")]
 fn window_counts(rows: &[serde_json::Value]) -> Vec<i64> {
     rows.iter()
         .filter_map(|r| r.get("n").and_then(|v| v.as_i64()))
@@ -555,6 +557,7 @@ fn p0_2_pt_aligned_rejected() {
     );
 }
 
+#[cfg(feature = "demo-io")]
 #[test]
 fn p0_4_barrier_waits_for_real_sink_flush() {
     let kernel = Arc::new(compact_kernel().unwrap());
@@ -618,6 +621,7 @@ fn p0_4_barrier_waits_for_real_sink_flush() {
 }
 
 #[test]
+#[cfg(feature = "demo-io")]
 fn n4_stale_barrier_ack_not_used_for_next_checkpoint() {
     use sparrow_runtime::CheckpointStore;
     use std::io::Write;
@@ -725,6 +729,7 @@ fn n4_stale_barrier_ack_not_used_for_next_checkpoint() {
 }
 
 #[test]
+#[cfg(feature = "demo-io")]
 fn n7_aligned_checkpoint_refuses_after_sink_4xx() {
     let kernel = Arc::new(compact_kernel().unwrap());
     kernel.block_on(async {
@@ -796,6 +801,7 @@ fn n7_aligned_checkpoint_refuses_after_sink_4xx() {
 }
 
 #[test]
+#[cfg(feature = "demo-io")]
 fn n5_append_only_et_window_accepts_rows_after_eof_poll() {
     use std::io::Write;
 
@@ -896,6 +902,7 @@ fn n5_append_only_et_window_accepts_rows_after_eof_poll() {
 }
 
 #[test]
+#[cfg(feature = "demo-io")]
 fn n5_sealed_eof_emits_final_et_windows() {
     let kernel = Arc::new(compact_kernel().unwrap());
     kernel.block_on(async {
@@ -973,6 +980,7 @@ fn n5_sealed_eof_emits_final_et_windows() {
 }
 
 #[test]
+#[cfg(feature = "demo-io")]
 fn n5_restart_fresh_sealed_emits_final_et_windows() {
     let kernel = Arc::new(compact_kernel().unwrap());
     kernel.block_on(async {

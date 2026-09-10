@@ -1,12 +1,23 @@
+#[cfg(feature = "demo-io")]
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+#[cfg(feature = "demo-io")]
+use std::sync::atomic::AtomicU16;
+#[cfg(any(test, feature = "demo-io"))]
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+#[cfg(feature = "demo-io")]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use sparrow_formats::{encode_json_batch, JsonLimits};
 use sparrow_model::{ErrorCode, InflightCounter, RestoreClaim, RowBatch};
+#[cfg(any(test, feature = "demo-io"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+#[cfg(any(test, feature = "demo-io"))]
+use tokio::net::TcpListener;
+#[cfg(feature = "demo-io")]
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -217,6 +228,7 @@ impl HttpSink {
 
 /// Tiny HTTP/1.1 capture server for demos and CI. Optional per-request delay
 /// demonstrates slow-sink backpressure.
+#[cfg(feature = "demo-io")]
 pub struct HttpCapture {
     pub addr: SocketAddr,
     bodies: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -226,6 +238,7 @@ pub struct HttpCapture {
     join: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(feature = "demo-io")]
 impl HttpCapture {
     pub async fn start() -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
@@ -307,6 +320,7 @@ impl HttpCapture {
     }
 }
 
+#[cfg(feature = "demo-io")]
 async fn handle_http(
     mut stream: TcpStream,
     bodies: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -387,6 +401,7 @@ async fn handle_http(
     Ok(())
 }
 
+#[cfg(feature = "demo-io")]
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
@@ -396,9 +411,11 @@ mod tests {
     use super::*;
     use crate::secret::MapSecretResolver;
     use sparrow_model::{
-        CreditKind, DataType, Field, FieldId, InflightCounter, MemoryOwner, ResourceBudget, Row,
-        RowBatchBuilder, Scalar, Schema, SchemaId,
+        CreditKind, DataType, Field, FieldId, MemoryOwner, ResourceBudget, Row, RowBatchBuilder,
+        Scalar, Schema, SchemaId,
     };
+    #[cfg(feature = "demo-io")]
+    use sparrow_model::InflightCounter;
 
     #[tokio::test]
     async fn v01_http_sink_does_not_follow_redirect_to_disallowed() {
@@ -474,6 +491,7 @@ mod tests {
         cancel.cancel();
     }
 
+    #[cfg(feature = "demo-io")]
     #[tokio::test]
     async fn http_sink_4xx_fails_outbox_not_success_ack() {
         let http = HttpCapture::start().await.unwrap();

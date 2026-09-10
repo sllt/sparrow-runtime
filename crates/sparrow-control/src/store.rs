@@ -9,6 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sparrow_model::{ErrorCode, Result, SparrowError};
 
 use crate::spec::PipelineSpec;
+use crate::status::PipelineStatus;
 
 pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 pub const FORMAT_VERSION: u32 = 1;
@@ -45,14 +46,16 @@ pub struct PipelineRow {
 pub struct DesiredState {
     pub name: String,
     pub revision: Option<u64>,
-    pub status: String,
+    /// Typed at the Rust boundary. SQLite column remains TEXT.
+    pub status: PipelineStatus,
 }
 
 #[derive(Clone, Debug)]
 pub struct ActualState {
     pub name: String,
     pub revision: Option<u64>,
-    pub status: String,
+    /// Typed at the Rust boundary. SQLite column remains TEXT.
+    pub status: PipelineStatus,
     pub attempt_id: u64,
     pub consecutive_failures: u64,
     pub last_error: Option<String>,
@@ -270,6 +273,13 @@ impl Store {
     }
 
     pub fn set_desired(&self, name: &str, status: &str, revision: Option<u64>) -> Result<()> {
+        let status = PipelineStatus::parse(status)?;
+        if !status.is_desired() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("desired status must be running or stopped, got '{}'", status.as_str()),
+            ));
+        }
         self.write(|c| {
             let exists: i64 = c
                 .query_row(
@@ -291,7 +301,7 @@ impl Store {
                     desired_revision=excluded.desired_revision,
                     desired_status=excluded.desired_status,
                     updated_at=excluded.updated_at",
-                params![name, revision.map(|r| r as i64), status, now_ms()],
+                params![name, revision.map(|r| r as i64), status.as_str(), now_ms()],
             )
             .map_err(db)?;
             Ok(())
@@ -306,6 +316,7 @@ impl Store {
         attempt_id: u64,
         last_error: Option<&str>,
     ) -> Result<()> {
+        let status = PipelineStatus::parse(status)?;
         self.write(|c| {
             let prev: i64 = c
                 .query_row(
@@ -317,8 +328,8 @@ impl Store {
                 .map_err(db)?
                 .unwrap_or(0);
             let consecutive = match status {
-                "running" | "completed" => 0,
-                "failed" => prev.saturating_add(1),
+                PipelineStatus::Running | PipelineStatus::Completed => 0,
+                PipelineStatus::Failed => prev.saturating_add(1),
                 _ => prev,
             };
             c.execute(
@@ -334,7 +345,7 @@ impl Store {
                 params![
                     name,
                     revision.map(|r| r as i64),
-                    status,
+                    status.as_str(),
                     attempt_id as i64,
                     consecutive,
                     last_error,
@@ -372,48 +383,55 @@ impl Store {
 
     pub fn desired(&self, name: &str) -> Result<DesiredState> {
         self.read(|c| {
-            c.query_row(
-                "SELECT name, desired_revision, desired_status FROM desired_state WHERE name=?1",
-                [name],
-                |r| {
-                    Ok(DesiredState {
-                        name: r.get(0)?,
-                        revision: r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
-                        status: r.get(2)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(db)?
-            .ok_or_else(|| {
-                SparrowError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("no desired state for `{name}`"),
+            let (name, rev, status): (String, Option<i64>, String) = c
+                .query_row(
+                    "SELECT name, desired_revision, desired_status FROM desired_state WHERE name=?1",
+                    [name],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
+                .optional()
+                .map_err(db)?
+                .ok_or_else(|| {
+                    SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("no desired state for `{name}`"),
+                    )
+                })?;
+            Ok(DesiredState {
+                name,
+                revision: rev.map(|v| v as u64),
+                status: PipelineStatus::parse(&status)?,
             })
         })
     }
 
     pub fn actual(&self, name: &str) -> Result<ActualState> {
         self.read(|c| {
-            c.query_row(
-                "SELECT name, actual_revision, actual_status, attempt_id, COALESCE(consecutive_failures, 0), last_error FROM actual_state WHERE name=?1",
-                [name],
-                |r| {
-                    Ok(ActualState {
-                        name: r.get(0)?,
-                        revision: r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
-                        status: r.get(2)?,
-                        attempt_id: r.get::<_, i64>(3)? as u64,
-                        consecutive_failures: r.get::<_, i64>(4)? as u64,
-                        last_error: r.get(5)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(db)?
-            .ok_or_else(|| {
-                SparrowError::new(ErrorCode::InvalidArgument, format!("no actual state for `{name}`"))
+            let (name, rev, status, attempt, failures, last_error): (
+                String,
+                Option<i64>,
+                String,
+                i64,
+                i64,
+                Option<String>,
+            ) = c
+                .query_row(
+                    "SELECT name, actual_revision, actual_status, attempt_id, COALESCE(consecutive_failures, 0), last_error FROM actual_state WHERE name=?1",
+                    [name],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .optional()
+                .map_err(db)?
+                .ok_or_else(|| {
+                    SparrowError::new(ErrorCode::InvalidArgument, format!("no actual state for `{name}`"))
+                })?;
+            Ok(ActualState {
+                name,
+                revision: rev.map(|v| v as u64),
+                status: PipelineStatus::parse(&status)?,
+                attempt_id: attempt as u64,
+                consecutive_failures: failures as u64,
+                last_error,
             })
         })
     }
@@ -425,14 +443,23 @@ impl Store {
                 .map_err(db)?;
             let rows = stmt
                 .query_map([], |r| {
-                    Ok(DesiredState {
-                        name: r.get(0)?,
-                        revision: r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
-                        status: r.get(2)?,
-                    })
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
                 })
                 .map_err(db)?;
-            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db)
+            let mut out = Vec::new();
+            for row in rows {
+                let (name, rev, status) = row.map_err(db)?;
+                out.push(DesiredState {
+                    name,
+                    revision: rev.map(|v| v as u64),
+                    status: PipelineStatus::parse(&status)?,
+                });
+            }
+            Ok(out)
         })
     }
 
@@ -769,6 +796,8 @@ fn init(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL,
             PRIMARY KEY (name, revision)
         );
+        -- Status columns stay TEXT (A8). Rust reads/writes PipelineStatus;
+        -- no CHECK constraint so existing catalogs keep loading.
         CREATE TABLE IF NOT EXISTS desired_state (
             name TEXT PRIMARY KEY,
             desired_revision INTEGER,
@@ -1310,5 +1339,21 @@ mod tests {
         assert_eq!(s.desired("hot").unwrap().status, "running");
         s.reset_actual_after_process_restart().unwrap();
         assert_eq!(s.actual("hot").unwrap().status, "stopped");
+    }
+
+    #[test]
+    fn a8_unknown_status_string_is_rejected() {
+        let s = Store::open_memory().unwrap();
+        s.put_pipeline("hot", &spec(), None).unwrap();
+        let err = s.set_desired("hot", "pretty_please", Some(1)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("pretty_please"), "{}", err.message);
+        let err = s.set_desired("hot", "failed", Some(1)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("running or stopped"), "{}", err.message);
+        let err = s
+            .set_actual("hot", "on-fire", Some(1), 1, None)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 }

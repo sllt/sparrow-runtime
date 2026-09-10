@@ -23,7 +23,7 @@ pub use bind::{
 pub use bound::{validate_predicate, BoundKind, BoundLogicalPlan, BoundNode};
 pub use catalog::Catalog;
 pub use explain::{
-    et_tumble_template, explain_bound, explain_graph, validate_graph, GraphExplain,
+    et_tumble_template, explain_bound, explain_graph, validate_graph, GraphExplain, REPLAY_UNBOUND,
 };
 pub use graph::{GraphSpec, GRAPH_SPEC_VERSION};
 pub use physical::{physicalize, PhysicalPlan, PhysicalStage, PlanOptions, TransformStep};
@@ -153,6 +153,52 @@ mod tests {
         assert!(!unfused.fused());
         assert_eq!(fused.mailbox_count(), 2);
         assert_eq!(unfused.mailbox_count(), 3);
+        let project = bound
+            .nodes
+            .iter()
+            .find_map(|n| match &n.kind {
+                BoundKind::Project { output, .. } => Some(output),
+                _ => None,
+            })
+            .expect("project");
+        assert!(
+            !project.field_by_name("device_id").unwrap().nullable,
+            "p3_46: non-null input column projected as itself stays non-null"
+        );
+        assert!(project.field_by_name("temperature").unwrap().nullable);
+    }
+
+    #[test]
+    fn p3_46_project_nullable_not_always_true() {
+        let spec = GraphSpec::from_json(
+            r#"{
+              "version": 1,
+              "pipeline_id": 1,
+              "revision_id": 1,
+              "nodes": [
+                {"id": 1, "kind": "memory_source", "table": "sensor_readings", "out": [2]},
+                {"id": 2, "kind": "project",
+                  "exprs": [
+                    {"alias": "device_id", "expr": {"k": "col", "name": "device_id"}},
+                    {"alias": "one", "expr": {"k": "lit", "value": {"t": "int64", "v": 1}}}
+                  ],
+                  "out": [3]},
+                {"id": 3, "kind": "capture_sink", "name": "capture"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let bound = bind_graph(&spec, &sensor_catalog()).unwrap();
+        let project = bound
+            .nodes
+            .iter()
+            .find_map(|n| match &n.kind {
+                BoundKind::Project { output, .. } => Some(output),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!project.field_by_name("device_id").unwrap().nullable);
+        assert!(!project.field_by_name("one").unwrap().nullable);
     }
 
     #[test]
