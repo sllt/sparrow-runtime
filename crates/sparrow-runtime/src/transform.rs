@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use sparrow_expr::{eval, filter_mask};
+use sparrow_expr::{bind, eval_bound, filter_mask};
 use sparrow_model::{
     CreditKind, ErrorCode, MemoryOwner, Result, Row, RowBatch, RowBatchBuilder, Scalar, Schema,
     SparrowError, WorkBudget,
@@ -60,9 +60,11 @@ pub fn apply_steps(
                     src.num_rows(),
                     src.tracked_bytes().saturating_mul(2).max(64),
                 )?;
+                let bound: Result<Vec<_>> = exprs.iter().map(|e| bind(e, input)).collect();
+                let bound = bound?;
                 for row in src.rows() {
                     let values: Result<Vec<Scalar>> =
-                        exprs.iter().map(|e| eval(e, input, &row.values)).collect();
+                        bound.iter().map(|e| eval_bound(e, &row.values)).collect();
                     b.push(Row { values: values? })?;
                 }
                 working = finish_step(b)?;

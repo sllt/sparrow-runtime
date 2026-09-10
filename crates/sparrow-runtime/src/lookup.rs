@@ -23,6 +23,9 @@ pub struct ReferenceTable {
     pub schema: Schema,
     pub key_fields: Vec<String>,
     index: HashMap<Vec<u8>, Row>,
+    /// CRC-32 of the frozen snapshot (name, version, keys, rows). Fail closed
+    /// on mismatch (P2-36).
+    checksum: u32,
 }
 
 impl ReferenceTable {
@@ -64,13 +67,59 @@ impl ReferenceTable {
             }
             index.insert(encode_scalars(&key), detached);
         }
+        let name = name.into();
+        let checksum = table_crc(&name, version, &key_fields, &index);
         Ok(Arc::new(Self {
-            name: name.into(),
+            name,
             version,
             schema,
             key_fields,
             index,
+            checksum,
         }))
+    }
+
+    pub fn checksum(&self) -> u32 {
+        self.checksum
+    }
+
+    /// Recompute CRC-32 from live rows and compare to the stored value.
+    pub fn verify(&self) -> Result<()> {
+        let got = table_crc(&self.name, self.version, &self.key_fields, &self.index);
+        if got != self.checksum {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                format!(
+                    "reference table '{}' crc32 mismatch (stored {:#010x} computed {:#010x})",
+                    self.name, self.checksum, got
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Test helper: keep live rows, replace the stored checksum.
+    pub fn with_stored_checksum(&self, checksum: u32) -> Self {
+        let mut t = self.clone();
+        t.checksum = checksum;
+        t
+    }
+
+    /// Test helper: flip the first cell of one row, keep the stored checksum.
+    pub fn with_corrupted_first_row(&self) -> Self {
+        let mut t = self.clone();
+        if let Some(row) = t.index.values_mut().next() {
+            if let Some(first) = row.values.first_mut() {
+                *first = match first {
+                    Scalar::Int64(v) => Scalar::Int64(v.wrapping_add(1)),
+                    Scalar::UInt64(v) => Scalar::UInt64(v.wrapping_add(1)),
+                    Scalar::Float64(v) => Scalar::Float64(*v + 1.0),
+                    Scalar::Utf8(_) => Scalar::utf8("__crc_corrupt__"),
+                    _ => Scalar::utf8("__crc_corrupt__"),
+                };
+            }
+        }
+        t
     }
 
     pub fn len(&self) -> usize {
@@ -80,6 +129,38 @@ impl ReferenceTable {
     pub fn get(&self, key: &[Scalar]) -> Option<&Row> {
         self.index.get(&encode_scalars(key))
     }
+}
+
+fn table_crc(
+    name: &str,
+    version: u64,
+    key_fields: &[String],
+    index: &HashMap<Vec<u8>, Row>,
+) -> u32 {
+    let mut buf = Vec::new();
+    let nb = name.as_bytes();
+    buf.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+    buf.extend_from_slice(nb);
+    buf.extend_from_slice(&version.to_le_bytes());
+    buf.extend_from_slice(&(key_fields.len() as u32).to_le_bytes());
+    for k in key_fields {
+        let b = k.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+    }
+    let mut keys: Vec<&Vec<u8>> = index.keys().collect();
+    keys.sort();
+    for k in keys {
+        buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        buf.extend_from_slice(k);
+        if let Some(row) = index.get(k) {
+            for s in &row.values {
+                s.encode_key(&mut buf);
+                buf.push(0xff);
+            }
+        }
+    }
+    crate::checkpoint::crc32(&buf)
 }
 
 fn encode_scalars(key: &[Scalar]) -> Vec<u8> {
@@ -145,6 +226,7 @@ impl VersionedReferenceTable {
                 format!("versioned table '{}' != snapshot '{}'", self.name, table.name),
             ));
         }
+        table.verify()?;
         let mut g = self.inner.write().expect("versioned table");
         if let Some(last) = g.last() {
             if valid_from < last.valid_from {
@@ -262,6 +344,14 @@ impl LookupOperator {
                 ErrorCode::InvalidArgument,
                 format!("lookup table '{}' != snapshot '{}'", spec.table, name),
             ));
+        }
+        match &source {
+            LookupSource::Static(t) => t.verify()?,
+            LookupSource::Versioned(t) => {
+                if let Some(latest) = t.latest() {
+                    latest.verify()?;
+                }
+            }
         }
         let stream_idx = resolve_keys(&input, &spec.stream_keys)?;
         let keep = if spec.keep.is_empty() {
@@ -427,4 +517,93 @@ pub fn table_from_pairs(
         1024,
         1024 * 1024,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparrow_model::ResourceBudget;
+
+    fn owner() -> Arc<MemoryOwner> {
+        MemoryOwner::new(ResourceBudget::compact())
+    }
+
+    fn sites(owner: &Arc<MemoryOwner>) -> Arc<ReferenceTable> {
+        table_from_pairs(
+            "sites",
+            1,
+            "device_id",
+            "site",
+            DataType::Utf8,
+            vec![(Scalar::utf8("a"), Scalar::utf8("west"))],
+            owner,
+        )
+        .unwrap()
+    }
+
+    fn stream_schema() -> Schema {
+        Schema::new(
+            SchemaId::new(1),
+            vec![
+                Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+                Field::new(FieldId::new(2), "temp", DataType::Float64, true),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn spec() -> LookupSpec {
+        LookupSpec::static_table(
+            "sites",
+            vec!["device_id".into()],
+            vec!["device_id".into()],
+            vec!["site".into()],
+        )
+    }
+
+    #[test]
+    fn p2_36_snapshot_checksum_verifies() {
+        let t = sites(&owner());
+        t.verify().unwrap();
+        assert_ne!(t.checksum(), 0);
+        let again = sites(&owner());
+        assert_eq!(
+            t.checksum(),
+            again.checksum(),
+            "same snapshot bytes must be stable"
+        );
+    }
+
+    #[test]
+    fn p2_36_wrong_stored_checksum_fails_closed() {
+        let t = sites(&owner());
+        let bad = t.with_stored_checksum(t.checksum().wrapping_add(1));
+        let err = bad.verify().unwrap_err();
+        assert_eq!(err.code, ErrorCode::CodecViolation);
+        assert!(err.to_string().contains("crc32"));
+    }
+
+    #[test]
+    fn p2_36_corrupted_row_fails_closed() {
+        let t = sites(&owner());
+        let bad = t.with_corrupted_first_row();
+        let err = bad.verify().unwrap_err();
+        assert_eq!(err.code, ErrorCode::CodecViolation);
+        let owner = owner();
+        let err = match LookupOperator::new(spec(), Arc::new(bad), stream_schema(), owner) {
+            Err(e) => e,
+            Ok(_) => panic!("corrupt table must fail lookup bind"),
+        };
+        assert_eq!(err.code, ErrorCode::CodecViolation);
+    }
+
+    #[test]
+    fn p2_36_publish_rejects_corrupt_table() {
+        let owner = owner();
+        let good = sites(&owner);
+        let ver = VersionedReferenceTable::from_static(Arc::clone(&good), 8).unwrap();
+        let bad = Arc::new(good.with_stored_checksum(1));
+        let err = ver.publish(2, 10, bad).unwrap_err();
+        assert_eq!(err.code, ErrorCode::CodecViolation);
+    }
 }

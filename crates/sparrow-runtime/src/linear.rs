@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use sparrow_expr::{eval, Expr};
+use sparrow_expr::{bind, eval_bound, BoundExpr};
 use sparrow_io::RecordSink;
 use sparrow_model::{
     CreditKind, ErrorCode, JobAttemptId, MemoryOwner, OperatorId, PipelineId, Result, Row,
@@ -23,8 +23,8 @@ pub struct RuntimeConfig {
 
 pub struct LinearExecutor {
     cfg: RuntimeConfig,
-    filter: Option<Expr>,
-    project: Option<(Vec<Expr>, Schema)>,
+    filter: Option<BoundExpr>,
+    project: Option<(Vec<BoundExpr>, Schema)>,
     filter_op: OperatorId,
     project_op: OperatorId,
 }
@@ -35,13 +35,23 @@ impl LinearExecutor {
         let mut project = None;
         let mut filter_op = OperatorId::new(0);
         let mut project_op = OperatorId::new(0);
+        let mut source_schema: Option<&Schema> = None;
         for node in &plan.nodes {
             match node {
+                LogicalOp::Source { schema, .. } => {
+                    source_schema = Some(schema);
+                }
                 LogicalOp::Filter {
                     operator,
                     predicate,
                 } => {
-                    filter = Some(predicate.clone());
+                    let schema = source_schema.ok_or_else(|| {
+                        SparrowError::new(
+                            ErrorCode::InvalidArgument,
+                            "filter requires a source schema to bind columns",
+                        )
+                    })?;
+                    filter = Some(bind(predicate, schema)?);
                     filter_op = *operator;
                 }
                 LogicalOp::Project {
@@ -49,10 +59,20 @@ impl LinearExecutor {
                     exprs,
                     output,
                 } => {
-                    project = Some((exprs.clone(), output.clone()));
+                    let schema = source_schema.ok_or_else(|| {
+                        SparrowError::new(
+                            ErrorCode::InvalidArgument,
+                            "project requires a source schema to bind columns",
+                        )
+                    })?;
+                    let bound = exprs
+                        .iter()
+                        .map(|e| bind(e, schema))
+                        .collect::<Result<Vec<_>>>()?;
+                    project = Some((bound, output.clone()));
                     project_op = *operator;
                 }
-                LogicalOp::Source { .. } | LogicalOp::Sink { .. } => {}
+                LogicalOp::Sink { .. } => {}
             }
         }
         Ok(Self {
@@ -69,8 +89,8 @@ impl LinearExecutor {
         let kept: Result<Vec<Row>> = input
             .rows()
             .iter()
-            .filter_map(|row| match self.keep(&schema, &row.values) {
-                Ok(true) => match self.project_row(&schema, &row.values) {
+            .filter_map(|row| match self.keep(&row.values) {
+                Ok(true) => match self.project_row(&row.values) {
                     Ok(values) => Some(Ok(Row { values })),
                     Err(e) => Some(Err(e)),
                 },
@@ -105,11 +125,11 @@ impl LinearExecutor {
         builder.finish().map_err(|e| self.attr(e, self.project_op))
     }
 
-    fn keep(&self, schema: &Schema, row: &[Scalar]) -> Result<bool> {
+    fn keep(&self, row: &[Scalar]) -> Result<bool> {
         let Some(pred) = &self.filter else {
             return Ok(true);
         };
-        match eval(pred, schema, row).map_err(|e| self.attr(e, self.filter_op))? {
+        match eval_bound(pred, row).map_err(|e| self.attr(e, self.filter_op))? {
             Scalar::Bool(v) => Ok(v),
             Scalar::Null => Ok(false),
             other => Err(self.attr(
@@ -122,13 +142,13 @@ impl LinearExecutor {
         }
     }
 
-    fn project_row(&self, schema: &Schema, row: &[Scalar]) -> Result<Vec<Scalar>> {
+    fn project_row(&self, row: &[Scalar]) -> Result<Vec<Scalar>> {
         let Some((exprs, _)) = &self.project else {
             return Ok(row.to_vec());
         };
         exprs
             .iter()
-            .map(|e| eval(e, schema, row).map_err(|err| self.attr(err, self.project_op)))
+            .map(|e| eval_bound(e, row).map_err(|err| self.attr(err, self.project_op)))
             .collect()
     }
 
@@ -157,7 +177,7 @@ pub fn drain<S: RecordSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sparrow_expr::BinaryOp;
+    use sparrow_expr::{BinaryOp, Expr};
     use sparrow_model::{
         DataType, DeliveryContract, Field, FieldId, MemoryOwner, ResourceBudget, RestoreClaim,
         RevisionId, SchemaId,
