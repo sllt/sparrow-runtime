@@ -1,7 +1,7 @@
 //! Provisional `RowBatch` layout.
 //!
 //! **V0.1 default layout (ADR-003): keep RowBatch.** See
-//! `docs/m0-report.md` and `docs/adr/003-layout-decision.md`. Packing is
+//! `docs/adr/003-layout-decision.md`. Packing is
 //! not a public ABI.
 //!
 //! Design notes:
@@ -17,7 +17,9 @@ use crate::error::{ErrorCode, Result, SparrowError};
 use crate::memory::{MemoryLease, MemoryOwner};
 use crate::resource::CreditKind;
 use crate::scalar::Scalar;
-use crate::types::{DataType, Schema};
+use crate::types::Schema;
+#[cfg(test)]
+use crate::types::DataType;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -104,6 +106,7 @@ pub struct RowBatchBuilder {
     max_bytes: usize,
     rows: Vec<Row>,
     current_bytes: usize,
+    lease: Option<MemoryLease>,
 }
 
 impl RowBatchBuilder {
@@ -138,6 +141,7 @@ impl RowBatchBuilder {
             max_bytes,
             rows: Vec::new(),
             current_bytes: 0,
+            lease: None,
         })
     }
 
@@ -171,8 +175,7 @@ impl RowBatchBuilder {
                 ));
             }
             if !value.is_null()
-                && value.data_type() != field.data_type
-                && !matches!(field.data_type, DataType::Dynamic)
+                && !value.matches_type(&field.data_type)
             {
                 return Err(SparrowError::new(
                     ErrorCode::TypeMismatch,
@@ -205,17 +208,22 @@ impl RowBatchBuilder {
             .context("peak", self.owner.peak_builder_bytes().to_string()));
         }
         // P1-15: charge the reservation ledger *before* Vec growth.
-        let _probe = self.owner.acquire(self.kind, add.max(1))?;
+        match &mut self.lease {
+            Some(lease) => lease.grow_to(next.max(1))?,
+            None => self.lease = Some(self.owner.acquire(self.kind, next.max(1))?),
+        }
         self.rows.reserve(1);
         self.current_bytes = next;
         self.rows.push(row);
-        drop(_probe);
         Ok(())
     }
 
     pub fn finish(self) -> Result<RowBatch> {
         let bytes = self.current_bytes.max(1);
-        let lease = self.owner.acquire(self.kind, bytes)?;
+        let lease = match self.lease {
+            Some(lease) => lease,
+            None => self.owner.acquire(self.kind, bytes)?,
+        };
         Ok(RowBatch {
             schema: self.schema,
             rows: Arc::new(self.rows),
@@ -230,6 +238,51 @@ mod tests {
     use crate::ids::FieldId;
     use crate::resource::ResourceBudget;
     use crate::types::Field;
+
+    #[test]
+    fn r4_unsorted_typed_objects_accept_unique_keys_and_reject_raw_duplicates() {
+        use crate::DynamicValue as D;
+        let structure = DataType::Struct(vec![
+            Field::new(FieldId::new(1), "b", DataType::Int64, false),
+            Field::new(FieldId::new(2), "a", DataType::Int64, false),
+        ]);
+        let map = DataType::Map { key: Box::new(DataType::Utf8), value: Box::new(DataType::Int64) };
+        for ty in [structure, map] {
+            let owner = pool();
+            let schema = Arc::new(Schema::new(1, vec![Field::new(FieldId::new(1), "f", ty, false)]).unwrap());
+            let mut builder = RowBatchBuilder::new(schema, owner.clone(), CreditKind::Reservation, 4, 4096).unwrap();
+            let object = |keys: &[&str]| Scalar::Dynamic(D::Object(keys.iter()
+                .map(|k| (Arc::from(*k), D::Int64(1))).collect::<Vec<_>>().into()));
+            for keys in [["b", "a"], ["a", "b"]] {
+                builder.push(Row { values: vec![object(&keys)] }).unwrap();
+            }
+            let billed = owner.usage().reservation_bytes;
+            for keys in [vec!["b", "b"], vec!["b", "a", "b"]] {
+                assert_eq!(builder.push(Row { values: vec![object(&keys)] }).unwrap_err().code, ErrorCode::TypeMismatch);
+                assert_eq!(owner.usage().reservation_bytes, billed);
+            }
+            drop(builder);
+            assert_eq!(owner.usage().physical_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn r3_builder_holds_credits_and_validates_nested_non_json_input() {
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let schema = Arc::new(Schema::new(1, vec![Field::new(FieldId::new(1), "xs", DataType::Array(Box::new(DataType::Int64)), false)]).unwrap());
+        let mut builder = RowBatchBuilder::new(schema, owner.clone(), CreditKind::Reservation, 4, 4096).unwrap();
+        let value = Scalar::Dynamic(crate::DynamicValue::Array(vec![crate::DynamicValue::Int64(7)].into()));
+        builder.push(Row { values: vec![value] }).unwrap();
+        let billed = owner.usage().reservation_bytes;
+        assert!(billed > 0, "builder must retain its lease before finish");
+        let invalid = Scalar::Dynamic(crate::DynamicValue::Array(vec![crate::DynamicValue::utf8("bad")].into()));
+        assert_eq!(builder.push(Row { values: vec![invalid] }).unwrap_err().code, ErrorCode::TypeMismatch);
+        assert_eq!(owner.usage().reservation_bytes, billed);
+        let batch = builder.finish().unwrap();
+        assert_eq!(owner.usage().reservation_bytes, billed, "finish must not double-bill");
+        drop(batch);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
 
     fn schema() -> Arc<Schema> {
         Arc::new(

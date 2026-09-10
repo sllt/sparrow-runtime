@@ -122,6 +122,7 @@ impl SharedCapture {
     pub fn push(&self, schema: &Schema, batch_rows: &[Row]) {
         self.seen
             .fetch_add(batch_rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if matches!(self.mode, CaptureMode::Disabled) { return; }
         let mut g = self.rows.lock().expect("capture");
         for r in batch_rows {
             Self::retain(&mut g, self.mode, r.values.clone());
@@ -132,6 +133,7 @@ impl SharedCapture {
     pub fn push_late(&self, batch_rows: &[Row]) {
         self.late_seen
             .fetch_add(batch_rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if matches!(self.mode, CaptureMode::Disabled) { return; }
         let mut g = self.late.lock().expect("late");
         for r in batch_rows {
             Self::retain(&mut g, self.mode, r.values.clone());

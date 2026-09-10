@@ -20,7 +20,8 @@ pub use store::{
 #[cfg(feature = "demo-io")]
 pub use supervisor::DemoHarness;
 pub use supervisor::{
-    compact_kernel, host_kernel, request_start, request_start_at, request_stop, DemoIo, Supervisor,
+    compact_kernel, host_kernel, host_kernel_with_max_jobs, parse_max_jobs,
+    request_start, request_start_at, request_stop, DemoIo, Supervisor,
 };
 pub use validate::{
     bind_plan, binder_catalog, capabilities_json, effective_guarantees, explain_plan,
@@ -31,3 +32,6 @@ pub use validate::{
 
 #[cfg(test)]
 mod review_tests;
+
+#[cfg(test)]
+mod r4_tests;

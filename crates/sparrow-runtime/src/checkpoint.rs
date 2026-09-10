@@ -140,6 +140,28 @@ impl CheckpointSnapshot {
         Ok(out)
     }
 
+    /// Wrap the already encoded ACK in-place; no second state encode/clone.
+    pub fn encode_frozen(checkpoint_id: u64, source: &SourcePosition, ingested_rows: u64,
+        layout: &PlanLayout, table: Option<&TableRevisionBind>,
+        mut freeze: crate::barrier::EncodedFreeze) -> Result<crate::barrier::EncodedFreeze> {
+        let mut prefix = Vec::new();
+        write_snapshot_prefix(&mut prefix, checkpoint_id, ingested_rows, source)?;
+        let mut suffix = Vec::new();
+        write_snapshot_suffix(&mut suffix, layout, table)?;
+        let total = prefix.len().saturating_add(freeze.bytes.len()).saturating_add(suffix.len());
+        if total as u64 > MAX_SNAPSHOT_BYTES {
+            return Err(SparrowError::new(ErrorCode::BoundExceeded, "snapshot exceeds byte cap"));
+        }
+        freeze.lease.grow_to(total.max(freeze.bytes.capacity()))?;
+        freeze.bytes.reserve_exact(total - freeze.bytes.len());
+        let state_len = freeze.bytes.len();
+        freeze.bytes.resize(total, 0);
+        freeze.bytes.copy_within(..state_len, prefix.len());
+        freeze.bytes[..prefix.len()].copy_from_slice(&prefix);
+        freeze.bytes[prefix.len() + state_len..].copy_from_slice(&suffix);
+        Ok(freeze)
+    }
+
     pub fn decode(src: &[u8]) -> Result<Self> {
         Self::decode_with_max_state_keys(src, MAX_FREEZE_ENTRIES)
     }
@@ -718,14 +740,26 @@ fn cut(point: &str, id: u64) -> SparrowError {
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xffff_ffff;
     for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
+        crc = (crc >> 8) ^ CRC32_TABLE[((crc ^ b as u32) & 0xff) as usize];
     }
     !crc
 }
+
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
 
 fn encode_str(s: &str, out: &mut Vec<u8>) {
     let b = s.as_bytes();
@@ -1016,7 +1050,7 @@ fn estimated_frozen_bytes(f: &WindowFreeze) -> usize {
         .sum()
 }
 
-fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>, max_entries: usize) -> Result<()> {
+pub(crate) fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>, max_entries: usize) -> Result<()> {
     if f.entries.len() > max_entries {
         return Err(SparrowError::new(
             ErrorCode::BoundExceeded,
@@ -1166,16 +1200,17 @@ mod tests {
     use std::sync::Arc;
 
     fn tmp() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "sparrow-chk-{}-{}",
+            "sparrow-chk-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).unwrap();
+        fs::create_dir(&p).unwrap();
         p
     }
 
@@ -1242,6 +1277,52 @@ mod tests {
         assert_eq!(got.window.entries.len(), 1);
         assert_eq!(got.window.kind, 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r4_freeze_uses_live_reservation_headroom_without_double_billing() {
+        use crate::barrier::EncodedFreeze;
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let schema = count_schema();
+        let mut op = WindowOperator::new(OperatorId::WINDOW, count_spec(), schema.clone(), owner.clone(), 64, 8).unwrap();
+        ingest_distinct_keys(&mut op, &schema, &owner, 1);
+        op.check_freeze_encode_bound(64).unwrap();
+        assert_eq!(op.check_freeze_encode_bound(0).unwrap_err().code, ErrorCode::BoundExceeded);
+        let estimate = op.estimated_freeze_bytes() + 256;
+        let pressure = owner.acquire(CreditKind::Reservation, owner.budget().reservation_bytes - estimate + 1).unwrap();
+        let before = owner.usage().reservation_bytes;
+        assert_eq!(EncodedFreeze::from_operator(&op, &owner, 64).unwrap_err().code, ErrorCode::ResourceExhausted);
+        assert_eq!(owner.usage().reservation_bytes, before);
+        assert_eq!(op.key_count(), 1);
+        drop(pressure);
+        // Exactly estimate bytes of headroom: encode must not acquire twice.
+        let pressure = owner.acquire(CreditKind::Reservation, owner.budget().reservation_bytes - estimate).unwrap();
+        let frozen = EncodedFreeze::from_operator(&op, &owner, 64).unwrap();
+        assert_eq!(owner.usage().reservation_bytes, owner.budget().reservation_bytes);
+        drop((frozen, pressure, op));
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    #[test]
+    fn r3_encoded_ack_preserves_snapshot_bytes_and_leases() {
+        assert_eq!(crc32(b"123456789"), 0xcbf43926);
+        let snap = sample_snapshot(7);
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let mut bytes = Vec::new();
+        encode_freeze(&snap.window, &mut bytes, 1024).unwrap();
+        let lease = owner.acquire(CreditKind::Reservation, bytes.capacity()).unwrap();
+        let encoded = CheckpointSnapshot::encode_frozen(snap.checkpoint_id, &snap.source,
+            snap.ingested_rows, &snap.layout, snap.table.as_ref(),
+            crate::barrier::EncodedFreeze { bytes, lease }).unwrap();
+        assert_eq!(encoded.bytes, snap.encode().unwrap());
+        assert!(owner.usage().reservation_bytes >= encoded.bytes.len());
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        store.commit_encoded(snap.checkpoint_id, &encoded.bytes).unwrap();
+        assert_eq!(store.recover_required().unwrap(), snap);
+        drop(encoded);
+        assert_eq!(owner.usage().physical_bytes, 0);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

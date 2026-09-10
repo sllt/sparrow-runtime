@@ -18,6 +18,9 @@ use crate::error::{ErrorCode, Result, SparrowError};
 pub struct InputId(pub u16);
 
 impl InputId {
+    /// V1 plans have exactly one source. All ingress/control paths share this ID.
+    pub const SINGLE: Self = Self(0);
+
     pub const fn new(id: u16) -> Self {
         Self(id)
     }

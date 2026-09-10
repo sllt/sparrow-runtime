@@ -74,7 +74,7 @@ impl DedupOperator {
     }
 
     pub fn retention_bytes(&self) -> usize {
-        self.state.retention_bytes()
+        self.state.retention_bytes() + self.expiry.values().map(StateKey::index_bytes).sum::<usize>()
     }
 
     pub fn on_batch(&mut self, batch: &RowBatch, now: i64) -> Result<Vec<Row>> {
@@ -107,7 +107,7 @@ impl DedupOperator {
         }
         self.state
             .put(sk.clone(), Seen { last_seen: now }, 16)?;
-        self.index_expiry(now, sk);
+        self.index_expiry(now, sk)?;
         Ok(true)
     }
 
@@ -115,9 +115,11 @@ impl DedupOperator {
         last_seen.saturating_add(self.spec.ttl_micros)
     }
 
-    fn index_expiry(&mut self, last_seen: i64, sk: StateKey) {
+    fn index_expiry(&mut self, last_seen: i64, sk: StateKey) -> Result<()> {
+        let sk = sk.indexed(&self.owner)?;
         let encoded = sk.encoded_bytes().to_vec();
         self.expiry.insert((self.expire_at(last_seen), encoded), sk);
+        Ok(())
     }
 
     fn unindex_expiry(&mut self, last_seen: i64, sk: &StateKey) {
@@ -267,6 +269,21 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(second.is_empty());
         assert_eq!(d.key_count(), 1);
+    }
+
+    #[test]
+    fn r3_expiry_index_is_billed_and_released() {
+        let owner = owner();
+        let mut d = DedupOperator::new(OperatorId::new(2), DedupSpec {
+            keys: vec!["id".into()], ttl_micros: 10, max_keys: 16,
+        }, schema(), owner.clone()).unwrap();
+        d.on_batch(&batch(&["long-key-material"], &owner), 0).unwrap();
+        assert!(d.retention_bytes() > d.state.retention_bytes());
+        assert_eq!(d.retention_bytes(), owner.usage().retention_bytes);
+        d.expire(10);
+        assert_eq!(owner.usage().retention_bytes, 0);
+        d.cleanup();
+        assert_eq!(owner.usage().physical_bytes, 0);
     }
 
     #[test]

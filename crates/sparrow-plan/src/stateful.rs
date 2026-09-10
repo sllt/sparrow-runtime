@@ -270,14 +270,14 @@ pub fn window_output_schema(input: &Schema, spec: &WindowSpec) -> Result<Schema>
     // arrival ordinals [0, count) — not timestamps (P3-47).
     fields.push(Field::new(
         FieldId::new(id),
-        "window_start",
+        if matches!(spec.kind, WindowKind::Count { .. }) { "count_start" } else { "window_start" },
         DataType::Int64,
         false,
     ));
     id += 1;
     fields.push(Field::new(
         FieldId::new(id),
-        "window_end",
+        if matches!(spec.kind, WindowKind::Count { .. }) { "count_end" } else { "window_end" },
         DataType::Int64,
         false,
     ));

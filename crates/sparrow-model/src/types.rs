@@ -1,8 +1,7 @@
 //! Typed schema vocabulary shared by SQL and Graph.
 //!
-//! Nested `Array` / `Struct` / `Map` may be *declared* so the validator can
-//! reject them consistently. Hot-path kernels in M0 only handle the scalar
-//! variants plus `Dynamic`.
+//! Nested `Array` / `Struct` / `Map` values use recursively validated
+//! `Scalar::Dynamic` storage. Arithmetic still requires a supported scalar.
 
 use crate::error::{ErrorCode, Result, SparrowError};
 use crate::ids::{FieldId, SchemaId};

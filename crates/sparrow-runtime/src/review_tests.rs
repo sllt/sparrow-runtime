@@ -437,6 +437,34 @@ fn count_window_plan(filter: Option<Expr>, size: u64) -> sparrow_plan::PhysicalP
 }
 
 #[test]
+fn r3_live_timer_metrics_and_job_cancel_count_are_real() {
+    use sparrow_model::{SharedVirtualClock, WindowKind};
+    use sparrow_plan::{bind_window_linear, AggCall, WindowSpec};
+    let spec = WindowSpec::new(WindowKind::tumbling_pt(1_000_000).unwrap(),
+        vec!["device_id".into()], vec![AggCall::count_star("n")]);
+    let bound = bind_window_linear(PipelineId::new(1), RevisionId::new(1), "sensors".into(),
+        count_schema(), None, spec, "out".into()).unwrap();
+    let plan = physicalize(&bound, &PlanOptions::default());
+    let kernel = kernel();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let handle = kernel.submit(JobRequest::new(plan, Vec::new(), SharedCapture::disabled())
+        .with_live_events(rx).with_clock(crate::RuntimeClock::virtual_clock(SharedVirtualClock::new(0)))).unwrap();
+    kernel.block_on(async {
+        tx.send(IngressEvent::Row(count_rows(&[1]).pop().unwrap())).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while kernel.metrics.snapshot().timers_live == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let stats = handle.stop().await.unwrap();
+        assert_eq!(stats.timers_live, 0);
+        assert!(stats.timers_cancelled > 0);
+        assert_eq!(kernel.metrics.snapshot().timers_live, 0);
+        assert!(kernel.metrics.snapshot().timers_cancelled > 0);
+    });
+}
+
+#[test]
 fn n9_future_drop_visible_in_metrics() {
     use sparrow_model::{SharedVirtualClock, WindowKind};
     use sparrow_plan::{bind_window_linear, AggCall, WindowSpec};
@@ -662,7 +690,8 @@ fn p0_4_barrier_waits_for_real_sink_flush() {
     let k = kernel();
     let (ev_tx, ev_rx) = tokio::sync::mpsc::channel(8);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(8);
-    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel(8);
+    let ack_tx = crate::AlignedAcks::default();
+    let mut ack_rx = ack_tx.begin(1).unwrap();
     let outbox = std::sync::Arc::new(sparrow_model::InflightCounter::new());
     let handle = k
         .submit(
@@ -708,6 +737,7 @@ fn p0_4_barrier_waits_for_real_sink_flush() {
             {
                 Ok(Some(crate::AlignedAck::WindowFrozen { .. })) => frozen = true,
                 Ok(Some(crate::AlignedAck::SinkFlushed { .. })) => flushed = true,
+                Ok(Some(crate::AlignedAck::FreezeFailed { error, .. })) => panic!("{error}"),
                 Ok(None) | Err(_) => break,
             }
         }
@@ -778,6 +808,7 @@ fn p1_20_second_job_refused_when_process_queue_reserved() {
         Err(e) => e,
     };
     assert_eq!(err.code, sparrow_model::ErrorCode::ResourceExhausted);
+    assert!(err.context.iter().any(|(key, value)| key == "admission" && value == "capacity"));
     assert!(
         err.message.contains("process queue") || err.message.contains("process memory"),
         "N jobs must not each get a full queue budget: {err}"

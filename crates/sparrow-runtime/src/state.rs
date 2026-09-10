@@ -18,6 +18,7 @@ pub struct StateKey {
     pub slot: StateSlotId,
     pub key: Vec<Scalar>,
     encoded: Vec<u8>,
+    index_lease: Option<Arc<MemoryLease>>,
 }
 
 impl PartialEq for StateKey {
@@ -49,11 +50,27 @@ impl StateKey {
             slot,
             key,
             encoded,
+            index_lease: None,
         }
     }
 
     pub fn tracked_bytes(&self) -> usize {
-        16 + self.key.iter().map(Scalar::tracked_bytes).sum::<usize>()
+        std::mem::size_of::<Self>() + self.encoded.len()
+            + self.key.iter().map(Scalar::tracked_bytes).sum::<usize>()
+    }
+
+    /// Index owns another key and encoded sort key plus B-tree overhead.
+    /// Acquire before cloning; lease follows index removal/cleanup.
+    pub fn indexed(&self, owner: &Arc<MemoryOwner>) -> Result<Self> {
+        let bytes = self.tracked_bytes().saturating_add(self.encoded.len()).saturating_add(128);
+        let lease = owner.acquire(CreditKind::Retention, bytes)?;
+        let mut key = self.clone();
+        key.index_lease = Some(Arc::new(lease));
+        Ok(key)
+    }
+
+    pub fn index_bytes(&self) -> usize {
+        self.index_lease.as_ref().map_or(0, |l| l.bytes())
     }
 
     pub fn encoded_bytes(&self) -> &[u8] {
@@ -89,6 +106,7 @@ impl<V> MemoryState<V> {
                 "state max_keys must be > 0 (unbounded state is rejected)",
             ));
         }
+        let max_keys = max_keys.min(owner.budget().max_state_keys);
         Ok(Self {
             owner,
             operator,

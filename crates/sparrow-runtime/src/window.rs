@@ -140,7 +140,7 @@ impl WindowOperator {
             owner,
             hub,
             holdback,
-            default_input: InputId(0),
+            default_input: InputId::SINGLE,
             closed_index: BTreeMap::new(),
             bound_aggs,
         })
@@ -166,10 +166,11 @@ impl WindowOperator {
     }
 
     pub fn retention_bytes(&self) -> usize {
-        match &self.store {
+        let state = match &self.store {
             WindowStore::Tumble(s) => s.retention_bytes(),
             WindowStore::Count(s) => s.retention_bytes(),
-        }
+        };
+        state + self.closed_index.values().map(StateKey::index_bytes).sum::<usize>()
     }
 
     pub fn live_timers(&self) -> usize {
@@ -348,7 +349,7 @@ impl WindowOperator {
                     bytes,
                 )?;
             }
-            self.index_insert(&sk, end);
+            self.index_insert(&sk, end)?;
         }
         if let WindowStore::Tumble(store) = &mut self.store {
             if let Some(entry) = store.get_mut(&sk) {
@@ -434,9 +435,11 @@ impl WindowOperator {
         }
     }
 
-    fn index_insert(&mut self, key: &StateKey, window_end: i64) {
+    fn index_insert(&mut self, key: &StateKey, window_end: i64) -> Result<()> {
+        let indexed = key.indexed(&self.owner)?;
         self.closed_index
-            .insert((window_end, key.encoded_bytes().to_vec()), key.clone());
+            .insert((window_end, key.encoded_bytes().to_vec()), indexed);
+        Ok(())
     }
 
     fn index_remove(&mut self, key: &StateKey, window_end: i64) {
@@ -444,14 +447,16 @@ impl WindowOperator {
             .remove(&(window_end, key.encoded_bytes().to_vec()));
     }
 
-    fn rebuild_closed_index(&mut self) {
+    fn rebuild_closed_index(&mut self) -> Result<()> {
         self.closed_index.clear();
         if let WindowStore::Tumble(store) = &self.store {
             for (k, e) in store.iter() {
+                let indexed = k.indexed(&self.owner)?;
                 self.closed_index
-                    .insert((e.window_end, k.encoded_bytes().to_vec()), k.clone());
+                    .insert((e.window_end, k.encoded_bytes().to_vec()), indexed);
             }
         }
+        Ok(())
     }
 
     /// Take a mailbox-sized chunk of closed windows (R17).
@@ -517,8 +522,6 @@ impl WindowOperator {
         let (start, end) = WindowKind::assign_tumble(now, size)?;
         let key = self.group_key(row);
         let sk = StateKey::new(self.operator, StateSlotId::new(SLOT), key);
-        let spec = self.spec.clone();
-        let input = self.input.clone();
         let mut late = Vec::new();
         let stale = match &self.store {
             WindowStore::Tumble(store) => store.get(&sk).and_then(|e| {
@@ -542,7 +545,7 @@ impl WindowOperator {
         }
         let missing = matches!(&self.store, WindowStore::Tumble(s) if s.get(&sk).is_none());
         if missing {
-            let accs = empty_accs(&spec, &input)?;
+            let accs = empty_accs(&self.spec, &self.input)?;
             let bytes: usize = accs.iter().map(Accumulator::tracked_bytes).sum();
             if let WindowStore::Tumble(store) = &mut self.store {
                 store.put(
@@ -555,7 +558,7 @@ impl WindowOperator {
                     bytes,
                 )?;
             }
-            self.index_insert(&sk, end);
+            self.index_insert(&sk, end)?;
             self.timers
                 .schedule(TimerId::window(self.operator, end), end)?;
         }
@@ -575,7 +578,7 @@ impl WindowOperator {
                 self.index_remove(&sk, old.window_end);
                 late.push(emit_tumble(&sk.key, &old));
             }
-            let accs = empty_accs(&spec, &input)?;
+            let accs = empty_accs(&self.spec, &self.input)?;
             let bytes: usize = accs.iter().map(Accumulator::tracked_bytes).sum();
             if let WindowStore::Tumble(store) = &mut self.store {
                 store.put(
@@ -588,7 +591,7 @@ impl WindowOperator {
                     bytes,
                 )?;
             }
-            self.index_insert(&sk, end);
+            self.index_insert(&sk, end)?;
             self.timers
                 .schedule(TimerId::window(self.operator, end), end)?;
         }
@@ -607,11 +610,9 @@ impl WindowOperator {
     fn on_count_row(&mut self, row: &Row, size: u64) -> Result<Vec<Row>> {
         let key = self.group_key(row);
         let sk = StateKey::new(self.operator, StateSlotId::new(SLOT), key);
-        let spec = self.spec.clone();
-        let input = self.input.clone();
         let missing = matches!(&self.store, WindowStore::Count(s) if s.get(&sk).is_none());
         if missing {
-            let accs = empty_accs(&spec, &input)?;
+            let accs = empty_accs(&self.spec, &self.input)?;
             let bytes: usize = accs.iter().map(Accumulator::tracked_bytes).sum();
             if let WindowStore::Count(store) = &mut self.store {
                 store.put(sk.clone(), CountEntry { count: 0, accs }, bytes)?;
@@ -716,7 +717,9 @@ impl WindowOperator {
     }
 
     /// Fail closed before encode / CURRENT publish when the freeze would
-    /// exceed the entry cap, snapshot byte quota, or live+encoded working set.
+    /// exceed entry/snapshot caps or either memory class. This is a structural
+    /// bound; EncodedFreeze atomically acquires current reservation headroom
+    /// before allocating. Do not re-check headroom after that lease is acquired.
     pub fn check_freeze_encode_bound(&self, max_entries: usize) -> Result<()> {
         let n = self.key_count();
         if n > max_entries {
@@ -738,17 +741,13 @@ impl WindowOperator {
             ));
         }
         let live = self.retention_bytes();
-        let peak = live.saturating_add(estimate);
-        let cap = self
-            .owner
-            .budget()
-            .retention_bytes
-            .saturating_add(self.owner.budget().reservation_bytes);
-        if peak > cap {
+        let budget = self.owner.budget();
+        if live > budget.retention_bytes || estimate > budget.reservation_bytes {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
                 format!(
-                    "freeze encode working set {peak}B (live+encoded) exceeds retention+reservation {cap}B; refusing encode before CURRENT (P1-14)"
+                    "freeze encode requires live {live}B / retention {}B and encoded {estimate}B / reservation {}B; refusing encode before CURRENT",
+                    budget.retention_bytes, budget.reservation_bytes
                 ),
             ));
         }
@@ -863,6 +862,9 @@ impl WindowOperator {
             (WindowStore::Tumble(store), 0) => {
                 for e in &freeze.entries {
                     let sk = StateKey::new(self.operator, StateSlotId::new(SLOT), e.key.clone());
+                    if store.get(&sk).is_some() {
+                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "checkpoint contains duplicate canonical keys; reset/replay required"));
+                    }
                     let bytes: usize = e.accs.iter().map(Accumulator::tracked_bytes).sum();
                     store.put(
                         sk,
@@ -878,6 +880,9 @@ impl WindowOperator {
             (WindowStore::Count(store), 1) => {
                 for e in &freeze.entries {
                     let sk = StateKey::new(self.operator, StateSlotId::new(SLOT), e.key.clone());
+                    if store.get(&sk).is_some() {
+                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "checkpoint contains duplicate canonical keys; reset/replay required"));
+                    }
                     let bytes: usize = e.accs.iter().map(Accumulator::tracked_bytes).sum();
                     store.put(
                         sk,
@@ -900,7 +905,7 @@ impl WindowOperator {
             h.restore(freeze.wm_in, freeze.wm_out);
         }
         self.hub.restore_effective(freeze.last_effective);
-        self.rebuild_closed_index();
+        self.rebuild_closed_index()?;
         // R16: PT windows must still close after restore without new data.
         if !self.spec.kind.uses_event_time() {
             if let WindowStore::Tumble(store) = &self.store {
@@ -1129,6 +1134,19 @@ mod review_tests {
     };
     use sparrow_plan::AggCall;
 
+    #[test]
+    fn r3_closed_window_index_is_billed_and_released() {
+        let mut window = op();
+        let owner = Arc::clone(&window.owner);
+        window.on_row(&Row { values: vec![Scalar::utf8("indexed-key"), Scalar::Int64(1)] }, 0).unwrap();
+        let index_bytes: usize = window.closed_index.values().map(StateKey::index_bytes).sum();
+        assert!(index_bytes > 0);
+        assert_eq!(window.retention_bytes(), owner.usage().retention_bytes);
+        window.cleanup();
+        assert_eq!(owner.usage().retention_bytes, 0);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
     fn schema() -> Schema {
         Schema::new(
             SchemaId::new(1),
@@ -1297,6 +1315,9 @@ mod review_tests {
             16,
         )
         .unwrap();
+        assert!(w.output_schema().field_by_name("count_start").is_some());
+        assert!(w.output_schema().field_by_name("count_end").is_some());
+        assert!(w.output_schema().field_by_name("window_start").is_none());
         let r1 = Row {
             values: vec![Scalar::utf8("a"), Scalar::Int64(1)],
         };

@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sparrow_control::{host_kernel, secrets_key_configured, secrets_key_required, Store};
+use sparrow_control::{host_kernel, host_kernel_with_max_jobs, parse_max_jobs, secrets_key_configured, secrets_key_required, Store};
 use sparrow_model::{ErrorCode, SparrowError};
 use sparrow_server::{boot, serve, DEFAULT_BIND};
 
@@ -19,6 +19,7 @@ struct Opts {
     safe_mode: bool,
     demo_io: bool,
     allow_remote: bool,
+    max_jobs: Option<usize>,
 }
 
 fn parse_opts() -> Result<Opts, SparrowError> {
@@ -28,12 +29,14 @@ fn parse_opts() -> Result<Opts, SparrowError> {
     let mut safe_mode = false;
     let mut demo_io = false;
     let mut allow_remote = false;
+    let mut max_jobs = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--bind" => bind = args.next().ok_or_else(|| arg("--bind needs a value"))?,
             "--token" => token = args.next().ok_or_else(|| arg("--token needs a value"))?,
             "--catalog" => catalog = args.next().ok_or_else(|| arg("--catalog needs a value"))?,
+            "--max-jobs" => max_jobs = Some(parse_max_jobs(&args.next().ok_or_else(|| arg("--max-jobs needs a value"))?)?),
             "--safe-mode" => {
                 safe_mode = true;
                 if std::env::var_os("SPARROW_SAFE_MODE").is_none() {
@@ -74,6 +77,7 @@ fn parse_opts() -> Result<Opts, SparrowError> {
         safe_mode,
         demo_io,
         allow_remote,
+        max_jobs,
     })
 }
 
@@ -89,6 +93,9 @@ sparrow-server — Sparrow V0.1 control plane
   --bind ADDR         default {DEFAULT_BIND} (loopback)
   --token TOKEN       or SPARROW_TOKEN (required)
   --catalog PATH      SQLite file (or :memory:)
+  --max-jobs N        concurrent job capacity (1..=256); overrides SPARROW_MAX_JOBS
+                      default 16; each job: 4 MiB reservation + 4 MiB retention
+                      + 2 MiB queue, 1024 state keys
   --safe-mode         do not auto-activate pipelines whose last attempt failed;
                       also requires SPARROW_DATA_ROOTS for file/checkpoint paths
   --demo-io           start in-process MQTT broker + HTTP capture
@@ -119,23 +126,54 @@ fn init_tracing() {
     let _ = tracing::subscriber::set_global_default(StderrSubscriber::from_env());
 }
 
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn r3_log_directives_filter_each_target() {
+        let subscriber = StderrSubscriber::from_filter("error,hyper=warn,sparrow=debug,sparrow_runtime=off");
+        assert!(!subscriber.allows("hyper::client", &tracing::Level::DEBUG));
+        assert!(subscriber.allows("hyper::client", &tracing::Level::WARN));
+        assert!(subscriber.allows("sparrow_control", &tracing::Level::DEBUG));
+        assert!(!subscriber.allows("sparrow_runtime", &tracing::Level::ERROR));
+        assert!(!subscriber.allows("other", &tracing::Level::INFO));
+    }
+}
+
 /// Minimal stderr subscriber so production `checkpoint_commit` info
 /// lines appear without pulling `tracing-subscriber` (and its
 /// edition2024-only transitive crates) onto this toolchain.
 struct StderrSubscriber {
-    max: tracing::Level,
+    default: tracing::level_filters::LevelFilter,
+    targets: Vec<(String, tracing::level_filters::LevelFilter)>,
 }
 
 impl StderrSubscriber {
     fn from_env() -> Self {
-        let max = match std::env::var("RUST_LOG") {
-            Ok(s) if s.contains("trace") => tracing::Level::TRACE,
-            Ok(s) if s.contains("debug") => tracing::Level::DEBUG,
-            Ok(s) if s.contains("warn") => tracing::Level::WARN,
-            Ok(s) if s.contains("error") => tracing::Level::ERROR,
-            _ => tracing::Level::INFO,
-        };
-        Self { max }
+        Self::from_filter(&std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+    }
+
+    fn from_filter(filter: &str) -> Self {
+        let mut this = Self { default: tracing::level_filters::LevelFilter::INFO, targets: Vec::new() };
+        for directive in filter.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some((target, level)) = directive.split_once('=') {
+                if let Ok(level) = level.trim().parse() {
+                    this.targets.push((target.trim().to_owned(), level));
+                }
+            } else if let Ok(level) = directive.parse() {
+                this.default = level;
+            } else {
+                this.targets.push((directive.to_owned(), tracing::level_filters::LevelFilter::TRACE));
+            }
+        }
+        this
+    }
+
+    fn allows(&self, target: &str, level: &tracing::Level) -> bool {
+        let max = self.targets.iter().filter(|(prefix, _)| target.starts_with(prefix))
+            .max_by_key(|(prefix, _)| prefix.len()).map_or(self.default, |(_, level)| *level);
+        *level <= max
     }
 }
 
@@ -161,7 +199,7 @@ impl tracing::field::Visit for FieldBuf {
 
 impl tracing::Subscriber for StderrSubscriber {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.level() <= &self.max
+        self.allows(metadata.target(), metadata.level())
     }
 
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -173,6 +211,7 @@ impl tracing::Subscriber for StderrSubscriber {
     fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
 
     fn event(&self, event: &tracing::Event<'_>) {
+        if !self.allows(event.metadata().target(), event.metadata().level()) { return; }
         let mut buf = FieldBuf(String::new());
         event.record(&mut buf);
         eprintln!(
@@ -208,7 +247,10 @@ fn run() -> Result<(), SparrowError> {
         Store::open(&opts.catalog)?
     };
     let store = Arc::new(store);
-    let kernel = Arc::new(host_kernel()?);
+    let kernel = Arc::new(match opts.max_jobs {
+        Some(n) => host_kernel_with_max_jobs(n)?,
+        None => host_kernel()?,
+    });
     let bind = opts.bind;
     let token = opts.token.clone();
     let safe = opts.safe_mode;

@@ -22,8 +22,168 @@ const STREAM_ET: &str = r#"{"fields":[
   {"name":"ts","type":"int64","nullable":false}
 ]}"#;
 
+#[test]
+#[cfg(feature = "demo-io")]
+fn r3_nested_stream_decode_batch_window_and_http_sink() {
+    nested_file_to_http("array<int64>", "[1,2]", "[3,4]");
+}
+
+#[test]
+#[cfg(feature = "demo-io")]
+fn r4_struct_map_and_nested_arrays_file_to_http() {
+    for (ty, a, b) in [
+        ("struct<b:int64,a:int64>", r#"{"b":1,"a":2}"#, r#"{"a":4,"b":3}"#),
+        ("map<utf8,int64>", r#"{"b":1,"a":2}"#, r#"{"a":4,"b":3}"#),
+        ("array<struct<b:int64,a:int64>>", r#"[{"b":1,"a":2}]"#, r#"[{"a":4,"b":3}]"#),
+        ("array<map<utf8,int64>>", r#"[{"b":1,"a":2}]"#, r#"[{"a":4,"b":3}]"#),
+    ] { nested_file_to_http(ty, a, b); }
+}
+
+#[cfg(feature = "demo-io")]
+fn nested_file_to_http(ty: &str, a: &str, b: &str) {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", &serde_json::json!({"fields":[{"name":"xs","type":ty,"nullable":false}]}).to_string()).unwrap();
+        let path = tmp("r3-nested");
+        std::fs::write(&path, format!("{{\"xs\":{a}}}\n{{\"xs\":{b}}}\n{{\"xs\":{a}}}\n{{\"xs\":{b}}}")).unwrap();
+        let http = sparrow_connectors::HttpCapture::start().await.unwrap();
+        store.put_allow("127.0.0.1", http.port()).unwrap();
+        let mut spec = file_spec(&path.to_string_lossy(),
+            "SELECT COUNT(*) AS n, xs FROM sensors GROUP BY xs, COUNT_WINDOW(2)", "restart_fresh", None);
+        spec.source.file_contract = Some("sealed".into());
+        spec.sink.kind = "http".into();
+        spec.sink.url = Some(http.url());
+        store.put_pipeline("r3-nested", &spec, None).unwrap();
+        request_start(&store, "r3-nested", "test").unwrap();
+        let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        sup.converge_once().await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while http_window_rows(&http).len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let rows = http_window_rows(&http);
+        sup.converge_once().await.unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}; actual={:?}; io={:?}", store.actual("r3-nested"), sup.io_snapshot().await);
+        for value in [a, b] {
+            let expected: serde_json::Value = serde_json::from_str(value).unwrap();
+            assert!(rows.iter().any(|r| r["xs"] == expected && r["n"] == 2), "{ty}: {rows:?}");
+        }
+        sup.kill_named("r3-nested").await.unwrap();
+        http.stop().await;
+        std::fs::remove_file(path).unwrap();
+    });
+}
+
 const ET_TUMBLE_SQL: &str =
     "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, TUMBLE(ts, INTERVAL '10' SECOND)";
+
+#[test]
+fn r3_host_runs_eight_window_pipelines() {
+    let kernel = Arc::new(crate::host_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let path = tmp("r3-capacity");
+        std::fs::write(&path, b"").unwrap();
+        for n in 0..8 {
+            let name = format!("r3-{n}");
+            let spec = file_spec(&path.to_string_lossy(),
+                "SELECT COUNT(*) AS n, device_id FROM sensors WHERE v > 0 GROUP BY device_id, COUNT_WINDOW(2)",
+                "restart_fresh", None);
+            store.put_pipeline(&name, &spec, None).unwrap();
+            request_start(&store, &name, "test").unwrap();
+        }
+        let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        sup.converge_once().await.unwrap();
+        for n in 0..8 { assert_eq!(store.actual(&format!("r3-{n}")).unwrap().status, "running"); }
+        assert_eq!(kernel.admitted_jobs(), 8);
+        for n in 0..8 { sup.kill_named(&format!("r3-{n}")).await.unwrap(); }
+        assert_eq!(kernel.admitted_jobs(), 0);
+        assert_eq!(kernel.process_owner().usage().physical_bytes, 0);
+        std::fs::remove_file(path).unwrap();
+    });
+}
+
+#[test]
+fn r3_fast_crashes_accumulate_until_stable_recovery() {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let path = tmp("r3-crash-loop");
+        std::fs::write(&path, b"bad-json\n").unwrap();
+        let mut spec = file_spec(&path.to_string_lossy(), "SELECT device_id FROM sensors", "restart_fresh", None);
+        spec.fail_on_decode = true;
+        store.put_pipeline("r3-crash", &spec, None).unwrap();
+        request_start(&store, "r3-crash", "test").unwrap();
+        let mut sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        for expected in 1..=3 {
+            if expected > 1 {
+                tokio::time::sleep(retry_backoff(expected - 1) + std::time::Duration::from_millis(20)).await;
+            }
+            sup.converge_once().await.unwrap();
+            assert_eq!(store.actual("r3-crash").unwrap().consecutive_failures, expected - 1);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                sup.converge_once().await.unwrap();
+                if store.actual("r3-crash").unwrap().status == "failed" { break; }
+                assert!(std::time::Instant::now() < deadline);
+            }
+            assert_eq!(store.actual("r3-crash").unwrap().consecutive_failures, expected);
+        }
+        std::fs::write(&path, b"").unwrap();
+        tokio::time::sleep(retry_backoff(3) + std::time::Duration::from_millis(20)).await;
+        sup.converge_once().await.unwrap();
+        assert_eq!(store.actual("r3-crash").unwrap().consecutive_failures, 3);
+        Arc::get_mut(&mut sup).unwrap().stable_run = std::time::Duration::ZERO;
+        sup.converge_once().await.unwrap();
+        assert_eq!(store.actual("r3-crash").unwrap().consecutive_failures, 0);
+        sup.kill_named("r3-crash").await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    });
+}
+
+#[test]
+fn r3_repeated_admission_rejection_never_consumes_crash_cap() {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let path = tmp("r3-admission");
+        std::fs::write(&path, b"").unwrap();
+        for n in 0..5 {
+            let name = format!("r3-{n}");
+            let spec = file_spec(&path.to_string_lossy(), "SELECT device_id FROM sensors", "restart_fresh", None);
+            store.put_pipeline(&name, &spec, None).unwrap();
+            request_start(&store, &name, "test").unwrap();
+        }
+        let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        sup.converge_once().await.unwrap();
+        let first = store.actual("r3-4").unwrap();
+        let history_id = store.last_attempt("r3-4").unwrap().unwrap().id;
+        for _ in 0..120 {
+            sup.clear_retry("r3-4").await;
+            sup.converge_once().await.unwrap();
+        }
+        let waiting = store.actual("r3-4").unwrap();
+        assert_eq!(waiting.attempt_id, first.attempt_id, "capacity polls are not new attempts");
+        assert_eq!(store.last_attempt("r3-4").unwrap().unwrap().id, history_id,
+            "neither starting nor waiting may flood history during capacity retries");
+        assert!(store.last_attempt("r3-0").unwrap().is_some(), "waiting must not evict sibling history");
+        assert_eq!(waiting.consecutive_failures, 0);
+        assert!(!waiting.last_error.as_deref().unwrap_or("").contains("held:"));
+        request_stop(&store, "r3-0", "test").unwrap();
+        sup.kill_named("r3-0").await.unwrap();
+        sup.clear_retry("r3-4").await;
+        sup.converge_once().await.unwrap();
+        assert_eq!(store.actual("r3-4").unwrap().status, "running");
+        assert_eq!(store.actual("r3-4").unwrap().attempt_id, first.attempt_id + 1);
+        for n in 1..5 { sup.kill_named(&format!("r3-{n}")).await.unwrap(); }
+        std::fs::remove_file(path).unwrap();
+    });
+}
 
 #[cfg(feature = "demo-io")]
 fn http_window_rows(http: &sparrow_connectors::HttpCapture) -> Vec<serde_json::Value> {
@@ -344,6 +504,7 @@ fn n1_consecutive_failure_cap_holds_with_error() {
             "cap must skip converge start: {held:?}"
         );
         let err = held.last_error.as_deref().unwrap_or("");
+        assert!(err.contains("boom"), "hold must preserve the original error: {err}");
         assert!(
             err.contains("held:") && err.contains("consecutive_failures"),
             "held pipeline must record last_error, got {held:?}"
@@ -642,7 +803,9 @@ fn n4_stale_barrier_ack_not_used_for_next_checkpoint() {
         )
         .unwrap();
         let http = sparrow_connectors::HttpCapture::start().await.unwrap();
-        http.set_delay_ms(6_500);
+        // Delay longer than the coordinator deadline, but shorter than the
+        // HTTP request timeout. A transport drop must remain sticky (R3-4).
+        http.set_delay_ms(400);
         store.put_allow("127.0.0.1", http.port()).unwrap();
         let mut spec = file_spec(
             &path.to_string_lossy(),
@@ -654,7 +817,8 @@ fn n4_stale_barrier_ack_not_used_for_next_checkpoint() {
         spec.sink.url = Some(http.url());
         store.put_pipeline("n4", &spec, None).unwrap();
         request_start(&store, "n4", "test").unwrap();
-        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        let mut sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        Arc::get_mut(&mut sup).unwrap().checkpoint_timeout = std::time::Duration::from_millis(100);
         let _ = sup.converge_once().await;
         let actual = store.actual("n4").unwrap();
         assert_eq!(actual.status, "running", "{:?}", actual.last_error);
@@ -794,6 +958,13 @@ fn n7_aligned_checkpoint_refuses_after_sink_4xx() {
             msg.contains("refus") || msg.contains("drop") || msg.contains("align"),
             "{err}"
         );
+
+        // Recovering the endpoint cannot retroactively deliver lost batches.
+        http.set_status(200);
+        for _ in 0..3 {
+            assert!(sup.checkpoint_named("n7").await.is_err());
+            assert!(!current.exists(), "retry must not clear unacknowledged loss");
+        }
 
         sup.kill_named("n7").await.unwrap();
         http.stop().await;

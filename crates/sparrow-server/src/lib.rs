@@ -70,6 +70,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     err: SparrowError,
@@ -112,6 +113,16 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
+
+/// SQLite and synchronous plan/config work must not block Axum workers.
+async fn blocking_api<T, F>(f: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> ApiResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(|e| ApiError::from(
+        SparrowError::new(ErrorCode::Internal, format!("API worker: {e}"))))?
+}
 
 fn require_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
     let raw = headers
@@ -190,28 +201,37 @@ async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> ApiR
 
 async fn validate(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
     let actor = require_auth(&state, &headers)?;
-    let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
-    let report = run_validate(&state, &spec)?;
-    let _ = state.store.audit(&actor, "validate", spec.sql.as_deref(), None, "ok");
-    Ok(Json(report))
+    blocking_api(move || {
+        let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
+        let report = run_validate(&state, &spec)?;
+        let _ = state.store.audit(&actor, "validate", spec.sql.as_deref(), None, "ok");
+        Ok(Json(report))
+    })
+    .await
 }
 
 async fn explain(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
     let _ = require_auth(&state, &headers)?;
-    let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
-    Ok(Json(run_explain(&state, &spec)?))
+    blocking_api(move || {
+        let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
+        Ok(Json(run_explain(&state, &spec)?))
+    })
+    .await
 }
 
 async fn test_plan(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
     let _ = require_auth(&state, &headers)?;
-    let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
-    let mut out = run_validate(&state, &spec)?;
-    if let Value::Object(map) = &mut out {
-        map.insert("explain".into(), run_explain(&state, &spec)?);
-        map.insert("started".into(), json!(false));
-        map.insert("note".into(), json!("test does not start I/O"));
-    }
-    Ok(Json(out))
+    blocking_api(move || {
+        let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
+        let mut out = run_validate(&state, &spec)?;
+        if let Value::Object(map) = &mut out {
+            map.insert("explain".into(), run_explain(&state, &spec)?);
+            map.insert("started".into(), json!(false));
+            map.insert("note".into(), json!("test does not start I/O"));
+        }
+        Ok(Json(out))
+    })
+    .await
 }
 
 fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
@@ -273,20 +293,23 @@ async fn graph_validate(
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     let _ = require_auth(&state, &headers)?;
-    let text = std::str::from_utf8(&body).map_err(|_| {
-        ApiError::from(SparrowError::new(
-            ErrorCode::InvalidArgument,
-            "GraphSpec must be UTF-8 JSON",
-        ))
-    })?;
-    let spec = sparrow_plan::GraphSpec::from_json(text).map_err(ApiError::from)?;
-    let catalog = sparrow_plan::Catalog::new();
-    let bound = sparrow_plan::validate_graph(&spec, &catalog).map_err(ApiError::from)?;
-    Ok(Json(json!({
-        "accepted": true,
-        "nodes": bound.nodes.len(),
-        "honesty": HONESTY,
-    })))
+    blocking_api(move || {
+        let text = std::str::from_utf8(&body).map_err(|_| {
+            ApiError::from(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "GraphSpec must be UTF-8 JSON",
+            ))
+        })?;
+        let spec = sparrow_plan::GraphSpec::from_json(text).map_err(ApiError::from)?;
+        let catalog = binder_catalog(&state.store).map_err(ApiError::from)?;
+        let bound = sparrow_plan::validate_graph(&spec, &catalog).map_err(ApiError::from)?;
+        Ok(Json(json!({
+            "accepted": true,
+            "nodes": bound.nodes.len(),
+            "honesty": HONESTY,
+        })))
+    })
+    .await
 }
 
 async fn graph_explain(
@@ -295,30 +318,34 @@ async fn graph_explain(
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     let _ = require_auth(&state, &headers)?;
-    let text = std::str::from_utf8(&body).map_err(|_| {
-        ApiError::from(SparrowError::new(
-            ErrorCode::InvalidArgument,
-            "GraphSpec must be UTF-8 JSON",
-        ))
-    })?;
-    let spec = sparrow_plan::GraphSpec::from_json(text).map_err(ApiError::from)?;
-    let report = sparrow_plan::explain_graph(&spec, &sparrow_plan::Catalog::new())
-        .map_err(ApiError::from)?;
-    Ok(Json(json!({
-        "accepted": report.accepted,
-        "stages": report.stages,
-        "physical": report.physical,
-        "fusion": report.fusion,
-        "time": report.time,
-        "state": report.state,
-        "guarantee": report.guarantee,
-        "fused": report.fused,
-        "mailbox_count": report.mailbox_count,
-        "delivery": report.delivery,
-        "recovery": report.recovery,
-        "honesty": report.honesty,
-        "experimental": report.experimental,
-    })))
+    blocking_api(move || {
+        let text = std::str::from_utf8(&body).map_err(|_| {
+            ApiError::from(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "GraphSpec must be UTF-8 JSON",
+            ))
+        })?;
+        let spec = sparrow_plan::GraphSpec::from_json(text).map_err(ApiError::from)?;
+        let catalog = binder_catalog(&state.store).map_err(ApiError::from)?;
+        let report = sparrow_plan::explain_graph(&spec, &catalog)
+            .map_err(ApiError::from)?;
+        Ok(Json(json!({
+            "accepted": report.accepted,
+            "stages": report.stages,
+            "physical": report.physical,
+            "fusion": report.fusion,
+            "time": report.time,
+            "state": report.state,
+            "guarantee": report.guarantee,
+            "fused": report.fused,
+            "mailbox_count": report.mailbox_count,
+            "delivery": report.delivery,
+            "recovery": report.recovery,
+            "honesty": report.honesty,
+            "experimental": report.experimental,
+        })))
+    })
+    .await
 }
 
 async fn put_stream(
@@ -328,20 +355,23 @@ async fn put_stream(
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let actor = require_auth(&state, &headers)?;
-    let spec = StreamSpec::from_json(&body).map_err(ApiError::from)?;
-    let _ = stream_schema(&name, &spec).map_err(ApiError::from)?;
-    let json = serde_json::to_string(&spec).map_err(|e| {
-        ApiError::from(SparrowError::new(ErrorCode::InvalidArgument, e.to_string()))
-    })?;
-    state.store.put_stream(&name, &json).map_err(ApiError::from)?;
-    state
-        .store
-        .audit(&actor, "put_stream", Some(&name), None, "ok")
-        .map_err(ApiError::from)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({"name": name, "fields": spec.fields})),
-    ))
+    blocking_api(move || {
+        let spec = StreamSpec::from_json(&body).map_err(ApiError::from)?;
+        let _ = stream_schema(&name, &spec).map_err(ApiError::from)?;
+        let json = serde_json::to_string(&spec).map_err(|e| {
+            ApiError::from(SparrowError::new(ErrorCode::InvalidArgument, e.to_string()))
+        })?;
+        state.store.put_stream(&name, &json).map_err(ApiError::from)?;
+        state
+            .store
+            .audit(&actor, "put_stream", Some(&name), None, "ok")
+            .map_err(ApiError::from)?;
+        Ok((
+            StatusCode::CREATED,
+            Json(json!({"name": name, "fields": spec.fields})),
+        ))
+    })
+    .await
 }
 
 async fn get_stream(
@@ -350,21 +380,27 @@ async fn get_stream(
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
-    let row = state.store.get_stream(&name).map_err(ApiError::from)?;
-    let spec: Value = serde_json::from_str(&row.schema_json).unwrap_or(Value::Null);
-    Ok(Json(json!({"name": row.name, "schema": spec})))
+    blocking_api(move || {
+        let row = state.store.get_stream(&name).map_err(ApiError::from)?;
+        let spec: Value = serde_json::from_str(&row.schema_json).unwrap_or(Value::Null);
+        Ok(Json(json!({"name": row.name, "schema": spec})))
+    })
+    .await
 }
 
 async fn list_streams(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
-    let names: Vec<String> = state
-        .store
-        .list_streams()
-        .map_err(ApiError::from)?
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
-    Ok(Json(json!({"streams": names})))
+    blocking_api(move || {
+        let names: Vec<String> = state
+            .store
+            .list_streams()
+            .map_err(ApiError::from)?
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        Ok(Json(json!({"streams": names})))
+    })
+    .await
 }
 
 async fn put_pipeline(
@@ -374,46 +410,49 @@ async fn put_pipeline(
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let actor = require_auth(&state, &headers)?;
-    let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
-    run_validate(&state, &spec)?;
-    let etag = if_match(&headers);
-    let created = state.store.get_pipeline(&name).is_err();
-    let row = state
-        .store
-        .put_pipeline(&name, &spec, etag.as_deref())
-        .map_err(|e| {
-            if e.message.contains("If-Match") {
-                ApiError {
-                    status: if e.message.contains("required") {
-                        StatusCode::PRECONDITION_REQUIRED
-                    } else {
-                        StatusCode::PRECONDITION_FAILED
-                    },
-                    err: e,
+    blocking_api(move || {
+        let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
+        run_validate(&state, &spec)?;
+        let etag = if_match(&headers);
+        let created = state.store.get_pipeline(&name).is_err();
+        let row = state
+            .store
+            .put_pipeline(&name, &spec, etag.as_deref())
+            .map_err(|e| {
+                if e.message.contains("If-Match") {
+                    ApiError {
+                        status: if e.message.contains("required") {
+                            StatusCode::PRECONDITION_REQUIRED
+                        } else {
+                            StatusCode::PRECONDITION_FAILED
+                        },
+                        err: e,
+                    }
+                } else {
+                    ApiError::from(e)
                 }
-            } else {
-                ApiError::from(e)
-            }
-        })?;
-    state
-        .store
-        .audit(&actor, "put_pipeline", Some(&name), Some(&row.etag), "ok")
-        .map_err(ApiError::from)?;
-    let status = if created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    Ok((
-        status,
-        Json(json!({
-            "name": row.name,
-            "revision": row.latest_revision,
-            "etag": row.etag,
-            "delivery": "live_best_effort",
-            "recovery": "restart_fresh",
-        })),
-    ))
+            })?;
+        state
+            .store
+            .audit(&actor, "put_pipeline", Some(&name), Some(&row.etag), "ok")
+            .map_err(ApiError::from)?;
+        let status = if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
+        Ok((
+            status,
+            Json(json!({
+                "name": row.name,
+                "revision": row.latest_revision,
+                "etag": row.etag,
+                "delivery": "live_best_effort",
+                "recovery": "restart_fresh",
+            })),
+        ))
+    })
+    .await
 }
 
 async fn get_pipeline(
@@ -422,7 +461,7 @@ async fn get_pipeline(
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
-    Ok(Json(status_body(&state, &name)?))
+    blocking_api(move || Ok(Json(status_body(&state, &name)?))).await
 }
 
 async fn pipeline_status(
@@ -431,7 +470,7 @@ async fn pipeline_status(
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
-    Ok(Json(status_body(&state, &name)?))
+    blocking_api(move || Ok(Json(status_body(&state, &name)?))).await
 }
 
 fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
@@ -483,6 +522,8 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         "checkpoint_commits": snap.checkpoint_commits,
         "checkpoint_aborts": snap.checkpoint_aborts,
         "future_dropped": snap.future_dropped,
+        "timers_live": snap.timers_live,
+        "timers_cancelled": snap.timers_cancelled,
         "io": {
             "mqtt_received": io.mqtt_received,
             "mqtt_decoded": io.mqtt_decoded,
@@ -503,8 +544,11 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
 
 async fn list_pipelines(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
-    let names = state.store.list_pipeline_names().map_err(ApiError::from)?;
-    Ok(Json(json!({"pipelines": names})))
+    blocking_api(move || {
+        let names = state.store.list_pipeline_names().map_err(ApiError::from)?;
+        Ok(Json(json!({"pipelines": names})))
+    })
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -519,36 +563,39 @@ async fn start_pipeline(
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     let actor = require_auth(&state, &headers)?;
-    if let Some(tag) = if_match(&headers) {
-        let row = state.store.get_pipeline(&name).map_err(ApiError::from)?;
-        if tag != row.etag {
-            return Err(ApiError {
-                status: StatusCode::PRECONDITION_FAILED,
-                err: SparrowError::new(ErrorCode::InvalidArgument, "If-Match does not match etag"),
-            });
+    blocking_api(move || {
+        if let Some(tag) = if_match(&headers) {
+            let row = state.store.get_pipeline(&name).map_err(ApiError::from)?;
+            if tag != row.etag {
+                return Err(ApiError {
+                    status: StatusCode::PRECONDITION_FAILED,
+                    err: SparrowError::new(ErrorCode::InvalidArgument, "If-Match does not match etag"),
+                });
+            }
         }
-    }
-    let revision = if body.is_empty() {
-        None
-    } else {
-        let parsed: StartBody = serde_json::from_slice(&body).map_err(|e| {
-            ApiError::from(SparrowError::new(
-                ErrorCode::InvalidArgument,
-                format!("start body JSON: {e}"),
-            ))
-        })?;
-        parsed.revision
-    };
-    request_start_at(&state.store, &name, &actor, revision).map_err(ApiError::from)?;
-    state.supervisor.wake();
-    let mut body = status_body(&state, &name)?;
-    if let Value::Object(map) = &mut body {
-        map.insert(
-            "note".into(),
-            json!("desired state committed; supervisor converges asynchronously. This is not exactly-once."),
-        );
-    }
-    Ok(Json(body))
+        let revision = if body.is_empty() {
+            None
+        } else {
+            let parsed: StartBody = serde_json::from_slice(&body).map_err(|e| {
+                ApiError::from(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("start body JSON: {e}"),
+                ))
+            })?;
+            parsed.revision
+        };
+        request_start_at(&state.store, &name, &actor, revision).map_err(ApiError::from)?;
+        state.supervisor.wake();
+        let mut body = status_body(&state, &name)?;
+        if let Value::Object(map) = &mut body {
+            map.insert(
+                "note".into(),
+                json!("desired state committed; supervisor converges asynchronously. This is not exactly-once."),
+            );
+        }
+        Ok(Json(body))
+    })
+    .await
 }
 
 async fn checkpoint_pipeline(
@@ -594,16 +641,19 @@ async fn restore_pipeline(
         .await
         .map_err(ApiError::from)?;
     // Start the latest revision — the one that contains restore=checkpoint (P0-3).
-    request_start(&state.store, &name, &actor).map_err(ApiError::from)?;
-    state.supervisor.wake();
-    let mut body = status_body(&state, &name)?;
-    if let Value::Object(map) = &mut body {
-        map.insert(
-            "note".into(),
-            json!("restore requested; supervisor starts the revision that contains restore=checkpoint. Not exactly-once."),
-        );
-    }
-    Ok(Json(body))
+    blocking_api(move || {
+        request_start(&state.store, &name, &actor).map_err(ApiError::from)?;
+        state.supervisor.wake();
+        let mut body = status_body(&state, &name)?;
+        if let Value::Object(map) = &mut body {
+            map.insert(
+                "note".into(),
+                json!("restore requested; supervisor starts the revision that contains restore=checkpoint. Not exactly-once."),
+            );
+        }
+        Ok(Json(body))
+    })
+    .await
 }
 
 async fn kill_pipeline(
@@ -612,10 +662,12 @@ async fn kill_pipeline(
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let actor = require_auth(&state, &headers)?;
-    request_stop(&state.store, &name, &actor).map_err(ApiError::from)?;
+    let state_c = state.clone();
+    let name_c = name.clone();
+    blocking_api(move || request_stop(&state_c.store, &name_c, &actor).map_err(ApiError::from)).await?;
     state.supervisor.kill_named(&name).await.map_err(ApiError::from)?;
     state.supervisor.wake();
-    Ok(Json(status_body(&state, &name)?))
+    blocking_api(move || Ok(Json(status_body(&state, &name)?))).await
 }
 
 async fn stop_pipeline(
@@ -624,9 +676,12 @@ async fn stop_pipeline(
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let actor = require_auth(&state, &headers)?;
-    request_stop(&state.store, &name, &actor).map_err(ApiError::from)?;
-    state.supervisor.wake();
-    Ok(Json(status_body(&state, &name)?))
+    blocking_api(move || {
+        request_stop(&state.store, &name, &actor).map_err(ApiError::from)?;
+        state.supervisor.wake();
+        Ok(Json(status_body(&state, &name)?))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -641,12 +696,15 @@ async fn put_allow(
     Json(body): Json<AllowBody>,
 ) -> ApiResult<Json<Value>> {
     let actor = require_auth(&state, &headers)?;
-    state.store.put_allow(&body.host, body.port).map_err(ApiError::from)?;
-    state
-        .store
-        .audit(&actor, "allowlist", Some(&format!("{}:{}", body.host, body.port)), None, "ok")
-        .map_err(ApiError::from)?;
-    Ok(Json(json!({"host": body.host, "port": body.port})))
+    blocking_api(move || {
+        state.store.put_allow(&body.host, body.port).map_err(ApiError::from)?;
+        state
+            .store
+            .audit(&actor, "allowlist", Some(&format!("{}:{}", body.host, body.port)), None, "ok")
+            .map_err(ApiError::from)?;
+        Ok(Json(json!({"host": body.host, "port": body.port})))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -661,18 +719,21 @@ async fn put_secret(
     Json(body): Json<SecretBody>,
 ) -> ApiResult<StatusCode> {
     let actor = require_auth(&state, &headers)?;
-    if body.value.len() > 4096 {
-        return Err(ApiError::from(SparrowError::new(
-            ErrorCode::MaxRecordSize,
-            "secret value exceeds 4KiB",
-        )));
-    }
-    state.store.put_secret(&name, &body.value).map_err(ApiError::from)?;
-    state
-        .store
-        .audit(&actor, "put_secret", Some(&name), Some("value redacted"), "ok")
-        .map_err(ApiError::from)?;
-    Ok(StatusCode::NO_CONTENT)
+    blocking_api(move || {
+        if body.value.len() > 4096 {
+            return Err(ApiError::from(SparrowError::new(
+                ErrorCode::MaxRecordSize,
+                "secret value exceeds 4KiB",
+            )));
+        }
+        state.store.put_secret(&name, &body.value).map_err(ApiError::from)?;
+        state
+            .store
+            .audit(&actor, "put_secret", Some(&name), Some("value redacted"), "ok")
+            .map_err(ApiError::from)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
 }
 
 async fn list_audit(
@@ -680,19 +741,22 @@ async fn list_audit(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
-    let rows = state.store.list_audit(50).map_err(ApiError::from)?;
-    Ok(Json(json!({
-        "audit": rows.iter().map(|r| json!({
-            "id": r.id,
-            "at_ms": r.at_ms,
-            "actor": r.actor,
-            "action": r.action,
-            "target": r.target,
-            "detail": r.detail,
-            "outcome": r.outcome,
-        })).collect::<Vec<_>>(),
-        "cap": 200,
-    })))
+    blocking_api(move || {
+        let rows = state.store.list_audit(50).map_err(ApiError::from)?;
+        Ok(Json(json!({
+            "audit": rows.iter().map(|r| json!({
+                "id": r.id,
+                "at_ms": r.at_ms,
+                "actor": r.actor,
+                "action": r.action,
+                "target": r.target,
+                "detail": r.detail,
+                "outcome": r.outcome,
+            })).collect::<Vec<_>>(),
+            "cap": 200,
+        })))
+    })
+    .await
 }
 
 async fn demo_io(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -782,7 +846,11 @@ pub async fn boot(
         }
         None
     };
-    let supervisor = Supervisor::new(Arc::clone(&store), kernel, safe_mode, demo.clone())?;
+    let store_c = Arc::clone(&store);
+    let demo_c = demo.clone();
+    let supervisor = tokio::task::spawn_blocking(move ||
+        Supervisor::new(store_c, kernel, safe_mode, demo_c))
+        .await.map_err(|e| SparrowError::new(ErrorCode::Internal, format!("boot: {e}")))??;
     let state = AppState {
         store,
         supervisor: Arc::clone(&supervisor),
@@ -813,7 +881,10 @@ pub async fn wait_status(
 ) -> Result<(), SparrowError> {
     let start = std::time::Instant::now();
     loop {
-        if let Ok(a) = state.store.actual(name) {
+        let store = state.store.clone();
+        let name_c = name.to_owned();
+        let worker = store.clone();
+        if let Ok(a) = store.run_blocking(move || worker.actual(&name_c)).await {
             if a.status == actual {
                 return Ok(());
             }
@@ -837,6 +908,31 @@ pub async fn wait_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "demo-io"))]
+    #[tokio::test]
+    async fn r3_disabled_demo_boot_returns_feature_error_without_runtime_drop_panic() {
+        let kernel = Arc::new(sparrow_control::compact_kernel().unwrap());
+        let store = Arc::new(Store::open_memory().unwrap());
+        match boot(store, kernel, "token".into(), false, true).await {
+            Err(error) => assert_eq!(error.code, ErrorCode::FeatureUnavailable),
+            Ok(_) => panic!("demo I/O must be unavailable"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r3_blocking_api_keeps_async_worker_responsive() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(blocking_api(move || {
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(())
+        }));
+        rx.await.unwrap();
+        tokio::time::timeout(Duration::from_millis(80), tokio::time::sleep(Duration::from_millis(10))).await.unwrap();
+        assert!(!worker.is_finished(), "blocking work must not monopolize this thread");
+        worker.await.unwrap().unwrap();
+    }
 
     #[test]
     fn p3_56_resource_exhausted_and_cancelled_not_500() {

@@ -17,6 +17,55 @@ const STREAM: &str = r#"{"fields":[
   {"name":"v","type":"int64","nullable":false}
 ]}"#;
 
+#[test]
+fn r4_capacity_waiting_is_visible_in_http_status() {
+    let kernel = Arc::new(sparrow_control::host_kernel_with_max_jobs(1).unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        let supervisor = sparrow_control::Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        let state = AppState { store: store.clone(), supervisor, token: Arc::new(TOKEN.into()), safe_mode: false };
+        let path = tmp("r4-capacity.ndjson");
+        std::fs::write(&path, b"").unwrap();
+        store.put_stream("sensors", STREAM).unwrap();
+        for name in ["a", "b"] {
+            let spec = sparrow_control::PipelineSpec::from_json(&serde_json::to_vec(&json!({
+                "stream":"sensors", "sql":"SELECT device_id FROM sensors",
+                "source":{"kind":"file","path":path,"file_contract":"append_only"},
+                "sink":{"kind":"log"}
+            })).unwrap()).unwrap();
+            store.put_pipeline(name, &spec, None).unwrap();
+            sparrow_control::request_start(&store, name, "test").unwrap();
+        }
+        state.supervisor.converge_once().await.unwrap();
+        let (status, body) = call(&state, auth_get("/v1/pipelines/b/status")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["desired"]["status"], "running");
+        assert_eq!(body["actual"]["status"], "waiting");
+        assert!(body["actual"]["last_error"].as_str().unwrap().contains("capacity: 1/1 jobs admitted"));
+        state.supervisor.stop_all().await;
+        std::fs::remove_file(path).unwrap();
+    });
+}
+
+#[test]
+fn r3_graph_endpoints_use_registered_stream_catalog() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let (status, _) = call(&state, auth_put("/v1/streams/sensors", STREAM)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let graph = json!({"version":1, "pipeline_id":1, "revision_id":1, "nodes":[
+            {"id":1,"kind":"memory_source","table":"sensors","out":[2]},
+            {"id":2,"kind":"capture_sink","name":"out"}
+        ]}).to_string();
+        for endpoint in ["/v1/graphs/validate", "/v1/graphs/explain"] {
+            let (status, body) = call(&state, auth_post(endpoint, &graph)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["accepted"], true);
+        }
+    });
+}
+
 fn tmp(name: &str) -> std::path::PathBuf {
     sparrow_connectors::ensure_default_data_root().join(format!(
         "sparrow-api-{name}-{}-{}",
@@ -360,6 +409,7 @@ fn r28_same_prefix_different_suffix_rejects_restore() {
     });
 }
 
+#[cfg(feature = "demo-io")]
 const LIVE_STREAM: &str = r#"{"fields":[
   {"name":"device_id","type":"utf8","nullable":false},
   {"name":"temperature","type":"float64","nullable":true},
@@ -478,6 +528,7 @@ fn r12_where_change_rejects_restore_via_api() {
 }
 
 #[test]
+#[cfg(feature = "demo-io")]
 fn r25_mqtt_http_ingest_moves_metrics() {
     let kernel = compact_kernel().unwrap();
     kernel.block_on(async {

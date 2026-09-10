@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn identity_rotation_rejected() {
-        let mut src = MemoryReplaySource::from_lines("rot", &["a", "b"]);
+        let src = MemoryReplaySource::from_lines("rot", &["a", "b"]);
         let pos = src.position();
         let mut other = MemoryReplaySource::from_lines("rot", &["x", "y"]);
         assert_eq!(

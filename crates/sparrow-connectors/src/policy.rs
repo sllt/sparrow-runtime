@@ -223,9 +223,9 @@ fn resolve_for_policy(path: &Path) -> Result<PathBuf> {
     Ok(canon)
 }
 
-/// Resolve `.` / `..` lexically. `..` that would escape the filesystem root
-/// is rejected so `/tmp/../etc/passwd` becomes `/etc/passwd` (then fail the
-/// allowlist), never a lexical prefix of `/tmp`.
+/// Remove `.` and reject all `..` components before resolving symlinks.
+/// Lexically collapsing a parent component can authorize a different path
+/// than the OS opens when the preceding component is a symlink.
 fn lexical_normalize(path: &Path) -> Result<PathBuf> {
     let mut out = PathBuf::new();
     for c in path.components() {
@@ -234,12 +234,10 @@ fn lexical_normalize(path: &Path) -> Result<PathBuf> {
             Component::RootDir => out.push(c.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
-                    return Err(ConnectorError::new(
-                        ErrorCode::PolicyDenied,
-                        "path `..` escapes the filesystem root",
-                    ));
-                }
+                return Err(ConnectorError::new(
+                    ErrorCode::PolicyDenied,
+                    "parent components (`..`) are forbidden in data paths",
+                ));
             }
             Component::Normal(s) => out.push(s),
         }
@@ -366,6 +364,21 @@ mod tests {
         let p = ensure_default_data_root().join("sparrow-policy-ok.ndjson");
         check_data_path_in(&p, &default_data_roots())
             .expect("sparrow data dir is the default root");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn r3_symlink_parent_component_is_never_lexically_authorized() {
+        let base = ensure_default_data_root().join(format!("r3-symlink-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = base.join("allowed");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(outside.join("child")).unwrap();
+        std::os::unix::fs::symlink(outside.join("child"), root.join("link")).unwrap();
+        assert_eq!(check_data_path_in(&root.join("link/../secret"), &[root.clone()]).unwrap_err().code(), ErrorCode::PolicyDenied);
+        assert!(check_data_path_in(&root.join("ok.ndjson"), &[root]).is_ok());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

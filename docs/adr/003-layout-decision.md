@@ -12,8 +12,29 @@ scenarios (single-event, 128-row numeric filter/project, JSON/Dynamic extract,
 32-rule fan-out). DataFusion was documented as an experiments-only snippet and
 was not added as a Cargo dependency.
 
-Raw numbers live in `docs/m0-report.md`. They are selection-gate measurements,
-not SLOs.
+The original selection-gate measurements are retained below. They are
+historical layout/kernel experiments, not current performance SLOs.
+
+### Selection-gate evidence
+
+Measured on 2026-09-09 in the cloud agent VM with `rustc 1.88.0`,
+`x86_64-unknown-linux-gnu`, using
+`cargo run -p arrow-evaluation --release`. Both paths used the same
+`id`, `temp`, `name`, `payload` schema and `temp > 25` predicate.
+
+| Scenario | RowBatch ns/op | Arrow ns/op | Arrow / RowBatch |
+| --- | ---: | ---: | ---: |
+| Single-event filter/project | 73.1 | 434.8 | 5.95 |
+| 128-row numeric filter/project | 6619.1 | 645.7 | 0.10 |
+| JSON/Dynamic extract, 64 rows | 3223.1 | 2348.1 | 0.73 |
+| Fan-out, 32 rules × 32 rows | 39895.5 | 3992.2 | 0.10 |
+
+`layout-rowbatch --release`: 1000 × 64-row numeric filters took 2.32 ms;
+builder peak and tracked physical size were both 2560 B. Arrow's vectorized
+kernels versus scalar RowBatch evaluation explain much of the batch gap.
+The JSON cases perform different extraction strategies, so they are not a
+controlled codec comparison. DataFusion was a documented snippet only,
+not a dependency or optimizer benchmark.
 
 ## Decision
 
@@ -22,7 +43,7 @@ not SLOs.
 Do **not** make Arrow (or DataFusion) a dependency of `sparrow-model` or
 `sparrow-runtime`. Arrow remains under `experiments/arrow-evaluation`.
 
-Rationale (see the report for the table):
+Rationale (see the selection-gate evidence above):
 
 - Single-event filter/project is ~6× faster on RowBatch in the release suite.
   That path is the product's common case.

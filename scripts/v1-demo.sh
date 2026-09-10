@@ -103,7 +103,7 @@ for i in $(seq 1 80); do
   fi
   sleep 0.15
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    cat "$LOG" >&2
+    sed -n '1,200p' "$LOG" >&2
     fail "server exited"
   fi
 done

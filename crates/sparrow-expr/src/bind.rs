@@ -67,12 +67,14 @@ pub fn bind(expr: &Expr, schema: &Schema) -> Result<BoundExpr> {
         Expr::IsNotNull(inner) => Ok(BoundExpr::IsNotNull(Box::new(bind(inner, schema)?))),
         Expr::Not(inner) => Ok(BoundExpr::Not(Box::new(bind(inner, schema)?))),
         Expr::Call { name, args } => {
+            let name = name.to_ascii_lowercase();
+            check_call_arity(&name, args.len())?;
             let args = args
                 .iter()
                 .map(|a| bind(a, schema))
                 .collect::<Result<Vec<_>>>()?;
             Ok(BoundExpr::Call {
-                name: name.clone(),
+                name,
                 args,
             })
         }
@@ -86,7 +88,9 @@ pub fn bind(expr: &Expr, schema: &Schema) -> Result<BoundExpr> {
 /// Evaluate a bind-time tree. Column access is an index; no schema scan.
 pub fn eval_bound(expr: &BoundExpr, row: &[Scalar]) -> Result<Scalar> {
     match expr {
-        BoundExpr::Column { index } => Ok(row.get(*index).cloned().unwrap_or(Scalar::Null)),
+        BoundExpr::Column { index } => row.get(*index).cloned().ok_or_else(||
+            SparrowError::new(ErrorCode::Internal,
+                format!("bound column {index} outside row of width {}", row.len()))),
         BoundExpr::Literal(s) => Ok(s.clone()),
         BoundExpr::Cast { expr, target } => cast(&eval_bound(expr, row)?, target, false),
         BoundExpr::TryCast { expr, target } => cast(&eval_bound(expr, row)?, target, true),
@@ -106,7 +110,6 @@ pub fn eval_bound(expr: &BoundExpr, row: &[Scalar]) -> Result<Scalar> {
             )),
         },
         BoundExpr::Call { name, args } => {
-            check_call_arity(name, args.len())?;
             let vals: Result<Vec<Scalar>> = args.iter().map(|a| eval_bound(a, row)).collect();
             eval_call_values(name, vals?)
         }
@@ -135,6 +138,29 @@ mod tests {
     use super::*;
     use crate::{eval, BinaryOp, Expr};
     use sparrow_model::{Field, FieldId, SchemaId};
+
+    #[test]
+    fn r4_bad_arity_fails_at_bind_without_any_rows() {
+        for (name, argc) in [("UPPER", 0), ("upper", 2), ("ABS", 2), ("COALESCE", 0), ("NULLIF", 1)] {
+            let expression = Expr::Call { name: name.into(), args: vec![Expr::Literal(Scalar::Null); argc] };
+            assert_eq!(bind(&expression, &wide_schema()).unwrap_err().code, ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn r3_short_row_fails_closed_instead_of_null() {
+        let error = eval_bound(&BoundExpr::Column { index: 1 }, &[Scalar::Int64(1)]).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn r3_function_name_canonicalized_at_bind() {
+        let expression = Expr::Call { name: "UPPER".into(), args: vec![Expr::Literal(Scalar::utf8("a"))] };
+        let compiled = bind(&expression, &wide_schema()).unwrap();
+        let BoundExpr::Call { name, .. } = &compiled else { panic!("call expected") };
+        assert_eq!(name, "upper");
+        assert_eq!(eval_bound(&compiled, &[]).unwrap(), Scalar::utf8("A"));
+    }
 
     fn wide_schema() -> Schema {
         let fields = (0..32)

@@ -11,7 +11,7 @@ use sparrow_model::{ErrorCode, Result, SparrowError};
 use crate::spec::PipelineSpec;
 use crate::status::PipelineStatus;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 1;
+pub const CATALOG_SCHEMA_VERSION: u32 = 2;
 pub const FORMAT_VERSION: u32 = 1;
 const AUDIT_CAP: usize = 200;
 const ATTEMPT_CAP: usize = 100;
@@ -58,6 +58,8 @@ pub struct ActualState {
     pub status: PipelineStatus,
     pub attempt_id: u64,
     pub consecutive_failures: u64,
+    /// Durable safe-mode latch, independent of the bounded attempt history.
+    pub restart_blocked: bool,
     pub last_error: Option<String>,
 }
 
@@ -316,6 +318,16 @@ impl Store {
         attempt_id: u64,
         last_error: Option<&str>,
     ) -> Result<()> {
+        self.set_actual_inner(name, status, revision, attempt_id, last_error, true)
+    }
+
+    /// Capacity/temporary admission failures wait without consuming the crash cap.
+    pub fn set_waiting_failure(&self, name: &str, revision: u64, attempt: u64, error: &str) -> Result<()> {
+        self.set_actual_inner(name, "waiting", Some(revision), attempt, Some(error), false)
+    }
+
+    fn set_actual_inner(&self, name: &str, status: &str, revision: Option<u64>,
+        attempt_id: u64, last_error: Option<&str>, count_failure: bool) -> Result<()> {
         let status = PipelineStatus::parse(status)?;
         self.write(|c| {
             let prev: i64 = c
@@ -328,18 +340,22 @@ impl Store {
                 .map_err(db)?
                 .unwrap_or(0);
             let consecutive = match status {
-                PipelineStatus::Running | PipelineStatus::Completed => 0,
-                PipelineStatus::Failed => prev.saturating_add(1),
+                PipelineStatus::Completed => 0,
+                PipelineStatus::Failed if count_failure => prev.saturating_add(1),
                 _ => prev,
             };
             c.execute(
-                "INSERT INTO actual_state(name, actual_revision, actual_status, attempt_id, consecutive_failures, last_error, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO actual_state(name, actual_revision, actual_status, attempt_id, consecutive_failures, last_error, updated_at, restart_blocked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(name) DO UPDATE SET
                     actual_revision=excluded.actual_revision,
                     actual_status=excluded.actual_status,
                     attempt_id=excluded.attempt_id,
                     consecutive_failures=excluded.consecutive_failures,
+                    restart_blocked=CASE
+                        WHEN excluded.actual_status='failed' THEN 1
+                        WHEN excluded.actual_status IN ('running', 'completed') THEN 0
+                        ELSE actual_state.restart_blocked END,
                     last_error=excluded.last_error,
                     updated_at=excluded.updated_at",
                 params![
@@ -349,7 +365,8 @@ impl Store {
                     attempt_id as i64,
                     consecutive,
                     last_error,
-                    now_ms()
+                    now_ms(),
+                    status == PipelineStatus::Failed
                 ],
             )
             .map_err(db)?;
@@ -369,7 +386,7 @@ impl Store {
         })
     }
 
-    /// Clear the consecutive-failure hold so `request_start` can converge again.
+    /// Reset crash counting after a stable run. Does not unlock safe-mode.
     pub fn reset_consecutive_failures(&self, name: &str) -> Result<()> {
         self.write(|c| {
             c.execute(
@@ -377,6 +394,28 @@ impl Store {
                 params![now_ms(), name],
             )
             .map_err(db)?;
+            Ok(())
+        })
+    }
+
+    /// An explicit start atomically commits desired state and clears both holds.
+    /// Merely pruning history, stopping, or restarting the process cannot unlock.
+    pub(crate) fn request_start_revision(&self, name: &str, revision: u64) -> Result<()> {
+        self.write(|c| {
+            let changed = c.execute(
+                "UPDATE desired_state SET desired_status='running', desired_revision=?1,
+                    updated_at=?2 WHERE name=?3",
+                params![revision as i64, now_ms(), name],
+            ).map_err(db)?;
+            let actual = c.execute(
+                "UPDATE actual_state SET actual_status='stopped', actual_revision=NULL,
+                    consecutive_failures=0, restart_blocked=0, last_error=NULL,
+                    updated_at=?1 WHERE name=?2",
+                params![now_ms(), name],
+            ).map_err(db)?;
+            if changed != 1 || actual != 1 {
+                return Err(SparrowError::new(ErrorCode::InvalidSchema, "missing pipeline start state"));
+            }
             Ok(())
         })
     }
@@ -407,18 +446,19 @@ impl Store {
 
     pub fn actual(&self, name: &str) -> Result<ActualState> {
         self.read(|c| {
-            let (name, rev, status, attempt, failures, last_error): (
+            let (name, rev, status, attempt, failures, last_error, restart_blocked): (
                 String,
                 Option<i64>,
                 String,
                 i64,
                 i64,
                 Option<String>,
+                bool,
             ) = c
                 .query_row(
-                    "SELECT name, actual_revision, actual_status, attempt_id, COALESCE(consecutive_failures, 0), last_error FROM actual_state WHERE name=?1",
+                    "SELECT name, actual_revision, actual_status, attempt_id, COALESCE(consecutive_failures, 0), last_error, restart_blocked FROM actual_state WHERE name=?1",
                     [name],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
                 )
                 .optional()
                 .map_err(db)?
@@ -431,6 +471,7 @@ impl Store {
                 status: PipelineStatus::parse(&status)?,
                 attempt_id: attempt as u64,
                 consecutive_failures: failures as u64,
+                restart_blocked,
                 last_error,
             })
         })
@@ -467,7 +508,7 @@ impl Store {
     pub fn reset_actual_after_process_restart(&self) -> Result<()> {
         self.write(|c| {
             c.execute(
-                "UPDATE actual_state SET actual_status='stopped', last_error=NULL, updated_at=?1",
+                "UPDATE actual_state SET actual_status='stopped', updated_at=?1",
                 params![now_ms()],
             )
             .map_err(db)?;
@@ -810,6 +851,7 @@ fn init(conn: &Connection) -> Result<()> {
             actual_status TEXT NOT NULL,
             attempt_id INTEGER NOT NULL DEFAULT 0,
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            restart_blocked INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             updated_at INTEGER NOT NULL
         );
@@ -843,21 +885,62 @@ fn init(conn: &Connection) -> Result<()> {
         "#,
     )
     .map_err(db)?;
-    migrate_actual_consecutive_failures(conn)?;
     let ver = meta_u32(conn, "catalog_schema_version").unwrap_or(0);
-    if ver == 0 {
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('catalog_schema_version', ?1), ('format_version', ?2)",
-            params![CATALOG_SCHEMA_VERSION.to_string(), FORMAT_VERSION.to_string()],
-        )
-        .map_err(db)?;
-    } else if ver != CATALOG_SCHEMA_VERSION {
+    if ver != 0 && ver != 1 && ver != CATALOG_SCHEMA_VERSION {
         return Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
             format!(
                 "catalog_schema_version {ver} is not supported (want {CATALOG_SCHEMA_VERSION})"
             ),
         ));
+    }
+    if ver < CATALOG_SCHEMA_VERSION {
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(db)?;
+        let migrated = (|| -> Result<()> {
+            migrate_actual_consecutive_failures(conn)?;
+            migrate_restart_blocked(conn)?;
+            if ver == 0 {
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('catalog_schema_version', ?1), ('format_version', ?2)",
+                    params![CATALOG_SCHEMA_VERSION.to_string(), FORMAT_VERSION.to_string()],
+                ).map_err(db)?;
+            } else {
+                conn.execute("UPDATE meta SET value=?1 WHERE key='catalog_schema_version'",
+                    [CATALOG_SCHEMA_VERSION.to_string()]).map_err(db)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = migrated {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        conn.execute_batch("COMMIT").map_err(db)?;
+    }
+    Ok(())
+}
+
+fn migrate_restart_blocked(conn: &Connection) -> Result<()> {
+    let has_latch = {
+        let mut stmt = conn.prepare("PRAGMA table_info(actual_state)").map_err(db)?;
+        let columns = stmt.query_map([], |r| r.get::<_, String>(1)).map_err(db)?;
+        let mut found = false;
+        for column in columns { found |= column.map_err(db)? == "restart_blocked"; }
+        found
+    };
+    if !has_latch {
+        conn.execute_batch(
+            "ALTER TABLE actual_state ADD COLUMN restart_blocked INTEGER NOT NULL DEFAULT 0;
+             UPDATE actual_state SET restart_blocked=CASE
+                WHEN actual_status IN ('running', 'completed') THEN 0
+                WHEN actual_status='failed' THEN 1
+                ELSE COALESCE((SELECT CASE outcome
+                    WHEN 'failed' THEN 1 WHEN 'running' THEN 0 WHEN 'completed' THEN 0 ELSE NULL END
+                    FROM deployment_attempts WHERE pipeline=actual_state.name ORDER BY id DESC LIMIT 1),
+                    consecutive_failures > 0 OR COALESCE(last_error, '') LIKE 'held:%') END;
+             UPDATE actual_state SET last_error=COALESCE(last_error,
+                (SELECT detail FROM deployment_attempts WHERE pipeline=actual_state.name ORDER BY id DESC LIMIT 1))
+                WHERE restart_blocked=1;"
+        ).map_err(db)?;
     }
     Ok(())
 }
@@ -1327,9 +1410,97 @@ mod tests {
     }
 
     #[test]
+    fn r5_failure_latch_and_explicit_start_are_transactional() {
+        let s = Store::open_memory().unwrap();
+        s.put_pipeline("hot", &spec(), None).unwrap();
+        s.debug_fail_next_commit();
+        assert!(s.set_actual("hot", "failed", Some(1), 1, Some("fault")).is_err());
+        assert!(!s.actual("hot").unwrap().restart_blocked);
+        assert_eq!(s.actual("hot").unwrap().status, "stopped");
+
+        s.set_actual("hot", "failed", Some(1), 1, Some("fault")).unwrap();
+        s.insert_attempt("hot", 1, "failed", Some("fault")).unwrap();
+        assert!(s.actual("hot").unwrap().restart_blocked);
+        s.debug_fail_next_commit();
+        assert!(s.request_start_revision("hot", 1).is_err());
+        assert_eq!(s.desired("hot").unwrap().status, "stopped");
+        assert_eq!(s.actual("hot").unwrap().status, "failed");
+        assert!(s.actual("hot").unwrap().restart_blocked);
+        s.reset_consecutive_failures("hot").unwrap();
+        assert!(s.actual("hot").unwrap().restart_blocked, "crash count is not the safe-mode latch");
+        s.reset_actual_after_process_restart().unwrap();
+        assert!(s.actual("hot").unwrap().restart_blocked);
+
+        s.request_start_revision("hot", 1).unwrap();
+        assert_eq!(s.desired("hot").unwrap().status, "running");
+        assert_eq!(s.actual("hot").unwrap().status, "stopped");
+        assert!(!s.actual("hot").unwrap().restart_blocked);
+        assert_eq!(s.actual("hot").unwrap().consecutive_failures, 0);
+        assert!(s.actual("hot").unwrap().last_error.is_none());
+        assert_eq!(s.last_attempt("hot").unwrap().unwrap().outcome, "failed",
+            "unlock must not require destroying historical failure evidence");
+    }
+
+    fn legacy_v1_catalog() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('catalog_schema_version', '1'), ('format_version', '1');
+             CREATE TABLE actual_state(name TEXT PRIMARY KEY, actual_revision INTEGER,
+                actual_status TEXT NOT NULL, attempt_id INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at INTEGER NOT NULL);
+             CREATE TABLE deployment_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pipeline TEXT NOT NULL, revision INTEGER NOT NULL, started_at INTEGER NOT NULL,
+                outcome TEXT NOT NULL, detail TEXT, restore_claim TEXT NOT NULL DEFAULT 'none');
+             INSERT INTO actual_state VALUES
+                ('a', 1, 'failed', 1, 1, 'actual failure', 0),
+                ('b', 1, 'stopped', 1, 0, NULL, 0),
+                ('c', 1, 'stopped', 1, 1, 'failure with evicted history', 0),
+                ('d', 1, 'running', 2, 1, NULL, 0),
+                ('e', 1, 'stopped', 2, 1, NULL, 0),
+                ('f', 1, 'completed', 2, 0, NULL, 0),
+                ('g', 1, 'stopped', 1, 0, 'held: safe-mode and last attempt failed', 0);
+             INSERT INTO deployment_attempts(pipeline, revision, started_at, outcome, detail) VALUES
+                ('b', 1, 0, 'failed', 'history-only failure'), ('e', 1, 0, 'running', NULL);"
+        ).unwrap();
+        c
+    }
+
+    #[test]
+    fn r5_v1_migration_preserves_failures_and_does_not_rearm_unlocked_jobs() {
+        let c = legacy_v1_catalog();
+        init(&c).unwrap();
+        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 2);
+        assert_eq!(meta_u32(&c, "format_version").unwrap(), 1);
+        for (name, expected) in [("a", true), ("b", true), ("c", true), ("d", false), ("e", false), ("f", false), ("g", true)] {
+            let blocked: bool = c.query_row("SELECT restart_blocked FROM actual_state WHERE name=?1", [name], |r| r.get(0)).unwrap();
+            assert_eq!(blocked, expected, "migration for {name}");
+        }
+        let error: String = c.query_row("SELECT last_error FROM actual_state WHERE name='b'", [], |r| r.get(0)).unwrap();
+        assert_eq!(error, "history-only failure");
+        c.execute("UPDATE actual_state SET restart_blocked=0 WHERE name='b'", []).unwrap();
+        init(&c).unwrap();
+        let blocked: bool = c.query_row("SELECT restart_blocked FROM actual_state WHERE name='b'", [], |r| r.get(0)).unwrap();
+        assert!(!blocked, "v2 reopen must not reconstruct a cleared latch from stale history");
+    }
+
+    #[test]
+    fn r5_failed_migration_rolls_back_column_and_version() {
+        let c = legacy_v1_catalog();
+        c.execute_batch("CREATE TRIGGER fail_migration BEFORE UPDATE ON actual_state
+            BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;").unwrap();
+        assert!(init(&c).is_err());
+        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 1);
+        assert!(c.prepare("SELECT restart_blocked FROM actual_state").is_err());
+        c.execute_batch("DROP TRIGGER fail_migration;").unwrap();
+        init(&c).unwrap();
+        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 2);
+    }
+
+    #[test]
     fn put_get_and_if_match() {
         let s = Store::open_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), 1);
+        assert_eq!(s.schema_version().unwrap(), CATALOG_SCHEMA_VERSION);
         let row = s.put_pipeline("hot", &spec(), None).unwrap();
         assert_eq!(row.etag, "rev-1");
         let err = s.put_pipeline("hot", &spec(), None).unwrap_err();

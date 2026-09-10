@@ -236,11 +236,6 @@ impl VersionedReferenceTable {
                 ));
             }
         }
-        if let Some(last) = g.last_mut() {
-            if last.valid_to.is_none() {
-                last.valid_to = Some(valid_from);
-            }
-        }
         if g.len() >= self.max_versions {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -249,6 +244,11 @@ impl VersionedReferenceTable {
                     self.name, self.max_versions
                 ),
             ));
+        }
+        if let Some(last) = g.last_mut() {
+            if last.valid_to.is_none() {
+                last.valid_to = Some(valid_from);
+            }
         }
         g.push(TableVersion {
             version,
@@ -260,13 +260,26 @@ impl VersionedReferenceTable {
     }
 
     pub fn lookup_as_of(&self, key: &[Scalar], as_of: i64) -> Option<Row> {
+        self.table_as_of(as_of).and_then(|t| t.get(key).cloned())
+    }
+
+    pub fn table_as_of(&self, as_of: i64) -> Option<Arc<ReferenceTable>> {
         let g = self.inner.read().expect("versioned table");
         g.iter()
             .rev()
             .find(|v| {
                 as_of >= v.valid_from && v.valid_to.map(|to| as_of < to).unwrap_or(true)
             })
-            .and_then(|v| v.table.get(key).cloned())
+            .map(|v| Arc::clone(&v.table))
+    }
+
+    /// Caller must supply a safe watermark for every reader. Do not evict
+    /// history automatically at publish: late events may still require it.
+    pub fn gc_before(&self, safe_watermark: i64) -> usize {
+        let mut g = self.inner.write().expect("versioned table");
+        let before = g.len();
+        g.retain(|v| v.valid_to.map_or(true, |end| end > safe_watermark));
+        before - g.len()
     }
 
     pub fn latest(&self) -> Option<Arc<ReferenceTable>> {
@@ -411,8 +424,8 @@ impl LookupOperator {
                 .iter()
                 .map(|&i| row.values[i].detach_copy())
                 .collect();
-            let hit = match &self.source {
-                LookupSource::Static(t) => t.get(&key).cloned(),
+            let table = match &self.source {
+                LookupSource::Static(t) => Some(Arc::clone(t)),
                 LookupSource::Versioned(t) => {
                     let as_of = if let Some(i) = self.as_of_idx {
                         row.values
@@ -427,11 +440,11 @@ impl LookupOperator {
                     } else {
                         i64::MAX
                     };
-                    t.lookup_as_of(&key, as_of)
+                    t.table_as_of(as_of)
                 }
             };
             let mut values: Vec<Scalar> = row.values.iter().map(Scalar::detach_copy).collect();
-            match hit {
+            match table.as_ref().and_then(|t| t.get(&key)) {
                 Some(hit) => {
                     for &i in &self.keep_idx {
                         values.push(hit.values[i].detach_copy());
@@ -539,6 +552,20 @@ mod tests {
             owner,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn r3_failed_publish_preserves_previous_interval_and_gc_is_explicit() {
+        let owner = owner();
+        let versioned = VersionedReferenceTable::new("sites", 2).unwrap();
+        let table = sites(&owner);
+        versioned.publish(1, 0, table.clone()).unwrap();
+        versioned.publish(2, 10, table.clone()).unwrap();
+        assert!(versioned.publish(3, 20, table.clone()).is_err());
+        assert!(versioned.lookup_as_of(&[Scalar::utf8("a")], 100).is_some());
+        assert_eq!(versioned.gc_before(10), 1);
+        versioned.publish(3, 20, table).unwrap();
+        assert_eq!(versioned.version_count(), 2);
     }
 
     fn stream_schema() -> Schema {

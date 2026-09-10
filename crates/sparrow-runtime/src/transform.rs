@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use sparrow_expr::{bind, eval_bound, filter_mask};
+use sparrow_expr::{bind, eval_bound, BoundExpr};
 use sparrow_model::{
     CreditKind, ErrorCode, MemoryOwner, Result, Row, RowBatch, RowBatchBuilder, Scalar, Schema,
     SparrowError, WorkBudget,
@@ -15,86 +15,102 @@ pub fn apply_steps(
     owner: &Arc<MemoryOwner>,
     work: &WorkBudget,
 ) -> Result<Option<RowBatch>> {
-    if steps.is_empty() {
-        return Ok(None);
+    CompiledTransform::new(steps)?.apply(batch, owner, work)
+}
+
+enum CompiledStep {
+    Filter(BoundExpr),
+    Project(Vec<BoundExpr>),
+}
+
+#[cfg(test)]
+mod r3_tests {
+    use super::*;
+    use sparrow_model::{DataType, Field, FieldId, OperatorId, ResourceBudget};
+    use sparrow_expr::Expr;
+
+    #[test]
+    fn r3_projection_expansion_uses_budget_not_input_multiple() {
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let input = Schema::new(1, vec![Field::new(FieldId::new(1), "n", DataType::Int64, false)]).unwrap();
+        let output = Schema::new(2, vec![Field::new(FieldId::new(1), "s", DataType::Utf8, false)]).unwrap();
+        let compiled = CompiledTransform::new(&[TransformStep::Project {
+            operator: OperatorId::new(1), input: input.clone(), output,
+            exprs: vec![Expr::Literal(Scalar::utf8("x".repeat(512)))],
+        }]).unwrap();
+        for _ in 0..3 {
+            let batches = build_source_batches(input.clone(), vec![Row { values: vec![Scalar::Int64(1)] }], &owner, 1).unwrap();
+            let out = compiled.apply(&batches[0], &owner, &WorkBudget::new(100)).unwrap().unwrap();
+            assert_eq!(out.rows()[0].values[0], Scalar::utf8("x".repeat(512)));
+        }
+        assert_eq!(owner.usage().physical_bytes, 0);
     }
-    // Each step builds into a charged [`RowBatchBuilder`]. No unaccounted
-    // `to_vec()` of the whole batch (A2 / P1-16).
-    let mut working: Option<RowBatch> = None;
-    for step in steps {
-        match step {
-            TransformStep::Filter {
-                predicate, input, ..
-            } => {
-                let src = working.as_ref().unwrap_or(batch);
-                work.consume(src.num_rows() as u64)?;
-                let mask = filter_mask(predicate, input, src.rows())?;
-                let mut b = step_builder(input.clone(), owner, src.num_rows(), src.tracked_bytes())?;
-                for (row, keep) in src.rows().iter().zip(mask) {
-                    if keep {
-                        b.push(row.clone())?;
-                    }
+}
+
+/// Construct once per stage, not once per batch. Fused steps retain only
+/// one row of intermediate values, not a shadow batch for each step.
+pub struct CompiledTransform {
+    steps: Vec<CompiledStep>,
+    output: Option<Arc<Schema>>,
+}
+
+impl CompiledTransform {
+    pub fn work_units(&self, rows: usize) -> u64 {
+        let per_row: u64 = self.steps.iter().map(|step| match step {
+            CompiledStep::Filter(_) => 1,
+            CompiledStep::Project(exprs) => exprs.len().max(1) as u64,
+        }).sum();
+        per_row.saturating_mul(rows as u64)
+    }
+
+    pub fn new(steps: &[TransformStep]) -> Result<Self> {
+        let mut compiled = Vec::new();
+        let mut output = None;
+        for step in steps {
+            match step {
+                TransformStep::Filter { predicate, input, .. } => {
+                    compiled.push(CompiledStep::Filter(bind(predicate, input)?));
+                    output = Some(Arc::new(input.clone()));
                 }
-                working = finish_step(b)?;
-                if working.is_none() {
-                    return Ok(None);
-                }
-            }
-            TransformStep::Project {
-                exprs,
-                input,
-                output,
-                ..
-            }
-            | TransformStep::Map {
-                exprs,
-                input,
-                output,
-                ..
-            } => {
-                let src = working.as_ref().unwrap_or(batch);
-                work.consume(src.num_rows() as u64 * exprs.len().max(1) as u64)?;
-                let mut b = step_builder(
-                    output.clone(),
-                    owner,
-                    src.num_rows(),
-                    src.tracked_bytes().saturating_mul(2).max(64),
-                )?;
-                let bound: Result<Vec<_>> = exprs.iter().map(|e| bind(e, input)).collect();
-                let bound = bound?;
-                for row in src.rows() {
-                    let values: Result<Vec<Scalar>> =
-                        bound.iter().map(|e| eval_bound(e, &row.values)).collect();
-                    b.push(Row { values: values? })?;
-                }
-                working = finish_step(b)?;
-                if working.is_none() {
-                    return Ok(None);
+                TransformStep::Project { exprs, input, output: schema, .. }
+                | TransformStep::Map { exprs, input, output: schema, .. } => {
+                    compiled.push(CompiledStep::Project(exprs.iter().map(|e| bind(e, input)).collect::<Result<_>>()?));
+                    output = Some(Arc::new(schema.clone()));
                 }
             }
         }
+        Ok(Self { steps: compiled, output })
     }
-    Ok(working)
-}
 
-fn step_builder(
-    schema: Schema,
-    owner: &Arc<MemoryOwner>,
-    rows_hint: usize,
-    bytes_hint: usize,
-) -> Result<RowBatchBuilder> {
-    let max_rows = owner.budget().max_rows.max(rows_hint).max(1);
-    let max_bytes = owner
-        .budget()
-        .cap(CreditKind::Reservation)
-        .min(bytes_hint.saturating_mul(2).max(64));
-    RowBatchBuilder::new(
-        Arc::new(schema),
-        Arc::clone(owner),
-        CreditKind::Reservation,
-        max_rows,
-        max_bytes.max(64),
-    )
+    pub fn apply(&self, batch: &RowBatch, owner: &Arc<MemoryOwner>, work: &WorkBudget) -> Result<Option<RowBatch>> {
+        let Some(schema) = &self.output else { return Ok(None); };
+        let mut builder = RowBatchBuilder::new(Arc::clone(schema), Arc::clone(owner),
+            CreditKind::Reservation, owner.budget().max_rows,
+            owner.budget().reservation_bytes)?;
+        'rows: for row in batch.rows() {
+            let mut values = std::borrow::Cow::Borrowed(row.values.as_slice());
+            for step in &self.steps {
+                match step {
+                    CompiledStep::Filter(predicate) => {
+                        work.consume(1)?;
+                        match eval_bound(predicate, &values)? {
+                            Scalar::Bool(true) => {}
+                            Scalar::Bool(false) | Scalar::Null => continue 'rows,
+                            other => return Err(SparrowError::new(ErrorCode::TypeMismatch,
+                                format!("filter must be bool, got {}", other.data_type()))),
+                        }
+                    }
+                    CompiledStep::Project(exprs) => {
+                        work.consume(exprs.len().max(1) as u64)?;
+                        let next = exprs.iter().map(|e| eval_bound(e, &values)).collect::<Result<Vec<_>>>()?;
+                        values = std::borrow::Cow::Owned(next);
+                    }
+                }
+            }
+            builder.push(Row { values: values.into_owned() })?;
+        }
+        finish_step(builder)
+    }
 }
 
 fn finish_step(b: RowBatchBuilder) -> Result<Option<RowBatch>> {

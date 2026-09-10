@@ -585,8 +585,9 @@ impl<'de> serde::de::Visitor<'de> for JsonVisitor {
             None => return Err(self.depth_err()),
         };
         let mut pairs = Vec::new();
+        let mut keys = std::collections::HashSet::new();
         while let Some(key) = map.next_key::<String>()? {
-            if pairs.iter().any(|(k, _)| k == &key) {
+            if !keys.insert(key.clone()) {
                 return Err(serde::de::Error::custom("JSON object has duplicate keys"));
             }
             let val = map.next_value_seed(JsonSeed {

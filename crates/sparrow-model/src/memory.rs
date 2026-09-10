@@ -17,15 +17,18 @@ struct AllocInner {
     bytes: usize,
     kind: CreditKind,
     handles: AtomicUsize,
+    parent_lease: Option<MemoryLease>,
 }
 
 /// Process- or job-scoped owner of tracked allocations.
 ///
-/// R2 batch 8: the Kernel holds one process-wide owner. Jobs share it so
-/// N concurrent jobs cannot each draw an independent full [`ResourceBudget`].
+/// R3: jobs have child quotas. Every child lease also holds a parent lease,
+/// so isolation does not bypass the shared process [`ResourceBudget`].
 #[derive(Debug)]
 pub struct MemoryOwner {
     budget: ResourceBudget,
+    parent: Option<Arc<MemoryOwner>>,
+    label: String,
     next_id: AtomicU64,
     reservation: AtomicUsize,
     retention: AtomicUsize,
@@ -43,6 +46,8 @@ impl MemoryOwner {
     pub fn new(budget: ResourceBudget) -> Arc<Self> {
         Arc::new(Self {
             budget,
+            parent: None,
+            label: "process".into(),
             next_id: AtomicU64::new(1),
             reservation: AtomicUsize::new(0),
             retention: AtomicUsize::new(0),
@@ -53,6 +58,15 @@ impl MemoryOwner {
             peak_builder_bytes: AtomicUsize::new(0),
             lock: Mutex::new(()),
         })
+    }
+
+    /// A job quota charges both its own ledger and the process ledger.
+    pub fn child(parent: Arc<Self>, budget: ResourceBudget, label: impl Into<String>) -> Arc<Self> {
+        let mut child = Self::new(budget);
+        let inner = Arc::get_mut(&mut child).expect("new owner is unique");
+        inner.parent = Some(parent);
+        inner.label = label.into();
+        child
     }
 
     pub fn budget(&self) -> ResourceBudget {
@@ -87,7 +101,7 @@ impl MemoryOwner {
             return Err(SparrowError::new(
                 ErrorCode::ResourceExhausted,
                 format!(
-                    "{kind} headroom exhausted: used={used} request={bytes} cap={cap}",
+                    "{}: {kind} headroom exhausted: used={used} request={bytes} cap={cap}", self.label,
                     kind = kind.as_str()
                 ),
             )
@@ -127,7 +141,7 @@ impl MemoryOwner {
             return Err(SparrowError::new(
                 ErrorCode::ResourceExhausted,
                 format!(
-                    "{kind} credits exhausted: used={used} request={bytes} cap={cap}",
+                    "{}: {kind} credits exhausted: used={used} request={bytes} cap={cap}", self.label,
                     kind = kind.as_str()
                 ),
             )
@@ -137,6 +151,7 @@ impl MemoryOwner {
             .context("request", bytes.to_string())
             .context("cap", cap.to_string()));
         }
+        let parent_lease = self.parent.as_ref().map(|p| p.acquire(kind, bytes)).transpose()?;
         self.ledger(kind).fetch_add(bytes, Ordering::SeqCst);
         let physical = self.physical.fetch_add(bytes, Ordering::SeqCst) + bytes;
         self.peak_physical.fetch_max(physical, Ordering::SeqCst);
@@ -149,6 +164,7 @@ impl MemoryOwner {
                 bytes,
                 kind,
                 handles: AtomicUsize::new(1),
+                parent_lease,
             }),
         })
     }
@@ -191,6 +207,27 @@ impl MemoryLease {
             owner: Arc::clone(&self.owner),
             alloc: Arc::clone(&self.alloc),
         }
+    }
+
+    /// Grow an exclusively owned allocation without temporarily billing it twice.
+    pub fn grow_to(&mut self, bytes: usize) -> Result<()> {
+        if bytes <= self.alloc.bytes { return Ok(()); }
+        let alloc = Arc::get_mut(&mut self.alloc).ok_or_else(||
+            SparrowError::new(ErrorCode::Internal, "cannot grow a shared lease"))?;
+        let extra = bytes - alloc.bytes;
+        let _gate = self.owner.lock.lock().expect("memory owner lock");
+        let used = self.owner.ledger(alloc.kind).load(Ordering::SeqCst);
+        if used.saturating_add(extra) > self.owner.budget.cap(alloc.kind) {
+            return Err(SparrowError::new(ErrorCode::ResourceExhausted,
+                format!("{}: {} credits exhausted while growing to {bytes}",
+                    self.owner.label, alloc.kind.as_str())).retryable(true));
+        }
+        if let Some(parent) = &mut alloc.parent_lease { parent.grow_to(bytes)?; }
+        self.owner.ledger(alloc.kind).fetch_add(extra, Ordering::SeqCst);
+        let physical = self.owner.physical.fetch_add(extra, Ordering::SeqCst) + extra;
+        self.owner.peak_physical.fetch_max(physical, Ordering::SeqCst);
+        alloc.bytes = bytes;
+        Ok(())
     }
 
     /// Copy: new physical allocation, typically for long-lived state.
@@ -308,5 +345,41 @@ mod tests {
             .ensure_headroom(CreditKind::Reservation, 50)
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn r3_child_quota_isolates_siblings_and_bills_parent() {
+        let root = owner();
+        let mut budget = root.budget();
+        budget.retention_bytes = 512;
+        let a = MemoryOwner::child(root.clone(), budget, "pipeline=a");
+        let b = MemoryOwner::child(root.clone(), budget, "pipeline=b");
+        let held = a.acquire(CreditKind::Retention, 512).unwrap();
+        let error = a.acquire(CreditKind::Retention, 1).unwrap_err();
+        assert!(error.message.contains("pipeline=a"));
+        let sibling = b.acquire(CreditKind::Retention, 512).unwrap();
+        assert_eq!(root.usage().retention_bytes, 1024);
+        let shared = held.share();
+        drop(held);
+        assert_eq!(root.usage().retention_bytes, 1024);
+        drop(shared);
+        drop(sibling);
+        assert_eq!(root.usage().physical_bytes, 0);
+    }
+
+    #[test]
+    fn r3_growing_child_lease_is_atomic_and_releases_parent() {
+        let root = owner();
+        let mut budget = root.budget();
+        budget.reservation_bytes = 512;
+        let child = MemoryOwner::child(root.clone(), budget, "pipeline=a");
+        let mut lease = child.acquire(CreditKind::Reservation, 100).unwrap();
+        lease.grow_to(500).unwrap();
+        assert!(lease.grow_to(513).is_err());
+        assert_eq!(lease.bytes(), 500);
+        assert_eq!(child.usage().reservation_bytes, 500);
+        assert_eq!(root.usage().reservation_bytes, 500);
+        drop(lease);
+        assert_eq!(root.usage().reservation_bytes, 0);
     }
 }

@@ -40,6 +40,10 @@ pub(crate) async fn apply_file_poll(
     fail_on_decode: bool,
 ) -> Result<bool> {
     match poll {
+        FilePoll::Pending => {
+            tokio::task::yield_now().await;
+            Ok(false)
+        }
         FilePoll::Row(row) => {
             if let Some(n) = ingested {
                 n.fetch_add(1, Ordering::SeqCst);
@@ -62,7 +66,7 @@ pub(crate) async fn apply_file_poll(
                     *terminal_sent = true;
                     let _ = tx
                         .send(IngressEvent::Control(StreamControl::Watermark {
-                            input: 0,
+                            input: sparrow_model::InputId::SINGLE.raw(),
                             wm_micros: FileContract::TERMINAL_WM_MICROS,
                         }))
                         .await;

@@ -85,7 +85,8 @@ pub fn eval(expr: &Expr, schema: &Schema, row: &[Scalar]) -> Result<Scalar> {
 }
 
 pub(crate) fn eval_call_values(name: &str, vals: Vec<Scalar>) -> Result<Scalar> {
-    match name.to_ascii_lowercase().as_str() {
+    // BoundExpr stores canonical lowercase function names.
+    match name {
         "abs" => match vals.first() {
             Some(Scalar::Int64(v)) => {
                 let abs = v.checked_abs().ok_or_else(|| {
@@ -179,7 +180,7 @@ pub(crate) fn eval_call_values(name: &str, vals: Vec<Scalar>) -> Result<Scalar> 
 }
 
 pub(crate) fn check_call_arity(name: &str, argc: usize) -> Result<()> {
-    match name.to_ascii_lowercase().as_str() {
+    match name {
         "abs" | "lower" | "upper" | "length" | "char_length" => {
             if argc != 1 {
                 return Err(SparrowError::new(
@@ -187,6 +188,10 @@ pub(crate) fn check_call_arity(name: &str, argc: usize) -> Result<()> {
                     format!("{name} requires 1 argument, got {argc}"),
                 ));
             }
+        }
+        "nullif" if argc != 2 => {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                format!("{name} requires 2 arguments, got {argc}")));
         }
         "coalesce" => {
             if argc == 0 {

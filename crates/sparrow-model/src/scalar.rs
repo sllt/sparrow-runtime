@@ -79,6 +79,14 @@ impl Scalar {
         }
     }
 
+    pub fn matches_type(&self, ty: &DataType) -> bool {
+        if matches!(ty, DataType::Dynamic) || self.data_type() == *ty { return true; }
+        match self {
+            Self::Dynamic(value) if ty.is_nested() => value.matches_type(ty, 0),
+            _ => false,
+        }
+    }
+
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null) || matches!(self, Self::Dynamic(DynamicValue::Null))
     }
@@ -116,7 +124,7 @@ impl Scalar {
         }
     }
 
-    /// Stable key encoding for keyed state (NaN-safe via to_bits).
+    /// Structural key encoding. Signed zero and NaN representations are canonical.
     pub fn encode_key(&self, out: &mut Vec<u8>) {
         match self {
             Self::Null => out.push(0),
@@ -134,7 +142,8 @@ impl Scalar {
             }
             Self::Float64(v) => {
                 out.push(4);
-                out.extend_from_slice(&v.to_bits().to_le_bytes());
+                let bits = if *v == 0.0 { 0 } else if v.is_nan() { f64::NAN.to_bits() } else { v.to_bits() };
+                out.extend_from_slice(&bits.to_le_bytes());
             }
             Self::Utf8(s) => {
                 out.push(5);
@@ -150,9 +159,9 @@ impl Scalar {
                 out.push(7);
                 out.extend_from_slice(&v.to_le_bytes());
             }
-            Self::Dynamic(_) => {
+            Self::Dynamic(value) => {
                 out.push(8);
-                out.extend_from_slice(&(self.tracked_bytes() as u64).to_le_bytes());
+                value.encode_key(out);
             }
         }
     }
@@ -166,6 +175,13 @@ impl Scalar {
                 ErrorCode::FeatureUnavailable,
                 "Dynamic scalars cannot be snapshotted in V1 aligned checkpoint",
             ));
+        }
+        // Value codecs preserve exact floating bits; only state-key equality
+        // canonicalizes them. Existing SPV1 value bytes remain compatible.
+        if let Self::Float64(value) = self {
+            out.push(4);
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+            return Ok(());
         }
         self.encode_key(out);
         Ok(())
@@ -267,6 +283,68 @@ pub enum DynamicValue {
 }
 
 impl DynamicValue {
+    fn encode_key(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Null => Scalar::Null.encode_key(out),
+            Self::Bool(v) => Scalar::Bool(*v).encode_key(out),
+            Self::Int64(v) => Scalar::Int64(*v).encode_key(out),
+            Self::UInt64(v) => Scalar::UInt64(*v).encode_key(out),
+            Self::Float64(v) => Scalar::Float64(*v).encode_key(out),
+            Self::Utf8(v) => Scalar::Utf8(v.clone()).encode_key(out),
+            Self::Bytes(v) => Scalar::Bytes(v.clone()).encode_key(out),
+            Self::Array(values) => {
+                out.push(9);
+                out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for value in values.iter() { value.encode_key(out); }
+            }
+            Self::Object(values) => {
+                out.push(10);
+                out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                let mut sorted: Vec<_> = values.iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, value) in sorted {
+                    Scalar::Utf8(name.clone()).encode_key(out);
+                    value.encode_key(out);
+                }
+            }
+        }
+    }
+
+    fn matches_type(&self, ty: &DataType, depth: usize) -> bool {
+        if depth > 64 { return false; }
+        if matches!(self, Self::Null) || matches!(ty, DataType::Dynamic) { return true; }
+        match (self, ty) {
+            (Self::Bool(_), DataType::Bool) | (Self::Int64(_), DataType::Int64 | DataType::TimestampMicrosUTC)
+            | (Self::UInt64(_), DataType::UInt64) | (Self::Float64(_), DataType::Float64)
+            | (Self::Utf8(_), DataType::Utf8) | (Self::Bytes(_), DataType::Bytes) => true,
+            (Self::Array(values), DataType::Array(inner)) => values.iter().all(|v| v.matches_type(inner, depth + 1)),
+            (Self::Object(values), DataType::Struct(fields)) => {
+                Self::unique_object_keys(values)
+                && values.len() == fields.len() && fields.iter().all(|f| {
+                    values.iter().find(|(k, _)| k.as_ref() == f.name).map_or(false, |(_, v)|
+                        (f.nullable || !matches!(v, Self::Null)) && v.matches_type(&f.data_type, depth + 1))
+                })
+            }
+            (Self::Object(values), DataType::Map { key, value }) => Self::unique_object_keys(values) && values.iter().all(|(k,v)| {
+                let valid_key = match key.as_ref() {
+                    DataType::Utf8 | DataType::Dynamic => true,
+                    DataType::Int64 => k.parse::<i64>().is_ok(),
+                    DataType::UInt64 => k.parse::<u64>().is_ok(),
+                    _ => false,
+                };
+                valid_key && v.matches_type(value, depth + 1)
+            }),
+            _ => false,
+        }
+    }
+
+    // Object is public: non-JSON callers may bypass try_object. Validate
+    // uniqueness, not insertion order, at the typed ingress boundary.
+    fn unique_object_keys(values: &[(Arc<str>, DynamicValue)]) -> bool {
+        let mut seen = std::collections::HashSet::with_capacity(values.len());
+        values.iter().all(|(key, _)| seen.insert(key.as_ref()))
+    }
+
     pub fn utf8(s: impl AsRef<str>) -> Self {
         Self::Utf8(Arc::from(s.as_ref()))
     }
@@ -363,6 +441,22 @@ impl DynamicValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r3_state_keys_encode_content_and_canonical_float_equality() {
+        let encode = |value: Scalar| { let mut bytes = Vec::new(); value.encode_key(&mut bytes); bytes };
+        let a = Scalar::Dynamic(DynamicValue::object(vec![("aa", DynamicValue::utf8("bb"))]));
+        let b = Scalar::Dynamic(DynamicValue::object(vec![("cc", DynamicValue::utf8("dd"))]));
+        assert_eq!(a.tracked_bytes(), b.tracked_bytes());
+        assert_ne!(encode(a), encode(b));
+        assert_eq!(encode(Scalar::Float64(-0.0)), encode(Scalar::Float64(0.0)));
+        assert_eq!(encode(Scalar::Float64(f64::NAN)), encode(Scalar::Float64(f64::from_bits(0x7ff8000000000001))));
+        let mut value = Vec::new();
+        Scalar::Float64(-0.0).encode_value(&mut value).unwrap();
+        let decoded = Scalar::decode_value(&mut value.as_slice()).unwrap();
+        let Scalar::Float64(decoded) = decoded else { panic!("float expected") };
+        assert_eq!(decoded.to_bits(), (-0.0f64).to_bits());
+    }
 
     #[test]
     fn dynamic_extract_and_detach() {

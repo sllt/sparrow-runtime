@@ -98,7 +98,7 @@ No per-event or per-key labels.
 - Request bodies capped at 64KiB
 - `TargetPolicy` deny-by-default; unauthorized HTTP/MQTT hosts are 403
 - TLS `skip_verify` rejected; outbound HTTP does **not** auto-follow redirects
-- Catalog SQLite file is `0600`. Secrets are XOR-sealed (`enc:v1:…`, key from `SPARROW_SECRETS_KEY` or a process-local default) and never echoed in errors. **Threat model:** this is disk-at-rest obfuscation + permissions, not a HSM. Anyone who can read the DB and the key can recover secrets. Prefer `env:` refs for production.
+- Catalog SQLite file is `0600`. Secrets use ChaCha20-Poly1305 (`enc:v2:`); legacy XOR/plaintext envelopes are rejected. Configure `SPARROW_SECRETS_KEY` or `SPARROW_SECRETS_KEY_FILE` for restart-safe decryption. A missing key warns in development and fails in safe/required-key mode. This is local at-rest protection, not an HSM or multi-tenant secret service.
 
 ## Secrets (R27)
 

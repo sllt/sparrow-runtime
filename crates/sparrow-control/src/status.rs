@@ -10,13 +10,14 @@ use sparrow_model::{ErrorCode, Result, SparrowError};
 /// Closed status vocabulary for desired and actual pipeline rows.
 ///
 /// Desired writes are `running` | `stopped`. Actual also uses
-/// `starting`, `failed`, and `completed`.
+/// `starting`, `waiting` (capacity), `failed`, and `completed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PipelineStatus {
     Stopped,
     Starting,
     Running,
+    Waiting,
     Failed,
     Completed,
 }
@@ -27,6 +28,7 @@ impl PipelineStatus {
             Self::Stopped => "stopped",
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::Waiting => "waiting",
             Self::Failed => "failed",
             Self::Completed => "completed",
         }
@@ -37,6 +39,7 @@ impl PipelineStatus {
             "stopped" => Ok(Self::Stopped),
             "starting" => Ok(Self::Starting),
             "running" => Ok(Self::Running),
+            "waiting" => Ok(Self::Waiting),
             "failed" => Ok(Self::Failed),
             "completed" => Ok(Self::Completed),
             other => Err(SparrowError::new(

@@ -108,7 +108,59 @@ impl LitSpec {
 }
 
 pub fn parse_type(name: &str) -> Result<DataType> {
-    match name.to_ascii_lowercase().as_str() {
+    if name.len() > 4096 {
+        return Err(SparrowError::new(ErrorCode::BoundExceeded, "type declaration exceeds 4KiB"));
+    }
+    parse_type_inner(name.trim(), 0)
+}
+
+fn parse_type_inner(name: &str, depth: usize) -> Result<DataType> {
+    if depth > 32 {
+        return Err(SparrowError::new(ErrorCode::BoundExceeded, "nested type depth exceeds 32"));
+    }
+    if let Some(open) = name.find('<') {
+        let malformed = || SparrowError::new(ErrorCode::InvalidSchema, "malformed nested type");
+        let body = name[open + 1..].strip_suffix('>').ok_or_else(malformed)?;
+        let mut args = Vec::new();
+        let mut level = 0usize;
+        let mut start = 0;
+        for (i, ch) in body.char_indices() {
+            match ch {
+                '<' => level += 1,
+                '>' => level = level.checked_sub(1).ok_or_else(malformed)?,
+                ',' if level == 0 => { args.push(body[start..i].trim()); start = i + 1; }
+                _ => {}
+            }
+        }
+        if level != 0 { return Err(malformed()); }
+        args.push(body[start..].trim());
+        if args.iter().any(|a| a.is_empty()) { return Err(malformed()); }
+        let parse = |s: &str| parse_type_inner(s.trim(), depth + 1);
+        return match name[..open].trim().to_ascii_lowercase().as_str() {
+            "array" if args.len() == 1 => Ok(DataType::Array(Box::new(parse(args[0])?))),
+            "map" if args.len() == 2 => {
+                let key = parse(args[0])?;
+                if !matches!(key, DataType::Utf8 | DataType::Int64 | DataType::UInt64) {
+                    return Err(SparrowError::new(ErrorCode::InvalidSchema, "JSON map key must be utf8/int64/uint64"));
+                }
+                Ok(DataType::Map { key: Box::new(key), value: Box::new(parse(args[1])?) })
+            }
+            "struct" if args.len() <= 64 => {
+                let mut fields = Vec::new();
+                for (i, arg) in args.iter().enumerate() {
+                    let (field, ty) = arg.split_once(':').ok_or_else(malformed)?;
+                    let field = field.trim();
+                    let nullable = field.ends_with('?');
+                    let field = field.trim_end_matches('?');
+                    fields.push(sparrow_model::Field::new(sparrow_model::FieldId::new(i as u16 + 1), field, parse(ty)?, nullable));
+                }
+                sparrow_model::Schema::new(1, fields.clone())?;
+                Ok(DataType::Struct(fields))
+            }
+            _ => Err(malformed()),
+        };
+    }
+    match name.trim().to_ascii_lowercase().as_str() {
         "null" => Ok(DataType::Null),
         "bool" | "boolean" => Ok(DataType::Bool),
         "int64" | "bigint" | "long" => Ok(DataType::Int64),
@@ -143,5 +195,21 @@ fn parse_op(name: &str) -> Result<BinaryOp> {
             ErrorCode::InvalidArgument,
             format!("unknown binary op '{other}'"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod r3_type_tests {
+    use super::*;
+
+    #[test]
+    fn nested_schema_types_are_bounded_and_validated() {
+        assert!(matches!(parse_type("array<map<utf8,struct<x:int64, y?:bool>>>>"), Err(_)));
+        let parsed = parse_type("array<map<utf8,struct<x:int64, y?:bool>>>").unwrap();
+        assert!(parsed.is_nested());
+        for bad in ["array<>", "map<utf8>", "map<bool,int64>", "struct<x:int64,x:utf8>"] {
+            assert!(parse_type(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_type(&format!("{}int64{}", "array<".repeat(34), ">".repeat(34))).unwrap_err().code, ErrorCode::BoundExceeded);
     }
 }

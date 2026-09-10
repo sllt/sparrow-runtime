@@ -17,7 +17,7 @@ use sparrow_model::{
 };
 use sparrow_plan::{PhysicalPlan, PhysicalStage, PlanLayout};
 use sparrow_runtime::{
-    wait_aligned_acks, AlignedAck, AlignedJob, CheckpointSnapshot, CheckpointStore, IngressEvent,
+    AlignedAcks, AlignedJob, CheckpointSnapshot, CheckpointStore, IngressEvent,
     JobHandle, JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, StreamControl,
 };
 use tokio::sync::{Mutex, Notify};
@@ -35,11 +35,20 @@ use crate::validate::{
 /// increments on start/stop/running/failed; it must not trigger this hold.
 pub(crate) const MAX_PIPELINE_ATTEMPTS: u64 = 16;
 
-/// Per-pipeline restart backoff: `40ms << min(consecutive_failures, 6)`.
-/// Cap is 2.56s. Must never be awaited inside the shared converge loop.
+/// Per-pipeline backoff, capped at 32 seconds; never sleep in converge.
+/// A successful launch is not a stable recovery: reset after 30s running.
 pub(crate) fn retry_backoff(consecutive_failures: u64) -> Duration {
-    let shift = consecutive_failures.min(6) as u32;
-    Duration::from_millis(40u64.saturating_mul(1u64 << shift))
+    let shift = consecutive_failures.min(7) as u32;
+    Duration::from_millis(250u64.saturating_mul(1u64 << shift))
+}
+
+pub(crate) fn capacity_backoff(attempt: u32) -> Duration {
+    Duration::from_millis((500u64 << attempt.saturating_sub(1).min(4)).min(5_000))
+}
+
+fn is_capacity_wait(error: &SparrowError) -> bool {
+    error.retryable && error.code == sparrow_model::ErrorCode::ResourceExhausted
+        && error.context.iter().any(|(key, value)| key == "admission" && value == "capacity")
 }
 
 #[cfg(feature = "demo-io")]
@@ -110,7 +119,11 @@ enum RunningKind {
     },
 }
 
+const STABLE_RUN: Duration = Duration::from_secs(30);
+
 struct RunningJob {
+    started_at: Instant,
+    stable: bool,
     kind: RunningKind,
     revision: u64,
     diag: Arc<IoDiagnostics>,
@@ -128,12 +141,15 @@ impl RunningJob {
 }
 
 pub struct Supervisor {
+    pub(crate) checkpoint_timeout: Duration,
+    pub(crate) stable_run: Duration,
     store: Arc<Store>,
     kernel: Arc<Kernel>,
     running: Mutex<HashMap<String, RunningJob>>,
     /// When a failed pipeline may be retried. Checked with `continue`;
     /// the shared converge loop must not sleep on this map.
     next_retry_at: Mutex<HashMap<String, Instant>>,
+    capacity_retries: Mutex<HashMap<String, u32>>,
     wake: Notify,
     safe_mode: bool,
     #[cfg(feature = "demo-io")]
@@ -158,10 +174,13 @@ impl Supervisor {
         store.reset_actual_after_process_restart()?;
         let secrets = StoreSecrets::new(Arc::clone(&store));
         Ok(Arc::new(Self {
+            checkpoint_timeout: Duration::from_secs(5),
+            stable_run: STABLE_RUN,
             store,
             kernel,
             running: Mutex::new(HashMap::new()),
             next_retry_at: Mutex::new(HashMap::new()),
+            capacity_retries: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             safe_mode,
             #[cfg(feature = "demo-io")]
@@ -224,6 +243,18 @@ impl Supervisor {
 
     pub async fn converge_once(&self) -> Result<()> {
         self.reap_finished().await;
+        let stable_names: Vec<String> = {
+            let mut jobs = self.running.lock().await;
+            jobs.iter_mut().filter_map(|(name, job)| {
+                if !job.stable && !job.is_finished() && job.started_at.elapsed() >= self.stable_run {
+                    job.stable = true;
+                    Some(name.clone())
+                } else { None }
+            }).collect()
+        };
+        for name in stable_names {
+            self.catalog(move |s| s.reset_consecutive_failures(&name)).await?;
+        }
         let desired = self.catalog(|s| s.list_desired()).await?;
         for d in desired {
             if d.status == "running" {
@@ -240,7 +271,7 @@ impl Supervisor {
                     if a.status == "completed" && a.revision == d.revision {
                         continue;
                     }
-                    if a.status == "failed" && a.consecutive_failures > 0 {
+                    if (a.status == "failed" || a.status == "waiting") && a.revision == d.revision {
                         // N8: per-pipeline due time. Never sleep here —
                         // a failed sibling must not stall healthy start/stop.
                         if !self
@@ -264,16 +295,23 @@ impl Supervisor {
                 if let Err(e) = self.start_named(&d.name, rev).await {
                     let name = d.name.clone();
                     let msg = e.message.clone();
+                    let waiting = is_capacity_wait(&e);
                     let _ = self
                         .catalog({
                             let name = name.clone();
                             move |s| {
-                                let attempt = s
-                                    .actual(&name)
-                                    .map(|a| a.attempt_id.saturating_add(1))
-                                    .unwrap_or(1);
-                                s.set_actual(&name, "failed", Some(rev), attempt, Some(&msg))?;
-                                s.insert_attempt(&name, rev, "failed", Some(&msg))
+                                let previous = s.actual(&name)?;
+                                let still_waiting = waiting && previous.status == "waiting"
+                                    && previous.revision == Some(rev);
+                                let attempt = previous.attempt_id.saturating_add(u64::from(!still_waiting));
+                                if waiting {
+                                    s.set_waiting_failure(&name, rev, attempt, &msg)?;
+                                    if !still_waiting { s.insert_attempt(&name, rev, "waiting", Some(&msg))?; }
+                                } else {
+                                    s.set_actual(&name, "failed", Some(rev), attempt, Some(&msg))?;
+                                    s.insert_attempt(&name, rev, "failed", Some(&msg))?;
+                                }
+                                Ok(())
                             }
                         })
                         .await;
@@ -281,15 +319,15 @@ impl Supervisor {
                 } else {
                     self.clear_retry(&d.name).await;
                 }
-            } else if let Some(job) = {
-                let mut g = self.running.lock().await;
-                g.remove(&d.name)
-            } {
-                self.stop_job(job).await;
+            } else {
+                self.clear_retry(&d.name).await;
+                let job = self.running.lock().await.remove(&d.name);
+                if let Some(job) = job { self.stop_job(job).await; }
                 let name = d.name.clone();
                 let revision = d.revision;
                 let _ = self
                     .catalog(move |s| {
+                        if s.actual(&name)?.status == "stopped" { return Ok(()); }
                         let attempt = s
                             .actual(&name)
                             .map(|a| a.attempt_id.saturating_add(1))
@@ -353,11 +391,8 @@ impl Supervisor {
     }
 
     async fn retry_is_due(&self, name: &str, consecutive_failures: u64) -> bool {
-        if consecutive_failures == 0 {
-            self.clear_retry(name).await;
-            return true;
-        }
         let mut map = self.next_retry_at.lock().await;
+        if consecutive_failures == 0 && !map.contains_key(name) { return true; }
         let due = *map
             .entry(name.to_string())
             .or_insert_with(|| Instant::now() + retry_backoff(consecutive_failures));
@@ -365,53 +400,53 @@ impl Supervisor {
     }
 
     async fn schedule_retry(&self, name: &str) {
-        let cf = self
+        let actual = self
             .catalog({
                 let name = name.to_string();
-                move |s| Ok(s.actual(&name).map(|a| a.consecutive_failures).unwrap_or(1))
+                move |s| s.actual(&name)
             })
-            .await
-            .unwrap_or(1)
-            .max(1);
-        let due = Instant::now() + retry_backoff(cf);
+            .await;
+        let delay = if actual.as_ref().is_ok_and(|a| a.status == "waiting") {
+            let mut retries = self.capacity_retries.lock().await;
+            let n = retries.entry(name.to_string()).or_default();
+            *n = n.saturating_add(1);
+            capacity_backoff(*n)
+        } else {
+            self.capacity_retries.lock().await.remove(name);
+            retry_backoff(actual.map(|a| a.consecutive_failures).unwrap_or(1).max(1))
+        };
+        let due = Instant::now() + delay;
         self.next_retry_at.lock().await.insert(name.to_string(), due);
     }
 
-    async fn clear_retry(&self, name: &str) {
+    pub(crate) async fn clear_retry(&self, name: &str) {
         self.next_retry_at.lock().await.remove(name);
+        self.capacity_retries.lock().await.remove(name);
     }
 
     async fn should_hold_failed(&self, name: &str) -> Result<bool> {
         let name = name.to_string();
         let safe = self.safe_mode;
         self.catalog(move |s| {
-            if let Ok(a) = s.actual(&name) {
-                if a.consecutive_failures >= MAX_PIPELINE_ATTEMPTS {
-                    let msg = format!(
-                        "held: consecutive_failures {} reached cap {MAX_PIPELINE_ATTEMPTS}",
-                        a.consecutive_failures
-                    );
-                    if a.last_error.as_deref() != Some(msg.as_str()) {
-                        s.set_last_error(&name, Some(&msg))?;
-                    }
-                    return Ok(true);
+            let a = s.actual(&name)?;
+            if a.status != "running" && a.status != "waiting" && a.consecutive_failures >= MAX_PIPELINE_ATTEMPTS {
+                let msg = format!(
+                    "held: consecutive_failures {} reached cap {MAX_PIPELINE_ATTEMPTS}; last: {}",
+                    a.consecutive_failures,
+                    a.last_error.as_deref().unwrap_or("unknown")
+                );
+                if !a.last_error.as_deref().unwrap_or("").starts_with("held:") {
+                    s.set_last_error(&name, Some(&msg))?;
                 }
+                return Ok(true);
             }
-            if !safe {
-                return Ok(false);
-            }
-            if let Some(last) = s.last_attempt(&name)? {
-                if last.outcome == "failed" {
-                    let msg = "held: safe-mode and last attempt failed";
-                    if let Ok(a) = s.actual(&name) {
-                        if a.last_error.as_deref() != Some(msg) {
-                            s.set_last_error(&name, Some(msg))?;
-                        }
-                    } else {
-                        s.set_last_error(&name, Some(msg))?;
-                    }
-                    return Ok(true);
+            if safe && a.restart_blocked {
+                let msg = "held: safe-mode and last attempt failed";
+                if !a.last_error.as_deref().unwrap_or("").starts_with("held:") {
+                    let detail = format!("{msg}; last: {}", a.last_error.as_deref().unwrap_or("unknown"));
+                    s.set_last_error(&name, Some(&detail))?;
                 }
+                return Ok(true);
             }
             Ok(false)
         })
@@ -450,12 +485,16 @@ impl Supervisor {
             let name = name_s.clone();
             let note = note_s.clone();
             move |s| {
-                let attempt = s
-                    .actual(&name)
-                    .map(|a| a.attempt_id.saturating_add(1))
-                    .unwrap_or(1);
+                let previous = s.actual(&name)?;
+                // Preserve the waiting state until admission succeeds. Otherwise
+                // every capacity poll writes starting + waiting and defeats dedup.
+                if previous.status == "waiting" && previous.revision == Some(revision) {
+                    return Ok(());
+                }
+                let attempt = previous.attempt_id.saturating_add(1);
                 s.set_actual(&name, "starting", Some(revision), attempt, None)?;
-                s.insert_attempt(&name, revision, "starting", Some(&note))
+                s.insert_attempt(&name, revision, "starting", Some(&note))?;
+                Ok(())
             }
         })
         .await?;
@@ -485,7 +524,8 @@ impl Supervisor {
         let name_s = name.to_string();
         let note_s = note.to_string();
         self.catalog(move |s| {
-            let attempt = s.actual(&name_s).map(|a| a.attempt_id).unwrap_or(1);
+            let previous = s.actual(&name_s)?;
+            let attempt = previous.attempt_id.saturating_add(u64::from(previous.status == "waiting"));
             s.set_actual(&name_s, "running", Some(revision), attempt, None)?;
             s.insert_attempt(&name_s, revision, "running", Some(&note_s))
         })
@@ -559,6 +599,8 @@ impl Supervisor {
             None,
         )?;
         Ok(RunningJob {
+            started_at: Instant::now(),
+            stable: false,
             kind: RunningKind::Live {
                 handle: job,
                 source,
@@ -638,6 +680,8 @@ impl Supervisor {
             None,
         )?;
         Ok(RunningJob {
+            started_at: Instant::now(),
+            stable: false,
             kind: RunningKind::Live {
                 handle: job,
                 source,
@@ -666,7 +710,7 @@ impl Supervisor {
         sparrow_connectors::policy::check_data_path(std::path::Path::new(&chk))?;
         let store = CheckpointStore::open_with_max_state_keys(
             std::path::Path::new(&chk),
-            self.kernel.budget().max_state_keys,
+            self.kernel.job_budget().max_state_keys,
         )?;
         let fail_on_decode = spec.effective_fail_on_decode();
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
@@ -704,7 +748,7 @@ impl Supervisor {
         let outbox_n = spec.sink.outbox_capacity.max(1);
         let (tx_ev, rx_ev) = tokio::sync::mpsc::channel(inbox);
         let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox_n);
-        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel::<AlignedAck>(8);
+        let acks = AlignedAcks::default();
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<AlignedCmd>(4);
         let outbox = Arc::new(InflightCounter::new());
         let diag = IoDiagnostics::new();
@@ -716,7 +760,7 @@ impl Supervisor {
                 .with_live_out(tx_out)
                 .with_aligned(AlignedJob {
                     restore: restore_freeze,
-                    acks: ack_tx,
+                    acks: acks.clone(),
                     outbox: Arc::clone(&outbox),
                 }),
         )?;
@@ -727,6 +771,7 @@ impl Supervisor {
         let next_r = Arc::clone(&next_id);
         let store_r = Arc::clone(&store);
         let layout_r = Arc::clone(&layout);
+        let checkpoint_timeout = self.checkpoint_timeout;
         let source_task = self.kernel.handle().spawn(async move {
             let mut terminal_sent = false;
             loop {
@@ -740,61 +785,49 @@ impl Supervisor {
                         let Some(AlignedCmd::Checkpoint { reply }) = cmd else {
                             return Ok(());
                         };
-                        let id = next_r.load(std::sync::atomic::Ordering::SeqCst);
+                        // Every attempt gets a fresh id, including encode/commit failures.
+                        let id = next_r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // Cut is the source cursor when the barrier is injected.
                         // Do not later stitch a stale freeze onto a newer pos_r.
                         let cut_source = pos_r.lock().expect("pos").clone();
                         let cut_ingested =
                             ingested_r.load(std::sync::atomic::Ordering::SeqCst);
-                        if tx_ev
-                            .send(IngressEvent::Control(StreamControl::CheckpointBarrier {
+                        // The timeout includes barrier injection. Dropping this future
+                        // drops its request inbox, so late encoded ACKs release leases.
+                        let aligned = async {
+                            let request = acks.begin(id)?;
+                            tx_ev.send(IngressEvent::Control(StreamControl::CheckpointBarrier {
                                 checkpoint_id: id,
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            let _ = reply.send(Err(SparrowError::new(
-                                sparrow_model::ErrorCode::Cancelled,
-                                "aligned source ended before barrier",
-                            )));
-                            return Ok(());
-                        }
-                        let acks = match wait_aligned_acks(
-                            &mut ack_rx,
-                            id,
-                            Duration::from_secs(5),
-                        )
-                        .await
-                        {
+                            })).await.map_err(|_| SparrowError::new(
+                                sparrow_model::ErrorCode::Cancelled, "aligned source ended before barrier"))?;
+                            request.wait(checkpoint_timeout).await
+                        };
+                        let result = tokio::select! {
+                            _ = child.cancelled() => return Ok(()),
+                            result = tokio::time::timeout(checkpoint_timeout, aligned) =>
+                                result.unwrap_or_else(|_| Err(SparrowError::new(
+                                    sparrow_model::ErrorCode::ResourceExhausted, "aligned checkpoint timed out"))),
+                        };
+                        let acks = match result {
                             Ok(a) => a,
                             Err(e) => {
                                 // Abandon this id so late freeze/flush cannot
                                 // satisfy the next checkpoint_named.
-                                next_r.store(
-                                    id.saturating_add(1),
-                                    std::sync::atomic::Ordering::SeqCst,
-                                );
                                 metrics.record_checkpoint_abort();
                                 let _ = reply.send(Err(e));
                                 continue;
                             }
                         };
-                        let snap = CheckpointSnapshot {
-                            checkpoint_id: id,
-                            source: cut_source,
-                            window: acks.freeze.expect("aligned freeze"),
-                            ingested_rows: cut_ingested,
-                            layout: (*layout_r).clone(),
-                            table: None,
-                        };
+                        let freeze = acks.freeze.expect("aligned freeze");
+                        let layout = Arc::clone(&layout_r);
                         let store = Arc::clone(&store_r);
                         let committed = tokio::task::spawn_blocking(move || {
                             let started = std::time::Instant::now();
                             let mut store = store.lock().expect("store");
-                            let payload_len = snap
-                                .encode_with_max_state_keys(store.max_state_keys())?
-                                .len() as u64;
-                            let id = store.commit(&snap)?;
+                            let payload = CheckpointSnapshot::encode_frozen(
+                                id, &cut_source, cut_ingested, &layout, None, freeze)?;
+                            let payload_len = payload.bytes.len() as u64;
+                            let id = store.commit_encoded(id, &payload.bytes)?;
                             Ok((id, payload_len, started.elapsed()))
                         })
                         .await
@@ -806,7 +839,6 @@ impl Supervisor {
                         });
                         match committed {
                             Ok(Ok((cid, payload_len, duration))) => {
-                                next_r.store(cid.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
                                 metrics.record_checkpoint(duration, payload_len);
                                 tracing::info!(
                                     checkpoint_id = cid,
@@ -859,6 +891,8 @@ impl Supervisor {
             Some(Arc::clone(&outbox)),
         )?;
         Ok(RunningJob {
+            started_at: Instant::now(),
+            stable: false,
             kind: RunningKind::Aligned {
                 cancel,
                 cmd: cmd_tx,
@@ -1066,19 +1100,48 @@ pub fn compact_kernel() -> Result<Kernel> {
 /// Host-sized kernel for sparrow-server. SQLite/checkpoint/file still run on
 /// the blocking pool; these workers stay for mailbox/stage futures.
 pub fn host_kernel() -> Result<Kernel> {
+    let max_jobs = match std::env::var("SPARROW_MAX_JOBS") {
+        Ok(value) => parse_max_jobs(&value)?,
+        Err(std::env::VarError::NotPresent) => 16,
+        Err(_) => return Err(SparrowError::new(sparrow_model::ErrorCode::InvalidArgument,
+            "SPARROW_MAX_JOBS must be an integer in 1..=256")),
+    };
+    host_kernel_with_max_jobs(max_jobs)
+}
+
+pub fn parse_max_jobs(value: &str) -> Result<usize> {
+    value.parse::<usize>().ok().filter(|n| (1..=256).contains(n))
+        .ok_or_else(|| SparrowError::new(sparrow_model::ErrorCode::InvalidArgument,
+            "max_jobs must be an integer in 1..=256 (--max-jobs / SPARROW_MAX_JOBS)"))
+}
+
+/// Scale the three process memory caps by the configured number of Compact
+/// jobs. These are admission/credit limits, not eagerly allocated memory.
+pub fn host_kernel_with_max_jobs(max_jobs: usize) -> Result<Kernel> {
+    if !(1..=256).contains(&max_jobs) {
+        return Err(SparrowError::new(sparrow_model::ErrorCode::InvalidArgument,
+            "max_jobs must be in 1..=256"));
+    }
+    let job = ResourceBudget::compact();
+    let budget = ResourceBudget {
+        reservation_bytes: job.reservation_bytes * max_jobs,
+        retention_bytes: job.retention_bytes * max_jobs,
+        queue_bytes: job.queue_bytes * max_jobs,
+        ..ResourceBudget::performance()
+    };
     let n = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4)
         .clamp(4, 16);
-    Kernel::new(KernelOptions {
-        budget: ResourceBudget::compact(),
+    Kernel::new_with_job_budget(KernelOptions {
+        budget,
         mailbox: MailboxConfig {
             max_items: 32,
             max_bytes: 256 * 1024,
         },
         worker_threads: n,
         rows_per_batch: 8,
-    })
+    }, job)
 }
 
 fn window_from_plan(
@@ -1130,10 +1193,7 @@ pub fn request_start_at(
         }
         None => row.latest_revision,
     };
-    store.set_desired(name, "running", Some(rev))?;
-    store.reset_consecutive_failures(name)?;
-    let attempt = store.actual(name).map(|a| a.attempt_id).unwrap_or(0);
-    store.set_actual(name, "stopped", None, attempt, None)?;
+    store.request_start_revision(name, rev)?;
     store.audit(
         actor,
         "start",
@@ -1157,6 +1217,51 @@ pub fn request_stop(store: &Store, name: &str, actor: &str) -> Result<()> {
         "accepted",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod r4_retry_tests {
+    use super::*;
+
+    #[test]
+    fn r5_only_explicit_capacity_admission_enters_waiting() {
+        use sparrow_model::ErrorCode;
+        let plain = SparrowError::new(ErrorCode::ResourceExhausted, "memory allocation failed");
+        assert!(plain.retryable);
+        assert!(!is_capacity_wait(&plain));
+        assert!(!is_capacity_wait(&plain.clone().context("admission", "configuration")));
+        let capacity = plain.context("admission", "capacity");
+        assert!(is_capacity_wait(&capacity));
+        assert!(!is_capacity_wait(&capacity.retryable(false)));
+        assert!(!is_capacity_wait(&SparrowError::new(ErrorCode::InvalidArgument, "bad plan")
+            .context("admission", "capacity").retryable(true)));
+    }
+
+    #[test]
+    fn r4_capacity_retry_grows_independently_of_crash_count_and_resets() {
+        let kernel = Arc::new(host_kernel_with_max_jobs(1).unwrap());
+        kernel.block_on(async {
+            let store = Arc::new(Store::open_memory().unwrap());
+            let spec = crate::PipelineSpec::from_json(br#"{"stream":"sensors","sql":"SELECT v FROM sensors","source":{"kind":"file","path":"unused.ndjson"},"sink":{"kind":"log"}}"#).unwrap();
+            store.put_pipeline("wait", &spec, None).unwrap();
+            let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+            store.set_waiting_failure("wait", 1, 1, "capacity").unwrap();
+            for (i, expected_ms) in [500, 1000, 2000, 4000, 5000, 5000].into_iter().enumerate() {
+                sup.schedule_retry("wait").await;
+                assert_eq!(capacity_backoff(i as u32 + 1), Duration::from_millis(expected_ms));
+                assert_eq!(sup.capacity_retries.lock().await["wait"], i as u32 + 1);
+                assert!(sup.next_retry_at.lock().await.contains_key("wait"));
+                assert_eq!(store.actual("wait").unwrap().consecutive_failures, 0);
+            }
+            sup.clear_retry("wait").await;
+            sup.schedule_retry("wait").await;
+            assert_eq!(sup.capacity_retries.lock().await["wait"], 1);
+            store.set_actual("wait", "failed", Some(1), 2, Some("crash")).unwrap();
+            sup.schedule_retry("wait").await;
+            assert!(!sup.capacity_retries.lock().await.contains_key("wait"));
+            assert_eq!(store.actual("wait").unwrap().consecutive_failures, 1);
+        });
+    }
 }
 
 #[cfg(all(test, feature = "demo-io"))]
