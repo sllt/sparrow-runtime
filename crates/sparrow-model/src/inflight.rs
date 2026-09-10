@@ -13,6 +13,9 @@ pub struct InflightCounter {
     sent: AtomicU64,
     acked: AtomicU64,
     failed: AtomicU64,
+    /// `failed` observed at the last barrier mark. Drops that land before
+    /// the barrier is processed still belong to that cut.
+    marked_failed: AtomicU64,
 }
 
 impl InflightCounter {
@@ -48,6 +51,18 @@ impl InflightCounter {
         self.failed.load(Ordering::SeqCst)
     }
 
+    /// Drops since the last [`mark`] (previous barrier, or job start).
+    pub fn drops_since_mark(&self) -> u64 {
+        self.failed()
+            .saturating_sub(self.marked_failed.load(Ordering::SeqCst))
+    }
+
+    /// Close the drop window after a barrier has observed this cut.
+    pub fn mark(&self) {
+        self.marked_failed
+            .store(self.failed(), Ordering::SeqCst);
+    }
+
     /// Unresolved batches. Barrier commit is dishonest while this is > 0.
     pub fn pending(&self) -> u64 {
         self.sent()
@@ -79,5 +94,8 @@ mod tests {
         assert_eq!(c.pending(), 0);
         assert_eq!(c.failed(), 1);
         assert_eq!(c.acked(), 0);
+        assert_eq!(c.drops_since_mark(), 1);
+        c.mark();
+        assert_eq!(c.drops_since_mark(), 0);
     }
 }

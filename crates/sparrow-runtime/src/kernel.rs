@@ -644,6 +644,9 @@ async fn stage_loop(
                         // The supervisor refuses commit; late acks keep their id.
                         let flush =
                             wait_outbox(&aj.outbox, std::time::Duration::from_secs(5)).await;
+                        // Consume this cut's drop window so the next barrier
+                        // only sees drops that belong to it.
+                        aj.outbox.mark();
                         let _ = aj
                             .acks
                             .send(AlignedAck::SinkFlushed {

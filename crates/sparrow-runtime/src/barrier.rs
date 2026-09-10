@@ -104,19 +104,15 @@ pub fn discard_stale_acks(ack_rx: &mut tokio::sync::mpsc::Receiver<AlignedAck>, 
 }
 
 pub async fn wait_outbox(outbox: &InflightCounter, timeout: Duration) -> FlushOutcome {
-    let failed0 = outbox.failed();
     let deadline = Instant::now() + timeout;
     while outbox.pending() > 0 {
         if Instant::now() >= deadline {
-            let dropped = outbox
-                .failed()
-                .saturating_sub(failed0)
-                .max(outbox.pending());
+            let dropped = outbox.drops_since_mark().max(outbox.pending());
             return FlushOutcome { ok: false, dropped };
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    let dropped = outbox.failed().saturating_sub(failed0);
+    let dropped = outbox.drops_since_mark();
     FlushOutcome {
         ok: dropped == 0,
         dropped,
