@@ -67,6 +67,7 @@ fn rejects_are_explicit() {
 
     let allow = TargetPolicy::allow("127.0.0.1", 1883);
     let mut missing = MqttSourceConfig::demo("127.0.0.1", 1883, schema.clone());
+    missing.tls.enabled = true;
     missing.password_secret = Some("does.not.exist".into());
     assert_eq!(
         missing.validate(&secrets, &allow).unwrap_err().code(),

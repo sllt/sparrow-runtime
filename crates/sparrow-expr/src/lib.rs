@@ -648,14 +648,25 @@ mod tests {
             right: Box::new(Expr::Literal(Scalar::Int64(a + 1))),
         };
         assert_eq!(eval(&eq, &schema, &row).unwrap(), Scalar::Bool(false));
-        let nan = Expr::Binary {
+        let nan_eq = Expr::Binary {
             op: BinaryOp::Eq,
             left: Box::new(Expr::Literal(Scalar::Float64(f64::NAN))),
             right: Box::new(Expr::Literal(Scalar::Float64(1.0))),
         };
         assert_eq!(
-            eval(&nan, &schema, &row).unwrap_err().code,
-            ErrorCode::InvalidArgument
+            eval(&nan_eq, &schema, &row).unwrap(),
+            Scalar::Bool(false),
+            "Eq uses IEEE: NaN equals nothing (not unwrap_or Equal)"
+        );
+        let nan_lt = Expr::Binary {
+            op: BinaryOp::Lt,
+            left: Box::new(Expr::Literal(Scalar::Float64(f64::NAN))),
+            right: Box::new(Expr::Literal(Scalar::Float64(1.0))),
+        };
+        assert_eq!(
+            eval(&nan_lt, &schema, &row).unwrap_err().code,
+            ErrorCode::InvalidArgument,
+            "ordered compare must not treat NaN as Equal"
         );
         let tmin = Expr::Call {
             name: "least".into(),

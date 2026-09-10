@@ -395,11 +395,12 @@ mod tests {
             max_future_skew_micros: Some(1_000_000),
         };
         let mut h = WatermarkHub::new().with_binding(bind).unwrap();
-        let err = h
-            .observe_event(InputId(0), 10_000_000, 0)
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::InvalidArgument);
-        assert!(err.message.contains("future timestamp"));
+        assert_eq!(
+            h.observe_event(InputId(0), 10_000_000, 0).unwrap(),
+            None,
+            "beyond max_future_skew must drop, not fail the job"
+        );
+        assert!(h.effective().is_none(), "dropped future event must not advance watermark");
     }
 
     #[test]

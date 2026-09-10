@@ -55,6 +55,10 @@ impl StateKey {
     pub fn tracked_bytes(&self) -> usize {
         16 + self.key.iter().map(Scalar::tracked_bytes).sum::<usize>()
     }
+
+    pub fn encoded_bytes(&self) -> &[u8] {
+        &self.encoded
+    }
 }
 
 #[derive(Debug)]

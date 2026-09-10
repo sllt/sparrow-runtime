@@ -535,6 +535,8 @@ impl Supervisor {
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.recovery = RecoveryPolicy::Aligned;
         cfg.restore = spec.restore_claim()?;
+        // Aligned files keep growing after a cut; R28 immutable is for sealed files.
+        cfg.contract = sparrow_connectors::FileContract::AppendOnly;
         let mut source = FileReplaySource::open(&cfg).map_err(|e| {
             SparrowError::new(e.code(), e.to_string())
         })?;
@@ -568,6 +570,7 @@ impl Supervisor {
         let outbox = Arc::new(InflightCounter::new());
         let diag = IoDiagnostics::new();
         let diag_src = Arc::clone(&diag);
+        let metrics = Arc::clone(&self.kernel.metrics);
         let job = self.kernel.submit(
             JobRequest::new(plan, Vec::new(), SharedCapture::disabled())
                 .with_live_events(rx_ev)
@@ -663,12 +666,18 @@ impl Supervisor {
                         match committed {
                             Ok(Ok(cid)) => {
                                 next_r.store(cid.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
+                                metrics.record_checkpoint(
+                                    std::time::Duration::from_millis(1),
+                                    1,
+                                );
                                 let _ = reply.send(Ok(cid));
                             }
                             Ok(Err(e)) => {
+                                metrics.record_checkpoint_abort();
                                 let _ = reply.send(Err(e));
                             }
                             Err(e) => {
+                                metrics.record_checkpoint_abort();
                                 let _ = reply.send(Err(e));
                             }
                         }

@@ -314,7 +314,9 @@ impl CheckpointStore {
                     Err(e)
                 }
             },
-            Ok(None) => Ok(self.load_latest_valid_except(None)),
+            // Missing CURRENT means the last publish did not land. Do not
+            // promote an unpublished MANIFEST (crash after rename, before CURRENT).
+            Ok(None) => Ok(None),
             Err(e) => {
                 if let Some(snap) = self.load_latest_valid_except(None) {
                     Ok(Some(snap))

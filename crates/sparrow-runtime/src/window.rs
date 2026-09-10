@@ -381,7 +381,8 @@ impl WindowOperator {
         let victim = match &self.store {
             WindowStore::Tumble(store) => store
                 .iter()
-                .find(|(_, e)| e.window_end <= wm_out)
+                .filter(|(_, e)| e.window_end <= wm_out)
+                .min_by_key(|(k, e)| (e.window_end, k.encoded_bytes().to_vec()))
                 .map(|(k, _)| k.clone()),
             _ => None,
         };
@@ -423,11 +424,13 @@ impl WindowOperator {
 
     fn peek_closed_bytes(&self, wm_out: i64) -> Option<usize> {
         match &self.store {
-            WindowStore::Tumble(store) => store.iter().find_map(|(_, e)| {
-                (e.window_end <= wm_out).then(|| {
+            WindowStore::Tumble(store) => store
+                .iter()
+                .filter(|(_, e)| e.window_end <= wm_out)
+                .min_by_key(|(k, e)| (e.window_end, k.encoded_bytes().to_vec()))
+                .map(|(_, e)| {
                     e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>() + 32
-                })
-            }),
+                }),
             _ => None,
         }
     }

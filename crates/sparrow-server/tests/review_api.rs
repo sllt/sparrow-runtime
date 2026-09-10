@@ -193,12 +193,18 @@ fn r24_aligned_without_window_is_failed_not_stuck_running() {
             "delivery": "live_best_effort",
             "recovery": "aligned"
         });
-        call(&state, auth_put("/v1/pipelines/nowin", spec.to_string())).await;
-        let (st, _) = call(&state, auth_post("/v1/pipelines/nowin/start", "{}")).await;
-        assert_eq!(st, StatusCode::OK);
-        wait_status(&state, "nowin", "failed", Duration::from_secs(5))
-            .await
-            .expect("missing window on aligned start must surface Failed");
+        let (st, body) = call(&state, auth_put("/v1/pipelines/nowin", spec.to_string())).await;
+        assert!(
+            st.is_client_error(),
+            "aligned without a window must fail closed at put/validate, got {st} {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("window"),
+            "{body}"
+        );
         let _ = std::fs::remove_file(&path);
     });
 }
