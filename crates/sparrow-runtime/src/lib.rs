@@ -23,7 +23,10 @@ pub mod watermark;
 pub mod window;
 
 pub use aligned::{run_until, AlignedSession};
-pub use barrier::{wait_outbox, AlignedAck, AlignedJob};
+pub use barrier::{
+    discard_stale_acks, wait_aligned_acks, wait_outbox, AlignedAck, AlignedJob, BarrierAcks,
+    FlushOutcome,
+};
 pub use capture::{CaptureMode, SharedCapture, StallGate};
 pub use checkpoint::{
     CheckpointSnapshot, CheckpointStore, FaultHook, FaultPoint, TableRevisionBind,

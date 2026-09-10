@@ -1,16 +1,18 @@
 //! Process-visible in-flight counter for sink flush alignment.
 //!
-//! Enqueue **before** a batch is handed to a sink. Ack **after** the sink
-//! has durable-or-transport-acked that batch (HTTP response, MQTT write+flush,
-//! log ring write). A checkpoint barrier must wait until `pending() == 0`.
+//! Enqueue **before** a batch is handed to a sink. `ack` after a successful
+//! transport write. `fail` after a drop / 4xx / retries exhausted. A checkpoint
+//! barrier waits until `pending() == 0`, then refuses commit if any `fail`
+//! landed since the last barrier.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Shared sent/acked counter. Not a channel-empty check.
+/// Shared sent/acked/failed counter. Not a channel-empty check.
 #[derive(Debug, Default)]
 pub struct InflightCounter {
     sent: AtomicU64,
     acked: AtomicU64,
+    failed: AtomicU64,
 }
 
 impl InflightCounter {
@@ -23,9 +25,15 @@ impl InflightCounter {
         self.sent.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Record that the sink finished (success or fail-closed drop).
+    /// Record that the sink successfully flushed this batch.
     pub fn ack(&self) {
         self.acked.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Record that the sink dropped this batch (4xx, encode, retries exhausted).
+    /// Resolves in-flight so the barrier can observe the failure instead of hanging.
+    pub fn fail(&self) {
+        self.failed.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn sent(&self) -> u64 {
@@ -36,9 +44,14 @@ impl InflightCounter {
         self.acked.load(Ordering::SeqCst)
     }
 
-    /// Unacked batches. Barrier commit is dishonest while this is > 0.
+    pub fn failed(&self) -> u64 {
+        self.failed.load(Ordering::SeqCst)
+    }
+
+    /// Unresolved batches. Barrier commit is dishonest while this is > 0.
     pub fn pending(&self) -> u64 {
-        self.sent().saturating_sub(self.acked())
+        self.sent()
+            .saturating_sub(self.acked().saturating_add(self.failed()))
     }
 }
 
@@ -56,5 +69,15 @@ mod tests {
         assert_eq!(c.pending(), 1);
         c.ack();
         assert_eq!(c.pending(), 0);
+    }
+
+    #[test]
+    fn fail_resolves_pending_but_is_not_success() {
+        let c = InflightCounter::new();
+        c.enqueue();
+        c.fail();
+        assert_eq!(c.pending(), 0);
+        assert_eq!(c.failed(), 1);
+        assert_eq!(c.acked(), 0);
     }
 }

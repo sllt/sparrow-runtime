@@ -15,8 +15,8 @@ use sparrow_model::{
 };
 use sparrow_plan::{PhysicalPlan, PhysicalStage, PlanLayout, TransformStep};
 use sparrow_runtime::{
-    AlignedAck, AlignedJob, CheckpointSnapshot, CheckpointStore, IngressEvent, JobHandle,
-    JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, StreamControl,
+    wait_aligned_acks, AlignedAck, AlignedJob, CheckpointSnapshot, CheckpointStore, IngressEvent,
+    JobHandle, JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, StreamControl,
 };
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -632,6 +632,11 @@ impl Supervisor {
                             return Ok(());
                         };
                         let id = next_r.load(std::sync::atomic::Ordering::SeqCst);
+                        // Cut is the source cursor when the barrier is injected.
+                        // Do not later stitch a stale freeze onto a newer pos_r.
+                        let cut_source = pos_r.lock().expect("pos").clone();
+                        let cut_ingested =
+                            ingested_r.load(std::sync::atomic::Ordering::SeqCst);
                         if tx_ev
                             .send(IngressEvent::Control(StreamControl::CheckpointBarrier {
                                 checkpoint_id: id,
@@ -645,40 +650,31 @@ impl Supervisor {
                             )));
                             return Ok(());
                         }
-                        let mut freeze = None;
-                        let mut flushed = false;
-                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                        while tokio::time::Instant::now() < deadline && !(freeze.is_some() && flushed)
+                        let acks = match wait_aligned_acks(
+                            &mut ack_rx,
+                            id,
+                            Duration::from_secs(5),
+                        )
+                        .await
                         {
-                            match tokio::time::timeout(
-                                deadline.saturating_duration_since(tokio::time::Instant::now()),
-                                ack_rx.recv(),
-                            )
-                            .await
-                            {
-                                Ok(Some(AlignedAck::WindowFrozen { freeze: f, .. })) => {
-                                    freeze = Some(f);
-                                }
-                                Ok(Some(AlignedAck::SinkFlushed { .. })) => flushed = true,
-                                Ok(None) | Err(_) => break,
+                            Ok(a) => a,
+                            Err(e) => {
+                                // Abandon this id so late freeze/flush cannot
+                                // satisfy the next checkpoint_named.
+                                next_r.store(
+                                    id.saturating_add(1),
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                metrics.record_checkpoint_abort();
+                                let _ = reply.send(Err(e));
+                                continue;
                             }
-                        }
-                        if freeze.is_none() || !flushed {
-                            let _ = reply.send(Err(SparrowError::new(
-                                sparrow_model::ErrorCode::ResourceExhausted,
-                                format!(
-                                    "barrier did not align (freeze={} flush={}); refusing dishonest commit",
-                                    freeze.is_some(),
-                                    flushed
-                                ),
-                            )));
-                            continue;
-                        }
+                        };
                         let snap = CheckpointSnapshot {
                             checkpoint_id: id,
-                            source: pos_r.lock().expect("pos").clone(),
-                            window: freeze.expect("freeze"),
-                            ingested_rows: ingested_r.load(std::sync::atomic::Ordering::SeqCst),
+                            source: cut_source,
+                            window: acks.freeze.expect("aligned freeze"),
+                            ingested_rows: cut_ingested,
                             layout: (*layout_r).clone(),
                             table: None,
                         };

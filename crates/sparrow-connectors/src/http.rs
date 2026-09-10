@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,7 +76,10 @@ impl HttpSinkConfig {
         if self.max_retries > MAX_RETRIES {
             return Err(ConnectorError::new(
                 ErrorCode::BoundExceeded,
-                format!("HTTP max_retries {} exceeds {MAX_RETRIES}", self.max_retries),
+                format!(
+                    "HTTP max_retries {} exceeds {MAX_RETRIES}",
+                    self.max_retries
+                ),
             ));
         }
         policy.check_http_url(&self.url)?;
@@ -127,9 +130,15 @@ impl HttpSink {
                 next = rx.recv() => {
                     match next {
                         Some(batch) => {
-                            self.post_batch(&batch).await;
+                            let ok = self.post_batch(&batch).await;
                             if let Some(o) = &outbox {
-                                o.ack();
+                                if ok {
+                                    o.ack();
+                                } else {
+                                    // Aligned treats a drop/4xx as a failed flush,
+                                    // not a successful SinkFlushed.
+                                    o.fail();
+                                }
                             }
                         }
                         None => break,
@@ -139,17 +148,24 @@ impl HttpSink {
         }
     }
 
-    async fn post_batch(&self, batch: &RowBatch) {
+    async fn post_batch(&self, batch: &RowBatch) -> bool {
         let schema = batch.schema();
         let body = match encode_json_batch(schema, batch.rows()) {
-            Ok(b) if b.len() <= JsonLimits::default().max_bytes.saturating_mul(batch.num_rows().max(1)) => b,
+            Ok(b)
+                if b.len()
+                    <= JsonLimits::default()
+                        .max_bytes
+                        .saturating_mul(batch.num_rows().max(1)) =>
+            {
+                b
+            }
             Ok(_) => {
                 self.diag.http_dropped.fetch_add(1, Ordering::Relaxed);
-                return;
+                return false;
             }
             Err(_) => {
                 self.diag.http_dropped.fetch_add(1, Ordering::Relaxed);
-                return;
+                return false;
             }
         };
         self.diag.http_inflight.fetch_add(1, Ordering::Relaxed);
@@ -160,6 +176,7 @@ impl HttpSink {
         } else {
             self.diag.http_dropped.fetch_add(1, Ordering::Relaxed);
         }
+        ok
     }
 
     async fn post_bytes(&self, body: &[u8]) -> bool {
@@ -198,6 +215,7 @@ pub struct HttpCapture {
     pub addr: SocketAddr,
     bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     delay_ms: Arc<AtomicU64>,
+    status: Arc<AtomicU16>,
     cancel: CancellationToken,
     join: tokio::task::JoinHandle<()>,
 }
@@ -212,10 +230,12 @@ impl HttpCapture {
         })?;
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let delay_ms = Arc::new(AtomicU64::new(0));
+        let status = Arc::new(AtomicU16::new(200));
         let cancel = CancellationToken::new();
         let child = cancel.clone();
         let bodies_task = Arc::clone(&bodies);
         let delay_task = Arc::clone(&delay_ms);
+        let status_task = Arc::clone(&status);
         let join = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -225,9 +245,10 @@ impl HttpCapture {
                             Ok((stream, _)) => {
                                 let bodies = Arc::clone(&bodies_task);
                                 let delay = Arc::clone(&delay_task);
+                                let status = Arc::clone(&status_task);
                                 let child = child.clone();
                                 tokio::spawn(async move {
-                                    let _ = handle_http(stream, bodies, delay, child).await;
+                                    let _ = handle_http(stream, bodies, delay, status, child).await;
                                 });
                             }
                             Err(_) => break,
@@ -240,6 +261,7 @@ impl HttpCapture {
             addr,
             bodies,
             delay_ms,
+            status,
             cancel,
             join,
         })
@@ -255,6 +277,11 @@ impl HttpCapture {
 
     pub fn set_delay_ms(&self, ms: u64) {
         self.delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// Capture response status. 4xx is not retried by the HTTP sink (P1-22).
+    pub fn set_status(&self, code: u16) {
+        self.status.store(code, Ordering::SeqCst);
     }
 
     pub fn bodies(&self) -> Vec<Vec<u8>> {
@@ -278,6 +305,7 @@ async fn handle_http(
     mut stream: TcpStream,
     bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     delay_ms: Arc<AtomicU64>,
+    status: Arc<AtomicU16>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut buf = Vec::new();
@@ -286,9 +314,10 @@ async fn handle_http(
         if cancel.is_cancelled() {
             return Ok(());
         }
-        let n = stream.read(&mut tmp).await.map_err(|e| {
-            ConnectorError::new(ErrorCode::Internal, format!("HTTP read: {e}"))
-        })?;
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("HTTP read: {e}")))?;
         if n == 0 {
             return Ok(());
         }
@@ -320,9 +349,10 @@ async fn handle_http(
     }
     let mut body = buf[header_end + 4..].to_vec();
     while body.len() < content_len {
-        let n = stream.read(&mut tmp).await.map_err(|e| {
-            ConnectorError::new(ErrorCode::Internal, format!("HTTP body: {e}"))
-        })?;
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("HTTP body: {e}")))?;
         if n == 0 {
             break;
         }
@@ -337,10 +367,17 @@ async fn handle_http(
         }
     }
     bodies.lock().expect("http bodies").push(body);
-    let resp = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
-    stream.write_all(resp).await.map_err(|e| {
-        ConnectorError::new(ErrorCode::Internal, format!("HTTP write: {e}"))
-    })?;
+    let code = status.load(Ordering::SeqCst);
+    let resp = if code >= 400 {
+        format!("HTTP/1.1 {code} ERR\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .into_bytes()
+    } else {
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec()
+    };
+    stream
+        .write_all(&resp)
+        .await
+        .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("HTTP write: {e}")))?;
     Ok(())
 }
 
@@ -353,8 +390,8 @@ mod tests {
     use super::*;
     use crate::secret::MapSecretResolver;
     use sparrow_model::{
-        CreditKind, DataType, Field, FieldId, MemoryOwner, ResourceBudget, Row, RowBatchBuilder,
-        Scalar, Schema, SchemaId,
+        CreditKind, DataType, Field, FieldId, InflightCounter, MemoryOwner, ResourceBudget, Row,
+        RowBatchBuilder, Scalar, Schema, SchemaId,
     };
 
     #[tokio::test]
@@ -368,7 +405,9 @@ mod tests {
                 hits2.fetch_add(1, Ordering::SeqCst);
                 let mut buf = [0u8; 64];
                 let _ = s.read(&mut buf).await;
-                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
             }
         });
         let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -384,16 +423,32 @@ mod tests {
         let url = format!("http://127.0.0.1:{front_port}/ingest");
         let cfg = HttpSinkConfig::demo(&url);
         let policy = TargetPolicy::allow("127.0.0.1", front_port);
-        let sink = HttpSink::bind(cfg, &MapSecretResolver::empty(), &policy, IoDiagnostics::new())
-            .unwrap();
+        let sink = HttpSink::bind(
+            cfg,
+            &MapSecretResolver::empty(),
+            &policy,
+            IoDiagnostics::new(),
+        )
+        .unwrap();
         let schema = Schema::new(
             SchemaId::new(1),
-            vec![Field::new(FieldId::new(1), "device_id", DataType::Utf8, false)],
+            vec![Field::new(
+                FieldId::new(1),
+                "device_id",
+                DataType::Utf8,
+                false,
+            )],
         )
         .unwrap();
         let owner = MemoryOwner::new(ResourceBudget::compact());
-        let mut b = RowBatchBuilder::new(std::sync::Arc::new(schema), owner, CreditKind::Reservation, 1, 1024)
-            .unwrap();
+        let mut b = RowBatchBuilder::new(
+            std::sync::Arc::new(schema),
+            owner,
+            CreditKind::Reservation,
+            1,
+            1024,
+        )
+        .unwrap();
         b.push(Row {
             values: vec![Scalar::utf8("d")],
         })
@@ -411,5 +466,70 @@ mod tests {
             "redirect hop to a disallowed target must not be followed"
         );
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn http_sink_4xx_fails_outbox_not_success_ack() {
+        let http = HttpCapture::start().await.unwrap();
+        http.set_status(400);
+        let policy = TargetPolicy::allow("127.0.0.1", http.port());
+        let diag = IoDiagnostics::new();
+        let sink = HttpSink::bind(
+            HttpSinkConfig::demo(http.url()),
+            &MapSecretResolver::empty(),
+            &policy,
+            Arc::clone(&diag),
+        )
+        .unwrap();
+        let schema = Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(
+                FieldId::new(1),
+                "device_id",
+                DataType::Utf8,
+                false,
+            )],
+        )
+        .unwrap();
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let mut b = RowBatchBuilder::new(
+            std::sync::Arc::new(schema),
+            owner,
+            CreditKind::Reservation,
+            1,
+            1024,
+        )
+        .unwrap();
+        b.push(Row {
+            values: vec![Scalar::utf8("d")],
+        })
+        .unwrap();
+        let batch = b.finish().unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        let outbox = Arc::new(InflightCounter::new());
+        outbox.enqueue();
+        let outbox_r = Arc::clone(&outbox);
+        tokio::spawn(sink.run(rx, child, Some(outbox_r)));
+        tx.send(batch).await.unwrap();
+        let start = std::time::Instant::now();
+        while outbox.pending() > 0 && start.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(outbox.pending(), 0);
+        assert_eq!(
+            outbox.acked(),
+            0,
+            "4xx must not count as a successful flush ack"
+        );
+        assert_eq!(outbox.failed(), 1);
+        assert!(
+            diag.snapshot().http_dropped >= 1 || diag.snapshot().http_failed >= 1,
+            "{:?}",
+            diag.snapshot()
+        );
+        cancel.cancel();
+        http.stop().await;
     }
 }

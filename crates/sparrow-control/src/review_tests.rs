@@ -501,3 +501,181 @@ fn p0_4_barrier_waits_for_real_sink_flush() {
         let _ = std::fs::remove_dir_all(&chk);
     });
 }
+
+#[test]
+fn n4_stale_barrier_ack_not_used_for_next_checkpoint() {
+    use sparrow_runtime::CheckpointStore;
+    use std::io::Write;
+
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let path = tmp("n4.ndjson");
+        let chk = tmp("n4-chk");
+        std::fs::create_dir_all(&chk).unwrap();
+        // 2 rows → COUNT_WINDOW(2) emits once; freeze leftover = 0.
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n",
+        )
+        .unwrap();
+        let http = sparrow_connectors::HttpCapture::start().await.unwrap();
+        http.set_delay_ms(6_500);
+        store.put_allow("127.0.0.1", http.port()).unwrap();
+        let mut spec = file_spec(
+            &path.to_string_lossy(),
+            "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, COUNT_WINDOW(2)",
+            "aligned",
+            Some(&chk.to_string_lossy()),
+        );
+        spec.sink.kind = "http".into();
+        spec.sink.url = Some(http.url());
+        store.put_pipeline("n4", &spec, None).unwrap();
+        request_start(&store, "n4", "test").unwrap();
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        let _ = sup.converge_once().await;
+        let actual = store.actual("n4").unwrap();
+        assert_eq!(actual.status, "running", "{:?}", actual.last_error);
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        let current = chk.join("CURRENT");
+        assert!(!current.exists(), "CURRENT must not exist before checkpoint");
+
+        let first = sup.checkpoint_named("n4").await;
+        assert!(
+            first.is_err(),
+            "slow sink must time out barrier #1 without a dishonest commit: {first:?}"
+        );
+        assert!(
+            !current.exists(),
+            "timed-out barrier must not publish CURRENT"
+        );
+
+        // Rows between barriers. A stitch of barrier #1's empty freeze + this
+        // pos would drop v=3,4,5 from both state and replay.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(
+                b"{\"device_id\":\"d1\",\"v\":3}\n{\"device_id\":\"d1\",\"v\":4}\n{\"device_id\":\"d1\",\"v\":5}\n",
+            )
+            .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        http.set_delay_ms(0);
+        let wait0 = std::time::Instant::now();
+        while http.bodies().is_empty() && wait0.elapsed() < std::time::Duration::from_secs(8) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Late freeze/flush for id=1 must now sit in ack_rx (or have been drained).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let id = sup
+            .checkpoint_named("n4")
+            .await
+            .expect("second checkpoint after sink recovers");
+        assert!(
+            id >= 2,
+            "monotonic checkpoint id: timed-out barrier #1 must not be reused, got {id}"
+        );
+        assert!(current.exists(), "second checkpoint must publish CURRENT");
+
+        let snap = CheckpointStore::open(&chk)
+            .unwrap()
+            .recover_committed()
+            .unwrap()
+            .expect("committed snapshot");
+        assert_eq!(snap.checkpoint_id, id);
+        assert_eq!(
+            snap.ingested_rows, 5,
+            "cut must be the freeze covering all ingested rows, not a stale ack + new pos: {snap:?}"
+        );
+        assert_eq!(snap.source.record_index, 5, "{:?}", snap.source);
+        let leftover: u64 = snap.window.entries.iter().map(|e| e.count).sum();
+        assert_eq!(
+            leftover, 1,
+            "COUNT_WINDOW(2) at 5 rows leftover=1; empty freeze from barrier #1 \
+             stitched with current pos is leftover=0 (rows 3–5 lost): {snap:?}"
+        );
+
+        sup.kill_named("n4").await.unwrap();
+        http.stop().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+#[test]
+fn n7_aligned_checkpoint_refuses_after_sink_4xx() {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let path = tmp("n7.ndjson");
+        let chk = tmp("n7-chk");
+        std::fs::create_dir_all(&chk).unwrap();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n",
+        )
+        .unwrap();
+        let http = sparrow_connectors::HttpCapture::start().await.unwrap();
+        http.set_status(400);
+        store.put_allow("127.0.0.1", http.port()).unwrap();
+        let mut spec = file_spec(
+            &path.to_string_lossy(),
+            "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, COUNT_WINDOW(1)",
+            "aligned",
+            Some(&chk.to_string_lossy()),
+        );
+        spec.sink.kind = "http".into();
+        spec.sink.url = Some(http.url());
+        store.put_pipeline("n7", &spec, None).unwrap();
+        request_start(&store, "n7", "test").unwrap();
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        let _ = sup.converge_once().await;
+        let actual = store.actual("n7").unwrap();
+        assert_eq!(actual.status, "running", "{:?}", actual.last_error);
+        let wait0 = std::time::Instant::now();
+        loop {
+            let io = sup.io_snapshot().await;
+            if io.http_dropped >= 1 || io.http_failed >= 1 {
+                break;
+            }
+            if wait0.elapsed() > std::time::Duration::from_secs(3) {
+                panic!("HTTP 4xx drop never appeared in diag: {io}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let current = chk.join("CURRENT");
+        assert!(!current.exists());
+        let err = sup
+            .checkpoint_named("n7")
+            .await
+            .expect_err("aligned must refuse commit after HTTP 4xx drop");
+        assert!(
+            !current.exists(),
+            "CURRENT must not advance after a dropped/4xx flush"
+        );
+        let io = sup.io_snapshot().await;
+        assert!(
+            io.http_dropped >= 1 || io.http_failed >= 1,
+            "drops must be visible in diag: {io}"
+        );
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("refus") || msg.contains("drop") || msg.contains("align"),
+            "{err}"
+        );
+
+        sup.kill_named("n7").await.unwrap();
+        http.stop().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
