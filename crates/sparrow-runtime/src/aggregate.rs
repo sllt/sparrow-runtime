@@ -170,13 +170,14 @@ impl Accumulator {
                 Ok(())
             }
             Self::Min { v } => {
-                if value.is_null() {
+                if value.is_null() || value.is_nan() {
                     return Ok(());
                 }
                 match v {
                     None => *v = Some(value.detach_copy()),
+                    Some(cur) if cur.is_nan() => *v = Some(value.detach_copy()),
                     Some(cur) => {
-                        if cmp_ord(value, cur)? == std::cmp::Ordering::Less {
+                        if cmp_ord(value, cur)? == Some(std::cmp::Ordering::Less) {
                             *v = Some(value.detach_copy());
                         }
                     }
@@ -184,13 +185,14 @@ impl Accumulator {
                 Ok(())
             }
             Self::Max { v } => {
-                if value.is_null() {
+                if value.is_null() || value.is_nan() {
                     return Ok(());
                 }
                 match v {
                     None => *v = Some(value.detach_copy()),
+                    Some(cur) if cur.is_nan() => *v = Some(value.detach_copy()),
                     Some(cur) => {
-                        if cmp_ord(value, cur)? == std::cmp::Ordering::Greater {
+                        if cmp_ord(value, cur)? == Some(std::cmp::Ordering::Greater) {
                             *v = Some(value.detach_copy());
                         }
                     }
@@ -394,24 +396,19 @@ fn overflow() -> SparrowError {
     )
 }
 
-fn cmp_ord(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
+fn cmp_ord(a: &Scalar, b: &Scalar) -> Result<Option<std::cmp::Ordering>> {
     match (a, b) {
-        (Scalar::Int64(x), Scalar::Int64(y)) => Ok(x.cmp(y)),
-        (Scalar::UInt64(x), Scalar::UInt64(y)) => Ok(x.cmp(y)),
-        (Scalar::Int64(x), Scalar::UInt64(y)) if *x >= 0 => Ok((*x as u64).cmp(y)),
-        (Scalar::UInt64(x), Scalar::Int64(y)) if *y >= 0 => Ok(x.cmp(&(*y as u64))),
-        (Scalar::TimestampMicrosUTC(x), Scalar::TimestampMicrosUTC(y)) => Ok(x.cmp(y)),
-        (Scalar::TimestampMicrosUTC(x), Scalar::Int64(y)) => Ok(x.cmp(y)),
-        (Scalar::Int64(x), Scalar::TimestampMicrosUTC(y)) => Ok(x.cmp(y)),
-        (Scalar::Float64(x), Scalar::Float64(y)) => x.partial_cmp(y).ok_or_else(|| {
-            SparrowError::new(
-                ErrorCode::InvalidArgument,
-                "MIN/MAX refuses unordered NaN (no implicit Equal)",
-            )
-        }),
-        (Scalar::Utf8(x), Scalar::Utf8(y)) => Ok(x.as_ref().cmp(y.as_ref())),
-        (Scalar::Bytes(x), Scalar::Bytes(y)) => Ok(x.as_ref().cmp(y.as_ref())),
-        (Scalar::Bool(x), Scalar::Bool(y)) => Ok(x.cmp(y)),
+        (Scalar::Int64(x), Scalar::Int64(y)) => Ok(Some(x.cmp(y))),
+        (Scalar::UInt64(x), Scalar::UInt64(y)) => Ok(Some(x.cmp(y))),
+        (Scalar::Int64(x), Scalar::UInt64(y)) if *x >= 0 => Ok(Some((*x as u64).cmp(y))),
+        (Scalar::UInt64(x), Scalar::Int64(y)) if *y >= 0 => Ok(Some(x.cmp(&(*y as u64)))),
+        (Scalar::TimestampMicrosUTC(x), Scalar::TimestampMicrosUTC(y)) => Ok(Some(x.cmp(y))),
+        (Scalar::TimestampMicrosUTC(x), Scalar::Int64(y)) => Ok(Some(x.cmp(y))),
+        (Scalar::Int64(x), Scalar::TimestampMicrosUTC(y)) => Ok(Some(x.cmp(y))),
+        (Scalar::Float64(x), Scalar::Float64(y)) => Ok(x.partial_cmp(y)),
+        (Scalar::Utf8(x), Scalar::Utf8(y)) => Ok(Some(x.as_ref().cmp(y.as_ref()))),
+        (Scalar::Bytes(x), Scalar::Bytes(y)) => Ok(Some(x.as_ref().cmp(y.as_ref()))),
+        (Scalar::Bool(x), Scalar::Bool(y)) => Ok(Some(x.cmp(y))),
         _ => Err(SparrowError::new(
             ErrorCode::TypeMismatch,
             format!("MIN/MAX cannot compare {} and {}", a.data_type(), b.data_type()),
@@ -457,6 +454,18 @@ mod tests {
             ov.update(&Scalar::Int64(1)).unwrap_err().code,
             ErrorCode::IntegerOverflow
         );
+
+        let mut mn = Accumulator::new(AggFn::Min, DataType::Float64, false).unwrap();
+        mn.update(&Scalar::Float64(f64::NAN)).unwrap();
+        mn.update(&Scalar::Float64(10.0)).unwrap();
+        mn.update(&Scalar::Float64(f64::NAN)).unwrap();
+        mn.update(&Scalar::Float64(3.0)).unwrap();
+        assert_eq!(mn.finish(), Scalar::Float64(3.0));
+        let mut mx = Accumulator::new(AggFn::Max, DataType::Float64, false).unwrap();
+        mx.update(&Scalar::Float64(f64::NAN)).unwrap();
+        mx.update(&Scalar::Float64(10.0)).unwrap();
+        mx.update(&Scalar::Float64(30.0)).unwrap();
+        assert_eq!(mx.finish(), Scalar::Float64(30.0));
     }
 
     #[test]

@@ -472,6 +472,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         "checkpoint_bytes": snap.checkpoint_bytes,
         "checkpoint_commits": snap.checkpoint_commits,
         "checkpoint_aborts": snap.checkpoint_aborts,
+        "future_dropped": snap.future_dropped,
         "io": {
             "mqtt_received": io.mqtt_received,
             "mqtt_decoded": io.mqtt_decoded,

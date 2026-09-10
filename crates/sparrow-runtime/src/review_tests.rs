@@ -437,6 +437,205 @@ fn count_window_plan(filter: Option<Expr>, size: u64) -> sparrow_plan::PhysicalP
 }
 
 #[test]
+fn n9_future_drop_visible_in_metrics() {
+    use sparrow_model::{SharedVirtualClock, WindowKind};
+    use sparrow_plan::{bind_window_linear, AggCall, WindowSpec};
+
+    let schema = Schema::new(
+        SchemaId::new(1),
+        vec![
+            Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+            Field::new(FieldId::new(2), "temperature", DataType::Float64, true),
+            Field::new(FieldId::new(3), "ts", DataType::Int64, false),
+        ],
+    )
+    .unwrap();
+    let spec = WindowSpec::new(
+        WindowKind::tumbling_et(1_000_000).unwrap(),
+        vec!["device_id".into()],
+        vec![AggCall::count_star("n")],
+    )
+    .event_time("ts", 0);
+    let bound = bind_window_linear(
+        PipelineId::new(1),
+        RevisionId::new(1),
+        "sensors".into(),
+        schema,
+        None,
+        spec,
+        "c".into(),
+    )
+    .unwrap();
+    let plan = physicalize(&bound, &PlanOptions { fuse: true });
+    let year_2100 = 4_102_444_800_000_000i64;
+    let rows = vec![
+        Row {
+            values: vec![
+                Scalar::utf8("d1"),
+                Scalar::Float64(99.0),
+                Scalar::Int64(year_2100),
+            ],
+        },
+        Row {
+            values: vec![
+                Scalar::utf8("d1"),
+                Scalar::Float64(10.0),
+                Scalar::Int64(500_000),
+            ],
+        },
+        Row {
+            values: vec![
+                Scalar::utf8("d1"),
+                Scalar::Float64(20.0),
+                Scalar::Int64(1_500_000),
+            ],
+        },
+    ];
+    let k = kernel();
+    let capture = SharedCapture::new();
+    // `now` is processing time (virtual origin 0 here), not event time.
+    let clock = crate::RuntimeClock::virtual_clock(SharedVirtualClock::new(0));
+    k.run(
+        JobRequest::new(plan, rows, capture.clone())
+            .with_clock(clock)
+            .with_controls(vec![StreamControl::Watermark {
+                input: 0,
+                wm_micros: 3_000_000,
+            }]),
+    )
+    .unwrap();
+    let snap = k.metrics.snapshot();
+    assert!(
+        snap.future_dropped >= 1,
+        "year-2100 drop must increment kernel future_dropped (exported on /v1/metrics): {snap:?}"
+    );
+    assert!(
+        capture.row_count() >= 1,
+        "later windows must still form after the future drop: {:?}",
+        capture.rows()
+    );
+}
+
+#[test]
+fn n10_nan_compare_does_not_fail_job() {
+    use sparrow_expr::filter_mask;
+    use sparrow_model::{AggFn, WindowKind};
+    use sparrow_plan::{bind_window_linear, AggCall, WindowSpec};
+
+    let schema = schema();
+    // Compound predicate so filter_mask cannot take the CmpF64 fast path and
+    // must eval — the path that used to return Err on NaN and fail the job.
+    let pred = Expr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Column {
+                name: "temp".into(),
+            }),
+            right: Box::new(Expr::Literal(Scalar::Float64(0.0))),
+        }),
+        right: Box::new(Expr::Binary {
+            op: BinaryOp::Lt,
+            left: Box::new(Expr::Column {
+                name: "temp".into(),
+            }),
+            right: Box::new(Expr::Literal(Scalar::Float64(100.0))),
+        }),
+    };
+    let nan_rows = vec![
+        Row {
+            values: vec![Scalar::Int64(1), Scalar::Float64(f64::NAN)],
+        },
+        Row {
+            values: vec![Scalar::Int64(2), Scalar::Float64(30.0)],
+        },
+        Row {
+            values: vec![Scalar::Int64(3), Scalar::Float64(-1.0)],
+        },
+    ];
+    let mask = filter_mask(&pred, &schema, &nan_rows).expect("NaN compare must not error");
+    assert_eq!(
+        mask,
+        vec![false, true, false],
+        "NaN is unknown/false in WHERE; only 30.0 is kept"
+    );
+
+    let bound = bind_linear(
+        PipelineId::new(1),
+        RevisionId::new(1),
+        "s".into(),
+        schema.clone(),
+        Some(pred),
+        None,
+        None,
+        "c".into(),
+    )
+    .unwrap();
+    let plan = physicalize(&bound, &PlanOptions { fuse: true });
+    let k = kernel();
+    let capture = SharedCapture::new();
+    k.run(JobRequest::new(plan, nan_rows, capture.clone()))
+        .expect("WHERE over NaN must not JobFailed");
+    assert_eq!(
+        capture.row_count(),
+        1,
+        "only the finite in-range row must pass: {:?}",
+        capture.rows()
+    );
+
+    let win = WindowSpec::new(
+        WindowKind::Count { size: 3 },
+        vec!["id".into()],
+        vec![AggCall::new(
+            AggFn::Min,
+            Some(Expr::Column {
+                name: "temp".into(),
+            }),
+            "mn",
+        )],
+    );
+    let bound = bind_window_linear(
+        PipelineId::new(1),
+        RevisionId::new(1),
+        "s".into(),
+        schema,
+        None,
+        win,
+        "c".into(),
+    )
+    .unwrap();
+    let plan = physicalize(&bound, &PlanOptions { fuse: true });
+    let min_rows = vec![
+        Row {
+            values: vec![Scalar::Int64(1), Scalar::Float64(10.0)],
+        },
+        Row {
+            values: vec![Scalar::Int64(1), Scalar::Float64(f64::NAN)],
+        },
+        Row {
+            values: vec![Scalar::Int64(1), Scalar::Float64(30.0)],
+        },
+    ];
+    let capture = SharedCapture::new();
+    k.run(JobRequest::new(plan, min_rows, capture.clone()))
+        .expect("MIN over NaN must not JobFailed");
+    assert_eq!(capture.row_count(), 1, "COUNT_WINDOW(3) emits one row");
+    let out = capture.rows();
+    let mn = out[0]
+        .values
+        .iter()
+        .find_map(|s| match s {
+            Scalar::Float64(v) if !v.is_nan() => Some(*v),
+            _ => None,
+        })
+        .expect(&format!("MIN must skip NaN and emit a finite min: {out:?}"));
+    assert!(
+        (mn - 10.0).abs() < 1e-9,
+        "MIN skips NaN and keeps 10.0, got {mn} from {out:?}"
+    );
+}
+
+#[test]
 fn a1_aligned_runs_full_plan_through_kernel() {
     let plan = count_window_plan(Some(filter_gt_v(1)), 2);
     assert!(

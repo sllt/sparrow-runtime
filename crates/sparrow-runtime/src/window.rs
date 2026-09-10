@@ -25,6 +25,9 @@ pub struct WindowEmission {
     /// Event-time close watermark that still has keyed state to drain in
     /// mailbox-sized chunks (R17). Kernel must take/send before advancing.
     pub pending_close: Option<i64>,
+    /// Rows rejected because `event_time > now + max_future_skew`.
+    /// Counted for observability; does not poison the watermark (P0-5).
+    pub future_dropped: u64,
 }
 
 impl WindowEmission {
@@ -196,6 +199,14 @@ impl WindowOperator {
         self.drain_watermark()
     }
 
+    /// Ingest a batch at processing-time `now`.
+    ///
+    /// `now` is **processing time** from [`crate::RuntimeClock`] (host wall
+    /// clock or an injected virtual clock), in microseconds. It is **not**
+    /// event time and does not advance the watermark. Event-time future-skew
+    /// compares `event_time > now + max_future_skew`; those rows are counted
+    /// on [`WindowEmission::future_dropped`] and dropped without poisoning
+    /// `max_et` (P0-5).
     pub fn on_batch(&mut self, batch: &RowBatch, now: i64) -> Result<WindowEmission> {
         let mut out = WindowEmission::default();
         let due = self.fire_due(now)?;
@@ -204,6 +215,7 @@ impl WindowOperator {
             let one = self.on_row(row, now)?;
             out.finals.extend(one.finals);
             out.lates.extend(one.lates);
+            out.future_dropped = out.future_dropped.saturating_add(one.future_dropped);
             // ET close is signaled via pending_close (N5). Dropping it
             // means later event times never emit finals on the live path.
             if let Some(wm) = one.pending_close {
@@ -230,14 +242,12 @@ impl WindowOperator {
             WindowKind::TumblingProcessingTime { size_micros } => {
                 Ok(WindowEmission {
                     finals: self.on_tumble_row(row, now, size_micros)?,
-                    lates: Vec::new(),
-                    pending_close: None,
+                    ..WindowEmission::default()
                 })
             }
             WindowKind::Count { size } => Ok(WindowEmission {
                 finals: self.on_count_row(row, size)?,
-                lates: Vec::new(),
-                pending_close: None,
+                ..WindowEmission::default()
             }),
             WindowKind::TumblingEventTime { size_micros } => {
                 self.on_et_row(row, now, size_micros, None)
@@ -259,8 +269,13 @@ impl WindowOperator {
         let ts = self.row_event_time(row)?;
         if let Some(bind) = self.spec.binding() {
             if let Some(skew) = bind.max_future_skew_micros {
+                // `now` is processing-time micros (see on_batch). Do not
+                // observe_event — that would poison max_et (P0-5).
                 if ts > now.saturating_add(skew) {
-                    return Ok(WindowEmission::default());
+                    return Ok(WindowEmission {
+                        future_dropped: 1,
+                        ..WindowEmission::default()
+                    });
                 }
             }
         }
@@ -359,9 +374,8 @@ impl WindowOperator {
         // Do not materialize every closed window here (P1-20 / R17).
         // Caller takes mailbox-sized chunks, then advance_holdback.
         Ok(WindowEmission {
-            finals: Vec::new(),
-            lates: Vec::new(),
             pending_close: Some(proposed_out),
+            ..WindowEmission::default()
         })
     }
 

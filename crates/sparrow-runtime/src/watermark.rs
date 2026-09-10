@@ -162,6 +162,10 @@ impl WatermarkHub {
 
     /// Observe an event timestamp. Generates `wm = max_et - out_of_orderness`.
     /// Rejects future timestamps when the binding sets a skew.
+    ///
+    /// `now_micros` is processing time from the kernel clock (see
+    /// [`EventTimeBinding::max_future_skew_micros`]). A future-skew reject
+    /// returns `Ok(None)` and does not advance `max_et`.
     pub fn observe_event(
         &mut self,
         id: InputId,

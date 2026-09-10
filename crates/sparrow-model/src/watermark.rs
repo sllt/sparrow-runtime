@@ -79,6 +79,11 @@ pub struct EventTimeBinding {
     /// Holdback `L` for finals lives on the window (`lateness_micros`), not here.
     pub out_of_orderness_micros: i64,
     /// If set, `event_time > now + skew` is dropped (does not advance max_et).
+    ///
+    /// `now` is **processing-time** microseconds from the kernel clock (host
+    /// wall time, or a virtual clock in tests). It is not event time and
+    /// never moves the watermark. Observable drops are counted as
+    /// `future_dropped` on kernel `/v1/metrics`.
     pub max_future_skew_micros: Option<i64>,
 }
 
