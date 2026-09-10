@@ -95,6 +95,7 @@ fn run() -> sparrow_model::Result<()> {
         },
         recovery: RecoveryPolicy::Aligned,
         contract: sparrow_connectors::FileContract::Immutable,
+        fail_on_decode: false,
     };
     let mut source = FileReplaySource::open(&cfg).map_err(|e| {
         sparrow_model::SparrowError::new(e.code(), e.to_string())

@@ -100,6 +100,7 @@ impl HttpPushSource {
             schema: config.schema.clone(),
             limits: config.json_limits,
             policy: sparrow_formats::BadRecordPolicy::Drop,
+            owner: None,
         };
         Ok(Self {
             config,

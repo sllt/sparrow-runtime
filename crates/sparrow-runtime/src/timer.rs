@@ -63,8 +63,10 @@ impl BoundedTimers {
         self.heap.len()
     }
 
+    /// O(1) heap peek (P2-33). A stale cancelled generation may surface a
+    /// deadline that `fire_due` will skip; the next peek is then the live min.
     pub fn peek_deadline(&self) -> Option<i64> {
-        self.deadlines.values().copied().min()
+        self.heap.peek().map(|Reverse((at, _, _))| *at)
     }
 
     /// Schedule or replace. Replacing cancels the previous generation.
@@ -189,5 +191,17 @@ mod tests {
         t.cancel_all();
         assert_eq!(t.live(), 0);
         assert_eq!(t.heap_len(), 0);
+    }
+
+    #[test]
+    fn p2_33_peek_deadline_is_heap_min() {
+        let op = OperatorId::new(9);
+        let mut t = BoundedTimers::new(op, 8).unwrap();
+        t.schedule(TimerId::window(op, 1), 500).unwrap();
+        t.schedule(TimerId::window(op, 2), 100).unwrap();
+        t.schedule(TimerId::window(op, 3), 300).unwrap();
+        assert_eq!(t.peek_deadline(), Some(100));
+        t.fire_due(100);
+        assert_eq!(t.peek_deadline(), Some(300));
     }
 }

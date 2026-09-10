@@ -723,3 +723,174 @@ fn p0_4_barrier_waits_for_real_sink_flush() {
         let _ = sink.await;
     });
 }
+
+fn pass_through_plan() -> sparrow_plan::PhysicalPlan {
+    let bound = bind_linear(
+        PipelineId::new(1),
+        RevisionId::new(1),
+        "s".into(),
+        schema(),
+        None,
+        None,
+        None,
+        "c".into(),
+    )
+    .unwrap();
+    physicalize(&bound, &PlanOptions { fuse: true })
+}
+
+#[test]
+fn p1_20_second_job_refused_when_process_queue_reserved() {
+    let plan = pass_through_plan();
+    assert!(plan.mailbox_count() >= 1);
+    let k = Kernel::new(KernelOptions {
+        budget: ResourceBudget {
+            queue_bytes: 4 * 1024,
+            ..ResourceBudget::compact()
+        },
+        mailbox: MailboxConfig {
+            max_items: 4,
+            max_bytes: 3 * 1024,
+        },
+        worker_threads: 2,
+        rows_per_batch: 4,
+    })
+    .unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let (out_tx, _out_rx) = tokio::sync::mpsc::channel(4);
+    let first = k
+        .submit(
+            JobRequest::new(plan.clone(), Vec::new(), SharedCapture::new())
+                .with_live_io(rx, out_tx),
+        )
+        .expect("first job must admit");
+    assert_eq!(k.admitted_jobs(), 1);
+    assert!(k.queue_reserved() > 0);
+    let err = match k.submit(JobRequest::new(plan, rows(), SharedCapture::new())) {
+        Ok(h) => {
+            k.block_on(h.stop()).ok();
+            panic!(
+                "second job was admitted (reserved={} cap={})",
+                k.queue_reserved(),
+                k.budget().queue_bytes
+            );
+        }
+        Err(e) => e,
+    };
+    assert_eq!(err.code, sparrow_model::ErrorCode::ResourceExhausted);
+    assert!(
+        err.message.contains("process queue") || err.message.contains("process memory"),
+        "N jobs must not each get a full queue budget: {err}"
+    );
+    drop(tx);
+    k.block_on(first.stop()).unwrap();
+    assert_eq!(k.admitted_jobs(), 0);
+    assert_eq!(k.queue_reserved(), 0);
+}
+
+#[test]
+fn p1_20_jobs_share_process_memory_owner() {
+    let k = kernel();
+    let owner = k.process_owner().clone();
+    let ret = owner
+        .acquire(
+            sparrow_model::CreditKind::Retention,
+            owner.budget().retention_bytes,
+        )
+        .unwrap();
+    let q = owner
+        .acquire(
+            sparrow_model::CreditKind::Queue,
+            owner.budget().queue_bytes,
+        )
+        .unwrap();
+    let plan = pass_through_plan();
+    let err = match k.submit(JobRequest::new(plan, rows(), SharedCapture::new())) {
+        Ok(h) => {
+            k.block_on(h.stop()).ok();
+            panic!("job admitted while process retention+queue were full");
+        }
+        Err(e) => e,
+    };
+    assert_eq!(err.code, sparrow_model::ErrorCode::ResourceExhausted);
+    assert!(
+        err.message.contains("process memory") || err.message.contains("process queue"),
+        "{err}"
+    );
+    drop(ret);
+    drop(q);
+}
+
+#[test]
+fn a2_transform_builder_charges_owner_not_shadow_vec() {
+    use sparrow_model::{CreditKind, MemoryOwner, OperatorId, RowBatchBuilder, WorkBudget};
+    use sparrow_plan::TransformStep;
+
+    let owner = MemoryOwner::new(ResourceBudget {
+        reservation_bytes: 512,
+        retention_bytes: 512,
+        queue_bytes: 512,
+        max_rows: 8,
+        work_units: 1_000,
+        max_state_keys: 8,
+        max_timers: 8,
+    });
+    let schema = schema();
+    let mut b = RowBatchBuilder::new(
+        std::sync::Arc::new(schema.clone()),
+        std::sync::Arc::clone(&owner),
+        CreditKind::Reservation,
+        4,
+        400,
+    )
+    .unwrap();
+    b.push(Row {
+        values: vec![Scalar::Int64(1), Scalar::Float64(10.0)],
+    })
+    .unwrap();
+    b.push(Row {
+        values: vec![Scalar::Int64(2), Scalar::Float64(30.0)],
+    })
+    .unwrap();
+    let batch = b.finish().unwrap();
+    let work = WorkBudget::new(1_000);
+    let out = crate::transform::apply_steps(
+        &batch,
+        &[TransformStep::Filter {
+            operator: OperatorId::new(1),
+            predicate: Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column {
+                    name: "temp".into(),
+                }),
+                right: Box::new(Expr::Literal(Scalar::Float64(15.0))),
+            },
+            input: schema,
+        }],
+        &owner,
+        &work,
+    )
+    .unwrap()
+    .expect("one row kept");
+    assert_eq!(out.num_rows(), 1);
+    assert!(owner.peak_builder_bytes() > 0);
+    drop(batch);
+    drop(out);
+    assert_eq!(owner.usage().reservation_bytes, 0);
+}
+
+#[test]
+fn a2_utf8_tracked_used_on_runtime_path() {
+    let owner = sparrow_model::MemoryOwner::new(ResourceBudget {
+        reservation_bytes: 24,
+        retention_bytes: 24,
+        queue_bytes: 24,
+        max_rows: 2,
+        work_units: 10,
+        max_state_keys: 2,
+        max_timers: 2,
+    });
+    let err = Scalar::utf8_tracked(&owner, "0123456789abcdef extra")
+        .unwrap_err();
+    assert_eq!(err.code, sparrow_model::ErrorCode::ResourceExhausted);
+}

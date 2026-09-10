@@ -6,6 +6,9 @@
 
 use std::sync::Arc;
 
+use crate::error::Result;
+use crate::memory::MemoryOwner;
+use crate::resource::CreditKind;
 use crate::types::DataType;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,12 +35,34 @@ impl Scalar {
         }
     }
 
+    /// Untracked UTF-8 constructor. The payload is **not** charged to a
+    /// [`MemoryOwner`] until a builder `push`es the row.
+    ///
+    /// Connector / runtime ingress should prefer [`Self::utf8_tracked`].
+    /// A full arena rewrite is out of scope (A2 leftover).
     pub fn utf8(s: impl AsRef<str>) -> Self {
         Self::Utf8(Arc::from(s.as_ref()))
     }
 
+    /// Untracked bytes constructor. Prefer [`Self::bytes_tracked`] on
+    /// connector / runtime ingress.
     pub fn bytes(b: impl AsRef<[u8]>) -> Self {
         Self::Bytes(Arc::from(b.as_ref()))
+    }
+
+    /// Allocate UTF-8 after checking reservation headroom on `owner`.
+    /// Does not hold a lease (no arena); builder `push` still charges the row.
+    pub fn utf8_tracked(owner: &MemoryOwner, s: impl AsRef<str>) -> Result<Self> {
+        let s = s.as_ref();
+        owner.ensure_headroom(CreditKind::Reservation, 16usize.saturating_add(s.len()))?;
+        Ok(Self::utf8(s))
+    }
+
+    /// Allocate bytes after checking reservation headroom on `owner`.
+    pub fn bytes_tracked(owner: &MemoryOwner, b: impl AsRef<[u8]>) -> Result<Self> {
+        let b = b.as_ref();
+        owner.ensure_headroom(CreditKind::Reservation, 16usize.saturating_add(b.len()))?;
+        Ok(Self::bytes(b))
     }
 
     pub fn data_type(&self) -> DataType {
@@ -345,6 +370,25 @@ mod tests {
         assert_eq!(v.get("temp"), Some(&DynamicValue::Float64(21.5)));
         let detached = v.detach_copy();
         assert_eq!(detached, v);
+    }
+
+    #[test]
+    fn a2_utf8_tracked_refuses_without_reservation_headroom() {
+        let owner = crate::memory::MemoryOwner::new(crate::resource::ResourceBudget {
+            reservation_bytes: 32,
+            retention_bytes: 32,
+            queue_bytes: 32,
+            max_rows: 4,
+            work_units: 10,
+            max_state_keys: 4,
+            max_timers: 4,
+        });
+        let err = Scalar::utf8_tracked(&owner, "this string is far too long for 32B")
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
+        let ok = Scalar::utf8_tracked(&owner, "ok").unwrap();
+        assert_eq!(ok, Scalar::utf8("ok"));
+        assert_eq!(owner.usage().reservation_bytes, 0);
     }
 
     #[test]

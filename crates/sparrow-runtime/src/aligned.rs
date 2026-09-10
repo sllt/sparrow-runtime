@@ -226,15 +226,15 @@ impl AlignedSession {
             return Err(e);
         }
         let started = Instant::now();
-        let snap = CheckpointSnapshot {
-            checkpoint_id: self.next_checkpoint,
-            source: self.source_pos.clone(),
-            window: self.operator.freeze(),
-            ingested_rows: self.ingested,
-            layout: self.layout.clone(),
-            table: self.table.clone(),
-        };
-        let encoded = match snap.encode_with_max_state_keys(self.store.max_state_keys()) {
+        let encoded = match CheckpointSnapshot::encode_from_operator(
+            self.next_checkpoint,
+            &self.source_pos,
+            self.ingested,
+            &self.layout,
+            self.table.as_ref(),
+            &self.operator,
+            self.store.max_state_keys(),
+        ) {
             Ok(b) => b,
             Err(e) => {
                 self.coordinator.abort_now("encode failed");
@@ -243,7 +243,7 @@ impl AlignedSession {
             }
         };
         let payload_len = encoded.len() as u64;
-        match self.store.commit(&snap) {
+        match self.store.commit_encoded(self.next_checkpoint, &encoded) {
             Ok(id) => {
                 // CURRENT published — must not report aborted (R13).
                 self.coordinator.force_committed();

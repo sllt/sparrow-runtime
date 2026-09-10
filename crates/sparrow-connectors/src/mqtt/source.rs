@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sparrow_formats::{JsonCodec, JsonLimits};
-use sparrow_model::{ErrorCode, RestoreClaim, Row, Schema, SourceFrame};
+use sparrow_model::{ErrorCode, ResourceBudget, RestoreClaim, Row, Schema, SourceFrame};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +40,9 @@ pub struct MqttSourceConfig {
     pub restore: RestoreClaim,
     pub schema: Schema,
     pub json_limits: JsonLimits,
+    /// When true, a decode error fails the source (and the job) instead of
+    /// only incrementing [`IoDiagnostics::decode_errors`] (P1-17).
+    pub fail_on_decode: bool,
 }
 
 impl MqttSourceConfig {
@@ -85,15 +88,33 @@ impl MqttSourceConfig {
         if let Some(name) = &self.password_secret {
             let _ = secrets.resolve(name)?;
         }
-        let worst = self
-            .inbox_capacity
-            .saturating_mul(self.json_limits.max_bytes);
-        if worst > 4 * 1024 * 1024 {
+        self.check_inbox_budget(ResourceBudget::compact().queue_bytes)?;
+        Ok(())
+    }
+
+    pub fn inbox_worst_case_bytes(&self) -> usize {
+        self.inbox_capacity
+            .saturating_mul(self.json_limits.max_bytes)
+    }
+
+    /// Hard reject when `inbox_capacity × max_record` exceeds the static
+    /// 4MiB ceiling **or** the process/job queue budget (P1-27).
+    pub fn check_inbox_budget(&self, queue_budget: usize) -> Result<()> {
+        let worst = self.inbox_worst_case_bytes();
+        const STATIC: usize = 4 * 1024 * 1024;
+        if worst > STATIC {
             return Err(ConnectorError::new(
                 ErrorCode::BoundExceeded,
                 format!(
-                    "MQTT inbox worst-case {}B exceeds 4MiB byte bound (inbox_capacity × max_record)",
-                    worst
+                    "MQTT inbox worst-case {worst}B exceeds 4MiB byte bound (inbox_capacity × max_record)"
+                ),
+            ));
+        }
+        if worst > queue_budget {
+            return Err(ConnectorError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "MQTT inbox worst-case {worst}B exceeds queue budget {queue_budget}B (inbox_capacity × max_record)"
                 ),
             ));
         }
@@ -121,6 +142,7 @@ impl MqttSourceConfig {
             restore: RestoreClaim::None,
             schema,
             json_limits: JsonLimits::default(),
+            fail_on_decode: false,
         }
     }
 }
@@ -152,7 +174,12 @@ impl MqttSource {
         let codec = JsonCodec {
             schema: config.schema.clone(),
             limits: config.json_limits,
-            policy: sparrow_formats::BadRecordPolicy::Drop,
+            policy: if config.fail_on_decode {
+                sparrow_formats::BadRecordPolicy::FailJob
+            } else {
+                sparrow_formats::BadRecordPolicy::Drop
+            },
+            owner: None,
         };
         Ok(Self {
             config,
@@ -165,18 +192,31 @@ impl MqttSource {
 
     /// Pump MQTT publishes into a bounded kernel ingress. Full inbox drops
     /// (`live_best_effort`); this is not an ack.
-    pub async fn run(self, tx: mpsc::Sender<Row>, cancel: CancellationToken) {
+    pub async fn run(self, tx: mpsc::Sender<Row>, cancel: CancellationToken) -> Result<()> {
         let mut backoff = self.config.reconnect_min;
         loop {
             if cancel.is_cancelled() {
-                break;
+                return Ok(());
             }
             match self.session(&tx, &cancel).await {
-                Ok(()) => break,
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if self.config.fail_on_decode
+                        && matches!(
+                            e.code,
+                            ErrorCode::CodecViolation
+                                | ErrorCode::MaxRecordSize
+                                | ErrorCode::InvalidSchema
+                                | ErrorCode::TypeMismatch
+                                | ErrorCode::BoundExceeded
+                        ) =>
+                {
+                    return Err(e);
+                }
                 Err(_) => {
                     self.diag.mqtt_reconnects.fetch_add(1, Ordering::Relaxed);
                     tokio::select! {
-                        _ = cancel.cancelled() => break,
+                        _ = cancel.cancelled() => return Ok(()),
                         _ = tokio::time::sleep(backoff) => {}
                     }
                     backoff = (backoff * 2).min(self.config.reconnect_max);
@@ -300,9 +340,20 @@ impl MqttSource {
                                         }
                                     }
                                 }
-                                Ok(None) | Err(_) => {
+                                Ok(None) => {
                                     self.diag.mqtt_dropped_bad.fetch_add(1, Ordering::Relaxed);
                                     self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    self.diag.mqtt_dropped_bad.fetch_add(1, Ordering::Relaxed);
+                                    self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
+                                    if self.config.fail_on_decode {
+                                        close_mqtt(&mut stream).await;
+                                        return Err(ConnectorError::new(
+                                            e.code,
+                                            format!("MQTT decode failed (fail_on_decode): {e}"),
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -378,6 +429,7 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(800), task)
             .await
             .expect("MQTT stop must finish while broker is silent")
+            .unwrap()
             .unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -446,5 +498,36 @@ mod tests {
             .expect("row");
         assert_eq!(row.values[0], sparrow_model::Scalar::utf8("d1"));
         cancel.cancel();
+    }
+
+    #[test]
+    fn p1_27_inbox_times_max_record_rejects_over_queue_budget() {
+        let mut cfg = MqttSourceConfig::demo("127.0.0.1", 1883, schema());
+        cfg.inbox_capacity = 40;
+        cfg.json_limits.max_bytes = 64 * 1024;
+        let worst = cfg.inbox_worst_case_bytes();
+        assert!(worst > ResourceBudget::compact().queue_bytes);
+        assert!(worst <= 4 * 1024 * 1024);
+        let err = cfg
+            .check_inbox_budget(ResourceBudget::compact().queue_bytes)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoundExceeded);
+        assert!(
+            err.message.contains("queue budget"),
+            "must name the queue budget, not only 4MiB: {}",
+            err.message
+        );
+        cfg.validate(&MapSecretResolver::empty(), &TargetPolicy::allow("127.0.0.1", 1883))
+            .unwrap_err();
+    }
+
+    #[test]
+    fn p1_27_inbox_within_compact_queue_is_ok() {
+        let mut cfg = MqttSourceConfig::demo("127.0.0.1", 1883, schema());
+        cfg.inbox_capacity = 16;
+        cfg.json_limits.max_bytes = 64 * 1024;
+        assert!(cfg.inbox_worst_case_bytes() <= ResourceBudget::compact().queue_bytes);
+        cfg.check_inbox_budget(ResourceBudget::compact().queue_bytes)
+            .unwrap();
     }
 }

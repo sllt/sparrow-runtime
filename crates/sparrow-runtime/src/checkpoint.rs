@@ -110,21 +110,33 @@ impl CheckpointSnapshot {
     pub fn encode_with_max_state_keys(&self, max_state_keys: usize) -> Result<Vec<u8>> {
         let cap = freeze_entry_cap(max_state_keys);
         let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
-        out.extend_from_slice(&self.checkpoint_id.to_le_bytes());
-        out.extend_from_slice(&self.ingested_rows.to_le_bytes());
-        encode_position(&self.source, &mut out)?;
+        write_snapshot_prefix(
+            &mut out,
+            self.checkpoint_id,
+            self.ingested_rows,
+            &self.source,
+        )?;
         encode_freeze(&self.window, &mut out, cap)?;
-        encode_layout(&self.layout, &mut out)?;
-        match &self.table {
-            None => out.push(0),
-            Some(t) => {
-                out.push(1);
-                encode_str(&t.name, &mut out);
-                out.extend_from_slice(&t.version.to_le_bytes());
-            }
-        }
+        write_snapshot_suffix(&mut out, &self.layout, self.table.as_ref())?;
+        Ok(out)
+    }
+
+    /// Encode from the live operator without materializing [`WindowFreeze`]
+    /// (P1-14 incremental path). Same bytes as freeze-then-encode.
+    pub fn encode_from_operator(
+        checkpoint_id: u64,
+        source: &SourcePosition,
+        ingested_rows: u64,
+        layout: &PlanLayout,
+        table: Option<&TableRevisionBind>,
+        op: &crate::window::WindowOperator,
+        max_state_keys: usize,
+    ) -> Result<Vec<u8>> {
+        let cap = freeze_entry_cap(max_state_keys);
+        let mut out = Vec::new();
+        write_snapshot_prefix(&mut out, checkpoint_id, ingested_rows, source)?;
+        op.encode_freeze_into(&mut out, cap)?;
+        write_snapshot_suffix(&mut out, layout, table)?;
         Ok(out)
     }
 
@@ -265,8 +277,14 @@ impl CheckpointStore {
     /// Freeze + chunk write + ACK + manifest commit. Recoverable only after
     /// CURRENT is renamed.
     pub fn commit(&mut self, snapshot: &CheckpointSnapshot) -> Result<u64> {
-        let id = snapshot.checkpoint_id.max(self.next_id);
         let payload = snapshot.encode_with_max_state_keys(self.max_state_keys)?;
+        self.commit_encoded(snapshot.checkpoint_id, &payload)
+    }
+
+    /// Commit a pre-encoded snapshot (incremental freeze encode). Fails
+    /// closed before CURRENT if the payload exceeds [`MAX_SNAPSHOT_BYTES`].
+    pub fn commit_encoded(&mut self, checkpoint_id: u64, payload: &[u8]) -> Result<u64> {
+        let id = checkpoint_id.max(self.next_id);
         if payload.len() as u64 > MAX_SNAPSHOT_BYTES {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -953,6 +971,51 @@ fn decode_layout(src: &mut &[u8]) -> Result<PlanLayout> {
     })
 }
 
+fn write_snapshot_prefix(
+    out: &mut Vec<u8>,
+    checkpoint_id: u64,
+    ingested_rows: u64,
+    source: &SourcePosition,
+) -> Result<()> {
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+    out.extend_from_slice(&checkpoint_id.to_le_bytes());
+    out.extend_from_slice(&ingested_rows.to_le_bytes());
+    encode_position(source, out)
+}
+
+fn write_snapshot_suffix(
+    out: &mut Vec<u8>,
+    layout: &PlanLayout,
+    table: Option<&TableRevisionBind>,
+) -> Result<()> {
+    encode_layout(layout, out)?;
+    match table {
+        None => out.push(0),
+        Some(t) => {
+            out.push(1);
+            encode_str(&t.name, out);
+            out.extend_from_slice(&t.version.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn estimated_frozen_bytes(f: &WindowFreeze) -> usize {
+    const ENTRY_OVERHEAD: usize = 2 + 8 + 8 + 8 + 2;
+    f.entries
+        .iter()
+        .map(|e| {
+            e.key.iter().map(Scalar::tracked_bytes).sum::<usize>()
+                + e.accs
+                    .iter()
+                    .map(crate::aggregate::Accumulator::tracked_bytes)
+                    .sum::<usize>()
+                + ENTRY_OVERHEAD
+        })
+        .sum()
+}
+
 fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>, max_entries: usize) -> Result<()> {
     if f.entries.len() > max_entries {
         return Err(SparrowError::new(
@@ -963,22 +1026,28 @@ fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>, max_entries: usize) -> Res
             ),
         ));
     }
+    let estimate = estimated_frozen_bytes(f).saturating_add(256);
+    if estimate as u64 > MAX_SNAPSHOT_BYTES {
+        return Err(SparrowError::new(
+            ErrorCode::BoundExceeded,
+            format!(
+                "estimated freeze {estimate}B exceeds {MAX_SNAPSHOT_BYTES}B snapshot quota; refusing encode before CURRENT"
+            ),
+        ));
+    }
     out.extend_from_slice(&f.operator.raw().to_le_bytes());
     out.extend_from_slice(&f.slot.raw().to_le_bytes());
     out.push(f.kind);
     out.extend_from_slice(&(f.entries.len() as u32).to_le_bytes());
     for e in &f.entries {
-        out.extend_from_slice(&(e.key.len() as u16).to_le_bytes());
-        for s in &e.key {
-            s.encode_value(out)?;
-        }
-        out.extend_from_slice(&e.window_start.to_le_bytes());
-        out.extend_from_slice(&e.window_end.to_le_bytes());
-        out.extend_from_slice(&e.count.to_le_bytes());
-        out.extend_from_slice(&(e.accs.len() as u16).to_le_bytes());
-        for a in &e.accs {
-            a.encode(out)?;
-        }
+        crate::window::write_freeze_entry(
+            out,
+            &e.key,
+            e.window_start,
+            e.window_end,
+            e.count,
+            &e.accs,
+        )?;
     }
     encode_opt_i64(f.wm_in, out);
     encode_opt_i64(f.wm_out, out);
@@ -1572,6 +1641,87 @@ mod tests {
         assert_eq!(got.window.entries.len(), n);
         let codec = CheckpointSnapshot::decode(&bytes).unwrap();
         assert_eq!(codec.window.entries.len(), n);
+    }
+
+    #[test]
+    fn p1_14_incremental_encode_matches_freeze_bytes() {
+        let schema = count_schema();
+        let spec = count_spec();
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let mut op = WindowOperator::new(
+            OperatorId::new(7),
+            spec.clone(),
+            schema.clone(),
+            Arc::clone(&owner),
+            64,
+            8,
+        )
+        .unwrap();
+        ingest_distinct_keys(&mut op, &schema, &owner, 12);
+        let window = op.freeze();
+        let snap = CheckpointSnapshot {
+            checkpoint_id: 1,
+            source: SourcePosition::start(SourceIdentity::memory("p114", 32, 1)),
+            window: window.clone(),
+            ingested_rows: 12,
+            layout: PlanLayout::from_window(OperatorId::new(7), window.slot, &spec),
+            table: None,
+        };
+        let cloned = snap.encode_with_max_state_keys(64).unwrap();
+        let streamed = CheckpointSnapshot::encode_from_operator(
+            1,
+            &snap.source,
+            12,
+            &snap.layout,
+            None,
+            &op,
+            64,
+        )
+        .unwrap();
+        assert_eq!(
+            cloned, streamed,
+            "incremental encode must match freeze-then-encode bytes"
+        );
+        let before = owner.usage().retention_bytes;
+        let _ = op.encode_freeze_into(&mut Vec::new(), 64).unwrap();
+        assert_eq!(
+            owner.usage().retention_bytes,
+            before,
+            "incremental encode must not clone entries onto the retention ledger"
+        );
+    }
+
+    #[test]
+    fn p1_14_encode_refuses_oversized_freeze_before_current() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open_with_max_state_keys(&dir, 64).unwrap();
+        let mut snap = sample_snapshot(1);
+        snap.window = WindowFreeze {
+            operator: snap.window.operator,
+            slot: snap.window.slot,
+            kind: 1,
+            entries: (0..24)
+                .map(|i| FrozenEntry {
+                    key: vec![Scalar::utf8("x".repeat(400_000))],
+                    window_start: 0,
+                    window_end: 0,
+                    count: i,
+                    accs: Vec::new(),
+                })
+                .collect(),
+            wm_in: None,
+            wm_out: None,
+            last_effective: None,
+        };
+        let err = store.commit(&snap).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoundExceeded);
+        assert!(
+            err.message.contains("refusing encode") || err.message.contains("snapshot quota"),
+            "must refuse before CURRENT: {err}"
+        );
+        assert!(!dir.join("CURRENT").exists());
+        assert!(store.recover_committed().unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

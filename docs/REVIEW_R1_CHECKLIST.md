@@ -31,7 +31,7 @@ Mark `- [x]` only when the item is fixed **and** covered by a semantic test
 
 - [x] **A2** `AlignedSession.finals/lates` bounded or unused on production path → production uses Kernel; session cap `MAX_SESSION_ROWS`; gold restore still matches. `2348289`
 - [x] **P1-15** builders acquire reservation before Vec growth → `RowBatchBuilder::push`; `builder_rejects_unbounded_expansion` / `r04_small_reservation_rejects_unfinished_builder`. `f19167e`
-- [ ] **P1-16** transform does not unaccounted `to_vec` of whole batches → code path fixed (`apply_steps`); no dedicated semantic test beyond existing transform jobs
+- [x] **P1-16** transform does not unaccounted `to_vec` of whole batches → each step uses `RowBatchBuilder` (A2 leftover, R2 batch 8). `a2_transform_builder_charges_owner_not_shadow_vec`. See `docs/REVIEW_R2_BATCH8.md`.
 - [x] **P1-20** `drain_watermark` is chunked take-emit-advance (R17 not bypassed) → `r17_take_closed_chunk_leaves_remaining_state` / `r17_many_keys_closing_chunk_within_mailbox`. `2348289`
 
 ## Phase 6 — Security
@@ -47,8 +47,9 @@ Mark `- [x]` only when the item is fixed **and** covered by a semantic test
 
 ## Remaining P1
 
-- [ ] **P1-14** freeze clone bounded / documented → still full clone under `max_state_keys`; not incremental
-- [ ] **P1-17** decode errors counted + optional fail policy → `IoDiagnostics.decode_errors` incremented; no job-wide fail-on-decode switch
+- [x] **P1-14** freeze clone bounded / documented → incremental `encode_freeze_into` (key refs only) on `AlignedSession`; encode refuses oversized before CURRENT. ACK path still materializes `WindowFreeze` (residual). `p1_14_incremental_encode_matches_freeze_bytes` / `p1_14_encode_refuses_oversized_freeze_before_current`. See `docs/REVIEW_R2_BATCH8.md`.
+- [x] **P1-20 (R2 process budget)** Kernel shares one `MemoryOwner`; queue admit sums live jobs. Distinct from the R1 P1-20 watermark-drain item. `p1_20_second_job_refused_when_process_queue_reserved`. See `docs/REVIEW_R2_BATCH8.md`.
+- [x] **P1-17** decode errors counted + optional fail policy → `fail_on_decode` spec flag / `SPARROW_FAIL_ON_DECODE`. `p1_17_fail_on_decode_fails_the_job`. Default still counts only. See `docs/REVIEW_R2_BATCH8.md`.
 - [x] **P1-18** `IoDiagnostics` on `RunningJob` and `/v1/metrics` → `r11_checkpoint_via_api_flushes_then_commits` metrics include `io`. `be2a784`
 - [x] **P1-19** converge backoff; per-pipeline attempt cap; safe_mode clarified → `MAX_PIPELINE_ATTEMPTS=16` now applies to `consecutive_failures` (R2 N1). `r24_start_failure_is_actual_failed` / `n1_healthy_start_stop_cycles_not_held`. See `docs/REVIEW_R2_BATCH1.md`.
 - [x] **P1-21** WorkBudget yields at quota (not reset every envelope) → `would_exhaust` + `begin_quantum`; `r02_quantum_allows_more_events_than_old_lifetime_cap`. `f19167e` / `2348289`
@@ -57,7 +58,7 @@ Mark `- [x]` only when the item is fixed **and** covered by a semantic test
 - [x] **P1-24** recover previous generation on corrupt CURRENT; GC error after commit is not a failed commit → `p1_24_corrupt_current_recovers_previous_generation`; missing CURRENT still not a commit. `2348289`
 - [x] **P1-25** `SNAPSHOT_VERSION` bumped when format changes (or documented unchanged) → format unchanged (decode caps only); version stays 1. `2348289`
 - [x] **P1-26** PT restore: aligned+PT rejected (fail closed; no silent complete overdue) → covered by `p0_2_pt_aligned_rejected`. `be2a784`
-- [ ] **P1-27** MQTT inbox byte bounds → `inbox_capacity * max_bytes ≤ 4MiB` in validate; no dedicated semantic test
+- [x] **P1-27** MQTT inbox byte bounds → 4MiB **and** process `queue_bytes` (compact 2MiB). `p1_27_inbox_times_max_record_rejects_over_queue_budget`. See `docs/REVIEW_R2_BATCH8.md`.
 - [x] **P1-28** single SQL binder dispatch is parse-driven (no `contains("HOP(")`) → `classify_statement`; `v03::tests::accept_hop`. `f19167e`
 
 ## Architecture A5–A8

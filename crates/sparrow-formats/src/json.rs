@@ -1,8 +1,10 @@
 //! JSON object ↔ [`Row`] with size/depth caps and schema checks.
 
+use std::sync::Arc;
+
 use serde::de::DeserializeSeed;
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
-use sparrow_model::{DataType, DynamicValue, Row, Scalar, Schema, SourceFrame};
+use sparrow_model::{DataType, DynamicValue, MemoryOwner, Row, Scalar, Schema, SourceFrame};
 
 /// What to do with a record that fails size, depth, or schema checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +35,8 @@ pub struct JsonCodec {
     pub schema: Schema,
     pub limits: JsonLimits,
     pub policy: BadRecordPolicy,
+    /// When set, Utf8/Bytes scalars use tracked constructors (A2 leftover).
+    pub owner: Option<Arc<MemoryOwner>>,
 }
 
 impl JsonCodec {
@@ -41,11 +45,31 @@ impl JsonCodec {
             schema,
             limits: JsonLimits::default(),
             policy: BadRecordPolicy::Drop,
+            owner: None,
         }
     }
 
+    pub fn with_owner(mut self, owner: Arc<MemoryOwner>) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    pub fn with_fail_on_decode(mut self, fail: bool) -> Self {
+        self.policy = if fail {
+            BadRecordPolicy::FailJob
+        } else {
+            BadRecordPolicy::Drop
+        };
+        self
+    }
+
     pub fn decode_frame(&self, frame: &SourceFrame) -> Result<Option<Row>> {
-        match decode_json_row(&self.schema, &frame.payload, &self.limits) {
+        match decode_json_row_on(
+            &self.schema,
+            &frame.payload,
+            &self.limits,
+            self.owner.as_deref(),
+        ) {
             Ok(row) => Ok(Some(row)),
             Err(err) => match self.policy {
                 BadRecordPolicy::Drop => Ok(None),
@@ -60,6 +84,15 @@ impl JsonCodec {
 }
 
 pub fn decode_json_row(schema: &Schema, bytes: &[u8], limits: &JsonLimits) -> Result<Row> {
+    decode_json_row_on(schema, bytes, limits, None)
+}
+
+pub fn decode_json_row_on(
+    schema: &Schema,
+    bytes: &[u8],
+    limits: &JsonLimits,
+    owner: Option<&MemoryOwner>,
+) -> Result<Row> {
     if bytes.len() > limits.max_bytes {
         return Err(SparrowError::new(
             ErrorCode::MaxRecordSize,
@@ -90,7 +123,9 @@ pub fn decode_json_row(schema: &Schema, bytes: &[u8], limits: &JsonLimits) -> Re
                     format!("missing required field '{}'", field.name),
                 ));
             }
-            Some((_, v)) => values.push(json_val_to_scalar(v, &field.data_type, field.nullable)?),
+            Some((_, v)) => {
+                values.push(json_val_to_scalar(v, &field.data_type, field.nullable, owner)?)
+            }
         }
     }
     Ok(Row { values })
@@ -141,7 +176,12 @@ pub fn json_depth(value: &serde_json::Value) -> usize {
     }
 }
 
-fn json_val_to_scalar(value: &JsonVal, ty: &DataType, nullable: bool) -> Result<Scalar> {
+fn json_val_to_scalar(
+    value: &JsonVal,
+    ty: &DataType,
+    nullable: bool,
+    owner: Option<&MemoryOwner>,
+) -> Result<Scalar> {
     if matches!(value, JsonVal::Null) {
         if nullable {
             return Ok(Scalar::Null);
@@ -165,14 +205,20 @@ fn json_val_to_scalar(value: &JsonVal, ty: &DataType, nullable: bool) -> Result<
             other => Err(type_err("float64", other)),
         },
         DataType::Utf8 => match value {
-            JsonVal::Utf8(s) => Ok(Scalar::utf8(s)),
+            JsonVal::Utf8(s) => match owner {
+                Some(o) => Scalar::utf8_tracked(o, s),
+                None => Ok(Scalar::utf8(s)),
+            },
             other => Err(type_err("utf8", other)),
         },
         DataType::Bytes => match value {
             JsonVal::Utf8(s) => {
                 let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
                     .map_err(|_| type_err("bytes(base64)", value))?;
-                Ok(Scalar::bytes(raw))
+                match owner {
+                    Some(o) => Scalar::bytes_tracked(o, raw),
+                    None => Ok(Scalar::bytes(raw)),
+                }
             }
             other => Err(type_err("bytes(base64)", other)),
         },
@@ -184,7 +230,7 @@ fn json_val_to_scalar(value: &JsonVal, ty: &DataType, nullable: bool) -> Result<
             };
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(scalar_to_dynamic(json_val_to_scalar(item, inner, true)?));
+                out.push(scalar_to_dynamic(json_val_to_scalar(item, inner, true, owner)?));
             }
             Ok(Scalar::Dynamic(DynamicValue::Array(out.into())))
         }
@@ -211,7 +257,7 @@ fn json_val_to_scalar(value: &JsonVal, ty: &DataType, nullable: bool) -> Result<
                         ));
                     }
                     Some((_, v)) => {
-                        let s = json_val_to_scalar(v, &f.data_type, f.nullable)?;
+                        let s = json_val_to_scalar(v, &f.data_type, f.nullable, owner)?;
                         out.push((f.name.clone(), scalar_to_dynamic(s)));
                     }
                 }
@@ -227,7 +273,7 @@ fn json_val_to_scalar(value: &JsonVal, ty: &DataType, nullable: bool) -> Result<
             let mut out = Vec::with_capacity(pairs.len());
             for (k, v) in pairs {
                 validate_map_key(k, key)?;
-                let s = json_val_to_scalar(v, val_ty, true)?;
+                let s = json_val_to_scalar(v, val_ty, true, owner)?;
                 out.push((k.clone(), scalar_to_dynamic(s)));
             }
             DynamicValue::try_object(out)
@@ -639,6 +685,7 @@ mod tests {
             schema: schema(),
             limits: JsonLimits::default(),
             policy: BadRecordPolicy::Drop,
+            owner: None,
         };
         let frame = SourceFrame::new(b"not-json".to_vec(), 0);
         assert!(codec.decode_frame(&frame).unwrap().is_none());
@@ -647,6 +694,7 @@ mod tests {
             schema: schema(),
             limits: JsonLimits::default(),
             policy: BadRecordPolicy::FailJob,
+            owner: None,
         };
         assert_eq!(
             fail.decode_frame(&frame).unwrap_err().code,

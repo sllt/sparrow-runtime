@@ -29,6 +29,10 @@ pub struct PipelineSpec {
     /// Directory for aligned File/replay checkpoints. Defaults to `{path}.sparrow-chk`.
     #[serde(default)]
     pub checkpoint_dir: Option<String>,
+    /// P1-17: decode errors fail the job instead of only incrementing
+    /// `IoDiagnostics.decode_errors`. Also enabled by `SPARROW_FAIL_ON_DECODE=1`.
+    #[serde(default)]
+    pub fail_on_decode: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -134,7 +138,22 @@ fn default_outbox() -> usize {
     16
 }
 
+pub fn fail_on_decode_from_env() -> bool {
+    match std::env::var("SPARROW_FAIL_ON_DECODE") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 impl PipelineSpec {
+    /// Spec flag or `SPARROW_FAIL_ON_DECODE=1|true|yes` (P1-17).
+    pub fn effective_fail_on_decode(&self) -> bool {
+        self.fail_on_decode || fail_on_decode_from_env()
+    }
+
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > MAX_SPEC_BYTES {
             return Err(SparrowError::new(
