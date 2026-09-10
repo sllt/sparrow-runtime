@@ -54,6 +54,7 @@ pub struct ActualState {
     pub revision: Option<u64>,
     pub status: String,
     pub attempt_id: u64,
+    pub consecutive_failures: u64,
     pub last_error: Option<String>,
 }
 
@@ -146,7 +147,12 @@ impl Store {
             )
             .optional()
             .map_err(db)?
-            .ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, format!("unknown stream `{name}`")))
+            .ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown stream `{name}`"),
+                )
+            })
         })
     }
 
@@ -167,7 +173,12 @@ impl Store {
         })
     }
 
-    pub fn put_pipeline(&self, name: &str, spec: &PipelineSpec, expected_etag: Option<&str>) -> Result<PipelineRow> {
+    pub fn put_pipeline(
+        &self,
+        name: &str,
+        spec: &PipelineSpec,
+        expected_etag: Option<&str>,
+    ) -> Result<PipelineRow> {
         check_name(name)?;
         self.write(|c| {
             let current: Option<(u64, String)> = c
@@ -223,8 +234,8 @@ impl Store {
             )
             .map_err(db)?;
             c.execute(
-                "INSERT OR IGNORE INTO actual_state(name, actual_revision, actual_status, attempt_id, last_error, updated_at)
-                 VALUES (?1, NULL, 'stopped', 0, NULL, ?2)",
+                "INSERT OR IGNORE INTO actual_state(name, actual_revision, actual_status, attempt_id, consecutive_failures, last_error, updated_at)
+                 VALUES (?1, NULL, 'stopped', 0, 0, NULL, ?2)",
                 params![name, ts],
             )
             .map_err(db)?;
@@ -248,7 +259,9 @@ impl Store {
 
     pub fn list_pipeline_names(&self) -> Result<Vec<String>> {
         self.read(|c| {
-            let mut stmt = c.prepare("SELECT name FROM pipelines ORDER BY name").map_err(db)?;
+            let mut stmt = c
+                .prepare("SELECT name FROM pipelines ORDER BY name")
+                .map_err(db)?;
             let rows = stmt.query_map([], |r| r.get(0)).map_err(db)?;
             rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db)
         })
@@ -257,7 +270,11 @@ impl Store {
     pub fn set_desired(&self, name: &str, status: &str, revision: Option<u64>) -> Result<()> {
         self.write(|c| {
             let exists: i64 = c
-                .query_row("SELECT COUNT(*) FROM pipelines WHERE name=?1", [name], |r| r.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM pipelines WHERE name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
                 .map_err(db)?;
             if exists == 0 {
                 return Err(SparrowError::new(
@@ -288,13 +305,28 @@ impl Store {
         last_error: Option<&str>,
     ) -> Result<()> {
         self.write(|c| {
+            let prev: i64 = c
+                .query_row(
+                    "SELECT consecutive_failures FROM actual_state WHERE name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db)?
+                .unwrap_or(0);
+            let consecutive = match status {
+                "running" | "completed" => 0,
+                "failed" => prev.saturating_add(1),
+                _ => prev,
+            };
             c.execute(
-                "INSERT INTO actual_state(name, actual_revision, actual_status, attempt_id, last_error, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO actual_state(name, actual_revision, actual_status, attempt_id, consecutive_failures, last_error, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(name) DO UPDATE SET
                     actual_revision=excluded.actual_revision,
                     actual_status=excluded.actual_status,
                     attempt_id=excluded.attempt_id,
+                    consecutive_failures=excluded.consecutive_failures,
                     last_error=excluded.last_error,
                     updated_at=excluded.updated_at",
                 params![
@@ -302,9 +334,34 @@ impl Store {
                     revision.map(|r| r as i64),
                     status,
                     attempt_id as i64,
+                    consecutive,
                     last_error,
                     now_ms()
                 ],
+            )
+            .map_err(db)?;
+            Ok(())
+        })
+    }
+
+    /// Update `last_error` without changing status, attempt_id, or consecutive_failures.
+    pub fn set_last_error(&self, name: &str, last_error: Option<&str>) -> Result<()> {
+        self.write(|c| {
+            c.execute(
+                "UPDATE actual_state SET last_error=?1, updated_at=?2 WHERE name=?3",
+                params![last_error, now_ms(), name],
+            )
+            .map_err(db)?;
+            Ok(())
+        })
+    }
+
+    /// Clear the consecutive-failure hold so `request_start` can converge again.
+    pub fn reset_consecutive_failures(&self, name: &str) -> Result<()> {
+        self.write(|c| {
+            c.execute(
+                "UPDATE actual_state SET consecutive_failures=0, updated_at=?1 WHERE name=?2",
+                params![now_ms(), name],
             )
             .map_err(db)?;
             Ok(())
@@ -327,7 +384,10 @@ impl Store {
             .optional()
             .map_err(db)?
             .ok_or_else(|| {
-                SparrowError::new(ErrorCode::InvalidArgument, format!("no desired state for `{name}`"))
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("no desired state for `{name}`"),
+                )
             })
         })
     }
@@ -335,7 +395,7 @@ impl Store {
     pub fn actual(&self, name: &str) -> Result<ActualState> {
         self.read(|c| {
             c.query_row(
-                "SELECT name, actual_revision, actual_status, attempt_id, last_error FROM actual_state WHERE name=?1",
+                "SELECT name, actual_revision, actual_status, attempt_id, COALESCE(consecutive_failures, 0), last_error FROM actual_state WHERE name=?1",
                 [name],
                 |r| {
                     Ok(ActualState {
@@ -343,7 +403,8 @@ impl Store {
                         revision: r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
                         status: r.get(2)?,
                         attempt_id: r.get::<_, i64>(3)? as u64,
-                        last_error: r.get(4)?,
+                        consecutive_failures: r.get::<_, i64>(4)? as u64,
+                        last_error: r.get(5)?,
                     })
                 },
             )
@@ -385,7 +446,13 @@ impl Store {
         })
     }
 
-    pub fn insert_attempt(&self, pipeline: &str, revision: u64, outcome: &str, detail: Option<&str>) -> Result<i64> {
+    pub fn insert_attempt(
+        &self,
+        pipeline: &str,
+        revision: u64,
+        outcome: &str,
+        detail: Option<&str>,
+    ) -> Result<i64> {
         self.write(|c| {
             c.execute(
                 "INSERT INTO deployment_attempts(pipeline, revision, started_at, outcome, detail, restore_claim)
@@ -426,7 +493,14 @@ impl Store {
         })
     }
 
-    pub fn audit(&self, actor: &str, action: &str, target: Option<&str>, detail: Option<&str>, outcome: &str) -> Result<()> {
+    pub fn audit(
+        &self,
+        actor: &str,
+        action: &str,
+        target: Option<&str>,
+        detail: Option<&str>,
+        outcome: &str,
+    ) -> Result<()> {
         self.write(|c| {
             c.execute(
                 "INSERT INTO audit_log(at_ms, actor, action, target, detail, outcome)
@@ -494,7 +568,9 @@ impl Store {
     pub fn get_secret(&self, name: &str) -> Result<Option<String>> {
         self.read(|c| {
             let raw: Option<String> = c
-                .query_row("SELECT value FROM secrets WHERE name=?1", [name], |r| r.get(0))
+                .query_row("SELECT value FROM secrets WHERE name=?1", [name], |r| {
+                    r.get(0)
+                })
                 .optional()
                 .map_err(db)?;
             match raw {
@@ -526,16 +602,20 @@ impl Store {
     }
 
     fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let g = self.inner.conn.lock().map_err(|_| {
-            SparrowError::new(ErrorCode::Internal, "catalog mutex poisoned")
-        })?;
+        let g = self
+            .inner
+            .conn
+            .lock()
+            .map_err(|_| SparrowError::new(ErrorCode::Internal, "catalog mutex poisoned"))?;
         f(&g)
     }
 
     fn write<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let g = self.inner.conn.lock().map_err(|_| {
-            SparrowError::new(ErrorCode::Internal, "catalog mutex poisoned")
-        })?;
+        let g = self
+            .inner
+            .conn
+            .lock()
+            .map_err(|_| SparrowError::new(ErrorCode::Internal, "catalog mutex poisoned"))?;
         g.execute_batch("BEGIN IMMEDIATE").map_err(db)?;
         match f(&g) {
             Ok(v) => {
@@ -576,8 +656,10 @@ impl Store {
     /// Test helper: raw sealed secret bytes (never used in logs).
     pub fn debug_raw_secret(&self, name: &str) -> Result<String> {
         self.read(|c| {
-            c.query_row("SELECT value FROM secrets WHERE name=?1", [name], |r| r.get(0))
-                .map_err(db)
+            c.query_row("SELECT value FROM secrets WHERE name=?1", [name], |r| {
+                r.get(0)
+            })
+            .map_err(db)
         })
     }
 }
@@ -591,7 +673,12 @@ fn load_pipeline_revision(c: &Connection, name: &str, revision: u64) -> Result<P
         )
         .optional()
         .map_err(db)?
-        .ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, format!("unknown pipeline `{name}`")))?;
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("unknown pipeline `{name}`"),
+            )
+        })?;
     let spec_json: String = c
         .query_row(
             "SELECT spec_json FROM pipeline_revisions WHERE name=?1 AND revision=?2",
@@ -606,9 +693,8 @@ fn load_pipeline_revision(c: &Connection, name: &str, revision: u64) -> Result<P
                 format!("pipeline `{name}` has no revision {revision}"),
             )
         })?;
-    let spec: PipelineSpec = serde_json::from_str(&spec_json).map_err(|e| {
-        SparrowError::new(ErrorCode::InvalidSchema, format!("stored spec: {e}"))
-    })?;
+    let spec: PipelineSpec = serde_json::from_str(&spec_json)
+        .map_err(|e| SparrowError::new(ErrorCode::InvalidSchema, format!("stored spec: {e}")))?;
     let etag = if revision == latest as u64 {
         etag
     } else {
@@ -631,7 +717,12 @@ fn load_pipeline(c: &Connection, name: &str) -> Result<PipelineRow> {
         )
         .optional()
         .map_err(db)?
-        .ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, format!("unknown pipeline `{name}`")))?;
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("unknown pipeline `{name}`"),
+            )
+        })?;
     let spec_json: String = c
         .query_row(
             "SELECT spec_json FROM pipeline_revisions WHERE name=?1 AND revision=?2",
@@ -639,9 +730,8 @@ fn load_pipeline(c: &Connection, name: &str) -> Result<PipelineRow> {
             |r| r.get(0),
         )
         .map_err(db)?;
-    let spec: PipelineSpec = serde_json::from_str(&spec_json).map_err(|e| {
-        SparrowError::new(ErrorCode::InvalidSchema, format!("stored spec: {e}"))
-    })?;
+    let spec: PipelineSpec = serde_json::from_str(&spec_json)
+        .map_err(|e| SparrowError::new(ErrorCode::InvalidSchema, format!("stored spec: {e}")))?;
     Ok(PipelineRow {
         name: name.to_string(),
         latest_revision: rev as u64,
@@ -688,6 +778,7 @@ fn init(conn: &Connection) -> Result<()> {
             actual_revision INTEGER,
             actual_status TEXT NOT NULL,
             attempt_id INTEGER NOT NULL DEFAULT 0,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             updated_at INTEGER NOT NULL
         );
@@ -721,6 +812,7 @@ fn init(conn: &Connection) -> Result<()> {
         "#,
     )
     .map_err(db)?;
+    migrate_actual_consecutive_failures(conn)?;
     let ver = meta_u32(conn, "catalog_schema_version").unwrap_or(0);
     if ver == 0 {
         conn.execute(
@@ -731,8 +823,34 @@ fn init(conn: &Connection) -> Result<()> {
     } else if ver != CATALOG_SCHEMA_VERSION {
         return Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
-            format!("catalog_schema_version {ver} is not supported (want {CATALOG_SCHEMA_VERSION})"),
+            format!(
+                "catalog_schema_version {ver} is not supported (want {CATALOG_SCHEMA_VERSION})"
+            ),
         ));
+    }
+    Ok(())
+}
+
+fn migrate_actual_consecutive_failures(conn: &Connection) -> Result<()> {
+    let mut has_cf = false;
+    {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(actual_state)")
+            .map_err(db)?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1)).map_err(db)?;
+        for col in rows {
+            if col.map_err(db)? == "consecutive_failures" {
+                has_cf = true;
+                break;
+            }
+        }
+    }
+    if !has_cf {
+        conn.execute(
+            "ALTER TABLE actual_state ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(db)?;
     }
     Ok(())
 }
@@ -741,7 +859,8 @@ fn meta_u32(conn: &Connection, key: &str) -> Result<u32> {
     let s: String = conn
         .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
         .map_err(db)?;
-    s.parse().map_err(|_| SparrowError::new(ErrorCode::InvalidSchema, "meta version"))
+    s.parse()
+        .map_err(|_| SparrowError::new(ErrorCode::InvalidSchema, "meta version"))
 }
 
 pub fn now_ms() -> i64 {
@@ -808,10 +927,16 @@ fn parse_secrets_key(raw: &[u8]) -> Result<[u8; 32]> {
     let trimmed = std::str::from_utf8(raw).unwrap_or("").trim();
     if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
         let v = hex_decode(trimmed).map_err(|_| {
-            SparrowError::new(ErrorCode::InvalidArgument, "SPARROW_SECRETS_KEY hex is invalid")
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "SPARROW_SECRETS_KEY hex is invalid",
+            )
         })?;
         return v.try_into().map_err(|_| {
-            SparrowError::new(ErrorCode::InvalidArgument, "SPARROW_SECRETS_KEY must be 32 bytes")
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "SPARROW_SECRETS_KEY must be 32 bytes",
+            )
         });
     }
     if raw.len() == 32 {
@@ -844,14 +969,13 @@ fn seal_secret(plain: &str) -> Result<String> {
     use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
     use ring::rand::{SecureRandom, SystemRandom};
     let key = secrets_key()?;
-    let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key).map_err(|_| {
-        SparrowError::new(ErrorCode::Internal, "secrets AEAD key rejected")
-    })?;
+    let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key)
+        .map_err(|_| SparrowError::new(ErrorCode::Internal, "secrets AEAD key rejected"))?;
     let aead = LessSafeKey::new(unbound);
     let mut nonce_bytes = [0u8; 12];
-    SystemRandom::new().fill(&mut nonce_bytes).map_err(|_| {
-        SparrowError::new(ErrorCode::Internal, "secrets nonce failed")
-    })?;
+    SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| SparrowError::new(ErrorCode::Internal, "secrets nonce failed"))?;
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
     let mut in_out = plain.as_bytes().to_vec();
     aead.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
@@ -865,9 +989,8 @@ fn seal_secret(plain: &str) -> Result<String> {
 fn unseal_secret(stored: &str) -> Result<String> {
     use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
     if let Some(hex) = stored.strip_prefix("enc:v2:") {
-        let raw = hex_decode(hex).map_err(|_| {
-            SparrowError::new(ErrorCode::InvalidSchema, "stored secret is corrupt")
-        })?;
+        let raw = hex_decode(hex)
+            .map_err(|_| SparrowError::new(ErrorCode::InvalidSchema, "stored secret is corrupt"))?;
         if raw.len() < 12 + 16 {
             return Err(SparrowError::new(
                 ErrorCode::InvalidSchema,
@@ -875,9 +998,8 @@ fn unseal_secret(stored: &str) -> Result<String> {
             ));
         }
         let key = secrets_key()?;
-        let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key).map_err(|_| {
-            SparrowError::new(ErrorCode::Internal, "secrets AEAD key rejected")
-        })?;
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key)
+            .map_err(|_| SparrowError::new(ErrorCode::Internal, "secrets AEAD key rejected"))?;
         let aead = LessSafeKey::new(unbound);
         let nonce = Nonce::try_assume_unique_for_key(&raw[..12]).map_err(|_| {
             SparrowError::new(ErrorCode::InvalidSchema, "stored secret nonce is invalid")
@@ -888,9 +1010,8 @@ fn unseal_secret(stored: &str) -> Result<String> {
             .map_err(|_| {
                 SparrowError::new(ErrorCode::InvalidSchema, "stored secret failed AEAD open")
             })?;
-        String::from_utf8(pt.to_vec()).map_err(|_| {
-            SparrowError::new(ErrorCode::InvalidSchema, "stored secret is not utf8")
-        })
+        String::from_utf8(pt.to_vec())
+            .map_err(|_| SparrowError::new(ErrorCode::InvalidSchema, "stored secret is not utf8"))
     } else if stored.starts_with("enc:v1:") {
         Err(SparrowError::new(
             ErrorCode::InvalidSchema,
@@ -1008,9 +1129,15 @@ mod tests {
         b.sql = Some("SELECT temperature FROM sensors".into());
         s.put_pipeline("hot", &b, Some("rev-1")).unwrap();
         let desired = s.get_pipeline_revision("hot", 1).unwrap();
-        assert_eq!(desired.spec.sql.as_deref(), Some("SELECT device_id FROM sensors"));
+        assert_eq!(
+            desired.spec.sql.as_deref(),
+            Some("SELECT device_id FROM sensors")
+        );
         let latest = s.get_pipeline("hot").unwrap();
-        assert_eq!(latest.spec.sql.as_deref(), Some("SELECT temperature FROM sensors"));
+        assert_eq!(
+            latest.spec.sql.as_deref(),
+            Some("SELECT temperature FROM sensors")
+        );
         assert_ne!(desired.spec.sql, latest.spec.sql);
     }
 
@@ -1019,9 +1146,15 @@ mod tests {
         let s = Store::open_memory().unwrap();
         s.put_secret("pw", "super-secret-value").unwrap();
         let raw = s.debug_raw_secret("pw").unwrap();
-        assert!(raw.starts_with("enc:v2:"), "stored secret must be AEAD-sealed: {raw}");
+        assert!(
+            raw.starts_with("enc:v2:"),
+            "stored secret must be AEAD-sealed: {raw}"
+        );
         assert!(!raw.contains("super-secret-value"));
-        assert_eq!(s.get_secret("pw").unwrap().as_deref(), Some("super-secret-value"));
+        assert_eq!(
+            s.get_secret("pw").unwrap().as_deref(),
+            Some("super-secret-value")
+        );
         let err = unseal_secret("super-secret-value").unwrap_err();
         assert_eq!(err.code, ErrorCode::PolicyDenied);
         let too_big = "x".repeat(4097);

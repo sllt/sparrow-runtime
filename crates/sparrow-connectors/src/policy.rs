@@ -1,5 +1,6 @@
+use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use sparrow_model::ErrorCode;
 
@@ -20,7 +21,9 @@ pub struct AllowedTarget {
 
 impl TargetPolicy {
     pub fn deny_all() -> Self {
-        Self { allowed: Vec::new() }
+        Self {
+            allowed: Vec::new(),
+        }
     }
 
     pub fn allow(host: impl Into<String>, port: u16) -> Self {
@@ -84,49 +87,86 @@ impl TargetPolicy {
     }
 }
 
-/// Allowlisted roots for File/replay paths and `checkpoint_dir` (P0-12).
+/// Allowlisted roots for File/replay paths and `checkpoint_dir` (P0-12 / N3).
 ///
-/// Override with `SPARROW_DATA_ROOTS` (colon-separated). Defaults include the
-/// process cwd, `/tmp`, and the platform temp dir so tests and local demos work.
+/// Policy (honest, fail-closed):
+/// - `SPARROW_DATA_ROOTS` (colon-separated) is the allowlist when set.
+///   An empty value means deny every file path.
+/// - When unset and `SPARROW_SAFE_MODE=1` (or `--safe-mode`), file paths are
+///   denied until roots are configured. systemd units often have cwd `/`.
+/// - Otherwise the only default is [`default_data_root`] (`{temp_dir}/sparrow`).
+///   CWD is never a default root. `/tmp` as a whole is not a default root
+///   (lexical `..` and siblings must not inherit a sandbox).
 pub fn data_roots() -> Vec<PathBuf> {
-    if let Ok(raw) = std::env::var("SPARROW_DATA_ROOTS") {
-        let roots: Vec<PathBuf> = raw
-            .split(':')
+    if let Some(roots) = configured_data_roots() {
+        return roots;
+    }
+    if std::env::var("SPARROW_SAFE_MODE").ok().as_deref() == Some("1") {
+        return Vec::new();
+    }
+    default_data_roots()
+}
+
+/// Roots from `SPARROW_DATA_ROOTS`. `None` if the variable is unset.
+/// `Some(vec![])` if it is set but empty (deny all).
+pub fn configured_data_roots() -> Option<Vec<PathBuf>> {
+    let raw = std::env::var("SPARROW_DATA_ROOTS").ok()?;
+    Some(
+        raw.split(':')
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
-            .collect();
-        if !roots.is_empty() {
-            return roots;
-        }
-    }
-    let mut roots = vec![
-        std::env::temp_dir(),
-        PathBuf::from("/tmp"),
-        PathBuf::from("/var/tmp"),
-    ];
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
-    roots
+            .collect(),
+    )
+}
+
+/// Default allowlist when `SPARROW_DATA_ROOTS` is unset (non-safe-mode).
+/// Never includes the process cwd.
+pub fn default_data_roots() -> Vec<PathBuf> {
+    vec![default_data_root()]
+}
+
+/// Sparrow-owned data directory under the process temp dir.
+pub fn default_data_root() -> PathBuf {
+    std::env::temp_dir().join("sparrow")
+}
+
+/// Create [`default_data_root`] if needed (tests / local demos).
+pub fn ensure_default_data_root() -> PathBuf {
+    let p = default_data_root();
+    let _ = std::fs::create_dir_all(&p);
+    p
 }
 
 /// Reject file / checkpoint paths that escape the allowlisted roots.
 pub fn check_data_path(path: &Path) -> Result<()> {
+    check_data_path_in(path, &data_roots())
+}
+
+/// Same as [`check_data_path`] against an explicit root list (tests).
+pub fn check_data_path_in(path: &Path, roots: &[PathBuf]) -> Result<()> {
     if path.as_os_str().is_empty() {
         return Err(ConnectorError::new(
             ErrorCode::InvalidArgument,
             "file path is empty",
         ));
     }
-    let resolved = resolve_for_policy(path)?;
-    let roots = data_roots();
-    let mut resolved_roots = Vec::new();
-    for root in &roots {
-        resolved_roots.push(resolve_for_policy(root).unwrap_or_else(|_| root.clone()));
+    if roots.is_empty() {
+        return Err(ConnectorError::new(
+            ErrorCode::PolicyDenied,
+            format!(
+                "path `{}` is denied: SPARROW_DATA_ROOTS is unset/empty (safe/production requires an explicit allowlist)",
+                path.display()
+            ),
+        ));
     }
-    let ok = resolved_roots.iter().any(|root| {
-        resolved.starts_with(root) || path.starts_with(root)
+    let resolved = resolve_for_policy(path)?;
+    let ok = roots.iter().any(|root| {
+        let root_res = match resolve_for_policy(root) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        resolved.starts_with(&root_res)
     });
     if ok {
         Ok(())
@@ -146,13 +186,12 @@ fn resolve_for_policy(path: &Path) -> Result<PathBuf> {
         path.to_path_buf()
     } else {
         std::env::current_dir()
-            .map_err(|e| {
-                ConnectorError::new(ErrorCode::Internal, format!("cwd: {e}"))
-            })?
+            .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("cwd: {e}")))?
             .join(path)
     };
-    let mut cur = abs.clone();
-    let mut missing = Vec::new();
+    let normalized = lexical_normalize(&abs)?;
+    let mut cur = normalized.clone();
+    let mut missing: Vec<OsString> = Vec::new();
     while !cur.exists() {
         match cur.file_name() {
             Some(name) => {
@@ -173,7 +212,7 @@ fn resolve_for_policy(path: &Path) -> Result<PathBuf> {
         cur
     };
     for name in missing.iter().rev() {
-        if name == ".." {
+        if name == ".." || name == "." {
             return Err(ConnectorError::new(
                 ErrorCode::PolicyDenied,
                 "path must not contain `..` escapes outside an existing prefix",
@@ -182,6 +221,36 @@ fn resolve_for_policy(path: &Path) -> Result<PathBuf> {
         canon.push(name);
     }
     Ok(canon)
+}
+
+/// Resolve `.` / `..` lexically. `..` that would escape the filesystem root
+/// is rejected so `/tmp/../etc/passwd` becomes `/etc/passwd` (then fail the
+/// allowlist), never a lexical prefix of `/tmp`.
+fn lexical_normalize(path: &Path) -> Result<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err(ConnectorError::new(
+                        ErrorCode::PolicyDenied,
+                        "path `..` escapes the filesystem root",
+                    ));
+                }
+            }
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(ConnectorError::new(
+            ErrorCode::PolicyDenied,
+            "path normalized to empty",
+        ));
+    }
+    Ok(out)
 }
 
 /// HttpPush bind policy (P0-12): loopback is allowed; unspecified / public
@@ -287,17 +356,16 @@ mod tests {
     fn blocks_metadata() {
         let p = TargetPolicy::allow("169.254.169.254", 80);
         assert_eq!(
-            p.check_host_port("169.254.169.254", 80)
-                .unwrap_err()
-                .code(),
+            p.check_host_port("169.254.169.254", 80).unwrap_err().code(),
             ErrorCode::PolicyDenied
         );
     }
 
     #[test]
     fn p0_12_tmp_path_is_allowed() {
-        let p = std::env::temp_dir().join("sparrow-policy-ok.ndjson");
-        check_data_path(&p).expect("temp dir is a default data root");
+        let p = ensure_default_data_root().join("sparrow-policy-ok.ndjson");
+        check_data_path_in(&p, &default_data_roots())
+            .expect("sparrow data dir is the default root");
     }
 
     #[test]
@@ -308,5 +376,88 @@ mod tests {
             ErrorCode::PolicyDenied
         );
         check_bind_addr("127.0.0.1:0", &p).unwrap();
+    }
+
+    #[test]
+    fn n3_path_traversal_rejected() {
+        let tmp_root = vec![PathBuf::from("/tmp")];
+        let cases = [
+            PathBuf::from("/tmp/../etc/passwd"),
+            PathBuf::from("/tmp/foo/../../etc/passwd"),
+            PathBuf::from("/tmp/./../etc/passwd"),
+            default_data_root().join("../etc/passwd"),
+            default_data_root().join("nested/../../etc/passwd"),
+            default_data_root().join("a/../../../etc/passwd"),
+        ];
+        for p in cases {
+            let err = check_data_path_in(&p, &tmp_root).expect_err(&format!(
+                "traversal must be rejected even when /tmp is a root: {}",
+                p.display()
+            ));
+            assert_eq!(
+                err.code(),
+                ErrorCode::PolicyDenied,
+                "{} => {}",
+                p.display(),
+                err
+            );
+        }
+        let sparrow = default_data_roots();
+        let under = ensure_default_data_root().join("n3-ok.ndjson");
+        check_data_path_in(&under, &sparrow).expect("path inside default sparrow root");
+        let sibling = std::env::temp_dir().join("n3-not-under-sparrow.ndjson");
+        assert_eq!(
+            check_data_path_in(&sibling, &sparrow).unwrap_err().code(),
+            ErrorCode::PolicyDenied
+        );
+
+        #[cfg(unix)]
+        {
+            let root = ensure_default_data_root();
+            let stamp = format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let outside = std::env::temp_dir().join(format!("n3-outside-{stamp}"));
+            std::fs::write(&outside, b"secret").unwrap();
+            let link = root.join(format!("n3-symlink-{stamp}"));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let err = check_data_path_in(&link, &sparrow).expect_err("symlink-out must be denied");
+            assert_eq!(err.code(), ErrorCode::PolicyDenied, "{err}");
+            let _ = std::fs::remove_file(&link);
+            let _ = std::fs::remove_file(&outside);
+        }
+    }
+
+    #[test]
+    fn n3_cwd_not_default_root() {
+        let defaults = default_data_roots();
+        if let Ok(cwd) = std::env::current_dir() {
+            assert!(
+                !defaults.iter().any(|r| r == &cwd),
+                "cwd must not be a default data root (systemd may be /): cwd={cwd:?} defaults={defaults:?}"
+            );
+            let only_cwd = cwd.join("n3-cwd-only-should-deny.ndjson");
+            if !only_cwd.starts_with(default_data_root()) {
+                assert_eq!(
+                    check_data_path_in(&only_cwd, &defaults).unwrap_err().code(),
+                    ErrorCode::PolicyDenied,
+                    "a path that is only under cwd must be denied"
+                );
+            }
+        }
+        assert!(
+            !defaults.iter().any(|r| r == Path::new("/")
+                || r == Path::new("/tmp")
+                || r == Path::new("/var/tmp")
+                || *r == std::env::temp_dir()),
+            "defaults must be the sparrow-owned dir, not cwd/tmp as a whole: {defaults:?}"
+        );
+        assert_eq!(defaults, vec![default_data_root()]);
     }
 }

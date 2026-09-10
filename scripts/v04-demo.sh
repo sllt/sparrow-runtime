@@ -7,6 +7,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 WORKDIR="${TMPDIR:-/tmp}/sparrow-v04-demo-$$"
 mkdir -p "$WORKDIR"
+export SPARROW_DATA_ROOTS="${SPARROW_DATA_ROOTS:-$WORKDIR}"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 DATA="$WORKDIR/events.ndjson"

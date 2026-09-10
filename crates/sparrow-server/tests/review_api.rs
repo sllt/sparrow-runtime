@@ -18,7 +18,7 @@ const STREAM: &str = r#"{"fields":[
 ]}"#;
 
 fn tmp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
+    sparrow_connectors::ensure_default_data_root().join(format!(
         "sparrow-api-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -63,7 +63,9 @@ fn auth_post(uri: &str, body: impl AsRef<str>) -> Request<Body> {
 async fn setup() -> AppState {
     let store = Arc::new(Store::open_memory().unwrap());
     let kernel = Arc::new(compact_kernel().unwrap());
-    let (state, _) = boot(store, kernel, TOKEN.into(), false, false).await.unwrap();
+    let (state, _) = boot(store, kernel, TOKEN.into(), false, false)
+        .await
+        .unwrap();
     state
 }
 
@@ -171,7 +173,11 @@ fn r23_start_desired_revision_not_latest() {
             .await
             .unwrap();
         let actual = state.store.actual("rev").unwrap();
-        assert_eq!(actual.revision, Some(1), "must run desired revision 1, not latest 2");
+        assert_eq!(
+            actual.revision,
+            Some(1),
+            "must run desired revision 1, not latest 2"
+        );
         let _ = std::fs::remove_file(&path);
     });
 }
@@ -297,7 +303,9 @@ fn r15_oversize_manifest_restore_fails_via_api() {
         let spec = file_window_spec(&path.to_string_lossy(), &chk.to_string_lossy());
         call(&state, auth_put("/v1/pipelines/r15", spec.to_string())).await;
         call(&state, auth_post("/v1/pipelines/r15/start", "{}")).await;
-        wait_status(&state, "r15", "running", Duration::from_secs(5)).await.unwrap();
+        wait_status(&state, "r15", "running", Duration::from_secs(5))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
         call(&state, auth_post("/v1/pipelines/r15/checkpoint", "{}")).await;
         call(&state, auth_post("/v1/pipelines/r15/kill", "{}")).await;
@@ -333,7 +341,9 @@ fn r28_same_prefix_different_suffix_rejects_restore() {
         let spec = file_window_spec(&path.to_string_lossy(), &chk.to_string_lossy());
         call(&state, auth_put("/v1/pipelines/r28", spec.to_string())).await;
         call(&state, auth_post("/v1/pipelines/r28/start", "{}")).await;
-        wait_status(&state, "r28", "running", Duration::from_secs(5)).await.unwrap();
+        wait_status(&state, "r28", "running", Duration::from_secs(5))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
         call(&state, auth_post("/v1/pipelines/r28/checkpoint", "{}")).await;
         call(&state, auth_post("/v1/pipelines/r28/kill", "{}")).await;
@@ -609,6 +619,54 @@ fn p1_29_unauthenticated_does_not_write_audit() {
         let (st, _) = call(&state, req).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
         let after = state.store.list_audit(200).unwrap().len();
-        assert_eq!(before, after, "auth failure must not touch the audit ledger");
+        assert_eq!(
+            before, after,
+            "auth failure must not touch the audit ledger"
+        );
+    });
+}
+
+#[test]
+fn n2_put_empty_sql_is_4xx() {
+    let kernel = compact_kernel().unwrap();
+    kernel.block_on(async {
+        let state = setup().await;
+        let (st, _) = call(&state, auth_put("/v1/streams/sensors", STREAM)).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let path = tmp("n2-empty.ndjson");
+        std::fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n").unwrap();
+        for sql in ["", "   "] {
+            let spec = json!({
+                "version": 1,
+                "stream": "sensors",
+                "sql": sql,
+                "source": { "kind": "file", "path": path.to_string_lossy() },
+                "sink": { "kind": "log" },
+                "delivery": "live_best_effort",
+                "recovery": "restart_fresh"
+            });
+            let (st, body) =
+                call(&state, auth_put("/v1/pipelines/n2empty", spec.to_string())).await;
+            assert!(
+                st.is_client_error(),
+                "PUT sql={sql:?} must be 4xx, not disconnect: {st} {body}"
+            );
+            assert_ne!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        }
+        let (st, _) = call(
+            &state,
+            Request::builder()
+                .method("GET")
+                .uri("/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "connection must stay up after empty SQL PUT"
+        );
+        let _ = std::fs::remove_file(&path);
     });
 }

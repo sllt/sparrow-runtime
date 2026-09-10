@@ -113,10 +113,13 @@ See `docs/v1-report.md`.
 | Bind | `127.0.0.1:43180` (loopback default; `--allow-remote` to override) |
 | Auth | `Authorization: Bearer <token>` (`--token` / `SPARROW_TOKEN`) |
 | Catalog | `--catalog PATH` (SQLite) |
-| Safe mode | `--safe-mode` — do not auto-start pipelines whose last attempt failed |
+| Safe mode | `--safe-mode` — do not auto-start pipelines whose last attempt failed; file paths require `SPARROW_DATA_ROOTS` |
 | Demo I/O | `--demo-io` — embedded MQTT + HTTP capture |
+| Data roots | `SPARROW_DATA_ROOTS` — colon-separated file/checkpoint allowlist |
 
 Flags: `--bind` `--token` `--catalog` `--safe-mode` `--demo-io` `--allow-remote`.
+
+**File path allowlist (N3):** `check_data_path` compares a *normalized* path (lexical `..` / `.`, then canonicalize when the prefix exists). The original path is never used as a `starts_with` fallback. CWD is never a default root (systemd cwd can be `/`). When `SPARROW_DATA_ROOTS` is unset, the only default is `{temp_dir}/sparrow` — not `/tmp` as a whole. `--safe-mode` / `SPARROW_SAFE_MODE=1` without `SPARROW_DATA_ROOTS` denies file paths. Demos should export `SPARROW_DATA_ROOTS` to their workdir.
 
 ## Workspace
 

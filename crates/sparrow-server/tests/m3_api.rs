@@ -76,7 +76,9 @@ fn auth_get(uri: &str) -> Request<Body> {
 async fn setup() -> AppState {
     let store = Arc::new(Store::open_memory().unwrap());
     let kernel = Arc::new(compact_kernel().unwrap());
-    let (state, _) = boot(store, kernel, TOKEN.into(), false, true).await.unwrap();
+    let (state, _) = boot(store, kernel, TOKEN.into(), false, true)
+        .await
+        .unwrap();
     state
 }
 
@@ -154,7 +156,7 @@ fn v1_file_aligned_validate_and_metrics() {
             "version": 1,
             "stream": "sensors",
             "sql": "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, COUNT_WINDOW(2)",
-            "source": { "kind": "file", "path": "/tmp/sparrow-v1-events.ndjson" },
+            "source": { "kind": "file", "path": format!("{}/n3-v1-events.ndjson", sparrow_connectors::ensure_default_data_root().display()) },
             "sink": { "kind": "log" },
             "delivery": "live_best_effort",
             "recovery": "aligned",
@@ -223,10 +225,15 @@ fn graph_explain_v03_et_window() {
         assert_eq!(st, StatusCode::OK, "{body}");
         assert!(body["time"].as_str().unwrap().contains("event-time"));
         assert!(body["state"].as_str().unwrap().contains("window_agg"));
-        assert!(body["guarantee"].as_str().unwrap().contains("live_best_effort"));
-        assert!(body["physical"].as_array().unwrap().iter().any(|s| {
-            s.as_str().unwrap().contains("window")
-        }));
+        assert!(body["guarantee"]
+            .as_str()
+            .unwrap()
+            .contains("live_best_effort"));
+        assert!(body["physical"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| { s.as_str().unwrap().contains("window") }));
     });
 }
 
@@ -266,8 +273,7 @@ fn api_mqtt_http_loop_and_fresh_restart() {
                 .map(|v| v.as_str().unwrap_or("").into())
                 .collect();
             let joined = text.join("\n");
-            if joined.contains("edge-a") && joined.contains("edge-b") && joined.contains("edge-c")
-            {
+            if joined.contains("edge-a") && joined.contains("edge-b") && joined.contains("edge-c") {
                 break text;
             }
             if start.elapsed() > Duration::from_secs(6) {
@@ -275,7 +281,11 @@ fn api_mqtt_http_loop_and_fresh_restart() {
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
         };
-        assert!(text.iter().any(|b| b.contains("edge-a") && b.contains("26.2")), "{text:?}");
+        assert!(
+            text.iter()
+                .any(|b| b.contains("edge-a") && b.contains("26.2")),
+            "{text:?}"
+        );
         assert!(text.iter().any(|b| b.contains("edge-b")));
         assert!(text.iter().any(|b| b.contains("edge-c")));
 
@@ -302,7 +312,10 @@ fn api_mqtt_http_loop_and_fresh_restart() {
         assert_eq!(st_json["recovery"], "restart_fresh");
         assert_eq!(st_json["effective"]["recovery"], "restart_fresh");
         assert_eq!(st_json["effective"]["exactly_once"], false);
-        assert!(st_json["effective"]["recovery_risk"].as_str().unwrap().contains("no_durable_restore"));
+        assert!(st_json["effective"]["recovery_risk"]
+            .as_str()
+            .unwrap()
+            .contains("no_durable_restore"));
         assert_eq!(st_json["honesty"].as_str().unwrap().contains("fresh"), true);
 
         // Start again → new attempt, not compute recovery.
@@ -312,7 +325,10 @@ fn api_mqtt_http_loop_and_fresh_restart() {
             .unwrap();
         let (_, st2) = call(&state, auth_get("/v1/pipelines/hot/status")).await;
         let attempt2 = st2["actual"]["attempt_id"].as_u64().unwrap();
-        assert!(attempt2 > attempt1, "fresh attempt expected, {attempt1} -> {attempt2}");
+        assert!(
+            attempt2 > attempt1,
+            "fresh attempt expected, {attempt1} -> {attempt2}"
+        );
     });
 }
 

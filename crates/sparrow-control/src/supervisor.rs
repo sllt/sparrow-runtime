@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sparrow_connectors::{
-    FileReplayConfig, FileReplaySource, HttpPushSource, HttpSink, IoDiagnostics, LogSink, MqttSink,
-    MqttSource, publish_qos0, sensor_json, EmbeddedBroker, HttpCapture,
+    publish_qos0, sensor_json, EmbeddedBroker, FileReplayConfig, FileReplaySource, HttpCapture,
+    HttpPushSource, HttpSink, IoDiagnostics, LogSink, MqttSink, MqttSource,
 };
 use sparrow_io::{RecordSource, ReplayableSource};
 use sparrow_model::{
@@ -18,17 +18,20 @@ use sparrow_runtime::{
     AlignedAck, AlignedJob, CheckpointSnapshot, CheckpointStore, IngressEvent, JobHandle,
     JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, StreamControl,
 };
-use tokio_util::sync::CancellationToken;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::store::Store;
 use crate::validate::{
     bind_plan, binder_catalog, http_config, http_push_config, mqtt_config, mqtt_sink_config,
-    store_policy, stream_to_schema, validate_aligned_plan, validate_io, DemoEndpoints, StoreSecrets,
+    store_policy, stream_to_schema, validate_aligned_plan, validate_io, DemoEndpoints,
+    StoreSecrets,
 };
 
-const MAX_PIPELINE_ATTEMPTS: u64 = 16;
+/// Cap on **consecutive** start failures. Lifetime `attempt_id` still
+/// increments on start/stop/running/failed; it must not trigger this hold.
+pub(crate) const MAX_PIPELINE_ATTEMPTS: u64 = 16;
 
 pub struct DemoHarness {
     pub broker: EmbeddedBroker,
@@ -195,18 +198,22 @@ impl Supervisor {
                 if self.should_hold_failed(&d.name).await? {
                     continue;
                 }
-                if let Ok(a) = self.catalog({
-                    let name = d.name.clone();
-                    move |s| s.actual(&name)
-                }).await
+                if let Ok(a) = self
+                    .catalog({
+                        let name = d.name.clone();
+                        move |s| s.actual(&name)
+                    })
+                    .await
                 {
                     if a.status == "completed" && a.revision == d.revision {
                         continue;
                     }
-                    if a.status == "failed" && a.attempt_id > 0 {
-                        let shift = a.attempt_id.min(6) as u32;
-                        tokio::time::sleep(Duration::from_millis(40u64.saturating_mul(1u64 << shift)))
-                            .await;
+                    if a.status == "failed" && a.consecutive_failures > 0 {
+                        let shift = a.consecutive_failures.min(6) as u32;
+                        tokio::time::sleep(Duration::from_millis(
+                            40u64.saturating_mul(1u64 << shift),
+                        ))
+                        .await;
                     }
                 }
                 let rev = d.revision.unwrap_or(1);
@@ -300,7 +307,14 @@ impl Supervisor {
         let safe = self.safe_mode;
         self.catalog(move |s| {
             if let Ok(a) = s.actual(&name) {
-                if a.attempt_id >= MAX_PIPELINE_ATTEMPTS {
+                if a.consecutive_failures >= MAX_PIPELINE_ATTEMPTS {
+                    let msg = format!(
+                        "held: consecutive_failures {} reached cap {MAX_PIPELINE_ATTEMPTS}",
+                        a.consecutive_failures
+                    );
+                    if a.last_error.as_deref() != Some(msg.as_str()) {
+                        s.set_last_error(&name, Some(&msg))?;
+                    }
                     return Ok(true);
                 }
             }
@@ -309,6 +323,14 @@ impl Supervisor {
             }
             if let Some(last) = s.last_attempt(&name)? {
                 if last.outcome == "failed" {
+                    let msg = "held: safe-mode and last attempt failed";
+                    if let Ok(a) = s.actual(&name) {
+                        if a.last_error.as_deref() != Some(msg) {
+                            s.set_last_error(&name, Some(msg))?;
+                        }
+                    } else {
+                        s.set_last_error(&name, Some(msg))?;
+                    }
                     return Ok(true);
                 }
             }
@@ -364,7 +386,10 @@ impl Supervisor {
             "file" | "file_replay" | "replay" => {
                 self.start_file(name, &spec, schema, plan, recovery).await?
             }
-            kind => self.start_live(name, &spec, schema, plan, kind, demo, &policy).await?,
+            kind => {
+                self.start_live(name, &spec, schema, plan, kind, demo, &policy)
+                    .await?
+            }
         };
 
         if let Some(old) = self.running.lock().await.insert(name.to_string(), {
@@ -377,10 +402,7 @@ impl Supervisor {
         let name_s = name.to_string();
         let note_s = note.to_string();
         self.catalog(move |s| {
-            let attempt = s
-                .actual(&name_s)
-                .map(|a| a.attempt_id)
-                .unwrap_or(1);
+            let attempt = s.actual(&name_s).map(|a| a.attempt_id).unwrap_or(1);
             s.set_actual(&name_s, "running", Some(revision), attempt, None)?;
             s.insert_attempt(&name_s, revision, "running", Some(&note_s))
         })
@@ -404,9 +426,9 @@ impl Supervisor {
         let (tx_in, rx_in) = tokio::sync::mpsc::channel(inbox);
         let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox);
         let capture = SharedCapture::disabled();
-        let job = self.kernel.submit(
-            JobRequest::new(plan, Vec::new(), capture).with_live_io(rx_in, tx_out),
-        )?;
+        let job = self
+            .kernel
+            .submit(JobRequest::new(plan, Vec::new(), capture).with_live_io(rx_in, tx_out))?;
         let cancel = job.cancellation();
         let source = match kind {
             "http_push" => {
@@ -429,7 +451,15 @@ impl Supervisor {
                 ));
             }
         };
-        let sink = self.spawn_sink(spec, rx_out, cancel, Arc::clone(&diag), demo.as_ref(), policy, None)?;
+        let sink = self.spawn_sink(
+            spec,
+            rx_out,
+            cancel,
+            Arc::clone(&diag),
+            demo.as_ref(),
+            policy,
+            None,
+        )?;
         Ok(RunningJob {
             kind: RunningKind::Live {
                 handle: job,
@@ -456,20 +486,21 @@ impl Supervisor {
             )
         })?;
         if recovery.is_aligned() {
-            return self.start_file_aligned(name, spec, schema, plan, path).await;
+            return self
+                .start_file_aligned(name, spec, schema, plan, path)
+                .await;
         }
         let cfg = FileReplayConfig::new(&path, schema.clone());
-        let mut src = FileReplaySource::open(&cfg).map_err(|e| {
-            SparrowError::new(e.code(), e.to_string())
-        })?;
+        let mut src =
+            FileReplaySource::open(&cfg).map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
         let inbox = spec.source.inbox_capacity.max(1);
         let outbox = spec.sink.outbox_capacity.max(1);
         let (tx_in, rx_in) = tokio::sync::mpsc::channel(inbox);
         let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox);
         let capture = SharedCapture::disabled();
-        let job = self.kernel.submit(
-            JobRequest::new(plan, Vec::new(), capture).with_live_io(rx_in, tx_out),
-        )?;
+        let job = self
+            .kernel
+            .submit(JobRequest::new(plan, Vec::new(), capture).with_live_io(rx_in, tx_out))?;
         let cancel = job.cancellation();
         let source = self.kernel.handle().spawn({
             let cancel = cancel.clone();
@@ -537,9 +568,8 @@ impl Supervisor {
         cfg.restore = spec.restore_claim()?;
         // Aligned files keep growing after a cut; R28 immutable is for sealed files.
         cfg.contract = sparrow_connectors::FileContract::AppendOnly;
-        let mut source = FileReplaySource::open(&cfg).map_err(|e| {
-            SparrowError::new(e.code(), e.to_string())
-        })?;
+        let mut source =
+            FileReplaySource::open(&cfg).map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
         let restore = matches!(
             spec.restore.as_ref().map(|r| r.kind.as_str()),
             Some("checkpoint")
@@ -770,25 +800,19 @@ impl Supervisor {
         Ok(match spec.sink.kind.as_str() {
             "log" => {
                 let log = LogSink::new(diag, 64);
-                self.kernel
-                    .handle()
-                    .spawn(log.run(rx_out, cancel, outbox))
+                self.kernel.handle().spawn(log.run(rx_out, cancel, outbox))
             }
             "mqtt" => {
                 let cfg = mqtt_sink_config(&spec.sink, demo)?;
-                let sink = MqttSink::bind(cfg, &self.secrets, policy, diag)
-                    .map_err(SparrowError::from)?;
-                self.kernel
-                    .handle()
-                    .spawn(sink.run(rx_out, cancel, outbox))
+                let sink =
+                    MqttSink::bind(cfg, &self.secrets, policy, diag).map_err(SparrowError::from)?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
             _ => {
                 let http_cfg = http_config(&spec.sink, demo)?;
                 let sink = HttpSink::bind(http_cfg, &self.secrets, policy, diag)
                     .map_err(SparrowError::from)?;
-                self.kernel
-                    .handle()
-                    .spawn(sink.run(rx_out, cancel, outbox))
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
         })
     }
@@ -881,7 +905,10 @@ impl Supervisor {
                 SparrowError::new(sparrow_model::ErrorCode::Cancelled, "aligned job ended")
             })?;
         rx.await.map_err(|_| {
-            SparrowError::new(sparrow_model::ErrorCode::Cancelled, "checkpoint reply dropped")
+            SparrowError::new(
+                sparrow_model::ErrorCode::Cancelled,
+                "checkpoint reply dropped",
+            )
         })?
     }
 
@@ -1014,13 +1041,16 @@ pub fn request_start_at(
         None => row.latest_revision,
     };
     store.set_desired(name, "running", Some(rev))?;
+    store.reset_consecutive_failures(name)?;
     let attempt = store.actual(name).map(|a| a.attempt_id).unwrap_or(0);
     store.set_actual(name, "stopped", None, attempt, None)?;
     store.audit(
         actor,
         "start",
         Some(name),
-        Some(&format!("desired=running; revision={rev}; catalog committed before I/O")),
+        Some(&format!(
+            "desired=running; revision={rev}; catalog committed before I/O"
+        )),
         "accepted",
     )?;
     Ok(())
@@ -1029,6 +1059,12 @@ pub fn request_start_at(
 pub fn request_stop(store: &Store, name: &str, actor: &str) -> Result<()> {
     let _ = store.get_pipeline(name)?;
     store.set_desired(name, "stopped", None)?;
-    store.audit(actor, "stop", Some(name), Some("desired=stopped"), "accepted")?;
+    store.audit(
+        actor,
+        "stop",
+        Some(name),
+        Some("desired=stopped"),
+        "accepted",
+    )?;
     Ok(())
 }
