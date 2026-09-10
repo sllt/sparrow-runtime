@@ -252,6 +252,13 @@ impl WindowOperator {
         slide: Option<i64>,
     ) -> Result<WindowEmission> {
         let ts = self.row_event_time(row)?;
+        if let Some(bind) = self.spec.binding() {
+            if let Some(skew) = bind.max_future_skew_micros {
+                if ts > now.saturating_add(skew) {
+                    return Ok(WindowEmission::default());
+                }
+            }
+        }
         self.hub
             .observe_event(self.default_input, ts, now)?;
         let assigned = if let Some(slide) = slide {
@@ -318,6 +325,17 @@ impl WindowOperator {
         Ok(())
     }
 
+    /// Test/demo helper: take every closed window for `pending_close`.
+    /// Production Kernel uses mailbox-sized `take_closed_chunk` instead.
+    pub fn materialize_emission(&mut self, mut emission: WindowEmission) -> Result<WindowEmission> {
+        if let Some(wm) = emission.pending_close.take() {
+            let chunk = self.take_closed_chunk(wm, 4096, 1024 * 1024)?;
+            emission.finals.extend(chunk);
+            self.advance_holdback(wm)?;
+        }
+        Ok(emission)
+    }
+
     fn drain_watermark(&mut self) -> Result<WindowEmission> {
         if self.holdback.is_none() {
             return Ok(WindowEmission::default());
@@ -333,16 +351,10 @@ impl WindowOperator {
         else {
             return Ok(WindowEmission::default());
         };
-        let mut finals = Vec::new();
-        while let Some(row) = self.take_closed_one(proposed_out)? {
-            finals.push(row);
-        }
-        self.holdback
-            .as_mut()
-            .expect("holdback")
-            .advance_out(proposed_out)?;
+        // Do not materialize every closed window here (P1-20 / R17).
+        // Caller takes mailbox-sized chunks, then advance_holdback.
         Ok(WindowEmission {
-            finals,
+            finals: Vec::new(),
             lates: Vec::new(),
             pending_close: Some(proposed_out),
         })
@@ -394,27 +406,30 @@ impl WindowOperator {
         let mut out = Vec::new();
         let mut bytes = 0usize;
         while out.len() < max_rows.max(1) {
+            let Some(sz) = self.peek_closed_bytes(wm_out) else {
+                break;
+            };
+            if !out.is_empty() && bytes.saturating_add(sz) > max_bytes {
+                break;
+            }
             let Some(row) = self.take_closed_one(wm_out)? else {
                 break;
             };
-            let sz = row.tracked_bytes();
-            if !out.is_empty() && bytes.saturating_add(sz) > max_bytes {
-                // Put this row back by... we already removed it. Emit it in this
-                // chunk if it is the first, otherwise we cannot reinsert easily.
-                // Always include at least one row; oversized single rows are the
-                // mailbox BoundExceeded path at send time.
-                if out.is_empty() {
-                    out.push(row);
-                } else {
-                    // Re-create is not possible; include it to avoid silent loss.
-                    out.push(row);
-                }
-                break;
-            }
-            bytes = bytes.saturating_add(sz);
+            bytes = bytes.saturating_add(row.tracked_bytes());
             out.push(row);
         }
         Ok(out)
+    }
+
+    fn peek_closed_bytes(&self, wm_out: i64) -> Option<usize> {
+        match &self.store {
+            WindowStore::Tumble(store) => store.iter().find_map(|(_, e)| {
+                (e.window_end <= wm_out).then(|| {
+                    e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>() + 32
+                })
+            }),
+            _ => None,
+        }
     }
 
     fn row_event_time(&self, row: &Row) -> Result<i64> {
@@ -600,7 +615,9 @@ impl WindowOperator {
         self.timers.cancel_all();
     }
 
-    /// Freeze open keyed state for an experimental aligned checkpoint.
+    /// Freeze open keyed state. This clones in-memory keys; the clone is
+    /// bounded by the job `max_state_keys` quota (P1-14). Not a streaming
+    /// snapshot — production jobs stay within that cap.
     pub fn freeze(&self) -> WindowFreeze {
         let mut entries = Vec::new();
         let kind = match &self.store {

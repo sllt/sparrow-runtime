@@ -5,6 +5,7 @@
 
 pub mod aggregate;
 pub mod aligned;
+pub mod barrier;
 pub mod capture;
 pub mod checkpoint;
 pub mod clock;
@@ -22,6 +23,7 @@ pub mod watermark;
 pub mod window;
 
 pub use aligned::{run_until, AlignedSession};
+pub use barrier::{wait_outbox, AlignedAck, AlignedJob};
 pub use capture::{CaptureMode, SharedCapture, StallGate};
 pub use checkpoint::{
     CheckpointSnapshot, CheckpointStore, FaultHook, FaultPoint, TableRevisionBind,

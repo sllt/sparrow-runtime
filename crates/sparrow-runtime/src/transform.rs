@@ -18,18 +18,22 @@ pub fn apply_steps(
     if steps.is_empty() {
         return Ok(None);
     }
+    let mut working: Option<Vec<Row>> = None;
     let mut schema = batch.schema().clone();
-    let mut rows: Vec<Row> = batch.rows().to_vec();
     for step in steps {
         match step {
-            TransformStep::Filter { predicate, input, .. } => {
-                work.consume(rows.len() as u64)?;
-                let mask = filter_mask(predicate, input, &rows)?;
-                rows = rows
-                    .into_iter()
+            TransformStep::Filter {
+                predicate, input, ..
+            } => {
+                let src = working.as_deref().unwrap_or(batch.rows());
+                work.consume(src.len() as u64)?;
+                let mask = filter_mask(predicate, input, src)?;
+                let next: Vec<Row> = src
+                    .iter()
                     .zip(mask)
-                    .filter_map(|(r, keep)| keep.then_some(r))
+                    .filter_map(|(r, keep)| keep.then(|| r.clone()))
                     .collect();
+                working = Some(next);
                 schema = input.clone();
             }
             TransformStep::Project {
@@ -44,18 +48,22 @@ pub fn apply_steps(
                 output,
                 ..
             } => {
-                work.consume(rows.len() as u64 * exprs.len().max(1) as u64)?;
-                let mut next = Vec::with_capacity(rows.len());
-                for row in &rows {
+                let src = working.as_deref().unwrap_or(batch.rows());
+                work.consume(src.len() as u64 * exprs.len().max(1) as u64)?;
+                let mut next = Vec::with_capacity(src.len());
+                for row in src {
                     let values: Result<Vec<Scalar>> =
                         exprs.iter().map(|e| eval(e, input, &row.values)).collect();
                     next.push(Row { values: values? });
                 }
-                rows = next;
+                working = Some(next);
                 schema = output.clone();
             }
         }
     }
+    let Some(rows) = working else {
+        return Ok(None);
+    };
     if rows.is_empty() {
         return Ok(None);
     }
@@ -102,7 +110,11 @@ pub fn build_source_batches(
             Arc::clone(owner),
             CreditKind::Reservation,
             chunk.len().max(1),
-            owner.budget().cap(CreditKind::Reservation).min(64 * 1024).max(64),
+            owner
+                .budget()
+                .cap(CreditKind::Reservation)
+                .min(64 * 1024)
+                .max(64),
         )?;
         for row in chunk {
             b.push(row.clone())?;

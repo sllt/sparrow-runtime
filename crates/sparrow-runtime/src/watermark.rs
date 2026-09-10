@@ -177,14 +177,8 @@ impl WatermarkHub {
         if let Some(bind) = &self.binding {
             if let Some(skew) = bind.max_future_skew_micros {
                 if event_time > now_micros.saturating_add(skew) {
-                    return Err(SparrowError::new(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "future timestamp {event_time} exceeds now {now_micros} + skew {skew}"
-                        ),
-                    )
-                    .context("event_time", event_time.to_string())
-                    .context("now", now_micros.to_string()));
+                    // Drop: do not advance max_et (P0-5). Job continues.
+                    return Ok(None);
                 }
             }
             let ooo = bind.out_of_orderness_micros;
