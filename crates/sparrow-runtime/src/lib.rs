@@ -29,7 +29,8 @@ pub use barrier::{
 };
 pub use capture::{CaptureMode, SharedCapture, StallGate};
 pub use checkpoint::{
-    CheckpointSnapshot, CheckpointStore, FaultHook, FaultPoint, TableRevisionBind,
+    freeze_entry_cap, CheckpointSnapshot, CheckpointStore, FaultHook, FaultPoint,
+    TableRevisionBind, MAX_FREEZE_ENTRIES,
 };
 pub use clock::RuntimeClock;
 pub use coordinator::{CheckpointCoordinator, CheckpointPhase};

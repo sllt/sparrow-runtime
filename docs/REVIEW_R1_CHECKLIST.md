@@ -43,7 +43,7 @@ Mark `- [x]` only when the item is fixed **and** covered by a semantic test
 
 ## P0 leftovers
 
-- [x] **P0-13** snapshot decode bounds entries/bytes before `Vec::with_capacity(n)` → `p0_13_freeze_rejects_untrusted_capacity`. `2348289`
+- [x] **P0-13** snapshot decode bounds entries/bytes before `Vec::with_capacity(n)` → `p0_13_freeze_rejects_untrusted_capacity`. R2 N6: encode/decode share the job `max_state_keys` (codec default = performance 16384, not a hard-coded 4096). `n6_performance_budget_freeze_commit_recover_roundtrip`. See `docs/REVIEW_R2_BATCH4.md`.
 
 ## Remaining P1
 

@@ -10,15 +10,15 @@
 //! This path is **not** exactly-once. Missing or corrupt checkpoints are
 //! rejected — never a silent empty-state continue.
 
+use sparrow_io::{SourceIdentity, SourcePosition};
+use sparrow_model::{
+    DeliveryContract, ErrorCode, OperatorId, RecoveryPolicy, ResourceBudget, Result, Scalar,
+    SparrowError, StateSlotId,
+};
+use sparrow_plan::PlanLayout;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use sparrow_io::{SourceIdentity, SourcePosition};
-use sparrow_model::{
-    DeliveryContract, ErrorCode, OperatorId, RecoveryPolicy, Result, Scalar, SparrowError,
-    StateSlotId,
-};
-use sparrow_plan::PlanLayout;
 
 use crate::aggregate::Accumulator;
 use crate::window::{FrozenEntry, WindowFreeze};
@@ -26,7 +26,8 @@ use crate::window::{FrozenEntry, WindowFreeze};
 pub const CHECKPOINT_LABEL: &str = "aligned";
 pub const CHUNK_SIZE: usize = 4096;
 pub const MAGIC: &[u8; 4] = b"SPV1";
-/// Codec version. Unchanged in R1 (entry-count caps are decode-time only) (P1-25).
+/// Codec version. Unchanged in R2 N6 (entry-count caps stay decode-time;
+/// encode now fails closed against the same bound). Format bytes unchanged (P1-25).
 pub const SNAPSHOT_VERSION: u16 = 1;
 pub const MANIFEST_MAGIC: &[u8; 4] = b"MAN2";
 pub const MANIFEST_VERSION: u16 = 1;
@@ -38,6 +39,20 @@ pub const MAX_MANIFEST_CHUNKS: u32 = 4096;
 /// Keep this many committed generations on disk (R15).
 pub const KEEP_GENERATIONS: u64 = 3;
 pub const MAX_STORE_BYTES: u64 = 32 * 1024 * 1024;
+/// Freeze entry alloc ceiling when no job bound is supplied. Tied to the
+/// largest official `ResourceBudget::max_state_keys` so a performance-profile
+/// `freeze()`+`commit()` cannot publish a CURRENT that `decode_freeze` rejects.
+pub const MAX_FREEZE_ENTRIES: usize = ResourceBudget::performance().max_state_keys;
+
+/// Encode/decode entry cap for one freeze. Uses the job `max_state_keys`
+/// when set; otherwise [`MAX_FREEZE_ENTRIES`].
+pub const fn freeze_entry_cap(max_state_keys: usize) -> usize {
+    if max_state_keys == 0 {
+        MAX_FREEZE_ENTRIES
+    } else {
+        max_state_keys
+    }
+}
 
 /// Fault injection points for crash-cut / disk-full tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,13 +101,21 @@ pub struct CheckpointSnapshot {
 
 impl CheckpointSnapshot {
     pub fn encode(&self) -> Result<Vec<u8>> {
+        self.encode_with_max_state_keys(MAX_FREEZE_ENTRIES)
+    }
+
+    /// Encode using the job/process `max_state_keys`. Fails closed if the
+    /// freeze has more entries than that bound (never publish CURRENT that
+    /// the matching decode path cannot recover).
+    pub fn encode_with_max_state_keys(&self, max_state_keys: usize) -> Result<Vec<u8>> {
+        let cap = freeze_entry_cap(max_state_keys);
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
         out.extend_from_slice(&self.checkpoint_id.to_le_bytes());
         out.extend_from_slice(&self.ingested_rows.to_le_bytes());
         encode_position(&self.source, &mut out)?;
-        encode_freeze(&self.window, &mut out)?;
+        encode_freeze(&self.window, &mut out, cap)?;
         encode_layout(&self.layout, &mut out)?;
         match &self.table {
             None => out.push(0),
@@ -105,7 +128,13 @@ impl CheckpointSnapshot {
         Ok(out)
     }
 
-    pub fn decode(mut src: &[u8]) -> Result<Self> {
+    pub fn decode(src: &[u8]) -> Result<Self> {
+        Self::decode_with_max_state_keys(src, MAX_FREEZE_ENTRIES)
+    }
+
+    pub fn decode_with_max_state_keys(src: &[u8], max_state_keys: usize) -> Result<Self> {
+        let cap = freeze_entry_cap(max_state_keys);
+        let mut src = src;
         if src.len() < 4 + 2 + 8 + 8 || &src[..4] != MAGIC {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
@@ -126,7 +155,7 @@ impl CheckpointSnapshot {
         let ingested_rows = u64::from_le_bytes(src[..8].try_into().unwrap());
         src = &src[8..];
         let source = decode_position(&mut src)?;
-        let window = decode_freeze(&mut src)?;
+        let window = decode_freeze(&mut src, cap)?;
         let layout = decode_layout(&mut src)?;
         if layout.operator != window.operator || layout.slot != window.slot {
             return Err(SparrowError::new(
@@ -182,10 +211,19 @@ pub struct CheckpointStore {
     dir: PathBuf,
     next_id: u64,
     pub fault: FaultHook,
+    max_state_keys: usize,
 }
 
 impl CheckpointStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_max_state_keys(dir, MAX_FREEZE_ENTRIES)
+    }
+
+    /// Open a store whose encode/decode freeze cap is the job `max_state_keys`.
+    pub fn open_with_max_state_keys(
+        dir: impl Into<PathBuf>,
+        max_state_keys: usize,
+    ) -> Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir).map_err(io_err)?;
         let next_id = match read_current(&dir) {
@@ -196,7 +234,16 @@ impl CheckpointStore {
             dir,
             next_id,
             fault: FaultHook::default(),
+            max_state_keys: freeze_entry_cap(max_state_keys),
         })
+    }
+
+    pub fn set_max_state_keys(&mut self, max_state_keys: usize) {
+        self.max_state_keys = freeze_entry_cap(max_state_keys);
+    }
+
+    pub fn max_state_keys(&self) -> usize {
+        self.max_state_keys
     }
 
     pub fn dir(&self) -> &Path {
@@ -219,7 +266,7 @@ impl CheckpointStore {
     /// CURRENT is renamed.
     pub fn commit(&mut self, snapshot: &CheckpointSnapshot) -> Result<u64> {
         let id = snapshot.checkpoint_id.max(self.next_id);
-        let payload = snapshot.encode()?;
+        let payload = snapshot.encode_with_max_state_keys(self.max_state_keys)?;
         if payload.len() as u64 > MAX_SNAPSHOT_BYTES {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -236,7 +283,10 @@ impl CheckpointStore {
         if chunks.len() as u32 > MAX_MANIFEST_CHUNKS {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
-                format!("checkpoint would write {} chunks (max {MAX_MANIFEST_CHUNKS})", chunks.len()),
+                format!(
+                    "checkpoint would write {} chunks (max {MAX_MANIFEST_CHUNKS})",
+                    chunks.len()
+                ),
             ));
         }
         for (i, chunk) in chunks.iter().enumerate() {
@@ -408,7 +458,10 @@ impl CheckpointStore {
                 ),
             ));
         }
-        Ok(CheckpointSnapshot::decode(&payload)?)
+        Ok(CheckpointSnapshot::decode_with_max_state_keys(
+            &payload,
+            self.max_state_keys,
+        )?)
     }
 
     /// Restore entry point: never continue with empty state when a restore
@@ -677,9 +730,8 @@ fn decode_str(src: &mut &[u8]) -> Result<String> {
             "truncated string payload in snapshot",
         ));
     }
-    let s = std::str::from_utf8(&src[..n]).map_err(|_| {
-        SparrowError::new(ErrorCode::CodecViolation, "snapshot string not utf8")
-    })?;
+    let s = std::str::from_utf8(&src[..n])
+        .map_err(|_| SparrowError::new(ErrorCode::CodecViolation, "snapshot string not utf8"))?;
     *src = &src[n..];
     Ok(s.to_string())
 }
@@ -901,7 +953,16 @@ fn decode_layout(src: &mut &[u8]) -> Result<PlanLayout> {
     })
 }
 
-fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>) -> Result<()> {
+fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>, max_entries: usize) -> Result<()> {
+    if f.entries.len() > max_entries {
+        return Err(SparrowError::new(
+            ErrorCode::BoundExceeded,
+            format!(
+                "freeze entry count {} exceeds max_state_keys {max_entries}; refusing encode (would publish unrecoverable CURRENT)",
+                f.entries.len()
+            ),
+        ));
+    }
     out.extend_from_slice(&f.operator.raw().to_le_bytes());
     out.extend_from_slice(&f.slot.raw().to_le_bytes());
     out.push(f.kind);
@@ -925,7 +986,7 @@ fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn decode_freeze(src: &mut &[u8]) -> Result<WindowFreeze> {
+fn decode_freeze(src: &mut &[u8], max_entries: usize) -> Result<WindowFreeze> {
     if src.len() < 4 + 1 + 4 {
         return Err(SparrowError::new(
             ErrorCode::CodecViolation,
@@ -946,12 +1007,11 @@ fn decode_freeze(src: &mut &[u8]) -> Result<WindowFreeze> {
     *src = &src[1..];
     let n = u32::from_le_bytes(src[..4].try_into().unwrap()) as usize;
     *src = &src[4..];
-    const MAX_FREEZE_ENTRIES: usize = 4096;
     const MIN_FREEZE_ENTRY: usize = 2 + 8 + 8 + 8 + 2;
-    if n > MAX_FREEZE_ENTRIES {
+    if n > max_entries {
         return Err(SparrowError::new(
             ErrorCode::BoundExceeded,
-            format!("freeze entry count {n} exceeds {MAX_FREEZE_ENTRIES}; refusing alloc"),
+            format!("freeze entry count {n} exceeds max_state_keys {max_entries}; refusing alloc"),
         ));
     }
     if src.len() < n.saturating_mul(MIN_FREEZE_ENTRY) {
@@ -1026,14 +1086,14 @@ fn decode_freeze(src: &mut &[u8]) -> Result<WindowFreeze> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::window::{FrozenEntry, WindowOperator};
     use sparrow_expr::Expr;
     use sparrow_io::{MemoryReplaySource, RecordSource, ReplayableSource};
     use sparrow_model::{
         AggFn, DataType, Field, FieldId, MemoryOwner, ResourceBudget, Schema, SchemaId, WindowKind,
     };
+    use sparrow_model::{CreditKind, Row, RowBatchBuilder};
     use sparrow_plan::{AggCall, WindowSpec};
-    use crate::window::WindowOperator;
-    use sparrow_model::{Row, RowBatchBuilder, CreditKind};
     use std::sync::Arc;
 
     fn tmp() -> PathBuf {
@@ -1078,14 +1138,8 @@ mod tests {
             8,
         )
         .unwrap();
-        let mut b = RowBatchBuilder::new(
-            Arc::new(schema),
-            owner,
-            CreditKind::Reservation,
-            2,
-            4096,
-        )
-        .unwrap();
+        let mut b = RowBatchBuilder::new(Arc::new(schema), owner, CreditKind::Reservation, 2, 4096)
+            .unwrap();
         b.push(Row {
             values: vec![Scalar::utf8("d1"), Scalar::Int64(10)],
         })
@@ -1328,10 +1382,7 @@ mod tests {
         assert!(!dir.join("chk-00000001").exists());
         assert!(!dir.join("chk-00000002").exists());
         assert!(dir.join("chk-00000005").exists());
-        assert_eq!(
-            store.recover_committed().unwrap().unwrap().checkpoint_id,
-            5
-        );
+        assert_eq!(store.recover_committed().unwrap().unwrap().checkpoint_id, 5);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1342,8 +1393,185 @@ mod tests {
         buf.extend_from_slice(&1u16.to_le_bytes());
         buf.push(0);
         buf.extend_from_slice(&1_000_000u32.to_le_bytes());
-        let err = super::decode_freeze(&mut buf.as_slice()).unwrap_err();
+        let err = super::decode_freeze(&mut buf.as_slice(), MAX_FREEZE_ENTRIES).unwrap_err();
         assert_eq!(err.code, ErrorCode::BoundExceeded);
+    }
+
+    fn count_schema() -> Schema {
+        Schema::new(
+            SchemaId::new(1),
+            vec![
+                Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+                Field::new(FieldId::new(2), "v", DataType::Int64, false),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn count_spec() -> WindowSpec {
+        WindowSpec::new(
+            WindowKind::Count { size: 1_000_000 },
+            vec!["device_id".into()],
+            vec![AggCall::new(
+                AggFn::Sum,
+                Some(Expr::Column { name: "v".into() }),
+                "s",
+            )],
+        )
+    }
+
+    fn synthetic_freeze(operator: OperatorId, n: usize) -> WindowFreeze {
+        WindowFreeze {
+            operator,
+            slot: StateSlotId::new(1),
+            kind: 1,
+            entries: (0..n)
+                .map(|i| FrozenEntry {
+                    key: vec![Scalar::Int64(i as i64)],
+                    window_start: 0,
+                    window_end: 0,
+                    count: 1,
+                    accs: Vec::new(),
+                })
+                .collect(),
+            wm_in: None,
+            wm_out: None,
+            last_effective: None,
+        }
+    }
+
+    fn ingest_distinct_keys(
+        op: &mut WindowOperator,
+        schema: &Schema,
+        owner: &Arc<MemoryOwner>,
+        n: usize,
+    ) {
+        const CHUNK: usize = 256;
+        let mut i = 0;
+        while i < n {
+            let end = (i + CHUNK).min(n);
+            let mut b = RowBatchBuilder::new(
+                Arc::new(schema.clone()),
+                Arc::clone(owner),
+                CreditKind::Reservation,
+                end - i,
+                64 * 1024,
+            )
+            .unwrap();
+            for k in i..end {
+                b.push(Row {
+                    values: vec![Scalar::utf8(format!("k{k:04}")), Scalar::Int64(1)],
+                })
+                .unwrap();
+            }
+            let batch = b.finish().unwrap();
+            let _ = op.on_batch(&batch, 0).unwrap();
+            i = end;
+        }
+    }
+
+    #[test]
+    fn n6_freeze_entry_cap_matches_performance_budget() {
+        assert_eq!(
+            MAX_FREEZE_ENTRIES,
+            ResourceBudget::performance().max_state_keys
+        );
+        assert!(MAX_FREEZE_ENTRIES > ResourceBudget::compact().max_state_keys);
+        assert!(MAX_FREEZE_ENTRIES > 4096);
+        assert_eq!(freeze_entry_cap(8192), 8192);
+        assert_eq!(freeze_entry_cap(0), MAX_FREEZE_ENTRIES);
+    }
+
+    #[test]
+    fn n6_performance_budget_freeze_commit_recover_roundtrip() {
+        let budget = ResourceBudget {
+            max_state_keys: 8192,
+            ..ResourceBudget::performance()
+        };
+        const N: usize = 5000;
+        assert!(N > 4096, "must exceed the old hardcoded decode cap");
+        assert!(N <= budget.max_state_keys);
+
+        let schema = count_schema();
+        let spec = count_spec();
+        let owner = MemoryOwner::new(budget);
+        let mut op = WindowOperator::new(
+            OperatorId::new(7),
+            spec.clone(),
+            schema.clone(),
+            Arc::clone(&owner),
+            budget.max_state_keys,
+            budget.max_timers,
+        )
+        .unwrap();
+        ingest_distinct_keys(&mut op, &schema, &owner, N);
+        assert_eq!(op.key_count(), N);
+
+        let window = op.freeze();
+        assert_eq!(window.entries.len(), N);
+        let dir = tmp();
+        let mut store =
+            CheckpointStore::open_with_max_state_keys(&dir, budget.max_state_keys).unwrap();
+        let snap = CheckpointSnapshot {
+            checkpoint_id: 1,
+            source: SourcePosition::start(SourceIdentity::memory("n6", 32, 1)),
+            window: window.clone(),
+            ingested_rows: N as u64,
+            layout: PlanLayout::from_window(OperatorId::new(7), window.slot, &spec),
+            table: None,
+        };
+        store.commit(&snap).unwrap();
+        assert!(dir.join("CURRENT").exists());
+
+        let got = store.recover_committed().unwrap().unwrap();
+        assert_eq!(got.window.entries.len(), N);
+        assert_eq!(got.ingested_rows, N as u64);
+
+        let owner2 = MemoryOwner::new(budget);
+        let mut restored = WindowOperator::new(
+            OperatorId::new(7),
+            spec,
+            schema,
+            owner2,
+            budget.max_state_keys,
+            budget.max_timers,
+        )
+        .unwrap();
+        restored.restore_freeze(&got.window).unwrap();
+        assert_eq!(restored.key_count(), N);
+        assert_eq!(restored.freeze().entries.len(), N);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn n6_encode_over_max_state_keys_does_not_publish_current() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open_with_max_state_keys(&dir, 16).unwrap();
+        let mut snap = sample_snapshot(1);
+        snap.window = synthetic_freeze(snap.window.operator, 17);
+        let err = store.commit(&snap).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoundExceeded);
+        assert!(
+            err.message.contains("max_state_keys"),
+            "encode must name the job bound: {err}"
+        );
+        assert!(!dir.join("CURRENT").exists());
+        assert!(store.recover_committed().unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn n6_decode_honors_job_max_state_keys() {
+        let n = 5000;
+        let mut snap = sample_snapshot(1);
+        snap.window = synthetic_freeze(snap.window.operator, n);
+        let bytes = snap.encode_with_max_state_keys(8192).unwrap();
+        let old_cap_err = CheckpointSnapshot::decode_with_max_state_keys(&bytes, 4096).unwrap_err();
+        assert_eq!(old_cap_err.code, ErrorCode::BoundExceeded);
+        let got = CheckpointSnapshot::decode_with_max_state_keys(&bytes, 8192).unwrap();
+        assert_eq!(got.window.entries.len(), n);
+        let codec = CheckpointSnapshot::decode(&bytes).unwrap();
+        assert_eq!(codec.window.entries.len(), n);
     }
 
     #[test]
@@ -1354,7 +1582,10 @@ mod tests {
         store.commit(&sample_snapshot(2)).unwrap();
         fs::write(dir.join("CURRENT"), b"not-a-checkpoint\n").unwrap();
         let got = store.recover_committed().unwrap().unwrap();
-        assert_eq!(got.checkpoint_id, 2, "must fall back to a verified generation");
+        assert_eq!(
+            got.checkpoint_id, 2,
+            "must fall back to a verified generation"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
