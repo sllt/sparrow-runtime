@@ -1,7 +1,7 @@
 //! Tight numeric loops for the common `col ▷ lit` filter. Layout stays
 //! RowBatch (ADR-003); this is a kernel, not a second engine.
 
-use crate::{eval, BinaryOp, Expr};
+use crate::{bind, eval_bound, BinaryOp, Expr};
 use sparrow_model::{Result, Row, Scalar, Schema};
 
 /// Predicate that can run without walking the full expression tree per cell.
@@ -60,15 +60,17 @@ impl SimplePred {
     }
 }
 
-/// Keep-mask for a simple numeric compare. Falls back to `eval` if the
+/// Keep-mask for a simple numeric compare. Falls back to `eval_bound` if the
 /// column is missing or non-numeric (NULL → drop, matching filter semantics).
+/// Column names are resolved once (P2-30), not per row.
 pub fn filter_mask(pred: &Expr, schema: &Schema, rows: &[Row]) -> Result<Vec<bool>> {
+    let bound = bind(pred, schema)?;
     if let Some(simple) = SimplePred::from_expr(pred) {
         if matches!(simple.op(), BinaryOp::Eq | BinaryOp::NotEq) {
             // Integer equality must match evaluator semantics, not f64.
             return rows
                 .iter()
-                .map(|row| match eval(pred, schema, &row.values)? {
+                .map(|row| match eval_bound(&bound, &row.values)? {
                     Scalar::Bool(v) => Ok(v),
                     Scalar::Null => Ok(false),
                     other => Err(sparrow_model::SparrowError::new(
@@ -98,7 +100,7 @@ pub fn filter_mask(pred: &Expr, schema: &Schema, rows: &[Row]) -> Result<Vec<boo
                     .map(|row| match row.values.get(idx) {
                         Some(Scalar::Float64(v)) => Ok(cmp_f64(*op, *v, *thr)),
                         Some(Scalar::Int64(_)) | Some(Scalar::UInt64(_)) => {
-                            match eval(pred, schema, &row.values)? {
+                            match eval_bound(&bound, &row.values)? {
                                 Scalar::Bool(v) => Ok(v),
                                 Scalar::Null => Ok(false),
                                 other => Err(sparrow_model::SparrowError::new(
@@ -118,7 +120,7 @@ pub fn filter_mask(pred: &Expr, schema: &Schema, rows: &[Row]) -> Result<Vec<boo
         }
     }
     rows.iter()
-        .map(|row| match eval(pred, schema, &row.values)? {
+        .map(|row| match eval_bound(&bound, &row.values)? {
             Scalar::Bool(v) => Ok(v),
             Scalar::Null => Ok(false),
             other => Err(sparrow_model::SparrowError::new(
@@ -144,6 +146,7 @@ fn cmp_f64(op: BinaryOp, left: f64, right: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eval;
     use sparrow_model::{DataType, Field, FieldId, SchemaId};
 
     #[test]

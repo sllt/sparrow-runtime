@@ -73,5 +73,9 @@ Mark `- [x]` only when the item is fixed **and** covered by a semantic test
 - [x] **P3-42** PlanLayout agg fingerprint no duplicate ty/input → `p3_42_agg_fingerprint_includes_func_alias_and_input_once`. `f19167e`
 - [x] **P3-43** PT/ET window kind tags are distinct → `p3_43_pt_and_et_window_kind_tags_differ`. `f19167e`
 - [x] **P3-45** SUM result types consistent → numeric only; Bool/Utf8 rejected at bind. `p3_45_sum_rejects_bool_and_utf8`
+- [x] **P2-30** column index at bind time → `bind` / `eval_bound`; filter/project/window/linear resolve names once. `p2_30_bind_resolves_column_index`. See `docs/REVIEW_R2_BATCH9.md`.
+- [x] **P2-32** dedup expire is incremental (expiry heap prefix, not full map). `p2_32_expire_is_prefix_not_full_scan`. See `docs/REVIEW_R2_BATCH9.md`.
+- [x] **P2-33** timer `peek_deadline` is O(1) heap peek (R2 batch 8). `p2_33_peek_deadline_is_heap_min`.
+- [x] **P2-36** reference table crc32; `verify()` / lookup bind / publish fail closed on mismatch. `p2_36_corrupted_row_fails_closed`. See `docs/REVIEW_R2_BATCH9.md`.
 - [x] **P2-40** Dynamic object key collision fail-closed → `p2_40_duplicate_dynamic_keys_fail_closed`. R2 batch 7: JSON object decode uses `DynamicValue::try_object` / fails on duplicate keys. `p2_40_json_object_duplicate_keys_fail_closed`
 - [x] **P3-54** expr fingerprint is structured (not Debug) → `p3_54_expr_fingerprint_is_structured_not_debug`. `f19167e`

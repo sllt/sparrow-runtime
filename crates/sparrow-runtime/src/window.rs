@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use sparrow_expr::eval;
+use sparrow_expr::{bind, eval_bound, BoundExpr};
 use sparrow_model::{
     CreditKind, DeliveryContract, ErrorCode, InputId, MemoryOwner, OperatorId, Result, Row,
     RowBatch, RowBatchBuilder, Scalar, Schema, SparrowError, StateSlotId, WindowKind,
@@ -71,6 +71,8 @@ pub struct WindowOperator {
     /// `take_closed_one` / `peek_closed_bytes` pop the first closed entry
     /// instead of scanning every key and `to_vec()`-ing candidates (N11).
     closed_index: BTreeMap<(i64, Vec<u8>), StateKey>,
+    /// Agg input exprs bound to column indices once (P2-30).
+    bound_aggs: Vec<Option<BoundExpr>>,
 }
 
 impl WindowOperator {
@@ -94,6 +96,14 @@ impl WindowOperator {
             None => None,
         };
         let output = sparrow_plan::window_output_schema(&input, &spec)?;
+        let bound_aggs = spec
+            .aggs
+            .iter()
+            .map(|a| match &a.input {
+                Some(e) => bind(e, &input).map(Some),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let store = match spec.kind {
             WindowKind::Count { .. } => WindowStore::Count(MemoryState::new(
                 Arc::clone(&owner),
@@ -132,6 +142,7 @@ impl WindowOperator {
             holdback,
             default_input: InputId(0),
             closed_index: BTreeMap::new(),
+            bound_aggs,
         })
     }
 
@@ -341,7 +352,7 @@ impl WindowOperator {
         }
         if let WindowStore::Tumble(store) = &mut self.store {
             if let Some(entry) = store.get_mut(&sk) {
-                update_accs(&self.spec, &self.input, &mut entry.accs, row)?;
+                update_accs(&self.bound_aggs, &self.spec, &mut entry.accs, row)?;
             }
             if let Some(entry) = store.get(&sk) {
                 let bytes: usize = entry.accs.iter().map(Accumulator::tracked_bytes).sum();
@@ -583,7 +594,7 @@ impl WindowOperator {
         }
         if let WindowStore::Tumble(store) = &mut self.store {
             if let Some(entry) = store.get_mut(&sk) {
-                update_accs(&spec, &input, &mut entry.accs, row)?;
+                update_accs(&self.bound_aggs, &self.spec, &mut entry.accs, row)?;
             }
             if let Some(entry) = store.get(&sk) {
                 let bytes: usize = entry.accs.iter().map(Accumulator::tracked_bytes).sum();
@@ -609,7 +620,7 @@ impl WindowOperator {
         let mut emit_row = None;
         if let WindowStore::Count(store) = &mut self.store {
             if let Some(entry) = store.get_mut(&sk) {
-                update_accs(&spec, &input, &mut entry.accs, row)?;
+                update_accs(&self.bound_aggs, &self.spec, &mut entry.accs, row)?;
                 entry.count += 1;
             }
             if let Some(entry) = store.get(&sk) {
@@ -1002,12 +1013,17 @@ fn empty_accs(spec: &WindowSpec, input: &Schema) -> Result<Vec<Accumulator>> {
         .collect()
 }
 
-fn update_accs(spec: &WindowSpec, input: &Schema, accs: &mut [Accumulator], row: &Row) -> Result<()> {
-    for (acc, call) in accs.iter_mut().zip(spec.aggs.iter()) {
+fn update_accs(
+    bound_aggs: &[Option<BoundExpr>],
+    spec: &WindowSpec,
+    accs: &mut [Accumulator],
+    row: &Row,
+) -> Result<()> {
+    for (i, (acc, call)) in accs.iter_mut().zip(spec.aggs.iter()).enumerate() {
         let v = if call.count_star {
             Scalar::Null
-        } else if let Some(expr) = &call.input {
-            eval(expr, input, &row.values)?
+        } else if let Some(expr) = bound_aggs.get(i).and_then(|b| b.as_ref()) {
+            eval_bound(expr, &row.values)?
         } else {
             Scalar::Null
         };

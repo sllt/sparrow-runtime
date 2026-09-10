@@ -29,7 +29,11 @@ so N jobs cannot each take a full compact queue. See
 
 Aligned freeze encode writes from the live store (no full entry clone)
 and refuses an oversized snapshot before CURRENT (P1-14). Residual: the
-Kernel ACK still sends a `WindowFreeze` value.
+Kernel ACK still sends a `WindowFreeze` value (batch 9 left this; ACK →
+encoded bytes is not a cheap supervisor/barrier change). Filter/project
+and window aggs bind column names once (P2-30). Dedup expire pops a
+deadline heap prefix (P2-32). Reference tables store a crc32 and fail
+closed on mismatch (P2-36). See `docs/REVIEW_R2_BATCH9.md`.
 
 Decode errors stay counted by default. `fail_on_decode` on the pipeline
 spec, or `SPARROW_FAIL_ON_DECODE=1`, fails the job (P1-17).

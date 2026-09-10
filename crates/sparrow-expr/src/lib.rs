@@ -6,8 +6,10 @@
 use sparrow_model::{DataType, DynamicValue, Result, Scalar, Schema, SparrowError};
 use sparrow_model::error::ErrorCode;
 
+pub mod bind;
 pub mod infer;
 pub mod kernels;
+pub use bind::{bind, eval_bound, BoundExpr};
 pub use infer::{infer_nullable, infer_type};
 pub use kernels::{filter_mask, SimplePred};
 
@@ -79,56 +81,10 @@ pub enum Expr {
 }
 
 pub fn eval(expr: &Expr, schema: &Schema, row: &[Scalar]) -> Result<Scalar> {
-    match expr {
-        Expr::Column { name } => {
-            let idx = schema.index_of_name(name).ok_or_else(|| {
-                SparrowError::new(ErrorCode::InvalidArgument, format!("unknown column '{name}'"))
-            })?;
-            Ok(row.get(idx).cloned().unwrap_or(Scalar::Null))
-        }
-        Expr::Literal(s) => Ok(s.clone()),
-        Expr::Cast { expr, target } => cast(&eval(expr, schema, row)?, target, false),
-        Expr::TryCast { expr, target } => cast(&eval(expr, schema, row)?, target, true),
-        Expr::Binary { op, left, right } => {
-            let l = eval(left, schema, row)?;
-            let r = eval(right, schema, row)?;
-            eval_binary(*op, &l, &r)
-        }
-        Expr::IsNull(inner) => Ok(Scalar::Bool(eval(inner, schema, row)?.is_null())),
-        Expr::IsNotNull(inner) => Ok(Scalar::Bool(!eval(inner, schema, row)?.is_null())),
-        Expr::Not(inner) => match eval(inner, schema, row)? {
-            Scalar::Bool(v) => Ok(Scalar::Bool(!v)),
-            Scalar::Null => Ok(Scalar::Null),
-            other => Err(SparrowError::new(
-                ErrorCode::TypeMismatch,
-                format!("NOT expects bool, got {}", other.data_type()),
-            )),
-        },
-        Expr::Call { name, args } => eval_call(name, args, schema, row),
-        Expr::DynamicGet { expr, key } => match eval(expr, schema, row)? {
-            Scalar::Dynamic(dynv) => match dynv.get(key) {
-                Some(DynamicValue::Null) | None => Ok(Scalar::Null),
-                Some(DynamicValue::Bool(v)) => Ok(Scalar::Bool(*v)),
-                Some(DynamicValue::Int64(v)) => Ok(Scalar::Int64(*v)),
-                Some(DynamicValue::UInt64(v)) => Ok(Scalar::UInt64(*v)),
-                Some(DynamicValue::Float64(v)) => Ok(Scalar::Float64(*v)),
-                Some(DynamicValue::Utf8(v)) => Ok(Scalar::Utf8(v.clone())),
-                Some(DynamicValue::Bytes(v)) => Ok(Scalar::Bytes(v.clone())),
-                Some(other) => Ok(Scalar::Dynamic(other.clone())),
-            },
-            Scalar::Null => Ok(Scalar::Null),
-            other => Err(SparrowError::new(
-                ErrorCode::TypeMismatch,
-                format!("dynamic extract requires Dynamic, got {}", other.data_type()),
-            )),
-        },
-    }
+    eval_bound(&bind(expr, schema)?, row)
 }
 
-fn eval_call(name: &str, args: &[Expr], schema: &Schema, row: &[Scalar]) -> Result<Scalar> {
-    check_call_arity(name, args.len())?;
-    let vals: Result<Vec<Scalar>> = args.iter().map(|a| eval(a, schema, row)).collect();
-    let vals = vals?;
+pub(crate) fn eval_call_values(name: &str, vals: Vec<Scalar>) -> Result<Scalar> {
     match name.to_ascii_lowercase().as_str() {
         "abs" => match vals.first() {
             Some(Scalar::Int64(v)) => {
@@ -222,7 +178,7 @@ fn eval_call(name: &str, args: &[Expr], schema: &Schema, row: &[Scalar]) -> Resu
     }
 }
 
-fn check_call_arity(name: &str, argc: usize) -> Result<()> {
+pub(crate) fn check_call_arity(name: &str, argc: usize) -> Result<()> {
     match name.to_ascii_lowercase().as_str() {
         "abs" | "lower" | "upper" | "length" | "char_length" => {
             if argc != 1 {
@@ -263,7 +219,7 @@ fn eval_int_arith(op: BinaryOp, left: i64, right: i64) -> Result<Scalar> {
     })
 }
 
-fn eval_binary(op: BinaryOp, left: &Scalar, right: &Scalar) -> Result<Scalar> {
+pub(crate) fn eval_binary(op: BinaryOp, left: &Scalar, right: &Scalar) -> Result<Scalar> {
     if matches!(op, BinaryOp::And | BinaryOp::Or) {
         return eval_logic(op, left, right);
     }
@@ -376,7 +332,7 @@ fn eval_logic(op: BinaryOp, left: &Scalar, right: &Scalar) -> Result<Scalar> {
     })
 }
 
-fn cast(value: &Scalar, target: &DataType, try_cast: bool) -> Result<Scalar> {
+pub(crate) fn cast(value: &Scalar, target: &DataType, try_cast: bool) -> Result<Scalar> {
     if value.is_null() {
         return Ok(Scalar::Null);
     }
