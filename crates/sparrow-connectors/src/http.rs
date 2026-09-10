@@ -1,3 +1,4 @@
+#[cfg(feature = "demo-io")]
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 #[cfg(feature = "demo-io")]
@@ -410,9 +411,11 @@ mod tests {
     use super::*;
     use crate::secret::MapSecretResolver;
     use sparrow_model::{
-        CreditKind, DataType, Field, FieldId, InflightCounter, MemoryOwner, ResourceBudget, Row,
-        RowBatchBuilder, Scalar, Schema, SchemaId,
+        CreditKind, DataType, Field, FieldId, MemoryOwner, ResourceBudget, Row, RowBatchBuilder,
+        Scalar, Schema, SchemaId,
     };
+    #[cfg(feature = "demo-io")]
+    use sparrow_model::InflightCounter;
 
     #[tokio::test]
     async fn v01_http_sink_does_not_follow_redirect_to_disallowed() {
