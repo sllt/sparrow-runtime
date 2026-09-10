@@ -9,6 +9,7 @@ pub const MAX_SQL_BYTES: usize = 8 * 1024;
 pub const MAX_SPEC_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineSpec {
     #[serde(default = "one")]
     pub version: u32,
@@ -31,6 +32,7 @@ pub struct PipelineSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSpec {
     pub kind: String,
     #[serde(default)]
@@ -59,9 +61,13 @@ pub struct SourceSpec {
     pub bind: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
+    /// MQTT/HTTP TLS. Credentials require this to be true (P0-11).
+    #[serde(default)]
+    pub tls: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SinkSpec {
     pub kind: String,
     #[serde(default)]
@@ -86,9 +92,12 @@ pub struct SinkSpec {
     pub qos: u8,
     #[serde(default = "default_true")]
     pub clean_session: bool,
+    #[serde(default)]
+    pub tls: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestoreSpec {
     pub kind: String,
     #[serde(default)]
@@ -194,6 +203,7 @@ impl PipelineSpec {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamSpec {
     pub fields: Vec<sparrow_plan::graph::FieldSpec>,
 }

@@ -12,4 +12,5 @@ sparrow-plan.workspace = true
 sparrow-io.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing = { version = "0.1.44", default-features = false }
 # No Axum, SQLite, MQTT, or SQL parser.

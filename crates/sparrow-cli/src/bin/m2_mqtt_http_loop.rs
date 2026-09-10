@@ -124,6 +124,7 @@ fn demonstrate_rejects() -> sparrow_model::Result<()> {
     println!("    unauthorized target → {}", err);
 
     let mut missing = MqttSourceConfig::demo("127.0.0.1", 1883, schema.clone());
+    missing.tls.enabled = true;
     missing.password_secret = Some("mqtt.password".into());
     let policy = TargetPolicy::allow("127.0.0.1", 1883);
     let err = missing

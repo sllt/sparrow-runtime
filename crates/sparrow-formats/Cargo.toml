@@ -8,3 +8,4 @@ description = "Sparrow codecs: bounded JSON decode/encode and schema validation"
 [dependencies]
 sparrow-model.workspace = true
 serde_json = "1"
+base64 = "0.22"

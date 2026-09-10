@@ -84,14 +84,9 @@ impl PlanLayout {
                     let input = a
                         .input
                         .as_ref()
-                        .map(|e| format!("{e:?}"))
+                        .map(expr_canonical)
                         .unwrap_or_else(|| "*".into());
-                    let ty = a
-                        .input
-                        .as_ref()
-                        .map(|e| format!("{e:?}"))
-                        .unwrap_or_default();
-                    format!("{}:{}:{input}:{ty}", a.func.as_str(), a.alias)
+                    format!("{}:{}:{input}", a.func.as_str(), a.alias)
                 })
                 .collect(),
             event_time_field: spec.event_time_field.clone(),
@@ -195,15 +190,56 @@ pub fn window_params_fingerprint(kind: &WindowKind) -> u64 {
 
 pub fn window_kind_tag(kind: WindowKind) -> u8 {
     match kind {
-        WindowKind::TumblingProcessingTime { .. } | WindowKind::TumblingEventTime { .. } => 0,
+        WindowKind::TumblingProcessingTime { .. } => 0,
         WindowKind::Count { .. } => 1,
         WindowKind::HoppingEventTime { .. } => 2,
+        WindowKind::TumblingEventTime { .. } => 3,
     }
 }
 
-/// Stable FNV-1a of a debug-printed predicate (V1 white-list, not a crypto hash).
+/// Structured fingerprint (not `Debug`) so layout hashes stay stable (P3-54).
 pub fn expr_fingerprint(expr: &Expr) -> u64 {
-    fnv1a64(format!("{expr:?}").as_bytes())
+    fnv1a64(expr_canonical(expr).as_bytes())
+}
+
+fn scalar_canonical(s: &sparrow_model::Scalar) -> String {
+    use sparrow_model::Scalar;
+    match s {
+        Scalar::Null => "null".into(),
+        Scalar::Bool(v) => format!("b:{v}"),
+        Scalar::Int64(v) => format!("i:{v}"),
+        Scalar::UInt64(v) => format!("u:{v}"),
+        Scalar::Float64(v) => format!("f:{v}"),
+        Scalar::Utf8(v) => format!("s:{v}"),
+        Scalar::Bytes(v) => format!("bin:{}", v.len()),
+        Scalar::TimestampMicrosUTC(v) => format!("ts:{v}"),
+        Scalar::Dynamic(_) => "dyn".into(),
+    }
+}
+
+fn expr_canonical(expr: &Expr) -> String {
+    match expr {
+        Expr::Column { name } => format!("col:{name}"),
+        Expr::Literal(s) => format!("lit:{}:{}", s.data_type(), scalar_canonical(s)),
+        Expr::Cast { expr, target } => format!("cast:{}:{}", expr_canonical(expr), target),
+        Expr::TryCast { expr, target } => format!("trycast:{}:{}", expr_canonical(expr), target),
+        Expr::Binary { op, left, right } => {
+            format!(
+                "bin:{}:{}:{}",
+                op.as_tag(),
+                expr_canonical(left),
+                expr_canonical(right)
+            )
+        }
+        Expr::IsNull(inner) => format!("isnull:{}", expr_canonical(inner)),
+        Expr::IsNotNull(inner) => format!("isnotnull:{}", expr_canonical(inner)),
+        Expr::Not(inner) => format!("not:{}", expr_canonical(inner)),
+        Expr::Call { name, args } => {
+            let a = args.iter().map(expr_canonical).collect::<Vec<_>>().join(",");
+            format!("call:{name}:{a}")
+        }
+        Expr::DynamicGet { expr, key } => format!("dget:{}:{key}", expr_canonical(expr)),
+    }
 }
 
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -299,6 +335,50 @@ mod tests {
             decide_state_reuse(&saved, &live),
             StateReuse::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn p3_43_pt_and_et_window_kind_tags_differ() {
+        assert_ne!(
+            window_kind_tag(WindowKind::TumblingProcessingTime {
+                size_micros: 1_000_000
+            }),
+            window_kind_tag(WindowKind::TumblingEventTime {
+                size_micros: 1_000_000
+            })
+        );
+        assert_eq!(
+            window_kind_tag(WindowKind::TumblingProcessingTime {
+                size_micros: 1_000_000
+            }),
+            0
+        );
+        assert_eq!(
+            window_kind_tag(WindowKind::TumblingEventTime {
+                size_micros: 1_000_000
+            }),
+            3
+        );
+    }
+
+    #[test]
+    fn p3_42_agg_fingerprint_includes_func_alias_and_input_once() {
+        let l = layout();
+        assert_eq!(l.aggs.len(), 1);
+        assert_eq!(l.aggs[0], "sum:s:col:v");
+    }
+
+    #[test]
+    fn p3_54_expr_fingerprint_is_structured_not_debug() {
+        let e = Expr::Binary {
+            op: sparrow_expr::BinaryOp::Gt,
+            left: Box::new(Expr::Column { name: "v".into() }),
+            right: Box::new(Expr::Literal(sparrow_model::Scalar::Int64(1))),
+        };
+        let canon = expr_canonical(&e);
+        assert!(canon.starts_with("bin:gt:"), "{canon}");
+        assert!(!canon.contains("Binary {"), "{canon}");
+        assert!(!canon.contains("Gt"), "{canon}");
     }
 
     #[test]

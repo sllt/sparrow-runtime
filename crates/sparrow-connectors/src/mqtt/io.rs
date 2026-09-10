@@ -1,14 +1,25 @@
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Once;
 use std::time::Duration;
 
+use rustls::pki_types::ServerName;
 use sparrow_model::ErrorCode;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
 
 use super::codec::{decode, decode_remaining_length, encode, Packet, MAX_PACKET_BYTES};
 use crate::error::{ConnectorError, Result};
 use crate::tls::TlsConfig;
+
+fn install_rustls_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 pub type MqttStream = Pin<Box<dyn MqttIo>>;
 
@@ -17,19 +28,37 @@ impl<T> MqttIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 pub async fn connect_plain(host: &str, port: u16, tls: &TlsConfig, wait: Duration) -> Result<MqttStream> {
     tls.validate()?;
-    if tls.enabled {
-        return Err(ConnectorError::new(
-            ErrorCode::FeatureUnavailable,
-            "MQTT TLS transport is not wired in this demo build; enable TLS only on the HTTP sink (reqwest rustls verifies certificates). skip_verify is still rejected",
-        ));
-    }
     let addr = format!("{host}:{port}");
     let stream = timeout(wait, TcpStream::connect(&addr))
         .await
         .map_err(|_| ConnectorError::new(ErrorCode::Internal, format!("MQTT connect timeout to {addr}")))?
         .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("MQTT connect {addr}: {e}")))?;
     let _ = stream.set_nodelay(true);
-    Ok(Box::pin(stream))
+    if !tls.enabled {
+        return Ok(Box::pin(stream));
+    }
+    install_rustls_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(host.to_owned()).map_err(|e| {
+        ConnectorError::new(
+            ErrorCode::InvalidArgument,
+            format!("MQTT TLS server name `{host}`: {e}"),
+        )
+    })?;
+    let tls_stream = timeout(wait, connector.connect(server_name, stream))
+        .await
+        .map_err(|_| {
+            ConnectorError::new(ErrorCode::Internal, format!("MQTT TLS handshake timeout to {addr}"))
+        })?
+        .map_err(|e| {
+            ConnectorError::new(ErrorCode::Internal, format!("MQTT TLS handshake {addr}: {e}"))
+        })?;
+    Ok(Box::pin(tls_stream))
 }
 
 pub async fn write_packet(stream: &mut MqttStream, packet: &Packet) -> Result<()> {

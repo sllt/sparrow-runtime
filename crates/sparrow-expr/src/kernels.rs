@@ -80,15 +80,41 @@ pub fn filter_mask(pred: &Expr, schema: &Schema, rows: &[Row]) -> Result<Vec<boo
         }
         let SimplePred::CmpF64 { column, op, thr } = &simple;
         if let Some(idx) = schema.index_of_name(column) {
-            return Ok(rows
-                .iter()
-                .map(|row| match row.values.get(idx) {
-                    Some(Scalar::Float64(v)) => cmp_f64(*op, *v, *thr),
-                    Some(Scalar::Int64(v)) => cmp_f64(*op, *v as f64, *thr),
-                    Some(Scalar::UInt64(v)) => cmp_f64(*op, *v as f64, *thr),
-                    _ => false,
+            let numeric = schema
+                .fields
+                .get(idx)
+                .map(|f| {
+                    matches!(
+                        f.data_type,
+                        sparrow_model::DataType::Float64
+                            | sparrow_model::DataType::Int64
+                            | sparrow_model::DataType::UInt64
+                    )
                 })
-                .collect());
+                .unwrap_or(false);
+            if numeric {
+                return rows
+                    .iter()
+                    .map(|row| match row.values.get(idx) {
+                        Some(Scalar::Float64(v)) => Ok(cmp_f64(*op, *v, *thr)),
+                        Some(Scalar::Int64(_)) | Some(Scalar::UInt64(_)) => {
+                            match eval(pred, schema, &row.values)? {
+                                Scalar::Bool(v) => Ok(v),
+                                Scalar::Null => Ok(false),
+                                other => Err(sparrow_model::SparrowError::new(
+                                    sparrow_model::ErrorCode::TypeMismatch,
+                                    format!("filter must be bool, got {}", other.data_type()),
+                                )),
+                            }
+                        }
+                        Some(Scalar::Null) | None => Ok(false),
+                        Some(_) => Err(sparrow_model::SparrowError::new(
+                            sparrow_model::ErrorCode::TypeMismatch,
+                            "filter compare fast-path refuses non-numeric cells (must match eval)",
+                        )),
+                    })
+                    .collect();
+            }
         }
     }
     rows.iter()
@@ -183,5 +209,51 @@ mod tests {
             .collect();
         assert_eq!(mask, evaled);
         assert_eq!(mask, vec![true, false]);
+    }
+
+    #[test]
+    fn p0_6_filter_mask_matches_eval_on_utf8() {
+        let schema = Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(FieldId::new(1), "name", DataType::Utf8, false)],
+        )
+        .unwrap();
+        let rows = vec![
+            Row {
+                values: vec![Scalar::utf8("ok")],
+            },
+            Row {
+                values: vec![Scalar::utf8("no")],
+            },
+        ];
+        let pred = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column {
+                name: "name".into(),
+            }),
+            right: Box::new(Expr::Literal(Scalar::utf8("ok"))),
+        };
+        let mask = filter_mask(&pred, &schema, &rows).unwrap();
+        let evaled: Vec<bool> = rows
+            .iter()
+            .map(|r| match eval(&pred, &schema, &r.values).unwrap() {
+                Scalar::Bool(v) => v,
+                _ => false,
+            })
+            .collect();
+        assert_eq!(mask, evaled);
+        assert_eq!(mask, vec![true, false]);
+
+        let bad = Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Column {
+                name: "name".into(),
+            }),
+            right: Box::new(Expr::Literal(Scalar::Float64(1.0))),
+        };
+        let mask_err = filter_mask(&bad, &schema, &rows).unwrap_err();
+        let eval_err = eval(&bad, &schema, &rows[0].values).unwrap_err();
+        assert_eq!(mask_err.code, eval_err.code);
+        assert_eq!(mask_err.code, sparrow_model::ErrorCode::TypeMismatch);
     }
 }

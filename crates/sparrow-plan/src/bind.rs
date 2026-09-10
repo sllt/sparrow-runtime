@@ -276,10 +276,8 @@ pub fn bind_linear(
 ) -> Result<BoundLogicalPlan> {
     let mut nodes = Vec::new();
     let mut cursor_schema = source_schema.clone();
-    let mut id = 1u32;
 
-    let source_id = OperatorId::new(id);
-    id += 1;
+    let source_id = OperatorId::SOURCE;
     let mut pending = source_id;
     nodes.push(BoundNode {
         id: source_id,
@@ -292,8 +290,7 @@ pub fn bind_linear(
 
     if let Some(predicate) = filter {
         validate_predicate(&predicate, &cursor_schema)?;
-        let fid = OperatorId::new(id);
-        id += 1;
+        let fid = OperatorId::FILTER;
         link(&mut nodes, pending, fid);
         nodes.push(BoundNode {
             id: fid,
@@ -309,8 +306,7 @@ pub fn bind_linear(
         for e in &exprs {
             infer_type(e, &cursor_schema)?;
         }
-        let pid = OperatorId::new(id);
-        id += 1;
+        let pid = OperatorId::PROJECT;
         link(&mut nodes, pending, pid);
         cursor_schema = output.clone();
         nodes.push(BoundNode {
@@ -328,8 +324,7 @@ pub fn bind_linear(
         pending = pid;
     }
     if let Some((exprs, output)) = map {
-        let mid = OperatorId::new(id);
-        id += 1;
+        let mid = OperatorId::MAP;
         link(&mut nodes, pending, mid);
         nodes.push(BoundNode {
             id: mid,
@@ -343,7 +338,7 @@ pub fn bind_linear(
         cursor_schema = output;
         pending = mid;
     }
-    let sid = OperatorId::new(id);
+    let sid = OperatorId::SINK;
     link(&mut nodes, pending, sid);
     nodes.push(BoundNode {
         id: sid,
@@ -458,9 +453,7 @@ fn bind_after_source(
     sink_name: String,
 ) -> Result<BoundLogicalPlan> {
     let mut nodes = Vec::new();
-    let mut id = 1u32;
-    let source_id = OperatorId::new(id);
-    id += 1;
+    let source_id = OperatorId::SOURCE;
     let mut pending = source_id;
     nodes.push(BoundNode {
         id: source_id,
@@ -472,8 +465,7 @@ fn bind_after_source(
     });
     if let Some(predicate) = filter {
         validate_predicate(&predicate, &source_schema)?;
-        let fid = OperatorId::new(id);
-        id += 1;
+        let fid = OperatorId::FILTER;
         link(&mut nodes, pending, fid);
         nodes.push(BoundNode {
             id: fid,
@@ -485,8 +477,12 @@ fn bind_after_source(
         });
         pending = fid;
     }
-    let mid_id = OperatorId::new(id);
-    id += 1;
+    let mid_id = match &mid {
+        BoundKind::WindowAgg { .. } => OperatorId::WINDOW,
+        BoundKind::Deduplicate { .. } => OperatorId::DEDUP,
+        BoundKind::Lookup { .. } => OperatorId::LOOKUP,
+        _ => OperatorId::WINDOW,
+    };
     link(&mut nodes, pending, mid_id);
     let out_schema = mid.output_schema().clone();
     nodes.push(BoundNode {
@@ -494,7 +490,7 @@ fn bind_after_source(
         kind: mid,
         downstream: Vec::new(),
     });
-    let sid = OperatorId::new(id);
+    let sid = OperatorId::SINK;
     link(&mut nodes, mid_id, sid);
     nodes.push(BoundNode {
         id: sid,
@@ -603,6 +599,10 @@ fn bind_window_node(node: &NodeSpec, _input: &Schema) -> Result<WindowSpec> {
         .as_ref()
         .and_then(|w| w.max_overlap)
         .unwrap_or(sparrow_model::DEFAULT_MAX_HOP_OVERLAP);
+    let max_future_skew_micros = node
+        .window
+        .as_ref()
+        .and_then(|w| w.max_future_skew_micros);
     let spec = WindowSpec {
         kind,
         keys,
@@ -610,6 +610,7 @@ fn bind_window_node(node: &NodeSpec, _input: &Schema) -> Result<WindowSpec> {
         event_time_field,
         lateness_micros,
         max_overlap,
+        max_future_skew_micros,
     };
     spec.validate()?;
     Ok(spec)

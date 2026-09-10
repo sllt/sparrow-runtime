@@ -15,7 +15,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sparrow_control::{
     bind_plan, binder_catalog, capabilities_json, effective_guarantees, explain_plan, honesty_json,
-    request_start_at, request_stop, stream_schema, validate_io, DemoHarness, PipelineSpec,
+    request_start, request_start_at, request_stop, stream_schema, validate_aligned_plan,
+    validate_io, DemoHarness,
+    PipelineSpec,
     RestoreSpec, Store, StreamSpec, Supervisor, HONESTY,
 };
 use sparrow_runtime::Kernel;
@@ -113,7 +115,7 @@ fn require_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
         .unwrap_or("");
     let token = raw.strip_prefix("Bearer ").unwrap_or("");
     if !tokens_equal(token, &state.token) {
-        let _ = state.store.audit("anonymous", "auth", None, Some("missing or invalid bearer"), "denied");
+        // P1-29: do not touch SQLite on auth failure (sync audit is a DoS / wipe vector).
         return Err(ApiError {
             status: StatusCode::UNAUTHORIZED,
             err: SparrowError::new(ErrorCode::PolicyDenied, "unauthorized: bearer token required"),
@@ -218,7 +220,8 @@ fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
     )
     .map_err(ApiError::from)?;
     let catalog = binder_catalog(&state.store).map_err(ApiError::from)?;
-    let _ = bind_plan(spec, &catalog, spec.stream.as_str(), 0).map_err(ApiError::from)?;
+    let plan = bind_plan(spec, &catalog, spec.stream.as_str(), 0).map_err(ApiError::from)?;
+    validate_aligned_plan(spec, &plan).map_err(ApiError::from)?;
     let demo = state.supervisor.demo_endpoints();
     let policy = sparrow_control::validate::store_policy(&state.store, demo.as_ref())
         .map_err(ApiError::from)?;
@@ -452,6 +455,7 @@ fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
 async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
     let snap = state.supervisor.kernel().metrics.snapshot();
+    let io = state.supervisor.io_snapshot().await;
     Ok(Json(json!({
         "jobs_started": snap.jobs_started,
         "jobs_stopped": snap.jobs_stopped,
@@ -468,6 +472,17 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         "checkpoint_bytes": snap.checkpoint_bytes,
         "checkpoint_commits": snap.checkpoint_commits,
         "checkpoint_aborts": snap.checkpoint_aborts,
+        "io": {
+            "mqtt_received": io.mqtt_received,
+            "mqtt_decoded": io.mqtt_decoded,
+            "mqtt_dropped_bad": io.mqtt_dropped_bad,
+            "mqtt_dropped_full": io.mqtt_dropped_full,
+            "http_posted": io.http_posted,
+            "http_failed": io.http_failed,
+            "http_inflight": io.http_inflight,
+            "log_written": io.log_written,
+            "decode_errors": io.decode_errors,
+        },
         "log": snap.log_line(),
         "label_budget": "job_and_connector_only; no per-event labels",
         "honesty": HONESTY,
@@ -545,23 +560,31 @@ async fn restore_pipeline(
 ) -> ApiResult<Json<Value>> {
     let actor = require_auth(&state, &headers)?;
     let _ = state.supervisor.kill_named(&name).await;
-    if let Ok(row) = state.store.get_pipeline(&name) {
-        let mut spec = row.spec;
-        spec.restore = Some(RestoreSpec {
-            kind: "checkpoint".into(),
-            snapshot_id: Some("aligned".into()),
-            client_id: None,
-        });
-        let _ = state.store.put_pipeline(&name, &spec, Some(&row.etag));
-    }
-    request_start_at(&state.store, &name, &actor, state.store.desired(&name).ok().and_then(|d| d.revision))
+    let store = state.store.clone();
+    let store_c = store.clone();
+    let name_c = name.clone();
+    store
+        .run_blocking(move || {
+            let row = store_c.get_pipeline(&name_c)?;
+            let mut spec = row.spec;
+            spec.restore = Some(RestoreSpec {
+                kind: "checkpoint".into(),
+                snapshot_id: Some("aligned".into()),
+                client_id: None,
+            });
+            store_c.put_pipeline(&name_c, &spec, Some(&row.etag))?;
+            Ok(())
+        })
+        .await
         .map_err(ApiError::from)?;
+    // Start the latest revision — the one that contains restore=checkpoint (P0-3).
+    request_start(&state.store, &name, &actor).map_err(ApiError::from)?;
     state.supervisor.wake();
     let mut body = status_body(&state, &name)?;
     if let Value::Object(map) = &mut body {
         map.insert(
             "note".into(),
-            json!("restore requested; supervisor starts from the committed checkpoint if restore.kind=checkpoint. Not exactly-once."),
+            json!("restore requested; supervisor starts the revision that contains restore=checkpoint. Not exactly-once."),
         );
     }
     Ok(Json(body))

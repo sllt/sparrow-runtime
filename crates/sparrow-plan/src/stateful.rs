@@ -57,6 +57,9 @@ pub struct WindowSpec {
     pub lateness_micros: i64,
     /// Planner cap for hopping overlap (`ceil(size/slide)`).
     pub max_overlap: u32,
+    /// Event-time future skew D. `None` means the ET default
+    /// ([`sparrow_model::DEFAULT_MAX_FUTURE_SKEW_MICROS`]).
+    pub max_future_skew_micros: Option<i64>,
 }
 
 impl WindowSpec {
@@ -68,6 +71,7 @@ impl WindowSpec {
             event_time_field: None,
             lateness_micros: 0,
             max_overlap: DEFAULT_MAX_HOP_OVERLAP,
+            max_future_skew_micros: None,
         }
     }
 
@@ -81,8 +85,16 @@ impl WindowSpec {
         self.event_time_field.as_ref().map(|f| EventTimeBinding {
             field: f.clone(),
             out_of_orderness_micros: 0,
-            max_future_skew_micros: None,
+            max_future_skew_micros: Some(
+                self.max_future_skew_micros
+                    .unwrap_or(sparrow_model::DEFAULT_MAX_FUTURE_SKEW_MICROS),
+            ),
         })
+    }
+
+    pub fn with_max_future_skew(mut self, micros: i64) -> Self {
+        self.max_future_skew_micros = Some(micros);
+        self
     }
 
     pub fn validate(&self) -> Result<()> {

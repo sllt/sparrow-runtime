@@ -21,11 +21,16 @@ pub fn bind_sql(
     pipeline: PipelineId,
     revision: RevisionId,
 ) -> Result<BoundLogicalPlan> {
-    if looks_like_v03(sql) {
-        return crate::bind_v03::bind_sql_v03(sql, catalog, pipeline, revision);
-    }
-    if looks_like_v02(sql) {
-        return crate::bind_v02::bind_sql_v02(sql, catalog, pipeline, revision);
+    if let Ok(statements) = Parser::parse_sql(&g0_dialect(), sql) {
+        match classify_statement(&statements[0]) {
+            SqlFamily::V03 => {
+                return crate::bind_v03::bind_sql_v03(sql, catalog, pipeline, revision);
+            }
+            SqlFamily::V02 => {
+                return crate::bind_v02::bind_sql_v02(sql, catalog, pipeline, revision);
+            }
+            SqlFamily::G0 => {}
+        }
     }
     let verdict = check_sql(sql)?;
     if !verdict.accepted {
@@ -44,23 +49,98 @@ pub fn bind_sql(
     bind_query(query, catalog, pipeline, revision)
 }
 
-fn looks_like_v03(sql: &str) -> bool {
-    let u = sql.to_ascii_uppercase();
-    u.contains("HOP(")
-        || u.contains("FOR SYSTEM_TIME")
-        || u.contains("WATERMARK")
-        || (u.contains("TUMBLE(")
-            && !u.contains("PROCESSING_TIME")
-            && !u.contains("PROCTIME")
-            && !u.contains("PROC_TIME"))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlFamily {
+    G0,
+    V02,
+    V03,
 }
 
-fn looks_like_v02(sql: &str) -> bool {
-    let u = sql.to_ascii_uppercase();
-    u.contains("GROUP BY")
-        || u.contains("TUMBLE")
-        || u.contains("COUNT_WINDOW")
-        || u.contains(" JOIN ")
+fn classify_statement(stmt: &Statement) -> SqlFamily {
+    let Statement::Query(query) = stmt else {
+        return SqlFamily::G0;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return SqlFamily::G0;
+    };
+    if select.from.iter().any(from_has_system_time) {
+        return SqlFamily::V03;
+    }
+    if let Some(name) = group_window_fn(select) {
+        return match name.as_str() {
+            "hop" => SqlFamily::V03,
+            "tumble" if group_tumble_is_event_time(select) => SqlFamily::V03,
+            "tumble" | "count_window" => SqlFamily::V02,
+            _ => SqlFamily::V02,
+        };
+    }
+    if !select.from.is_empty() && select.from.iter().any(|t| !t.joins.is_empty()) {
+        return SqlFamily::V02;
+    }
+    match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => SqlFamily::V02,
+        _ => SqlFamily::G0,
+    }
+}
+
+fn from_has_system_time(table: &sqlparser::ast::TableWithJoins) -> bool {
+    matches!(
+        &table.relation,
+        TableFactor::Table {
+            version: Some(sqlparser::ast::TableVersion::ForSystemTimeAsOf(_)),
+            ..
+        }
+    )
+}
+
+fn group_window_fn(select: &Select) -> Option<String> {
+    let exprs = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs,
+        _ => return None,
+    };
+    for e in exprs {
+        if let SqlExpr::Function(f) = e {
+            return Some(f.name.to_string().to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn group_tumble_is_event_time(select: &Select) -> bool {
+    let exprs = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs,
+        _ => return false,
+    };
+    for e in exprs {
+        if let SqlExpr::Function(f) = e {
+            if !f.name.to_string().eq_ignore_ascii_case("tumble") {
+                continue;
+            }
+            let args = match &f.args {
+                FunctionArguments::List(list) => &list.args,
+                _ => continue,
+            };
+            if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(first)) | FunctionArg::Named { arg: FunctionArgExpr::Expr(first), .. }) = args.first()
+            {
+                return !is_pt_ident(first);
+            }
+        }
+    }
+    true
+}
+
+fn is_pt_ident(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::Identifier(id) => {
+            let n = id.value.to_ascii_lowercase();
+            n == "processing_time" || n == "proctime" || n == "proc_time" || n == "processingtime"
+        }
+        SqlExpr::Function(inner) => {
+            let n = inner.name.to_string().to_ascii_lowercase();
+            n == "proctime" || n == "processingtime" || n == "processing_time"
+        }
+        _ => false,
+    }
 }
 
 fn bind_query(

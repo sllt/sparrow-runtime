@@ -473,13 +473,13 @@ impl Store {
 
     pub fn put_secret(&self, name: &str, value: &str) -> Result<()> {
         check_name(name)?;
-        if value.contains(name) && value.len() > 4096 {
+        if value.len() > 4096 {
             return Err(SparrowError::new(
                 ErrorCode::MaxRecordSize,
                 "secret value exceeds 4KiB",
             ));
         }
-        let stored = seal_secret(value);
+        let stored = seal_secret(value)?;
         self.write(|c| {
             c.execute(
                 "INSERT INTO secrets(name, value) VALUES (?1, ?2)
@@ -775,42 +775,132 @@ fn db(err: rusqlite::Error) -> SparrowError {
 }
 
 /// Threat model: catalog file is trusted-host local state. Secrets are
-/// XOR-sealed with `SPARROW_SECRETS_KEY` (or a process-local default) so a
-/// casual `sqlite3` dump is not plaintext. This is not a KMS. File mode is
-/// 0600. Secret values never appear in error messages.
-fn secrets_key() -> Vec<u8> {
-    std::env::var("SPARROW_SECRETS_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.into_bytes())
-        .unwrap_or_else(|| b"sparrow-dev-secrets-key-v1".to_vec())
+/// sealed with ChaCha20-Poly1305 (`enc:v2:`). Key comes from
+/// `SPARROW_SECRETS_KEY` / `SPARROW_SECRETS_KEY_FILE` (32 bytes or 64 hex
+/// chars). Without those, a process-local random key is used (dev only).
+/// Unprefixed plaintext is rejected (no fallback). Not a KMS. File mode 0600.
+fn secrets_key() -> Result<[u8; 32]> {
+    if let Ok(path) = std::env::var("SPARROW_SECRETS_KEY_FILE") {
+        if !path.is_empty() {
+            let raw = std::fs::read(path.trim()).map_err(|e| {
+                SparrowError::new(ErrorCode::SecretMissing, format!("secrets key file: {e}"))
+            })?;
+            return parse_secrets_key(&raw);
+        }
+    }
+    if let Ok(s) = std::env::var("SPARROW_SECRETS_KEY") {
+        if !s.is_empty() {
+            return parse_secrets_key(s.as_bytes());
+        }
+    }
+    if std::env::var("SPARROW_REQUIRE_SECRETS_KEY").ok().as_deref() == Some("1")
+        || std::env::var("SPARROW_SAFE_MODE").ok().as_deref() == Some("1")
+    {
+        return Err(SparrowError::new(
+            ErrorCode::SecretMissing,
+            "SPARROW_SECRETS_KEY or SPARROW_SECRETS_KEY_FILE is required in safe/production mode",
+        ));
+    }
+    Ok(*PROCESS_SECRETS_KEY.get_or_init(random_key))
 }
 
-fn seal_secret(plain: &str) -> String {
-    let key = secrets_key();
-    let mut out = Vec::with_capacity(plain.len());
-    for (i, b) in plain.as_bytes().iter().enumerate() {
-        out.push(b ^ key[i % key.len()]);
+fn parse_secrets_key(raw: &[u8]) -> Result<[u8; 32]> {
+    let trimmed = std::str::from_utf8(raw).unwrap_or("").trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let v = hex_decode(trimmed).map_err(|_| {
+            SparrowError::new(ErrorCode::InvalidArgument, "SPARROW_SECRETS_KEY hex is invalid")
+        })?;
+        return v.try_into().map_err(|_| {
+            SparrowError::new(ErrorCode::InvalidArgument, "SPARROW_SECRETS_KEY must be 32 bytes")
+        });
     }
-    format!("enc:v1:{}", hex_encode(&out))
+    if raw.len() == 32 {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(raw);
+        return Ok(k);
+    }
+    let t = trimmed.as_bytes();
+    if t.len() == 32 {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(t);
+        return Ok(k);
+    }
+    Err(SparrowError::new(
+        ErrorCode::InvalidArgument,
+        "SPARROW_SECRETS_KEY must be 32 raw bytes or 64 hex characters",
+    ))
+}
+
+fn random_key() -> [u8; 32] {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut k = [0u8; 32];
+    let _ = SystemRandom::new().fill(&mut k);
+    k
+}
+
+static PROCESS_SECRETS_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+fn seal_secret(plain: &str) -> Result<String> {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+    use ring::rand::{SecureRandom, SystemRandom};
+    let key = secrets_key()?;
+    let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key).map_err(|_| {
+        SparrowError::new(ErrorCode::Internal, "secrets AEAD key rejected")
+    })?;
+    let aead = LessSafeKey::new(unbound);
+    let mut nonce_bytes = [0u8; 12];
+    SystemRandom::new().fill(&mut nonce_bytes).map_err(|_| {
+        SparrowError::new(ErrorCode::Internal, "secrets nonce failed")
+    })?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let mut in_out = plain.as_bytes().to_vec();
+    aead.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+        .map_err(|_| SparrowError::new(ErrorCode::Internal, "secrets seal failed"))?;
+    let mut blob = Vec::with_capacity(12 + in_out.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&in_out);
+    Ok(format!("enc:v2:{}", hex_encode(&blob)))
 }
 
 fn unseal_secret(stored: &str) -> Result<String> {
-    if let Some(hex) = stored.strip_prefix("enc:v1:") {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+    if let Some(hex) = stored.strip_prefix("enc:v2:") {
         let raw = hex_decode(hex).map_err(|_| {
             SparrowError::new(ErrorCode::InvalidSchema, "stored secret is corrupt")
         })?;
-        let key = secrets_key();
-        let mut out = Vec::with_capacity(raw.len());
-        for (i, b) in raw.iter().enumerate() {
-            out.push(b ^ key[i % key.len()]);
+        if raw.len() < 12 + 16 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidSchema,
+                "stored secret is truncated",
+            ));
         }
-        String::from_utf8(out).map_err(|_| {
+        let key = secrets_key()?;
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key).map_err(|_| {
+            SparrowError::new(ErrorCode::Internal, "secrets AEAD key rejected")
+        })?;
+        let aead = LessSafeKey::new(unbound);
+        let nonce = Nonce::try_assume_unique_for_key(&raw[..12]).map_err(|_| {
+            SparrowError::new(ErrorCode::InvalidSchema, "stored secret nonce is invalid")
+        })?;
+        let mut in_out = raw[12..].to_vec();
+        let pt = aead
+            .open_in_place(nonce, Aad::empty(), &mut in_out)
+            .map_err(|_| {
+                SparrowError::new(ErrorCode::InvalidSchema, "stored secret failed AEAD open")
+            })?;
+        String::from_utf8(pt.to_vec()).map_err(|_| {
             SparrowError::new(ErrorCode::InvalidSchema, "stored secret is not utf8")
         })
+    } else if stored.starts_with("enc:v1:") {
+        Err(SparrowError::new(
+            ErrorCode::InvalidSchema,
+            "legacy XOR secret envelope is no longer accepted; reseal as enc:v2",
+        ))
     } else {
-        // Legacy plaintext row.
-        Ok(stored.to_string())
+        Err(SparrowError::new(
+            ErrorCode::PolicyDenied,
+            "unprefixed plaintext secrets are rejected (safe/production and default)",
+        ))
     }
 }
 
@@ -873,6 +963,7 @@ mod tests {
                 use_demo_io: false,
                 bind: None,
                 path: None,
+                tls: false,
             },
             sink: SinkSpec {
                 kind: "http".into(),
@@ -887,6 +978,7 @@ mod tests {
                 client_id: None,
                 qos: 0,
                 clean_session: true,
+                tls: false,
             },
             delivery: "live_best_effort".into(),
             recovery: "restart_fresh".into(),
@@ -927,9 +1019,16 @@ mod tests {
         let s = Store::open_memory().unwrap();
         s.put_secret("pw", "super-secret-value").unwrap();
         let raw = s.debug_raw_secret("pw").unwrap();
-        assert!(raw.starts_with("enc:v1:"), "stored secret must be sealed: {raw}");
+        assert!(raw.starts_with("enc:v2:"), "stored secret must be AEAD-sealed: {raw}");
         assert!(!raw.contains("super-secret-value"));
         assert_eq!(s.get_secret("pw").unwrap().as_deref(), Some("super-secret-value"));
+        let err = unseal_secret("super-secret-value").unwrap_err();
+        assert_eq!(err.code, ErrorCode::PolicyDenied);
+        let too_big = "x".repeat(4097);
+        assert_eq!(
+            s.put_secret("big", &too_big).unwrap_err().code,
+            ErrorCode::MaxRecordSize
+        );
     }
 
     #[test]

@@ -129,7 +129,7 @@ impl Scenario {
 }
 
 fn mqtt_http(kernel: &sparrow_runtime::Kernel) -> sparrow_model::Result<Scenario> {
-    let live = LiveLoop::start(kernel, 256, 256)?;
+    let live = LiveLoop::start(kernel, 64, 64)?;
     live.http.set_delay_ms(0);
     let rss0 = rss_kb();
     let started = Instant::now();

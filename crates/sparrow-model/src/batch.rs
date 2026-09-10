@@ -204,8 +204,12 @@ impl RowBatchBuilder {
             .context("attempted", next.to_string())
             .context("peak", self.owner.peak_builder_bytes().to_string()));
         }
+        // P1-15: charge the reservation ledger *before* Vec growth.
+        let _probe = self.owner.acquire(self.kind, add.max(1))?;
+        self.rows.reserve(1);
         self.current_bytes = next;
         self.rows.push(row);
+        drop(_probe);
         Ok(())
     }
 

@@ -27,6 +27,25 @@ pub enum BinaryOp {
     Or,
 }
 
+impl BinaryOp {
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Sub => "sub",
+            Self::Mul => "mul",
+            Self::Div => "div",
+            Self::Eq => "eq",
+            Self::NotEq => "neq",
+            Self::Lt => "lt",
+            Self::Lte => "lte",
+            Self::Gt => "gt",
+            Self::Gte => "gte",
+            Self::And => "and",
+            Self::Or => "or",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Column { name: String },
@@ -153,6 +172,51 @@ fn eval_call(name: &str, args: &[Expr], schema: &Schema, row: &[Scalar]) -> Resu
             }
             Ok(vals.into_iter().find(|v| !v.is_null()).unwrap_or(Scalar::Null))
         }
+        "nullif" => {
+            if vals.len() != 2 {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "nullif requires 2 arguments",
+                ));
+            }
+            if scalars_eq(&vals[0], &vals[1]) {
+                Ok(Scalar::Null)
+            } else {
+                Ok(vals[0].clone())
+            }
+        }
+        "greatest" | "least" => {
+            if vals.is_empty() {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("{name} requires at least 1 argument"),
+                ));
+            }
+            let mut acc: Option<Scalar> = None;
+            for v in vals {
+                if v.is_null() {
+                    continue;
+                }
+                acc = Some(match acc {
+                    None => v,
+                    Some(prev) => {
+                        let ord = cmp_scalars(&prev, &v)?;
+                        if name.eq_ignore_ascii_case("greatest") {
+                            if ord == std::cmp::Ordering::Less {
+                                v
+                            } else {
+                                prev
+                            }
+                        } else if ord == std::cmp::Ordering::Greater {
+                            v
+                        } else {
+                            prev
+                        }
+                    }
+                });
+            }
+            Ok(acc.unwrap_or(Scalar::Null))
+        }
         other => Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
             format!("unknown function '{other}'"),
@@ -275,21 +339,7 @@ fn eval_binary(op: BinaryOp, left: &Scalar, right: &Scalar) -> Result<Scalar> {
         }
         BinaryOp::Eq => Ok(Scalar::Bool(scalars_eq(left, right))),
         BinaryOp::NotEq => Ok(Scalar::Bool(!scalars_eq(left, right))),
-        cmp => {
-            let l = left.as_f64().ok_or_else(|| {
-                SparrowError::new(ErrorCode::TypeMismatch, "comparison expects numeric")
-            })?;
-            let r = right.as_f64().ok_or_else(|| {
-                SparrowError::new(ErrorCode::TypeMismatch, "comparison expects numeric")
-            })?;
-            Ok(Scalar::Bool(match cmp {
-                BinaryOp::Lt => l < r,
-                BinaryOp::Lte => l <= r,
-                BinaryOp::Gt => l > r,
-                BinaryOp::Gte => l >= r,
-                _ => unreachable!(),
-            }))
-        }
+        cmp => Ok(Scalar::Bool(cmp_ord_op(cmp, cmp_scalars(left, right)?)?)),
     }
 }
 
@@ -364,6 +414,60 @@ fn cast(value: &Scalar, target: &DataType, try_cast: bool) -> Result<Scalar> {
             .unwrap_or_else(|| fail("cannot CAST dynamic to float64".into())),
         (_, DataType::Dynamic) => Ok(Scalar::Dynamic(dynamic_from_scalar(value))),
         _ => fail(format!("cannot CAST {} to {target}", value.data_type())),
+    }
+}
+
+fn cmp_ord_op(op: BinaryOp, ord: std::cmp::Ordering) -> Result<bool> {
+    Ok(match op {
+        BinaryOp::Lt => ord.is_lt(),
+        BinaryOp::Lte => ord.is_le(),
+        BinaryOp::Gt => ord.is_gt(),
+        BinaryOp::Gte => ord.is_ge(),
+        _ => {
+            return Err(SparrowError::new(
+                ErrorCode::Internal,
+                "cmp_ord_op on non-compare op",
+            ))
+        }
+    })
+}
+
+fn cmp_scalars(left: &Scalar, right: &Scalar) -> Result<std::cmp::Ordering> {
+    match (left, right) {
+        (Scalar::Int64(a), Scalar::Int64(b)) => Ok(a.cmp(b)),
+        (Scalar::UInt64(a), Scalar::UInt64(b)) => Ok(a.cmp(b)),
+        (Scalar::Int64(a), Scalar::UInt64(b)) if *a >= 0 => Ok((*a as u64).cmp(b)),
+        (Scalar::UInt64(a), Scalar::Int64(b)) if *b >= 0 => Ok(a.cmp(&(*b as u64))),
+        (Scalar::TimestampMicrosUTC(a), Scalar::TimestampMicrosUTC(b)) => Ok(a.cmp(b)),
+        (Scalar::TimestampMicrosUTC(a), Scalar::Int64(b)) => Ok(a.cmp(b)),
+        (Scalar::Int64(a), Scalar::TimestampMicrosUTC(b)) => Ok(a.cmp(b)),
+        (Scalar::Float64(a), Scalar::Float64(b)) => a.partial_cmp(b).ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "NaN comparison is unordered; no implicit Equal",
+            )
+        }),
+        (Scalar::Utf8(a), Scalar::Utf8(b)) => Ok(a.as_ref().cmp(b.as_ref())),
+        _ => {
+            if let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) {
+                if matches!(left, Scalar::Float64(_)) || matches!(right, Scalar::Float64(_)) {
+                    return a.partial_cmp(&b).ok_or_else(|| {
+                        SparrowError::new(
+                            ErrorCode::InvalidArgument,
+                            "NaN comparison is unordered; no implicit Equal",
+                        )
+                    });
+                }
+            }
+            Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                format!(
+                    "cannot compare {} and {}",
+                    left.data_type(),
+                    right.data_type()
+                ),
+            ))
+        }
     }
 }
 
@@ -525,5 +629,108 @@ mod tests {
             name: "temp".into(),
         }))));
         assert_eq!(eval(&expr, &schema, &row).unwrap(), Scalar::Bool(true));
+    }
+
+    #[test]
+    fn p0_7_int_compare_beyond_2_pow_53() {
+        let schema = schema();
+        let row = vec![Scalar::Float64(0.0), Scalar::Dynamic(DynamicValue::Null)];
+        let a = 9_007_199_254_740_993i64;
+        let gt = Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Literal(Scalar::Int64(a + 1))),
+            right: Box::new(Expr::Literal(Scalar::Int64(a))),
+        };
+        assert_eq!(eval(&gt, &schema, &row).unwrap(), Scalar::Bool(true));
+        let eq = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Literal(Scalar::Int64(a))),
+            right: Box::new(Expr::Literal(Scalar::Int64(a + 1))),
+        };
+        assert_eq!(eval(&eq, &schema, &row).unwrap(), Scalar::Bool(false));
+        let nan_eq = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Literal(Scalar::Float64(f64::NAN))),
+            right: Box::new(Expr::Literal(Scalar::Float64(1.0))),
+        };
+        assert_eq!(
+            eval(&nan_eq, &schema, &row).unwrap(),
+            Scalar::Bool(false),
+            "Eq uses IEEE: NaN equals nothing (not unwrap_or Equal)"
+        );
+        let nan_lt = Expr::Binary {
+            op: BinaryOp::Lt,
+            left: Box::new(Expr::Literal(Scalar::Float64(f64::NAN))),
+            right: Box::new(Expr::Literal(Scalar::Float64(1.0))),
+        };
+        assert_eq!(
+            eval(&nan_lt, &schema, &row).unwrap_err().code,
+            ErrorCode::InvalidArgument,
+            "ordered compare must not treat NaN as Equal"
+        );
+        let tmin = Expr::Call {
+            name: "least".into(),
+            args: vec![
+                Expr::Literal(Scalar::TimestampMicrosUTC(9)),
+                Expr::Literal(Scalar::TimestampMicrosUTC(3)),
+            ],
+        };
+        assert_eq!(
+            eval(&tmin, &schema, &row).unwrap(),
+            Scalar::TimestampMicrosUTC(3)
+        );
+        let tmax = Expr::Call {
+            name: "greatest".into(),
+            args: vec![
+                Expr::Literal(Scalar::TimestampMicrosUTC(9)),
+                Expr::Literal(Scalar::TimestampMicrosUTC(3)),
+            ],
+        };
+        assert_eq!(
+            eval(&tmax, &schema, &row).unwrap(),
+            Scalar::TimestampMicrosUTC(9)
+        );
+    }
+
+    #[test]
+    fn p0_9_float_int_arith_and_uint_infer_match_eval() {
+        let schema = schema();
+        let row = vec![Scalar::Float64(0.0), Scalar::Dynamic(DynamicValue::Null)];
+        let add = Expr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::Literal(Scalar::Float64(1.5))),
+            right: Box::new(Expr::Literal(Scalar::Int64(2))),
+        };
+        assert_eq!(infer_type(&add, &schema).unwrap(), DataType::Float64);
+        assert_eq!(
+            eval(&add, &schema, &row).unwrap(),
+            Scalar::Float64(3.5),
+            "Float64+Int64 must stay Float64, not truncate to Int64"
+        );
+        let uadd = Expr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::Literal(Scalar::UInt64(7))),
+            right: Box::new(Expr::Literal(Scalar::UInt64(9))),
+        };
+        assert_eq!(infer_type(&uadd, &schema).unwrap(), DataType::UInt64);
+        assert_eq!(eval(&uadd, &schema, &row).unwrap(), Scalar::UInt64(16));
+        let nf = Expr::Call {
+            name: "nullif".into(),
+            args: vec![
+                Expr::Literal(Scalar::Int64(4)),
+                Expr::Literal(Scalar::Int64(4)),
+            ],
+        };
+        assert_eq!(infer_type(&nf, &schema).unwrap(), DataType::Int64);
+        assert_eq!(eval(&nf, &schema, &row).unwrap(), Scalar::Null);
+        let gr = Expr::Call {
+            name: "greatest".into(),
+            args: vec![
+                Expr::Literal(Scalar::Int64(1)),
+                Expr::Literal(Scalar::Int64(8)),
+            ],
+        };
+        assert_eq!(infer_type(&gr, &schema).unwrap(), DataType::Int64);
+        assert_eq!(eval(&gr, &schema, &row).unwrap(), Scalar::Int64(8));
     }
 }

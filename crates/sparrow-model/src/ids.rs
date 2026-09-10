@@ -74,6 +74,18 @@ id_newtype!(
     u16
 );
 
+impl OperatorId {
+    /// Stable SQL/linear kind ids (A7). Graph nodes keep the author-supplied id.
+    pub const SOURCE: Self = Self(1);
+    pub const FILTER: Self = Self(2);
+    pub const PROJECT: Self = Self(3);
+    pub const MAP: Self = Self(4);
+    pub const WINDOW: Self = Self(10);
+    pub const DEDUP: Self = Self(11);
+    pub const LOOKUP: Self = Self(12);
+    pub const SINK: Self = Self(20);
+}
+
 /// Compatibility address for a stateful slot: operator + slot.
 /// Restore rejects a checkpoint whose slot key does not match the live plan.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -99,5 +111,11 @@ mod tests {
         assert!(a < b);
         assert_eq!(a.raw(), 1);
         assert_eq!(format!("{a}"), "PipelineId(1)");
+    }
+
+    #[test]
+    fn window_id_is_stable_across_optional_filter() {
+        assert_eq!(OperatorId::WINDOW.raw(), 10);
+        assert_ne!(OperatorId::FILTER, OperatorId::WINDOW);
     }
 }

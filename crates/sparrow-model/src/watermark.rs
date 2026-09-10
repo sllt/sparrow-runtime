@@ -78,9 +78,13 @@ pub struct EventTimeBinding {
     /// Source-side out-of-orderness subtracted from max observed event time.
     /// Holdback `L` for finals lives on the window (`lateness_micros`), not here.
     pub out_of_orderness_micros: i64,
-    /// If set, `event_time > now + skew` is `invalid_argument` (future timestamp).
+    /// If set, `event_time > now + skew` is dropped (does not advance max_et).
     pub max_future_skew_micros: Option<i64>,
 }
+
+/// Default D for event-time windows when the spec omits an explicit skew.
+/// One hour. A year-2100 event must not permanently close later windows.
+pub const DEFAULT_MAX_FUTURE_SKEW_MICROS: i64 = 3_600_000_000;
 
 impl EventTimeBinding {
     pub fn new(field: impl Into<String>) -> Self {

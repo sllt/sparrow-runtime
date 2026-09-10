@@ -1621,6 +1621,7 @@ name = "sparrow-connectors"
 version = "0.1.0"
 dependencies = [
  "reqwest",
+ "rustls",
  "serde_json",
  "sparrow-expr",
  "sparrow-formats",
@@ -1630,14 +1631,17 @@ dependencies = [
  "sparrow-runtime",
  "sparrow-testkit",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]
 name = "sparrow-control"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1665,6 +1669,7 @@ dependencies = [
 name = "sparrow-formats"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde_json",
  "sparrow-model",
 ]
@@ -1700,6 +1705,7 @@ dependencies = [
  "sparrow-plan",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

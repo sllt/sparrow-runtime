@@ -119,9 +119,10 @@ fn future_timestamp_is_rejected() {
         max_future_skew_micros: Some(1_000_000),
     };
     let mut hub = WatermarkHub::new().with_binding(bind).unwrap();
-    let err = hub.observe_event(InputId(0), 9_000_000, 0).unwrap_err();
-    assert_eq!(err.code, ErrorCode::InvalidArgument);
-    assert!(err.message.contains("future timestamp"), "{}", err.message);
+    let none = hub.observe_event(InputId(0), 9_000_000, 0).unwrap();
+    assert!(none.is_none(), "future event must not advance the watermark");
+    hub.observe_event(InputId(0), 500_000, 0).unwrap();
+    assert_eq!(hub.effective(), Some(500_000));
 }
 
 #[test]
@@ -157,6 +158,7 @@ fn final_avg_80_then_late_side_output() {
     let mid = op.on_batch(&b, 0).unwrap();
     assert!(mid.finals.is_empty(), "must not emit before e+L: {:?}", mid.finals);
     let closed = op.observe_watermark(InputId(0), 13_000_000).unwrap();
+    let closed = op.materialize_emission(closed).unwrap();
     assert_eq!(closed.finals.len(), 1, "{:?}", closed.finals);
     match closed.finals[0].values.as_slice() {
         [Scalar::Utf8(d), Scalar::Int64(0), Scalar::Int64(10_000_000), Scalar::Float64(avg)] => {
@@ -183,6 +185,7 @@ fn count_window_cannot_impersonate_event_time() {
         event_time_field: Some("ts".into()),
         lateness_micros: 3,
         max_overlap: DEFAULT_MAX_HOP_OVERLAP,
+        max_future_skew_micros: None,
     };
     let err = spec.validate().unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArgument);
@@ -205,6 +208,7 @@ fn hop_overlap_planner_bound() {
         event_time_field: Some("ts".into()),
         lateness_micros: 0,
         max_overlap: 8,
+        max_future_skew_micros: None,
     };
     assert_eq!(bad.validate().unwrap_err().code, ErrorCode::BoundExceeded);
 }
@@ -263,4 +267,27 @@ fn versioned_lookup_as_of_event_time() {
         Some(Scalar::Utf8(s)) => assert_eq!(s.as_ref(), "east"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn p0_5_future_skew_protects_watermark() {
+    let (mut op, owner) = op(et_avg(1_000_000, 0));
+    let year_2100 = 4_102_444_800_000_000i64;
+    let poisoned = op
+        .on_batch(&batch(&owner, vec![row("d1", 99.0, year_2100)]), 0)
+        .unwrap();
+    assert!(poisoned.finals.is_empty());
+    assert!(poisoned.lates.is_empty());
+    op.on_batch(&batch(&owner, vec![row("d1", 10.0, 500_000)]), 0)
+        .unwrap();
+    op.on_batch(&batch(&owner, vec![row("d1", 20.0, 1_500_000)]), 0)
+        .unwrap();
+    let closed = op.observe_watermark(InputId(0), 3_000_000).unwrap();
+    let closed = op.materialize_emission(closed).unwrap();
+    assert!(
+        !closed.finals.is_empty(),
+        "year-2100 event must not make later normal events late forever: {:?}",
+        closed.finals
+    );
+    assert!(closed.lates.is_empty(), "normal events must not be late: {:?}", closed.lates);
 }

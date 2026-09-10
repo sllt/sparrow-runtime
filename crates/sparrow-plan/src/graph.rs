@@ -90,6 +90,8 @@ pub struct WindowNodeSpec {
     pub lateness_micros: Option<i64>,
     #[serde(default)]
     pub max_overlap: Option<u32>,
+    #[serde(default)]
+    pub max_future_skew_micros: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

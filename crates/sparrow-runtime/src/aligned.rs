@@ -180,8 +180,9 @@ impl AlignedSession {
         }
         let batch = b.finish()?;
         let emission = self.operator.on_batch(&batch, now)?;
-        self.finals.extend(emission.finals.clone());
-        self.lates.extend(emission.lates.clone());
+        let emission = self.operator.materialize_emission(emission)?;
+        push_capped(&mut self.finals, &emission.finals);
+        push_capped(&mut self.lates, &emission.lates);
         self.ingested = self.ingested.saturating_add(rows.len() as u64);
         self.source_pos = pos_after;
         self.metrics.record_ingest(rows.len() as u64);
@@ -245,9 +246,11 @@ impl AlignedSession {
                 let _ = self.coordinator.complete();
                 self.next_checkpoint = id.saturating_add(1);
                 self.metrics.record_checkpoint(started.elapsed(), payload_len);
-                eprintln!(
-                    "{{\"event\":\"checkpoint_commit\",\"checkpoint_id\":{id},\"bytes\":{payload_len},\"duration_micros\":{}}}",
-                    started.elapsed().as_micros()
+                tracing::info!(
+                    checkpoint_id = id,
+                    bytes = payload_len,
+                    duration_micros = started.elapsed().as_micros() as u64,
+                    "checkpoint_commit"
                 );
                 Ok(id)
             }
@@ -277,11 +280,19 @@ impl AlignedSession {
         let emission = self
             .operator
             .observe_watermark(sparrow_model::InputId(input), wm)?;
-        self.finals.extend(emission.finals.clone());
-        self.lates.extend(emission.lates.clone());
+        let emission = self.operator.materialize_emission(emission)?;
+        push_capped(&mut self.finals, &emission.finals);
+        push_capped(&mut self.lates, &emission.lates);
         self.metrics.record_emit(emission.finals.len() as u64);
         Ok(emission)
     }
+}
+
+const MAX_SESSION_ROWS: usize = 4096;
+
+fn push_capped(dst: &mut Vec<sparrow_model::Row>, rows: &[sparrow_model::Row]) {
+    let room = MAX_SESSION_ROWS.saturating_sub(dst.len());
+    dst.extend(rows.iter().take(room).cloned());
 }
 
 /// Drive a replayable source through an aligned session until `until_records`

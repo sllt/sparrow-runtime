@@ -26,6 +26,7 @@ use crate::window::{FrozenEntry, WindowFreeze};
 pub const CHECKPOINT_LABEL: &str = "aligned";
 pub const CHUNK_SIZE: usize = 4096;
 pub const MAGIC: &[u8; 4] = b"SPV1";
+/// Codec version. Unchanged in R1 (entry-count caps are decode-time only) (P1-25).
 pub const SNAPSHOT_VERSION: u16 = 1;
 pub const MANIFEST_MAGIC: &[u8; 4] = b"MAN2";
 pub const MANIFEST_VERSION: u16 = 1;
@@ -290,7 +291,10 @@ impl CheckpointStore {
         fs::rename(&cur_tmp, &cur).map_err(io_err)?;
         fsync_dir(&self.dir)?;
         self.next_id = id.saturating_add(1);
-        gc_generations(&self.dir, id)?;
+        // CURRENT is already published. A GC error must not look like a failed commit (P1-24).
+        if let Err(_e) = gc_generations(&self.dir, id) {
+            // Residual: store may be over quota until the next successful GC.
+        }
         Ok(id)
     }
 
@@ -300,9 +304,45 @@ impl CheckpointStore {
     /// `Ok(None)` means no CURRENT file — callers that *claimed* restore
     /// must treat this as a hard error (see [`Self::recover_required`]).
     pub fn recover_committed(&self) -> Result<Option<CheckpointSnapshot>> {
-        let Some(id) = read_current(&self.dir)? else {
-            return Ok(None);
-        };
+        match read_current(&self.dir) {
+            Ok(Some(id)) => match self.load_generation(id) {
+                Ok(snap) => Ok(Some(snap)),
+                Err(e) => {
+                    if let Some(snap) = self.load_latest_valid_except(Some(id)) {
+                        return Ok(Some(snap));
+                    }
+                    Err(e)
+                }
+            },
+            // Missing CURRENT means the last publish did not land. Do not
+            // promote an unpublished MANIFEST (crash after rename, before CURRENT).
+            Ok(None) => Ok(None),
+            Err(e) => {
+                if let Some(snap) = self.load_latest_valid_except(None) {
+                    Ok(Some(snap))
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    fn load_latest_valid_except(&self, skip: Option<u64>) -> Option<CheckpointSnapshot> {
+        let mut ids = list_generation_ids(&self.dir);
+        ids.sort_unstable();
+        ids.reverse();
+        for id in ids {
+            if Some(id) == skip {
+                continue;
+            }
+            if let Ok(snap) = self.load_generation(id) {
+                return Some(snap);
+            }
+        }
+        None
+    }
+
+    fn load_generation(&self, id: u64) -> Result<CheckpointSnapshot> {
         let chk = self.dir.join(format!("chk-{id:08}"));
         let man_path = chk.join("MANIFEST");
         if !man_path.exists() {
@@ -368,7 +408,7 @@ impl CheckpointStore {
                 ),
             ));
         }
-        Ok(Some(CheckpointSnapshot::decode(&payload)?))
+        Ok(CheckpointSnapshot::decode(&payload)?)
     }
 
     /// Restore entry point: never continue with empty state when a restore
@@ -497,6 +537,24 @@ fn dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+fn list_generation_ids(dir: &Path) -> Vec<u64> {
+    let mut ids = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let Some(s) = name.to_str() else {
+                continue;
+            };
+            if let Some(id) = s.strip_prefix("chk-").and_then(|x| x.parse::<u64>().ok()) {
+                if ent.path().is_dir() {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
 }
 
 fn gc_generations(dir: &Path, keep_id: u64) -> Result<()> {
@@ -888,6 +946,20 @@ fn decode_freeze(src: &mut &[u8]) -> Result<WindowFreeze> {
     *src = &src[1..];
     let n = u32::from_le_bytes(src[..4].try_into().unwrap()) as usize;
     *src = &src[4..];
+    const MAX_FREEZE_ENTRIES: usize = 4096;
+    const MIN_FREEZE_ENTRY: usize = 2 + 8 + 8 + 8 + 2;
+    if n > MAX_FREEZE_ENTRIES {
+        return Err(SparrowError::new(
+            ErrorCode::BoundExceeded,
+            format!("freeze entry count {n} exceeds {MAX_FREEZE_ENTRIES}; refusing alloc"),
+        ));
+    }
+    if src.len() < n.saturating_mul(MIN_FREEZE_ENTRY) {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "truncated window freeze entries (declared count exceeds remaining bytes)",
+        ));
+    }
     let mut entries = Vec::with_capacity(n);
     for _ in 0..n {
         if src.len() < 2 {
@@ -898,6 +970,12 @@ fn decode_freeze(src: &mut &[u8]) -> Result<WindowFreeze> {
         }
         let nk = u16::from_le_bytes(src[..2].try_into().unwrap()) as usize;
         *src = &src[2..];
+        if nk > 64 {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!("freeze key arity {nk} exceeds 64"),
+            ));
+        }
         let mut key = Vec::with_capacity(nk);
         for _ in 0..nk {
             key.push(Scalar::decode_value(src)?);
@@ -916,6 +994,12 @@ fn decode_freeze(src: &mut &[u8]) -> Result<WindowFreeze> {
         *src = &src[8..];
         let na = u16::from_le_bytes(src[..2].try_into().unwrap()) as usize;
         *src = &src[2..];
+        if na > 64 {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!("freeze accumulator count {na} exceeds 64"),
+            ));
+        }
         let mut accs = Vec::with_capacity(na);
         for _ in 0..na {
             accs.push(Accumulator::decode(src)?);
@@ -1248,6 +1332,29 @@ mod tests {
             store.recover_committed().unwrap().unwrap().checkpoint_id,
             5
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p0_13_freeze_rejects_untrusted_capacity() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&1_000_000u32.to_le_bytes());
+        let err = super::decode_freeze(&mut buf.as_slice()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoundExceeded);
+    }
+
+    #[test]
+    fn p1_24_corrupt_current_recovers_previous_generation() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        store.commit(&sample_snapshot(1)).unwrap();
+        store.commit(&sample_snapshot(2)).unwrap();
+        fs::write(dir.join("CURRENT"), b"not-a-checkpoint\n").unwrap();
+        let got = store.recover_committed().unwrap().unwrap();
+        assert_eq!(got.checkpoint_id, 2, "must fall back to a verified generation");
         let _ = fs::remove_dir_all(&dir);
     }
 }

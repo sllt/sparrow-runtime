@@ -395,10 +395,20 @@ fn overflow() -> SparrowError {
 }
 
 fn cmp_ord(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
-    if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
-        return Ok(x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal));
-    }
     match (a, b) {
+        (Scalar::Int64(x), Scalar::Int64(y)) => Ok(x.cmp(y)),
+        (Scalar::UInt64(x), Scalar::UInt64(y)) => Ok(x.cmp(y)),
+        (Scalar::Int64(x), Scalar::UInt64(y)) if *x >= 0 => Ok((*x as u64).cmp(y)),
+        (Scalar::UInt64(x), Scalar::Int64(y)) if *y >= 0 => Ok(x.cmp(&(*y as u64))),
+        (Scalar::TimestampMicrosUTC(x), Scalar::TimestampMicrosUTC(y)) => Ok(x.cmp(y)),
+        (Scalar::TimestampMicrosUTC(x), Scalar::Int64(y)) => Ok(x.cmp(y)),
+        (Scalar::Int64(x), Scalar::TimestampMicrosUTC(y)) => Ok(x.cmp(y)),
+        (Scalar::Float64(x), Scalar::Float64(y)) => x.partial_cmp(y).ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "MIN/MAX refuses unordered NaN (no implicit Equal)",
+            )
+        }),
         (Scalar::Utf8(x), Scalar::Utf8(y)) => Ok(x.as_ref().cmp(y.as_ref())),
         (Scalar::Bytes(x), Scalar::Bytes(y)) => Ok(x.as_ref().cmp(y.as_ref())),
         (Scalar::Bool(x), Scalar::Bool(y)) => Ok(x.cmp(y)),

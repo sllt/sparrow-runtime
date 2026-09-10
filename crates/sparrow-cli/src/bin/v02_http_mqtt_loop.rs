@@ -62,7 +62,7 @@ async fn run_async(kernel: &sparrow_runtime::Kernel) -> sparrow_model::Result<()
     )?;
     let cancel = job.cancellation();
     let push_task = kernel.handle().spawn(push.run(tx_in, cancel.clone()));
-    let sink_task = kernel.handle().spawn(sink.run(rx_out, cancel.clone()));
+    let sink_task = kernel.handle().spawn(sink.run(rx_out, cancel.clone(), None));
     let sub_task = kernel.handle().spawn(sub.run(tx_sub, cancel.clone()));
     tokio::time::sleep(Duration::from_millis(80)).await;
 

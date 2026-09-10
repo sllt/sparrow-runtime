@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sparrow_formats::{encode_json_row, JsonLimits};
-use sparrow_model::{ErrorCode, RestoreClaim, RowBatch};
+use sparrow_formats::{encode_json_batch, JsonLimits};
+use sparrow_model::{ErrorCode, InflightCounter, RestoreClaim, RowBatch};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -115,13 +115,23 @@ impl HttpSink {
         })
     }
 
-    pub async fn run(self, mut rx: mpsc::Receiver<RowBatch>, cancel: CancellationToken) {
+    pub async fn run(
+        self,
+        mut rx: mpsc::Receiver<RowBatch>,
+        cancel: CancellationToken,
+        outbox: Option<Arc<InflightCounter>>,
+    ) {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 next = rx.recv() => {
                     match next {
-                        Some(batch) => self.post_batch(&batch).await,
+                        Some(batch) => {
+                            self.post_batch(&batch).await;
+                            if let Some(o) = &outbox {
+                                o.ack();
+                            }
+                        }
                         None => break,
                     }
                 }
@@ -131,26 +141,24 @@ impl HttpSink {
 
     async fn post_batch(&self, batch: &RowBatch) {
         let schema = batch.schema();
-        for row in batch.rows() {
-            let body = match encode_json_row(schema, row) {
-                Ok(b) if b.len() <= JsonLimits::default().max_bytes => b,
-                Ok(_) => {
-                    self.diag.http_dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                Err(_) => {
-                    self.diag.http_dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-            };
-            self.diag.http_inflight.fetch_add(1, Ordering::Relaxed);
-            let ok = self.post_bytes(&body).await;
-            self.diag.http_inflight.fetch_sub(1, Ordering::Relaxed);
-            if ok {
-                self.diag.http_posted.fetch_add(1, Ordering::Relaxed);
-            } else {
+        let body = match encode_json_batch(schema, batch.rows()) {
+            Ok(b) if b.len() <= JsonLimits::default().max_bytes.saturating_mul(batch.num_rows().max(1)) => b,
+            Ok(_) => {
                 self.diag.http_dropped.fetch_add(1, Ordering::Relaxed);
+                return;
             }
+            Err(_) => {
+                self.diag.http_dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        self.diag.http_inflight.fetch_add(1, Ordering::Relaxed);
+        let ok = self.post_bytes(&body).await;
+        self.diag.http_inflight.fetch_sub(1, Ordering::Relaxed);
+        if ok {
+            self.diag.http_posted.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.diag.http_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -170,6 +178,11 @@ impl HttpSink {
             }
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => return true,
+                Ok(resp) if resp.status().is_client_error() => {
+                    // Do not retry 4xx (P1-22).
+                    self.diag.http_failed.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
                 Ok(_) | Err(_) => {
                     self.diag.http_failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -389,7 +402,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         let child = cancel.clone();
-        tokio::spawn(sink.run(rx, child));
+        tokio::spawn(sink.run(rx, child, None));
         tx.send(batch).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(

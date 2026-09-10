@@ -42,7 +42,7 @@ async fn broker_source_decodes_json() {
 #[tokio::test]
 async fn http_sink_posts_to_capture() {
     use sparrow_connectors::{HttpCapture, HttpSink, HttpSinkConfig};
-    use sparrow_formats::encode_json_row;
+    use sparrow_formats::encode_json_batch;
     use sparrow_model::{CreditKind, MemoryOwner, ResourceBudget, RowBatchBuilder};
     use sparrow_testkit::{sensor_fixture, sensor_schema};
     use std::sync::Arc;
@@ -60,7 +60,7 @@ async fn http_sink_posts_to_capture() {
     .unwrap();
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(sink.run(rx, cancel.clone()));
+    let task = tokio::spawn(sink.run(rx, cancel.clone(), None));
 
     let schema = Arc::new(sensor_schema());
     let owner = MemoryOwner::new(ResourceBudget::compact());
@@ -75,7 +75,7 @@ async fn http_sink_posts_to_capture() {
     .unwrap();
     b.push(rec.to_row()).unwrap();
     let batch = b.finish().unwrap();
-    let expected = encode_json_row(&schema, &batch.rows()[0]).unwrap();
+    let expected = encode_json_batch(&schema, batch.rows()).unwrap();
     tx.send(batch).await.unwrap();
     drop(tx);
 

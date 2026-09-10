@@ -387,3 +387,141 @@ fn r25_live_path_records_real_metrics() {
     assert!(snap.emitted_rows >= 2, "emit must be measured: {snap:?}");
     assert!(snap.live_samples > 0);
 }
+
+fn count_schema() -> Schema {
+    Schema::new(
+        SchemaId::new(1),
+        vec![
+            Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+            Field::new(FieldId::new(2), "v", DataType::Int64, false),
+        ],
+    )
+    .unwrap()
+}
+
+fn count_rows(vs: &[i64]) -> Vec<Row> {
+    vs.iter()
+        .map(|v| Row {
+            values: vec![Scalar::utf8("d1"), Scalar::Int64(*v)],
+        })
+        .collect()
+}
+
+fn filter_gt_v(thr: i64) -> Expr {
+    Expr::Binary {
+        op: BinaryOp::Gt,
+        left: Box::new(Expr::Column { name: "v".into() }),
+        right: Box::new(Expr::Literal(Scalar::Int64(thr))),
+    }
+}
+
+fn count_window_plan(filter: Option<Expr>, size: u64) -> sparrow_plan::PhysicalPlan {
+    use sparrow_model::WindowKind;
+    use sparrow_plan::{bind_window_linear, AggCall, WindowSpec};
+    let spec = WindowSpec::new(
+        WindowKind::Count { size },
+        vec!["device_id".into()],
+        vec![AggCall::count_star("n")],
+    );
+    let bound = bind_window_linear(
+        PipelineId::new(1),
+        RevisionId::new(1),
+        "sensors".into(),
+        count_schema(),
+        filter,
+        spec,
+        "c".into(),
+    )
+    .unwrap();
+    physicalize(&bound, &PlanOptions { fuse: true })
+}
+
+#[test]
+fn a1_aligned_runs_full_plan_through_kernel() {
+    let plan = count_window_plan(Some(filter_gt_v(1)), 2);
+    assert!(
+        plan.stages
+            .iter()
+            .any(|s| matches!(s, sparrow_plan::PhysicalStage::Transform { .. })),
+        "aligned Kernel path must keep the Filter stage: {:?}",
+        plan.stages
+    );
+    let k = kernel();
+    let capture = SharedCapture::new();
+    k.run(JobRequest::new(plan, count_rows(&[1, 2, 3, 4]), capture.clone()))
+        .unwrap();
+    assert_eq!(
+        capture.row_count(),
+        1,
+        "Filter+COUNT_WINDOW(2) on v=1,2,3,4 must emit one window [2,3], not two stripped windows: {:?}",
+        capture.rows()
+    );
+}
+
+#[test]
+fn p0_4_barrier_waits_for_real_sink_flush() {
+    let plan = count_window_plan(None, 1);
+    let k = kernel();
+    let (ev_tx, ev_rx) = tokio::sync::mpsc::channel(8);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(8);
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel(8);
+    let outbox = std::sync::Arc::new(sparrow_model::InflightCounter::new());
+    let handle = k
+        .submit(
+            JobRequest::new(plan, Vec::new(), SharedCapture::disabled())
+                .with_live_events(ev_rx)
+                .with_live_out(out_tx)
+                .with_aligned(crate::AlignedJob {
+                    restore: None,
+                    acks: ack_tx,
+                    outbox: std::sync::Arc::clone(&outbox),
+                }),
+        )
+        .unwrap();
+    let outbox_sink = std::sync::Arc::clone(&outbox);
+    k.block_on(async {
+        let sink = tokio::spawn(async move {
+            while let Some(_batch) = out_rx.recv().await {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                outbox_sink.ack();
+            }
+        });
+        ev_tx
+            .send(IngressEvent::Row(count_rows(&[1]).pop().unwrap()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        ev_tx
+            .send(IngressEvent::Control(StreamControl::CheckpointBarrier {
+                checkpoint_id: 1,
+            }))
+            .await
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let mut frozen = false;
+        let mut flushed = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && !(frozen && flushed) {
+            match tokio::time::timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                ack_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(crate::AlignedAck::WindowFrozen { .. })) => frozen = true,
+                Ok(Some(crate::AlignedAck::SinkFlushed { .. })) => flushed = true,
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let elapsed = t0.elapsed();
+        assert!(frozen, "window must freeze on the Kernel barrier");
+        assert!(flushed, "sink must ack after the real flush, not channel-empty");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "SinkFlushed in {elapsed:?} — barrier did not wait for sink ack"
+        );
+        drop(ev_tx);
+        let _ = handle.stop().await;
+        let _ = sink.await;
+    });
+}

@@ -153,7 +153,7 @@ fn v1_file_aligned_validate_and_metrics() {
         let ok = json!({
             "version": 1,
             "stream": "sensors",
-            "sql": "SELECT device_id FROM sensors",
+            "sql": "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, COUNT_WINDOW(2)",
             "source": { "kind": "file", "path": "/tmp/sparrow-v1-events.ndjson" },
             "sink": { "kind": "log" },
             "delivery": "live_best_effort",
@@ -258,18 +258,23 @@ fn api_mqtt_http_loop_and_fresh_restart() {
         assert_eq!(st, StatusCode::OK, "{pubd}");
 
         let start = std::time::Instant::now();
-        let bodies = loop {
+        let text = loop {
             let (_, cap) = call(&state, auth_get("/v1/demo/capture")).await;
             let bodies = cap["bodies"].as_array().cloned().unwrap_or_default();
-            if bodies.len() >= 3 {
-                break bodies;
+            let text: Vec<String> = bodies
+                .iter()
+                .map(|v| v.as_str().unwrap_or("").into())
+                .collect();
+            let joined = text.join("\n");
+            if joined.contains("edge-a") && joined.contains("edge-b") && joined.contains("edge-c")
+            {
+                break text;
             }
             if start.elapsed() > Duration::from_secs(6) {
-                panic!("expected 3 HTTP bodies, got {bodies:?}");
+                panic!("expected filtered fixture rows in HTTP batch posts, got {text:?}");
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
         };
-        let text: Vec<String> = bodies.iter().map(|v| v.as_str().unwrap_or("").into()).collect();
         assert!(text.iter().any(|b| b.contains("edge-a") && b.contains("26.2")), "{text:?}");
         assert!(text.iter().any(|b| b.contains("edge-b")));
         assert!(text.iter().any(|b| b.contains("edge-c")));

@@ -10,11 +10,13 @@ use sparrow_connectors::{
     MqttSource, publish_qos0, sensor_json, EmbeddedBroker, HttpCapture,
 };
 use sparrow_io::{RecordSource, ReplayableSource};
-use sparrow_model::{RecoveryPolicy, ResourceBudget, Result, SparrowError};
-use sparrow_plan::{PhysicalPlan, PhysicalStage};
+use sparrow_model::{
+    InflightCounter, RecoveryPolicy, ResourceBudget, Result, SparrowError, StateSlotId,
+};
+use sparrow_plan::{PhysicalPlan, PhysicalStage, PlanLayout, TransformStep};
 use sparrow_runtime::{
-    AlignedSession, CheckpointStore, JobHandle, JobRequest, Kernel, KernelOptions, MailboxConfig,
-    SharedCapture,
+    AlignedAck, AlignedJob, CheckpointSnapshot, CheckpointStore, IngressEvent, JobHandle,
+    JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, StreamControl,
 };
 use tokio_util::sync::CancellationToken;
 use tokio::sync::{Mutex, Notify};
@@ -23,8 +25,10 @@ use tokio::task::JoinHandle;
 use crate::store::Store;
 use crate::validate::{
     bind_plan, binder_catalog, http_config, http_push_config, mqtt_config, mqtt_sink_config,
-    store_policy, stream_to_schema, validate_io, DemoEndpoints, StoreSecrets,
+    store_policy, stream_to_schema, validate_aligned_plan, validate_io, DemoEndpoints, StoreSecrets,
 };
+
+const MAX_PIPELINE_ATTEMPTS: u64 = 16;
 
 pub struct DemoHarness {
     pub broker: EmbeddedBroker,
@@ -86,7 +90,8 @@ enum RunningKind {
     Aligned {
         cancel: CancellationToken,
         cmd: tokio::sync::mpsc::Sender<AlignedCmd>,
-        task: JoinHandle<Result<()>>,
+        handle: JobHandle,
+        source: JoinHandle<Result<()>>,
         sink: JoinHandle<()>,
     },
 }
@@ -94,13 +99,16 @@ enum RunningKind {
 struct RunningJob {
     kind: RunningKind,
     revision: u64,
+    diag: Arc<IoDiagnostics>,
 }
 
 impl RunningJob {
     fn is_finished(&self) -> bool {
         match &self.kind {
             RunningKind::Live { handle, .. } => handle.is_finished(),
-            RunningKind::Aligned { task, .. } => task.is_finished(),
+            RunningKind::Aligned { handle, source, .. } => {
+                handle.is_finished() || source.is_finished()
+            }
         }
     }
 }
@@ -161,17 +169,44 @@ impl Supervisor {
         }
     }
 
+    async fn catalog<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Store) -> Result<T> + Send + 'static,
+    {
+        let store = self.store.clone();
+        self.store.run_blocking(move || f(&store)).await
+    }
+
+    pub async fn io_snapshot(&self) -> sparrow_connectors::IoSnapshot {
+        let g = self.running.lock().await;
+        let mut acc = sparrow_connectors::IoSnapshot::default();
+        for j in g.values() {
+            acc.add_assign(&j.diag.snapshot());
+        }
+        acc
+    }
+
     pub async fn converge_once(&self) -> Result<()> {
         self.reap_finished().await;
-        let desired = self.store.list_desired()?;
+        let desired = self.catalog(|s| s.list_desired()).await?;
         for d in desired {
             if d.status == "running" {
-                if self.should_hold_failed(&d.name)? {
+                if self.should_hold_failed(&d.name).await? {
                     continue;
                 }
-                if let Ok(a) = self.store.actual(&d.name) {
+                if let Ok(a) = self.catalog({
+                    let name = d.name.clone();
+                    move |s| s.actual(&name)
+                }).await
+                {
                     if a.status == "completed" && a.revision == d.revision {
                         continue;
+                    }
+                    if a.status == "failed" && a.attempt_id > 0 {
+                        let shift = a.attempt_id.min(6) as u32;
+                        tokio::time::sleep(Duration::from_millis(40u64.saturating_mul(1u64 << shift)))
+                            .await;
                     }
                 }
                 let rev = d.revision.unwrap_or(1);
@@ -183,18 +218,32 @@ impl Supervisor {
                     continue;
                 }
                 if let Err(e) = self.start_named(&d.name, rev).await {
-                    let _ = self.store.set_actual(
-                        &d.name,
-                        "failed",
-                        Some(rev),
-                        self.next_attempt(&d.name),
-                        Some(&e.message),
-                    );
-                    let _ = self.store.insert_attempt(&d.name, rev, "failed", Some(&e.message));
+                    let name = d.name.clone();
+                    let msg = e.message.clone();
+                    let _ = self
+                        .catalog(move |s| {
+                            let attempt = s
+                                .actual(&name)
+                                .map(|a| a.attempt_id.saturating_add(1))
+                                .unwrap_or(1);
+                            s.set_actual(&name, "failed", Some(rev), attempt, Some(&msg))?;
+                            s.insert_attempt(&name, rev, "failed", Some(&msg))
+                        })
+                        .await;
                 }
             } else if let Some(job) = self.running.lock().await.remove(&d.name) {
                 self.stop_job(job).await;
-                let _ = self.store.set_actual(&d.name, "stopped", d.revision, self.next_attempt(&d.name), None);
+                let name = d.name.clone();
+                let revision = d.revision;
+                let _ = self
+                    .catalog(move |s| {
+                        let attempt = s
+                            .actual(&name)
+                            .map(|a| a.attempt_id.saturating_add(1))
+                            .unwrap_or(1);
+                        s.set_actual(&name, "stopped", revision, attempt, None)
+                    })
+                    .await;
             }
         }
         Ok(())
@@ -216,68 +265,100 @@ impl Supervisor {
             let outcome = self.join_job(job).await;
             match outcome {
                 Ok(()) => {
-                    let _ = self.store.set_actual(
-                        &name,
-                        "completed",
-                        Some(rev),
-                        self.next_attempt(&name),
-                        None,
-                    );
-                    let _ = self.store.insert_attempt(&name, rev, "completed", None);
+                    let n = name.clone();
+                    let _ = self
+                        .catalog(move |s| {
+                            let attempt = s
+                                .actual(&n)
+                                .map(|a| a.attempt_id.saturating_add(1))
+                                .unwrap_or(1);
+                            s.set_actual(&n, "completed", Some(rev), attempt, None)?;
+                            s.insert_attempt(&n, rev, "completed", None)
+                        })
+                        .await;
                 }
                 Err(e) => {
-                    let _ = self.store.set_actual(
-                        &name,
-                        "failed",
-                        Some(rev),
-                        self.next_attempt(&name),
-                        Some(&e.message),
-                    );
-                    let _ = self.store.insert_attempt(&name, rev, "failed", Some(&e.message));
+                    let n = name.clone();
+                    let msg = e.message.clone();
+                    let _ = self
+                        .catalog(move |s| {
+                            let attempt = s
+                                .actual(&n)
+                                .map(|a| a.attempt_id.saturating_add(1))
+                                .unwrap_or(1);
+                            s.set_actual(&n, "failed", Some(rev), attempt, Some(&msg))?;
+                            s.insert_attempt(&n, rev, "failed", Some(&msg))
+                        })
+                        .await;
                 }
             }
         }
     }
 
-    fn should_hold_failed(&self, name: &str) -> Result<bool> {
-        if !self.safe_mode {
-            return Ok(false);
-        }
-        if let Some(last) = self.store.last_attempt(name)? {
-            if last.outcome == "failed" {
-                return Ok(true);
+    async fn should_hold_failed(&self, name: &str) -> Result<bool> {
+        let name = name.to_string();
+        let safe = self.safe_mode;
+        self.catalog(move |s| {
+            if let Ok(a) = s.actual(&name) {
+                if a.attempt_id >= MAX_PIPELINE_ATTEMPTS {
+                    return Ok(true);
+                }
             }
-        }
-        Ok(false)
-    }
-
-    fn next_attempt(&self, name: &str) -> u64 {
-        self.store
-            .actual(name)
-            .map(|a| a.attempt_id.saturating_add(1))
-            .unwrap_or(1)
+            if !safe {
+                return Ok(false);
+            }
+            if let Some(last) = s.last_attempt(&name)? {
+                if last.outcome == "failed" {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
     }
 
     async fn start_named(&self, name: &str, revision: u64) -> Result<()> {
-        let row = self.store.get_pipeline_revision(name, revision)?;
-        let spec = row.spec;
-        let stream = self.store.get_stream(&spec.stream)?;
-        let schema = stream_to_schema(&stream)?;
-        let catalog = binder_catalog(&self.store)?;
+        let name_owned = name.to_string();
         let demo = self.demo_endpoints();
-        let policy = store_policy(&self.store, demo.as_ref())?;
+        let (spec, schema, catalog, policy) = self
+            .catalog({
+                let name = name_owned.clone();
+                let demo = demo.clone();
+                move |s| {
+                    let row = s.get_pipeline_revision(&name, revision)?;
+                    let stream = s.get_stream(&row.spec.stream)?;
+                    let schema = stream_to_schema(&stream)?;
+                    let catalog = binder_catalog(s)?;
+                    let policy = store_policy(s, demo.as_ref())?;
+                    Ok((row.spec, schema, catalog, policy))
+                }
+            })
+            .await?;
         validate_io(&spec, &schema, &self.secrets, &policy, demo.as_ref())?;
         let plan = bind_plan(&spec, &catalog, name, revision)?;
+        validate_aligned_plan(&spec, &plan)?;
 
-        let attempt = self.next_attempt(name);
-        self.store.set_actual(name, "starting", Some(revision), attempt, None)?;
-        let recovery = RecoveryPolicy::parse(&spec.recovery)?;
-        let note = if recovery.is_aligned() {
+        let note = if RecoveryPolicy::parse(&spec.recovery)?.is_aligned() {
             "aligned; not exactly-once"
         } else {
             "restart_fresh"
         };
-        self.store.insert_attempt(name, revision, "starting", Some(note))?;
+        let name_s = name.to_string();
+        let note_s = note.to_string();
+        self.catalog({
+            let name = name_s.clone();
+            let note = note_s.clone();
+            move |s| {
+                let attempt = s
+                    .actual(&name)
+                    .map(|a| a.attempt_id.saturating_add(1))
+                    .unwrap_or(1);
+                s.set_actual(&name, "starting", Some(revision), attempt, None)?;
+                s.insert_attempt(&name, revision, "starting", Some(&note))
+            }
+        })
+        .await?;
+        let recovery = RecoveryPolicy::parse(&spec.recovery)?;
 
         let job = match spec.source.kind.as_str() {
             "file" | "file_replay" | "replay" => {
@@ -293,8 +374,17 @@ impl Supervisor {
         }) {
             self.stop_job(old).await;
         }
-        self.store.set_actual(name, "running", Some(revision), attempt, None)?;
-        self.store.insert_attempt(name, revision, "running", Some(note))?;
+        let name_s = name.to_string();
+        let note_s = note.to_string();
+        self.catalog(move |s| {
+            let attempt = s
+                .actual(&name_s)
+                .map(|a| a.attempt_id)
+                .unwrap_or(1);
+            s.set_actual(&name_s, "running", Some(revision), attempt, None)?;
+            s.insert_attempt(&name_s, revision, "running", Some(&note_s))
+        })
+        .await?;
         Ok(())
     }
 
@@ -339,7 +429,7 @@ impl Supervisor {
                 ));
             }
         };
-        let sink = self.spawn_sink(spec, rx_out, cancel, diag, demo.as_ref(), policy)?;
+        let sink = self.spawn_sink(spec, rx_out, cancel, Arc::clone(&diag), demo.as_ref(), policy, None)?;
         Ok(RunningJob {
             kind: RunningKind::Live {
                 handle: job,
@@ -347,6 +437,7 @@ impl Supervisor {
                 sink,
             },
             revision: 0,
+            diag,
         })
     }
 
@@ -404,7 +495,15 @@ impl Supervisor {
             }
         });
         let diag = IoDiagnostics::new();
-        let sink = self.spawn_sink(spec, rx_out, cancel, diag, self.demo_endpoints().as_ref(), &store_policy(&self.store, self.demo_endpoints().as_ref())?)?;
+        let sink = self.spawn_sink(
+            spec,
+            rx_out,
+            cancel,
+            Arc::clone(&diag),
+            self.demo_endpoints().as_ref(),
+            &store_policy(&self.store, self.demo_endpoints().as_ref())?,
+            None,
+        )?;
         Ok(RunningJob {
             kind: RunningKind::Live {
                 handle: job,
@@ -412,6 +511,7 @@ impl Supervisor {
                 sink,
             },
             revision: 0,
+            diag,
         })
     }
 
@@ -423,43 +523,73 @@ impl Supervisor {
         plan: PhysicalPlan,
         path: String,
     ) -> Result<RunningJob> {
-        let (op, win, input) = window_from_plan(&plan)?;
+        crate::validate::validate_aligned_plan(spec, &plan)?;
+        let layout = layout_from_physical(&plan)?;
         let chk = spec
             .checkpoint_dir
             .clone()
             .unwrap_or_else(|| format!("{path}.sparrow-chk"));
+        sparrow_connectors::policy::check_data_path(std::path::Path::new(&path))?;
+        sparrow_connectors::policy::check_data_path(std::path::Path::new(&chk))?;
         let store = CheckpointStore::open(std::path::Path::new(&chk))?;
-        let cfg = FileReplayConfig::new(&path, schema.clone());
-        let mut cfg = cfg;
+        let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.recovery = RecoveryPolicy::Aligned;
         cfg.restore = spec.restore_claim()?;
+        // Aligned files keep growing after a cut; R28 immutable is for sealed files.
+        cfg.contract = sparrow_connectors::FileContract::AppendOnly;
         let mut source = FileReplaySource::open(&cfg).map_err(|e| {
             SparrowError::new(e.code(), e.to_string())
         })?;
-        let metrics = Arc::clone(&self.kernel.metrics);
-        let mut session = if matches!(
+        let restore = matches!(
             spec.restore.as_ref().map(|r| r.kind.as_str()),
             Some("checkpoint")
-        ) {
-            AlignedSession::restore(store, win, input, op, ResourceBudget::compact(), &mut source)?
+        );
+        let (restore_freeze, ingested0, next_chk) = if restore {
+            let snap = store.recover_required()?;
+            snap.check_compatible(&layout)?;
+            source.seek(&snap.source)?;
+            (
+                Some(snap.window.clone()),
+                snap.ingested_rows,
+                snap.checkpoint_id.saturating_add(1),
+            )
         } else {
-            AlignedSession::open(
-                store,
-                win,
-                input,
-                op,
-                ResourceBudget::compact(),
-                source.position(),
-            )?
+            (None, 0, 1)
         };
-        session.metrics = metrics;
-        let outbox = spec.sink.outbox_capacity.max(1);
-        let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox);
+        let pos = Arc::new(std::sync::Mutex::new(source.position()));
+        let ingested = Arc::new(std::sync::atomic::AtomicU64::new(ingested0));
+        let next_id = Arc::new(std::sync::atomic::AtomicU64::new(next_chk));
+        let store = Arc::new(std::sync::Mutex::new(store));
+        let layout = Arc::new(layout);
+        let inbox = spec.source.inbox_capacity.max(1);
+        let outbox_n = spec.sink.outbox_capacity.max(1);
+        let (tx_ev, rx_ev) = tokio::sync::mpsc::channel(inbox);
+        let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox_n);
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel::<AlignedAck>(8);
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<AlignedCmd>(4);
-        let cancel = CancellationToken::new();
+        let outbox = Arc::new(InflightCounter::new());
+        let diag = IoDiagnostics::new();
+        let diag_src = Arc::clone(&diag);
+        let metrics = Arc::clone(&self.kernel.metrics);
+        let job = self.kernel.submit(
+            JobRequest::new(plan, Vec::new(), SharedCapture::disabled())
+                .with_live_events(rx_ev)
+                .with_live_out(tx_out)
+                .with_aligned(AlignedJob {
+                    restore: restore_freeze,
+                    acks: ack_tx,
+                    outbox: Arc::clone(&outbox),
+                }),
+        )?;
+        let cancel = job.cancellation();
         let child = cancel.clone();
-        let task = self.kernel.handle().spawn(async move {
-            let tx_out = tx_out;
+        let pos_r = Arc::clone(&pos);
+        let ingested_r = Arc::clone(&ingested);
+        let next_r = Arc::clone(&next_id);
+        let store_r = Arc::clone(&store);
+        let layout_r = Arc::clone(&layout);
+        let source_task = self.kernel.handle().spawn(async move {
+            let mut eof_punctuated = false;
             loop {
                 if child.is_cancelled() {
                     return Ok(());
@@ -468,88 +598,162 @@ impl Supervisor {
                     biased;
                     _ = child.cancelled() => return Ok(()),
                     cmd = cmd_rx.recv() => {
-                        if let Some(AlignedCmd::Checkpoint { reply }) = cmd {
-                            // R11: wait until the sink has drained the outbox
-                            // (closed-window outputs) before committing the cut.
-                            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-                            let flush_ok = loop {
-                                if tx_out.capacity() >= tx_out.max_capacity() {
-                                    break true;
-                                }
-                                if tokio::time::Instant::now() >= deadline {
-                                    break false;
-                                }
-                                tokio::time::sleep(Duration::from_millis(5)).await;
-                            };
-                            let r = if flush_ok {
-                                session.checkpoint_barrier_after_flush(|| Ok(()))
-                            } else {
-                                Err(SparrowError::new(
-                                    sparrow_model::ErrorCode::ResourceExhausted,
-                                    "sink flush timeout before checkpoint commit",
-                                ))
-                            };
-                            let _ = reply.send(r);
-                        } else {
+                        let Some(AlignedCmd::Checkpoint { reply }) = cmd else {
                             return Ok(());
+                        };
+                        let id = next_r.load(std::sync::atomic::Ordering::SeqCst);
+                        if tx_ev
+                            .send(IngressEvent::Control(StreamControl::CheckpointBarrier {
+                                checkpoint_id: id,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            let _ = reply.send(Err(SparrowError::new(
+                                sparrow_model::ErrorCode::Cancelled,
+                                "aligned source ended before barrier",
+                            )));
+                            return Ok(());
+                        }
+                        let mut freeze = None;
+                        let mut flushed = false;
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        while tokio::time::Instant::now() < deadline && !(freeze.is_some() && flushed)
+                        {
+                            match tokio::time::timeout(
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                ack_rx.recv(),
+                            )
+                            .await
+                            {
+                                Ok(Some(AlignedAck::WindowFrozen { freeze: f, .. })) => {
+                                    freeze = Some(f);
+                                }
+                                Ok(Some(AlignedAck::SinkFlushed { .. })) => flushed = true,
+                                Ok(None) | Err(_) => break,
+                            }
+                        }
+                        if freeze.is_none() || !flushed {
+                            let _ = reply.send(Err(SparrowError::new(
+                                sparrow_model::ErrorCode::ResourceExhausted,
+                                format!(
+                                    "barrier did not align (freeze={} flush={}); refusing dishonest commit",
+                                    freeze.is_some(),
+                                    flushed
+                                ),
+                            )));
+                            continue;
+                        }
+                        let snap = CheckpointSnapshot {
+                            checkpoint_id: id,
+                            source: pos_r.lock().expect("pos").clone(),
+                            window: freeze.expect("freeze"),
+                            ingested_rows: ingested_r.load(std::sync::atomic::Ordering::SeqCst),
+                            layout: (*layout_r).clone(),
+                            table: None,
+                        };
+                        let store = Arc::clone(&store_r);
+                        let committed = tokio::task::spawn_blocking(move || {
+                            store.lock().expect("store").commit(&snap)
+                        })
+                        .await
+                        .map_err(|e| {
+                            SparrowError::new(
+                                sparrow_model::ErrorCode::Internal,
+                                format!("checkpoint worker: {e}"),
+                            )
+                        });
+                        match committed {
+                            Ok(Ok(cid)) => {
+                                next_r.store(cid.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
+                                metrics.record_checkpoint(
+                                    std::time::Duration::from_millis(1),
+                                    1,
+                                );
+                                let _ = reply.send(Ok(cid));
+                            }
+                            Ok(Err(e)) => {
+                                metrics.record_checkpoint_abort();
+                                let _ = reply.send(Err(e));
+                            }
+                            Err(e) => {
+                                metrics.record_checkpoint_abort();
+                                let _ = reply.send(Err(e));
+                            }
                         }
                     }
                     _ = tokio::task::yield_now() => {
-                        match source.next_frame() {
-                            Ok(Some(frame)) => {
-                                if let Ok(Some(row)) = source.decode_frame(&frame) {
-                                    let pos = source.position();
-                                    let emission = session.ingest_rows(&[row], 0, pos)?;
-                                    let mut rows = emission.finals;
-                                    if let Some(wm) = emission.pending_close {
-                                        loop {
-                                            let chunk = session.operator.take_closed_chunk(
-                                                wm,
-                                                8,
-                                                64 * 1024,
-                                            )?;
-                                            if chunk.is_empty() {
-                                                break;
-                                            }
-                                            rows.extend(chunk);
-                                        }
-                                        session.operator.advance_holdback(wm)?;
-                                    }
-                                    if !rows.is_empty() {
-                                        if let Some(b) = session.operator.build_batch(rows)? {
-                                            if tx_out.send(b).await.is_err() {
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
+                        let read = tokio::task::spawn_blocking(move || {
+                            let frame = source.next_frame();
+                            match frame {
+                                Ok(Some(f)) => {
+                                    let row = source.decode_frame(&f).ok().flatten();
+                                    let p = source.position();
+                                    Ok((source, Some(row), p))
+                                }
+                                Ok(None) => {
+                                    let p = source.position();
+                                    Ok((source, None, p))
+                                }
+                                Err(e) => Err(e),
+                            }
+                        })
+                        .await
+                        .map_err(|e| {
+                            SparrowError::new(
+                                sparrow_model::ErrorCode::Internal,
+                                format!("file replay worker: {e}"),
+                            )
+                        })?;
+                        let (src, row, p) = read?;
+                        source = src;
+                        *pos_r.lock().expect("pos") = p;
+                        match row {
+                            Some(Some(row)) => {
+                                ingested_r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if tx_ev.send(IngressEvent::Row(row)).await.is_err() {
+                                    return Ok(());
                                 }
                             }
-                            Ok(None) => {
+                            Some(None) => {
+                                diag_src.decode_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            None => {
+                                if !eof_punctuated {
+                                    eof_punctuated = true;
+                                    let _ = tx_ev
+                                        .send(IngressEvent::Control(StreamControl::Watermark {
+                                            input: 0,
+                                            wm_micros: i64::MAX / 4,
+                                        }))
+                                        .await;
+                                }
                                 tokio::time::sleep(Duration::from_millis(40)).await;
                             }
-                            Err(e) => return Err(e),
                         }
                     }
                 }
             }
         });
-        let diag = IoDiagnostics::new();
         let sink = self.spawn_sink(
             spec,
             rx_out,
             cancel.clone(),
-            diag,
+            Arc::clone(&diag),
             self.demo_endpoints().as_ref(),
             &store_policy(&self.store, self.demo_endpoints().as_ref())?,
+            Some(Arc::clone(&outbox)),
         )?;
         Ok(RunningJob {
             kind: RunningKind::Aligned {
                 cancel,
                 cmd: cmd_tx,
-                task,
+                handle: job,
+                source: source_task,
                 sink,
             },
             revision: 0,
+            diag,
         })
     }
 
@@ -561,23 +765,30 @@ impl Supervisor {
         diag: Arc<IoDiagnostics>,
         demo: Option<&DemoEndpoints>,
         policy: &sparrow_connectors::TargetPolicy,
+        outbox: Option<Arc<InflightCounter>>,
     ) -> Result<JoinHandle<()>> {
         Ok(match spec.sink.kind.as_str() {
             "log" => {
                 let log = LogSink::new(diag, 64);
-                self.kernel.handle().spawn(log.run(rx_out, cancel))
+                self.kernel
+                    .handle()
+                    .spawn(log.run(rx_out, cancel, outbox))
             }
             "mqtt" => {
                 let cfg = mqtt_sink_config(&spec.sink, demo)?;
                 let sink = MqttSink::bind(cfg, &self.secrets, policy, diag)
                     .map_err(SparrowError::from)?;
-                self.kernel.handle().spawn(sink.run(rx_out, cancel))
+                self.kernel
+                    .handle()
+                    .spawn(sink.run(rx_out, cancel, outbox))
             }
             _ => {
                 let http_cfg = http_config(&spec.sink, demo)?;
                 let sink = HttpSink::bind(http_cfg, &self.secrets, policy, diag)
                     .map_err(SparrowError::from)?;
-                self.kernel.handle().spawn(sink.run(rx_out, cancel))
+                self.kernel
+                    .handle()
+                    .spawn(sink.run(rx_out, cancel, outbox))
             }
         })
     }
@@ -595,12 +806,14 @@ impl Supervisor {
             }
             RunningKind::Aligned {
                 cancel,
-                task,
+                handle,
+                source,
                 sink,
                 ..
             } => {
                 cancel.cancel();
-                let _ = task.await;
+                let _ = handle.stop().await;
+                let _ = source.await;
                 let _ = sink.await;
             }
         }
@@ -618,15 +831,23 @@ impl Supervisor {
                 let _ = sink.await;
                 r.map(|_| ())
             }
-            RunningKind::Aligned { task, sink, .. } => {
-                let r = task.await.map_err(|e| {
-                    SparrowError::new(
+            RunningKind::Aligned {
+                handle,
+                source,
+                sink,
+                ..
+            } => {
+                let r = handle.wait().await;
+                let src = match source.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(SparrowError::new(
                         sparrow_model::ErrorCode::JobFailed,
-                        format!("aligned task panicked: {e}"),
-                    )
-                })?;
+                        format!("aligned source panicked: {e}"),
+                    )),
+                };
                 let _ = sink.await;
-                r
+                r.map(|_| ()).and(src)
             }
         }
     }
@@ -667,7 +888,16 @@ impl Supervisor {
     pub async fn kill_named(&self, name: &str) -> Result<()> {
         if let Some(job) = self.running.lock().await.remove(name) {
             self.stop_job(job).await;
-            let _ = self.store.set_actual(name, "stopped", None, self.next_attempt(name), Some("killed"));
+            let n = name.to_string();
+            let _ = self
+                .catalog(move |s| {
+                    let attempt = s
+                        .actual(&n)
+                        .map(|a| a.attempt_id.saturating_add(1))
+                        .unwrap_or(1);
+                    s.set_actual(&n, "stopped", None, attempt, Some("killed"))
+                })
+                .await;
         }
         Ok(())
     }
@@ -678,11 +908,23 @@ impl Supervisor {
         drop(g);
         for (name, job) in jobs {
             self.stop_job(job).await;
-            let _ = self.store.set_actual(&name, "stopped", None, self.next_attempt(&name), None);
+            let n = name.clone();
+            let _ = self
+                .catalog(move |s| {
+                    let attempt = s
+                        .actual(&n)
+                        .map(|a| a.attempt_id.saturating_add(1))
+                        .unwrap_or(1);
+                    s.set_actual(&n, "stopped", None, attempt, None)
+                })
+                .await;
         }
     }
 }
 
+/// Test / compact process: 2 async workers. Production catalog/checkpoint/file
+/// I/O must use `Store::run_blocking` / `spawn_blocking` so these workers are
+/// not blocked. See `docs/RUNTIME.md`.
 pub fn compact_kernel() -> Result<Kernel> {
     Kernel::new(KernelOptions {
         budget: ResourceBudget::compact(),
@@ -692,6 +934,24 @@ pub fn compact_kernel() -> Result<Kernel> {
         },
         worker_threads: 2,
         rows_per_batch: 4,
+    })
+}
+
+/// Host-sized kernel for sparrow-server. SQLite/checkpoint/file still run on
+/// the blocking pool; these workers stay for mailbox/stage futures.
+pub fn host_kernel() -> Result<Kernel> {
+    let n = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .clamp(4, 16);
+    Kernel::new(KernelOptions {
+        budget: ResourceBudget::compact(),
+        mailbox: MailboxConfig {
+            max_items: 32,
+            max_bytes: 256 * 1024,
+        },
+        worker_threads: n,
+        rows_per_batch: 8,
     })
 }
 
@@ -717,6 +977,21 @@ fn window_from_plan(
         sparrow_model::ErrorCode::FeatureUnavailable,
         "aligned recovery requires a window operator in the plan",
     ))
+}
+
+fn layout_from_physical(plan: &PhysicalPlan) -> Result<PlanLayout> {
+    let (operator, spec, _) = window_from_plan(plan)?;
+    let mut pred = None;
+    for s in &plan.stages {
+        if let PhysicalStage::Transform { steps } = s {
+            for step in steps {
+                if let TransformStep::Filter { predicate, .. } = step {
+                    pred = Some(predicate);
+                }
+            }
+        }
+    }
+    Ok(PlanLayout::from_window(operator, StateSlotId::new(1), &spec).with_where(pred))
 }
 
 /// Request start: write desired state and return immediately.

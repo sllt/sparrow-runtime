@@ -14,6 +14,7 @@ pub mod delivery;
 pub mod error;
 pub mod frame;
 pub mod ids;
+pub mod inflight;
 pub mod memory;
 pub mod resource;
 pub mod scalar;
@@ -32,13 +33,14 @@ pub use frame::{CodecBounds, CodecBoundary, SourceFrame, DEFAULT_MAX_RECORD_BYTE
 pub use ids::{
     FieldId, JobAttemptId, OperatorId, PipelineId, RevisionId, SchemaId, StateSlotId, StateSlotKey,
 };
+pub use inflight::InflightCounter;
 pub use memory::{MemoryLease, MemoryOwner};
 pub use resource::{CreditKind, CreditUsage, ResourceBudget};
 pub use scalar::{DynamicValue, Scalar};
 pub use types::{DataType, Field, Schema};
 pub use watermark::{
     holdback_wm_out, EventTimeBinding, InputActivity, InputId, Watermark,
-    DEFAULT_MAX_HOP_OVERLAP, DEFAULT_MAX_WATERMARK_INPUTS,
+    DEFAULT_MAX_FUTURE_SKEW_MICROS, DEFAULT_MAX_HOP_OVERLAP, DEFAULT_MAX_WATERMARK_INPUTS,
 };
 pub use window::{
     check_hop_overlap_bound, hop_overlap, AggFn, TimeDomain, WindowKind, INTEGER_OVERFLOW_POLICY,

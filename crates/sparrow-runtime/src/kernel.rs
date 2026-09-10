@@ -14,6 +14,7 @@ use sparrow_plan::{PhysicalPlan, PhysicalStage};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::barrier::{wait_outbox, AlignedAck, AlignedJob};
 use crate::capture::SharedCapture;
 use crate::clock::RuntimeClock;
 use crate::dedup::DedupOperator;
@@ -65,6 +66,8 @@ pub struct JobRequest {
     pub live_events: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
     /// Test-only: panic inside the first non-source stage.
     pub inject_panic: bool,
+    /// Production aligned recovery hooks (Kernel path; not AlignedSession).
+    pub aligned: Option<AlignedJob>,
 }
 
 /// Ordered live ingress envelope (R18).
@@ -89,7 +92,13 @@ impl JobRequest {
             live_ctrl: None,
             live_events: None,
             inject_panic: false,
+            aligned: None,
         }
+    }
+
+    pub fn with_aligned(mut self, aligned: AlignedJob) -> Self {
+        self.aligned = Some(aligned);
+        self
     }
 
     pub fn with_inject_panic(mut self) -> Self {
@@ -142,6 +151,11 @@ impl JobRequest {
         live_out: tokio::sync::mpsc::Sender<RowBatch>,
     ) -> Self {
         self.live_in = Some(live_in);
+        self.live_out = Some(live_out);
+        self
+    }
+
+    pub fn with_live_out(mut self, live_out: tokio::sync::mpsc::Sender<RowBatch>) -> Self {
         self.live_out = Some(live_out);
         self
     }
@@ -225,6 +239,7 @@ impl Kernel {
             max_state_keys: self.opts.budget.max_state_keys,
             max_timers: self.opts.budget.max_timers,
             metrics: Arc::clone(&self.metrics),
+            aligned: req.aligned.clone(),
         };
         let handle = self.rt.spawn(run_job(ctx, req));
         Ok(JobHandle {
@@ -273,6 +288,7 @@ struct JobCtx {
     max_state_keys: usize,
     max_timers: usize,
     metrics: Arc<RuntimeMetrics>,
+    aligned: Option<AlignedJob>,
 }
 
 pub struct JobHandle {
@@ -356,6 +372,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest) -> Result<JobStats> {
         mut live_ctrl,
         mut live_events,
         inject_panic,
+        aligned: _,
     } = req;
 
     let mut set = JoinSet::new();
@@ -460,7 +477,16 @@ fn clone_ctx(ctx: &JobCtx) -> JobCtx {
         max_state_keys: ctx.max_state_keys,
         max_timers: ctx.max_timers,
         metrics: Arc::clone(&ctx.metrics),
+        aligned: ctx.aligned.clone(),
     }
+}
+
+async fn consume_work(ctx: &JobCtx, units: u64) -> Result<()> {
+    if ctx.work.would_exhaust(units) {
+        tokio::task::yield_now().await;
+        ctx.work.begin_quantum();
+    }
+    ctx.work.consume(units)
 }
 
 struct LiveTaskGuard {
@@ -561,7 +587,6 @@ async fn stage_loop(
                 SparrowError::new(ErrorCode::Internal, "transform missing rx")
             })?;
             while let Some(mut env) = rx.recv().await? {
-                ctx.work.begin_quantum();
                 let (batch, ctrl) = env.take();
                 if let Some(ctrl) = ctrl {
                     if !tx.send_control(ctrl).await? {
@@ -569,6 +594,10 @@ async fn stage_loop(
                     }
                 }
                 if let Some(batch) = batch {
+                    if ctx.work.would_exhaust(batch.num_rows() as u64) {
+                        tokio::task::yield_now().await;
+                        ctx.work.begin_quantum();
+                    }
                     if let Some(out) = apply_steps(&batch, &steps, &ctx.owner, &ctx.work)? {
                         if !tx.send(out).await? {
                             return Ok(0);
@@ -587,20 +616,35 @@ async fn stage_loop(
                 if ctx.cancel.is_cancelled() {
                     break;
                 }
-                let (batch, _) = env.take();
+                let (batch, ctrl) = env.take();
                 if let Some(batch) = batch {
                     ctx.metrics.record_emit(batch.num_rows() as u64);
                     capture.push(&schema, batch.rows());
                     if let Some(out) = &live_out {
+                        if let Some(aj) = &ctx.aligned {
+                            aj.outbox.enqueue();
+                        }
                         tokio::select! {
                             biased;
                             _ = ctx.cancel.cancelled() => break,
                             sent = out.send(batch.share()) => {
                                 if sent.is_err() {
+                                    if let Some(aj) = &ctx.aligned {
+                                        aj.outbox.ack();
+                                    }
                                     break;
                                 }
                             }
                         }
+                    }
+                }
+                if let Some(StreamControl::CheckpointBarrier { checkpoint_id }) = ctrl {
+                    if let Some(aj) = &ctx.aligned {
+                        wait_outbox(&aj.outbox, std::time::Duration::from_secs(5)).await?;
+                        let _ = aj
+                            .acks
+                            .send(AlignedAck::SinkFlushed { checkpoint_id })
+                            .await;
                     }
                 }
             }
@@ -626,6 +670,9 @@ async fn stage_loop(
                 ctx.max_state_keys,
                 ctx.max_timers,
             )?;
+            if let Some(freeze) = ctx.aligned.as_ref().and_then(|a| a.restore.as_ref()) {
+                op.restore_freeze(freeze)?;
+            }
             window_stage(&ctx, &mut op, rx, &tx, &capture).await
         }
         PhysicalStage::Deduplicate {
@@ -641,7 +688,6 @@ async fn stage_loop(
             })?;
             let mut op = DedupOperator::new(operator, spec, input, Arc::clone(&ctx.owner))?;
             while let Some(mut env) = rx.recv().await? {
-                ctx.work.begin_quantum();
                 let (batch, ctrl) = env.take();
                 if let Some(ctrl) = ctrl {
                     if !tx.send_control(ctrl).await? {
@@ -649,7 +695,7 @@ async fn stage_loop(
                     }
                 }
                 if let Some(batch) = batch {
-                    ctx.work.consume(batch.num_rows() as u64)?;
+                    consume_work(&ctx, batch.num_rows() as u64).await?;
                     let rows = op.on_batch(&batch, ctx.clock.now_micros())?;
                     if let Some(out) = op.build_batch(rows)? {
                         if !tx.send(out).await? {
@@ -688,7 +734,6 @@ async fn stage_loop(
                 LookupOperator::new(spec, table, input, Arc::clone(&ctx.owner))?
             };
             while let Some(mut env) = rx.recv().await? {
-                ctx.work.begin_quantum();
                 let (batch, ctrl) = env.take();
                 if let Some(ctrl) = ctrl {
                     if !tx.send_control(ctrl).await? {
@@ -696,7 +741,7 @@ async fn stage_loop(
                     }
                 }
                 if let Some(batch) = batch {
-                    ctx.work.consume(batch.num_rows() as u64)?;
+                    consume_work(&ctx, batch.num_rows() as u64).await?;
                     let rows = op.on_batch(&batch)?;
                     if let Some(out) = op.build_batch(rows)? {
                         if !tx.send(out).await? {
@@ -724,6 +769,16 @@ async fn emit_window(
         return Ok(false);
     }
     if let Some(wm) = emission.pending_close {
+        loop {
+            let chunk = op.take_closed_chunk(wm, ctx.mailbox.max_items.max(1), ctx.mailbox.max_bytes)?;
+            if chunk.is_empty() {
+                break;
+            }
+            if !send_rows_chunked(ctx, op, tx, chunk).await? {
+                return Ok(false);
+            }
+        }
+        op.advance_holdback(wm)?;
         if !tx
             .send_control(StreamControl::Watermark {
                 input: 0,
@@ -825,7 +880,6 @@ async fn window_stage(
             env = rx.recv() => {
                 match env? {
                     Some(mut env) => {
-                        ctx.work.begin_quantum();
                         let (batch, ctrl) = env.take();
                         if let Some(ctrl) = ctrl {
                             let emission = match ctrl {
@@ -838,8 +892,23 @@ async fn window_stage(
                                 StreamControl::Active { input } => {
                                     op.mark_active(sparrow_model::InputId(input))?
                                 }
-                                StreamControl::CheckpointBarrier { .. } => {
-                                    if !tx.send_control(ctrl).await? {
+                                StreamControl::CheckpointBarrier { checkpoint_id } => {
+                                    if let Some(aj) = &ctx.aligned {
+                                        let freeze = op.freeze();
+                                        let _ = aj
+                                            .acks
+                                            .send(AlignedAck::WindowFrozen {
+                                                checkpoint_id,
+                                                freeze,
+                                            })
+                                            .await;
+                                    }
+                                    if !tx
+                                        .send_control(StreamControl::CheckpointBarrier {
+                                            checkpoint_id,
+                                        })
+                                        .await?
+                                    {
                                         return Ok(n);
                                     }
                                     crate::window::WindowEmission::default()
@@ -851,7 +920,7 @@ async fn window_stage(
                             }
                         }
                         if let Some(batch) = batch {
-                            ctx.work.consume(batch.num_rows() as u64)?;
+                            consume_work(ctx, batch.num_rows() as u64).await?;
                             let emission = op.on_batch(&batch, ctx.clock.now_micros())?;
                             n += emission.finals.len();
                             if !emit_window(ctx, op, tx, capture, emission).await? {
@@ -909,7 +978,6 @@ async fn live_source(
                 let Some(first) = row else {
                     return Ok(n);
                 };
-                ctx.work.begin_quantum();
                 let mut buf = vec![first];
                 while buf.len() < ctx.rows_per_batch {
                     match live_in.try_recv() {
@@ -960,7 +1028,6 @@ async fn live_source_ordered(
                 let Some(ev) = ev else {
                     return Ok(n);
                 };
-                ctx.work.begin_quantum();
                 match ev {
                     IngressEvent::Row(first) => {
                         let mut buf = vec![first];

@@ -177,14 +177,8 @@ impl WatermarkHub {
         if let Some(bind) = &self.binding {
             if let Some(skew) = bind.max_future_skew_micros {
                 if event_time > now_micros.saturating_add(skew) {
-                    return Err(SparrowError::new(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "future timestamp {event_time} exceeds now {now_micros} + skew {skew}"
-                        ),
-                    )
-                    .context("event_time", event_time.to_string())
-                    .context("now", now_micros.to_string()));
+                    // Drop: do not advance max_et (P0-5). Job continues.
+                    return Ok(None);
                 }
             }
             let ooo = bind.out_of_orderness_micros;
@@ -401,11 +395,12 @@ mod tests {
             max_future_skew_micros: Some(1_000_000),
         };
         let mut h = WatermarkHub::new().with_binding(bind).unwrap();
-        let err = h
-            .observe_event(InputId(0), 10_000_000, 0)
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::InvalidArgument);
-        assert!(err.message.contains("future timestamp"));
+        assert_eq!(
+            h.observe_event(InputId(0), 10_000_000, 0).unwrap(),
+            None,
+            "beyond max_future_skew must drop, not fail the job"
+        );
+        assert!(h.effective().is_none(), "dropped future event must not advance watermark");
     }
 
     #[test]

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "MQTT source, HTTP/Log sinks, secrets, and target policy (outside sparrow-runtime)"
 
+[features]
+default = ["demo-io"]
+demo-io = []
+
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }
 sparrow-io = { path = "../sparrow-io" }
@@ -14,6 +18,9 @@ tokio-util = { workspace = true }
 serde_json = "1"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "1.0.9"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

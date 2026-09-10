@@ -72,11 +72,30 @@ impl MqttSourceConfig {
             ));
         }
         policy.check_host_port(&self.host, self.port)?;
+        if (self.username_secret.is_some() || self.password_secret.is_some()) && !self.tls.enabled
+        {
+            return Err(ConnectorError::new(
+                ErrorCode::PolicyDenied,
+                "MQTT credentials require TLS; refusing plaintext username/password",
+            ));
+        }
         if let Some(name) = &self.username_secret {
             let _ = secrets.resolve(name)?;
         }
         if let Some(name) = &self.password_secret {
             let _ = secrets.resolve(name)?;
+        }
+        let worst = self
+            .inbox_capacity
+            .saturating_mul(self.json_limits.max_bytes);
+        if worst > 4 * 1024 * 1024 {
+            return Err(ConnectorError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "MQTT inbox worst-case {}B exceeds 4MiB byte bound (inbox_capacity × max_record)",
+                    worst
+                ),
+            ));
         }
         Ok(())
     }
@@ -283,6 +302,7 @@ impl MqttSource {
                                 }
                                 Ok(None) | Err(_) => {
                                     self.diag.mqtt_dropped_bad.fetch_add(1, Ordering::Relaxed);
+                                    self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                         }

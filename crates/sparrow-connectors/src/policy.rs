@@ -1,4 +1,5 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 use sparrow_model::ErrorCode;
 
@@ -83,6 +84,165 @@ impl TargetPolicy {
     }
 }
 
+/// Allowlisted roots for File/replay paths and `checkpoint_dir` (P0-12).
+///
+/// Override with `SPARROW_DATA_ROOTS` (colon-separated). Defaults include the
+/// process cwd, `/tmp`, and the platform temp dir so tests and local demos work.
+pub fn data_roots() -> Vec<PathBuf> {
+    if let Ok(raw) = std::env::var("SPARROW_DATA_ROOTS") {
+        let roots: Vec<PathBuf> = raw
+            .split(':')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+    let mut roots = vec![
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+    ];
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    roots
+}
+
+/// Reject file / checkpoint paths that escape the allowlisted roots.
+pub fn check_data_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(ConnectorError::new(
+            ErrorCode::InvalidArgument,
+            "file path is empty",
+        ));
+    }
+    let resolved = resolve_for_policy(path)?;
+    let roots = data_roots();
+    let mut resolved_roots = Vec::new();
+    for root in &roots {
+        resolved_roots.push(resolve_for_policy(root).unwrap_or_else(|_| root.clone()));
+    }
+    let ok = resolved_roots.iter().any(|root| {
+        resolved.starts_with(root) || path.starts_with(root)
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(ConnectorError::new(
+            ErrorCode::PolicyDenied,
+            format!(
+                "path `{}` is outside SPARROW_DATA_ROOTS allowlist",
+                path.display()
+            ),
+        ))
+    }
+}
+
+fn resolve_for_policy(path: &Path) -> Result<PathBuf> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                ConnectorError::new(ErrorCode::Internal, format!("cwd: {e}"))
+            })?
+            .join(path)
+    };
+    let mut cur = abs.clone();
+    let mut missing = Vec::new();
+    while !cur.exists() {
+        match cur.file_name() {
+            Some(name) => {
+                missing.push(name.to_os_string());
+                cur.pop();
+            }
+            None => break,
+        }
+    }
+    let mut canon = if cur.exists() {
+        cur.canonicalize().map_err(|e| {
+            ConnectorError::new(
+                ErrorCode::PolicyDenied,
+                format!("canonicalize {}: {e}", cur.display()),
+            )
+        })?
+    } else {
+        cur
+    };
+    for name in missing.iter().rev() {
+        if name == ".." {
+            return Err(ConnectorError::new(
+                ErrorCode::PolicyDenied,
+                "path must not contain `..` escapes outside an existing prefix",
+            ));
+        }
+        canon.push(name);
+    }
+    Ok(canon)
+}
+
+/// HttpPush bind policy (P0-12): loopback is allowed; unspecified / public
+/// binds are denied unless the host:port is on the allowlist.
+pub fn check_bind_addr(bind: &str, policy: &TargetPolicy) -> Result<()> {
+    let (host, port) = parse_bind(bind)?;
+    if host == "0.0.0.0" || host == "::" || host == "[::]" {
+        return Err(ConnectorError::new(
+            ErrorCode::PolicyDenied,
+            format!("HttpPush bind `{bind}` is unspecified; refuse open bind"),
+        ));
+    }
+    if is_loopback_host(&host) {
+        return Ok(());
+    }
+    if is_blocked_host(&host) {
+        return Err(ConnectorError::new(
+            ErrorCode::PolicyDenied,
+            format!("HttpPush bind host `{host}` is blocked"),
+        ));
+    }
+    policy.check_host_port(&host, port)
+}
+
+fn parse_bind(bind: &str) -> Result<(String, u16)> {
+    if let Ok(sa) = bind.parse::<SocketAddr>() {
+        return Ok((sa.ip().to_string(), sa.port()));
+    }
+    if let Some((host, port)) = bind.rsplit_once(':') {
+        let port = port.parse::<u16>().map_err(|_| {
+            ConnectorError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid HttpPush bind `{bind}`"),
+            )
+        })?;
+        let host = host.trim_matches(|c| c == '[' || c == ']').to_string();
+        if host.is_empty() {
+            return Err(ConnectorError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid HttpPush bind `{bind}`"),
+            ));
+        }
+        return Ok((host, port));
+    }
+    Err(ConnectorError::new(
+        ErrorCode::InvalidArgument,
+        format!("invalid HttpPush bind `{bind}`"),
+    ))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_matches(|c| c == '[' || c == ']');
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
+}
+
 fn host_eq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -132,5 +292,21 @@ mod tests {
                 .code(),
             ErrorCode::PolicyDenied
         );
+    }
+
+    #[test]
+    fn p0_12_tmp_path_is_allowed() {
+        let p = std::env::temp_dir().join("sparrow-policy-ok.ndjson");
+        check_data_path(&p).expect("temp dir is a default data root");
+    }
+
+    #[test]
+    fn p0_12_http_push_rejects_unspecified_bind() {
+        let p = TargetPolicy::deny_all();
+        assert_eq!(
+            check_bind_addr("0.0.0.0:8080", &p).unwrap_err().code(),
+            ErrorCode::PolicyDenied
+        );
+        check_bind_addr("127.0.0.1:0", &p).unwrap();
     }
 }
