@@ -64,6 +64,12 @@ pub struct SourceSpec {
     /// MQTT/HTTP TLS. Credentials require this to be true (P0-11).
     #[serde(default)]
     pub tls: bool,
+    /// File growth + EOF contract: `append_only`, `sealed`, or `immutable`.
+    /// Aligned file jobs default to `append_only` (poll on EOF, no terminal
+    /// watermark). Restart-fresh file jobs default to `sealed` (EOF closes
+    /// final ET windows and the job may complete).
+    #[serde(default)]
+    pub file_contract: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -1085,6 +1085,7 @@ mod tests {
                 bind: None,
                 path: None,
                 tls: false,
+                file_contract: None,
             },
             sink: SinkSpec {
                 kind: "http".into(),

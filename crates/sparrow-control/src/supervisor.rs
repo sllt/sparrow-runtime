@@ -9,7 +9,7 @@ use sparrow_connectors::{
     publish_qos0, sensor_json, EmbeddedBroker, FileReplayConfig, FileReplaySource, HttpCapture,
     HttpPushSource, HttpSink, IoDiagnostics, LogSink, MqttSink, MqttSource,
 };
-use sparrow_io::{RecordSource, ReplayableSource};
+use sparrow_io::ReplayableSource;
 use sparrow_model::{
     InflightCounter, RecoveryPolicy, ResourceBudget, Result, SparrowError, StateSlotId,
 };
@@ -490,42 +490,33 @@ impl Supervisor {
                 .start_file_aligned(name, spec, schema, plan, path)
                 .await;
         }
-        let cfg = FileReplayConfig::new(&path, schema.clone());
-        let mut src =
+        let contract = crate::validate::resolve_file_contract(spec, recovery)?;
+        let mut cfg = FileReplayConfig::new(&path, schema.clone());
+        cfg.contract = contract;
+        let src =
             FileReplaySource::open(&cfg).map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
         let inbox = spec.source.inbox_capacity.max(1);
         let outbox = spec.sink.outbox_capacity.max(1);
-        let (tx_in, rx_in) = tokio::sync::mpsc::channel(inbox);
+        let (tx_ev, rx_ev) = tokio::sync::mpsc::channel(inbox);
         let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox);
         let capture = SharedCapture::disabled();
-        let job = self
-            .kernel
-            .submit(JobRequest::new(plan, Vec::new(), capture).with_live_io(rx_in, tx_out))?;
+        let job = self.kernel.submit(
+            JobRequest::new(plan, Vec::new(), capture)
+                .with_live_events(rx_ev)
+                .with_live_out(tx_out),
+        )?;
         let cancel = job.cancellation();
+        let diag = IoDiagnostics::new();
+        let diag_src = Arc::clone(&diag);
         let source = self.kernel.handle().spawn({
             let cancel = cancel.clone();
             async move {
-                loop {
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    match src.next_frame() {
-                        Ok(Some(frame)) => {
-                            if let Ok(Some(row)) = src.decode_frame(&frame) {
-                                if tx_in.send(row).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            tokio::time::sleep(Duration::from_millis(40)).await;
-                        }
-                        Err(_) => break,
-                    }
-                }
+                let _ = crate::file_source::run_file_source(
+                    src, contract, tx_ev, cancel, diag_src, None, None,
+                )
+                .await;
             }
         });
-        let diag = IoDiagnostics::new();
         let sink = self.spawn_sink(
             spec,
             rx_out,
@@ -566,8 +557,10 @@ impl Supervisor {
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.recovery = RecoveryPolicy::Aligned;
         cfg.restore = spec.restore_claim()?;
-        // Aligned files keep growing after a cut; R28 immutable is for sealed files.
-        cfg.contract = sparrow_connectors::FileContract::AppendOnly;
+        // Aligned growing files default to AppendOnly (N5): EOF polls, no
+        // terminal MAX watermark. Finite fixtures set source.file_contract=sealed.
+        let contract = crate::validate::resolve_file_contract(spec, RecoveryPolicy::Aligned)?;
+        cfg.contract = contract;
         let mut source =
             FileReplaySource::open(&cfg).map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
         let restore = matches!(
@@ -619,7 +612,7 @@ impl Supervisor {
         let store_r = Arc::clone(&store);
         let layout_r = Arc::clone(&layout);
         let source_task = self.kernel.handle().spawn(async move {
-            let mut eof_punctuated = false;
+            let mut terminal_sent = false;
             loop {
                 if child.is_cancelled() {
                     return Ok(());
@@ -709,53 +702,20 @@ impl Supervisor {
                         }
                     }
                     _ = tokio::task::yield_now() => {
-                        let read = tokio::task::spawn_blocking(move || {
-                            let frame = source.next_frame();
-                            match frame {
-                                Ok(Some(f)) => {
-                                    let row = source.decode_frame(&f).ok().flatten();
-                                    let p = source.position();
-                                    Ok((source, Some(row), p))
-                                }
-                                Ok(None) => {
-                                    let p = source.position();
-                                    Ok((source, None, p))
-                                }
-                                Err(e) => Err(e),
-                            }
-                        })
-                        .await
-                        .map_err(|e| {
-                            SparrowError::new(
-                                sparrow_model::ErrorCode::Internal,
-                                format!("file replay worker: {e}"),
-                            )
-                        })?;
-                        let (src, row, p) = read?;
+                        let (src, poll) = crate::file_source::take_file_poll(source).await?;
                         source = src;
-                        *pos_r.lock().expect("pos") = p;
-                        match row {
-                            Some(Some(row)) => {
-                                ingested_r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                if tx_ev.send(IngressEvent::Row(row)).await.is_err() {
-                                    return Ok(());
-                                }
-                            }
-                            Some(None) => {
-                                diag_src.decode_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            None => {
-                                if !eof_punctuated {
-                                    eof_punctuated = true;
-                                    let _ = tx_ev
-                                        .send(IngressEvent::Control(StreamControl::Watermark {
-                                            input: 0,
-                                            wm_micros: i64::MAX / 4,
-                                        }))
-                                        .await;
-                                }
-                                tokio::time::sleep(Duration::from_millis(40)).await;
-                            }
+                        *pos_r.lock().expect("pos") = source.position();
+                        if crate::file_source::apply_file_poll(
+                            poll,
+                            contract,
+                            &tx_ev,
+                            &diag_src,
+                            &mut terminal_sent,
+                            Some(&ingested_r),
+                        )
+                        .await?
+                        {
+                            return Ok(());
                         }
                     }
                 }
