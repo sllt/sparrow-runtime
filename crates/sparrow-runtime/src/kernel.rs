@@ -205,6 +205,10 @@ impl Kernel {
         self.live_tasks.load(Ordering::SeqCst)
     }
 
+    pub fn budget(&self) -> ResourceBudget {
+        self.opts.budget
+    }
+
     /// Tokio handle for composition-root connector tasks (MQTT/HTTP).
     pub fn handle(&self) -> tokio::runtime::Handle {
         self.rt.handle().clone()

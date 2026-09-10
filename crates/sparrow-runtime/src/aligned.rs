@@ -88,6 +88,8 @@ impl AlignedSession {
             budget.max_timers,
         )?;
         let layout = Self::layout_for(operator, &spec, table.as_ref());
+        let mut store = store;
+        store.set_max_state_keys(budget.max_state_keys);
         Ok(Self {
             operator: op,
             store,
@@ -125,6 +127,8 @@ impl AlignedSession {
         source: &mut dyn ReplayableSource,
         table: Option<TableRevisionBind>,
     ) -> Result<Self> {
+        let mut store = store;
+        store.set_max_state_keys(budget.max_state_keys);
         let snap = store.recover_required()?;
         let live = Self::layout_for(operator, &spec, table.as_ref());
         snap.check_compatible(&live)?;
@@ -230,7 +234,7 @@ impl AlignedSession {
             layout: self.layout.clone(),
             table: self.table.clone(),
         };
-        let encoded = match snap.encode() {
+        let encoded = match snap.encode_with_max_state_keys(self.store.max_state_keys()) {
             Ok(b) => b,
             Err(e) => {
                 self.coordinator.abort_now("encode failed");
@@ -812,6 +816,34 @@ mod tests {
             .unwrap()
             .expect("previous CURRENT must survive a later abort");
         assert_eq!(recovered.checkpoint_id, id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn n6_aligned_store_uses_budget_max_state_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "sparrow-aligned-n6-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let budget = ResourceBudget {
+            max_state_keys: 8192,
+            ..ResourceBudget::performance()
+        };
+        let session = AlignedSession::open(
+            CheckpointStore::open(&dir).unwrap(),
+            count_spec(),
+            count_schema(),
+            OperatorId::new(2),
+            budget,
+            SourcePosition::start(sparrow_io::SourceIdentity::memory("n6", 0, 0)),
+        )
+        .unwrap();
+        assert_eq!(session.store.max_state_keys(), 8192);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

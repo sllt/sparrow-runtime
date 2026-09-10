@@ -553,7 +553,10 @@ impl Supervisor {
             .unwrap_or_else(|| format!("{path}.sparrow-chk"));
         sparrow_connectors::policy::check_data_path(std::path::Path::new(&path))?;
         sparrow_connectors::policy::check_data_path(std::path::Path::new(&chk))?;
-        let store = CheckpointStore::open(std::path::Path::new(&chk))?;
+        let store = CheckpointStore::open_with_max_state_keys(
+            std::path::Path::new(&chk),
+            self.kernel.budget().max_state_keys,
+        )?;
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.recovery = RecoveryPolicy::Aligned;
         cfg.restore = spec.restore_claim()?;
