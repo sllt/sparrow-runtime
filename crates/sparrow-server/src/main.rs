@@ -34,7 +34,12 @@ fn parse_opts() -> Result<Opts, SparrowError> {
             "--bind" => bind = args.next().ok_or_else(|| arg("--bind needs a value"))?,
             "--token" => token = args.next().ok_or_else(|| arg("--token needs a value"))?,
             "--catalog" => catalog = args.next().ok_or_else(|| arg("--catalog needs a value"))?,
-            "--safe-mode" => safe_mode = true,
+            "--safe-mode" => {
+                safe_mode = true;
+                if std::env::var_os("SPARROW_SAFE_MODE").is_none() {
+                    std::env::set_var("SPARROW_SAFE_MODE", "1");
+                }
+            }
             "--demo-io" => demo_io = true,
             "--allow-remote" => allow_remote = true,
             "-h" | "--help" => {
@@ -51,7 +56,10 @@ fn parse_opts() -> Result<Opts, SparrowError> {
         ));
     }
     let addr: SocketAddr = bind.parse().map_err(|e| {
-        SparrowError::new(ErrorCode::InvalidArgument, format!("invalid --bind {bind}: {e}"))
+        SparrowError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid --bind {bind}: {e}"),
+        )
     })?;
     if !addr.ip().is_loopback() && !allow_remote {
         return Err(SparrowError::new(
@@ -81,9 +89,15 @@ sparrow-server — Sparrow V0.1 control plane
   --bind ADDR         default {DEFAULT_BIND} (loopback)
   --token TOKEN       or SPARROW_TOKEN (required)
   --catalog PATH      SQLite file (or :memory:)
-  --safe-mode         do not auto-activate pipelines whose last attempt failed
+  --safe-mode         do not auto-activate pipelines whose last attempt failed;
+                      also requires SPARROW_DATA_ROOTS for file/checkpoint paths
   --demo-io           start in-process MQTT broker + HTTP capture
   --allow-remote      allow a non-loopback bind
+
+  SPARROW_DATA_ROOTS  colon-separated file/checkpoint allowlist. When unset,
+                      only {{temp_dir}}/sparrow is allowed (never cwd, never /tmp
+                      as a whole). Empty or --safe-mode without this env denies
+                      file paths.
 
 Delivery: live_best_effort + restart_fresh by default.
   File/replay may use recovery=aligned (not exactly-once). MQTT cannot restore.

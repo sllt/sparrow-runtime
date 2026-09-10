@@ -137,10 +137,18 @@ impl PipelineSpec {
             ));
         }
         let spec: Self = serde_json::from_slice(bytes).map_err(|e| {
-            SparrowError::new(ErrorCode::InvalidArgument, format!("pipeline spec JSON: {e}"))
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("pipeline spec JSON: {e}"),
+            )
         })?;
-        spec.basic_check()?;
+        spec.validate()?;
         Ok(spec)
+    }
+
+    /// Spec-level checks used by PUT / bind. Rejects blank SQL.
+    pub fn validate(&self) -> Result<()> {
+        self.basic_check()
     }
 
     pub fn basic_check(&self) -> Result<()> {
@@ -151,10 +159,19 @@ impl PipelineSpec {
             ));
         }
         if self.stream.is_empty() {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument, "stream is required"));
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "stream is required",
+            ));
         }
         match (&self.sql, &self.graph) {
             (Some(sql), None) => {
+                if sql.trim().is_empty() {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        "SQL must not be empty",
+                    ));
+                }
                 if sql.len() > MAX_SQL_BYTES {
                     return Err(SparrowError::new(
                         ErrorCode::MaxRecordSize,

@@ -6,7 +6,10 @@ use sparrow_model::ErrorCode;
 
 use crate::spec::{PipelineSpec, SinkSpec, SourceSpec};
 use crate::store::Store;
-use crate::supervisor::{compact_kernel, request_start, request_start_at, Supervisor};
+use crate::supervisor::{
+    compact_kernel, request_start, request_start_at, request_stop, Supervisor,
+    MAX_PIPELINE_ATTEMPTS,
+};
 
 const STREAM: &str = r#"{"fields":[
   {"name":"device_id","type":"utf8","nullable":false},
@@ -14,7 +17,7 @@ const STREAM: &str = r#"{"fields":[
 ]}"#;
 
 fn tmp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
+    sparrow_connectors::ensure_default_data_root().join(format!(
         "sparrow-ctl-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -151,7 +154,10 @@ fn r23_start_named_uses_desired_revision_not_latest() {
     let loaded = store
         .get_pipeline_revision("rev", desired.revision.unwrap())
         .unwrap();
-    assert_eq!(loaded.spec.sql.as_deref(), Some("SELECT device_id FROM sensors"));
+    assert_eq!(
+        loaded.spec.sql.as_deref(),
+        Some("SELECT device_id FROM sensors")
+    );
     let latest = store.get_pipeline("rev").unwrap();
     assert_eq!(latest.latest_revision, 2);
     assert_ne!(loaded.spec.sql, latest.spec.sql);
@@ -202,7 +208,140 @@ fn mqtt_aligned_still_rejected() {
         restore: None,
         checkpoint_dir: None,
     };
-    assert_eq!(spec.check_delivery().unwrap_err().code, ErrorCode::UnsupportedRestore);
+    assert_eq!(
+        spec.check_delivery().unwrap_err().code,
+        ErrorCode::UnsupportedRestore
+    );
+}
+
+#[test]
+fn n1_healthy_start_stop_cycles_not_held() {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let path = tmp("n1-cycles.ndjson");
+        std::fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n").unwrap();
+        let spec = file_spec(
+            &path.to_string_lossy(),
+            "SELECT device_id FROM sensors",
+            "restart_fresh",
+            None,
+        );
+        store.put_pipeline("n1cycles", &spec, None).unwrap();
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        for i in 0..10 {
+            request_start(&store, "n1cycles", "test").unwrap();
+            let _ = sup.converge_once().await;
+            let actual = store.actual("n1cycles").unwrap();
+            assert_eq!(
+                actual.status, "running",
+                "cycle {i} must start: attempt_id={} cf={} err={:?}",
+                actual.attempt_id, actual.consecutive_failures, actual.last_error
+            );
+            assert_eq!(actual.consecutive_failures, 0);
+            request_stop(&store, "n1cycles", "test").unwrap();
+            let _ = sup.converge_once().await;
+            let actual = store.actual("n1cycles").unwrap();
+            assert_eq!(actual.status, "stopped", "cycle {i} stop: {actual:?}");
+        }
+        request_start(&store, "n1cycles", "test").unwrap();
+        let _ = sup.converge_once().await;
+        let actual = store.actual("n1cycles").unwrap();
+        assert_eq!(
+            actual.status, "running",
+            "after ≥10 healthy start/stop cycles must still start; not stuck stopped without error: {actual:?}"
+        );
+        assert!(
+            actual.attempt_id >= 16,
+            "lifetime attempt_id should have passed the old cap: {}",
+            actual.attempt_id
+        );
+        assert_eq!(actual.consecutive_failures, 0);
+        assert!(
+            actual.last_error.is_none()
+                || !actual
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("held:"),
+            "{:?}",
+            actual.last_error
+        );
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+#[test]
+fn n1_consecutive_failure_cap_holds_with_error() {
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let path = tmp("n1-cap.ndjson");
+        std::fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n").unwrap();
+        let spec = file_spec(
+            &path.to_string_lossy(),
+            "SELECT device_id FROM sensors",
+            "restart_fresh",
+            None,
+        );
+        store.put_pipeline("n1cap", &spec, None).unwrap();
+        for _ in 0..MAX_PIPELINE_ATTEMPTS {
+            let attempt = store
+                .actual("n1cap")
+                .map(|a| a.attempt_id.saturating_add(1))
+                .unwrap_or(1);
+            store
+                .set_actual("n1cap", "failed", Some(1), attempt, Some("boom"))
+                .unwrap();
+        }
+        let before = store.actual("n1cap").unwrap();
+        assert!(
+            before.consecutive_failures >= MAX_PIPELINE_ATTEMPTS,
+            "{before:?}"
+        );
+        store.set_desired("n1cap", "running", Some(1)).unwrap();
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        let _ = sup.converge_once().await;
+        let held = store.actual("n1cap").unwrap();
+        assert_ne!(
+            held.status, "running",
+            "cap must skip converge start: {held:?}"
+        );
+        let err = held.last_error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("held:") && err.contains("consecutive_failures"),
+            "held pipeline must record last_error, got {held:?}"
+        );
+        request_start(&store, "n1cap", "test").unwrap();
+        assert_eq!(store.actual("n1cap").unwrap().consecutive_failures, 0);
+        let _ = sup.converge_once().await;
+        let after = store.actual("n1cap").unwrap();
+        assert_eq!(
+            after.status, "running",
+            "request_start must clear the hold: {after:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+#[test]
+fn n2_empty_sql_is_invalid_argument() {
+    let mut spec = file_spec(
+        "/tmp/n2.ndjson",
+        "SELECT device_id FROM sensors",
+        "restart_fresh",
+        None,
+    );
+    spec.sql = Some(String::new());
+    let err = spec.validate().unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+    spec.sql = Some("   \n".into());
+    assert_eq!(
+        spec.validate().unwrap_err().code,
+        ErrorCode::InvalidArgument
+    );
 }
 
 #[test]
@@ -235,13 +374,22 @@ fn p0_1_aligned_rejects_or_honors_where_projection() {
             .any(|s| matches!(s, sparrow_plan::PhysicalStage::Transform { .. })),
         "WHERE must remain on the aligned Kernel plan"
     );
-    let spec = file_spec("/tmp/p01.ndjson", sql, "aligned", Some("/tmp/p01-chk"));
+    let root = sparrow_connectors::ensure_default_data_root();
+    let spec = file_spec(
+        &root.join("p01.ndjson").to_string_lossy(),
+        sql,
+        "aligned",
+        Some(&root.join("p01-chk").to_string_lossy()),
+    );
     crate::validate::validate_aligned_plan(&spec, &plan)
         .expect("aligned+WHERE must be honored (not stripped/rejected)");
     let kernel = compact_kernel().unwrap();
-    let rows = [1, 2, 3, 4].into_iter().map(|v| Row {
-        values: vec![Scalar::utf8("d1"), Scalar::Int64(v)],
-    }).collect();
+    let rows = [1, 2, 3, 4]
+        .into_iter()
+        .map(|v| Row {
+            values: vec![Scalar::utf8("d1"), Scalar::Int64(v)],
+        })
+        .collect();
     let cap = SharedCapture::new();
     kernel
         .run(JobRequest::new(plan, rows, cap.clone()))
@@ -256,9 +404,7 @@ fn p0_1_aligned_rejects_or_honors_where_projection() {
 
 #[test]
 fn p0_2_pt_aligned_rejected() {
-    use sparrow_model::{
-        DataType, Field, FieldId, PipelineId, RevisionId, Schema, SchemaId,
-    };
+    use sparrow_model::{DataType, Field, FieldId, PipelineId, RevisionId, Schema, SchemaId};
     use sparrow_plan::{physicalize, Catalog, PlanOptions};
     use sparrow_sql::bind_sql;
 
@@ -278,12 +424,17 @@ fn p0_2_pt_aligned_rejected() {
     let bound = bind_sql(sql, &cat, PipelineId::new(1), RevisionId::new(1)).unwrap();
     let plan = physicalize(&bound, &PlanOptions { fuse: true });
     assert!(plan.has_processing_time_window());
-    let spec = file_spec("/tmp/p02.ndjson", sql, "aligned", Some("/tmp/p02-chk"));
+    let root = sparrow_connectors::ensure_default_data_root();
+    let spec = file_spec(
+        &root.join("p02.ndjson").to_string_lossy(),
+        sql,
+        "aligned",
+        Some(&root.join("p02-chk").to_string_lossy()),
+    );
     let err = crate::validate::validate_aligned_plan(&spec, &plan).unwrap_err();
     assert_eq!(err.code, ErrorCode::UnsupportedRestore);
     assert!(
-        err.message.to_ascii_lowercase().contains("processing-time")
-            || err.message.contains("PT"),
+        err.message.to_ascii_lowercase().contains("processing-time") || err.message.contains("PT"),
         "{}",
         err.message
     );
@@ -318,7 +469,10 @@ fn p0_4_barrier_waits_for_real_sink_flush() {
         assert_eq!(actual.status, "running", "{:?}", actual.last_error);
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         let current = chk.join("CURRENT");
-        assert!(!current.exists(), "CURRENT must not exist before checkpoint");
+        assert!(
+            !current.exists(),
+            "CURRENT must not exist before checkpoint"
+        );
         let appeared_early = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&appeared_early);
         let watch = current.clone();

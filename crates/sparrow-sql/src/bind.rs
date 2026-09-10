@@ -1,17 +1,17 @@
 //! Bind G0-accepted SQL onto the shared logical IR.
 
+use sparrow_expr::{infer_type, BinaryOp, Expr};
+use sparrow_model::error::{ErrorCode, Result, SparrowError};
+use sparrow_model::{DataType, PipelineId, RevisionId, Scalar, Schema, SchemaId};
+use sparrow_plan::catalog::project_schema;
+use sparrow_plan::BoundLogicalPlan;
+use sparrow_plan::{bind_linear, Catalog};
 use sqlparser::ast::{
     BinaryOperator, CastKind, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, Query, Select, SelectItem, SetExpr, Statement, TableFactor, Value,
     ValueWithSpan,
 };
 use sqlparser::parser::Parser;
-use sparrow_expr::{infer_type, BinaryOp, Expr};
-use sparrow_model::error::{ErrorCode, Result, SparrowError};
-use sparrow_model::{DataType, PipelineId, RevisionId, Scalar, Schema, SchemaId};
-use sparrow_plan::catalog::project_schema;
-use sparrow_plan::{bind_linear, Catalog};
-use sparrow_plan::BoundLogicalPlan;
 
 use crate::g0::{check_sql, g0_dialect};
 
@@ -21,7 +21,19 @@ pub fn bind_sql(
     pipeline: PipelineId,
     revision: RevisionId,
 ) -> Result<BoundLogicalPlan> {
+    if sql.trim().is_empty() {
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "SQL must not be empty",
+        ));
+    }
     if let Ok(statements) = Parser::parse_sql(&g0_dialect(), sql) {
+        if statements.is_empty() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "empty SQL statement",
+            ));
+        }
         match classify_statement(&statements[0]) {
             SqlFamily::V03 => {
                 return crate::bind_v03::bind_sql_v03(sql, catalog, pipeline, revision);
@@ -34,12 +46,19 @@ pub fn bind_sql(
     }
     let verdict = check_sql(sql)?;
     if !verdict.accepted {
-        return Err(SparrowError::new(ErrorCode::FeatureUnavailable, verdict.reason)
-            .context("sql", sql.chars().take(80).collect::<String>()));
+        return Err(
+            SparrowError::new(ErrorCode::FeatureUnavailable, verdict.reason)
+                .context("sql", sql.chars().take(80).collect::<String>()),
+        );
     }
-    let statements = Parser::parse_sql(&g0_dialect(), sql).map_err(|e| {
-        SparrowError::new(ErrorCode::InvalidArgument, format!("parse error: {e}"))
-    })?;
+    let statements = Parser::parse_sql(&g0_dialect(), sql)
+        .map_err(|e| SparrowError::new(ErrorCode::InvalidArgument, format!("parse error: {e}")))?;
+    if statements.is_empty() {
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "empty SQL statement",
+        ));
+    }
     let Statement::Query(query) = &statements[0] else {
         return Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
@@ -120,7 +139,13 @@ fn group_tumble_is_event_time(select: &Select) -> bool {
                 FunctionArguments::List(list) => &list.args,
                 _ => continue,
             };
-            if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(first)) | FunctionArg::Named { arg: FunctionArgExpr::Expr(first), .. }) = args.first()
+            if let Some(
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(first))
+                | FunctionArg::Named {
+                    arg: FunctionArgExpr::Expr(first),
+                    ..
+                },
+            ) = args.first()
             {
                 return !is_pt_ident(first);
             }
@@ -200,7 +225,10 @@ pub(crate) fn sql_expr_pub(expr: &SqlExpr) -> Result<Expr> {
     sql_expr(expr)
 }
 
-pub(crate) fn project_list_pub(items: &[SelectItem], schema: &Schema) -> Result<(Vec<Expr>, Vec<String>)> {
+pub(crate) fn project_list_pub(
+    items: &[SelectItem],
+    schema: &Schema,
+) -> Result<(Vec<Expr>, Vec<String>)> {
     project_list(items, schema)
 }
 
@@ -281,10 +309,7 @@ fn sql_expr(expr: &SqlExpr) -> Result<Expr> {
             name: id.value.clone(),
         }),
         SqlExpr::CompoundIdentifier(parts) => Ok(Expr::Column {
-            name: parts
-                .last()
-                .map(|p| p.value.clone())
-                .unwrap_or_default(),
+            name: parts.last().map(|p| p.value.clone()).unwrap_or_default(),
         }),
         SqlExpr::Value(v) => Ok(Expr::Literal(value_to_scalar(v)?)),
         SqlExpr::TypedString(ts) => Ok(Expr::Literal(value_to_scalar(&ts.value)?)),
@@ -358,7 +383,10 @@ fn sql_expr(expr: &SqlExpr) -> Result<Expr> {
             right: Box::new(sql_expr(right)?),
         }),
         SqlExpr::Cast {
-            kind, expr, data_type, ..
+            kind,
+            expr,
+            data_type,
+            ..
         } => {
             let target = map_sql_type(data_type)?;
             let inner = Box::new(sql_expr(expr)?);
@@ -575,7 +603,10 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n.kind, BoundKind::Filter { .. })),
             "JOIN WHERE must produce a Filter node: {:?}",
-            plan.nodes.iter().map(|n| format!("{:?}", n.kind)).collect::<Vec<_>>()
+            plan.nodes
+                .iter()
+                .map(|n| format!("{:?}", n.kind))
+                .collect::<Vec<_>>()
         );
         assert!(plan
             .nodes
@@ -629,6 +660,19 @@ mod tests {
             err.code == ErrorCode::FeatureUnavailable || err.message.contains("aggregate"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn n2_empty_sql_is_invalid_argument() {
+        for sql in ["", "   ", "\n\t", ";"] {
+            let err =
+                bind_sql(sql, &catalog(), PipelineId::new(1), RevisionId::new(1)).expect_err(sql);
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidArgument,
+                "empty/blank SQL must not panic or be FeatureUnavailable: {sql:?} => {err}"
+            );
+        }
     }
 
     #[test]

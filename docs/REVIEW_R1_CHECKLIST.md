@@ -50,7 +50,7 @@ Mark `- [x]` only when the item is fixed **and** covered by a semantic test
 - [ ] **P1-14** freeze clone bounded / documented → still full clone under `max_state_keys`; not incremental
 - [ ] **P1-17** decode errors counted + optional fail policy → `IoDiagnostics.decode_errors` incremented; no job-wide fail-on-decode switch
 - [x] **P1-18** `IoDiagnostics` on `RunningJob` and `/v1/metrics` → `r11_checkpoint_via_api_flushes_then_commits` metrics include `io`. `be2a784`
-- [x] **P1-19** converge backoff; per-pipeline attempt cap; safe_mode clarified → `MAX_PIPELINE_ATTEMPTS=16`; `r24_start_failure_is_actual_failed`. `be2a784`
+- [x] **P1-19** converge backoff; per-pipeline attempt cap; safe_mode clarified → `MAX_PIPELINE_ATTEMPTS=16` now applies to `consecutive_failures` (R2 N1). `r24_start_failure_is_actual_failed` / `n1_healthy_start_stop_cycles_not_held`. See `docs/REVIEW_R2_BATCH1.md`.
 - [x] **P1-21** WorkBudget yields at quota (not reset every envelope) → `would_exhaust` + `begin_quantum`; `r02_quantum_allows_more_events_than_old_lifetime_cap`. `f19167e` / `2348289`
 - [x] **P1-22** HTTP sink batch POST; do not retry 4xx → `http_sink_posts_to_capture` expects JSON array body. `2f3ad59`
 - [ ] **P1-23** finite source emits final ET windows before cleanup → EOF sends a large ET watermark; no dedicated semantic test

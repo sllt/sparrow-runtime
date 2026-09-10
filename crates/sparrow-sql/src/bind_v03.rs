@@ -1,11 +1,5 @@
 //! Bind V0.3 SQL: event-time TUMBLE/HOP, holdback, versioned lookup.
 
-use sqlparser::ast::{
-    BinaryOperator, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, JoinConstraint, JoinOperator, Select, SelectItem, SetExpr, Statement,
-    TableFactor, TableVersion, ValueWithSpan,
-};
-use sqlparser::parser::Parser;
 use sparrow_expr::{infer_type, Expr};
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sparrow_model::{
@@ -16,6 +10,12 @@ use sparrow_plan::{
     bind_linear, bind_lookup_linear, bind_window_linear, BoundKind, BoundLogicalPlan, Catalog,
     LookupSpec, WindowSpec,
 };
+use sqlparser::ast::{
+    BinaryOperator, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, JoinConstraint, JoinOperator, Select, SelectItem, SetExpr, Statement, TableFactor,
+    TableVersion, ValueWithSpan,
+};
+use sqlparser::parser::Parser;
 
 use crate::bind::{sql_expr_pub, table_name_pub};
 use crate::g0::g0_dialect;
@@ -29,11 +29,19 @@ pub fn bind_sql_v03(
 ) -> Result<BoundLogicalPlan> {
     let verdict = check_sql_v03(sql)?;
     if !verdict.accepted {
-        return Err(SparrowError::new(ErrorCode::FeatureUnavailable, verdict.reason));
+        return Err(SparrowError::new(
+            ErrorCode::FeatureUnavailable,
+            verdict.reason,
+        ));
     }
-    let statements = Parser::parse_sql(&g0_dialect(), sql).map_err(|e| {
-        SparrowError::new(ErrorCode::InvalidArgument, format!("parse error: {e}"))
-    })?;
+    let statements = Parser::parse_sql(&g0_dialect(), sql)
+        .map_err(|e| SparrowError::new(ErrorCode::InvalidArgument, format!("parse error: {e}")))?;
+    if statements.is_empty() {
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "empty SQL statement",
+        ));
+    }
     let Statement::Query(query) = &statements[0] else {
         return Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
@@ -63,7 +71,16 @@ fn bind_select_v03(
     };
 
     if let Some(join) = select.from[0].joins.first() {
-        return bind_join(select, join, stream, source_schema, filter, catalog, pipeline, revision);
+        return bind_join(
+            select,
+            join,
+            stream,
+            source_schema,
+            filter,
+            catalog,
+            pipeline,
+            revision,
+        );
     }
 
     if let Some(spec) = window_from_group(&select.group_by, &select.projection, &source_schema)? {
@@ -208,10 +225,9 @@ fn join_keys(op: &JoinOperator) -> Result<(String, String)> {
 fn col_name(e: &SqlExpr) -> Result<String> {
     match e {
         SqlExpr::Identifier(id) => Ok(id.value.clone()),
-        SqlExpr::CompoundIdentifier(parts) => Ok(parts
-            .last()
-            .map(|p| p.value.clone())
-            .unwrap_or_default()),
+        SqlExpr::CompoundIdentifier(parts) => {
+            Ok(parts.last().map(|p| p.value.clone()).unwrap_or_default())
+        }
         _ => Err(SparrowError::new(
             ErrorCode::InvalidArgument,
             "expected a column name",

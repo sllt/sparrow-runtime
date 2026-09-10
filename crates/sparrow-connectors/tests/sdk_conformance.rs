@@ -46,7 +46,7 @@ fn file_source_declares_replayable_and_seeks() {
     assert_eq!(cap.kind, "file");
     assert_eq!(cap.delivery, DeliveryGuarantee::LiveBestEffort);
 
-    let path = std::env::temp_dir().join(format!(
+    let path = sparrow_connectors::ensure_default_data_root().join(format!(
         "sparrow-sdk-file-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -79,7 +79,9 @@ fn file_source_declares_replayable_and_seeks() {
     src.next_frame().unwrap();
     src.seek(&pos).unwrap();
     let again = src.next_frame().unwrap().unwrap();
-    assert!(std::str::from_utf8(&again.payload).unwrap().contains("\"v\":2"));
+    assert!(std::str::from_utf8(&again.payload)
+        .unwrap()
+        .contains("\"v\":2"));
     let _ = std::fs::remove_file(&path);
 }
 
@@ -119,7 +121,10 @@ fn sink_flush_is_part_of_sdk() {
     let diag = std::sync::Arc::new(sparrow_connectors::IoDiagnostics::default());
     let sink = LogSink::new(diag, 8);
     sink.flush().unwrap();
-    assert_eq!(LogSinkConfig::capabilities().replay, ReplaySupport::Unsupported);
+    assert_eq!(
+        LogSinkConfig::capabilities().replay,
+        ReplaySupport::Unsupported
+    );
 
     let owner = sparrow_model::MemoryOwner::new(sparrow_model::ResourceBudget::compact());
     let mut b = RowBatchBuilder::new(

@@ -8,6 +8,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 WORKDIR="${TMPDIR:-/tmp}/sparrow-v1-demo-$$"
 mkdir -p "$WORKDIR"
+# N3: file/checkpoint paths require an explicit allowlist (cwd is never a default root).
+export SPARROW_DATA_ROOTS="${SPARROW_DATA_ROOTS:-$WORKDIR}"
 trap 'rm -rf "$WORKDIR"; kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
 DATA="$WORKDIR/events.ndjson"

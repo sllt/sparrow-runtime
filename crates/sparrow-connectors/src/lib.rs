@@ -21,9 +21,9 @@ pub use capabilities::{
     refuse_delivery_name, refuse_durable_recovery, refuse_qos_durable, refuse_unsupported_recovery,
     ConnectorCapabilities, ReplaySupport,
 };
-pub use file_replay::{FileContract, FileReplayConfig, FileReplaySource};
 pub use diag::{IoDiagnostics, IoSnapshot};
 pub use error::{ConnectorError, Result};
+pub use file_replay::{FileContract, FileReplayConfig, FileReplaySource};
 pub use http::{HttpCapture, HttpSink, HttpSinkConfig};
 pub use http_push::{HttpPushSource, HttpPushSourceConfig};
 pub use log::{LogSink, LogSinkConfig};
@@ -32,7 +32,8 @@ pub use mqtt::{
     MqttSourceConfig,
 };
 pub use policy::{
-    check_bind_addr, check_data_path, data_roots, AllowedTarget, TargetPolicy,
+    check_bind_addr, check_data_path, check_data_path_in, configured_data_roots, data_roots,
+    default_data_root, default_data_roots, ensure_default_data_root, AllowedTarget, TargetPolicy,
 };
 pub use secret::{MapSecretResolver, SecretResolver};
 pub use tls::TlsConfig;

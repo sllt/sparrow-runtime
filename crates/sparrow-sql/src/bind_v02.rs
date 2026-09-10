@@ -1,21 +1,19 @@
 //! Bind V0.2 SQL (PT/count windows, aggregates, static lookup JOIN).
 
+use sparrow_expr::{infer_type, BinaryOp, Expr};
+use sparrow_model::error::{ErrorCode, Result, SparrowError};
+use sparrow_model::{AggFn, DataType, PipelineId, RevisionId, Schema, SchemaId, WindowKind};
+use sparrow_plan::catalog::project_schema;
+use sparrow_plan::{
+    bind_linear, bind_lookup_linear, bind_window_linear, lookup_output_schema,
+    window_output_schema, AggCall, BoundKind, BoundLogicalPlan, Catalog, LookupSpec, WindowSpec,
+};
 use sqlparser::ast::{
     BinaryOperator, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, JoinConstraint, JoinOperator, Select, SelectItem, SetExpr, Statement,
     ValueWithSpan,
 };
 use sqlparser::parser::Parser;
-use sparrow_expr::{infer_type, BinaryOp, Expr};
-use sparrow_model::error::{ErrorCode, Result, SparrowError};
-use sparrow_model::{
-    AggFn, DataType, PipelineId, RevisionId, Schema, SchemaId, WindowKind,
-};
-use sparrow_plan::catalog::project_schema;
-use sparrow_plan::{
-    bind_linear, bind_lookup_linear, bind_window_linear, lookup_output_schema, window_output_schema,
-    AggCall, BoundKind, BoundLogicalPlan, Catalog, LookupSpec, WindowSpec,
-};
 
 use crate::bind::{sql_expr_pub, table_name_pub};
 use crate::g0::g0_dialect;
@@ -29,11 +27,19 @@ pub fn bind_sql_v02(
 ) -> Result<BoundLogicalPlan> {
     let verdict = check_sql_v02(sql)?;
     if !verdict.accepted {
-        return Err(SparrowError::new(ErrorCode::FeatureUnavailable, verdict.reason));
+        return Err(SparrowError::new(
+            ErrorCode::FeatureUnavailable,
+            verdict.reason,
+        ));
     }
-    let statements = Parser::parse_sql(&g0_dialect(), sql).map_err(|e| {
-        SparrowError::new(ErrorCode::InvalidArgument, format!("parse error: {e}"))
-    })?;
+    let statements = Parser::parse_sql(&g0_dialect(), sql)
+        .map_err(|e| SparrowError::new(ErrorCode::InvalidArgument, format!("parse error: {e}")))?;
+    if statements.is_empty() {
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "empty SQL statement",
+        ));
+    }
     let Statement::Query(query) = &statements[0] else {
         return Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
@@ -63,7 +69,16 @@ fn bind_select_v02(
     };
 
     if let Some(join) = select.from[0].joins.first() {
-        return bind_join(select, join, stream, source_schema, filter, catalog, pipeline, revision);
+        return bind_join(
+            select,
+            join,
+            stream,
+            source_schema,
+            filter,
+            catalog,
+            pipeline,
+            revision,
+        );
     }
 
     if let Some(spec) = window_from_group(&select.group_by, &select.projection, &source_schema)? {
@@ -268,10 +283,9 @@ fn join_keys(op: &JoinOperator) -> Result<(String, String)> {
 fn col_name(e: &SqlExpr) -> Result<String> {
     match e {
         SqlExpr::Identifier(id) => Ok(id.value.clone()),
-        SqlExpr::CompoundIdentifier(parts) => Ok(parts
-            .last()
-            .map(|p| p.value.clone())
-            .unwrap_or_default()),
+        SqlExpr::CompoundIdentifier(parts) => {
+            Ok(parts.last().map(|p| p.value.clone()).unwrap_or_default())
+        }
         _ => Err(SparrowError::new(
             ErrorCode::InvalidArgument,
             "JOIN ON must be column = column",
@@ -318,9 +332,9 @@ fn count_window_size(f: &Function) -> Result<u64> {
         FunctionArguments::List(list) => match list.args.first() {
             Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(v)))) => {
                 match &v.value {
-                    sqlparser::ast::Value::Number(s, _) => s.parse::<u64>().map_err(|e| {
-                        SparrowError::new(ErrorCode::InvalidArgument, e.to_string())
-                    }),
+                    sqlparser::ast::Value::Number(s, _) => s
+                        .parse::<u64>()
+                        .map_err(|e| SparrowError::new(ErrorCode::InvalidArgument, e.to_string())),
                     _ => Err(SparrowError::new(
                         ErrorCode::InvalidArgument,
                         "COUNT_WINDOW expects an integer",

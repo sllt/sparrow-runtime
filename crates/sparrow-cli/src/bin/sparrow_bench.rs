@@ -83,7 +83,7 @@ fn count_spec() -> WindowSpec {
 }
 
 fn tmp(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+    sparrow_connectors::ensure_default_data_root().join(format!(
         "sparrow-bench-{name}-{}-{}",
         std::process::id(),
         now_micros()
@@ -280,9 +280,8 @@ fn file_window(checkpoint_every: Option<u64>) -> sparrow_model::Result<Scenario>
         recovery: RecoveryPolicy::Aligned,
         contract: FileContract::Immutable,
     };
-    let mut source = FileReplaySource::open(&cfg).map_err(|e| {
-        sparrow_model::SparrowError::new(e.code(), e.to_string())
-    })?;
+    let mut source = FileReplaySource::open(&cfg)
+        .map_err(|e| sparrow_model::SparrowError::new(e.code(), e.to_string()))?;
     let mut session = AlignedSession::open(
         CheckpointStore::open(&chk)?,
         count_spec(),
@@ -359,7 +358,9 @@ fn run() -> sparrow_model::Result<()> {
     println!("host-specific: numbers are not SLOs");
     println!("exactly_once=rejected");
     println!("mqtt_replay=unsupported");
-    println!("mqtt_events={MQTT_EVENTS} file_events={FILE_EVENTS} checkpoint_every={CHECKPOINT_EVERY}");
+    println!(
+        "mqtt_events={MQTT_EVENTS} file_events={FILE_EVENTS} checkpoint_every={CHECKPOINT_EVERY}"
+    );
     println!(
         "smoke_thresholds mqtt_eps>={SMOKE_MQTT_EPS} file_eps>={SMOKE_FILE_EPS} p99_us<={SMOKE_P99_US} rss_kb<={SMOKE_RSS_KB}"
     );
