@@ -118,4 +118,14 @@ mod tests {
         assert_eq!(OperatorId::WINDOW.raw(), 10);
         assert_ne!(OperatorId::FILTER, OperatorId::WINDOW);
     }
+
+    #[test]
+    fn n16_window_operator_id_is_ten() {
+        // R1 assigned WINDOW=10. Pre-R1 checkpoints that stored a different
+        // OperatorId fail closed on restore (layout / slot mismatch).
+        assert_eq!(OperatorId::WINDOW.raw(), 10);
+        assert_eq!(OperatorId::SOURCE.raw(), 1);
+        assert_eq!(OperatorId::FILTER.raw(), 2);
+        assert_eq!(OperatorId::SINK.raw(), 20);
+    }
 }

@@ -84,6 +84,12 @@ impl HttpSinkConfig {
         }
         policy.check_http_url(&self.url)?;
         if let Some(name) = &self.header_secret {
+            if !self.url.starts_with("https://") {
+                return Err(ConnectorError::new(
+                    ErrorCode::PolicyDenied,
+                    "HTTP header_secret requires an https:// URL (refusing plaintext credentials)",
+                ));
+            }
             let _ = secrets.resolve(name)?;
         }
         Ok(())
@@ -531,5 +537,29 @@ mod tests {
         );
         cancel.cancel();
         http.stop().await;
+    }
+
+    #[test]
+    fn n16_http_header_secret_requires_https() {
+        let secrets = MapSecretResolver::new(
+            [("tok".into(), "secret".into())].into_iter().collect(),
+        );
+        let mut http = HttpSinkConfig::demo("http://127.0.0.1:1/ingest");
+        http.header_secret = Some("tok".into());
+        let err = http
+            .validate(&secrets, &TargetPolicy::allow("127.0.0.1", 1))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::PolicyDenied);
+        assert!(
+            err.to_string().contains("https"),
+            "{}",
+            err
+        );
+
+        let mut https = HttpSinkConfig::demo("https://127.0.0.1:443/ingest");
+        https.header_secret = Some("tok".into());
+        https
+            .validate(&secrets, &TargetPolicy::allow("127.0.0.1", 443))
+            .expect("https + header_secret must be accepted");
     }
 }

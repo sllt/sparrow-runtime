@@ -309,11 +309,17 @@ pub fn http_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<Http
             SparrowError::new(ErrorCode::InvalidArgument, "HTTP sink url is required")
         })?
     };
+    if sink.header_secret.is_some() && !url.starts_with("https://") {
+        return Err(SparrowError::new(
+            ErrorCode::PolicyDenied,
+            "HTTP header_secret requires an https:// URL (refusing plaintext credentials)",
+        ));
+    }
     let mut cfg = HttpSinkConfig::demo(url.clone());
     cfg.outbox_capacity = sink.outbox_capacity;
     cfg.header_secret = sink.header_secret.clone();
     cfg.tls = TlsConfig {
-        enabled: sink.tls && url.starts_with("https://"),
+        enabled: (sink.tls && url.starts_with("https://")) || sink.header_secret.is_some(),
         skip_verify: sink.skip_verify,
     };
     cfg.restore = RestoreClaim::None;
@@ -696,5 +702,30 @@ mod tests {
         src.tls = true;
         let cfg = mqtt_config(&src, schema, None, "cred").unwrap();
         assert!(cfg.tls.enabled, "tls:true must be wired into MQTT config");
+    }
+
+    #[test]
+    fn n16_http_header_secret_requires_https() {
+        let mut sink = crate::spec::SinkSpec {
+            kind: "http".into(),
+            url: Some("http://127.0.0.1:8443/ingest".into()),
+            skip_verify: false,
+            outbox_capacity: 8,
+            use_demo_io: false,
+            header_secret: Some("tok".into()),
+            host: None,
+            port: None,
+            topic: None,
+            client_id: None,
+            qos: 0,
+            clean_session: true,
+            tls: false,
+        };
+        let err = http_config(&sink, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::PolicyDenied);
+        sink.url = Some("https://127.0.0.1:8443/ingest".into());
+        let cfg = http_config(&sink, None).unwrap();
+        assert!(cfg.tls.enabled, "header_secret must imply TLS");
+        assert_eq!(cfg.header_secret.as_deref(), Some("tok"));
     }
 }

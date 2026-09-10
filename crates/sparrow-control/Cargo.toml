@@ -20,6 +20,7 @@ serde_json = "1"
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
 tokio-util = { workspace = true }
 ring = "0.17"
+tracing = { version = "0.1.44", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

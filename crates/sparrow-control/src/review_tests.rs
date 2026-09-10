@@ -1096,3 +1096,115 @@ fn n5_restart_fresh_decode_errors_counted() {
         let _ = std::fs::remove_file(&path);
     });
 }
+
+#[test]
+fn n15_aligned_checkpoint_records_real_duration_and_bytes() {
+    use sparrow_runtime::CheckpointStore;
+
+    let kernel = Arc::new(compact_kernel().unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let path = tmp("n15.ndjson");
+        let chk = tmp("n15-chk");
+        std::fs::create_dir_all(&chk).unwrap();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n{\"device_id\":\"d1\",\"v\":3}\n",
+        )
+        .unwrap();
+        let spec = file_spec(
+            &path.to_string_lossy(),
+            "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, COUNT_WINDOW(2)",
+            "aligned",
+            Some(&chk.to_string_lossy()),
+        );
+        store.put_pipeline("n15", &spec, None).unwrap();
+        request_start(&store, "n15", "test").unwrap();
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
+        let _ = sup.converge_once().await;
+        let actual = store.actual("n15").unwrap();
+        assert_eq!(actual.status, "running", "{:?}", actual.last_error);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let id = sup.checkpoint_named("n15").await.expect("checkpoint");
+        assert!(id >= 1);
+        let metrics = kernel.metrics.snapshot();
+        assert!(
+            metrics.checkpoint_commits >= 1,
+            "aligned commit must increment checkpoint_commits: {metrics:?}"
+        );
+        assert_ne!(
+            metrics.checkpoint_bytes, 1,
+            "must not record the old hardcoded 1-byte payload: {metrics:?}"
+        );
+        let recovered = CheckpointStore::open(&chk)
+            .unwrap()
+            .recover_committed()
+            .unwrap()
+            .expect("CURRENT");
+        let encoded = recovered
+            .encode_with_max_state_keys(kernel.budget().max_state_keys)
+            .unwrap();
+        assert_eq!(
+            metrics.checkpoint_bytes,
+            encoded.len() as u64,
+            "checkpoint_bytes must be the spawn_blocking payload length"
+        );
+        sup.kill_named("n15").await.unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&chk);
+    });
+}
+
+#[test]
+fn n16_layout_from_physical_uses_filter_before_window() {
+    use sparrow_expr::Expr;
+    use sparrow_model::{
+        DataType, Field, FieldId, OperatorId, PipelineId, RevisionId, Schema, SchemaId,
+    };
+    use sparrow_plan::{expr_fingerprint, physicalize, Catalog, PhysicalStage, PlanOptions, TransformStep};
+    use sparrow_sql::bind_sql;
+
+    let mut cat = Catalog::new();
+    cat.insert(
+        "sensors",
+        Schema::new(
+            SchemaId::new(1),
+            vec![
+                Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+                Field::new(FieldId::new(2), "v", DataType::Int64, false),
+            ],
+        )
+        .unwrap(),
+    );
+    let sql =
+        "SELECT COUNT(*) AS n, device_id FROM sensors WHERE v > 1 GROUP BY device_id, COUNT_WINDOW(2)";
+    let bound = bind_sql(sql, &cat, PipelineId::new(1), RevisionId::new(1)).unwrap();
+    let mut plan = physicalize(&bound, &PlanOptions { fuse: true });
+    let before = crate::supervisor::layout_from_physical(&plan).unwrap();
+    assert_ne!(before.where_fingerprint, 0, "WHERE before window must be fingerprinted");
+
+    let after = Expr::Column {
+        name: "must_not_win".into(),
+    };
+    plan.stages.push(PhysicalStage::Transform {
+        steps: vec![TransformStep::Filter {
+            operator: OperatorId::new(99),
+            predicate: after.clone(),
+            input: plan
+                .stages
+                .iter()
+                .find_map(|s| match s {
+                    PhysicalStage::WindowAgg { output, .. } => Some(output.clone()),
+                    _ => None,
+                })
+                .expect("window output"),
+        }],
+    });
+    let layout = crate::supervisor::layout_from_physical(&plan).unwrap();
+    assert_eq!(
+        layout.where_fingerprint, before.where_fingerprint,
+        "trailing Filter after the window must not change the layout fingerprint"
+    );
+    assert_ne!(layout.where_fingerprint, expr_fingerprint(&after));
+}

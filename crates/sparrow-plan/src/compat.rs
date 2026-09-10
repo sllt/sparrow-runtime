@@ -267,6 +267,28 @@ pub fn where_before_window(plan: &BoundLogicalPlan) -> Option<&Expr> {
     None
 }
 
+/// Last Filter in stages that appear *before* the window. A Filter after
+/// the window (HAVING-shaped, or a trailing map/filter) must not change
+/// the checkpoint WHERE fingerprint (N16).
+pub fn where_before_window_physical(plan: &crate::PhysicalPlan) -> Option<&Expr> {
+    use crate::{PhysicalStage, TransformStep};
+    let mut last_filter = None;
+    for s in &plan.stages {
+        match s {
+            PhysicalStage::Transform { steps } => {
+                for step in steps {
+                    if let TransformStep::Filter { predicate, .. } = step {
+                        last_filter = Some(predicate);
+                    }
+                }
+            }
+            PhysicalStage::WindowAgg { .. } => return last_filter,
+            _ => {}
+        }
+    }
+    last_filter
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +401,80 @@ mod tests {
         assert!(canon.starts_with("bin:gt:"), "{canon}");
         assert!(!canon.contains("Binary {"), "{canon}");
         assert!(!canon.contains("Gt"), "{canon}");
+    }
+
+    #[test]
+    fn n16_physical_layout_uses_filter_before_window() {
+        use crate::{PhysicalPlan, PhysicalStage, TransformStep};
+        use sparrow_model::{DataType, Field, FieldId, PipelineId, RevisionId, Schema, SchemaId};
+
+        let schema = Schema::new(
+            SchemaId::new(1),
+            vec![
+                Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+                Field::new(FieldId::new(2), "v", DataType::Int64, false),
+            ],
+        )
+        .unwrap();
+        let before = Expr::Column { name: "before".into() };
+        let after = Expr::Column { name: "after".into() };
+        let spec = WindowSpec::new(
+            WindowKind::Count { size: 2 },
+            vec!["device_id".into()],
+            vec![AggCall::new(
+                AggFn::Sum,
+                Some(Expr::Column { name: "v".into() }),
+                "s",
+            )],
+        );
+        let out = crate::window_output_schema(&schema, &spec).unwrap();
+        let plan = PhysicalPlan {
+            pipeline: PipelineId::new(1),
+            revision: RevisionId::new(1),
+            stages: vec![
+                PhysicalStage::MemorySource {
+                    operator: OperatorId::SOURCE,
+                    name: "sensors".into(),
+                    schema: schema.clone(),
+                },
+                PhysicalStage::Transform {
+                    steps: vec![TransformStep::Filter {
+                        operator: OperatorId::FILTER,
+                        predicate: before.clone(),
+                        input: schema.clone(),
+                    }],
+                },
+                PhysicalStage::WindowAgg {
+                    operator: OperatorId::WINDOW,
+                    spec,
+                    input: schema.clone(),
+                    output: out,
+                },
+                PhysicalStage::Transform {
+                    steps: vec![TransformStep::Filter {
+                        operator: OperatorId::new(99),
+                        predicate: after.clone(),
+                        input: schema.clone(),
+                    }],
+                },
+            ],
+        };
+        let pred = where_before_window_physical(&plan).expect("filter before window");
+        assert_eq!(pred, &before);
+        assert_ne!(expr_fingerprint(pred), expr_fingerprint(&after));
+        let layout = PlanLayout::from_window(OperatorId::WINDOW, StateSlotId::new(1), &plan_window(&plan))
+            .with_where(where_before_window_physical(&plan));
+        assert_eq!(layout.where_fingerprint, expr_fingerprint(&before));
+        assert_ne!(layout.where_fingerprint, expr_fingerprint(&after));
+    }
+
+    fn plan_window(plan: &crate::PhysicalPlan) -> WindowSpec {
+        for s in &plan.stages {
+            if let crate::PhysicalStage::WindowAgg { spec, .. } = s {
+                return spec.clone();
+            }
+        }
+        panic!("window");
     }
 
     #[test]

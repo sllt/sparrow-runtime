@@ -12,15 +12,18 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const FILE_EOF_POLL: Duration = Duration::from_millis(40);
+/// Leave `spawn_blocking` after this many frames or ~64KiB (N14).
+pub(crate) const FILE_POLL_BATCH_FRAMES: usize = 32;
+pub(crate) const FILE_POLL_BATCH_BYTES: usize = 64 * 1024;
 
-pub(crate) async fn take_file_poll(
+pub(crate) async fn take_file_batch(
     mut source: FileReplaySource,
-) -> Result<(FileReplaySource, FilePoll)> {
+) -> Result<(FileReplaySource, Vec<FilePoll>)> {
     tokio::task::spawn_blocking(move || {
-        let poll = source
-            .poll_decoded()
+        let polls = source
+            .poll_decoded_batch(FILE_POLL_BATCH_FRAMES, FILE_POLL_BATCH_BYTES)
             .map_err(|e| SparrowError::new(e.code, e.to_string()))?;
-        Ok((source, poll))
+        Ok((source, polls))
     })
     .await
     .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("file replay worker: {e}")))?
@@ -80,22 +83,24 @@ pub(crate) async fn run_file_source(
         if cancel.is_cancelled() {
             return Ok(());
         }
-        let (src, poll) = take_file_poll(source).await?;
+        let (src, polls) = take_file_batch(source).await?;
         source = src;
         if let Some(p) = &pos {
             *p.lock().expect("pos") = source.position();
         }
-        if apply_file_poll(
-            poll,
-            contract,
-            &tx,
-            &diag,
-            &mut terminal_sent,
-            ingested.as_deref(),
-        )
-        .await?
-        {
-            return Ok(());
+        for poll in polls {
+            if apply_file_poll(
+                poll,
+                contract,
+                &tx,
+                &diag,
+                &mut terminal_sent,
+                ingested.as_deref(),
+            )
+            .await?
+            {
+                return Ok(());
+            }
         }
     }
 }
