@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sparrow_control::{host_kernel, Store};
+use sparrow_control::{host_kernel, secrets_key_configured, secrets_key_required, Store};
 use sparrow_model::{ErrorCode, SparrowError};
 use sparrow_server::{boot, serve, DEFAULT_BIND};
 
@@ -98,6 +98,9 @@ sparrow-server — Sparrow V0.1 control plane
                       only {{temp_dir}}/sparrow is allowed (never cwd, never /tmp
                       as a whole). Empty or --safe-mode without this env denies
                       file paths.
+  SPARROW_SECRETS_KEY 32 bytes or 64 hex chars (or SPARROW_SECRETS_KEY_FILE).
+                      Unset uses a process-local random key and logs a warning.
+                      --safe-mode / SPARROW_REQUIRE_SECRETS_KEY=1 refuse.
 
 Delivery: live_best_effort + restart_fresh by default.
   File/replay may use recovery=aligned (not exactly-once). MQTT cannot restore.
@@ -112,8 +115,93 @@ fn main() {
     }
 }
 
+fn init_tracing() {
+    let _ = tracing::subscriber::set_global_default(StderrSubscriber::from_env());
+}
+
+/// Minimal stderr subscriber so production `checkpoint_commit` info
+/// lines appear without pulling `tracing-subscriber` (and its
+/// edition2024-only transitive crates) onto this toolchain.
+struct StderrSubscriber {
+    max: tracing::Level,
+}
+
+impl StderrSubscriber {
+    fn from_env() -> Self {
+        let max = match std::env::var("RUST_LOG") {
+            Ok(s) if s.contains("trace") => tracing::Level::TRACE,
+            Ok(s) if s.contains("debug") => tracing::Level::DEBUG,
+            Ok(s) if s.contains("warn") => tracing::Level::WARN,
+            Ok(s) if s.contains("error") => tracing::Level::ERROR,
+            _ => tracing::Level::INFO,
+        };
+        Self { max }
+    }
+}
+
+struct FieldBuf(String);
+
+impl tracing::field::Visit for FieldBuf {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            self.0.push_str(&format!("{value:?}"));
+            return;
+        }
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        self.0.push_str(field.name());
+        self.0.push('=');
+        self.0.push_str(&format!("{value:?}"));
+    }
+}
+
+impl tracing::Subscriber for StderrSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.level() <= &self.max
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut buf = FieldBuf(String::new());
+        event.record(&mut buf);
+        eprintln!(
+            "{} {}: {}",
+            event.metadata().level(),
+            event.metadata().target(),
+            buf.0
+        );
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
 fn run() -> Result<(), SparrowError> {
     let opts = parse_opts()?;
+    init_tracing();
+    if !secrets_key_configured() {
+        if secrets_key_required() || opts.safe_mode {
+            tracing::error!(
+                "SPARROW_SECRETS_KEY / SPARROW_SECRETS_KEY_FILE is required in --safe-mode"
+            );
+        } else {
+            tracing::warn!(
+                "SPARROW_SECRETS_KEY unset; using a process-local random key (dev only). Sealed secrets will not survive restart."
+            );
+        }
+    }
     let store = if opts.catalog.as_os_str() == ":memory:" {
         Store::open_memory()?
     } else {

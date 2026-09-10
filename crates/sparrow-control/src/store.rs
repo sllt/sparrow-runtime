@@ -96,6 +96,7 @@ impl Store {
                 let _ = std::fs::set_permissions(path, perms);
             }
         }
+        note_secrets_key_on_open()?;
         Ok(Self {
             inner: Arc::new(StoreInner {
                 conn: Mutex::new(conn),
@@ -107,6 +108,7 @@ impl Store {
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(db)?;
         init(&conn)?;
+        note_secrets_key_on_open()?;
         Ok(Self {
             inner: Arc::new(StoreInner {
                 conn: Mutex::new(conn),
@@ -896,8 +898,56 @@ fn db(err: rusqlite::Error) -> SparrowError {
 /// Threat model: catalog file is trusted-host local state. Secrets are
 /// sealed with ChaCha20-Poly1305 (`enc:v2:`). Key comes from
 /// `SPARROW_SECRETS_KEY` / `SPARROW_SECRETS_KEY_FILE` (32 bytes or 64 hex
-/// chars). Without those, a process-local random key is used (dev only).
+/// chars). Without those, a process-local random key is used (dev only)
+/// and a warning is logged at store open (N12). `--safe-mode` /
+/// `SPARROW_SAFE_MODE=1` / `SPARROW_REQUIRE_SECRETS_KEY=1` refuse instead.
 /// Unprefixed plaintext is rejected (no fallback). Not a KMS. File mode 0600.
+pub fn secrets_key_configured() -> bool {
+    env_nonempty("SPARROW_SECRETS_KEY_FILE") || env_nonempty("SPARROW_SECRETS_KEY")
+}
+
+pub fn secrets_key_required() -> bool {
+    std::env::var("SPARROW_REQUIRE_SECRETS_KEY").ok().as_deref() == Some("1")
+        || std::env::var("SPARROW_SAFE_MODE").ok().as_deref() == Some("1")
+}
+
+fn env_nonempty(name: &str) -> bool {
+    std::env::var(name).ok().map(|s| !s.is_empty()).unwrap_or(false)
+}
+
+/// Decision used at store open and when sealing. `configured` / `required`
+/// are injected in tests so we do not mutate process env.
+pub(crate) fn secrets_key_on_open(configured: bool, required: bool) -> Result<SecretsKeyOnOpen> {
+    if configured {
+        return Ok(SecretsKeyOnOpen::Configured);
+    }
+    if required {
+        return Err(SparrowError::new(
+            ErrorCode::SecretMissing,
+            "SPARROW_SECRETS_KEY or SPARROW_SECRETS_KEY_FILE is required in safe/production mode",
+        ));
+    }
+    Ok(SecretsKeyOnOpen::ProcessLocalDev)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SecretsKeyOnOpen {
+    Configured,
+    ProcessLocalDev,
+}
+
+fn note_secrets_key_on_open() -> Result<()> {
+    match secrets_key_on_open(secrets_key_configured(), secrets_key_required())? {
+        SecretsKeyOnOpen::Configured => Ok(()),
+        SecretsKeyOnOpen::ProcessLocalDev => {
+            tracing::warn!(
+                "SPARROW_SECRETS_KEY / SPARROW_SECRETS_KEY_FILE is unset; using a process-local random key (dev only). Sealed secrets will not survive restart. Set a key, or SPARROW_SAFE_MODE=1 / SPARROW_REQUIRE_SECRETS_KEY=1 to refuse."
+            );
+            Ok(())
+        }
+    }
+}
+
 fn secrets_key() -> Result<[u8; 32]> {
     if let Ok(path) = std::env::var("SPARROW_SECRETS_KEY_FILE") {
         if !path.is_empty() {
@@ -912,14 +962,7 @@ fn secrets_key() -> Result<[u8; 32]> {
             return parse_secrets_key(s.as_bytes());
         }
     }
-    if std::env::var("SPARROW_REQUIRE_SECRETS_KEY").ok().as_deref() == Some("1")
-        || std::env::var("SPARROW_SAFE_MODE").ok().as_deref() == Some("1")
-    {
-        return Err(SparrowError::new(
-            ErrorCode::SecretMissing,
-            "SPARROW_SECRETS_KEY or SPARROW_SECRETS_KEY_FILE is required in safe/production mode",
-        ));
-    }
+    let _ = secrets_key_on_open(false, secrets_key_required())?;
     Ok(*PROCESS_SECRETS_KEY.get_or_init(random_key))
 }
 
@@ -1140,6 +1183,33 @@ mod tests {
             Some("SELECT temperature FROM sensors")
         );
         assert_ne!(desired.spec.sql, latest.spec.sql);
+    }
+
+    #[test]
+    fn n12_unconfigured_secrets_key_warns_or_refuses() {
+        assert_eq!(
+            secrets_key_on_open(false, false).unwrap(),
+            SecretsKeyOnOpen::ProcessLocalDev
+        );
+        assert_eq!(
+            secrets_key_on_open(true, false).unwrap(),
+            SecretsKeyOnOpen::Configured
+        );
+        assert_eq!(
+            secrets_key_on_open(true, true).unwrap(),
+            SecretsKeyOnOpen::Configured
+        );
+        let err = secrets_key_on_open(false, true).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SecretMissing);
+        assert!(
+            err.message.contains("SPARROW_SECRETS_KEY"),
+            "{}",
+            err.message
+        );
+        // Dev open still works (warning is tracing-only).
+        let s = Store::open_memory().unwrap();
+        s.put_secret("n12", "dev-only").unwrap();
+        assert_eq!(s.get_secret("n12").unwrap().as_deref(), Some("dev-only"));
     }
 
     #[test]

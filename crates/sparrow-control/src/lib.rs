@@ -12,7 +12,8 @@ mod file_source;
 
 pub use spec::{PipelineSpec, RestoreSpec, SinkSpec, SourceSpec, StreamSpec};
 pub use store::{
-    ActualState, AuditRow, DesiredState, PipelineRow, Store, CATALOG_SCHEMA_VERSION, FORMAT_VERSION,
+    secrets_key_configured, secrets_key_required, ActualState, AuditRow, DesiredState, PipelineRow,
+    Store, CATALOG_SCHEMA_VERSION, FORMAT_VERSION,
 };
 pub use supervisor::{
     compact_kernel, host_kernel, request_start, request_start_at, request_stop, DemoHarness,

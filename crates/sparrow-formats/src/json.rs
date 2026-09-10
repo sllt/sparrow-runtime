@@ -95,18 +95,20 @@ pub fn decode_json_row(schema: &Schema, bytes: &[u8], limits: &JsonLimits) -> Re
 }
 
 /// Encode a batch as a JSON array of objects (HTTP sink batch POST, P1-22).
+///
+/// Each row is encoded once. The array is assembled from those object
+/// bytes — no bytes→Value→bytes round-trip per row (N13).
 pub fn encode_json_batch(schema: &Schema, rows: &[Row]) -> Result<Vec<u8>> {
-    let mut arr = Vec::with_capacity(rows.len());
-    for row in rows {
-        let bytes = encode_json_row(schema, row)?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-            SparrowError::new(ErrorCode::CodecViolation, format!("JSON batch: {e}"))
-        })?;
-        arr.push(v);
+    let mut out = Vec::new();
+    out.push(b'[');
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend(encode_json_row(schema, row)?);
     }
-    serde_json::to_vec(&serde_json::Value::Array(arr)).map_err(|e| {
-        SparrowError::new(ErrorCode::CodecViolation, format!("JSON batch encode: {e}"))
-    })
+    out.push(b']');
+    Ok(out)
 }
 
 pub fn encode_json_row(schema: &Schema, row: &Row) -> Result<Vec<u8>> {
@@ -392,5 +394,36 @@ mod tests {
         assert_eq!(row.values[0], Scalar::bytes(b"ab".to_vec()));
         let enc = encode_json_row(&bytes, &row).unwrap();
         assert!(String::from_utf8_lossy(&enc).contains("YWI="));
+    }
+
+    #[test]
+    fn n13_encode_json_batch_is_array_without_reparse() {
+        let s = schema();
+        let row = decode_json_row(
+            &s,
+            br#"{"device_id":"edge-a","temperature":26.2,"payload":{"temp":26.2}}"#,
+            &JsonLimits::default(),
+        )
+        .unwrap();
+        let one = encode_json_row(&s, &row).unwrap();
+        let batch = encode_json_batch(&s, &[row.clone(), row]).unwrap();
+        assert_eq!(batch.first().copied(), Some(b'['));
+        assert_eq!(batch.last().copied(), Some(b']'));
+        let expected: Vec<u8> = {
+            let mut v = Vec::new();
+            v.push(b'[');
+            v.extend_from_slice(&one);
+            v.push(b',');
+            v.extend_from_slice(&one);
+            v.push(b']');
+            v
+        };
+        assert_eq!(
+            batch, expected,
+            "batch must concatenate row objects; no Value round-trip"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&batch).unwrap();
+        assert_eq!(parsed.as_array().map(|a| a.len()), Some(2));
+        assert_eq!(parsed[0]["device_id"], "edge-a");
     }
 }

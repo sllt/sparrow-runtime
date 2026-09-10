@@ -28,7 +28,8 @@ pub use explain::{
 pub use graph::{GraphSpec, GRAPH_SPEC_VERSION};
 pub use physical::{physicalize, PhysicalPlan, PhysicalStage, PlanOptions, TransformStep};
 pub use compat::{
-    decide_state_reuse, expr_fingerprint, where_before_window, PlanLayout, StateReuse,
+    decide_state_reuse, expr_fingerprint, where_before_window, where_before_window_physical,
+    PlanLayout, StateReuse,
 };
 pub use stateful::{
     agg_result_type, lookup_output_schema, window_output_schema, AggCall, DedupSpec, LookupSpec,

@@ -13,7 +13,7 @@ use sparrow_io::ReplayableSource;
 use sparrow_model::{
     InflightCounter, RecoveryPolicy, ResourceBudget, Result, SparrowError, StateSlotId,
 };
-use sparrow_plan::{PhysicalPlan, PhysicalStage, PlanLayout, TransformStep};
+use sparrow_plan::{PhysicalPlan, PhysicalStage, PlanLayout};
 use sparrow_runtime::{
     wait_aligned_acks, AlignedAck, AlignedJob, CheckpointSnapshot, CheckpointStore, IngressEvent,
     JobHandle, JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, StreamControl,
@@ -731,7 +731,13 @@ impl Supervisor {
                         };
                         let store = Arc::clone(&store_r);
                         let committed = tokio::task::spawn_blocking(move || {
-                            store.lock().expect("store").commit(&snap)
+                            let started = std::time::Instant::now();
+                            let mut store = store.lock().expect("store");
+                            let payload_len = snap
+                                .encode_with_max_state_keys(store.max_state_keys())?
+                                .len() as u64;
+                            let id = store.commit(&snap)?;
+                            Ok((id, payload_len, started.elapsed()))
                         })
                         .await
                         .map_err(|e| {
@@ -741,11 +747,14 @@ impl Supervisor {
                             )
                         });
                         match committed {
-                            Ok(Ok(cid)) => {
+                            Ok(Ok((cid, payload_len, duration))) => {
                                 next_r.store(cid.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
-                                metrics.record_checkpoint(
-                                    std::time::Duration::from_millis(1),
-                                    1,
+                                metrics.record_checkpoint(duration, payload_len);
+                                tracing::info!(
+                                    checkpoint_id = cid,
+                                    bytes = payload_len,
+                                    duration_micros = duration.as_micros() as u64,
+                                    "checkpoint_commit"
                                 );
                                 let _ = reply.send(Ok(cid));
                             }
@@ -760,20 +769,22 @@ impl Supervisor {
                         }
                     }
                     _ = tokio::task::yield_now() => {
-                        let (src, poll) = crate::file_source::take_file_poll(source).await?;
+                        let (src, polls) = crate::file_source::take_file_batch(source).await?;
                         source = src;
                         *pos_r.lock().expect("pos") = source.position();
-                        if crate::file_source::apply_file_poll(
-                            poll,
-                            contract,
-                            &tx_ev,
-                            &diag_src,
-                            &mut terminal_sent,
-                            Some(&ingested_r),
-                        )
-                        .await?
-                        {
-                            return Ok(());
+                        for poll in polls {
+                            if crate::file_source::apply_file_poll(
+                                poll,
+                                contract,
+                                &tx_ev,
+                                &diag_src,
+                                &mut terminal_sent,
+                                Some(&ingested_r),
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -1020,18 +1031,9 @@ fn window_from_plan(
     ))
 }
 
-fn layout_from_physical(plan: &PhysicalPlan) -> Result<PlanLayout> {
+pub(crate) fn layout_from_physical(plan: &PhysicalPlan) -> Result<PlanLayout> {
     let (operator, spec, _) = window_from_plan(plan)?;
-    let mut pred = None;
-    for s in &plan.stages {
-        if let PhysicalStage::Transform { steps } = s {
-            for step in steps {
-                if let TransformStep::Filter { predicate, .. } = step {
-                    pred = Some(predicate);
-                }
-            }
-        }
-    }
+    let pred = sparrow_plan::where_before_window_physical(plan);
     Ok(PlanLayout::from_window(operator, StateSlotId::new(1), &spec).with_where(pred))
 }
 

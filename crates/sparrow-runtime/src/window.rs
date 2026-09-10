@@ -1,6 +1,6 @@
 //! Processing-time, count, event-time tumble, and hopping windows.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use sparrow_expr::eval;
@@ -67,6 +67,10 @@ pub struct WindowOperator {
     hub: WatermarkHub,
     holdback: Option<OutputHoldback>,
     default_input: InputId,
+    /// Ordered closable tumble keys: `(window_end, encoded_key) → StateKey`.
+    /// `take_closed_one` / `peek_closed_bytes` pop the first closed entry
+    /// instead of scanning every key and `to_vec()`-ing candidates (N11).
+    closed_index: BTreeMap<(i64, Vec<u8>), StateKey>,
 }
 
 impl WindowOperator {
@@ -127,6 +131,7 @@ impl WindowOperator {
             hub,
             holdback,
             default_input: InputId(0),
+            closed_index: BTreeMap::new(),
         })
     }
 
@@ -332,6 +337,7 @@ impl WindowOperator {
                     bytes,
                 )?;
             }
+            self.index_insert(&sk, end);
         }
         if let WindowStore::Tumble(store) = &mut self.store {
             if let Some(entry) = store.get_mut(&sk) {
@@ -386,35 +392,55 @@ impl WindowOperator {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn flush_closed(&mut self, wm_out: i64) -> Result<Vec<Row>> {
-        let mut out = Vec::new();
-        while let Some(row) = self.take_closed_one(wm_out)? {
-            out.push(row);
-        }
-        Ok(out)
-    }
-
     /// Remove and emit at most one closed window. Used so a giant flush
     /// cannot drop all state and then fail to send.
+    ///
+    /// Order is deterministic: smallest `(window_end, encoded_key)` first.
+    /// The closed index is maintained on put/remove so this is O(log n),
+    /// not a full scan plus per-candidate `to_vec` (N11).
     pub fn take_closed_one(&mut self, wm_out: i64) -> Result<Option<Row>> {
-        let victim = match &self.store {
-            WindowStore::Tumble(store) => store
-                .iter()
-                .filter(|(_, e)| e.window_end <= wm_out)
-                .min_by_key(|(k, e)| (e.window_end, k.encoded_bytes().to_vec()))
-                .map(|(k, _)| k.clone()),
-            _ => None,
-        };
-        let Some(k) = victim else {
-            return Ok(None);
-        };
-        if let WindowStore::Tumble(store) = &mut self.store {
-            if let Some(entry) = store.remove(&k) {
+        loop {
+            let Some(k) = self.next_closed_key(wm_out) else {
+                return Ok(None);
+            };
+            let entry = match &mut self.store {
+                WindowStore::Tumble(store) => store.remove(&k),
+                _ => None,
+            };
+            if let Some(entry) = entry {
+                self.closed_index
+                    .remove(&(entry.window_end, k.encoded_bytes().to_vec()));
                 return Ok(Some(emit_tumble(&group_from_et_key(&k.key), &entry)));
             }
+            self.closed_index.retain(|_, v| v != &k);
         }
-        Ok(None)
+    }
+
+    fn next_closed_key(&self, wm_out: i64) -> Option<StateKey> {
+        match self.closed_index.first_key_value() {
+            Some(((end, _), key)) if *end <= wm_out => Some(key.clone()),
+            _ => None,
+        }
+    }
+
+    fn index_insert(&mut self, key: &StateKey, window_end: i64) {
+        self.closed_index
+            .insert((window_end, key.encoded_bytes().to_vec()), key.clone());
+    }
+
+    fn index_remove(&mut self, key: &StateKey, window_end: i64) {
+        self.closed_index
+            .remove(&(window_end, key.encoded_bytes().to_vec()));
+    }
+
+    fn rebuild_closed_index(&mut self) {
+        self.closed_index.clear();
+        if let WindowStore::Tumble(store) = &self.store {
+            for (k, e) in store.iter() {
+                self.closed_index
+                    .insert((e.window_end, k.encoded_bytes().to_vec()), k.clone());
+            }
+        }
     }
 
     /// Take a mailbox-sized chunk of closed windows (R17).
@@ -443,14 +469,11 @@ impl WindowOperator {
     }
 
     fn peek_closed_bytes(&self, wm_out: i64) -> Option<usize> {
+        let key = self.next_closed_key(wm_out)?;
         match &self.store {
-            WindowStore::Tumble(store) => store
-                .iter()
-                .filter(|(_, e)| e.window_end <= wm_out)
-                .min_by_key(|(k, e)| (e.window_end, k.encoded_bytes().to_vec()))
-                .map(|(_, e)| {
-                    e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>() + 32
-                }),
+            WindowStore::Tumble(store) => store.get(&key).map(|e| {
+                e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>() + 32
+            }),
             _ => None,
         }
     }
@@ -497,10 +520,13 @@ impl WindowOperator {
             _ => None,
         };
         if stale.is_some() {
-            if let WindowStore::Tumble(store) = &mut self.store {
-                if let Some(old) = store.remove(&sk) {
-                    late.push(emit_tumble(&sk.key, &old));
-                }
+            let old = match &mut self.store {
+                WindowStore::Tumble(store) => store.remove(&sk),
+                _ => None,
+            };
+            if let Some(old) = old {
+                self.index_remove(&sk, old.window_end);
+                late.push(emit_tumble(&sk.key, &old));
             }
         }
         let missing = matches!(&self.store, WindowStore::Tumble(s) if s.get(&sk).is_none());
@@ -518,6 +544,7 @@ impl WindowOperator {
                     bytes,
                 )?;
             }
+            self.index_insert(&sk, end);
             self.timers
                 .schedule(TimerId::window(self.operator, end), end)?;
         }
@@ -529,10 +556,13 @@ impl WindowOperator {
             _ => false,
         };
         if rotate {
-            if let WindowStore::Tumble(store) = &mut self.store {
-                if let Some(old) = store.remove(&sk) {
-                    late.push(emit_tumble(&sk.key, &old));
-                }
+            let old = match &mut self.store {
+                WindowStore::Tumble(store) => store.remove(&sk),
+                _ => None,
+            };
+            if let Some(old) = old {
+                self.index_remove(&sk, old.window_end);
+                late.push(emit_tumble(&sk.key, &old));
             }
             let accs = empty_accs(&spec, &input)?;
             let bytes: usize = accs.iter().map(Accumulator::tracked_bytes).sum();
@@ -547,6 +577,7 @@ impl WindowOperator {
                     bytes,
                 )?;
             }
+            self.index_insert(&sk, end);
             self.timers
                 .schedule(TimerId::window(self.operator, end), end)?;
         }
@@ -605,11 +636,14 @@ impl WindowOperator {
             _ => return Ok(Vec::new()),
         };
         let mut out = Vec::new();
-        if let WindowStore::Tumble(store) = &mut self.store {
-            for k in victims {
-                if let Some(entry) = store.remove(&k) {
-                    out.push(emit_tumble(&k.key, &entry));
-                }
+        for k in victims {
+            let entry = match &mut self.store {
+                WindowStore::Tumble(store) => store.remove(&k),
+                _ => None,
+            };
+            if let Some(entry) = entry {
+                self.index_remove(&k, entry.window_end);
+                out.push(emit_tumble(&k.key, &entry));
             }
         }
         Ok(out)
@@ -635,6 +669,7 @@ impl WindowOperator {
             WindowStore::Tumble(s) => s.clear(),
             WindowStore::Count(s) => s.clear(),
         }
+        self.closed_index.clear();
         self.timers.cancel_all();
     }
 
@@ -737,6 +772,7 @@ impl WindowOperator {
             h.restore(freeze.wm_in, freeze.wm_out);
         }
         self.hub.restore_effective(freeze.last_effective);
+        self.rebuild_closed_index();
         // R16: PT windows must still close after restore without new data.
         if !self.spec.kind.uses_event_time() {
             if let WindowStore::Tumble(store) = &self.store {
@@ -1064,5 +1100,86 @@ mod review_tests {
         }
         assert_eq!(total, 32, "every closed key must be emitted");
         assert!(rounds > 1, "32 keys must not flush as a single mailbox burst");
+    }
+
+    #[test]
+    fn n11_many_keys_close_in_deterministic_order() {
+        const N: usize = 256;
+        let mut entries = Vec::with_capacity(N);
+        for i in 0..N {
+            let end = 10 + ((i % 7) as i64) * 10;
+            entries.push(FrozenEntry {
+                key: vec![Scalar::utf8(&format!("k{i:03}")), Scalar::Int64(0)],
+                window_start: 0,
+                window_end: end,
+                count: 0,
+                accs: vec![Accumulator::new(AggFn::Sum, DataType::Int64, false).unwrap()],
+            });
+        }
+        let mut expected: Vec<(i64, Vec<u8>, String)> = entries
+            .iter()
+            .map(|e| {
+                let sk = StateKey::new(OperatorId::new(1), StateSlotId::new(1), e.key.clone());
+                let name = match &e.key[0] {
+                    Scalar::Utf8(s) => s.to_string(),
+                    _ => String::new(),
+                };
+                (e.window_end, sk.encoded_bytes().to_vec(), name)
+            })
+            .collect();
+        expected.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+
+        let mut w = WindowOperator::new(
+            OperatorId::new(1),
+            pt_spec(),
+            schema(),
+            MemoryOwner::new(ResourceBudget::compact()),
+            512,
+            512,
+        )
+        .unwrap();
+        w.restore_freeze(&WindowFreeze {
+            operator: OperatorId::new(1),
+            slot: StateSlotId::new(1),
+            kind: 0,
+            entries,
+            wm_in: Some(100),
+            wm_out: Some(0),
+            last_effective: Some(100),
+        })
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let mut got = Vec::new();
+        loop {
+            let chunk = w.take_closed_chunk(100, 16, 4096).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            for row in chunk {
+                let name = match &row.values[0] {
+                    Scalar::Utf8(s) => s.to_string(),
+                    _ => String::new(),
+                };
+                let end = match row.values.get(2) {
+                    Some(Scalar::Int64(v)) => *v,
+                    _ => -1,
+                };
+                got.push((end, name));
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "closing {N} keys via the ordered index must not O(n²) scan"
+        );
+        assert_eq!(got.len(), N, "every closed key must emit once");
+        let expected_pairs: Vec<(i64, String)> =
+            expected.into_iter().map(|(end, _, name)| (end, name)).collect();
+        assert_eq!(
+            got, expected_pairs,
+            "closed keys must emit in (window_end, encoded_key) order"
+        );
+        assert!(w.take_closed_chunk(100, 16, 4096).unwrap().is_empty());
+        assert_eq!(w.key_count(), 0);
     }
 }

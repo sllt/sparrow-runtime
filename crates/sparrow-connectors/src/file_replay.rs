@@ -213,6 +213,43 @@ impl FileReplaySource {
         }
     }
 
+    /// Read up to `max_frames` records or about `max_bytes` of decoded
+    /// rows, then return so the caller can leave `spawn_blocking` (N14).
+    /// Stops early on EOF. AppendOnly/Sealed identity is unchanged —
+    /// [`Self::poll_decoded`] still owns reopen / message-boundary cuts.
+    pub fn poll_decoded_batch(
+        &mut self,
+        max_frames: usize,
+        max_bytes: usize,
+    ) -> ModelResult<Vec<FilePoll>> {
+        let max_frames = max_frames.max(1);
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        loop {
+            if out.len() >= max_frames {
+                break;
+            }
+            let poll = self.poll_decoded()?;
+            match &poll {
+                FilePoll::Row(row) => {
+                    let sz = row.tracked_bytes();
+                    if !out.is_empty() && bytes.saturating_add(sz) > max_bytes {
+                        out.push(poll);
+                        break;
+                    }
+                    bytes = bytes.saturating_add(sz);
+                    out.push(poll);
+                }
+                FilePoll::DecodeError => out.push(poll),
+                FilePoll::Eof => {
+                    out.push(poll);
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn refresh_identity(&self) -> Result<SourceIdentity> {
         let meta = fs::metadata(&self.path).map_err(|e| {
             ConnectorError::new(
@@ -633,6 +670,70 @@ mod tests {
         assert!(
             matches!(again, FilePoll::Row(_)),
             "AppendOnly must see rows written after EOF, got {again:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn n14_poll_decoded_batch_reads_frames_then_eof() {
+        let path = tmp("n14-batch");
+        let mut body = Vec::new();
+        for i in 0..20 {
+            body.extend(format!("{{\"device_id\":\"d1\",\"v\":{i}}}\n").into_bytes());
+        }
+        std::fs::write(&path, &body).unwrap();
+        let mut cfg = FileReplayConfig::new(&path, schema());
+        cfg.contract = FileContract::Sealed;
+        let mut src = FileReplaySource::open(&cfg).unwrap();
+        let polls = src.poll_decoded_batch(32, 64 * 1024).unwrap();
+        let rows = polls
+            .iter()
+            .filter(|p| matches!(p, FilePoll::Row(_)))
+            .count();
+        assert_eq!(rows, 20, "one blocking batch should decode many frames");
+        assert!(
+            matches!(polls.last(), Some(FilePoll::Eof)),
+            "sealed batch must end with EOF, got {:?}",
+            polls.last()
+        );
+        assert_eq!(src.poll_decoded_batch(8, 1024).unwrap().len(), 1);
+        assert!(matches!(
+            src.poll_decoded_batch(8, 1024).unwrap()[0],
+            FilePoll::Eof
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn n14_append_only_batch_eof_then_growth() {
+        use std::io::Write;
+        let path = tmp("n14-append");
+        std::fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n")
+            .unwrap();
+        let mut cfg = FileReplayConfig::new(&path, schema());
+        cfg.contract = FileContract::AppendOnly;
+        let mut src = FileReplaySource::open(&cfg).unwrap();
+        let first = src.poll_decoded_batch(32, 64 * 1024).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .filter(|p| matches!(p, FilePoll::Row(_)))
+                .count(),
+            2
+        );
+        assert!(matches!(first.last(), Some(FilePoll::Eof)));
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, r#"{{"device_id":"d1","v":3}}"#).unwrap();
+            f.flush().unwrap();
+        }
+        let again = src.poll_decoded_batch(32, 64 * 1024).unwrap();
+        assert!(
+            again.iter().any(|p| matches!(p, FilePoll::Row(_))),
+            "AppendOnly batch must see growth after EOF, got {again:?}"
         );
         let _ = std::fs::remove_file(&path);
     }
