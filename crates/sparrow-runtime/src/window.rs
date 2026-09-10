@@ -367,6 +367,7 @@ impl WindowOperator {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn flush_closed(&mut self, wm_out: i64) -> Result<Vec<Row>> {
         let mut out = Vec::new();
         while let Some(row) = self.take_closed_one(wm_out)? {

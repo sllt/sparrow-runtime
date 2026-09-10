@@ -128,7 +128,7 @@ curl -sf -H "${AUTH[0]}" -H "${AUTH[1]}" -X PUT --data '{
 FILE_SPEC='{
   "version": 1,
   "stream": "sensors",
-  "sql": "SELECT device_id, v FROM sensors",
+  "sql": "SELECT COUNT(*) AS n, device_id FROM sensors GROUP BY device_id, COUNT_WINDOW(2)",
   "source": { "kind": "file", "path": "'"$DATA"'" },
   "sink": { "kind": "log" },
   "delivery": "live_best_effort",
