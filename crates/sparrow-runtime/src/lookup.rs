@@ -590,7 +590,10 @@ mod tests {
         let err = bad.verify().unwrap_err();
         assert_eq!(err.code, ErrorCode::CodecViolation);
         let owner = owner();
-        let err = LookupOperator::new(spec(), Arc::new(bad), stream_schema(), owner).unwrap_err();
+        let err = match LookupOperator::new(spec(), Arc::new(bad), stream_schema(), owner) {
+            Err(e) => e,
+            Ok(_) => panic!("corrupt table must fail lookup bind"),
+        };
         assert_eq!(err.code, ErrorCode::CodecViolation);
     }
 
