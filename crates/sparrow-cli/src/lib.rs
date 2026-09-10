@@ -2,9 +2,11 @@
 //! crate, not of `sparrow-runtime`.
 
 use sparrow_connectors::{
-    sensor_json, EmbeddedBroker, HttpCapture, HttpSink, HttpSinkConfig, IoDiagnostics,
-    MapSecretResolver, MqttSource, MqttSourceConfig, TargetPolicy,
+    HttpSink, HttpSinkConfig, IoDiagnostics, MapSecretResolver, MqttSource, MqttSourceConfig,
+    TargetPolicy,
 };
+#[cfg(feature = "demo-io")]
+use sparrow_connectors::{sensor_json, EmbeddedBroker, HttpCapture};
 use sparrow_expr::{BinaryOp, Expr};
 use sparrow_model::{
     DataType, Field, FieldId, PipelineId, ResourceBudget, Result, RevisionId, Scalar, Schema,
@@ -72,6 +74,7 @@ pub fn compact_kernel() -> Result<Kernel> {
     })
 }
 
+#[cfg(feature = "demo-io")]
 pub struct LiveLoop {
     pub broker: EmbeddedBroker,
     pub http: HttpCapture,
@@ -83,6 +86,7 @@ pub struct LiveLoop {
     pub policy: TargetPolicy,
 }
 
+#[cfg(feature = "demo-io")]
 impl LiveLoop {
     pub fn start(kernel: &Kernel, inbox: usize, outbox: usize) -> Result<Self> {
         kernel.block_on(Self::start_async(kernel, inbox, outbox))

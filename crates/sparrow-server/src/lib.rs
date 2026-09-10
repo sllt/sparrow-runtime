@@ -14,12 +14,15 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sparrow_control::{
-    bind_plan, binder_catalog, capabilities_json, effective_guarantees, explain_plan, honesty_json,
+    bind_plan, binder_catalog, capabilities_json, effective_guarantees, explain_plan_with,
+    honesty_json, replay_label_for_source,
     request_start, request_start_at, request_stop, stream_schema, validate_aligned_plan,
-    validate_io, DemoHarness,
+    validate_io, DemoIo,
     PipelineSpec,
     RestoreSpec, Store, StreamSpec, Supervisor, HONESTY,
 };
+#[cfg(feature = "demo-io")]
+use sparrow_control::DemoHarness;
 use sparrow_runtime::Kernel;
 use sparrow_model::{ErrorCode, SparrowError};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -83,6 +86,8 @@ impl From<SparrowError> for ApiError {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
             ErrorCode::MaxRecordSize | ErrorCode::BoundExceeded => StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::Cancelled => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self { status, err }
@@ -238,7 +243,12 @@ fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
 fn run_explain(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
     let catalog = binder_catalog(&state.store).map_err(ApiError::from)?;
     let plan = bind_plan(spec, &catalog, spec.stream.as_str(), 0).map_err(ApiError::from)?;
-    let e = explain_plan(&plan);
+    let recovery = spec
+        .check_delivery()
+        .map(|(_, r)| r)
+        .unwrap_or(sparrow_model::RecoveryPolicy::RestartFresh);
+    let replay = replay_label_for_source(&spec.source.kind);
+    let e = explain_plan_with(&plan, recovery, replay);
     Ok(json!({
         "accepted": e.accepted,
         "stages": e.stages,
@@ -521,9 +531,13 @@ async fn start_pipeline(
     let revision = if body.is_empty() {
         None
     } else {
-        serde_json::from_slice::<StartBody>(&body)
-            .ok()
-            .and_then(|b| b.revision)
+        let parsed: StartBody = serde_json::from_slice(&body).map_err(|e| {
+            ApiError::from(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("start body JSON: {e}"),
+            ))
+        })?;
+        parsed.revision
     };
     request_start_at(&state.store, &name, &actor, revision).map_err(ApiError::from)?;
     state.supervisor.wake();
@@ -699,25 +713,47 @@ async fn demo_io(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
 
 async fn demo_publish(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
-    let Some(demo) = state.supervisor.demo() else {
-        return Err(ApiError::from(SparrowError::new(
+    #[cfg(feature = "demo-io")]
+    {
+        let Some(demo) = state.supervisor.demo() else {
+            return Err(ApiError::from(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "demo I/O is not enabled",
+            )));
+        };
+        demo.publish_fixture().await.map_err(ApiError::from)?;
+        return Ok(Json(json!({"published": 6, "topic": "sensors/json"})));
+    }
+    #[cfg(not(feature = "demo-io"))]
+    {
+        let _ = state;
+        Err(ApiError::from(SparrowError::new(
             ErrorCode::FeatureUnavailable,
-            "demo I/O is not enabled",
-        )));
-    };
-    demo.publish_fixture().await.map_err(ApiError::from)?;
-    Ok(Json(json!({"published": 6, "topic": "sensors/json"})))
+            "sparrow-server was built without the demo-io feature",
+        )))
+    }
 }
 
 async fn demo_capture(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
-    let Some(demo) = state.supervisor.demo() else {
-        return Err(ApiError::from(SparrowError::new(
+    #[cfg(feature = "demo-io")]
+    {
+        let Some(demo) = state.supervisor.demo() else {
+            return Err(ApiError::from(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "demo I/O is not enabled",
+            )));
+        };
+        return Ok(Json(json!({"bodies": demo.http.body_strings()})));
+    }
+    #[cfg(not(feature = "demo-io"))]
+    {
+        let _ = state;
+        Err(ApiError::from(SparrowError::new(
             ErrorCode::FeatureUnavailable,
-            "demo I/O is not enabled",
-        )));
-    };
-    Ok(Json(json!({"bodies": demo.http.body_strings()})))
+            "sparrow-server was built without the demo-io feature",
+        )))
+    }
 }
 
 pub async fn boot(
@@ -726,13 +762,24 @@ pub async fn boot(
     token: String,
     safe_mode: bool,
     demo_io: bool,
-) -> Result<(AppState, Option<Arc<DemoHarness>>), SparrowError> {
+) -> Result<(AppState, Option<DemoIo>), SparrowError> {
+    #[cfg(feature = "demo-io")]
     let demo = if demo_io {
         let h = Arc::new(DemoHarness::start().await?);
         store.put_allow(&h.broker.host(), h.broker.port())?;
         store.put_allow("127.0.0.1", h.http.port())?;
         Some(h)
     } else {
+        None
+    };
+    #[cfg(not(feature = "demo-io"))]
+    let demo = {
+        if demo_io {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "sparrow-server was built without the demo-io feature",
+            ));
+        }
         None
     };
     let supervisor = Supervisor::new(Arc::clone(&store), kernel, safe_mode, demo.clone())?;
@@ -784,5 +831,20 @@ pub async fn wait_status(
             ));
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p3_56_resource_exhausted_and_cancelled_not_500() {
+        let r = ApiError::from(SparrowError::new(ErrorCode::ResourceExhausted, "cap")).into_response();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        let r = ApiError::from(SparrowError::new(ErrorCode::Cancelled, "gone")).into_response();
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        let r = ApiError::from(SparrowError::new(ErrorCode::Internal, "boom")).into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

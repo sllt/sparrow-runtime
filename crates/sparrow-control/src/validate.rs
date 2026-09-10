@@ -99,8 +99,24 @@ pub fn bind_plan(
     Ok(physicalize(&bound, &PlanOptions { fuse: true }))
 }
 
+pub fn replay_label_for_source(kind: &str) -> &'static str {
+    match kind {
+        "file" | "file_replay" | "replay" => "replayable",
+        "mqtt" | "mqtt_source" | "http_push" | "http" => "unsupported",
+        _ => sparrow_plan::REPLAY_UNBOUND,
+    }
+}
+
 pub fn explain_plan(plan: &PhysicalPlan) -> ExplainReport {
-    let g = sparrow_plan::GraphExplain::from_plan(plan);
+    explain_plan_with(plan, RecoveryPolicy::RestartFresh, sparrow_plan::REPLAY_UNBOUND)
+}
+
+pub fn explain_plan_with(
+    plan: &PhysicalPlan,
+    recovery: RecoveryPolicy,
+    replay: &'static str,
+) -> ExplainReport {
+    let g = sparrow_plan::GraphExplain::from_plan_with(plan, recovery, replay);
     ExplainReport {
         accepted: g.accepted,
         stages: g.stages,

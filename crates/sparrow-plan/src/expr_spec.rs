@@ -7,7 +7,7 @@ use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sparrow_model::{DataType, Scalar};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "k", rename_all = "snake_case")]
+#[serde(tag = "k", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExprSpec {
     Col {
         name: String,
@@ -48,7 +48,7 @@ pub enum ExprSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "t", rename_all = "snake_case")]
+#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LitSpec {
     Null,
     Bool { v: bool },

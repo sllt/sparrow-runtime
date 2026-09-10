@@ -6,9 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sparrow_connectors::{
-    publish_qos0, sensor_json, EmbeddedBroker, FileReplayConfig, FileReplaySource, HttpCapture,
-    HttpPushSource, HttpSink, IoDiagnostics, LogSink, MqttSink, MqttSource,
+    FileReplayConfig, FileReplaySource, HttpPushSource, HttpSink, IoDiagnostics, LogSink, MqttSink,
+    MqttSource,
 };
+#[cfg(feature = "demo-io")]
+use sparrow_connectors::{publish_qos0, sensor_json, EmbeddedBroker, HttpCapture};
 use sparrow_io::ReplayableSource;
 use sparrow_model::{
     InflightCounter, RecoveryPolicy, ResourceBudget, Result, SparrowError, StateSlotId,
@@ -40,11 +42,13 @@ pub(crate) fn retry_backoff(consecutive_failures: u64) -> Duration {
     Duration::from_millis(40u64.saturating_mul(1u64 << shift))
 }
 
+#[cfg(feature = "demo-io")]
 pub struct DemoHarness {
     pub broker: EmbeddedBroker,
     pub http: HttpCapture,
 }
 
+#[cfg(feature = "demo-io")]
 impl DemoHarness {
     pub async fn start() -> Result<Self> {
         let broker = EmbeddedBroker::start().await.map_err(SparrowError::from)?;
@@ -132,16 +136,24 @@ pub struct Supervisor {
     next_retry_at: Mutex<HashMap<String, Instant>>,
     wake: Notify,
     safe_mode: bool,
+    #[cfg(feature = "demo-io")]
     demo: Option<Arc<DemoHarness>>,
     secrets: StoreSecrets,
 }
+
+/// Demo handle passed into [`Supervisor::new`]. `()` when built without `demo-io`.
+#[cfg(feature = "demo-io")]
+pub type DemoIo = Arc<DemoHarness>;
+#[cfg(not(feature = "demo-io"))]
+pub type DemoIo = ();
 
 impl Supervisor {
     pub fn new(
         store: Arc<Store>,
         kernel: Arc<Kernel>,
         safe_mode: bool,
-        demo: Option<Arc<DemoHarness>>,
+        #[cfg(feature = "demo-io")] demo: Option<DemoIo>,
+        #[cfg(not(feature = "demo-io"))] _demo: Option<DemoIo>,
     ) -> Result<Arc<Self>> {
         store.reset_actual_after_process_restart()?;
         let secrets = StoreSecrets::new(Arc::clone(&store));
@@ -152,17 +164,26 @@ impl Supervisor {
             next_retry_at: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             safe_mode,
+            #[cfg(feature = "demo-io")]
             demo,
             secrets,
         }))
     }
 
+    #[cfg(feature = "demo-io")]
     pub fn demo(&self) -> Option<Arc<DemoHarness>> {
         self.demo.clone()
     }
 
     pub fn demo_endpoints(&self) -> Option<DemoEndpoints> {
-        self.demo.as_ref().map(|d| d.endpoints())
+        #[cfg(feature = "demo-io")]
+        {
+            self.demo.as_ref().map(|d| d.endpoints())
+        }
+        #[cfg(not(feature = "demo-io"))]
+        {
+            None
+        }
     }
 
     pub fn wake(&self) {
@@ -260,7 +281,10 @@ impl Supervisor {
                 } else {
                     self.clear_retry(&d.name).await;
                 }
-            } else if let Some(job) = self.running.lock().await.remove(&d.name) {
+            } else if let Some(job) = {
+                let mut g = self.running.lock().await;
+                g.remove(&d.name)
+            } {
                 self.stop_job(job).await;
                 let name = d.name.clone();
                 let revision = d.revision;
@@ -447,11 +471,15 @@ impl Supervisor {
             }
         };
 
-        if let Some(old) = self.running.lock().await.insert(name.to_string(), {
-            let mut j = job;
-            j.revision = revision;
-            j
-        }) {
+        let old = {
+            let mut g = self.running.lock().await;
+            g.insert(name.to_string(), {
+                let mut j = job;
+                j.revision = revision;
+                j
+            })
+        };
+        if let Some(old) = old {
             self.stop_job(old).await;
         }
         let name_s = name.to_string();
@@ -938,7 +966,11 @@ impl Supervisor {
     }
 
     pub async fn kill_named(&self, name: &str) -> Result<()> {
-        if let Some(job) = self.running.lock().await.remove(name) {
+        let job = {
+            let mut g = self.running.lock().await;
+            g.remove(name)
+        };
+        if let Some(job) = job {
             self.stop_job(job).await;
             let n = name.to_string();
             let _ = self
@@ -1083,4 +1115,13 @@ pub fn request_stop(store: &Store, name: &str, actor: &str) -> Result<()> {
         "accepted",
     )?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "demo-io"))]
+mod a6_tests {
+    #[test]
+    fn a6_demo_harness_type_is_exported() {
+        fn assert_exported(_: Option<super::DemoHarness>) {}
+        assert_exported(None);
+    }
 }

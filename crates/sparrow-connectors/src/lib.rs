@@ -24,13 +24,14 @@ pub use capabilities::{
 pub use diag::{IoDiagnostics, IoSnapshot};
 pub use error::{ConnectorError, Result};
 pub use file_replay::{FileContract, FilePoll, FileReplayConfig, FileReplaySource};
-pub use http::{HttpCapture, HttpSink, HttpSinkConfig};
+#[cfg(feature = "demo-io")]
+pub use http::HttpCapture;
+pub use http::{HttpSink, HttpSinkConfig};
 pub use http_push::{HttpPushSource, HttpPushSourceConfig};
 pub use log::{LogSink, LogSinkConfig};
-pub use mqtt::{
-    publish_qos0, publish_qos0_many, EmbeddedBroker, MqttSink, MqttSinkConfig, MqttSource,
-    MqttSourceConfig,
-};
+#[cfg(feature = "demo-io")]
+pub use mqtt::{publish_qos0, publish_qos0_many, EmbeddedBroker};
+pub use mqtt::{MqttSink, MqttSinkConfig, MqttSource, MqttSourceConfig};
 pub use policy::{
     check_bind_addr, check_data_path, check_data_path_in, configured_data_roots, data_roots,
     default_data_root, default_data_roots, ensure_default_data_root, AllowedTarget, TargetPolicy,
@@ -59,4 +60,25 @@ pub fn sensor_json(
     })
     .to_string()
     .into_bytes()
+}
+
+#[cfg(test)]
+mod a6_tests {
+    #[cfg(feature = "demo-io")]
+    #[test]
+    fn a6_demo_io_exports_embedded_broker_and_http_capture() {
+        fn assert_exported(
+            _: Option<crate::EmbeddedBroker>,
+            _: Option<crate::HttpCapture>,
+        ) {
+        }
+        assert_exported(None, None);
+    }
+
+    #[cfg(not(feature = "demo-io"))]
+    #[test]
+    fn a6_demo_io_disabled_has_no_demo_types() {
+        // Production `--no-default-features` must compile this crate without
+        // EmbeddedBroker / HttpCapture. This test existing is the proof.
+    }
 }

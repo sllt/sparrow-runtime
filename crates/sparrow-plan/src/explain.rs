@@ -6,7 +6,7 @@ use crate::bound::{BoundKind, BoundLogicalPlan};
 use crate::graph::GraphSpec;
 use crate::physical::{physicalize, PhysicalPlan, PhysicalStage, PlanOptions};
 use crate::{bind_graph, Catalog};
-use sparrow_model::{DeliveryContract, DeliveryGuarantee, Result, WindowKind};
+use sparrow_model::{DeliveryContract, DeliveryGuarantee, RecoveryPolicy, Result};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GraphExplain {
@@ -26,8 +26,21 @@ pub struct GraphExplain {
     pub experimental: bool,
 }
 
+/// Replay is not on the physical plan. Graph/SQL explain without a
+/// pipeline source cannot pretend a connector is bound.
+pub const REPLAY_UNBOUND: &str =
+    "unbound — physical plan has no connector; MQTT/HTTP=unsupported, file=replayable";
+
 impl GraphExplain {
     pub fn from_plan(plan: &PhysicalPlan) -> Self {
+        Self::from_plan_with(plan, RecoveryPolicy::RestartFresh, REPLAY_UNBOUND)
+    }
+
+    pub fn from_plan_with(
+        plan: &PhysicalPlan,
+        recovery: RecoveryPolicy,
+        replay: &'static str,
+    ) -> Self {
         let stages = plan
             .stages
             .iter()
@@ -54,14 +67,14 @@ impl GraphExplain {
             )
         } else if plan.has_processing_time_window() {
             "processing-time".into()
-        } else if has_count_window(plan) {
+        } else if plan.has_count_window() {
             "count / arrival-order (not event-time)".into()
         } else {
             "none".into()
         };
         let state = describe_state(plan);
         let experimental = false;
-        let recovery = plan.recovery_label();
+        let recovery = plan.recovery_label_for(recovery);
         let guarantee = format!(
             "{} + recovery={} (aligned checkpoint is opt-in for ReplayableSource, not exactly-once)",
             DeliveryGuarantee::LiveBestEffort.as_str(),
@@ -79,23 +92,11 @@ impl GraphExplain {
             guarantee,
             delivery: DeliveryGuarantee::LiveBestEffort.as_str(),
             recovery,
-            replay: "source-dependent",
+            replay,
             honesty: plan.honesty(),
             experimental,
         }
     }
-}
-
-fn has_count_window(plan: &PhysicalPlan) -> bool {
-    plan.stages.iter().any(|s| {
-        matches!(
-            s,
-            PhysicalStage::WindowAgg {
-                spec,
-                ..
-            } if matches!(spec.kind, WindowKind::Count { .. })
-        )
-    })
 }
 
 fn describe_state(plan: &PhysicalPlan) -> String {
@@ -238,5 +239,28 @@ mod tests {
         assert!(report.guarantee.contains("live_best_effort"));
         assert!(report.honesty.contains("event-time"));
         assert!(report.physical.iter().any(|s| s.contains("window")));
+        assert_eq!(report.recovery, "none");
+        assert_eq!(report.replay, REPLAY_UNBOUND);
+        assert!(
+            !report.guarantee.contains("V0_3") && !report.recovery.contains("V0"),
+            "recovery_label must not cite a milestone contract: {}",
+            report.guarantee
+        );
+    }
+
+    #[test]
+    fn p3_44_recovery_label_follows_policy_not_v0_3() {
+        let spec = GraphSpec::from_json(et_tumble_template()).unwrap();
+        let bound = crate::bind_graph(&spec, &Catalog::new()).unwrap();
+        let plan = crate::physicalize(&bound, &crate::PlanOptions { fuse: true });
+        assert_eq!(
+            plan.recovery_label_for(RecoveryPolicy::RestartFresh),
+            "none"
+        );
+        assert_eq!(plan.recovery_label_for(RecoveryPolicy::Aligned), "aligned");
+        let aligned = GraphExplain::from_plan_with(&plan, RecoveryPolicy::Aligned, "replayable");
+        assert_eq!(aligned.recovery, "aligned");
+        assert_eq!(aligned.replay, "replayable");
+        assert!(!aligned.guarantee.contains("V0_3"));
     }
 }

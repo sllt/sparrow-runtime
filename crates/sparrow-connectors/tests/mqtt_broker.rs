@@ -1,3 +1,5 @@
+#![cfg(feature = "demo-io")]
+
 use std::time::Duration;
 
 use sparrow_connectors::{

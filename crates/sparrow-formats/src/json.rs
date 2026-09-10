@@ -1,5 +1,6 @@
 //! JSON object ↔ [`Row`] with size/depth caps and schema checks.
 
+use serde::de::DeserializeSeed;
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sparrow_model::{DataType, DynamicValue, Row, Scalar, Schema, SourceFrame};
 
@@ -65,22 +66,23 @@ pub fn decode_json_row(schema: &Schema, bytes: &[u8], limits: &JsonLimits) -> Re
             format!("JSON record {}B exceeds max_bytes {}", bytes.len(), limits.max_bytes),
         ));
     }
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
-        SparrowError::new(ErrorCode::CodecViolation, format!("invalid JSON: {e}"))
-    })?;
-    let depth = json_depth(&value);
-    if depth > limits.max_depth {
+    let hint = json_byte_depth(bytes);
+    if hint > limits.max_depth {
         return Err(SparrowError::new(
             ErrorCode::BoundExceeded,
-            format!("JSON depth {depth} exceeds max_depth {}", limits.max_depth),
+            format!("JSON depth {hint} exceeds max_depth {}", limits.max_depth),
         ));
     }
-    let obj = value.as_object().ok_or_else(|| {
-        SparrowError::new(ErrorCode::CodecViolation, "JSON root must be an object")
-    })?;
+    let value = parse_strict_json(bytes, limits.max_depth)?;
+    let JsonVal::Object(fields) = value else {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "JSON root must be an object",
+        ));
+    };
     let mut values = Vec::with_capacity(schema.fields.len());
     for field in &schema.fields {
-        match obj.get(&field.name) {
+        match fields.iter().find(|(k, _)| k == &field.name) {
             None if field.nullable => values.push(Scalar::Null),
             None => {
                 return Err(SparrowError::new(
@@ -88,7 +90,7 @@ pub fn decode_json_row(schema: &Schema, bytes: &[u8], limits: &JsonLimits) -> Re
                     format!("missing required field '{}'", field.name),
                 ));
             }
-            Some(v) => values.push(json_to_scalar(v, &field.data_type, field.nullable)?),
+            Some((_, v)) => values.push(json_val_to_scalar(v, &field.data_type, field.nullable)?),
         }
     }
     Ok(Row { values })
@@ -139,8 +141,8 @@ pub fn json_depth(value: &serde_json::Value) -> usize {
     }
 }
 
-fn json_to_scalar(value: &serde_json::Value, ty: &DataType, nullable: bool) -> Result<Scalar> {
-    if value.is_null() {
+fn json_val_to_scalar(value: &JsonVal, ty: &DataType, nullable: bool) -> Result<Scalar> {
+    if matches!(value, JsonVal::Null) {
         if nullable {
             return Ok(Scalar::Null);
         }
@@ -150,97 +152,174 @@ fn json_to_scalar(value: &serde_json::Value, ty: &DataType, nullable: bool) -> R
         ));
     }
     match ty {
-        DataType::Bool => value
-            .as_bool()
-            .map(Scalar::Bool)
-            .ok_or_else(|| type_err("bool", value)),
+        DataType::Bool => match value {
+            JsonVal::Bool(v) => Ok(Scalar::Bool(*v)),
+            other => Err(type_err("bool", other)),
+        },
         DataType::Int64 => int64(value).map(Scalar::Int64),
         DataType::UInt64 => uint64(value).map(Scalar::UInt64),
-        DataType::Float64 => value
-            .as_f64()
-            .map(Scalar::Float64)
-            .ok_or_else(|| type_err("float64", value)),
-        DataType::Utf8 => value
-            .as_str()
-            .map(Scalar::utf8)
-            .ok_or_else(|| type_err("utf8", value)),
-        DataType::Bytes => {
-            let s = value.as_str().ok_or_else(|| type_err("bytes(base64)", value))?;
-            let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
-                .map_err(|_| type_err("bytes(base64)", value))?;
-            Ok(Scalar::bytes(raw))
-        }
+        DataType::Float64 => match value {
+            JsonVal::F64(v) => Ok(Scalar::Float64(*v)),
+            JsonVal::I64(v) => Ok(Scalar::Float64(*v as f64)),
+            JsonVal::U64(v) => Ok(Scalar::Float64(*v as f64)),
+            other => Err(type_err("float64", other)),
+        },
+        DataType::Utf8 => match value {
+            JsonVal::Utf8(s) => Ok(Scalar::utf8(s)),
+            other => Err(type_err("utf8", other)),
+        },
+        DataType::Bytes => match value {
+            JsonVal::Utf8(s) => {
+                let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
+                    .map_err(|_| type_err("bytes(base64)", value))?;
+                Ok(Scalar::bytes(raw))
+            }
+            other => Err(type_err("bytes(base64)", other)),
+        },
         DataType::TimestampMicrosUTC => int64(value).map(Scalar::TimestampMicrosUTC),
-        DataType::Dynamic | DataType::Null => Ok(Scalar::Dynamic(json_to_dynamic(value))),
-        DataType::Array(_) | DataType::Struct(_) | DataType::Map { .. } => {
-            Ok(Scalar::Dynamic(json_to_dynamic(value)))
+        DataType::Dynamic | DataType::Null => Ok(Scalar::Dynamic(json_val_to_dynamic(value)?)),
+        DataType::Array(inner) => {
+            let JsonVal::Array(items) = value else {
+                return Err(type_err("array", value));
+            };
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(scalar_to_dynamic(json_val_to_scalar(item, inner, true)?));
+            }
+            Ok(Scalar::Dynamic(DynamicValue::Array(out.into())))
+        }
+        DataType::Struct(fields) => {
+            let JsonVal::Object(pairs) = value else {
+                return Err(type_err("struct", value));
+            };
+            for (k, _) in pairs {
+                if !fields.iter().any(|f| f.name == *k) {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidSchema,
+                        format!("struct has unknown field '{k}'"),
+                    ));
+                }
+            }
+            let mut out = Vec::with_capacity(fields.len());
+            for f in fields {
+                match pairs.iter().find(|(k, _)| k == &f.name) {
+                    None if f.nullable => out.push((f.name.clone(), DynamicValue::Null)),
+                    None => {
+                        return Err(SparrowError::new(
+                            ErrorCode::InvalidSchema,
+                            format!("missing required struct field '{}'", f.name),
+                        ));
+                    }
+                    Some((_, v)) => {
+                        let s = json_val_to_scalar(v, &f.data_type, f.nullable)?;
+                        out.push((f.name.clone(), scalar_to_dynamic(s)));
+                    }
+                }
+            }
+            DynamicValue::try_object(out)
+                .map(Scalar::Dynamic)
+                .map_err(|(e, _)| e)
+        }
+        DataType::Map { key, value: val_ty } => {
+            let JsonVal::Object(pairs) = value else {
+                return Err(type_err("map", value));
+            };
+            let mut out = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                validate_map_key(k, key)?;
+                let s = json_val_to_scalar(v, val_ty, true)?;
+                out.push((k.clone(), scalar_to_dynamic(s)));
+            }
+            DynamicValue::try_object(out)
+                .map(Scalar::Dynamic)
+                .map_err(|(e, _)| e)
         }
     }
 }
 
-fn int64(value: &serde_json::Value) -> Result<i64> {
-    if let Some(v) = value.as_i64() {
-        return Ok(v);
-    }
-    if let Some(v) = value.as_u64() {
-        if v <= i64::MAX as u64 {
-            return Ok(v as i64);
+fn validate_map_key(key: &str, ty: &DataType) -> Result<()> {
+    match ty {
+        DataType::Utf8 => Ok(()),
+        DataType::Int64 => {
+            key.parse::<i64>().map(|_| ()).map_err(|_| {
+                SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    "map key is not int64",
+                )
+            })
         }
+        DataType::UInt64 => {
+            key.parse::<u64>().map(|_| ()).map_err(|_| {
+                SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    "map key is not uint64",
+                )
+            })
+        }
+        other => Err(SparrowError::new(
+            ErrorCode::TypeMismatch,
+            format!("map key type {other} is not supported for JSON objects"),
+        )),
     }
-    if value.as_f64().is_some() {
-        return Err(SparrowError::new(
+}
+
+fn int64(value: &JsonVal) -> Result<i64> {
+    match value {
+        JsonVal::I64(v) => Ok(*v),
+        JsonVal::U64(v) if *v <= i64::MAX as u64 => Ok(*v as i64),
+        JsonVal::F64(_) => Err(SparrowError::new(
             ErrorCode::TypeMismatch,
             "JSON number is not an integer; refusing silent truncate into int64",
-        ));
+        )),
+        other => Err(type_err("int64", other)),
     }
-    Err(type_err("int64", value))
 }
 
-fn uint64(value: &serde_json::Value) -> Result<u64> {
-    if let Some(v) = value.as_u64() {
-        return Ok(v);
-    }
-    if let Some(v) = value.as_i64() {
-        if v >= 0 {
-            return Ok(v as u64);
-        }
-    }
-    if value.as_f64().is_some() {
-        return Err(SparrowError::new(
+fn uint64(value: &JsonVal) -> Result<u64> {
+    match value {
+        JsonVal::U64(v) => Ok(*v),
+        JsonVal::I64(v) if *v >= 0 => Ok(*v as u64),
+        JsonVal::F64(_) => Err(SparrowError::new(
             ErrorCode::TypeMismatch,
             "JSON number is not an integer; refusing silent truncate into uint64",
-        ));
+        )),
+        other => Err(type_err("uint64", other)),
     }
-    Err(type_err("uint64", value))
 }
 
-fn json_to_dynamic(value: &serde_json::Value) -> DynamicValue {
-    match value {
-        serde_json::Value::Null => DynamicValue::Null,
-        serde_json::Value::Bool(v) => DynamicValue::Bool(*v),
-        serde_json::Value::Number(n) => {
-            if let Some(v) = n.as_i64() {
-                DynamicValue::Int64(v)
-            } else if let Some(v) = n.as_u64() {
-                DynamicValue::UInt64(v)
-            } else if let Some(v) = n.as_f64() {
-                DynamicValue::Float64(v)
-            } else {
-                return DynamicValue::Null;
+fn json_val_to_dynamic(value: &JsonVal) -> Result<DynamicValue> {
+    Ok(match value {
+        JsonVal::Null => DynamicValue::Null,
+        JsonVal::Bool(v) => DynamicValue::Bool(*v),
+        JsonVal::I64(v) => DynamicValue::Int64(*v),
+        JsonVal::U64(v) => DynamicValue::UInt64(*v),
+        JsonVal::F64(v) => DynamicValue::Float64(*v),
+        JsonVal::Utf8(s) => DynamicValue::utf8(s),
+        JsonVal::Array(items) => {
+            let vals: Result<Vec<DynamicValue>> = items.iter().map(json_val_to_dynamic).collect();
+            DynamicValue::Array(vals?.into())
+        }
+        JsonVal::Object(pairs) => {
+            let mut out = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                out.push((k.clone(), json_val_to_dynamic(v)?));
             }
+            DynamicValue::try_object(out).map_err(|(e, _)| e)?
         }
-        serde_json::Value::String(s) => DynamicValue::utf8(s),
-        serde_json::Value::Array(items) => {
-            let vals: Vec<DynamicValue> = items.iter().map(json_to_dynamic).collect();
-            DynamicValue::Array(vals.into())
-        }
-        serde_json::Value::Object(map) => {
-            let pairs: Vec<(String, DynamicValue)> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), json_to_dynamic(v)))
-                .collect();
-            DynamicValue::object(pairs)
-        }
+    })
+}
+
+fn scalar_to_dynamic(value: Scalar) -> DynamicValue {
+    match value {
+        Scalar::Null => DynamicValue::Null,
+        Scalar::Bool(v) => DynamicValue::Bool(v),
+        Scalar::Int64(v) => DynamicValue::Int64(v),
+        Scalar::UInt64(v) => DynamicValue::UInt64(v),
+        Scalar::Float64(v) => DynamicValue::Float64(v),
+        Scalar::Utf8(s) => DynamicValue::Utf8(s),
+        Scalar::Bytes(b) => DynamicValue::Bytes(b),
+        Scalar::TimestampMicrosUTC(v) => DynamicValue::Int64(v),
+        Scalar::Dynamic(d) => d,
     }
 }
 
@@ -284,11 +363,223 @@ fn dynamic_to_json(value: &DynamicValue) -> serde_json::Value {
     }
 }
 
-fn type_err(expected: &str, value: &serde_json::Value) -> SparrowError {
+fn type_err(expected: &str, value: &JsonVal) -> SparrowError {
     SparrowError::new(
         ErrorCode::TypeMismatch,
-        format!("expected {expected}, got {value}"),
+        format!("expected {expected}, got {}", value.kind()),
     )
+}
+
+/// Nesting depth from bytes, ignoring braces/brackets inside strings.
+/// Used to refuse oversized trees *before* serde allocates them.
+pub fn json_byte_depth(bytes: &[u8]) -> usize {
+    let mut depth = 0usize;
+    let mut max = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    for &b in bytes {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum JsonVal {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Utf8(String),
+    Array(Vec<JsonVal>),
+    Object(Vec<(String, JsonVal)>),
+}
+
+impl JsonVal {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Bool(_) => "bool",
+            Self::I64(_) | Self::U64(_) | Self::F64(_) => "number",
+            Self::Utf8(_) => "string",
+            Self::Array(_) => "array",
+            Self::Object(_) => "object",
+        }
+    }
+}
+
+struct JsonSeed {
+    depth: usize,
+    max_depth: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for JsonSeed {
+    type Value = JsonVal;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> std::result::Result<JsonVal, D::Error> {
+        deserializer.deserialize_any(JsonVisitor {
+            depth: self.depth,
+            max_depth: self.max_depth,
+        })
+    }
+}
+
+struct JsonVisitor {
+    depth: usize,
+    max_depth: usize,
+}
+
+impl JsonVisitor {
+    fn child(&self) -> Option<JsonSeed> {
+        let next = self.depth.saturating_add(1);
+        if next > self.max_depth {
+            return None;
+        }
+        Some(JsonSeed {
+            depth: next,
+            max_depth: self.max_depth,
+        })
+    }
+
+    fn depth_err<E: serde::de::Error>(&self) -> E {
+        let next = self.depth.saturating_add(1);
+        E::custom(format!(
+            "JSON depth {next} exceeds max_depth {}",
+            self.max_depth
+        ))
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for JsonVisitor {
+    type Value = JsonVal;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<JsonVal, E> {
+        Ok(JsonVal::Bool(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<JsonVal, E> {
+        Ok(JsonVal::I64(v))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<JsonVal, E> {
+        Ok(JsonVal::U64(v))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<JsonVal, E> {
+        Ok(JsonVal::F64(v))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<JsonVal, E> {
+        Ok(JsonVal::Utf8(v.to_string()))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> std::result::Result<JsonVal, E> {
+        Ok(JsonVal::Utf8(v))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<JsonVal, E> {
+        Ok(JsonVal::Null)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> std::result::Result<JsonVal, E> {
+        Ok(JsonVal::Null)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<JsonVal, D::Error> {
+        JsonSeed {
+            depth: self.depth,
+            max_depth: self.max_depth,
+        }
+        .deserialize(deserializer)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<JsonVal, A::Error> {
+        let seed = match self.child() {
+            Some(s) => s,
+            None => return Err(self.depth_err()),
+        };
+        let mut items = Vec::new();
+        while let Some(v) = seq.next_element_seed(JsonSeed {
+            depth: seed.depth,
+            max_depth: seed.max_depth,
+        })? {
+            items.push(v);
+        }
+        Ok(JsonVal::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<JsonVal, A::Error> {
+        let seed = match self.child() {
+            Some(s) => s,
+            None => return Err(self.depth_err()),
+        };
+        let mut pairs = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if pairs.iter().any(|(k, _)| k == &key) {
+                return Err(serde::de::Error::custom("JSON object has duplicate keys"));
+            }
+            let val = map.next_value_seed(JsonSeed {
+                depth: seed.depth,
+                max_depth: seed.max_depth,
+            })?;
+            pairs.push((key, val));
+        }
+        Ok(JsonVal::Object(pairs))
+    }
+}
+
+fn parse_strict_json(bytes: &[u8], max_depth: usize) -> Result<JsonVal> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let value = serde::de::DeserializeSeed::deserialize(
+        JsonSeed {
+            depth: 0,
+            max_depth,
+        },
+        &mut de,
+    )
+    .map_err(|e| map_json_de_error(e, max_depth))?;
+    de.end()
+        .map_err(|e| SparrowError::new(ErrorCode::CodecViolation, format!("invalid JSON: {e}")))?;
+    Ok(value)
+}
+
+fn map_json_de_error(err: serde_json::Error, max_depth: usize) -> SparrowError {
+    let msg = err.to_string();
+    if msg.contains("duplicate keys") {
+        SparrowError::new(ErrorCode::InvalidArgument, "JSON object has duplicate keys")
+    } else if msg.contains("exceeds max_depth") {
+        SparrowError::new(
+            ErrorCode::BoundExceeded,
+            format!("JSON depth exceeds max_depth {max_depth}"),
+        )
+    } else {
+        SparrowError::new(ErrorCode::CodecViolation, format!("invalid JSON: {err}"))
+    }
 }
 
 #[cfg(test)]
@@ -425,5 +716,123 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&batch).unwrap();
         assert_eq!(parsed.as_array().map(|a| a.len()), Some(2));
         assert_eq!(parsed[0]["device_id"], "edge-a");
+    }
+
+    #[test]
+    fn p0_8_array_struct_map_validate_against_schema() {
+        let arr = Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(
+                FieldId::new(1),
+                "xs",
+                DataType::Array(Box::new(DataType::Int64)),
+                false,
+            )],
+        )
+        .unwrap();
+        let row = decode_json_row(&arr, br#"{"xs":[1,2,3]}"#, &JsonLimits::default()).unwrap();
+        match &row.values[0] {
+            Scalar::Dynamic(DynamicValue::Array(items)) => assert_eq!(items.len(), 3),
+            other => panic!("expected validated array, got {other:?}"),
+        }
+        let err = decode_json_row(&arr, br#"{"xs":[1,"nope"]}"#, &JsonLimits::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::TypeMismatch);
+        assert!(!err.message.contains("nope"), "payload must not leak: {}", err.message);
+
+        let st = Schema::new(
+            SchemaId::new(2),
+            vec![Field::new(
+                FieldId::new(1),
+                "pt",
+                DataType::Struct(vec![
+                    Field::new(FieldId::new(1), "x", DataType::Int64, false),
+                    Field::new(FieldId::new(2), "y", DataType::Int64, true),
+                ]),
+                false,
+            )],
+        )
+        .unwrap();
+        let ok = decode_json_row(&st, br#"{"pt":{"x":1}}"#, &JsonLimits::default()).unwrap();
+        assert!(matches!(ok.values[0], Scalar::Dynamic(DynamicValue::Object(_))));
+        let err = decode_json_row(&st, br#"{"pt":{"x":1,"z":9}}"#, &JsonLimits::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidSchema);
+        let err = decode_json_row(&st, br#"{"pt":[1,2]}"#, &JsonLimits::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::TypeMismatch);
+
+        let map = Schema::new(
+            SchemaId::new(3),
+            vec![Field::new(
+                FieldId::new(1),
+                "m",
+                DataType::Map {
+                    key: Box::new(DataType::Utf8),
+                    value: Box::new(DataType::Int64),
+                },
+                false,
+            )],
+        )
+        .unwrap();
+        let row = decode_json_row(&map, br#"{"m":{"a":1,"b":2}}"#, &JsonLimits::default()).unwrap();
+        assert!(matches!(row.values[0], Scalar::Dynamic(DynamicValue::Object(_))));
+        let err = decode_json_row(&map, br#"{"m":{"a":"x"}}"#, &JsonLimits::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::TypeMismatch);
+        assert!(!err.message.contains("\"x\""), "{}", err.message);
+    }
+
+    #[test]
+    fn p2_40_json_object_duplicate_keys_fail_closed() {
+        let s = Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(FieldId::new(1), "payload", DataType::Dynamic, false)],
+        )
+        .unwrap();
+        let err = decode_json_row(
+            &s,
+            br#"{"payload":{"k":1,"k":2}}"#,
+            &JsonLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("duplicate"), "{}", err.message);
+
+        let err = decode_json_row(&s, br#"{"payload":1,"payload":2}"#, &JsonLimits::default())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn p3_53_type_err_does_not_include_raw_payload() {
+        let s = Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(FieldId::new(1), "v", DataType::Int64, false)],
+        )
+        .unwrap();
+        let secret = br#"{"v":"this-must-not-land-in-last_error"}"#;
+        let err = decode_json_row(&s, secret, &JsonLimits::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::TypeMismatch);
+        assert!(
+            !err.message.contains("this-must-not-land-in-last_error"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("int64"), "{}", err.message);
+        assert!(err.message.contains("string"), "{}", err.message);
+    }
+
+    #[test]
+    fn p0_8_depth_checked_from_bytes_before_parse() {
+        let s = schema();
+        let deep = r#"{"device_id":"x","payload":{"a":{"b":{"c":{"d":1}}}}}"#;
+        assert!(json_byte_depth(deep.as_bytes()) > 4);
+        let err = decode_json_row(
+            &s,
+            deep.as_bytes(),
+            &JsonLimits {
+                max_bytes: 1024,
+                max_depth: 4,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BoundExceeded);
     }
 }

@@ -4,7 +4,9 @@
 use crate::bound::{BoundKind, BoundLogicalPlan, BoundNode};
 use crate::stateful::{DedupSpec, LookupSpec, WindowSpec};
 use sparrow_expr::Expr;
-use sparrow_model::{DeliveryContract, OperatorId, PipelineId, RevisionId, Schema};
+use sparrow_model::{
+    DeliveryContract, OperatorId, PipelineId, RecoveryPolicy, RevisionId, Schema, WindowKind,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlanOptions {
@@ -126,12 +128,38 @@ impl PhysicalPlan {
         })
     }
 
-    pub fn recovery_label(&self) -> &'static str {
-        if self.has_processing_time_window() || self.has_event_time_window() {
-            DeliveryContract::V0_3.recovery.none_label()
-        } else {
-            DeliveryContract::V0_3.recovery.as_str()
+    pub fn has_count_window(&self) -> bool {
+        self.stages.iter().any(|s| {
+            matches!(
+                s,
+                PhysicalStage::WindowAgg {
+                    spec,
+                    ..
+                } if matches!(spec.kind, WindowKind::Count { .. })
+            )
+        })
+    }
+
+    /// Honesty label for the plan under `recovery`.
+    ///
+    /// Does not cite a milestone contract (V0.3 etc.). Windowed
+    /// `restart_fresh` jobs advertise `none`; aligned jobs advertise `aligned`.
+    pub fn recovery_label_for(&self, recovery: RecoveryPolicy) -> &'static str {
+        if recovery.is_aligned() {
+            return RecoveryPolicy::Aligned.as_str();
         }
+        if self.has_processing_time_window()
+            || self.has_event_time_window()
+            || self.has_count_window()
+        {
+            RecoveryPolicy::RestartFresh.none_label()
+        } else {
+            RecoveryPolicy::RestartFresh.as_str()
+        }
+    }
+
+    pub fn recovery_label(&self) -> &'static str {
+        self.recovery_label_for(RecoveryPolicy::RestartFresh)
     }
 
     pub fn honesty(&self) -> &'static str {

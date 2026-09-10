@@ -8,7 +8,7 @@ use crate::graph::{GraphSpec, NodeSpec};
 use crate::stateful::{
     lookup_output_schema, window_output_schema, AggCall, DedupSpec, LookupSpec, WindowSpec,
 };
-use sparrow_expr::{infer_type, Expr};
+use sparrow_expr::{infer_nullable, infer_type, Expr};
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sparrow_model::{AggFn, OperatorId, PipelineId, RevisionId, Schema, SchemaId, WindowKind};
 
@@ -98,7 +98,8 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                 for named in specs {
                     let expr = named.expr.clone().into_expr()?;
                     let ty = infer_type(&expr, &input)?;
-                    fields.push((named.alias.clone(), ty, true));
+                    let nullable = infer_nullable(&expr, &input)?;
+                    fields.push((named.alias.clone(), ty, nullable));
                     exprs.push(expr);
                 }
                 let output = project_schema(SchemaId::new(next_schema), &fields)?;

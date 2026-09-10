@@ -63,6 +63,7 @@ pub fn topic_matches(filter: &str, topic: &str) -> bool {
     false
 }
 
+#[cfg(feature = "demo-io")]
 pub struct EmbeddedBroker {
     pub addr: SocketAddr,
     cancel: CancellationToken,

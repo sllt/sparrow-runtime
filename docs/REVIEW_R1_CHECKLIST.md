@@ -24,7 +24,7 @@ Mark `- [x]` only when the item is fixed **and** covered by a semantic test
 
 - [x] **P0-6** `filter_mask` matches eval on Utf8 (error, not silent drop) → `p0_6_filter_mask_matches_eval_on_utf8`. `f19167e`
 - [x] **P0-7** Int64/UInt64 exact compare beyond 2^53; Timestamp MIN/MAX; no NaN→Equal → `p0_7_int_compare_beyond_2_pow_53`. `f19167e`
-- [x] **P0-8** JSON float→int64 errors; Bytes base64; Dynamic numbers fail closed → `p0_8_json_float_to_int_errors`. `f19167e`
+- [x] **P0-8** JSON float→int64 errors; Bytes base64; Dynamic numbers fail closed → `p0_8_json_float_to_int_errors`. R2 batch 7: Array/Struct/Map validate against schema (not silent Dynamic); depth checked from bytes before parse. `p0_8_array_struct_map_validate_against_schema` / `p0_8_depth_checked_from_bytes_before_parse`
 - [x] **P0-9** (Float64, Int64) arith returns Float64; UInt64 infer/eval match; nullif/greatest/least consistent → `p0_9_float_int_arith_and_uint_infer_match_eval`. `f19167e`
 
 ## Phase 5 — Real ledger
@@ -63,14 +63,14 @@ Mark `- [x]` only when the item is fixed **and** covered by a semantic test
 ## Architecture A5–A8
 
 - [ ] **A5** tracing in library crates (no `eprintln` JSON) → aligned checkpoint uses `tracing`; LogSink eprintln is product output
-- [ ] **A6** demo broker / HttpCapture / DemoHarness feature-gated → `demo-io` feature exists (default on); not fully `cfg`-gated
+- [x] **A6** demo broker / HttpCapture / DemoHarness feature-gated → `#[cfg(feature = "demo-io")]` on the types and exports; default feature stays on; `--no-default-features` drops the demo broker. `a6_demo_io_exports_embedded_broker_and_http_capture`. See `docs/REVIEW_R2_BATCH7.md`.
 - [x] **A7** stable OperatorId (kind constants / explicit Graph ids) → SQL/linear use `OperatorId::WINDOW` etc.; `window_id_is_stable_across_optional_filter`. Graph still uses author node ids. `f19167e`
-- [ ] **A8** typed status + `deny_unknown_fields` on specs → `deny_unknown_fields` on specs; SQLite status remains a string
+- [x] **A8** typed status + `deny_unknown_fields` on specs → `deny_unknown_fields` on GraphSpec/NodeSpec (and nested specs); `PipelineStatus` at the Rust boundary; SQLite `desired_status` / `actual_status` remain TEXT. `a8_graph_and_node_spec_deny_unknown_fields` / `a8_unknown_status_string_is_rejected`
 
 ## P2 / P3 correctness-adjacent
 
 - [x] **P3-42** PlanLayout agg fingerprint no duplicate ty/input → `p3_42_agg_fingerprint_includes_func_alias_and_input_once`. `f19167e`
 - [x] **P3-43** PT/ET window kind tags are distinct → `p3_43_pt_and_et_window_kind_tags_differ`. `f19167e`
-- [ ] **P3-45** SUM result types consistent → infer follows input numeric type; no extra rewrite
-- [x] **P2-40** Dynamic object key collision fail-closed → `p2_40_duplicate_dynamic_keys_fail_closed`. `f19167e`
+- [x] **P3-45** SUM result types consistent → numeric only; Bool/Utf8 rejected at bind. `p3_45_sum_rejects_bool_and_utf8`
+- [x] **P2-40** Dynamic object key collision fail-closed → `p2_40_duplicate_dynamic_keys_fail_closed`. R2 batch 7: JSON object decode uses `DynamicValue::try_object` / fails on duplicate keys. `p2_40_json_object_duplicate_keys_fail_closed`
 - [x] **P3-54** expr fingerprint is structured (not Debug) → `p3_54_expr_fingerprint_is_structured_not_debug`. `f19167e`
