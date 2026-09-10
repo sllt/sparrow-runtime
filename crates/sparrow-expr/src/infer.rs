@@ -41,9 +41,23 @@ pub fn infer_type(expr: &Expr, schema: &Schema) -> Result<DataType> {
                 ));
             }
             if matches!(lt, DataType::Float64) || matches!(rt, DataType::Float64) {
-                Ok(DataType::Float64)
-            } else {
+                if is_numeric(&lt) && is_numeric(&rt) {
+                    Ok(DataType::Float64)
+                } else {
+                    Err(SparrowError::new(
+                        ErrorCode::TypeMismatch,
+                        format!("arithmetic expects numeric, got {lt} and {rt}"),
+                    ))
+                }
+            } else if matches!(lt, DataType::UInt64) && matches!(rt, DataType::UInt64) {
+                Ok(DataType::UInt64)
+            } else if is_intish(&lt) && is_intish(&rt) {
                 Ok(DataType::Int64)
+            } else {
+                Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    format!("arithmetic expects numeric, got {lt} and {rt}"),
+                ))
             }
         }
         Expr::Call { name, args } => eval_call_sig(name, args.len(), schema, args),
@@ -89,13 +103,38 @@ fn eval_call_sig(
         "lower" | "upper" => Ok(DataType::Utf8),
         "length" | "char_length" => Ok(DataType::Int64),
         "coalesce" => infer_type(&args[0], schema),
-        "nullif" | "greatest" | "least" => args
-            .first()
-            .map(|a| infer_type(a, schema))
-            .unwrap_or(Ok(DataType::Null)),
+        "nullif" => {
+            if argc != 2 {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "nullif requires 2 arguments",
+                ));
+            }
+            infer_type(&args[0], schema)
+        }
+        "greatest" | "least" => {
+            if argc == 0 {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("{name} requires at least 1 argument"),
+                ));
+            }
+            infer_type(&args[0], schema)
+        }
         other => Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
             format!("unknown function '{other}'"),
         )),
     }
+}
+
+fn is_numeric(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::TimestampMicrosUTC
+    )
+}
+
+fn is_intish(t: &DataType) -> bool {
+    matches!(t, DataType::Int64 | DataType::UInt64 | DataType::TimestampMicrosUTC)
 }

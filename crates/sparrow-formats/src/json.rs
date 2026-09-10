@@ -94,6 +94,21 @@ pub fn decode_json_row(schema: &Schema, bytes: &[u8], limits: &JsonLimits) -> Re
     Ok(Row { values })
 }
 
+/// Encode a batch as a JSON array of objects (HTTP sink batch POST, P1-22).
+pub fn encode_json_batch(schema: &Schema, rows: &[Row]) -> Result<Vec<u8>> {
+    let mut arr = Vec::with_capacity(rows.len());
+    for row in rows {
+        let bytes = encode_json_row(schema, row)?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+            SparrowError::new(ErrorCode::CodecViolation, format!("JSON batch: {e}"))
+        })?;
+        arr.push(v);
+    }
+    serde_json::to_vec(&serde_json::Value::Array(arr)).map_err(|e| {
+        SparrowError::new(ErrorCode::CodecViolation, format!("JSON batch encode: {e}"))
+    })
+}
+
 pub fn encode_json_row(schema: &Schema, row: &Row) -> Result<Vec<u8>> {
     if row.values.len() != schema.fields.len() {
         return Err(SparrowError::new(
@@ -147,10 +162,12 @@ fn json_to_scalar(value: &serde_json::Value, ty: &DataType, nullable: bool) -> R
             .as_str()
             .map(Scalar::utf8)
             .ok_or_else(|| type_err("utf8", value)),
-        DataType::Bytes => value
-            .as_str()
-            .map(|s| Scalar::bytes(s.as_bytes()))
-            .ok_or_else(|| type_err("bytes", value)),
+        DataType::Bytes => {
+            let s = value.as_str().ok_or_else(|| type_err("bytes(base64)", value))?;
+            let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
+                .map_err(|_| type_err("bytes(base64)", value))?;
+            Ok(Scalar::bytes(raw))
+        }
         DataType::TimestampMicrosUTC => int64(value).map(Scalar::TimestampMicrosUTC),
         DataType::Dynamic | DataType::Null => Ok(Scalar::Dynamic(json_to_dynamic(value))),
         DataType::Array(_) | DataType::Struct(_) | DataType::Map { .. } => {
@@ -168,8 +185,11 @@ fn int64(value: &serde_json::Value) -> Result<i64> {
             return Ok(v as i64);
         }
     }
-    if let Some(v) = value.as_f64() {
-        return Ok(v as i64);
+    if value.as_f64().is_some() {
+        return Err(SparrowError::new(
+            ErrorCode::TypeMismatch,
+            "JSON number is not an integer; refusing silent truncate into int64",
+        ));
     }
     Err(type_err("int64", value))
 }
@@ -183,6 +203,12 @@ fn uint64(value: &serde_json::Value) -> Result<u64> {
             return Ok(v as u64);
         }
     }
+    if value.as_f64().is_some() {
+        return Err(SparrowError::new(
+            ErrorCode::TypeMismatch,
+            "JSON number is not an integer; refusing silent truncate into uint64",
+        ));
+    }
     Err(type_err("uint64", value))
 }
 
@@ -195,8 +221,10 @@ fn json_to_dynamic(value: &serde_json::Value) -> DynamicValue {
                 DynamicValue::Int64(v)
             } else if let Some(v) = n.as_u64() {
                 DynamicValue::UInt64(v)
+            } else if let Some(v) = n.as_f64() {
+                DynamicValue::Float64(v)
             } else {
-                DynamicValue::Float64(n.as_f64().unwrap_or(0.0))
+                return DynamicValue::Null;
             }
         }
         serde_json::Value::String(s) => DynamicValue::utf8(s),
@@ -222,7 +250,9 @@ fn scalar_to_json(value: &Scalar) -> serde_json::Value {
         Scalar::UInt64(v) => serde_json::json!(v),
         Scalar::Float64(v) => serde_json::json!(v),
         Scalar::Utf8(v) => serde_json::Value::String(v.to_string()),
-        Scalar::Bytes(v) => serde_json::Value::String(String::from_utf8_lossy(v).into_owned()),
+        Scalar::Bytes(v) => serde_json::Value::String(
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v.as_ref()),
+        ),
         Scalar::TimestampMicrosUTC(v) => serde_json::json!(v),
         Scalar::Dynamic(d) => dynamic_to_json(d),
     }
@@ -236,7 +266,9 @@ fn dynamic_to_json(value: &DynamicValue) -> serde_json::Value {
         DynamicValue::UInt64(v) => serde_json::json!(v),
         DynamicValue::Float64(v) => serde_json::json!(v),
         DynamicValue::Utf8(v) => serde_json::Value::String(v.to_string()),
-        DynamicValue::Bytes(v) => serde_json::Value::String(String::from_utf8_lossy(v).into_owned()),
+        DynamicValue::Bytes(v) => serde_json::Value::String(
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v.as_ref()),
+        ),
         DynamicValue::Array(items) => {
             serde_json::Value::Array(items.iter().map(dynamic_to_json).collect())
         }
@@ -338,5 +370,27 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidSchema);
+    }
+
+    #[test]
+    fn p0_8_json_float_to_int_errors() {
+        let s = Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(FieldId::new(1), "v", DataType::Int64, false)],
+        )
+        .unwrap();
+        let err = decode_json_row(&s, br#"{"v":1.5}"#, &JsonLimits::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::TypeMismatch);
+        assert!(err.message.contains("integer"), "{}", err.message);
+
+        let bytes = Schema::new(
+            SchemaId::new(2),
+            vec![Field::new(FieldId::new(1), "b", DataType::Bytes, false)],
+        )
+        .unwrap();
+        let row = decode_json_row(&bytes, br#"{"b":"YWI="}"#, &JsonLimits::default()).unwrap();
+        assert_eq!(row.values[0], Scalar::bytes(b"ab".to_vec()));
+        let enc = encode_json_row(&bytes, &row).unwrap();
+        assert!(String::from_utf8_lossy(&enc).contains("YWI="));
     }
 }

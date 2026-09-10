@@ -234,6 +234,7 @@ fn window_from_group(
     let mut kind: Option<WindowKind> = None;
     let mut event_time_field = None;
     let mut lateness = 0i64;
+    let mut max_future_skew_micros = None;
     for e in exprs {
         if let SqlExpr::Function(f) = e {
             let n = f.name.to_string().to_ascii_lowercase();
@@ -242,6 +243,7 @@ fn window_from_group(
                 kind = Some(parsed.kind);
                 event_time_field = parsed.event_time_field;
                 lateness = parsed.lateness_micros;
+                max_future_skew_micros = parsed.max_future_skew_micros;
                 continue;
             }
             if n == "hop" {
@@ -249,6 +251,7 @@ fn window_from_group(
                 kind = Some(parsed.kind);
                 event_time_field = parsed.event_time_field;
                 lateness = parsed.lateness_micros;
+                max_future_skew_micros = parsed.max_future_skew_micros;
                 continue;
             }
             if n == "count_window" {
@@ -266,6 +269,7 @@ fn window_from_group(
     spec.event_time_field = event_time_field;
     spec.lateness_micros = lateness;
     spec.max_overlap = DEFAULT_MAX_HOP_OVERLAP;
+    spec.max_future_skew_micros = max_future_skew_micros;
     spec.validate()?;
     Ok(Some(spec))
 }
@@ -274,6 +278,7 @@ struct ParsedWindow {
     kind: WindowKind,
     event_time_field: Option<String>,
     lateness_micros: i64,
+    max_future_skew_micros: Option<i64>,
 }
 
 fn parse_tumble(f: &Function) -> Result<ParsedWindow> {
@@ -295,6 +300,7 @@ fn parse_tumble(f: &Function) -> Result<ParsedWindow> {
             kind: WindowKind::tumbling_pt(interval_expr_micros(args[1])?)?,
             event_time_field: None,
             lateness_micros: 0,
+            max_future_skew_micros: None,
         });
     }
     let field = col_name(args[0])?;
@@ -310,10 +316,16 @@ fn parse_tumble(f: &Function) -> Result<ParsedWindow> {
     } else {
         0
     };
+    let max_future_skew_micros = if args.len() >= 4 {
+        Some(interval_expr_micros(args[3])?)
+    } else {
+        None
+    };
     Ok(ParsedWindow {
         kind: WindowKind::tumbling_et(size)?,
         event_time_field: Some(field),
         lateness_micros: lateness,
+        max_future_skew_micros,
     })
 }
 
@@ -333,10 +345,16 @@ fn parse_hop(f: &Function) -> Result<ParsedWindow> {
     } else {
         0
     };
+    let max_future_skew_micros = if args.len() >= 5 {
+        Some(interval_expr_micros(args[4])?)
+    } else {
+        None
+    };
     Ok(ParsedWindow {
         kind: WindowKind::hopping_et(size, slide)?,
         event_time_field: Some(field),
         lateness_micros: lateness,
+        max_future_skew_micros,
     })
 }
 

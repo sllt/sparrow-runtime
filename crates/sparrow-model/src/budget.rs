@@ -43,6 +43,12 @@ impl WorkBudget {
         self.remaining.load(Ordering::SeqCst)
     }
 
+    /// True when `consume(units)` would fail the current quantum.
+    /// Stages should yield, then [`Self::begin_quantum`], then consume.
+    pub fn would_exhaust(&self, units: u64) -> bool {
+        units > 0 && self.remaining() < units
+    }
+
     /// Replenish the per-poll quantum. Live stages must call this each batch.
     pub fn begin_quantum(&self) {
         self.remaining.store(self.quantum, Ordering::SeqCst);

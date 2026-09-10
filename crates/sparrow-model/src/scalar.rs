@@ -237,11 +237,40 @@ impl DynamicValue {
     }
 
     pub fn object(fields: Vec<(impl AsRef<str>, DynamicValue)>) -> Self {
-        let pairs: Vec<(Arc<str>, DynamicValue)> = fields
-            .into_iter()
-            .map(|(k, v)| (Arc::from(k.as_ref()), v))
-            .collect();
-        Self::Object(Arc::from(pairs))
+        match Self::try_object(fields) {
+            Ok(v) => v,
+            Err((_, last_wins)) => last_wins,
+        }
+    }
+
+    /// Fail closed on duplicate keys (P2-40). `Err` carries the last-wins object
+    /// for callers that must still materialize a value.
+    pub fn try_object(
+        fields: Vec<(impl AsRef<str>, DynamicValue)>,
+    ) -> std::result::Result<Self, (crate::error::SparrowError, Self)> {
+        let mut pairs: Vec<(Arc<str>, DynamicValue)> = Vec::with_capacity(fields.len());
+        let mut dup = false;
+        for (k, v) in fields {
+            let key = Arc::<str>::from(k.as_ref());
+            if let Some(pos) = pairs.iter().position(|(ek, _)| ek.as_ref() == key.as_ref()) {
+                pairs[pos].1 = v;
+                dup = true;
+            } else {
+                pairs.push((key, v));
+            }
+        }
+        let obj = Self::Object(Arc::from(pairs));
+        if dup {
+            Err((
+                crate::error::SparrowError::new(
+                    crate::error::ErrorCode::InvalidArgument,
+                    "dynamic object has duplicate keys",
+                ),
+                obj,
+            ))
+        } else {
+            Ok(obj)
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&DynamicValue> {
@@ -306,5 +335,17 @@ mod tests {
         assert_eq!(v.get("temp"), Some(&DynamicValue::Float64(21.5)));
         let detached = v.detach_copy();
         assert_eq!(detached, v);
+    }
+
+    #[test]
+    fn p2_40_duplicate_dynamic_keys_fail_closed() {
+        let err = DynamicValue::try_object(vec![
+            ("k", DynamicValue::Int64(1)),
+            ("k", DynamicValue::Int64(2)),
+        ]);
+        assert!(err.is_err(), "duplicate keys must not succeed");
+        let (e, last) = err.unwrap_err();
+        assert_eq!(e.code, crate::error::ErrorCode::InvalidArgument);
+        assert_eq!(last.get("k"), Some(&DynamicValue::Int64(2)));
     }
 }
