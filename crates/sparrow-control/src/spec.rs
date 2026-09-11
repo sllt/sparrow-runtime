@@ -59,6 +59,14 @@ pub struct SourceSpec {
     pub skip_verify: bool,
     #[serde(default = "default_inbox")]
     pub inbox_capacity: usize,
+    /// MQTT only: bounded full-inbox wait in milliseconds (default 5, 0..=1000).
+    /// Zero restores immediate drop. This does not enable reliable delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_quickack: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_bytes: Option<usize>,
     #[serde(default)]
     pub use_demo_io: bool,
     #[serde(default)]
@@ -86,6 +94,14 @@ pub struct SinkSpec {
     pub skip_verify: bool,
     #[serde(default = "default_outbox")]
     pub outbox_capacity: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linger_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight: Option<usize>,
     #[serde(default)]
     pub use_demo_io: bool,
     #[serde(default)]
@@ -188,6 +204,27 @@ impl PipelineSpec {
                 ErrorCode::InvalidArgument,
                 "stream is required",
             ));
+        }
+        if (self.source.tcp_quickack.is_some() || self.source.inbox_bytes.is_some()) && self.source.kind != "mqtt" {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument, "tcp_quickack and inbox_bytes are MQTT-only"));
+        }
+        if self.sink.kind != "http" && (self.sink.batch_rows.is_some() || self.sink.batch_bytes.is_some()
+            || self.sink.linger_ms.is_some() || self.sink.max_inflight.is_some()) {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument, "batch/linger/max_inflight are HTTP-only"));
+        }
+        if let Some(ms) = self.source.inbox_wait_ms {
+            if self.source.kind != "mqtt" {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "source.inbox_wait_ms is only supported for MQTT",
+                ));
+            }
+            if ms > 1000 {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    "MQTT inbox_wait_ms must be in 0..=1000",
+                ));
+            }
         }
         match (&self.sql, &self.graph) {
             (Some(sql), None) => {

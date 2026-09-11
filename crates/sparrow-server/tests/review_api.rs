@@ -18,6 +18,92 @@ const STREAM: &str = r#"{"fields":[
 ]}"#;
 
 #[test]
+fn r6_repeated_start_running_is_idempotent_but_new_revision_still_starts() {
+    let kernel = Arc::new(sparrow_control::host_kernel_with_max_jobs(2).unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        let supervisor = sparrow_control::Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        let state = AppState { store: store.clone(), supervisor, token: Arc::new(TOKEN.into()), safe_mode: false };
+        let path = tmp("r6-repeat-start.ndjson");
+        std::fs::write(&path, b"").unwrap();
+        store.put_stream("sensors", STREAM).unwrap();
+        let spec = restart_file_spec(&path);
+        store.put_pipeline("idem", &spec, None).unwrap();
+        let (status, _) = call(&state, auth_post("/v1/pipelines/idem/start", "{}")).await;
+        assert_eq!(status, StatusCode::OK);
+        state.supervisor.converge_once().await.unwrap();
+        let (_, before) = call(&state, auth_get("/v1/pipelines/idem/status")).await;
+        assert_eq!(before["actual"]["status"], "running");
+        assert_eq!(before["actual"]["revision"], 1);
+        let history_id = store.last_attempt("idem").unwrap().unwrap().id;
+        for _ in 0..3 {
+            let (status, reply) = call(&state, auth_post("/v1/pipelines/idem/start", "{}")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(reply["actual"], before["actual"], "even the immediate reply must stay running");
+            state.supervisor.converge_once().await.unwrap();
+            let (_, after) = call(&state, auth_get("/v1/pipelines/idem/status")).await;
+            assert_eq!(after["actual"], before["actual"]);
+            assert_eq!(kernel.metrics.snapshot().jobs_started, 1);
+            assert_eq!(kernel.metrics.snapshot().jobs_stopped, 0);
+            assert_eq!(store.last_attempt("idem").unwrap().unwrap().id, history_id);
+        }
+        store.put_pipeline("idem", &spec, Some("rev-1")).unwrap();
+        let (status, reply) = call(&state, auth_post("/v1/pipelines/idem/start", r#"{"revision":2}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reply["actual"]["status"], "stopped");
+        assert!(reply["actual"]["revision"].is_null());
+        assert_eq!(reply["desired"]["revision"], 2);
+        state.supervisor.converge_once().await.unwrap();
+        let (_, after) = call(&state, auth_get("/v1/pipelines/idem/status")).await;
+        assert_eq!(after["actual"]["status"], "running");
+        assert_eq!(after["actual"]["revision"], 2);
+        assert_eq!(kernel.metrics.snapshot().jobs_started, 2);
+        assert_eq!(kernel.admitted_jobs(), 1);
+        state.supervisor.stop_all().await;
+        std::fs::remove_file(path).unwrap();
+    });
+}
+
+#[test]
+fn r6_status_exposes_failure_latch_and_retained_counter() {
+    let kernel = Arc::new(sparrow_control::host_kernel_with_max_jobs(1).unwrap());
+    kernel.block_on(async {
+        let path = tmp("r6-status-fields.ndjson");
+        std::fs::write(&path, b"").unwrap();
+        for safe_mode in [false, true] {
+            let store = Arc::new(Store::open_memory().unwrap());
+            let supervisor = sparrow_control::Supervisor::new(store.clone(), kernel.clone(), safe_mode, None).unwrap();
+            let state = AppState { store: store.clone(), supervisor, token: Arc::new(TOKEN.into()), safe_mode };
+            store.put_stream("sensors", STREAM).unwrap();
+            store.put_pipeline("status", &restart_file_spec(&path), None).unwrap();
+            store.set_actual("status", "failed", Some(1), 1, Some("test fault")).unwrap();
+            let (status, failed) = call(&state, auth_get("/v1/pipelines/status/status")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(failed["safe_mode"], safe_mode);
+            assert_eq!(failed["actual"]["consecutive_failures"], 1);
+            assert_eq!(failed["actual"]["restart_blocked"], true);
+            assert_eq!(failed["actual"]["last_error"], "test fault",
+                "fields are visible before converge writes a held prefix");
+            store.set_actual("status", "running", Some(1), 2, None).unwrap();
+            let (status, running) = call(&state, auth_get("/v1/pipelines/status/status")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(running["actual"]["status"], "running");
+            assert_eq!(running["actual"]["consecutive_failures"], 1);
+            assert_eq!(running["actual"]["restart_blocked"], false);
+        }
+        std::fs::remove_file(path).unwrap();
+    });
+}
+
+fn restart_file_spec(path: &std::path::Path) -> sparrow_control::PipelineSpec {
+    sparrow_control::PipelineSpec::from_json(&serde_json::to_vec(&json!({
+        "stream":"sensors", "sql":"SELECT device_id FROM sensors",
+        "source":{"kind":"file","path":path,"file_contract":"append_only"},
+        "sink":{"kind":"log"}, "recovery":"restart_fresh"
+    })).unwrap()).unwrap()
+}
+
+#[test]
 fn r4_capacity_waiting_is_visible_in_http_status() {
     let kernel = Arc::new(sparrow_control::host_kernel_with_max_jobs(1).unwrap());
     kernel.block_on(async {
@@ -576,6 +662,16 @@ fn r25_mqtt_http_ingest_moves_metrics() {
             "{body}"
         );
         let _ = call(&state, auth_post("/v1/pipelines/r25/stop", "{}")).await;
+        assert_eq!(body["queue_metrics_available"], false);
+        assert_eq!(body["io_scope"], "running_attempts");
+        assert!(body["io"]["mqtt_reconnects"].is_u64());
+        assert!(body["io"]["mqtt_backpressure_waits"].is_u64());
+        assert!(body["io"]["mqtt_backpressure_recovered"].is_u64());
+        for name in ["mqtt_inbox_items", "mqtt_inbox_bytes", "mqtt_inbox_peak_bytes", "mqtt_pending_bytes",
+            "mqtt_dropped_budget", "mqtt_dropped_oversize", "mqtt_quickack_calls", "mqtt_quickack_errors", "http_acked_batches"] {
+            assert!(body["io"][name].is_u64(), "missing {name}");
+        }
+        assert!(body["io"]["http_retries"].is_u64());
     });
 }
 

@@ -5,7 +5,7 @@
 //! barrier waits until `pending() == 0`, then refuses commit if any `fail`
 //! landed since the last barrier.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Shared sent/acked/failed counter. Not a channel-empty check.
 #[derive(Debug, Default)]
@@ -16,11 +16,32 @@ pub struct InflightCounter {
     /// `failed` observed at the last barrier mark. Drops that land before
     /// the barrier is processed still belong to that cut.
     marked_failed: AtomicU64,
+    flush_requested: AtomicBool,
+    flush_waker: std::sync::Mutex<Option<std::task::Waker>>,
 }
 
 impl InflightCounter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wake the single sink collector so an aligned cut never waits for linger.
+    pub fn request_flush(&self) {
+        self.flush_requested.store(true, Ordering::SeqCst);
+        if let Some(waker) = self.flush_waker.lock().expect("flush waker").take() { waker.wake(); }
+    }
+
+    pub async fn flush_requested(&self) {
+        std::future::poll_fn(|cx| {
+            let mut waker = self.flush_waker.lock().expect("flush waker");
+            if self.flush_requested.swap(false, Ordering::SeqCst) {
+                *waker = None;
+                std::task::Poll::Ready(())
+            } else {
+                *waker = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        }).await
     }
 
     /// Record that a batch has been handed to the sink path.

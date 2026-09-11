@@ -1604,6 +1604,8 @@ dependencies = [
 name = "sparrow-cli"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
+ "serde_json",
  "sparrow-connectors",
  "sparrow-expr",
  "sparrow-formats",
@@ -1623,6 +1625,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde_json",
+ "socket2",
  "sparrow-expr",
  "sparrow-formats",
  "sparrow-io",

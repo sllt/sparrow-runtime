@@ -133,8 +133,8 @@ pub fn decode_json_row_on(
 
 /// Encode a batch as a JSON array of objects (HTTP sink batch POST, P1-22).
 ///
-/// Each row is encoded once. The array is assembled from those object
-/// bytes — no bytes→Value→bytes round-trip per row (N13).
+/// Each row is written directly into the batch buffer, without an intermediate
+/// per-row byte vector. Existing field order and scalar encoding are unchanged.
 pub fn encode_json_batch(schema: &Schema, rows: &[Row]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.push(b'[');
@@ -142,13 +142,119 @@ pub fn encode_json_batch(schema: &Schema, rows: &[Row]) -> Result<Vec<u8>> {
         if i > 0 {
             out.push(b',');
         }
-        out.extend(encode_json_row(schema, row)?);
+        encode_json_row_into(schema, row, &mut out)?;
     }
     out.push(b']');
     Ok(out)
 }
 
 pub fn encode_json_row(schema: &Schema, row: &Row) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_json_row_into(schema, row, &mut out)?;
+    Ok(out)
+}
+
+/// Hard bound checked by the writer before any final-buffer growth.
+pub fn encode_json_batch_bounded(schema: &Schema, rows: &[Row], limit: usize) -> Result<Vec<u8>> {
+    encode_json_batch_bounded_with_capacity(schema, rows, limit, |_| Ok(()))
+}
+
+/// Admit each requested buffer capacity before allocating it. The callback
+/// receives capacity, not JSON length; callers retain its credit until the
+/// returned Vec is dropped. Admission errors survive serde's I/O wrapping.
+pub fn encode_json_batch_bounded_with_capacity(
+    schema: &Schema,
+    rows: &[Row],
+    limit: usize,
+    admit: impl FnMut(usize) -> Result<()>,
+) -> Result<Vec<u8>> {
+    use std::io::Write;
+    struct Limited<F> {
+        bytes: Vec<u8>,
+        limit: usize,
+        admit: F,
+        error: Option<SparrowError>,
+    }
+    impl<F: FnMut(usize) -> Result<()>> Limited<F> {
+        fn append(&mut self, bytes: &[u8]) -> Result<()> {
+            let next = self
+                .bytes
+                .len()
+                .checked_add(bytes.len())
+                .filter(|n| *n <= self.limit)
+                .ok_or_else(|| {
+                    SparrowError::new(ErrorCode::BoundExceeded, "JSON byte limit exceeded")
+                })?;
+            if next > self.bytes.capacity() {
+                // Avoid a ledger acquisition for every tiny serializer write.
+                // Still clamp small hard limits (including the empty array).
+                let capacity = next
+                    .checked_next_power_of_two()
+                    .unwrap_or(self.limit)
+                    .max(256)
+                    .min(self.limit);
+                (self.admit)(capacity)?;
+                self.bytes
+                    .try_reserve_exact(capacity - self.bytes.len())
+                    .map_err(|e| {
+                        SparrowError::new(
+                            ErrorCode::ResourceExhausted,
+                            format!("JSON buffer allocation: {e}"),
+                        )
+                    })?;
+                // Global Vec allocation records the requested capacity. Fail
+                // closed rather than returning an unexpectedly larger buffer.
+                if self.bytes.capacity() > capacity {
+                    return Err(SparrowError::new(
+                        ErrorCode::ResourceExhausted,
+                        "JSON allocation exceeded admitted capacity",
+                    ));
+                }
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+    impl<F: FnMut(usize) -> Result<()>> Write for Limited<F> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Err(error) = self.append(bytes) {
+                self.error = Some(error);
+                return Err(std::io::Error::other("bounded JSON writer failed"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Limited {
+        bytes: Vec::new(),
+        limit,
+        admit,
+        error: None,
+    };
+    let result = (|| -> Result<()> {
+        out.write_all(b"[")
+            .map_err(|e| SparrowError::new(ErrorCode::BoundExceeded, e.to_string()))?;
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                out.write_all(b",")
+                    .map_err(|e| SparrowError::new(ErrorCode::BoundExceeded, e.to_string()))?;
+            }
+            encode_json_row_into(schema, row, &mut out)?;
+        }
+        out.write_all(b"]")
+            .map_err(|e| SparrowError::new(ErrorCode::BoundExceeded, e.to_string()))?;
+        Ok(())
+    })();
+    if let Some(error) = out.error {
+        return Err(error);
+    }
+    result?;
+    Ok(out.bytes)
+}
+
+fn encode_json_row_into(schema: &Schema, row: &Row, out: &mut impl std::io::Write) -> Result<()> {
     if row.values.len() != schema.fields.len() {
         return Err(SparrowError::new(
             ErrorCode::InvalidSchema,
@@ -159,7 +265,7 @@ pub fn encode_json_row(schema: &Schema, row: &Row) -> Result<Vec<u8>> {
     for (field, value) in schema.fields.iter().zip(row.values.iter()) {
         map.insert(field.name.clone(), scalar_to_json(value));
     }
-    serde_json::to_vec(&serde_json::Value::Object(map)).map_err(|e| {
+    serde_json::to_writer(out, &serde_json::Value::Object(map)).map_err(|e| {
         SparrowError::new(ErrorCode::CodecViolation, format!("JSON encode: {e}"))
     })
 }
@@ -647,6 +753,91 @@ mod tests {
     }
 
     #[test]
+    fn bounded_writer_bills_capacity_not_configured_limit() {
+        use sparrow_model::{CreditKind, ResourceBudget};
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let mut lease = owner.acquire(CreditKind::Reservation, 512).unwrap();
+        let s = schema();
+        let row = Row {
+            values: vec![Scalar::utf8("edge-a"), Scalar::Null, Scalar::Null],
+        };
+        let rows = [row];
+        let bytes = encode_json_batch_bounded_with_capacity(&s, &rows, 1024 * 1024, |capacity| {
+            lease.grow_to(capacity + 512)
+        })
+        .unwrap();
+        assert_eq!(bytes, encode_json_batch(&s, &rows).unwrap());
+        assert_eq!(lease.bytes(), bytes.capacity() + 512);
+        assert!(lease.bytes() <= 1024);
+        drop(bytes);
+        drop(lease);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    #[test]
+    fn bounded_writer_preserves_admission_error_through_serde() {
+        let s = schema();
+        let row = Row {
+            values: vec![Scalar::utf8("x".repeat(1000)), Scalar::Null, Scalar::Null],
+        };
+        let mut attempts = Vec::new();
+        let error = encode_json_batch_bounded_with_capacity(&s, &[row], 4096, |capacity| {
+            attempts.push(capacity);
+            if capacity > 256 {
+                Err(
+                    SparrowError::new(ErrorCode::ResourceExhausted, "parent quota")
+                        .context("scope", "process"),
+                )
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceExhausted);
+        assert_eq!(error.message, "parent quota");
+        assert_eq!(error.context, vec![("scope".into(), "process".into())]);
+        assert_eq!(attempts.len(), 2, "must stop at the first denied growth");
+        assert_eq!(attempts[0], 256);
+        assert!(attempts[1] > 256);
+    }
+
+    #[test]
+    fn bounded_writer_handles_tiny_limits_and_escaped_byte_expansion() {
+        let s = schema();
+        for limit in [0, 1] {
+            assert_eq!(
+                encode_json_batch_bounded(&s, &[], limit).unwrap_err().code,
+                ErrorCode::BoundExceeded
+            );
+        }
+        assert_eq!(encode_json_batch_bounded(&s, &[], 2).unwrap(), b"[]");
+        let rows = [Row {
+            values: vec![
+                Scalar::utf8("\u{0001}\"\\汉".repeat(100)),
+                Scalar::Null,
+                Scalar::Null,
+            ],
+        }];
+        let expected = encode_json_batch(&s, &rows).unwrap();
+        let mut capacities = Vec::new();
+        let bytes =
+            encode_json_batch_bounded_with_capacity(&s, &rows, expected.len(), |capacity| {
+                capacities.push(capacity);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(bytes, expected);
+        assert_eq!(bytes.capacity(), *capacities.last().unwrap());
+        assert!(capacities.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(
+            encode_json_batch_bounded(&s, &rows, expected.len() - 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::BoundExceeded
+        );
+    }
+
+    #[test]
     fn round_trip_and_limits() {
         let s = schema();
         let bytes = br#"{"device_id":"edge-a","temperature":26.2,"payload":{"temp":26.2}}"#;
@@ -734,6 +925,18 @@ mod tests {
         assert_eq!(row.values[0], Scalar::bytes(b"ab".to_vec()));
         let enc = encode_json_row(&bytes, &row).unwrap();
         assert!(String::from_utf8_lossy(&enc).contains("YWI="));
+    }
+
+    #[test]
+    fn batch_encoding_preserves_bytes_escaping_and_empty_output() {
+        let schema = schema();
+        let row = decode_json_row(&schema,
+            br#"{"device_id":"a\"b\\c","temperature":null,"payload":{"z":[1,true,null]}}"#,
+            &JsonLimits::default()).unwrap();
+        assert_eq!(encode_json_batch(&schema, &[row]).unwrap(),
+            br#"[{"device_id":"a\"b\\c","payload":{"z":[1,true,null]},"temperature":null}]"#);
+        assert_eq!(encode_json_batch(&schema, &[]).unwrap(), b"[]");
+        assert!(encode_json_batch(&schema, &[Row { values: vec![] }]).is_err());
     }
 
     #[test]

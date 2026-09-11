@@ -201,37 +201,55 @@ pub async fn publish_qos0_many(
     topic: &str,
     payloads: Vec<Vec<u8>>,
 ) -> Result<()> {
-    let mut stream = super::io::connect_plain(
-        host,
-        port,
-        &crate::tls::TlsConfig::disabled(),
-        Duration::from_secs(2),
-    )
-    .await?;
-    write_packet(
-        &mut stream,
-        &Packet::Connect(Connect {
-            client_id: client_id.into(),
-            clean_session: true,
-            keepalive: 30,
-            username: None,
-            password: None,
-        }),
-    )
-    .await?;
-    let mut reader = MqttFramedReader::new();
-    match read_packet(&mut reader, &mut stream).await? {
-        Packet::ConnAck { return_code: 0, .. } => {}
-        other => {
-            return Err(ConnectorError::new(
-                ErrorCode::Internal,
-                format!("unexpected connack {other:?}"),
-            ));
-        }
-    }
+    let mut publisher = MqttPublisher::connect(host, port, client_id).await?;
     for payload in payloads {
+        publisher.publish(topic, payload).await?;
+    }
+    publisher.close().await
+}
+
+/// Reusable QoS0 publisher for test/benchmark drivers. One CONNECT per session,
+/// not per message. The caller stamps each payload immediately before publish.
+pub struct MqttPublisher {
+    stream: super::io::MqttStream,
+}
+
+impl MqttPublisher {
+    pub async fn connect(host: &str, port: u16, client_id: &str) -> Result<Self> {
+        let mut stream = super::io::connect_plain(
+            host,
+            port,
+            &crate::tls::TlsConfig::disabled(),
+            Duration::from_secs(2),
+        )
+        .await?;
         write_packet(
             &mut stream,
+            &Packet::Connect(Connect {
+                client_id: client_id.into(),
+                clean_session: true,
+                keepalive: 120,
+                username: None,
+                password: None,
+            }),
+        )
+        .await?;
+        let mut reader = MqttFramedReader::new();
+        match read_packet(&mut reader, &mut stream).await? {
+            Packet::ConnAck { return_code: 0, .. } => {}
+            other => {
+                return Err(ConnectorError::new(
+                    ErrorCode::Internal,
+                    format!("unexpected connack {other:?}"),
+                ));
+            }
+        }
+        Ok(Self { stream })
+    }
+
+    pub async fn publish(&mut self, topic: &str, payload: Vec<u8>) -> Result<()> {
+        write_packet(
+            &mut self.stream,
             &Packet::Publish(Publish {
                 dup: false,
                 qos: 0,
@@ -241,10 +259,12 @@ pub async fn publish_qos0_many(
                 payload,
             }),
         )
-        .await?;
+        .await
     }
-    write_packet(&mut stream, &Packet::Disconnect).await?;
-    Ok(())
+
+    pub async fn close(mut self) -> Result<()> {
+        write_packet(&mut self.stream, &Packet::Disconnect).await
+    }
 }
 
 #[cfg(test)]
@@ -256,6 +276,52 @@ mod tests {
         assert!(topic_matches("sensors/json", "sensors/json"));
         assert!(topic_matches("sensors/#", "sensors/json"));
         assert!(!topic_matches("other", "sensors/json"));
+    }
+
+    #[tokio::test]
+    async fn benchmark_publisher_keeps_one_connection_for_multiple_calls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream: MqttStream = Box::pin(stream);
+            let mut reader = MqttFramedReader::new();
+            assert!(matches!(
+                read_packet(&mut reader, &mut stream).await.unwrap(),
+                Packet::Connect(_)
+            ));
+            write_packet(
+                &mut stream,
+                &Packet::ConnAck {
+                    session_present: false,
+                    return_code: 0,
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..3 {
+                let Packet::Publish(p) = read_packet(&mut reader, &mut stream).await.unwrap()
+                else {
+                    panic!("publish")
+                };
+                assert_eq!(p.payload, vec![i]);
+            }
+            assert!(matches!(
+                read_packet(&mut reader, &mut stream).await.unwrap(),
+                Packet::Disconnect
+            ));
+        });
+        let mut publisher = MqttPublisher::connect("127.0.0.1", addr.port(), "persistent")
+            .await
+            .unwrap();
+        for i in 0..3 {
+            publisher.publish("test", vec![i]).await.unwrap();
+        }
+        publisher.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

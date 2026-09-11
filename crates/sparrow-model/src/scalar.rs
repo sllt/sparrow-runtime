@@ -25,6 +25,14 @@ pub enum Scalar {
 }
 
 impl Scalar {
+    pub(crate) fn resident_heap_bytes(&self) -> usize {
+        match self {
+            Self::Utf8(v) => v.len().saturating_add(48),
+            Self::Bytes(v) => v.len().saturating_add(48),
+            Self::Dynamic(v) => v.resident_heap_bytes(),
+            _ => 0,
+        }
+    }
     /// Event-time micros from Int64 or TimestampMicrosUTC. Other types are None.
     pub fn as_event_time_micros(&self) -> Option<i64> {
         match self {
@@ -283,6 +291,17 @@ pub enum DynamicValue {
 }
 
 impl DynamicValue {
+    fn resident_heap_bytes(&self) -> usize {
+        match self {
+            Self::Utf8(v) => v.len().saturating_add(48),
+            Self::Bytes(v) => v.len().saturating_add(48),
+            Self::Array(v) => v.iter().fold(48usize.saturating_add(v.len().saturating_mul(std::mem::size_of::<Self>())),
+                |n, x| n.saturating_add(x.resident_heap_bytes())),
+            Self::Object(v) => v.iter().fold(48usize.saturating_add(v.len().saturating_mul(std::mem::size_of::<(Arc<str>, Self)>())),
+                |n, (k, x)| n.saturating_add(k.len()).saturating_add(48).saturating_add(x.resident_heap_bytes())),
+            _ => 0,
+        }
+    }
     fn encode_key(&self, out: &mut Vec<u8>) {
         match self {
             Self::Null => Scalar::Null.encode_key(out),

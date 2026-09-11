@@ -27,6 +27,13 @@ pub struct Row {
 }
 
 impl Row {
+    /// Conservative decoded allocation estimate, not serialized JSON length.
+    /// Shared heap values are deliberately charged in full for each row.
+    pub fn resident_bytes(&self) -> usize {
+        self.values.iter().fold(std::mem::size_of::<Self>()
+            .saturating_add(self.values.capacity().saturating_mul(std::mem::size_of::<Scalar>()))
+            .saturating_add(32), |n, v| n.saturating_add(v.resident_heap_bytes()))
+    }
     pub fn tracked_bytes(&self) -> usize {
         self.values.iter().map(Scalar::tracked_bytes).sum::<usize>() + 8
     }
@@ -53,6 +60,8 @@ impl RowBatch {
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    pub fn schema_arc(&self) -> Arc<Schema> { Arc::clone(&self.schema) }
 
     pub fn num_rows(&self) -> usize {
         self.rows.len()
@@ -154,6 +163,12 @@ impl RowBatchBuilder {
     }
 
     pub fn push(&mut self, row: Row) -> Result<()> {
+        self.push_accounted(row, 0)
+    }
+
+    /// Ingress handoff must acquire destination credit before releasing its
+    /// queue lease. Ordinary callers cannot reduce the normal row charge.
+    pub fn push_accounted(&mut self, row: Row, minimum_bytes: usize) -> Result<()> {
         if row.values.len() != self.schema.fields.len() {
             return Err(SparrowError::new(
                 ErrorCode::InvalidSchema,
@@ -195,7 +210,7 @@ impl RowBatchBuilder {
             )
             .context("max_rows", self.max_rows.to_string()));
         }
-        let add = row.tracked_bytes();
+        let add = row.tracked_bytes().max(minimum_bytes);
         let next = self.current_bytes.saturating_add(add);
         self.owner.note_builder_peak(next);
         if next > self.max_bytes {

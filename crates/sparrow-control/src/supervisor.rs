@@ -24,7 +24,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::store::Store;
+use crate::store::{ActualState, Store};
 use crate::validate::{
     bind_plan, binder_catalog, http_config, http_push_config, mqtt_config, mqtt_sink_config,
     store_policy, stream_to_schema, validate_aligned_plan, validate_io, DemoEndpoints,
@@ -215,7 +215,9 @@ impl Supervisor {
 
     pub async fn run_loop(self: Arc<Self>) {
         loop {
-            let _ = self.converge_once().await;
+            if let Err(error) = self.converge_once().await {
+                tracing::error!(code = error.code.as_str(), error = %error, "supervisor_converge_failed");
+            }
             tokio::select! {
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
@@ -258,31 +260,31 @@ impl Supervisor {
         let desired = self.catalog(|s| s.list_desired()).await?;
         for d in desired {
             if d.status == "running" {
-                if self.should_hold_failed(&d.name).await? {
-                    continue;
-                }
-                if let Ok(a) = self
-                    .catalog({
-                        let name = d.name.clone();
-                        move |s| s.actual(&name)
-                    })
-                    .await
-                {
-                    if a.status == "completed" && a.revision == d.revision {
+                // Read actual state once and fail closed for this pipeline only.
+                // A persistent bad row must not starve healthy siblings' start/stop.
+                let a = match self.actual_if_start_allowed(&d.name).await {
+                    Ok(Some(actual)) => actual,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::error!(pipeline = %d.name, code = error.code.as_str(),
+                            error = %error, "pipeline_converge_skipped");
                         continue;
                     }
-                    if (a.status == "failed" || a.status == "waiting") && a.revision == d.revision {
-                        // N8: per-pipeline due time. Never sleep here —
-                        // a failed sibling must not stall healthy start/stop.
-                        if !self
-                            .retry_is_due(&d.name, a.consecutive_failures)
-                            .await
-                        {
-                            continue;
-                        }
-                    } else {
-                        self.clear_retry(&d.name).await;
+                };
+                if a.status == "completed" && a.revision == d.revision {
+                    continue;
+                }
+                if (a.status == "failed" || a.status == "waiting") && a.revision == d.revision {
+                    // N8: per-pipeline due time. Never sleep here —
+                    // a failed sibling must not stall healthy start/stop.
+                    if !self
+                        .retry_is_due(&d.name, a.consecutive_failures)
+                        .await
+                    {
+                        continue;
                     }
+                } else {
+                    self.clear_retry(&d.name).await;
                 }
                 let rev = d.revision.unwrap_or(1);
                 let already = {
@@ -424,7 +426,8 @@ impl Supervisor {
         self.capacity_retries.lock().await.remove(name);
     }
 
-    async fn should_hold_failed(&self, name: &str) -> Result<bool> {
+    /// None means held. A read/write error is not permission to start the job.
+    async fn actual_if_start_allowed(&self, name: &str) -> Result<Option<ActualState>> {
         let name = name.to_string();
         let safe = self.safe_mode;
         self.catalog(move |s| {
@@ -438,7 +441,7 @@ impl Supervisor {
                 if !a.last_error.as_deref().unwrap_or("").starts_with("held:") {
                     s.set_last_error(&name, Some(&msg))?;
                 }
-                return Ok(true);
+                return Ok(None);
             }
             if safe && a.restart_blocked {
                 let msg = "held: safe-mode and last attempt failed";
@@ -446,9 +449,9 @@ impl Supervisor {
                     let detail = format!("{msg}; last: {}", a.last_error.as_deref().unwrap_or("unknown"));
                     s.set_last_error(&name, Some(&detail))?;
                 }
-                return Ok(true);
+                return Ok(None);
             }
-            Ok(false)
+            Ok(Some(a))
         })
         .await
     }
@@ -546,12 +549,19 @@ impl Supervisor {
         let diag = IoDiagnostics::new();
         let inbox = spec.source.inbox_capacity.max(1);
         let outbox = spec.sink.outbox_capacity.max(1);
-        let (tx_in, rx_in) = tokio::sync::mpsc::channel(inbox);
         let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox);
         let capture = SharedCapture::disabled();
-        let job = self
-            .kernel
-            .submit(JobRequest::new(plan, Vec::new(), capture).with_live_io(rx_in, tx_out))?;
+        let mut request = JobRequest::new(plan, Vec::new(), capture);
+        let (tx_in, tx_budgeted) = if kind == "mqtt" {
+            let (tx, rx) = tokio::sync::mpsc::channel(inbox);
+            request = request.with_budgeted_live_io(rx, tx_out);
+            (None, Some(tx))
+        } else {
+            let (tx, rx) = tokio::sync::mpsc::channel(inbox);
+            request = request.with_live_io(rx, tx_out);
+            (Some(tx), None)
+        };
+        let job = self.kernel.submit(request)?;
         let cancel = job.cancellation();
         let source = match kind {
             "http_push" => {
@@ -561,7 +571,7 @@ impl Supervisor {
                     .map_err(SparrowError::from)?;
                 let cancel_src = cancel.clone();
                 self.kernel.handle().spawn(async move {
-                    push.run(tx_in, cancel_src).await;
+                    push.run(tx_in.expect("HTTP ingress"), cancel_src).await;
                     Ok(())
                 })
             }
@@ -569,13 +579,15 @@ impl Supervisor {
                 let mut mqtt_cfg = mqtt_config(&spec.source, schema, demo.as_ref(), name)?;
                 mqtt_cfg.fail_on_decode = spec.effective_fail_on_decode();
                 mqtt_cfg
-                    .check_inbox_budget(self.kernel.budget().queue_bytes)
+                    .check_inbox_budget(self.kernel.job_budget().queue_bytes)
                     .map_err(SparrowError::from)?;
                 let mqtt = MqttSource::bind(mqtt_cfg, &self.secrets, policy, Arc::clone(&diag))
                     .map_err(SparrowError::from)?;
                 let cancel_job = cancel.clone();
+                let owner = job.memory_owner();
+                let max_row_bytes = self.kernel.ingress_row_limit();
                 self.kernel.handle().spawn(async move {
-                    let r = mqtt.run(tx_in, cancel_job.clone()).await.map_err(SparrowError::from);
+                    let r = mqtt.run_budgeted(tx_budgeted.expect("MQTT ingress"), cancel_job.clone(), owner, max_row_bytes).await.map_err(SparrowError::from);
                     if r.is_err() {
                         cancel_job.cancel();
                     }
@@ -774,6 +786,7 @@ impl Supervisor {
         let checkpoint_timeout = self.checkpoint_timeout;
         let source_task = self.kernel.handle().spawn(async move {
             let mut terminal_sent = false;
+            let mut next_file_poll = None;
             loop {
                 if child.is_cancelled() {
                     return Ok(());
@@ -858,12 +871,13 @@ impl Supervisor {
                             }
                         }
                     }
-                    _ = tokio::task::yield_now() => {
+                    _ = crate::file_source::wait_for_file_poll(next_file_poll) => {
+                        next_file_poll = None;
                         let (src, polls) = crate::file_source::take_file_batch(source).await?;
                         source = src;
                         *pos_r.lock().expect("pos") = source.position();
                         for poll in polls {
-                            if crate::file_source::apply_file_poll(
+                            match crate::file_source::apply_file_poll(
                                 poll,
                                 contract,
                                 &tx_ev,
@@ -874,7 +888,12 @@ impl Supervisor {
                             )
                             .await?
                             {
-                                return Ok(());
+                                crate::file_source::FileProgress::Done => return Ok(()),
+                                crate::file_source::FileProgress::Continue => {}
+                                crate::file_source::FileProgress::Wait => {
+                                    next_file_poll = Some(tokio::time::Instant::now()
+                                        + crate::file_source::FILE_EOF_POLL);
+                                }
                             }
                         }
                     }

@@ -176,6 +176,7 @@ impl BarrierAcks {
 }
 
 pub async fn wait_outbox(outbox: &InflightCounter, timeout: Duration) -> FlushOutcome {
+    outbox.request_flush();
     let deadline = Instant::now() + timeout;
     while outbox.pending() > 0 {
         if Instant::now() >= deadline {

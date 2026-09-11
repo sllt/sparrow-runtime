@@ -30,6 +30,27 @@ mod r3_tests {
     use sparrow_expr::Expr;
 
     #[test]
+    fn source_batches_move_rows_share_schema_and_release_failed_leases() {
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let schema = Arc::new(Schema::new(1, vec![
+            Field::new(FieldId::new(1), "n", DataType::Int64, false),
+        ]).unwrap());
+        let rows: Vec<_> = (0..3).map(|n| Row { values: vec![Scalar::Int64(n)] }).collect();
+        let pointers: Vec<_> = rows.iter().map(|r| r.values.as_ptr()).collect();
+        let batches = build_source_batches_shared(schema.clone(), rows, &owner, 2).unwrap();
+        assert_eq!(batches.iter().map(RowBatch::num_rows).collect::<Vec<_>>(), vec![2, 1]);
+        for batch in &batches {
+            assert!(std::ptr::eq(batch.schema(), schema.as_ref()));
+        }
+        assert_eq!(batches.iter().flat_map(|b| b.rows()).map(|r| r.values.as_ptr()).collect::<Vec<_>>(), pointers);
+        drop(batches);
+        assert_eq!(owner.usage().physical_bytes, 0);
+        let rows = vec![Row { values: vec![Scalar::Int64(1)] }, Row { values: vec![Scalar::Bool(true)] }];
+        assert!(build_source_batches_shared(schema, rows, &owner, 1).is_err());
+        assert_eq!(owner.usage().physical_bytes, 0, "failed later batches must release earlier leases");
+    }
+
+    #[test]
     fn r3_projection_expansion_uses_budget_not_input_multiple() {
         let owner = MemoryOwner::new(ResourceBudget::compact());
         let input = Schema::new(1, vec![Field::new(FieldId::new(1), "n", DataType::Int64, false)]).unwrap();
@@ -126,28 +147,38 @@ pub fn build_source_batches(
     owner: &Arc<MemoryOwner>,
     rows_per_batch: usize,
 ) -> Result<Vec<RowBatch>> {
+    build_source_batches_shared(Arc::new(schema), rows, owner, rows_per_batch)
+}
+
+pub(crate) fn build_source_batches_shared(
+    schema: Arc<Schema>,
+    rows: Vec<Row>,
+    owner: &Arc<MemoryOwner>,
+    rows_per_batch: usize,
+) -> Result<Vec<RowBatch>> {
     if rows_per_batch == 0 {
         return Err(SparrowError::new(
             ErrorCode::InvalidArgument,
             "rows_per_batch must be > 0",
         ));
     }
-    let schema = Arc::new(schema);
     let mut out = Vec::new();
-    for chunk in rows.chunks(rows_per_batch) {
+    let mut rows = rows.into_iter();
+    while rows.len() > 0 {
+        let chunk_len = rows.len().min(rows_per_batch);
         let mut b = RowBatchBuilder::new(
             Arc::clone(&schema),
             Arc::clone(owner),
             CreditKind::Reservation,
-            chunk.len().max(1),
+            chunk_len,
             owner
                 .budget()
                 .cap(CreditKind::Reservation)
                 .min(64 * 1024)
                 .max(64),
         )?;
-        for row in chunk {
-            b.push(row.clone())?;
+        for row in rows.by_ref().take(chunk_len) {
+            b.push(row)?;
         }
         out.push(b.finish()?);
     }

@@ -1,4 +1,4 @@
-//! R4/R5 production-path regressions: admission, checkpoint isolation, safe-mode.
+//! R4-R6 production-path regressions: admission, checkpoint isolation, safe-mode.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,45 @@ fn spec(path: &std::path::Path, recovery: &str) -> PipelineSpec {
         "source":{"kind":"file", "path":path, "file_contract":"append_only"},
         "sink":{"kind":"log"}, "recovery":recovery,
     })).unwrap()).unwrap()
+}
+
+#[test]
+fn r6_bad_actual_row_does_not_starve_sibling_start_stop() {
+    let scratch = Scratch::new();
+    let path = scratch.file(b"");
+    let catalog = scratch.0.join("catalog.db");
+    let kernel = Arc::new(host_kernel_with_max_jobs(2).unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open(&catalog).unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        for name in ["a_bad", "b_stop", "z_start"] {
+            store.put_pipeline(name, &spec(&path, "restart_fresh"), None).unwrap();
+        }
+        let sup = Supervisor::new(store.clone(), kernel.clone(), true, None).unwrap();
+        request_start(&store, "b_stop", "test").unwrap();
+        sup.converge_once().await.unwrap();
+        assert_eq!(store.actual("b_stop").unwrap().status, "running");
+
+        request_start(&store, "a_bad", "test").unwrap();
+        request_start(&store, "z_start", "test").unwrap();
+        request_stop(&store, "b_stop", "test").unwrap();
+        // Mutate only this disposable catalog, bypassing the typed write API.
+        let raw = rusqlite::Connection::open(&catalog).unwrap();
+        raw.execute("UPDATE actual_state SET actual_status='invalid-status' WHERE name='a_bad'", []).unwrap();
+        for _ in 0..3 {
+            sup.converge_once().await.unwrap();
+            assert!(store.actual("a_bad").is_err(), "unreadable state must never authorize a start");
+            assert_eq!(store.actual("b_stop").unwrap().status, "stopped");
+            assert_eq!(store.actual("z_start").unwrap().status, "running");
+            assert_eq!(kernel.admitted_jobs(), 1);
+            assert_eq!(kernel.metrics.snapshot().jobs_started, 2);
+        }
+        raw.execute("UPDATE actual_state SET actual_status='stopped' WHERE name='a_bad'", []).unwrap();
+        sup.converge_once().await.unwrap();
+        assert_eq!(store.actual("a_bad").unwrap().status, "running");
+        assert_eq!(kernel.admitted_jobs(), 2);
+        sup.stop_all().await;
+    });
 }
 
 #[test]

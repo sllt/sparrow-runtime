@@ -399,6 +399,8 @@ impl Store {
     }
 
     /// An explicit start atomically commits desired state and clears both holds.
+    /// Starting the same running revision is idempotent; all other states/revisions
+    /// reset to stopped so converge can start (or retry) the requested revision.
     /// Merely pruning history, stopping, or restarting the process cannot unlock.
     pub(crate) fn request_start_revision(&self, name: &str, revision: u64) -> Result<()> {
         self.write(|c| {
@@ -408,10 +410,14 @@ impl Store {
                 params![revision as i64, now_ms(), name],
             ).map_err(db)?;
             let actual = c.execute(
-                "UPDATE actual_state SET actual_status='stopped', actual_revision=NULL,
+                "UPDATE actual_state SET
+                    actual_status=CASE WHEN actual_status='running' AND actual_revision=?3
+                        THEN 'running' ELSE 'stopped' END,
+                    actual_revision=CASE WHEN actual_status='running' AND actual_revision=?3
+                        THEN actual_revision ELSE NULL END,
                     consecutive_failures=0, restart_blocked=0, last_error=NULL,
                     updated_at=?1 WHERE name=?2",
-                params![now_ms(), name],
+                params![now_ms(), name, revision as i64],
             ).map_err(db)?;
             if changed != 1 || actual != 1 {
                 return Err(SparrowError::new(ErrorCode::InvalidSchema, "missing pipeline start state"));
@@ -1236,6 +1242,9 @@ mod tests {
                 password_secret: None,
                 skip_verify: false,
                 inbox_capacity: 8,
+                inbox_wait_ms: None,
+                tcp_quickack: None,
+                inbox_bytes: None,
                 use_demo_io: false,
                 bind: None,
                 path: None,
@@ -1247,6 +1256,10 @@ mod tests {
                 url: Some("http://127.0.0.1:9/ingest".into()),
                 skip_verify: false,
                 outbox_capacity: 8,
+                batch_rows: None,
+                batch_bytes: None,
+                linger_ms: None,
+                max_inflight: None,
                 use_demo_io: false,
                 header_secret: None,
                 host: None,
@@ -1407,6 +1420,41 @@ mod tests {
             "SQLite must not run on the async worker thread"
         );
         assert_eq!(store.get_stream("sensors").unwrap().name, "sensors");
+    }
+
+    #[test]
+    fn r6_start_preserves_only_matching_running_revision() {
+        for status in ["stopped", "starting", "waiting", "failed", "completed", "running"] {
+            let s = Store::open_memory().unwrap();
+            s.put_pipeline("hot", &spec(), None).unwrap();
+            // Desired running alone must not preserve a failed/waiting actual row.
+            s.set_desired("hot", "running", Some(1)).unwrap();
+            s.set_actual("hot", "failed", Some(1), 6, Some("previous fault")).unwrap();
+            s.set_actual("hot", status, Some(1), 7, Some("test status")).unwrap();
+            s.request_start_revision("hot", 1).unwrap();
+            let actual = s.actual("hot").unwrap();
+            assert_eq!(actual.status.as_str(), if status == "running" { "running" } else { "stopped" });
+            assert_eq!(actual.revision, if status == "running" { Some(1) } else { None });
+            assert_eq!(actual.attempt_id, 7);
+            assert_eq!(actual.consecutive_failures, 0);
+            assert!(!actual.restart_blocked);
+            assert!(actual.last_error.is_none());
+        }
+
+        let s = Store::open_memory().unwrap();
+        s.put_pipeline("hot", &spec(), None).unwrap();
+        s.put_pipeline("hot", &spec(), Some("rev-1")).unwrap();
+        s.set_desired("hot", "running", Some(1)).unwrap();
+        s.set_actual("hot", "running", Some(1), 7, None).unwrap();
+        s.debug_fail_next_commit();
+        assert!(s.request_start_revision("hot", 2).is_err());
+        assert_eq!(s.desired("hot").unwrap().revision, Some(1));
+        assert_eq!(s.actual("hot").unwrap().status, "running");
+        assert_eq!(s.actual("hot").unwrap().revision, Some(1));
+        s.request_start_revision("hot", 2).unwrap();
+        assert_eq!(s.desired("hot").unwrap().revision, Some(2));
+        assert_eq!(s.actual("hot").unwrap().status, "stopped");
+        assert_eq!(s.actual("hot").unwrap().revision, None);
     }
 
     #[test]

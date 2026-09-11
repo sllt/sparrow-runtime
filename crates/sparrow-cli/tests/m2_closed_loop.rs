@@ -45,11 +45,28 @@ fn slow_http_does_not_grow_unbounded() {
             "RSS grew too much: {a} -> {b} kB; {snap}"
         );
     }
+    // A small burst can fit across several bounded stages, or recover during
+    // the MQTT enqueue grace. Loss is not proof of a memory bound. Deterministic
+    // connector tests separately cover full-inbox timeout and recovery.
+    assert!(snap.http_inflight <= 1, "{snap}");
+    let usage = kernel.process_owner().usage();
+    let budget = kernel.budget();
+    assert!(usage.reservation_bytes <= budget.reservation_bytes);
+    assert!(usage.retention_bytes <= budget.retention_bytes);
+    assert!(usage.queue_bytes <= budget.queue_bytes);
     assert!(
-        snap.mqtt_dropped_full > 0 || snap.mqtt_decoded <= 16,
-        "expected bounded drops or a capped decode count, got {snap}"
+        usage.peak_physical_bytes
+            <= budget.reservation_bytes + budget.retention_bytes + budget.queue_bytes
     );
+    let diag = live.diag.clone();
     live.stop(&kernel).unwrap();
+    // Atomic snapshots are not transactional while the source is running.
+    // Check cross-counter relations only after joining the connector tasks.
+    let snap = diag.snapshot();
+    assert!(snap.mqtt_decoded <= snap.mqtt_received && snap.mqtt_received <= 48);
+    assert!(snap.mqtt_backpressure_recovered <= snap.mqtt_backpressure_waits);
+    assert_eq!(kernel.process_owner().usage().live_handles, 0);
+    assert_eq!(kernel.live_tasks(), 0);
 }
 
 #[test]

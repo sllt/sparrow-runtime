@@ -3,7 +3,8 @@
 //!
 //! Default delivery is `live_best_effort` + `restart_fresh`. MQTT replay is
 //! declared unsupported. File/replay source is Replayable for V1 aligned
-//! checkpoint only. Buffers are bounded; a full inbox drops.
+//! checkpoint only. Buffers are bounded; MQTT waits briefly on a full inbox,
+//! then drops if capacity does not recover before its configured deadline.
 
 pub mod capabilities;
 pub mod diag;
@@ -25,12 +26,12 @@ pub use diag::{IoDiagnostics, IoSnapshot};
 pub use error::{ConnectorError, Result};
 pub use file_replay::{FileContract, FilePoll, FileReplayConfig, FileReplaySource};
 #[cfg(feature = "demo-io")]
-pub use http::HttpCapture;
+pub use http::{CapturedRequest, HttpCapture};
 pub use http::{HttpSink, HttpSinkConfig};
 pub use http_push::{HttpPushSource, HttpPushSourceConfig};
 pub use log::{LogSink, LogSinkConfig};
 #[cfg(feature = "demo-io")]
-pub use mqtt::{publish_qos0, publish_qos0_many, EmbeddedBroker};
+pub use mqtt::{publish_qos0, publish_qos0_many, EmbeddedBroker, MqttPublisher};
 pub use mqtt::{MqttSink, MqttSinkConfig, MqttSource, MqttSourceConfig};
 pub use policy::{
     check_bind_addr, check_data_path, check_data_path_in, configured_data_roots, data_roots,

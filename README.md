@@ -20,6 +20,16 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 当前里程碑 / current milestone: **V1**（production aligned recovery + coordinator + observability）。
 
 Runtime contracts and compatibility notes: [`docs/RUNTIME.md`](docs/RUNTIME.md).
+MQTT ingress now has decoded-byte accounting and optional Linux QUICKACK;
+HTTP sinks support opt-in batch/linger and bounded concurrency (default serial).
+See the runtime contracts before changing queue, body or ordering settings.
+Server MQTT byte accounting is on by default (256 KiB payload credit); Linux
+QUICKACK remains off. For latency-sensitive colocated Mosquitto deployments,
+evaluate `source.tcp_quickack=true` against CPU/packet cost; loopback benchmark
+results are not a guarantee for the default 16-slot inbox or a WAN.
+HTTP defaults remain serial with one POST per upstream batch and a 256 KiB body
+limit. Encoded buffers now reserve credit incrementally by capacity, not the
+configured maximum body size; batching/concurrency still require explicit tuning.
 Count-window boundary columns are now `count_start` / `count_end` (arrival
 ordinals, not timestamps); PT/ET retain `window_start` / `window_end`.
 
@@ -68,11 +78,12 @@ cargo test --workspace
 # V1 process demos (production aligned file checkpoint, MQTT reject, soak, API)
 bash scripts/v1-demo.sh
 bash scripts/review-fix-demo.sh
-bash scripts/bench.sh
+# Full-service benchmark (requires Mosquitto; builds the real server + driver)
+bash scripts/bench.sh --mosquitto /path/to/mosquitto
 cargo run -p sparrow-cli --bin v1_file_checkpoint -- --data FILE --chk DIR --mode gold
 cargo run -p sparrow-cli --bin v1_mqtt_reject
 cargo run -p sparrow-cli --bin v1_soak
-cargo run -p sparrow-cli --bin sparrow_bench --release
+# See docs/bench.md for eKuiper comparison, validation and measurement scope.
 
 # V0.4 process demos (same File path; policy name is now aligned)
 bash scripts/v04-demo.sh

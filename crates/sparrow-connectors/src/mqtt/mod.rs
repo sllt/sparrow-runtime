@@ -6,6 +6,6 @@ pub mod sink;
 pub mod source;
 
 #[cfg(feature = "demo-io")]
-pub use broker::{publish_qos0, publish_qos0_many, EmbeddedBroker};
+pub use broker::{publish_qos0, publish_qos0_many, EmbeddedBroker, MqttPublisher};
 pub use sink::{MqttSink, MqttSinkConfig};
 pub use source::{MqttSource, MqttSourceConfig};

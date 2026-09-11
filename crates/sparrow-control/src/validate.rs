@@ -301,6 +301,11 @@ pub fn mqtt_config(
         skip_verify: source.skip_verify,
     };
     cfg.inbox_capacity = source.inbox_capacity;
+    cfg.tcp_quickack = source.tcp_quickack.unwrap_or(false);
+    cfg.inbox_bytes = Some(source.inbox_bytes.unwrap_or(256 * 1024));
+    if let Some(ms) = source.inbox_wait_ms {
+        cfg.inbox_wait_timeout = std::time::Duration::from_millis(ms);
+    }
     cfg.restore = RestoreClaim::None;
     Ok(cfg)
 }
@@ -333,6 +338,10 @@ pub fn http_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<Http
     }
     let mut cfg = HttpSinkConfig::demo(url.clone());
     cfg.outbox_capacity = sink.outbox_capacity;
+    if let Some(n) = sink.batch_rows { cfg.batch_rows = n; }
+    if let Some(n) = sink.batch_bytes { cfg.batch_bytes = n; }
+    if let Some(ms) = sink.linger_ms { cfg.linger = std::time::Duration::from_millis(ms); }
+    if let Some(n) = sink.max_inflight { cfg.max_inflight = n; }
     cfg.header_secret = sink.header_secret.clone();
     cfg.tls = TlsConfig {
         enabled: (sink.tls && url.starts_with("https://")) || sink.header_secret.is_some(),
@@ -572,6 +581,42 @@ mod tests {
     use crate::spec::RestoreSpec;
 
     #[test]
+    fn mqtt_inbox_wait_spec_default_override_and_validation() {
+        let base = serde_json::json!({
+            "stream": "sensors", "sql": "SELECT device_id FROM sensors",
+            "source": {"kind": "mqtt", "host": "127.0.0.1", "port": 1883},
+            "sink": {"kind": "log"}
+        });
+        let schema = Schema::new(SchemaId::new(1), vec![sparrow_model::Field::new(
+            sparrow_model::FieldId::new(1), "device_id", sparrow_model::DataType::Utf8, false,
+        )]).unwrap();
+        let spec = PipelineSpec::from_json(&serde_json::to_vec(&base).unwrap()).unwrap();
+        assert_eq!(spec.source.inbox_wait_ms, None);
+        let default_cfg = mqtt_config(&spec.source, schema.clone(), None, "budget").unwrap();
+        assert_eq!(default_cfg.inbox_bytes, Some(256*1024));
+        assert!(!default_cfg.tcp_quickack);
+        assert!(serde_json::to_value(&spec).unwrap()["source"].get("inbox_wait_ms").is_none());
+        assert_eq!(mqtt_config(&spec.source, schema.clone(), None, "wait").unwrap().inbox_wait_timeout,
+            std::time::Duration::from_millis(5));
+        for ms in [0, 5, 1000] {
+            let mut value = base.clone();
+            value["source"]["inbox_wait_ms"] = serde_json::json!(ms);
+            let spec = PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+            let cfg = mqtt_config(&spec.source, schema.clone(), None, "wait").unwrap();
+            assert_eq!(cfg.inbox_wait_timeout, std::time::Duration::from_millis(ms));
+        }
+        for ms in [serde_json::json!(1001), serde_json::json!(u64::MAX), serde_json::json!(-1), serde_json::json!(0.5)] {
+            let mut value = base.clone();
+            value["source"]["inbox_wait_ms"] = ms;
+            assert!(PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        let mut value = base;
+        value["source"]["kind"] = serde_json::json!("file");
+        value["source"]["inbox_wait_ms"] = serde_json::json!(5);
+        assert_eq!(PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err().code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
     fn rejects_checkpoint_and_at_least_once() {
         let mut spec = PipelineSpec {
             version: 1,
@@ -590,6 +635,9 @@ mod tests {
                 password_secret: None,
                 skip_verify: false,
                 inbox_capacity: 8,
+                inbox_wait_ms: None,
+                tcp_quickack: None,
+                inbox_bytes: None,
                 use_demo_io: false,
                 bind: None,
                 path: None,
@@ -601,6 +649,10 @@ mod tests {
                 url: Some("http://127.0.0.1:1/".into()),
                 skip_verify: false,
                 outbox_capacity: 8,
+                batch_rows: None,
+                batch_bytes: None,
+                linger_ms: None,
+                max_inflight: None,
                 use_demo_io: false,
                 header_secret: None,
                 host: None,
@@ -659,6 +711,9 @@ mod tests {
             password_secret: None,
             skip_verify: false,
             inbox_capacity: 8,
+            inbox_wait_ms: None,
+            tcp_quickack: None,
+            inbox_bytes: None,
             use_demo_io: false,
             bind: None,
             path: None,
@@ -698,6 +753,9 @@ mod tests {
             password_secret: Some("pw".into()),
             skip_verify: false,
             inbox_capacity: 8,
+            inbox_wait_ms: None,
+            tcp_quickack: None,
+            inbox_bytes: None,
             use_demo_io: false,
             bind: None,
             path: None,
@@ -728,6 +786,10 @@ mod tests {
             url: Some("http://127.0.0.1:8443/ingest".into()),
             skip_verify: false,
             outbox_capacity: 8,
+            batch_rows: None,
+            batch_bytes: None,
+            linger_ms: None,
+            max_inflight: None,
             use_demo_io: false,
             header_secret: Some("tok".into()),
             host: None,

@@ -43,6 +43,76 @@ fn kernel() -> Kernel {
 }
 
 #[test]
+fn byte_accounted_ingress_releases_queues_on_eof_and_cancel() {
+    use sparrow_model::{QueuedRow, QueueOccupancy};
+    use std::sync::{Arc, atomic::Ordering};
+    for stop in [false, true] {
+        let k = kernel();
+        let bound = bind_linear(PipelineId::new(1), RevisionId::new(1), "s".into(), schema(), None, None, None, "c".into()).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        let (out, mut output) = tokio::sync::mpsc::channel(8);
+        let job = k.submit(JobRequest::new(physicalize(&bound, &PlanOptions { fuse: true }), Vec::new(), SharedCapture::disabled()).with_budgeted_live_io(rx, out)).unwrap();
+        let owner = job.memory_owner();
+        let occupancy = Arc::new(QueueOccupancy::default());
+        k.block_on(async {
+            for row in rows() { tx.send(QueuedRow::try_new(row, &owner, &occupancy).unwrap()).await.unwrap(); }
+            if stop { job.cancel(); }
+            drop(tx);
+            let drain = async { while output.recv().await.is_some() {} };
+            let wait = async { tokio::time::timeout(std::time::Duration::from_secs(2), job.wait()).await.unwrap().unwrap() };
+            let (_, stats) = tokio::join!(drain, wait);
+            if !stop { assert_eq!(stats.ingested_rows, 2); }
+        });
+        assert_eq!(occupancy.items.load(Ordering::Relaxed), 0);
+        assert_eq!(owner.usage().live_handles, 0);
+        assert_eq!(k.process_owner().usage().physical_bytes, 0);
+    }
+}
+
+#[test]
+fn ingest_is_counted_once_for_memory_live_eof_and_live_stop() {
+    for mode in 0..5 {
+        let k = kernel();
+        let bound = bind_linear(PipelineId::new(1), RevisionId::new(1),
+            "s".into(), schema(), None, None, None, "c".into()).unwrap();
+        let plan = physicalize(&bound, &PlanOptions { fuse: true });
+        if mode == 0 {
+            let stats = k.run(JobRequest::new(plan, rows(), SharedCapture::new())).unwrap();
+            assert_eq!(stats.ingested_rows, 2);
+            assert_eq!(k.metrics.snapshot().ingested_rows, 2);
+            continue;
+        }
+        let ordered = mode == 2 || mode == 4;
+        let stop = mode >= 3;
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(4);
+        let (out, _output) = tokio::sync::mpsc::channel(4);
+        let req = JobRequest::new(plan, Vec::new(), SharedCapture::new());
+        let req = if ordered { req.with_live_events(events_rx) } else { req.with_live_io(rx, out) };
+        let handle = k.submit(req).unwrap();
+        k.block_on(async {
+            for row in rows() {
+                if ordered { events_tx.send(IngressEvent::Row(row)).await.unwrap(); }
+                else { tx.send(row).await.unwrap(); }
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while k.metrics.snapshot().ingested_rows < 2 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            assert_eq!(k.metrics.snapshot().ingested_rows, 2);
+            if stop { handle.cancel(); }
+            drop(tx);
+            drop(events_tx);
+            let stats = tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait())
+                .await.unwrap().unwrap();
+            assert_eq!(stats.ingested_rows, 2);
+            assert_eq!(k.metrics.snapshot().ingested_rows, 2, "mode {mode}: completion double-counted ingress");
+        });
+    }
+}
+
+#[test]
 fn r01_stage_error_is_job_failed_not_ok_cancelled() {
     let output = schema();
     let bound = bind_linear(
