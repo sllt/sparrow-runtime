@@ -25,6 +25,11 @@ pub enum Scalar {
 }
 
 impl Scalar {
+    /// Conservative resident size of a detached value, including nested heap
+    /// containers. Shared payloads may be counted twice; never a wire-size cap.
+    pub fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.resident_heap_bytes())
+    }
     pub(crate) fn resident_heap_bytes(&self) -> usize {
         match self {
             Self::Utf8(v) => v.len().saturating_add(48),
@@ -88,7 +93,9 @@ impl Scalar {
     }
 
     pub fn matches_type(&self, ty: &DataType) -> bool {
-        if matches!(ty, DataType::Dynamic) || self.data_type() == *ty { return true; }
+        if matches!(ty, DataType::Dynamic) || self.data_type() == *ty {
+            return true;
+        }
         match self {
             Self::Dynamic(value) if ty.is_nested() => value.matches_type(ty, 0),
             _ => false,
@@ -113,7 +120,11 @@ impl Scalar {
     pub fn tracked_bytes(&self) -> usize {
         const TAG: usize = 16;
         match self {
-            Self::Null | Self::Bool(_) | Self::Int64(_) | Self::UInt64(_) | Self::Float64(_)
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int64(_)
+            | Self::UInt64(_)
+            | Self::Float64(_)
             | Self::TimestampMicrosUTC(_) => TAG,
             Self::Utf8(s) => TAG + s.len(),
             Self::Bytes(b) => TAG + b.len(),
@@ -150,7 +161,13 @@ impl Scalar {
             }
             Self::Float64(v) => {
                 out.push(4);
-                let bits = if *v == 0.0 { 0 } else if v.is_nan() { f64::NAN.to_bits() } else { v.to_bits() };
+                let bits = if *v == 0.0 {
+                    0
+                } else if v.is_nan() {
+                    f64::NAN.to_bits()
+                } else {
+                    v.to_bits()
+                };
                 out.extend_from_slice(&bits.to_le_bytes());
             }
             Self::Utf8(s) => {
@@ -172,6 +189,59 @@ impl Scalar {
                 value.encode_key(out);
             }
         }
+    }
+
+    /// Reversible value encoding used by aligned checkpoint snapshots.
+    /// Exact wire length for the supported value codec, never resident size.
+    pub fn encoded_value_len(&self) -> Result<usize> {
+        match self {
+            Self::Null => Ok(1),
+            Self::Bool(_) => Ok(2),
+            Self::Utf8(v) => Ok(5usize.saturating_add(v.len())),
+            Self::Bytes(v) => Ok(5usize.saturating_add(v.len())),
+            Self::Dynamic(_) => Err(crate::SparrowError::new(
+                crate::ErrorCode::FeatureUnavailable,
+                "Dynamic scalars cannot be snapshotted in V1 aligned checkpoint",
+            )),
+            _ => Ok(9),
+        }
+    }
+
+    /// Validate/advance the value codec without allocating a decoded payload.
+    pub fn skip_encoded_value(src: &mut &[u8]) -> Result<()> {
+        use crate::{ErrorCode, SparrowError};
+        let invalid = || {
+            SparrowError::new(
+                ErrorCode::CodecViolation,
+                "invalid or truncated scalar encoding",
+            )
+        };
+        let Some((&tag, tail)) = src.split_first() else {
+            return Err(invalid());
+        };
+        *src = tail;
+        let (size, utf8) = match tag {
+            0 => (0, false),
+            1 => (1, false),
+            2 | 3 | 4 | 7 => (8, false),
+            5 | 6 => {
+                if src.len() < 4 {
+                    return Err(invalid());
+                }
+                let n = u32::from_le_bytes(src[..4].try_into().unwrap()) as usize;
+                *src = &src[4..];
+                (n, tag == 5)
+            }
+            _ => return Err(invalid()),
+        };
+        if src.len() < size {
+            return Err(invalid());
+        }
+        if utf8 {
+            std::str::from_utf8(&src[..size]).map_err(|_| invalid())?;
+        }
+        *src = &src[size..];
+        Ok(())
     }
 
     /// Reversible value encoding used by aligned checkpoint snapshots.
@@ -295,10 +365,21 @@ impl DynamicValue {
         match self {
             Self::Utf8(v) => v.len().saturating_add(48),
             Self::Bytes(v) => v.len().saturating_add(48),
-            Self::Array(v) => v.iter().fold(48usize.saturating_add(v.len().saturating_mul(std::mem::size_of::<Self>())),
-                |n, x| n.saturating_add(x.resident_heap_bytes())),
-            Self::Object(v) => v.iter().fold(48usize.saturating_add(v.len().saturating_mul(std::mem::size_of::<(Arc<str>, Self)>())),
-                |n, (k, x)| n.saturating_add(k.len()).saturating_add(48).saturating_add(x.resident_heap_bytes())),
+            Self::Array(v) => v.iter().fold(
+                48usize.saturating_add(v.len().saturating_mul(std::mem::size_of::<Self>())),
+                |n, x| n.saturating_add(x.resident_heap_bytes()),
+            ),
+            Self::Object(v) => v.iter().fold(
+                48usize.saturating_add(
+                    v.len()
+                        .saturating_mul(std::mem::size_of::<(Arc<str>, Self)>()),
+                ),
+                |n, (k, x)| {
+                    n.saturating_add(k.len())
+                        .saturating_add(48)
+                        .saturating_add(x.resident_heap_bytes())
+                },
+            ),
             _ => 0,
         }
     }
@@ -314,7 +395,9 @@ impl DynamicValue {
             Self::Array(values) => {
                 out.push(9);
                 out.extend_from_slice(&(values.len() as u64).to_le_bytes());
-                for value in values.iter() { value.encode_key(out); }
+                for value in values.iter() {
+                    value.encode_key(out);
+                }
             }
             Self::Object(values) => {
                 out.push(10);
@@ -330,29 +413,47 @@ impl DynamicValue {
     }
 
     fn matches_type(&self, ty: &DataType, depth: usize) -> bool {
-        if depth > 64 { return false; }
-        if matches!(self, Self::Null) || matches!(ty, DataType::Dynamic) { return true; }
+        if depth > 64 {
+            return false;
+        }
+        if matches!(self, Self::Null) || matches!(ty, DataType::Dynamic) {
+            return true;
+        }
         match (self, ty) {
-            (Self::Bool(_), DataType::Bool) | (Self::Int64(_), DataType::Int64 | DataType::TimestampMicrosUTC)
-            | (Self::UInt64(_), DataType::UInt64) | (Self::Float64(_), DataType::Float64)
-            | (Self::Utf8(_), DataType::Utf8) | (Self::Bytes(_), DataType::Bytes) => true,
-            (Self::Array(values), DataType::Array(inner)) => values.iter().all(|v| v.matches_type(inner, depth + 1)),
+            (Self::Bool(_), DataType::Bool)
+            | (Self::Int64(_), DataType::Int64 | DataType::TimestampMicrosUTC)
+            | (Self::UInt64(_), DataType::UInt64)
+            | (Self::Float64(_), DataType::Float64)
+            | (Self::Utf8(_), DataType::Utf8)
+            | (Self::Bytes(_), DataType::Bytes) => true,
+            (Self::Array(values), DataType::Array(inner)) => {
+                values.iter().all(|v| v.matches_type(inner, depth + 1))
+            }
             (Self::Object(values), DataType::Struct(fields)) => {
                 Self::unique_object_keys(values)
-                && values.len() == fields.len() && fields.iter().all(|f| {
-                    values.iter().find(|(k, _)| k.as_ref() == f.name).map_or(false, |(_, v)|
-                        (f.nullable || !matches!(v, Self::Null)) && v.matches_type(&f.data_type, depth + 1))
-                })
+                    && values.len() == fields.len()
+                    && fields.iter().all(|f| {
+                        values
+                            .iter()
+                            .find(|(k, _)| k.as_ref() == f.name)
+                            .map_or(false, |(_, v)| {
+                                (f.nullable || !matches!(v, Self::Null))
+                                    && v.matches_type(&f.data_type, depth + 1)
+                            })
+                    })
             }
-            (Self::Object(values), DataType::Map { key, value }) => Self::unique_object_keys(values) && values.iter().all(|(k,v)| {
-                let valid_key = match key.as_ref() {
-                    DataType::Utf8 | DataType::Dynamic => true,
-                    DataType::Int64 => k.parse::<i64>().is_ok(),
-                    DataType::UInt64 => k.parse::<u64>().is_ok(),
-                    _ => false,
-                };
-                valid_key && v.matches_type(value, depth + 1)
-            }),
+            (Self::Object(values), DataType::Map { key, value }) => {
+                Self::unique_object_keys(values)
+                    && values.iter().all(|(k, v)| {
+                        let valid_key = match key.as_ref() {
+                            DataType::Utf8 | DataType::Dynamic => true,
+                            DataType::Int64 => k.parse::<i64>().is_ok(),
+                            DataType::UInt64 => k.parse::<u64>().is_ok(),
+                            _ => false,
+                        };
+                        valid_key && v.matches_type(value, depth + 1)
+                    })
+            }
             _ => false,
         }
     }
@@ -407,7 +508,10 @@ impl DynamicValue {
 
     pub fn get(&self, key: &str) -> Option<&DynamicValue> {
         match self {
-            Self::Object(pairs) => pairs.iter().find(|(k, _)| k.as_ref() == key).map(|(_, v)| v),
+            Self::Object(pairs) => pairs
+                .iter()
+                .find(|(k, _)| k.as_ref() == key)
+                .map(|(_, v)| v),
             _ => None,
         }
     }
@@ -463,17 +567,26 @@ mod tests {
 
     #[test]
     fn r3_state_keys_encode_content_and_canonical_float_equality() {
-        let encode = |value: Scalar| { let mut bytes = Vec::new(); value.encode_key(&mut bytes); bytes };
+        let encode = |value: Scalar| {
+            let mut bytes = Vec::new();
+            value.encode_key(&mut bytes);
+            bytes
+        };
         let a = Scalar::Dynamic(DynamicValue::object(vec![("aa", DynamicValue::utf8("bb"))]));
         let b = Scalar::Dynamic(DynamicValue::object(vec![("cc", DynamicValue::utf8("dd"))]));
         assert_eq!(a.tracked_bytes(), b.tracked_bytes());
         assert_ne!(encode(a), encode(b));
         assert_eq!(encode(Scalar::Float64(-0.0)), encode(Scalar::Float64(0.0)));
-        assert_eq!(encode(Scalar::Float64(f64::NAN)), encode(Scalar::Float64(f64::from_bits(0x7ff8000000000001))));
+        assert_eq!(
+            encode(Scalar::Float64(f64::NAN)),
+            encode(Scalar::Float64(f64::from_bits(0x7ff8000000000001)))
+        );
         let mut value = Vec::new();
         Scalar::Float64(-0.0).encode_value(&mut value).unwrap();
         let decoded = Scalar::decode_value(&mut value.as_slice()).unwrap();
-        let Scalar::Float64(decoded) = decoded else { panic!("float expected") };
+        let Scalar::Float64(decoded) = decoded else {
+            panic!("float expected")
+        };
         assert_eq!(decoded.to_bits(), (-0.0f64).to_bits());
     }
 
@@ -496,8 +609,7 @@ mod tests {
             max_state_keys: 4,
             max_timers: 4,
         });
-        let err = Scalar::utf8_tracked(&owner, "this string is far too long for 32B")
-            .unwrap_err();
+        let err = Scalar::utf8_tracked(&owner, "this string is far too long for 32B").unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::ResourceExhausted);
         let ok = Scalar::utf8_tracked(&owner, "ok").unwrap();
         assert_eq!(ok, Scalar::utf8("ok"));

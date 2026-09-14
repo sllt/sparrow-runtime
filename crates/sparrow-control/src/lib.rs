@@ -8,10 +8,13 @@ pub mod status;
 pub mod store;
 pub mod supervisor;
 pub mod validate;
+pub mod checkpoint;
+pub mod capability;
 
 mod file_source;
 
 pub use spec::{PipelineSpec, RestoreSpec, SinkSpec, SourceSpec, StreamSpec};
+pub use checkpoint::CheckpointSpec;
 pub use status::PipelineStatus;
 pub use store::{
     secrets_key_configured, secrets_key_required, ActualState, AuditRow, DesiredState, PipelineRow,

@@ -24,6 +24,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::checkpoint::{CheckpointAdmission, CheckpointControl, CheckpointSpec};
 use crate::store::{ActualState, Store};
 use crate::validate::{
     bind_plan, binder_catalog, http_config, http_push_config, mqtt_config, mqtt_sink_config,
@@ -105,7 +106,65 @@ impl DemoHarness {
 enum AlignedCmd {
     Checkpoint {
         reply: tokio::sync::oneshot::Sender<Result<u64>>,
+        admission: CheckpointAdmission,
     },
+}
+
+async fn request_checkpoint(
+    cmd: &tokio::sync::mpsc::Sender<AlignedCmd>,
+    control: &Arc<CheckpointControl>,
+    cancel: &CancellationToken,
+    trigger: &'static str,
+) -> Result<u64> {
+    if cancel.is_cancelled() {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::Cancelled,
+            "job stopping",
+        ));
+    }
+    let admission = control.begin(trigger)?;
+    let deadline = admission.deadline;
+    let (reply, wait) = tokio::sync::oneshot::channel();
+    cmd.try_send(AlignedCmd::Checkpoint { reply, admission })
+        .map_err(|_| {
+            SparrowError::new(
+                sparrow_model::ErrorCode::Cancelled,
+                "checkpoint actor unavailable",
+            )
+        })?;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(SparrowError::new(sparrow_model::ErrorCode::Cancelled, "job stopping")),
+        reply = wait => reply.map_err(|_| SparrowError::new(sparrow_model::ErrorCode::Cancelled, "checkpoint reply dropped"))?,
+        _ = tokio::time::sleep_until(deadline) => {
+            control.waiter_timeout();
+            Err(SparrowError::new(sparrow_model::ErrorCode::ResourceExhausted,
+                "checkpoint wait timed out; a blocking durable commit may still finish, inspect status before retry").retryable(true))
+        }
+    }
+}
+
+async fn periodic_checkpoints(
+    cmd: tokio::sync::mpsc::Sender<AlignedCmd>,
+    control: Arc<CheckpointControl>,
+    cancel: CancellationToken,
+) {
+    let Some(ms) = control.policy.interval_ms else {
+        return;
+    };
+    let period = Duration::from_millis(ms);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! { biased; _ = cancel.cancelled() => break, _ = tick.tick() => {} }
+        if request_checkpoint(&cmd, &control, &cancel, "periodic")
+            .await
+            .is_err()
+            && cmd.is_closed()
+        {
+            break;
+        }
+    }
 }
 
 enum RunningKind {
@@ -120,10 +179,99 @@ enum RunningKind {
         handle: JobHandle,
         source: JoinHandle<Result<()>>,
         sink: JoinHandle<()>,
+        scheduler: Option<JoinHandle<()>>,
+        checkpoint: Arc<CheckpointControl>,
     },
 }
 
 const STABLE_RUN: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+mod production_checkpoint_tests {
+    use super::*;
+    #[test]
+    fn self_review_cancelled_stop_keeps_transition_until_children_finish() {
+        let kernel = Arc::new(compact_kernel().unwrap());
+        kernel.block_on(async {
+            for all in [false,true] {
+                let store=Arc::new(Store::open_memory().unwrap());
+                let sup=Supervisor::new(store,kernel.clone(),false,None).unwrap();
+                let schema=sparrow_model::Schema::new(1,vec![sparrow_model::Field::new(1,"v",sparrow_model::DataType::Int64,false)]).unwrap();
+                let mut catalog=sparrow_plan::Catalog::new();catalog.insert("s",schema);
+                let plan=sparrow_sql::bind_sql("SELECT v FROM s",&catalog,1.into(),1.into()).unwrap();
+                let handle=kernel.submit(JobRequest::new(sparrow_plan::physicalize(&plan,&Default::default()),vec![],SharedCapture::disabled())).unwrap();
+                let lease=kernel.process_owner().acquire(sparrow_model::CreditKind::Retention,128).unwrap();
+                let (release,wait)=tokio::sync::oneshot::channel();
+                let source=kernel.handle().spawn(async move {let _lease=lease;let _=wait.await;Ok(())});
+                let sink=kernel.handle().spawn(async {});
+                sup.running.lock().await.insert("delayed".into(),RunningJob {
+                    source_kind:"file",sink_kind:"log",started_at:Instant::now(),stable:false,revision:1,
+                    diag:IoDiagnostics::new(),kind:RunningKind::Live{handle,source,sink},
+                });
+                let s=sup.clone();
+                let waiter=tokio::spawn(async move {if all {s.stop_all().await;}else{s.kill_named("delayed").await.unwrap();}});
+                tokio::time::timeout(Duration::from_secs(2),async {
+                    while sup.running.lock().await.contains_key("delayed") {tokio::task::yield_now().await;}
+                }).await.unwrap();
+                waiter.abort();let _=waiter.await;
+                let retained=sup.transition.try_lock().is_err();
+                release.send(()).unwrap();
+                sup.stop_all().await;
+                assert!(retained,"cancelled waiter released transition while old source was still alive; stop_all={all}");
+                assert_eq!(kernel.process_owner().usage().physical_bytes,0);
+            }
+        });
+    }
+    #[tokio::test(start_paused = true)]
+    async fn production_periodic_scheduler_has_no_overlap_or_detached_tick_tasks() {
+        let control = crate::checkpoint::tests::control();
+        let cancel = CancellationToken::new();
+        let (cmd, mut rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(periodic_checkpoints(cmd, control.clone(), cancel.clone()));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let AlignedCmd::Checkpoint {
+            reply,
+            mut admission,
+        } = rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        assert!(reply.is_closed());
+        assert!(control.snapshot().active);
+        assert_eq!(control.snapshot().started, 1);
+        assert!(rx.try_recv().is_err());
+        admission.finish(&Ok(1), None);
+        drop(admission);
+        drop(reply);
+        cancel.cancel();
+        task.await.unwrap();
+        let snapshot = control.snapshot();
+        assert_eq!(
+            (snapshot.started, snapshot.succeeded, snapshot.failed),
+            (1, 1, 0)
+        );
+        assert!(snapshot.timed_out_waiters > 0);
+        assert!(!snapshot.active);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn production_queued_manual_timeout_keeps_gate_until_actor_discards() {
+        let control = crate::checkpoint::tests::control();
+        let cancel = CancellationToken::new();
+        let (cmd, mut rx) = tokio::sync::mpsc::channel(1);
+        let c = control.clone();
+        let stop = cancel.clone();
+        let call = tokio::spawn(async move { request_checkpoint(&cmd, &c, &stop, "manual").await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(101)).await;
+        assert!(call.await.unwrap().is_err());
+        assert!(control.begin("periodic").is_err());
+        let AlignedCmd::Checkpoint { reply, admission } = rx.recv().await.unwrap();
+        assert!(reply.is_closed());
+        drop(admission);
+        let s = control.snapshot();
+        assert_eq!((s.started, s.failed, s.active), (1, 1, false));
+    }
+}
 
 struct RunningJob {
     source_kind: &'static str,
@@ -149,6 +297,13 @@ pub struct PipelineFlowSnapshot {
     pub source_kind: &'static str,
     pub sink_kind: &'static str,
     pub diagnostics: Arc<IoDiagnostics>,
+}
+pub struct PipelineCheckpointInventory {
+    pub revision: u64,
+    pub attempt: Option<u64>,
+    pub scope: &'static str,
+    pub storage_sample: &'static str,
+    pub storage: sparrow_runtime::checkpoint::CheckpointInventory,
 }
 fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
     match spec.sink.kind.as_str() {
@@ -178,8 +333,15 @@ impl RunningJob {
     fn is_finished(&self) -> bool {
         match &self.kind {
             RunningKind::Live { handle, .. } => handle.is_finished(),
-            RunningKind::Aligned { handle, source, .. } => {
-                handle.is_finished() || source.is_finished()
+            RunningKind::Aligned {
+                handle,
+                source,
+                scheduler,
+                ..
+            } => {
+                handle.is_finished()
+                    || source.is_finished()
+                    || scheduler.as_ref().is_some_and(|s| s.is_finished())
             }
         }
     }
@@ -191,6 +353,9 @@ pub struct Supervisor {
     store: Arc<Store>,
     kernel: Arc<Kernel>,
     running: Mutex<HashMap<String, RunningJob>>,
+    transition: Mutex<()>,
+    transition_work: Arc<tokio::sync::Semaphore>,
+    shutdown: CancellationToken,
     /// When a failed pipeline may be retried. Checked with `continue`;
     /// the shared converge loop must not sleep on this map.
     next_retry_at: Mutex<HashMap<String, Instant>>,
@@ -224,6 +389,9 @@ impl Supervisor {
             store,
             kernel,
             running: Mutex::new(HashMap::new()),
+            transition: Mutex::new(()),
+            transition_work: Arc::new(tokio::sync::Semaphore::new(128)),
+            shutdown: CancellationToken::new(),
             next_retry_at: Mutex::new(HashMap::new()),
             capacity_retries: Mutex::new(HashMap::new()),
             wake: Notify::new(),
@@ -251,7 +419,7 @@ impl Supervisor {
     }
 
     pub fn wake(&self) {
-        self.wake.notify_waiters();
+        self.wake.notify_one();
     }
 
     pub fn kernel(&self) -> &Kernel {
@@ -260,14 +428,112 @@ impl Supervisor {
 
     pub async fn run_loop(self: Arc<Self>) {
         loop {
+            if self.shutdown.is_cancelled() {
+                break;
+            }
             if let Err(error) = self.converge_once().await {
                 tracing::error!(code = error.code.as_str(), error = %error, "supervisor_converge_failed");
             }
             tokio::select! {
+                _ = self.shutdown.cancelled() => break,
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
         }
+    }
+
+    pub async fn shutdown(self: &Arc<Self>) {
+        self.begin_shutdown();
+        self.stop_all().await;
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+    pub fn is_draining(&self) -> bool {
+        self.shutdown.is_cancelled()
+    }
+
+    pub fn checkpoint_snapshot(&self, name: &str) -> Result<Option<(u64, Arc<CheckpointControl>)>> {
+        let jobs = self.running.try_lock().map_err(|_| {
+            SparrowError::new(sparrow_model::ErrorCode::ResourceExhausted, "registry busy")
+        })?;
+        Ok(jobs.get(name).and_then(|job| match &job.kind {
+            RunningKind::Aligned { checkpoint, .. } => Some((job.revision, checkpoint.clone())),
+            _ => None,
+        }))
+    }
+
+    pub async fn checkpoint_inventory(&self, name: &str) -> Result<PipelineCheckpointInventory> {
+        let active = {
+            let jobs = self.running.lock().await;
+            jobs.get(name).and_then(|job| match &job.kind {
+                RunningKind::Aligned { checkpoint, .. } => {
+                    Some((checkpoint.clone(), job.revision, checkpoint.attempt))
+                }
+                _ => None,
+            })
+        };
+        if let Some((control, revision, attempt)) = active {
+            // A status reader must not retain the writer's FileLock after
+            // stop/join and accidentally reject the next attempt's admission.
+            let storage = control.snapshot().storage.ok_or_else(|| {
+                SparrowError::new(
+                    sparrow_model::ErrorCode::Internal,
+                    "checkpoint storage sample unavailable",
+                )
+            })?;
+            return Ok(PipelineCheckpointInventory {
+                revision,
+                attempt: Some(attempt),
+                scope: "running_attempt",
+                storage_sample: "cached_at_start_or_last_completed_commit",
+                storage,
+            });
+        }
+        let name = name.to_owned();
+        self.catalog(move |store| {
+            let row = store.get_pipeline(&name)?;
+            if row.spec.recovery != "aligned"
+                || !matches!(
+                    row.spec.source.kind.as_str(),
+                    "file" | "file_replay" | "replay"
+                )
+            {
+                return Err(SparrowError::new(
+                    sparrow_model::ErrorCode::FeatureUnavailable,
+                    "aligned File configuration required",
+                ));
+            }
+            let path = row.spec.checkpoint_dir.clone().unwrap_or_else(|| {
+                format!(
+                    "{}.sparrow-chk",
+                    row.spec.source.path.as_deref().unwrap_or("")
+                )
+            });
+            let path = std::path::Path::new(&path);
+            sparrow_connectors::check_data_path(path)?;
+            let storage = if path.exists() {
+                CheckpointStore::open_readonly(path)?.inventory()?
+            } else {
+                sparrow_runtime::checkpoint::CheckpointInventory {
+                    current: None,
+                    pinned: None,
+                    current_error: None,
+                    generations: Vec::new(),
+                    bytes: 0,
+                    maintenance_error: None,
+                }
+            };
+            Ok(PipelineCheckpointInventory {
+                revision: row.latest_revision,
+                attempt: None,
+                scope: "stored_latest_revision",
+                storage_sample: "live_disk_listing",
+                storage,
+            })
+        })
+        .await
     }
 
     async fn catalog<T, F>(&self, f: F) -> Result<T>
@@ -366,7 +632,67 @@ impl Supervisor {
             .collect()
     }
 
-    pub async fn converge_once(&self) -> Result<()> {
+    /// Once admitted, a lifecycle operation owns its guard and children even
+    /// if the HTTP/embedding caller stops waiting. Bound detached waiters too.
+    async fn transition_operation<T, F, Fut>(
+        self: &Arc<Self>,
+        wait_for_capacity: bool,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        let permit = if wait_for_capacity {
+            self.transition_work
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    SparrowError::new(
+                        sparrow_model::ErrorCode::Cancelled,
+                        "lifecycle capacity closed",
+                    )
+                })?
+        } else {
+            self.transition_work
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    SparrowError::new(
+                        sparrow_model::ErrorCode::ResourceExhausted,
+                        "lifecycle operation capacity exhausted",
+                    )
+                    .retryable(true)
+                })?
+        };
+        let supervisor = self.clone();
+        self.kernel
+            .handle()
+            .spawn(async move {
+                let _permit = permit;
+                let _transition = supervisor.transition.lock().await;
+                operation(supervisor.clone()).await
+            })
+            .await
+            .map_err(|e| {
+                SparrowError::new(
+                    sparrow_model::ErrorCode::Internal,
+                    format!("lifecycle worker: {e}"),
+                )
+            })?
+    }
+
+    pub async fn converge_once(self: &Arc<Self>) -> Result<()> {
+        self.transition_operation(false, |sup| async move { sup.converge_inner().await })
+            .await
+    }
+
+    async fn converge_inner(&self) -> Result<()> {
+        if self.shutdown.is_cancelled() {
+            return Ok(());
+        }
         self.reap_finished().await;
         let stable_names: Vec<String> = {
             let mut jobs = self.running.lock().await;
@@ -574,6 +900,18 @@ impl Supervisor {
         let safe = self.safe_mode;
         self.catalog(move |s| {
             let a = s.actual(&name)?;
+            if a.restart_blocked {
+                let desired=s.desired(&name)?;
+                let fixed=desired.revision.map(|r|s.get_pipeline_revision(&name,r))
+                    .transpose()?.is_some_and(|r|r.spec.fixed_snapshot_id().is_some());
+                if fixed {
+                    let msg = "held: fixed snapshot replay requires explicit start after failure or process restart";
+                    if a.last_error.as_deref() != Some(msg) {
+                        s.set_last_error(&name, Some(msg))?;
+                    }
+                    return Ok(None);
+                }
+            }
             if a.status != "running"
                 && a.status != "waiting"
                 && a.consecutive_failures >= MAX_PIPELINE_ATTEMPTS
@@ -607,7 +945,8 @@ impl Supervisor {
     async fn start_named(&self, name: &str, revision: u64) -> Result<()> {
         let name_owned = name.to_string();
         let demo = self.demo_endpoints();
-        let (spec, schema, catalog, policy) = self
+        let secrets = StoreSecrets::new(self.store.clone());
+        let (spec, schema, plan, policy) = self
             .catalog({
                 let name = name_owned.clone();
                 let demo = demo.clone();
@@ -617,13 +956,21 @@ impl Supervisor {
                     let schema = stream_to_schema(&stream)?;
                     let catalog = binder_catalog(s)?;
                     let policy = store_policy(s, demo.as_ref())?;
-                    Ok((row.spec, schema, catalog, policy))
+                    validate_io(&row.spec, &schema, &secrets, &policy, demo.as_ref())?;
+                    let plan = bind_plan(&row.spec, &catalog, &name, revision)?;
+                    validate_aligned_plan(&row.spec, &plan)?;
+                    Ok((row.spec, schema, plan, policy))
                 }
             })
             .await?;
-        validate_io(&spec, &schema, &self.secrets, &policy, demo.as_ref())?;
-        let plan = bind_plan(&spec, &catalog, name, revision)?;
-        validate_aligned_plan(&spec, &plan)?;
+
+        // Replacement is stop/join then start, never two writers/readers of
+        // one source/checkpoint directory. Static validation above leaves a
+        // healthy old revision untouched when the new spec is invalid.
+        let old = self.running.lock().await.remove(name);
+        if let Some(old) = old {
+            self.stop_job(old).await;
+        }
 
         let note = if RecoveryPolicy::parse(&spec.recovery)?.is_aligned() {
             "aligned; not exactly-once"
@@ -653,7 +1000,8 @@ impl Supervisor {
 
         let job = match spec.source.kind.as_str() {
             "file" | "file_replay" | "replay" => {
-                self.start_file(name, &spec, schema, plan, recovery).await?
+                self.start_file(name, &spec, schema, plan, recovery, &policy)
+                    .await?
             }
             kind => {
                 self.start_live(name, &spec, schema, plan, kind, demo, &policy)
@@ -717,61 +1065,80 @@ impl Supervisor {
         };
         let job = self.kernel.submit(request)?;
         let cancel = job.cancellation();
-        let source = match kind {
-            "http_push" => {
-                let cfg = http_push_config(&spec.source, schema)?;
-                let push = HttpPushSource::bind(cfg, &self.secrets, policy, Arc::clone(&diag))
-                    .await
-                    .map_err(SparrowError::from)?;
-                let cancel_src = cancel.clone();
-                self.kernel.handle().spawn(async move {
-                    push.run(tx_in.expect("HTTP ingress"), cancel_src).await;
-                    Ok(())
-                })
-            }
-            "mqtt" => {
-                let mut mqtt_cfg = mqtt_config(&spec.source, schema, demo.as_ref(), name)?;
-                mqtt_cfg.fail_on_decode = spec.effective_fail_on_decode();
-                mqtt_cfg
-                    .check_inbox_budget(self.kernel.job_budget().queue_bytes)
-                    .map_err(SparrowError::from)?;
-                let mqtt = MqttSource::bind(mqtt_cfg, &self.secrets, policy, Arc::clone(&diag))
-                    .map_err(SparrowError::from)?;
-                let cancel_job = cancel.clone();
-                let owner = job.memory_owner();
-                let max_row_bytes = self.kernel.ingress_row_limit();
-                self.kernel.handle().spawn(async move {
-                    let r = mqtt
-                        .run_budgeted(
-                            tx_budgeted.expect("MQTT ingress"),
-                            cancel_job.clone(),
-                            owner,
-                            max_row_bytes,
-                        )
+        let source_result: Result<JoinHandle<Result<()>>> = async {
+            Ok(match kind {
+                "http_push" => {
+                    let cfg = http_push_config(&spec.source, schema)?;
+                    let push = HttpPushSource::bind(cfg, &self.secrets, policy, Arc::clone(&diag))
                         .await
-                        .map_err(SparrowError::from);
-                    if r.is_err() {
-                        cancel_job.cancel();
-                    }
-                    r
-                })
-            }
-            other => {
-                return Err(SparrowError::new(
-                    sparrow_model::ErrorCode::FeatureUnavailable,
-                    format!("source kind `{other}` is not wired on the live path"),
-                ));
+                        .map_err(SparrowError::from)?;
+                    let cancel_src = cancel.clone();
+                    self.kernel.handle().spawn(async move {
+                        push.run(tx_in.expect("HTTP ingress"), cancel_src).await;
+                        Ok(())
+                    })
+                }
+                "mqtt" => {
+                    let mut mqtt_cfg = mqtt_config(&spec.source, schema, demo.as_ref(), name)?;
+                    mqtt_cfg.fail_on_decode = spec.effective_fail_on_decode();
+                    mqtt_cfg
+                        .check_inbox_budget(self.kernel.job_budget().queue_bytes)
+                        .map_err(SparrowError::from)?;
+                    let mqtt = MqttSource::bind(mqtt_cfg, &self.secrets, policy, Arc::clone(&diag))
+                        .map_err(SparrowError::from)?;
+                    let cancel_job = cancel.clone();
+                    let owner = job.memory_owner();
+                    let max_row_bytes = self.kernel.ingress_row_limit();
+                    self.kernel.handle().spawn(async move {
+                        let r = mqtt
+                            .run_budgeted(
+                                tx_budgeted.expect("MQTT ingress"),
+                                cancel_job.clone(),
+                                owner,
+                                max_row_bytes,
+                            )
+                            .await
+                            .map_err(SparrowError::from);
+                        if r.is_err() {
+                            cancel_job.cancel();
+                        }
+                        r
+                    })
+                }
+                other => {
+                    return Err(SparrowError::new(
+                        sparrow_model::ErrorCode::FeatureUnavailable,
+                        format!("source kind `{other}` is not wired on the live path"),
+                    ));
+                }
+            })
+        }
+        .await;
+        let source = match source_result {
+            Ok(source) => source,
+            Err(error) => {
+                let _ = job.stop().await;
+                return Err(error);
             }
         };
-        let sink = self.spawn_sink(
+        let sink_result = self.spawn_sink(
             spec,
             rx_out,
-            cancel,
+            cancel.clone(),
             Arc::clone(&diag),
             demo.as_ref(),
             policy,
             None,
-        )?;
+        );
+        let sink = match sink_result {
+            Ok(sink) => sink,
+            Err(error) => {
+                cancel.cancel();
+                let _ = job.stop().await;
+                let _ = source.await;
+                return Err(error);
+            }
+        };
         Ok(RunningJob {
             source_kind: if kind == "mqtt" { "mqtt" } else { "http_push" },
             sink_kind: observed_sink_kind(spec),
@@ -794,6 +1161,7 @@ impl Supervisor {
         schema: sparrow_model::Schema,
         plan: PhysicalPlan,
         recovery: RecoveryPolicy,
+        policy: &sparrow_connectors::TargetPolicy,
     ) -> Result<RunningJob> {
         let path = spec.source.path.clone().ok_or_else(|| {
             SparrowError::new(
@@ -803,7 +1171,7 @@ impl Supervisor {
         })?;
         if recovery.is_aligned() {
             return self
-                .start_file_aligned(name, spec, schema, plan, path)
+                .start_file_aligned(name, spec, schema, plan, path, policy)
                 .await;
         }
         let contract = crate::validate::resolve_file_contract(spec, recovery)?;
@@ -811,8 +1179,12 @@ impl Supervisor {
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.contract = contract;
         cfg.fail_on_decode = fail_on_decode;
-        let src =
-            FileReplaySource::open(&cfg).map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
+        let src = self
+            .store
+            .run_blocking(move || {
+                FileReplaySource::open(&cfg).map_err(|e| SparrowError::new(e.code(), e.to_string()))
+            })
+            .await?;
         let inbox = spec.source.inbox_capacity.max(1);
         let outbox = spec.sink.outbox_capacity.max(1);
         let diag = IoDiagnostics::new();
@@ -849,15 +1221,24 @@ impl Supervisor {
                 r
             }
         });
-        let sink = self.spawn_sink(
+        let sink_result = self.spawn_sink(
             spec,
             rx_out,
-            cancel,
+            cancel.clone(),
             Arc::clone(&diag),
             self.demo_endpoints().as_ref(),
-            &store_policy(&self.store, self.demo_endpoints().as_ref())?,
+            policy,
             None,
-        )?;
+        );
+        let sink = match sink_result {
+            Ok(sink) => sink,
+            Err(error) => {
+                cancel.cancel();
+                let _ = job.stop().await;
+                let _ = source.await;
+                return Err(error);
+            }
+        };
         Ok(RunningJob {
             source_kind: "file",
             sink_kind: observed_sink_kind(spec),
@@ -880,19 +1261,20 @@ impl Supervisor {
         schema: sparrow_model::Schema,
         plan: PhysicalPlan,
         path: String,
+        target_policy: &sparrow_connectors::TargetPolicy,
     ) -> Result<RunningJob> {
         crate::validate::validate_aligned_plan(spec, &plan)?;
-        let layout = layout_from_physical(&plan)?;
+        let layout = Arc::new(layout_from_physical(&plan)?);
         let chk = spec
             .checkpoint_dir
             .clone()
             .unwrap_or_else(|| format!("{path}.sparrow-chk"));
         sparrow_connectors::policy::check_data_path(std::path::Path::new(&path))?;
         sparrow_connectors::policy::check_data_path(std::path::Path::new(&chk))?;
-        let store = CheckpointStore::open_with_max_state_keys(
-            std::path::Path::new(&chk),
-            self.kernel.job_budget().max_state_keys,
-        )?;
+        let policy = spec.checkpoint.clone().unwrap_or_else(|| CheckpointSpec {
+            timeout_ms: self.checkpoint_timeout.as_millis() as u64,
+            ..CheckpointSpec::default()
+        });
         let fail_on_decode = spec.effective_fail_on_decode();
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.recovery = RecoveryPolicy::Aligned;
@@ -902,35 +1284,84 @@ impl Supervisor {
         // terminal MAX watermark. Finite fixtures set source.file_contract=sealed.
         let contract = crate::validate::resolve_file_contract(spec, RecoveryPolicy::Aligned)?;
         cfg.contract = contract;
-        let mut source =
-            FileReplaySource::open(&cfg).map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
-        let restore = matches!(
-            spec.restore.as_ref().map(|r| r.kind.as_str()),
-            Some("checkpoint")
-        );
-        let (restore_freeze, ingested0, next_chk) = if restore {
-            let snap = store.recover_required()?;
-            snap.check_compatible(&layout)?;
-            source.seek(&snap.source)?;
-            (
-                Some(snap.window.clone()),
-                snap.ingested_rows,
-                snap.checkpoint_id.saturating_add(1),
-            )
-        } else {
-            (None, 0, 1)
-        };
-        let pos = Arc::new(std::sync::Mutex::new(source.position()));
+        let selected = spec.restore.clone();
+        let restore_layout = layout.clone();
+        let restore_policy = policy.clone();
+        let max_keys = self.kernel.job_budget().max_state_keys;
+        // Fingerprinting, bounded snapshot reads and cursor verification are
+        // cold filesystem work; never block a Tokio executor worker on them.
+        let (source, store, restore_freeze, ingested0, restored_from, inventory) = self
+            .store
+            .run_blocking(move || {
+                let mut store = CheckpointStore::open_exclusive(
+                    std::path::Path::new(&chk),
+                    max_keys,
+                    restore_policy.retention(),
+                )?;
+                let mut source = FileReplaySource::open(&cfg)
+                    .map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
+                let inventory = store.inventory()?;
+                let restore = matches!(
+                    selected.as_ref().map(|r| r.kind.as_str()),
+                    Some("checkpoint")
+                ) || (restore_policy.resume_latest
+                    && (inventory.current.is_some() || inventory.current_error.is_some()));
+                if restore_policy.resume_latest && !restore && !inventory.generations.is_empty() {
+                    return Err(SparrowError::new(
+                        sparrow_model::ErrorCode::UnsupportedRestore,
+                        "checkpoint history exists without CURRENT; refusing automatic fresh start",
+                    ));
+                }
+                let (restore_freeze, ingested0, restored_from) = if restore {
+                    let requested = selected
+                        .as_ref()
+                        .and_then(|s| s.snapshot_id.as_deref())
+                        .filter(|s| !s.is_empty() && *s != "aligned");
+                    let snap = if let Some(id) = requested {
+                        store.recover_id(id.parse().map_err(|_| {
+                            SparrowError::new(
+                                sparrow_model::ErrorCode::InvalidArgument,
+                                "snapshot_id must be aligned or an integer",
+                            )
+                        })?)?
+                    } else {
+                        store.recover_required()?
+                    };
+                    snap.check_compatible(&restore_layout)?;
+                    source.seek(&snap.source)?;
+                    if requested.is_some() {
+                        store.pin_recovery_point(snap.checkpoint_id)?;
+                    }
+                    (
+                        Some(snap.window),
+                        snap.ingested_rows,
+                        Some(snap.checkpoint_id),
+                    )
+                } else {
+                    (None, 0, None)
+                };
+                let inventory = store.inventory()?;
+                Ok((
+                    source,
+                    store,
+                    restore_freeze,
+                    ingested0,
+                    restored_from,
+                    inventory,
+                ))
+            })
+            .await?;
+        let mut source = source;
+        let next_chk = store.next_checkpoint_id();
         let ingested = Arc::new(std::sync::atomic::AtomicU64::new(ingested0));
         let next_id = Arc::new(std::sync::atomic::AtomicU64::new(next_chk));
         let store = Arc::new(std::sync::Mutex::new(store));
-        let layout = Arc::new(layout);
         let inbox = spec.source.inbox_capacity.max(1);
         let outbox_n = spec.sink.outbox_capacity.max(1);
         let (tx_ev, rx_ev) = observed::channel(inbox);
         let (tx_out, rx_out) = observed::channel(outbox_n);
         let acks = AlignedAcks::default();
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<AlignedCmd>(4);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<AlignedCmd>(1);
         let outbox = Arc::new(InflightCounter::new());
         let diag = IoDiagnostics::new();
         diag.observe_source(&tx_ev);
@@ -950,12 +1381,20 @@ impl Supervisor {
         )?;
         let cancel = job.cancellation();
         let child = cancel.clone();
-        let pos_r = Arc::clone(&pos);
         let ingested_r = Arc::clone(&ingested);
         let next_r = Arc::clone(&next_id);
         let store_r = Arc::clone(&store);
         let layout_r = Arc::clone(&layout);
-        let checkpoint_timeout = self.checkpoint_timeout;
+        let checkpoint_timeout = Duration::from_millis(policy.timeout_ms);
+        let checkpoint = CheckpointControl::new(policy.clone(), job.attempt.raw(), inventory);
+        checkpoint.restored_from(restored_from);
+        let scheduler = policy.interval_ms.map(|_| {
+            self.kernel.handle().spawn(periodic_checkpoints(
+                cmd_tx.clone(),
+                checkpoint.clone(),
+                cancel.clone(),
+            ))
+        });
         let source_task = self.kernel.handle().spawn(async move {
             let _lifecycle=diag_src.observation.lifecycle(true);
             diag_src.observation.health(true,HealthState::Ready,"file_open",None);
@@ -969,20 +1408,31 @@ impl Supervisor {
                     biased;
                     _ = child.cancelled() => return Ok(()),
                     cmd = cmd_rx.recv() => {
-                        let Some(AlignedCmd::Checkpoint { reply }) = cmd else {
+                        let Some(AlignedCmd::Checkpoint { reply, mut admission }) = cmd else {
                             return Ok(());
                         };
+                        if reply.is_closed() || tokio::time::Instant::now() >= admission.deadline { continue; }
+                        admission.phase("aligning");
                         // Every attempt gets a fresh id, including encode/commit failures.
                         let id = next_r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // Cut is the source cursor when the barrier is injected.
-                        // Do not later stitch a stale freeze onto a newer pos_r.
-                        let cut_source = pos_r.lock().expect("pos").clone();
+                        // Refresh the identity at the consumed cut (including
+                        // append after an empty open) before injecting the barrier.
+                        let (returned,position)=crate::file_source::checkpoint_file_position(source).await?;
+                        source=returned;
+                        let cut_source=match position {
+                            Ok(position)=>position,
+                            Err(error)=>{
+                                metrics.record_checkpoint_abort();admission.finish(&Err(error.clone()),None);
+                                let _=reply.send(Err(error));continue;
+                            }
+                        };
                         let cut_ingested =
                             ingested_r.load(std::sync::atomic::Ordering::SeqCst);
                         // The timeout includes barrier injection. Dropping this future
                         // drops its request inbox, so late encoded ACKs release leases.
                         let aligned = async {
-                            let request = acks.begin(id)?;
+                            let request = acks.begin_with_deadline(id, admission.deadline)?;
                             tx_ev.send(IngressEvent::Control(StreamControl::CheckpointBarrier {
                                 checkpoint_id: id,
                             })).await.map_err(|_| SparrowError::new(
@@ -991,7 +1441,7 @@ impl Supervisor {
                         };
                         let result = tokio::select! {
                             _ = child.cancelled() => return Ok(()),
-                            result = tokio::time::timeout(checkpoint_timeout, aligned) =>
+                            result = tokio::time::timeout_at(admission.deadline, aligned) =>
                                 result.unwrap_or_else(|_| Err(SparrowError::new(
                                     sparrow_model::ErrorCode::ResourceExhausted, "aligned checkpoint timed out"))),
                         };
@@ -1001,6 +1451,7 @@ impl Supervisor {
                                 // Abandon this id so late freeze/flush cannot
                                 // satisfy the next checkpoint_named.
                                 metrics.record_checkpoint_abort();
+                                admission.finish(&Err(e.clone()), None);
                                 let _ = reply.send(Err(e));
                                 continue;
                             }
@@ -1008,14 +1459,16 @@ impl Supervisor {
                         let freeze = acks.freeze.expect("aligned freeze");
                         let layout = Arc::clone(&layout_r);
                         let store = Arc::clone(&store_r);
+                        admission.phase("committing");
                         let committed = tokio::task::spawn_blocking(move || {
                             let started = std::time::Instant::now();
                             let mut store = store.lock().expect("store");
                             let payload = CheckpointSnapshot::encode_frozen(
                                 id, &cut_source, cut_ingested, &layout, None, freeze)?;
-                            let payload_len = payload.bytes.len() as u64;
-                            let id = store.commit_encoded(id, &payload.bytes)?;
-                            Ok((id, payload_len, started.elapsed()))
+                            let payload_len = payload.bytes().len() as u64;
+                            let id = store.commit_prepared(&payload)?;
+                            let storage = store.inventory().ok();
+                            Ok::<_, SparrowError>((id, payload_len, started.elapsed(), storage))
                         })
                         .await
                         .map_err(|e| {
@@ -1025,7 +1478,7 @@ impl Supervisor {
                             )
                         });
                         match committed {
-                            Ok(Ok((cid, payload_len, duration))) => {
+                            Ok(Ok((cid, payload_len, duration, storage))) => {
                                 metrics.record_checkpoint(duration, payload_len);
                                 tracing::info!(
                                     checkpoint_id = cid,
@@ -1033,14 +1486,17 @@ impl Supervisor {
                                     duration_micros = duration.as_micros() as u64,
                                     "checkpoint_commit"
                                 );
+                                admission.finish(&Ok(cid), storage);
                                 let _ = reply.send(Ok(cid));
                             }
                             Ok(Err(e)) => {
                                 metrics.record_checkpoint_abort();
+                                admission.finish(&Err(e.clone()), None);
                                 let _ = reply.send(Err(e));
                             }
                             Err(e) => {
                                 metrics.record_checkpoint_abort();
+                                admission.finish(&Err(e.clone()), None);
                                 let _ = reply.send(Err(e));
                             }
                         }
@@ -1053,7 +1509,6 @@ impl Supervisor {
                         let (src, polls) = result.map_err(|e|{diag_src.observation.health(true,HealthState::Failed,"file_read_failed",Some(e.code));e})?;
                         let batch_ready=crate::file_source::observe_file_batch(&diag_src,&polls);
                         source = src;
-                        *pos_r.lock().expect("pos") = source.position();
                             match crate::file_source::apply_file_batch(
                                 polls,
                                 contract,
@@ -1078,15 +1533,27 @@ impl Supervisor {
                 }
             }
         });
-        let sink = self.spawn_sink(
+        let sink_result = self.spawn_sink(
             spec,
             rx_out,
             cancel.clone(),
             Arc::clone(&diag),
             self.demo_endpoints().as_ref(),
-            &store_policy(&self.store, self.demo_endpoints().as_ref())?,
+            target_policy,
             Some(Arc::clone(&outbox)),
-        )?;
+        );
+        let sink = match sink_result {
+            Ok(sink) => sink,
+            Err(error) => {
+                cancel.cancel();
+                let _ = job.stop().await;
+                let _ = source_task.await;
+                if let Some(scheduler) = scheduler {
+                    let _ = scheduler.await;
+                }
+                return Err(error);
+            }
+        };
         Ok(RunningJob {
             source_kind: "file",
             sink_kind: observed_sink_kind(spec),
@@ -1098,6 +1565,8 @@ impl Supervisor {
                 handle: job,
                 source: source_task,
                 sink,
+                scheduler,
+                checkpoint,
             },
             revision: 0,
             diag,
@@ -1150,12 +1619,16 @@ impl Supervisor {
                 handle,
                 source,
                 sink,
+                scheduler,
                 ..
             } => {
                 cancel.cancel();
                 let _ = handle.stop().await;
                 let _ = source.await;
                 let _ = sink.await;
+                if let Some(scheduler) = scheduler {
+                    let _ = scheduler.await;
+                }
             }
         }
     }
@@ -1187,8 +1660,18 @@ impl Supervisor {
                 handle,
                 source,
                 sink,
+                scheduler,
+                cancel,
                 ..
             } => {
+                // A scheduler panic must not leave the source waiting forever
+                // while reap holds the lifecycle transition gate.
+                if scheduler.as_ref().is_some_and(|s| s.is_finished())
+                    && !source.is_finished()
+                    && !cancel.is_cancelled()
+                {
+                    cancel.cancel();
+                }
                 let r = handle.wait().await;
                 let src = match source.await {
                     Ok(Ok(())) => Ok(()),
@@ -1199,19 +1682,34 @@ impl Supervisor {
                     )),
                 };
                 let _ = sink.await;
+                cancel.cancel();
+                if let Some(scheduler) = scheduler {
+                    scheduler.await.map_err(|e| {
+                        SparrowError::new(
+                            sparrow_model::ErrorCode::JobFailed,
+                            format!("checkpoint scheduler: {e}"),
+                        )
+                    })?;
+                }
                 r.map(|_| ()).and(src)
             }
         }
     }
 
     pub async fn checkpoint_named(&self, name: &str) -> Result<u64> {
-        let cmd = {
+        let (cmd, control, cancel) = {
             let g = self.running.lock().await;
             match g.get(name) {
                 Some(RunningJob {
-                    kind: RunningKind::Aligned { cmd, .. },
+                    kind:
+                        RunningKind::Aligned {
+                            cmd,
+                            checkpoint,
+                            cancel,
+                            ..
+                        },
                     ..
-                }) => cmd.clone(),
+                }) => (cmd.clone(), checkpoint.clone(), cancel.clone()),
                 Some(_) => {
                     return Err(SparrowError::new(
                         sparrow_model::ErrorCode::FeatureUnavailable,
@@ -1226,21 +1724,16 @@ impl Supervisor {
                 }
             }
         };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        cmd.send(AlignedCmd::Checkpoint { reply: tx })
-            .await
-            .map_err(|_| {
-                SparrowError::new(sparrow_model::ErrorCode::Cancelled, "aligned job ended")
-            })?;
-        rx.await.map_err(|_| {
-            SparrowError::new(
-                sparrow_model::ErrorCode::Cancelled,
-                "checkpoint reply dropped",
-            )
-        })?
+        request_checkpoint(&cmd, &control, &cancel, "manual").await
     }
 
-    pub async fn kill_named(&self, name: &str) -> Result<()> {
+    pub async fn kill_named(self: &Arc<Self>, name: &str) -> Result<()> {
+        let name = name.to_owned();
+        self.transition_operation(false, move |sup| async move { sup.kill_inner(&name).await })
+            .await
+    }
+
+    async fn kill_inner(&self, name: &str) -> Result<()> {
         let job = {
             let mut g = self.running.lock().await;
             g.remove(name)
@@ -1261,7 +1754,19 @@ impl Supervisor {
         Ok(())
     }
 
-    pub async fn stop_all(&self) {
+    pub async fn stop_all(self: &Arc<Self>) {
+        if let Err(error) = self
+            .transition_operation(true, |sup| async move {
+                sup.stop_all_inner().await;
+                Ok(())
+            })
+            .await
+        {
+            tracing::error!(code=error.code.as_str(),error=%error,"stop_all_failed");
+        }
+    }
+
+    async fn stop_all_inner(&self) {
         let mut g = self.running.lock().await;
         let jobs: Vec<_> = g.drain().collect();
         drop(g);
@@ -1411,6 +1916,29 @@ pub fn request_stop(store: &Store, name: &str, actor: &str) -> Result<()> {
 #[cfg(test)]
 mod r4_retry_tests {
     use super::*;
+
+    #[test]
+    fn r10_fixed_restore_failure_is_held_even_without_safe_mode() {
+        let kernel = Arc::new(host_kernel_with_max_jobs(1).unwrap());
+        kernel.block_on(async {
+            let store = Arc::new(Store::open_memory().unwrap());
+            let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+            let spec = crate::PipelineSpec::from_json(br#"{"stream":"sensors","sql":"SELECT SUM(v) AS s FROM sensors GROUP BY COUNT_WINDOW(3)","source":{"kind":"file","path":"unused.ndjson"},"sink":{"kind":"log"},"recovery":"aligned","checkpoint_dir":"unused-checkpoints","restore":{"kind":"checkpoint","snapshot_id":"1"},"checkpoint":{"resume_latest":true,"interval_ms":100}}"#).unwrap();
+            assert!(!spec.checkpoint_warnings().is_empty());
+            store.put_pipeline_and_start("fixed", &spec, None).unwrap();
+            assert!(sup.actual_if_start_allowed("fixed").await.unwrap().is_some());
+            store.set_actual("fixed", "failed", Some(1), 1, Some("sink failed")).unwrap();
+            for _ in 0..3 {
+                assert!(sup.actual_if_start_allowed("fixed").await.unwrap().is_none());
+            }
+            assert_eq!(store.actual("fixed").unwrap().consecutive_failures, 1);
+            assert!(store.actual("fixed").unwrap().last_error.unwrap().contains("fixed snapshot"));
+            request_start(&store, "fixed", "test").unwrap();
+            assert!(sup.actual_if_start_allowed("fixed").await.unwrap().is_some());
+            assert_eq!(store.get_pipeline("fixed").unwrap().spec.fixed_snapshot_id(), Some(1));
+            sup.shutdown().await;
+        });
+    }
 
     #[test]
     fn r5_only_explicit_capacity_admission_enters_waiting() {

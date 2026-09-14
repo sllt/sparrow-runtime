@@ -455,6 +455,7 @@ pub fn capabilities_json() -> serde_json::Value {
     let mqtt_sink = ConnectorCapabilities::MQTT_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
     serde_json::json!({
+        "inventory":crate::capability::inventory(),
         "delivery": DeliveryGuarantee::LiveBestEffort.as_str(),
         "recovery": RecoveryPolicy::RestartFresh.as_str(),
         "recovery_pt_window": RecoveryPolicy::RestartFresh.none_label(),
@@ -663,6 +664,7 @@ mod tests {
             recovery: "restart_fresh".into(),
             restore: None,
             checkpoint_dir: None,
+            checkpoint: None,
             fail_on_decode: false,
         };
         assert_eq!(

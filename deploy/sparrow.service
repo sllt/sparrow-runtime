@@ -1,0 +1,36 @@
+[Unit]
+Description=Sparrow single-node streaming runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sparrow
+Group=sparrow
+WorkingDirectory=/var/lib/sparrow
+EnvironmentFile=/etc/sparrow/production.env
+ExecStart=/opt/sparrow/current/bin/sparrow-server --safe-mode
+Restart=on-failure
+RestartSec=5s
+# Normal SIGTERM joins source/checkpoint/sink tasks. A blocked filesystem can
+# exceed this bound; systemd then force-kills. This is NOT a successful flush.
+TimeoutStopSec=150s
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/sparrow
+LimitNOFILE=8192
+# Operator must size memory/task/disk limits for the selected job profile.
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target

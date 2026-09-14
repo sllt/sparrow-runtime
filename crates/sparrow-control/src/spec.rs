@@ -29,6 +29,8 @@ pub struct PipelineSpec {
     /// Directory for aligned File/replay checkpoints. Defaults to `{path}.sparrow-chk`.
     #[serde(default)]
     pub checkpoint_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<crate::checkpoint::CheckpointSpec>,
     /// P1-17: decode errors fail the job instead of only incrementing
     /// `IoDiagnostics.decode_errors`. Also enabled by `SPARROW_FAIL_ON_DECODE=1`.
     #[serde(default)]
@@ -165,6 +167,39 @@ pub fn fail_on_decode_from_env() -> bool {
 }
 
 impl PipelineSpec {
+    /// A numeric restore is an explicit replay operation, never an implicit
+    /// request to replay the same history after failure/process restart.
+    pub fn fixed_snapshot_id(&self) -> Option<u64> {
+        self.restore
+            .as_ref()
+            .filter(|r| r.kind == "checkpoint")?
+            .snapshot_id
+            .as_deref()?
+            .parse()
+            .ok()
+    }
+
+    pub fn checkpoint_warnings(&self) -> Vec<&'static str> {
+        let mut warnings = Vec::new();
+        if self.fixed_snapshot_id().is_some() {
+            warnings
+                .push("fixed_snapshot_requires_explicit_start_after_failure_or_process_restart");
+            if self.checkpoint.as_ref().is_some_and(|p| p.resume_latest) {
+                warnings.push(
+                    "fixed_snapshot_overrides_resume_latest_remove_fixed_restore_to_follow_current",
+                );
+            }
+        } else if self.restore.is_none()
+            && self
+                .checkpoint
+                .as_ref()
+                .is_some_and(|p| p.interval_ms.is_some() && !p.resume_latest)
+        {
+            warnings.push("periodic_checkpoint_enabled_but_automatic_resume_disabled");
+        }
+        warnings
+    }
+
     /// Spec flag or `SPARROW_FAIL_ON_DECODE=1|true|yes` (P1-17).
     pub fn effective_fail_on_decode(&self) -> bool {
         self.fail_on_decode || fail_on_decode_from_env()
@@ -193,6 +228,25 @@ impl PipelineSpec {
     }
 
     pub fn basic_check(&self) -> Result<()> {
+        if !(1..=4096).contains(&self.source.inbox_capacity)
+            || !(1..=4096).contains(&self.sink.outbox_capacity)
+        {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "source inbox and sink outbox must be 1..=4096 items",
+            ));
+        }
+        if let Some(policy) = &self.checkpoint {
+            policy.validate()?;
+            if self.recovery != "aligned"
+                || !matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay")
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "checkpoint policy requires aligned File/replay",
+                ));
+            }
+        }
         if self.version != PIPELINE_SPEC_VERSION {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
@@ -205,12 +259,24 @@ impl PipelineSpec {
                 "stream is required",
             ));
         }
-        if (self.source.tcp_quickack.is_some() || self.source.inbox_bytes.is_some()) && self.source.kind != "mqtt" {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument, "tcp_quickack and inbox_bytes are MQTT-only"));
+        if (self.source.tcp_quickack.is_some() || self.source.inbox_bytes.is_some())
+            && self.source.kind != "mqtt"
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "tcp_quickack and inbox_bytes are MQTT-only",
+            ));
         }
-        if self.sink.kind != "http" && (self.sink.batch_rows.is_some() || self.sink.batch_bytes.is_some()
-            || self.sink.linger_ms.is_some() || self.sink.max_inflight.is_some()) {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument, "batch/linger/max_inflight are HTTP-only"));
+        if self.sink.kind != "http"
+            && (self.sink.batch_rows.is_some()
+                || self.sink.batch_bytes.is_some()
+                || self.sink.linger_ms.is_some()
+                || self.sink.max_inflight.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "batch/linger/max_inflight are HTTP-only",
+            ));
         }
         if let Some(ms) = self.source.inbox_wait_ms {
             if self.source.kind != "mqtt" {

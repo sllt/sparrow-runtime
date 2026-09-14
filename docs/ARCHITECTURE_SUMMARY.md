@@ -1,5 +1,10 @@
 # Sparrow architecture summary (V1)
 
+> Historical V1 architecture summary. As of 2026-09-14, current Server aligned
+> eligibility is File + one Count/ET window; old codec and broader embedded
+> API descriptions below are not current restore guarantees. See
+> [RUNTIME.md](RUNTIME.md), [PRODUCTION.md](PRODUCTION.md) and `/v1/capabilities`.
+
 Sparrow is a **single-node IoT/Edge streaming dataflow runtime**. It is not a
 distributed Flink clone and not a Rust eKuiper clone.
 

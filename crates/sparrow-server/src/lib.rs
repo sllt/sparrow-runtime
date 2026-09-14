@@ -17,16 +17,18 @@ use serde_json::{json, Value};
 use sparrow_control::DemoHarness;
 use sparrow_control::{
     bind_plan, binder_catalog, capabilities_json, explain_plan_with, honesty_json,
-    replay_label_for_source, request_start, request_start_at, request_stop, stream_schema,
-    validate_aligned_plan, validate_io, DemoIo, PipelineSpec, RestoreSpec, Store, StreamSpec,
-    Supervisor, HONESTY,
+    replay_label_for_source, request_start_at, request_stop, stream_schema, validate_aligned_plan,
+    validate_io, DemoIo, PipelineSpec, RestoreSpec, Store, StreamSpec, Supervisor, HONESTY,
 };
 use sparrow_model::{ErrorCode, SparrowError};
 use sparrow_runtime::Kernel;
 use tower_http::limit::RequestBodyLimitLayer;
+mod operations;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:43180";
 pub const MAX_BODY: usize = 64 * 1024;
+static API_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
+static API_REQUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(128);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -54,6 +56,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/pipelines/{name}/start", post(start_pipeline))
         .route("/v1/pipelines/{name}/stop", post(stop_pipeline))
         .route("/v1/pipelines/{name}/checkpoint", post(checkpoint_pipeline))
+        .route(
+            "/v1/pipelines/{name}/checkpoints",
+            get(operations::checkpoints),
+        )
+        .route("/v1/pipelines/{name}/diagnose", get(operations::diagnose))
         .route("/v1/pipelines/{name}/restore", post(restore_pipeline))
         .route("/v1/pipelines/{name}/kill", post(kill_pipeline))
         .route("/v1/allowlist", put(put_allow))
@@ -65,7 +72,59 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/demo/capture", get(demo_capture))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            management_guard,
+        ))
         .with_state(state)
+}
+
+async fn management_guard(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !matches!(request.uri().path(), "/" | "/v1/health") {
+        if let Err(error) = require_auth(&state, request.headers()) {
+            return error.into_response();
+        }
+    }
+    let read_only = matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    if state.supervisor.is_draining() && !read_only {
+        return ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            err: SparrowError::new(
+                ErrorCode::Cancelled,
+                "server is draining; mutation not accepted",
+            )
+            .retryable(true),
+        }
+        .into_response();
+    }
+    let Ok(_permit) = API_REQUESTS.try_acquire() else {
+        return ApiError::from(
+            SparrowError::new(
+                ErrorCode::ResourceExhausted,
+                "management request capacity exhausted",
+            )
+            .retryable(true),
+        )
+        .into_response();
+    };
+    match tokio::time::timeout(Duration::from_secs(125), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => ApiError {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            err: SparrowError::new(
+                ErrorCode::ResourceExhausted,
+                "management deadline exceeded; operation outcome may require status inspection",
+            ),
+        }
+        .into_response(),
+    }
 }
 
 #[derive(Debug)]
@@ -118,7 +177,21 @@ where
     T: Send + 'static,
     F: FnOnce() -> ApiResult<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(f).await.map_err(|e| {
+    let permit = API_WORK.try_acquire().map_err(|_| {
+        ApiError::from(
+            SparrowError::new(
+                ErrorCode::ResourceExhausted,
+                "management worker capacity exhausted",
+            )
+            .retryable(true),
+        )
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| {
         ApiError::from(SparrowError::new(
             ErrorCode::Internal,
             format!("API worker: {e}"),
@@ -315,6 +388,8 @@ fn run_explain(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
         "honesty": e.honesty,
         "experimental": e.experimental,
         "effective": sparrow_control::effective_guarantees_with_plan(spec, &plan),
+        "checkpoint_policy": spec.checkpoint,
+        "checkpoint_warnings": spec.checkpoint_warnings(),
     }))
 }
 
@@ -558,6 +633,7 @@ fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
         "mailboxes": mailboxes,
         "observation": observation,
         "histogram_contract": histogram_contract_json(),
+        "checkpoint": operations::checkpoint_status(state, name),
     }))
 }
 
@@ -780,6 +856,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         "observations":{"retention":"active_handles_only","jobs":flow_jobs.iter().map(|(name,s)|json!({"name":name,"observation":flow_snapshot_json(s)})).collect::<Vec<_>>()},
         "state_keys": snap.state_keys,
         "state_bytes": snap.state_bytes,
+        "state_sample_scope": "last_window_sample_not_process_total",
         "live_samples": snap.live_samples,
         "watermark_lag_micros": snap.watermark_lag_micros,
         "checkpoint_duration_micros": snap.checkpoint_duration_micros,
@@ -860,49 +937,82 @@ async fn checkpoint_pipeline(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    require_auth(&state, &headers)?;
-    let id = state
-        .supervisor
-        .checkpoint_named(&name)
+    let actor = require_auth(&state, &headers)?;
+    let result = state.supervisor.checkpoint_named(&name).await;
+    let store = state.store.clone();
+    let audit_name = name.clone();
+    let outcome = if result.is_ok() {
+        "committed"
+    } else {
+        "failed_or_wait_timed_out"
+    };
+    let audit_recorded = store
+        .clone()
+        .run_blocking(move || store.audit(&actor, "checkpoint", Some(&audit_name), None, outcome))
         .await
-        .map_err(ApiError::from)?;
+        .is_ok();
+    let id = result.map_err(ApiError::from)?;
     Ok(Json(json!({
         "checkpoint_id": id,
+        "audit_recorded": audit_recorded,
         "exactly_once": false,
         "honesty": HONESTY,
     })))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RestoreBody {
+    snapshot_id: Option<u64>,
 }
 
 async fn restore_pipeline(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    body: Bytes,
 ) -> ApiResult<Json<Value>> {
     let actor = require_auth(&state, &headers)?;
-    let _ = state.supervisor.kill_named(&name).await;
-    let store = state.store.clone();
-    let store_c = store.clone();
-    let name_c = name.clone();
-    store
-        .run_blocking(move || {
-            let row = store_c.get_pipeline(&name_c)?;
+    let request: RestoreBody = if body.is_empty() {
+        RestoreBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|_| {
+            ApiError::from(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "invalid restore request",
+            ))
+        })?
+    };
+    blocking_api(move || {
+            let row = state.store.get_pipeline(&name).map_err(ApiError::from)?;
             let mut spec = row.spec;
             spec.restore = Some(RestoreSpec {
                 kind: "checkpoint".into(),
-                snapshot_id: Some("aligned".into()),
+                snapshot_id: Some(
+                    request
+                        .snapshot_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "aligned".into()),
+                ),
                 client_id: None,
             });
-            store_c.put_pipeline(&name_c, &spec, Some(&row.etag))?;
-            Ok(())
-        })
-        .await
-        .map_err(ApiError::from)?;
-    // Start the latest revision — the one that contains restore=checkpoint (P0-3).
-    blocking_api(move || {
-        request_start(&state.store, &name, &actor).map_err(ApiError::from)?;
+            spec.check_delivery().map_err(ApiError::from)?;
+            let plan = bind_plan(
+                &spec,
+                &binder_catalog(&state.store).map_err(ApiError::from)?,
+                &name,
+                row.latest_revision,
+            ).map_err(ApiError::from)?;
+            validate_aligned_plan(&spec, &plan).map_err(ApiError::from)?;
+            // Reject malformed/unsupported/CAS-conflicting requests before stopping
+            // the live attempt. The selected new revision is activated explicitly.
+            let restore_revision=state.store.put_pipeline_and_start(&name,&spec,Some(&row.etag))
+                .map_err(ApiError::from)?.latest_revision;
+        let audit_recorded=state.store.audit(&actor,"restore",Some(&name),Some(&restore_revision.to_string()),"requested").is_ok();
         state.supervisor.wake();
         let mut body = status_body(&state, &name)?;
         if let Value::Object(map) = &mut body {
+            map.insert("audit_recorded".into(),json!(audit_recorded));
             map.insert(
                 "note".into(),
                 json!("restore requested; supervisor starts the revision that contains restore=checkpoint. Not exactly-once."),
@@ -1143,12 +1253,41 @@ pub async fn serve(state: AppState, addr: SocketAddr) -> Result<(), SparrowError
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("bind {addr}: {e}")))?;
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+    let supervisor = state.supervisor.clone();
+    let stopping = supervisor.clone();
+    let result = axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Completing this future stops accept first. Do not hide a long
+            // source/commit join inside the shutdown notification itself.
+            stopping.begin_shutdown();
         })
         .await
-        .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("server: {e}")))
+        .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("server: {e}")));
+    let shutdown = supervisor.shutdown();
+    tokio::pin!(shutdown);
+    if tokio::time::timeout(Duration::from_secs(120), shutdown.as_mut())
+        .await
+        .is_err()
+    {
+        tracing::warn!("shutdown_join_exceeded_120s_waiting_for_owned_tasks; external_service_manager_may_force_kill");
+        shutdown.await; // timeout borrowed the future; never abort/detach join
+    }
+    result
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 pub async fn wait_status(

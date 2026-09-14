@@ -178,12 +178,14 @@ fn r4_host_capacity_waiting_and_configurable_seventeenth_job() {
 }
 
 #[test]
-fn r4_checkpoint_bound_failure_keeps_job_running_and_retry_can_commit() {
+fn r4_checkpoint_credit_failure_keeps_job_running_and_retry_can_commit() {
     use std::io::Write;
     let scratch = Scratch::new();
     let row = format!("{{\"device_id\":\"{}\",\"v\":1}}\n", "x".repeat(128));
     let path = scratch.file(&row);
-    let job = ResourceBudget { reservation_bytes: 512, retention_bytes: 8192, ..ResourceBudget::compact() };
+    // Working state/key scratch is now billed too. Use a viable job budget,
+    // then exhaust the parent only during freeze to isolate checkpoint failure.
+    let job = ResourceBudget { reservation_bytes: 8192, retention_bytes: 8192, ..ResourceBudget::compact() };
     let kernel = Arc::new(Kernel::new_with_job_budget(KernelOptions {
         budget: ResourceBudget::compact(), mailbox: MailboxConfig { max_items: 8, max_bytes: 1024 },
         worker_threads: 2, rows_per_batch: 1,
@@ -200,15 +202,21 @@ fn r4_checkpoint_bound_failure_keeps_job_running_and_retry_can_commit() {
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        while kernel.process_owner().usage().reservation_bytes != 0 {
+            assert!(Instant::now()<deadline);tokio::task::yield_now().await;
+        }
+        let pressure=kernel.process_owner().acquire(sparrow_model::CreditKind::Reservation,
+            kernel.process_owner().budget().reservation_bytes-256).unwrap();
         for _ in 0..2 {
-            assert_eq!(sup.checkpoint_named("small").await.unwrap_err().code, ErrorCode::BoundExceeded);
+            assert_eq!(sup.checkpoint_named("small").await.unwrap_err().code, ErrorCode::ResourceExhausted);
             sup.converge_once().await.unwrap();
             let actual = store.actual("small").unwrap();
             assert_eq!(actual.status, "running");
             assert_eq!(actual.consecutive_failures, 0);
             assert_eq!(kernel.metrics.snapshot().jobs_failed, 0);
-            assert_eq!(kernel.process_owner().usage().reservation_bytes, 0);
+            assert_eq!(kernel.process_owner().usage().reservation_bytes, pressure.bytes());
         }
+        drop(pressure);
         // Complete the count window so its next (empty) freeze fits the quota.
         let mut append = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         append.write_all(row.as_bytes()).unwrap();

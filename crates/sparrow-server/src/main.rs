@@ -8,7 +8,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sparrow_control::{host_kernel, host_kernel_with_max_jobs, parse_max_jobs, secrets_key_configured, secrets_key_required, Store};
+use sparrow_control::{
+    host_kernel, host_kernel_with_max_jobs, parse_max_jobs, secrets_key_configured,
+    secrets_key_required, Store,
+};
 use sparrow_model::{ErrorCode, SparrowError};
 use sparrow_server::{boot, serve, DEFAULT_BIND};
 
@@ -36,7 +39,11 @@ fn parse_opts() -> Result<Opts, SparrowError> {
             "--bind" => bind = args.next().ok_or_else(|| arg("--bind needs a value"))?,
             "--token" => token = args.next().ok_or_else(|| arg("--token needs a value"))?,
             "--catalog" => catalog = args.next().ok_or_else(|| arg("--catalog needs a value"))?,
-            "--max-jobs" => max_jobs = Some(parse_max_jobs(&args.next().ok_or_else(|| arg("--max-jobs needs a value"))?)?),
+            "--max-jobs" => {
+                max_jobs = Some(parse_max_jobs(
+                    &args.next().ok_or_else(|| arg("--max-jobs needs a value"))?,
+                )?)
+            }
             "--safe-mode" => {
                 safe_mode = true;
                 if std::env::var_os("SPARROW_SAFE_MODE").is_none() {
@@ -45,6 +52,15 @@ fn parse_opts() -> Result<Opts, SparrowError> {
             }
             "--demo-io" => demo_io = true,
             "--allow-remote" => allow_remote = true,
+            "--version" => {
+                println!(
+                    "sparrow-server {} commit={} demo={}",
+                    env!("CARGO_PKG_VERSION"),
+                    option_env!("SPARROW_BUILD_COMMIT").unwrap_or("unknown"),
+                    cfg!(feature = "demo-io")
+                );
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -58,6 +74,7 @@ fn parse_opts() -> Result<Opts, SparrowError> {
             "management token required (--token or SPARROW_TOKEN); unauthenticated mutating calls are refused",
         ));
     }
+    validate_management_token(&token, demo_io)?;
     let addr: SocketAddr = bind.parse().map_err(|e| {
         SparrowError::new(
             ErrorCode::InvalidArgument,
@@ -85,13 +102,27 @@ fn arg(msg: impl Into<String>) -> SparrowError {
     SparrowError::new(ErrorCode::InvalidArgument, msg)
 }
 
+fn validate_management_token(token: &str, demo: bool) -> Result<(), SparrowError> {
+    if !demo
+        && (token == "REPLACE_WITH_A_RANDOM_MANAGEMENT_TOKEN"
+            || token.len() < 16
+            || !token.bytes().all(|b| b.is_ascii_graphic())
+            || token.bytes().all(|b| Some(b) == token.bytes().next()))
+    {
+        return Err(SparrowError::new(ErrorCode::SecretMissing,
+            "production management token must be a non-placeholder, non-repeated token of at least 16 visible ASCII bytes; use a securely generated random token via SPARROW_TOKEN"));
+    }
+    Ok(())
+}
+
 fn print_help() {
     eprintln!(
         "\
 sparrow-server — Sparrow V0.1 control plane
 
   --bind ADDR         default {DEFAULT_BIND} (loopback)
-  --token TOKEN       or SPARROW_TOKEN (required)
+  --token TOKEN       compatibility only; exposes token in process arguments
+                      prefer SPARROW_TOKEN (required, production >=16 bytes)
   --catalog PATH      SQLite file (or :memory:)
   --max-jobs N        concurrent job capacity (1..=256); overrides SPARROW_MAX_JOBS
                       default 16; each job: 4 MiB reservation + 4 MiB retention
@@ -131,8 +162,24 @@ mod log_tests {
     use super::*;
 
     #[test]
+    fn r10_production_rejects_placeholder_weak_or_control_character_tokens() {
+        for token in [
+            "",
+            "short",
+            "REPLACE_WITH_A_RANDOM_MANAGEMENT_TOKEN",
+            "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "valid-length-but\nnewline",
+        ] {
+            assert!(validate_management_token(token, false).is_err());
+        }
+        assert!(validate_management_token("isolated-benchmark-only", false).is_ok());
+        assert!(validate_management_token("dev", true).is_ok());
+    }
+
+    #[test]
     fn r3_log_directives_filter_each_target() {
-        let subscriber = StderrSubscriber::from_filter("error,hyper=warn,sparrow=debug,sparrow_runtime=off");
+        let subscriber =
+            StderrSubscriber::from_filter("error,hyper=warn,sparrow=debug,sparrow_runtime=off");
         assert!(!subscriber.allows("hyper::client", &tracing::Level::DEBUG));
         assert!(subscriber.allows("hyper::client", &tracing::Level::WARN));
         assert!(subscriber.allows("sparrow_control", &tracing::Level::DEBUG));
@@ -155,7 +202,10 @@ impl StderrSubscriber {
     }
 
     fn from_filter(filter: &str) -> Self {
-        let mut this = Self { default: tracing::level_filters::LevelFilter::INFO, targets: Vec::new() };
+        let mut this = Self {
+            default: tracing::level_filters::LevelFilter::INFO,
+            targets: Vec::new(),
+        };
         for directive in filter.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             if let Some((target, level)) = directive.split_once('=') {
                 if let Ok(level) = level.trim().parse() {
@@ -164,15 +214,22 @@ impl StderrSubscriber {
             } else if let Ok(level) = directive.parse() {
                 this.default = level;
             } else {
-                this.targets.push((directive.to_owned(), tracing::level_filters::LevelFilter::TRACE));
+                this.targets.push((
+                    directive.to_owned(),
+                    tracing::level_filters::LevelFilter::TRACE,
+                ));
             }
         }
         this
     }
 
     fn allows(&self, target: &str, level: &tracing::Level) -> bool {
-        let max = self.targets.iter().filter(|(prefix, _)| target.starts_with(prefix))
-            .max_by_key(|(prefix, _)| prefix.len()).map_or(self.default, |(_, level)| *level);
+        let max = self
+            .targets
+            .iter()
+            .filter(|(prefix, _)| target.starts_with(prefix))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map_or(self.default, |(_, level)| *level);
         *level <= max
     }
 }
@@ -211,7 +268,9 @@ impl tracing::Subscriber for StderrSubscriber {
     fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
 
     fn event(&self, event: &tracing::Event<'_>) {
-        if !self.allows(event.metadata().target(), event.metadata().level()) { return; }
+        if !self.allows(event.metadata().target(), event.metadata().level()) {
+            return;
+        }
         let mut buf = FieldBuf(String::new());
         event.record(&mut buf);
         eprintln!(
@@ -241,6 +300,30 @@ fn run() -> Result<(), SparrowError> {
             );
         }
     }
+    let _catalog_lock = if opts.catalog.as_os_str() != ":memory:" {
+        if let Some(parent) = opts.catalog.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| arg(format!("catalog directory: {e}")))?;
+        }
+        let canonical = if opts.catalog.exists() {
+            std::fs::canonicalize(&opts.catalog)
+        } else {
+            std::fs::canonicalize(
+                opts.catalog
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(std::path::Path::new(".")),
+            )
+            .map(|parent| parent.join(opts.catalog.file_name().expect("catalog file name")))
+        }
+        .map_err(|e| arg(format!("catalog path: {e}")))?;
+        let mut lock = canonical.into_os_string();
+        lock.push(".server.lock");
+        Some(sparrow_io::fs_lock::FileLock::acquire(
+            std::path::Path::new(&lock),
+        )?)
+    } else {
+        None
+    };
     let store = if opts.catalog.as_os_str() == ":memory:" {
         Store::open_memory()?
     } else {

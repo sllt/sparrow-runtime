@@ -148,7 +148,14 @@ impl CheckpointSnapshot {
         layout: &PlanLayout,
         table: Option<&TableRevisionBind>,
         mut freeze: crate::barrier::EncodedFreeze,
-    ) -> Result<crate::barrier::EncodedFreeze> {
+    ) -> Result<EncodedSnapshot> {
+        if freeze.bytes.len() < 11 {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "truncated prepared freeze",
+            ));
+        }
+        let entries = u32::from_le_bytes(freeze.bytes[7..11].try_into().unwrap()) as usize;
         let mut prefix = Vec::new();
         write_snapshot_prefix(&mut prefix, checkpoint_id, ingested_rows, source)?;
         let mut suffix = Vec::new();
@@ -170,7 +177,12 @@ impl CheckpointSnapshot {
         freeze.bytes.copy_within(..state_len, prefix.len());
         freeze.bytes[..prefix.len()].copy_from_slice(&prefix);
         freeze.bytes[prefix.len() + state_len..].copy_from_slice(&suffix);
-        Ok(freeze)
+        Ok(EncodedSnapshot {
+            bytes: freeze.bytes,
+            lease: freeze.lease,
+            checkpoint_id,
+            entries,
+        })
     }
 
     pub fn decode(src: &[u8]) -> Result<Self> {
@@ -178,6 +190,10 @@ impl CheckpointSnapshot {
     }
 
     pub fn decode_with_max_state_keys(src: &[u8], max_state_keys: usize) -> Result<Self> {
+        Self::decode_mode(src, max_state_keys, true)
+    }
+
+    fn decode_mode(src: &[u8], max_state_keys: usize, materialize: bool) -> Result<Self> {
         let cap = freeze_entry_cap(max_state_keys);
         let mut src = src;
         if src.len() < 4 + 2 + 8 + 8 || &src[..4] != MAGIC {
@@ -200,7 +216,7 @@ impl CheckpointSnapshot {
         let ingested_rows = u64::from_le_bytes(src[..8].try_into().unwrap());
         src = &src[8..];
         let source = decode_position(&mut src)?;
-        let window = decode_freeze(&mut src, cap)?;
+        let window = decode_freeze_mode(&mut src, cap, materialize)?;
         let layout = decode_layout(&mut src, ver)?;
         if layout.operator != window.operator || layout.slot != window.slot {
             return Err(SparrowError::new(
@@ -262,12 +278,76 @@ impl CheckpointSnapshot {
     }
 }
 
+/// Only the runtime encoder can construct this immutable, owner-carrying
+/// snapshot. External callers cannot label arbitrary bytes as trusted.
+pub struct EncodedSnapshot {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) lease: sparrow_model::MemoryLease,
+    checkpoint_id: u64,
+    entries: usize,
+}
+impl EncodedSnapshot {
+    pub fn bytes(&self) -> &[u8] {
+        debug_assert!(self.lease.bytes() >= self.bytes.len());
+        &self.bytes
+    }
+}
+
 /// Directory-backed experimental checkpoint store.
 pub struct CheckpointStore {
     dir: PathBuf,
     next_id: u64,
     pub fault: FaultHook,
     max_state_keys: usize,
+    writer_lock: Option<sparrow_io::fs_lock::FileLock>,
+    retention: CheckpointRetention,
+    maintenance_error: Option<ErrorCode>,
+    pinned: Option<u64>,
+    read_only: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CheckpointRetention {
+    pub generations: usize,
+    /// Logical file bytes, including temporary generations; not filesystem blocks.
+    pub max_bytes: u64,
+}
+impl Default for CheckpointRetention {
+    fn default() -> Self {
+        Self {
+            generations: KEEP_GENERATIONS as usize,
+            max_bytes: MAX_STORE_BYTES,
+        }
+    }
+}
+impl CheckpointRetention {
+    pub fn validate(self) -> Result<()> {
+        if !(1..=128).contains(&self.generations)
+            || !(1024 * 1024..=1024 * 1024 * 1024).contains(&self.max_bytes)
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "checkpoint retention requires 1..=128 generations and 1 MiB..=1 GiB",
+            ));
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug)]
+pub struct CheckpointGeneration {
+    pub id: u64,
+    pub bytes: u64,
+    pub published: bool,
+    pub current: bool,
+}
+#[derive(Clone, Debug)]
+pub struct CheckpointInventory {
+    pub current: Option<u64>,
+    pub pinned: Option<u64>,
+    pub current_error: Option<ErrorCode>,
+    pub generations: Vec<CheckpointGeneration>,
+    pub bytes: u64,
+    pub maintenance_error: Option<ErrorCode>,
 }
 
 impl CheckpointStore {
@@ -280,18 +360,110 @@ impl CheckpointStore {
         dir: impl Into<PathBuf>,
         max_state_keys: usize,
     ) -> Result<Self> {
+        Self::open_impl(dir, max_state_keys, true)
+    }
+
+    pub fn open_readonly(dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_impl(dir, MAX_FREEZE_ENTRIES, false)
+    }
+
+    fn open_impl(dir: impl Into<PathBuf>, max_state_keys: usize, create: bool) -> Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(&dir).map_err(io_err)?;
-        let next_id = match read_current(&dir) {
-            Ok(Some(id)) => id.saturating_add(1),
-            _ => 1,
-        };
+        if create {
+            fs::create_dir_all(&dir).map_err(io_err)?;
+        }
+        let next_id = list_generation_ids(&dir)?
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                SparrowError::new(ErrorCode::BoundExceeded, "checkpoint id exhausted")
+            })?;
         Ok(Self {
             dir,
             next_id,
             fault: FaultHook::default(),
             max_state_keys: freeze_entry_cap(max_state_keys),
+            writer_lock: None,
+            retention: CheckpointRetention::default(),
+            maintenance_error: None,
+            pinned: None,
+            read_only: !create,
         })
+    }
+
+    /// Production writers retain exclusive directory ownership through stop,
+    /// including any non-cancellable blocking commit. Legacy open permits reads;
+    /// its commits acquire a temporary lock and cannot bypass this holder.
+    pub fn open_exclusive(
+        dir: impl Into<PathBuf>,
+        max_state_keys: usize,
+        retention: CheckpointRetention,
+    ) -> Result<Self> {
+        retention.validate()?;
+        let mut store = Self::open_with_max_state_keys(dir, max_state_keys)?;
+        store.writer_lock = Some(sparrow_io::fs_lock::FileLock::acquire(
+            &store.dir.join("WRITER_LOCK"),
+        )?);
+        store.next_id = list_generation_ids(&store.dir)?
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                SparrowError::new(ErrorCode::BoundExceeded, "checkpoint id exhausted")
+            })?;
+        store.retention = retention;
+        Ok(store)
+    }
+
+    pub fn next_checkpoint_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// A numeric RestoreSpec is a persistent dependency, not a one-shot
+    /// request. Keep that verified point until the owning attempt is stopped
+    /// and a new configuration opens the store without that dependency.
+    pub fn pin_recovery_point(&mut self, id: u64) -> Result<()> {
+        self.recover_id(id)?;
+        self.pinned = Some(id);
+        Ok(())
+    }
+
+    pub fn inventory(&self) -> Result<CheckpointInventory> {
+        let (current, current_error) = match read_current(&self.dir) {
+            Ok(id) => (id, None),
+            Err(e) => (None, Some(e.code)),
+        };
+        let mut generations = Vec::new();
+        for id in list_generation_ids(&self.dir)? {
+            generations.push(CheckpointGeneration {
+                id,
+                bytes: dir_size(&self.dir.join(format!("chk-{id:08}")))?,
+                published: Some(id) == current || self.was_published(id),
+                current: Some(id) == current,
+            });
+        }
+        generations.sort_by_key(|g| g.id);
+        Ok(CheckpointInventory {
+            current,
+            pinned: self.pinned,
+            current_error,
+            generations,
+            bytes: dir_size(&self.dir)?,
+            maintenance_error: self.maintenance_error,
+        })
+    }
+
+    pub fn recover_id(&self, id: u64) -> Result<CheckpointSnapshot> {
+        if !self.was_published(id) && read_current(&self.dir)? != Some(id) {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "checkpoint has no durable publication proof",
+            ));
+        }
+        self.load_generation(id)
     }
 
     pub fn set_max_state_keys(&mut self, max_state_keys: usize) {
@@ -328,7 +500,57 @@ impl CheckpointStore {
     /// Commit a pre-encoded snapshot (incremental freeze encode). Fails
     /// closed before CURRENT if the payload exceeds [`MAX_SNAPSHOT_BYTES`].
     pub fn commit_encoded(&mut self, checkpoint_id: u64, payload: &[u8]) -> Result<u64> {
-        let id = checkpoint_id.max(self.next_id);
+        self.commit_bytes(checkpoint_id, payload, false)
+    }
+
+    pub fn commit_prepared(&mut self, snapshot: &EncodedSnapshot) -> Result<u64> {
+        if snapshot.entries > self.max_state_keys {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "prepared snapshot exceeds store max_state_keys",
+            ));
+        }
+        self.commit_bytes(snapshot.checkpoint_id, snapshot.bytes(), true)
+    }
+
+    fn commit_bytes(&mut self, checkpoint_id: u64, payload: &[u8], prepared: bool) -> Result<u64> {
+        if self.read_only {
+            return Err(SparrowError::new(
+                ErrorCode::PolicyDenied,
+                "read-only checkpoint store cannot commit",
+            ));
+        }
+        let _temporary_lock = if self.writer_lock.is_none() {
+            Some(sparrow_io::fs_lock::FileLock::acquire(
+                &self.dir.join("WRITER_LOCK"),
+            )?)
+        } else {
+            None
+        };
+        // Legacy/read handles may have been opened before a different writer
+        // published and pruned generations. Recheck under the writer lock.
+        let disk_next = list_generation_ids(&self.dir)?
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                SparrowError::new(ErrorCode::BoundExceeded, "checkpoint id exhausted")
+            })?;
+        self.next_id = self.next_id.max(disk_next);
+        let id = checkpoint_id;
+        if id == u64::MAX || id < self.next_id || self.dir.join(format!("chk-{id:08}")).exists() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "checkpoint id must be fresh and monotonic",
+            ));
+        }
+        if payload.len() < 14 || u64::from_le_bytes(payload[6..14].try_into().unwrap()) != id {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "encoded checkpoint id differs from publication id",
+            ));
+        }
         if payload.len() as u64 > MAX_SNAPSHOT_BYTES {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -338,10 +560,48 @@ impl CheckpointStore {
                 ),
             ));
         }
+        // Public pre-encoded callers must not be able to publish an arbitrary
+        // id-shaped byte string. Bounds are checked before this cold decode.
+        if !prepared {
+            drop(CheckpointSnapshot::decode_mode(
+                payload,
+                self.max_state_keys,
+                false,
+            )?);
+        }
+        let protected = match read_current(&self.dir) {
+            Ok(Some(current)) => {
+                // Preserve publication proof for pre-marker CURRENT stores
+                // before replacing CURRENT. Never bless an unverified generation.
+                match self.load_generation_mode(current, false) {
+                    Ok(_) => {
+                        if !self.was_published(current) {
+                            self.record_publication(current)?;
+                        }
+                        Some(current)
+                    }
+                    Err(error) => Some(
+                        self.load_latest_valid_except(Some(current))
+                            .ok_or(error)?
+                            .checkpoint_id,
+                    ),
+                }
+            }
+            Ok(None) => None,
+            Err(error) => Some(
+                self.load_latest_valid_except(None)
+                    .ok_or(error)?
+                    .checkpoint_id,
+            ),
+        };
+        self.prune(protected, payload.len() as u64 + MAX_MANIFEST_BYTES + 4096)?;
+        self.next_id = id.checked_add(1).ok_or_else(|| {
+            SparrowError::new(ErrorCode::BoundExceeded, "checkpoint id exhausted")
+        })?;
         let chk = self.dir.join(format!("chk-{id:08}"));
-        fs::create_dir_all(&chk).map_err(io_err)?;
+        fs::create_dir(&chk).map_err(io_err)?;
         fsync_dir(&self.dir)?;
-        let chunks = chunk_payload(&payload);
+        let chunks: Vec<&[u8]> = payload.chunks(CHUNK_SIZE).collect();
         if chunks.len() as u32 > MAX_MANIFEST_CHUNKS {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -402,11 +662,13 @@ impl CheckpointStore {
         write_all_sync(&cur_tmp, format!("chk-{id:08}\n").as_bytes())?;
         fs::rename(&cur_tmp, &cur).map_err(io_err)?;
         fsync_dir(&self.dir)?;
-        self.next_id = id.saturating_add(1);
-        // CURRENT is already published. A GC error must not look like a failed commit (P1-24).
-        if let Err(_e) = gc_generations(&self.dir, id) {
-            // Residual: store may be over quota until the next successful GC.
-        }
+        // CURRENT is durable. Maintenance failure must not undo that fact or
+        // falsely report failed commit, but is exposed to operations.
+        self.maintenance_error = self
+            .record_publication(id)
+            .and_then(|_| self.prune(Some(id), 0))
+            .err()
+            .map(|e| e.code);
         Ok(id)
     }
 
@@ -440,11 +702,16 @@ impl CheckpointStore {
     }
 
     fn load_latest_valid_except(&self, skip: Option<u64>) -> Option<CheckpointSnapshot> {
-        let mut ids = list_generation_ids(&self.dir);
+        let mut ids = list_generation_ids(&self.dir).ok()?;
         ids.sort_unstable();
         ids.reverse();
         for id in ids {
-            if Some(id) == skip {
+            if skip.is_some_and(|current| id >= current) {
+                continue;
+            }
+            // A MANIFEST may exist after a crash before CURRENT publication.
+            // It is not eligible fallback merely because its checksum is valid.
+            if !self.was_published(id) {
                 continue;
             }
             if let Ok(snap) = self.load_generation(id) {
@@ -455,7 +722,21 @@ impl CheckpointStore {
     }
 
     fn load_generation(&self, id: u64) -> Result<CheckpointSnapshot> {
+        self.load_generation_mode(id, true)
+    }
+
+    fn load_generation_mode(&self, id: u64, materialize: bool) -> Result<CheckpointSnapshot> {
         let chk = self.dir.join(format!("chk-{id:08}"));
+        if !fs::symlink_metadata(&chk)
+            .map_err(io_err)?
+            .file_type()
+            .is_dir()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::PolicyDenied,
+                "checkpoint generation must be a real directory",
+            ));
+        }
         let man_path = chk.join("MANIFEST");
         if !man_path.exists() {
             return Err(SparrowError::new(
@@ -480,7 +761,7 @@ impl CheckpointStore {
                 ),
             ));
         }
-        let man_bytes = fs::read(&man_path).map_err(io_err)?;
+        let man_bytes = read_bounded(&man_path, MAX_MANIFEST_BYTES)?;
         let manifest = Manifest::decode(&man_bytes)?;
         if manifest.checkpoint_id != id {
             return Err(SparrowError::new(
@@ -498,7 +779,13 @@ impl CheckpointStore {
                 ));
             }
             let path = chk.join(format!("{i:04}.bin"));
-            let chunk = fs::read(&path).map_err(io_err)?;
+            let chunk = read_bounded(&path, CHUNK_SIZE as u64)?;
+            if payload.len() as u64 + chunk.len() as u64 > manifest.bytes {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    "chunks exceed declared snapshot size",
+                ));
+            }
             let got = crc32(&chunk);
             let expect = manifest.checksums.get(i as usize).copied().unwrap_or(0);
             if got != expect {
@@ -520,10 +807,73 @@ impl CheckpointStore {
                 ),
             ));
         }
-        Ok(CheckpointSnapshot::decode_with_max_state_keys(
-            &payload,
-            self.max_state_keys,
-        )?)
+        let snapshot = CheckpointSnapshot::decode_mode(&payload, self.max_state_keys, materialize)?;
+        if snapshot.checkpoint_id != id {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "snapshot and generation ids differ",
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    fn record_publication(&self, id: u64) -> Result<()> {
+        let dir = self.dir.join(format!("chk-{id:08}"));
+        let manifest = read_bounded(&dir.join("MANIFEST"), MAX_MANIFEST_BYTES)?;
+        let marker = format!("PUB1 {id} {}\n", crc32(&manifest));
+        write_all_sync(&dir.join("PUBLISHED.tmp"), marker.as_bytes())?;
+        fs::rename(dir.join("PUBLISHED.tmp"), dir.join("PUBLISHED")).map_err(io_err)?;
+        fsync_dir(&dir)
+    }
+    fn was_published(&self, id: u64) -> bool {
+        let dir = self.dir.join(format!("chk-{id:08}"));
+        let Ok(marker) = read_bounded(&dir.join("PUBLISHED"), 128) else {
+            return false;
+        };
+        let Ok(manifest) = read_bounded(&dir.join("MANIFEST"), MAX_MANIFEST_BYTES) else {
+            return false;
+        };
+        marker == format!("PUB1 {id} {}\n", crc32(&manifest)).as_bytes()
+    }
+    fn prune(&self, protected: Option<u64>, reserve: u64) -> Result<()> {
+        let mut removed = false;
+        let mut ids = list_generation_ids(&self.dir)?;
+        ids.sort_by_key(|id| (self.was_published(*id), *id));
+        let mut count = ids.len();
+        let mut bytes = dir_size(&self.dir)?;
+        // Leave room for the prospective generation, but never remove CURRENT.
+        let keep = self
+            .retention
+            .generations
+            .max(if self.pinned.is_some() { 2 } else { 1 })
+            .saturating_sub(usize::from(reserve > 0));
+        for id in ids {
+            if count <= keep && bytes.saturating_add(reserve) <= self.retention.max_bytes {
+                break;
+            }
+            if Some(id) == protected
+                || Some(id) == self.pinned
+                || Some(id) == read_current(&self.dir).ok().flatten()
+            {
+                continue;
+            }
+            let path = self.dir.join(format!("chk-{id:08}"));
+            let size = dir_size(&path)?;
+            fs::remove_dir_all(path).map_err(io_err)?;
+            removed = true;
+            count -= 1;
+            bytes = bytes.saturating_sub(size);
+        }
+        if removed {
+            fsync_dir(&self.dir)?;
+        }
+        if bytes.saturating_add(reserve) > self.retention.max_bytes {
+            return Err(SparrowError::new(
+                ErrorCode::ResourceExhausted,
+                "checkpoint storage quota exhausted; CURRENT preserved",
+            ));
+        }
+        Ok(())
     }
 
     /// Restore entry point: never continue with empty state when a restore
@@ -603,6 +953,12 @@ impl Manifest {
             ));
         }
         let nsum = nsum as usize;
+        if nsum != n_chunks as usize {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "MANIFEST checksum count does not match chunk count",
+            ));
+        }
         s = &s[4..];
         if s.len() < nsum * 4 {
             return Err(SparrowError::new(
@@ -615,6 +971,12 @@ impl Manifest {
             checksums.push(u32::from_le_bytes(s[..4].try_into().unwrap()));
             s = &s[4..];
         }
+        if !s.is_empty() {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "MANIFEST trailing bytes",
+            ));
+        }
         Ok(Self {
             checkpoint_id,
             n_chunks,
@@ -625,76 +987,109 @@ impl Manifest {
     }
 }
 
-fn chunk_payload(payload: &[u8]) -> Vec<Vec<u8>> {
-    if payload.is_empty() {
-        return vec![Vec::new()];
-    }
-    payload.chunks(CHUNK_SIZE).map(|c| c.to_vec()).collect()
-}
-
 fn fsync_dir(path: &Path) -> Result<()> {
     let dir = File::open(path).map_err(io_err)?;
     dir.sync_all().map_err(io_err)?;
     Ok(())
 }
 
-fn dir_size(path: &Path) -> u64 {
-    let mut total = 0u64;
-    let Ok(rd) = fs::read_dir(path) else {
-        return 0;
-    };
-    for ent in rd.flatten() {
-        let p = ent.path();
-        if p.is_dir() {
-            total = total.saturating_add(dir_size(&p));
-        } else if let Ok(m) = ent.metadata() {
-            total = total.saturating_add(m.len());
-        }
-    }
-    total
-}
-
-fn list_generation_ids(dir: &Path) -> Vec<u64> {
-    let mut ids = Vec::new();
-    if let Ok(rd) = fs::read_dir(dir) {
-        for ent in rd.flatten() {
-            let name = ent.file_name();
-            let Some(s) = name.to_str() else {
-                continue;
-            };
-            if let Some(id) = s.strip_prefix("chk-").and_then(|x| x.parse::<u64>().ok()) {
-                if ent.path().is_dir() {
-                    ids.push(id);
-                }
-            }
-        }
-    }
-    ids
-}
-
-fn gc_generations(dir: &Path, keep_id: u64) -> Result<()> {
-    let floor = keep_id.saturating_sub(KEEP_GENERATIONS.saturating_sub(1));
-    if let Ok(rd) = fs::read_dir(dir) {
-        for ent in rd.flatten() {
-            let name = ent.file_name();
-            let Some(s) = name.to_str() else {
-                continue;
-            };
-            let Some(id) = s.strip_prefix("chk-").and_then(|x| x.parse::<u64>().ok()) else {
-                continue;
-            };
-            if id < floor {
-                let _ = fs::remove_dir_all(ent.path());
-            }
-        }
-    }
-    if dir_size(dir) > MAX_STORE_BYTES {
+fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>> {
+    let meta = fs::symlink_metadata(path).map_err(io_err)?;
+    if !meta.file_type().is_file() {
         return Err(SparrowError::new(
-            ErrorCode::ResourceExhausted,
-            format!("checkpoint store exceeds {MAX_STORE_BYTES}B after GC"),
+            ErrorCode::PolicyDenied,
+            "checkpoint component must be a regular file",
         ));
     }
-    Ok(())
+    if meta.len() > max {
+        return Err(SparrowError::new(
+            ErrorCode::BoundExceeded,
+            "checkpoint component exceeds read bound",
+        ));
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(io_err)?
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_err)?;
+    if bytes.len() as u64 > max {
+        return Err(SparrowError::new(
+            ErrorCode::BoundExceeded,
+            "checkpoint component grew beyond read bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn dir_size(path: &Path) -> Result<u64> {
+    fn walk(path: &Path, depth: usize, entries: &mut usize) -> Result<u64> {
+        if depth > 8 {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "checkpoint directory nesting limit",
+            ));
+        }
+        let mut total = 0u64;
+        for entry in fs::read_dir(path).map_err(io_err)? {
+            let entry = entry.map_err(io_err)?;
+            *entries += 1;
+            if *entries > 300_000 {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    "checkpoint directory entry limit",
+                ));
+            }
+            let kind = entry.file_type().map_err(io_err)?;
+            if kind.is_symlink() || (!kind.is_file() && !kind.is_dir()) {
+                return Err(SparrowError::new(
+                    ErrorCode::PolicyDenied,
+                    "checkpoint store contains a link or special file",
+                ));
+            }
+            total = total.saturating_add(if kind.is_dir() {
+                walk(&entry.path(), depth + 1, entries)?
+            } else {
+                entry.metadata().map_err(io_err)?.len()
+            });
+        }
+        Ok(total)
+    }
+    walk(path, 0, &mut 0)
+}
+
+fn list_generation_ids(dir: &Path) -> Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    for (n, ent) in fs::read_dir(dir).map_err(io_err)?.enumerate() {
+        if n >= 1024 {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "checkpoint store entry limit",
+            ));
+        }
+        let ent = ent.map_err(io_err)?;
+        let name = ent.file_name();
+        let Some(s) = name.to_str() else {
+            continue;
+        };
+        if let Some(id) = s.strip_prefix("chk-").and_then(|x| x.parse::<u64>().ok()) {
+            if s != format!("chk-{id:08}") || !ent.file_type().map_err(io_err)?.is_dir() {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "noncanonical checkpoint generation path",
+                )
+                .context("path", ent.path().display().to_string()));
+            }
+            ids.push(id);
+            if ids.len() > 256 {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    "too many checkpoint generations; inspect/clean store",
+                ));
+            }
+        }
+    }
+    Ok(ids)
 }
 
 fn write_all_sync(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -717,14 +1112,13 @@ fn write_all_trunc(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn read_current(dir: &Path) -> Result<Option<u64>> {
     let path = dir.join("CURRENT");
-    if !path.exists() {
-        return Ok(None);
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err(e)),
+        Ok(_) => {}
     }
-    let mut s = String::new();
-    File::open(&path)
-        .map_err(io_err)?
-        .read_to_string(&mut s)
-        .map_err(io_err)?;
+    let s = String::from_utf8(read_bounded(&path, 128)?)
+        .map_err(|_| SparrowError::new(ErrorCode::CodecViolation, "CURRENT is not UTF-8"))?;
     let name = s.trim();
     let id = name
         .strip_prefix("chk-")
@@ -1106,10 +1500,13 @@ fn estimated_frozen_bytes(f: &WindowFreeze) -> usize {
     f.entries
         .iter()
         .map(|e| {
-            e.key.iter().map(Scalar::tracked_bytes).sum::<usize>()
+            e.key
+                .iter()
+                .map(|v| v.encoded_value_len().unwrap_or(0))
+                .sum::<usize>()
                 + e.accs
                     .iter()
-                    .map(crate::aggregate::Accumulator::tracked_bytes)
+                    .map(|a| a.encoded_len().unwrap_or(0))
                     .sum::<usize>()
                 + ENTRY_OVERHEAD
         })
@@ -1155,7 +1552,16 @@ pub(crate) fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>, max_entries: us
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_freeze(src: &mut &[u8], max_entries: usize) -> Result<WindowFreeze> {
+    decode_freeze_mode(src, max_entries, true)
+}
+
+fn decode_freeze_mode(
+    src: &mut &[u8],
+    max_entries: usize,
+    materialize: bool,
+) -> Result<WindowFreeze> {
     if src.len() < 4 + 1 + 4 {
         return Err(SparrowError::new(
             ErrorCode::CodecViolation,
@@ -1189,7 +1595,7 @@ fn decode_freeze(src: &mut &[u8], max_entries: usize) -> Result<WindowFreeze> {
             "truncated window freeze entries (declared count exceeds remaining bytes)",
         ));
     }
-    let mut entries = Vec::with_capacity(n);
+    let mut entries = Vec::with_capacity(if materialize { n } else { 0 });
     for _ in 0..n {
         if src.len() < 2 {
             return Err(SparrowError::new(
@@ -1205,9 +1611,13 @@ fn decode_freeze(src: &mut &[u8], max_entries: usize) -> Result<WindowFreeze> {
                 format!("freeze key arity {nk} exceeds 64"),
             ));
         }
-        let mut key = Vec::with_capacity(nk);
+        let mut key = Vec::with_capacity(if materialize { nk } else { 0 });
         for _ in 0..nk {
-            key.push(Scalar::decode_value(src)?);
+            if materialize {
+                key.push(Scalar::decode_value(src)?);
+            } else {
+                Scalar::skip_encoded_value(src)?;
+            }
         }
         if src.len() < 8 + 8 + 8 + 2 {
             return Err(SparrowError::new(
@@ -1229,17 +1639,23 @@ fn decode_freeze(src: &mut &[u8], max_entries: usize) -> Result<WindowFreeze> {
                 format!("freeze accumulator count {na} exceeds 64"),
             ));
         }
-        let mut accs = Vec::with_capacity(na);
+        let mut accs = Vec::with_capacity(if materialize { na } else { 0 });
         for _ in 0..na {
-            accs.push(Accumulator::decode(src)?);
+            if materialize {
+                accs.push(Accumulator::decode(src)?);
+            } else {
+                Accumulator::skip_encoded(src)?;
+            }
         }
-        entries.push(FrozenEntry {
-            key,
-            window_start,
-            window_end,
-            count,
-            accs,
-        });
+        if materialize {
+            entries.push(FrozenEntry {
+                key,
+                window_start,
+                window_end,
+                count,
+                accs,
+            });
+        }
     }
     Ok(WindowFreeze {
         operator,
@@ -1255,6 +1671,157 @@ fn decode_freeze(src: &mut &[u8], max_entries: usize) -> Result<WindowFreeze> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_unpublished_manifest_is_never_a_corruption_fallback() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        store.commit(&sample_snapshot(1)).unwrap();
+        store.fault.point = FaultPoint::AfterManifestRename;
+        assert!(store.commit(&sample_snapshot(2)).is_err());
+        fs::write(dir.join("CURRENT"), b"broken\n").unwrap();
+        assert_eq!(store.recover_required().unwrap().checkpoint_id, 1);
+        assert!(store.recover_id(2).is_err());
+        assert_eq!(store.recover_id(1).unwrap().checkpoint_id, 1);
+        store.fault.point = FaultPoint::None;
+        store.commit(&sample_snapshot(3)).unwrap();
+        assert_eq!(store.recover_required().unwrap().checkpoint_id, 3);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn production_store_writer_exclusion_and_monotonic_ids() {
+        let dir = tmp();
+        let mut stale = CheckpointStore::open(&dir).unwrap();
+        let mut writer =
+            CheckpointStore::open_exclusive(&dir, 1024, CheckpointRetention::default()).unwrap();
+        writer.commit(&sample_snapshot(1)).unwrap();
+        assert!(
+            CheckpointStore::open_exclusive(&dir, 1024, CheckpointRetention::default()).is_err()
+        );
+        let mut reader = CheckpointStore::open(&dir).unwrap();
+        assert_eq!(reader.recover_required().unwrap().checkpoint_id, 1);
+        assert!(reader.commit(&sample_snapshot(2)).is_err());
+        drop(writer);
+        reader.commit(&sample_snapshot(2)).unwrap();
+        assert!(reader.commit(&sample_snapshot(2)).is_err());
+        let next = CheckpointStore::open(&dir).unwrap().next_checkpoint_id();
+        assert_eq!(next, 3);
+        for id in 3..=6 {
+            reader.commit(&sample_snapshot(id)).unwrap();
+        }
+        assert!(!dir.join("chk-00000001").exists());
+        assert!(
+            stale.commit(&sample_snapshot(1)).is_err(),
+            "pruned ids cannot be recycled by stale handles"
+        );
+        assert_eq!(reader.recover_required().unwrap().checkpoint_id, 6);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn production_numeric_restore_dependency_survives_retention_gc() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open_exclusive(
+            &dir,
+            1024,
+            CheckpointRetention {
+                generations: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store.commit(&sample_snapshot(1)).unwrap();
+        store.pin_recovery_point(1).unwrap();
+        for id in 2..=6 {
+            store.commit(&sample_snapshot(id)).unwrap();
+        }
+        assert_eq!(store.recover_id(1).unwrap().checkpoint_id, 1);
+        let inventory = store.inventory().unwrap();
+        assert_eq!(inventory.pinned, Some(1));
+        assert_eq!(
+            inventory.generations.len(),
+            2,
+            "one pinned point plus CURRENT, not unbounded history"
+        );
+        drop(store);
+        let mut store = CheckpointStore::open_exclusive(
+            &dir,
+            1024,
+            CheckpointRetention {
+                generations: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store.commit(&sample_snapshot(7)).unwrap();
+        assert!(store.recover_id(1).is_err());
+        assert_eq!(store.inventory().unwrap().generations.len(), 1);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn production_quota_failure_preserves_current_and_unrelated_files() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open_exclusive(
+            &dir,
+            1024,
+            CheckpointRetention {
+                generations: 2,
+                max_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        store.commit(&sample_snapshot(1)).unwrap();
+        let current = fs::read(dir.join("CURRENT")).unwrap();
+        fs::write(dir.join("operator-owned.bin"), vec![0; 1024 * 1024]).unwrap();
+        assert_eq!(
+            store.commit(&sample_snapshot(2)).unwrap_err().code,
+            ErrorCode::ResourceExhausted
+        );
+        assert_eq!(fs::read(dir.join("CURRENT")).unwrap(), current);
+        assert!(dir.join("operator-owned.bin").exists());
+        assert_eq!(store.recover_required().unwrap().checkpoint_id, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn production_legacy_current_gets_history_proof_before_replacement() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        store.commit(&sample_snapshot(1)).unwrap();
+        fs::remove_file(dir.join("chk-00000001/PUBLISHED")).unwrap();
+        assert_eq!(store.recover_required().unwrap().checkpoint_id, 1);
+        store.commit(&sample_snapshot(2)).unwrap();
+        assert!(store.was_published(1));
+        fs::write(dir.join("chk-00000002/0000.bin"), b"bad").unwrap();
+        assert_eq!(store.recover_required().unwrap().checkpoint_id, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn production_checkpoint_reads_are_bounded_and_inventory_is_read_only() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        store.commit(&sample_snapshot(1)).unwrap();
+        let current = fs::read(dir.join("CURRENT")).unwrap();
+        let inventory = store.inventory().unwrap();
+        assert_eq!(inventory.current, Some(1));
+        assert!(inventory.generations[0].published);
+        assert_eq!(fs::read(dir.join("CURRENT")).unwrap(), current);
+        fs::write(dir.join("chk-00000001/0000.bin"), vec![0; CHUNK_SIZE + 1]).unwrap();
+        assert_eq!(
+            store.recover_required().unwrap_err().code,
+            ErrorCode::BoundExceeded
+        );
+        fs::write(dir.join("CURRENT"), vec![0; 129]).unwrap();
+        assert_eq!(
+            store.inventory().unwrap().current_error,
+            Some(ErrorCode::BoundExceeded)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
     use crate::window::{FrozenEntry, WindowOperator};
     use sparrow_expr::Expr;
     use sparrow_io::{MemoryReplaySource, RecordSource, ReplayableSource};
@@ -1336,6 +1903,121 @@ mod tests {
                 .with_input_schema(&schema),
             table: None,
         }
+    }
+
+    #[test]
+    fn r10_bounded_validation_matches_decode_without_materializing_state() {
+        let bytes = sample_snapshot(1).encode().unwrap();
+        for end in 0..=bytes.len() {
+            assert_eq!(
+                CheckpointSnapshot::decode_mode(&bytes[..end], 1024, false).is_ok(),
+                CheckpointSnapshot::decode_with_max_state_keys(&bytes[..end], 1024).is_ok(),
+                "prefix {end}"
+            );
+        }
+        for index in 0..bytes.len() {
+            for value in [0u8, 1, 255] {
+                let mut mutated = bytes.clone();
+                mutated[index] = value;
+                assert_eq!(
+                    CheckpointSnapshot::decode_mode(&mutated, 1024, false).is_ok(),
+                    CheckpointSnapshot::decode_with_max_state_keys(&mutated, 1024).is_ok(),
+                    "byte {index}={value}"
+                );
+            }
+        }
+        let validated = CheckpointSnapshot::decode_mode(&bytes, 1024, false).unwrap();
+        assert!(validated.window.entries.is_empty());
+        assert!(!CheckpointSnapshot::decode(&bytes)
+            .unwrap()
+            .window
+            .entries
+            .is_empty());
+    }
+
+    #[test]
+    fn r10_publication_proof_never_replaces_chunk_validation_before_gc() {
+        let dir = tmp();
+        let mut store = CheckpointStore::open_exclusive(
+            &dir,
+            1024,
+            CheckpointRetention {
+                generations: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store.commit(&sample_snapshot(1)).unwrap();
+        let proof = fs::metadata(dir.join("chk-00000001/PUBLISHED"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        store.commit(&sample_snapshot(2)).unwrap();
+        assert_eq!(
+            fs::metadata(dir.join("chk-00000001/PUBLISHED"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            proof,
+            "old publication proof need not be rewritten"
+        );
+        let current = dir.join("chk-00000002/0000.bin");
+        let mut bytes = fs::read(&current).unwrap();
+        bytes[0] ^= 1;
+        fs::write(current, bytes).unwrap();
+        assert!(
+            store.was_published(2),
+            "proof authenticates MANIFEST, not chunk contents"
+        );
+        store.fault.point = FaultPoint::AfterManifestRename;
+        assert!(store.commit(&sample_snapshot(3)).is_err());
+        assert_eq!(
+            store.recover_required().unwrap().checkpoint_id,
+            1,
+            "failed replacement must not GC the last valid fallback"
+        );
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn r10_readonly_open_never_creates_directories_or_commits() {
+        let dir = tmp();
+        let missing = dir.join("missing");
+        assert!(CheckpointStore::open_readonly(&missing).is_err());
+        assert!(!missing.exists());
+        let mut store = CheckpointStore::open_readonly(&dir).unwrap();
+        assert_eq!(
+            store.commit(&sample_snapshot(1)).unwrap_err().code,
+            ErrorCode::PolicyDenied
+        );
+        assert!(!dir.join("LOCK").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn r10_wire_estimate_excludes_state_container_overhead() {
+        let owner = MemoryOwner::new(ResourceBudget::performance());
+        let schema = count_schema();
+        let mut op = WindowOperator::new(
+            OperatorId::WINDOW,
+            count_spec(),
+            schema.clone(),
+            owner.clone(),
+            1024,
+            1024,
+        )
+        .unwrap();
+        ingest_distinct_keys(&mut op, &schema, &owner, 512);
+        let encoded = crate::barrier::EncodedFreeze::from_operator(&op, &owner, 1024).unwrap();
+        let estimate = op.estimated_freeze_bytes() + 256;
+        assert!(estimate >= encoded.bytes.len());
+        assert!(estimate <= encoded.bytes.len() * 3 / 2);
+        assert!(op.retention_bytes() > estimate * 2);
+        assert_eq!(
+            op.estimated_freeze_bytes(),
+            estimated_frozen_bytes(&op.freeze())
+        );
     }
 
     #[test]
@@ -1465,17 +2147,18 @@ mod tests {
         assert_eq!(owner.usage().reservation_bytes, before);
         assert_eq!(op.key_count(), 1);
         drop(pressure);
-        // Exactly estimate bytes of headroom: encode must not acquire twice.
+        // Exactly wire + reference-sort workspace headroom. No whole decoded
+        // state reservation; transient sorting credit refunds before return.
         let pressure = owner
             .acquire(
                 CreditKind::Reservation,
-                owner.budget().reservation_bytes - estimate,
+                owner.budget().reservation_bytes - estimate - op.freeze_workspace_bytes(),
             )
             .unwrap();
         let frozen = EncodedFreeze::from_operator(&op, &owner, 64).unwrap();
         assert_eq!(
             owner.usage().reservation_bytes,
-            owner.budget().reservation_bytes
+            owner.budget().reservation_bytes - op.freeze_workspace_bytes()
         );
         drop((frozen, pressure, op));
         assert_eq!(owner.usage().physical_bytes, 0);

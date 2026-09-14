@@ -17,6 +17,17 @@ pub(crate) const FILE_EOF_POLL: Duration = Duration::from_millis(40);
 pub(crate) const FILE_POLL_BATCH_FRAMES: usize = 32;
 pub(crate) const FILE_POLL_BATCH_BYTES: usize = 64 * 1024;
 
+pub(crate) async fn checkpoint_file_position(
+    source: FileReplaySource,
+) -> Result<(FileReplaySource, Result<SourcePosition>)> {
+    tokio::task::spawn_blocking(move || {
+        let position = source.checkpoint_position();
+        (source, position)
+    })
+    .await
+    .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("file checkpoint worker: {e}")))
+}
+
 pub(crate) async fn take_file_batch(
     mut source: FileReplaySource,
 ) -> Result<(FileReplaySource, Vec<FilePoll>)> {

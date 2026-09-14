@@ -1,7 +1,8 @@
 //! I/O *contracts*. Live MQTT/HTTP implementations live in `sparrow-connectors`.
 //!
 //! Codecs convert [`SourceFrame`] bytes into typed [`RowBatch`] records.
-//! Implementations in this crate are test doubles only.
+//! Connector implementations here are test doubles; observed channels and
+//! the cooperative filesystem lock are shared production boundary helpers.
 
 use sparrow_model::{
     CodecBounds, Result, RowBatch, SourceFrame, SparrowError,
@@ -11,6 +12,8 @@ use sparrow_model::error::ErrorCode;
 pub mod replay;
 #[cfg(feature = "observation")]
 pub mod observed;
+
+pub mod fs_lock;
 
 pub use replay::{
     fnv1a64, MemoryReplaySource, ReplayCapabilities, ReplaySupport, ReplayableSource,

@@ -30,6 +30,7 @@ pub struct DedupOperator {
     /// instead of scanning the whole map (P2-32).
     expiry: BTreeMap<(i64, Vec<u8>), StateKey>,
     last_expire_probes: usize,
+    expiry_bytes: usize,
 }
 
 impl DedupOperator {
@@ -56,6 +57,7 @@ impl DedupOperator {
             owner,
             expiry: BTreeMap::new(),
             last_expire_probes: 0,
+            expiry_bytes: 0,
         })
     }
 
@@ -74,7 +76,9 @@ impl DedupOperator {
     }
 
     pub fn retention_bytes(&self) -> usize {
-        self.state.retention_bytes() + self.expiry.values().map(StateKey::index_bytes).sum::<usize>()
+        self.state
+            .retention_bytes()
+            .saturating_add(self.expiry_bytes)
     }
 
     pub fn on_batch(&mut self, batch: &RowBatch, now: i64) -> Result<Vec<Row>> {
@@ -94,7 +98,7 @@ impl DedupOperator {
         let key: Vec<Scalar> = self
             .key_idx
             .iter()
-            .map(|&i| row.values[i].detach_copy())
+            .map(|&i| row.values[i].clone())
             .collect();
         let sk = StateKey::new(self.operator, StateSlotId::new(SLOT), key);
         if let Some(seen) = self.state.get(&sk) {
@@ -105,8 +109,7 @@ impl DedupOperator {
             self.unindex_expiry(last_seen, &sk);
             self.state.remove(&sk);
         }
-        self.state
-            .put(sk.clone(), Seen { last_seen: now }, 16)?;
+        self.state.put(sk.clone(), Seen { last_seen: now }, 16)?;
         self.index_expiry(now, sk)?;
         Ok(true)
     }
@@ -118,13 +121,20 @@ impl DedupOperator {
     fn index_expiry(&mut self, last_seen: i64, sk: StateKey) -> Result<()> {
         let sk = sk.indexed(&self.owner)?;
         let encoded = sk.encoded_bytes().to_vec();
-        self.expiry.insert((self.expire_at(last_seen), encoded), sk);
+        let bytes = sk.index_bytes();
+        let old = self.expiry.insert((self.expire_at(last_seen), encoded), sk);
+        self.expiry_bytes =
+            self.expiry_bytes.saturating_add(bytes) - old.as_ref().map_or(0, StateKey::index_bytes);
         Ok(())
     }
 
     fn unindex_expiry(&mut self, last_seen: i64, sk: &StateKey) {
-        self.expiry
-            .remove(&(self.expire_at(last_seen), sk.encoded_bytes().to_vec()));
+        if let Some(old) = self
+            .expiry
+            .remove(&(self.expire_at(last_seen), sk.encoded_bytes().to_vec()))
+        {
+            self.expiry_bytes -= old.index_bytes();
+        }
     }
 
     fn expire(&mut self, now: i64) {
@@ -140,6 +150,7 @@ impl DedupOperator {
             let Some((_, sk)) = self.expiry.pop_first() else {
                 break;
             };
+            self.expiry_bytes -= sk.index_bytes();
             self.state.remove(&sk);
         }
     }
@@ -148,9 +159,14 @@ impl DedupOperator {
         finish_rows(&self.input, rows, &self.owner)
     }
 
+    pub(crate) fn build_metered_batch(&self, rows: Vec<Row>) -> Result<Option<RowBatch>> {
+        crate::window::finish_rows_metered(&self.input, rows, &self.owner)
+    }
+
     pub fn cleanup(&mut self) {
         self.state.clear();
         self.expiry.clear();
+        self.expiry_bytes = 0;
         self.last_expire_probes = 0;
     }
 }
@@ -274,10 +290,19 @@ mod tests {
     #[test]
     fn r3_expiry_index_is_billed_and_released() {
         let owner = owner();
-        let mut d = DedupOperator::new(OperatorId::new(2), DedupSpec {
-            keys: vec!["id".into()], ttl_micros: 10, max_keys: 16,
-        }, schema(), owner.clone()).unwrap();
-        d.on_batch(&batch(&["long-key-material"], &owner), 0).unwrap();
+        let mut d = DedupOperator::new(
+            OperatorId::new(2),
+            DedupSpec {
+                keys: vec!["id".into()],
+                ttl_micros: 10,
+                max_keys: 16,
+            },
+            schema(),
+            owner.clone(),
+        )
+        .unwrap();
+        d.on_batch(&batch(&["long-key-material"], &owner), 0)
+            .unwrap();
         assert!(d.retention_bytes() > d.state.retention_bytes());
         assert_eq!(d.retention_bytes(), owner.usage().retention_bytes);
         d.expire(10);

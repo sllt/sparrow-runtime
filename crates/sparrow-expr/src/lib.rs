@@ -3,12 +3,14 @@
 //! M0 ships a small scalar evaluator so filter/project stubs and G1a
 //! kernels have one semantics. Nested-type kernels are out of scope.
 
-use sparrow_model::{DataType, DynamicValue, Result, Scalar, Schema, SparrowError};
 use sparrow_model::error::ErrorCode;
+use sparrow_model::{DataType, DynamicValue, Result, Scalar, Schema, SparrowError};
 
+pub mod allocation;
 pub mod bind;
 pub mod infer;
 pub mod kernels;
+pub mod semantics;
 pub use bind::{bind, eval_bound, BoundExpr};
 pub use infer::{infer_nullable, infer_type};
 pub use kernels::{filter_mask, SimplePred};
@@ -50,7 +52,9 @@ impl BinaryOp {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
-    Column { name: String },
+    Column {
+        name: String,
+    },
     Literal(Scalar),
     Cast {
         expr: Box<Expr>,
@@ -90,10 +94,7 @@ pub(crate) fn eval_call_values(name: &str, vals: Vec<Scalar>) -> Result<Scalar> 
         "abs" => match vals.first() {
             Some(Scalar::Int64(v)) => {
                 let abs = v.checked_abs().ok_or_else(|| {
-                    SparrowError::new(
-                        ErrorCode::IntegerOverflow,
-                        "abs(Int64::MIN) overflows",
-                    )
+                    SparrowError::new(ErrorCode::IntegerOverflow, "abs(Int64::MIN) overflows")
                 })?;
                 Ok(Scalar::Int64(abs))
             }
@@ -103,22 +104,34 @@ pub(crate) fn eval_call_values(name: &str, vals: Vec<Scalar>) -> Result<Scalar> 
                 ErrorCode::InvalidArgument,
                 "abs requires 1 argument",
             )),
-            _ => Err(SparrowError::new(ErrorCode::TypeMismatch, "abs expects numeric")),
+            _ => Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                "abs expects numeric",
+            )),
         },
         "lower" => match vals.first() {
             Some(Scalar::Utf8(s)) => Ok(Scalar::utf8(s.to_ascii_lowercase())),
             Some(Scalar::Null) => Ok(Scalar::Null),
-            _ => Err(SparrowError::new(ErrorCode::TypeMismatch, "lower expects utf8")),
+            _ => Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                "lower expects utf8",
+            )),
         },
         "upper" => match vals.first() {
             Some(Scalar::Utf8(s)) => Ok(Scalar::utf8(s.to_ascii_uppercase())),
             Some(Scalar::Null) => Ok(Scalar::Null),
-            _ => Err(SparrowError::new(ErrorCode::TypeMismatch, "upper expects utf8")),
+            _ => Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                "upper expects utf8",
+            )),
         },
         "length" | "char_length" => match vals.first() {
             Some(Scalar::Utf8(s)) => Ok(Scalar::Int64(s.chars().count() as i64)),
             Some(Scalar::Null) => Ok(Scalar::Null),
-            _ => Err(SparrowError::new(ErrorCode::TypeMismatch, "length expects utf8")),
+            _ => Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                "length expects utf8",
+            )),
         },
         "coalesce" => {
             if vals.is_empty() {
@@ -127,7 +140,10 @@ pub(crate) fn eval_call_values(name: &str, vals: Vec<Scalar>) -> Result<Scalar> 
                     "coalesce requires at least 1 argument",
                 ));
             }
-            Ok(vals.into_iter().find(|v| !v.is_null()).unwrap_or(Scalar::Null))
+            Ok(vals
+                .into_iter()
+                .find(|v| !v.is_null())
+                .unwrap_or(Scalar::Null))
         }
         "nullif" => {
             if vals.len() != 2 {
@@ -180,28 +196,22 @@ pub(crate) fn eval_call_values(name: &str, vals: Vec<Scalar>) -> Result<Scalar> 
 }
 
 pub(crate) fn check_call_arity(name: &str, argc: usize) -> Result<()> {
-    match name {
-        "abs" | "lower" | "upper" | "length" | "char_length" => {
-            if argc != 1 {
-                return Err(SparrowError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("{name} requires 1 argument, got {argc}"),
-                ));
-            }
-        }
-        "nullif" if argc != 2 => {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,
-                format!("{name} requires 2 arguments, got {argc}")));
-        }
-        "coalesce" => {
-            if argc == 0 {
-                return Err(SparrowError::new(
-                    ErrorCode::InvalidArgument,
-                    "coalesce requires at least 1 argument",
-                ));
-            }
-        }
-        _ => {}
+    let function = semantics::function(name).ok_or_else(|| {
+        SparrowError::new(
+            ErrorCode::FeatureUnavailable,
+            format!("unknown function {name}"),
+        )
+    })?;
+    if argc < function.min_args || function.max_args.is_some_and(|max| argc > max) {
+        let expected = match function.max_args {
+            Some(max) if max == function.min_args => format!("exactly {max}"),
+            Some(max) => format!("{}..={max}", function.min_args),
+            None => format!("at least {}", function.min_args),
+        };
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            format!("{name} argument count {argc}; expected {expected}"),
+        ));
     }
     Ok(())
 }
@@ -220,7 +230,10 @@ fn eval_int_arith(op: BinaryOp, left: i64, right: i64) -> Result<Scalar> {
         _ => None,
     };
     v.map(Scalar::Int64).ok_or_else(|| {
-        SparrowError::new(ErrorCode::IntegerOverflow, "checked integer arithmetic overflow")
+        SparrowError::new(
+            ErrorCode::IntegerOverflow,
+            "checked integer arithmetic overflow",
+        )
     })
 }
 
@@ -354,7 +367,9 @@ pub(crate) fn cast(value: &Scalar, target: &DataType, try_cast: bool) -> Result<
         (Scalar::Int64(v), DataType::Float64) => Ok(Scalar::Float64(*v as f64)),
         (Scalar::Int64(v), DataType::Utf8) => Ok(Scalar::utf8(v.to_string())),
         (Scalar::UInt64(v), DataType::UInt64) => Ok(Scalar::UInt64(*v)),
-        (Scalar::UInt64(v), DataType::Int64) if *v <= i64::MAX as u64 => Ok(Scalar::Int64(*v as i64)),
+        (Scalar::UInt64(v), DataType::Int64) if *v <= i64::MAX as u64 => {
+            Ok(Scalar::Int64(*v as i64))
+        }
         (Scalar::UInt64(v), DataType::Float64) => Ok(Scalar::Float64(*v as f64)),
         (Scalar::Float64(v), DataType::Float64) => Ok(Scalar::Float64(*v)),
         (Scalar::Float64(v), DataType::Int64) => Ok(Scalar::Int64(*v as i64)),
@@ -487,7 +502,10 @@ mod tests {
             }),
             key: "humidity".into(),
         };
-        assert_eq!(eval(&extract, &schema, &row).unwrap(), Scalar::Float64(40.0));
+        assert_eq!(
+            eval(&extract, &schema, &row).unwrap(),
+            Scalar::Float64(40.0)
+        );
     }
 
     #[test]

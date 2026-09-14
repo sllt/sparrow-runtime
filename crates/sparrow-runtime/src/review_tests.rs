@@ -43,6 +43,155 @@ fn kernel() -> Kernel {
 }
 
 #[test]
+fn r10_kernel_multikey_minmax_count_pt_et_and_slow_sink_keep_bounded_working_memory() {
+    use sparrow_model::{AggFn, SharedVirtualClock, WindowKind};
+    use sparrow_plan::{bind_window_linear, AggCall, WindowSpec};
+    const KEYS: usize = 1024;
+    for mode in 0..3 {
+        let schema = Schema::new(
+            1,
+            vec![
+                Field::new(1, "device_id", DataType::Utf8, false),
+                Field::new(2, "v", DataType::Int64, false),
+                Field::new(3, "name", DataType::Utf8, false),
+                Field::new(4, "unused", DataType::Utf8, false),
+                Field::new(5, "ts", DataType::Int64, false),
+            ],
+        )
+        .unwrap();
+        let kind = match mode {
+            0 => WindowKind::count(2).unwrap(),
+            1 => WindowKind::tumbling_pt(1_000_000).unwrap(),
+            _ => WindowKind::tumbling_et(1_000_000).unwrap(),
+        };
+        let mut spec = WindowSpec::new(
+            kind,
+            vec!["device_id".into()],
+            vec![
+                AggCall::new(
+                    AggFn::Min,
+                    Some(Expr::Column {
+                        name: "name".into(),
+                    }),
+                    "m",
+                ),
+                AggCall::new(AggFn::Sum, Some(Expr::Column { name: "v".into() }), "s"),
+            ],
+        );
+        if mode == 2 {
+            spec = spec.event_time("ts", 0);
+        }
+        let plan = physicalize(
+            &bind_window_linear(
+                1.into(),
+                1.into(),
+                "input".into(),
+                schema,
+                None,
+                spec,
+                "out".into(),
+            )
+            .unwrap(),
+            &PlanOptions::default(),
+        );
+        let k = Kernel::new_with_job_budget(
+            KernelOptions {
+                budget: ResourceBudget::performance(),
+                mailbox: MailboxConfig {
+                    max_items: 8,
+                    max_bytes: 128 * 1024,
+                },
+                worker_threads: 2,
+                rows_per_batch: 8,
+            },
+            ResourceBudget::compact(),
+        )
+        .unwrap();
+        let clock = RuntimeClock::virtual_clock(SharedVirtualClock::new(0));
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1);
+        let job = k
+            .submit(
+                JobRequest::new(plan, vec![], SharedCapture::disabled())
+                    .with_live_events(rx)
+                    .with_live_out(out_tx)
+                    .with_clock(clock.clone()),
+            )
+            .unwrap();
+        k.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                let producer = async {
+                    for round in 0..if mode == 1 { 1 } else { 2 } {
+                        for key in 0..KEYS {
+                            tx.send(IngressEvent::Row(Row {
+                                values: vec![
+                                    Scalar::utf8(format!("{key:04}{}", "k".repeat(320))),
+                                    Scalar::Int64(round + 1),
+                                    Scalar::utf8(if round == 0 { "aa" } else { "zz" }),
+                                    Scalar::utf8("ignored".repeat(128)),
+                                    Scalar::Int64(1),
+                                ],
+                            }))
+                            .await
+                            .unwrap();
+                        }
+                        if round == 0 {
+                            while k.metrics.snapshot().state_keys != KEYS as u64 {
+                                tokio::task::yield_now().await;
+                            }
+                            if mode == 1 {
+                                clock.set_virtual(1_000_000);
+                            }
+                        }
+                    }
+                    if mode == 2 {
+                        tx.send(IngressEvent::Control(StreamControl::Watermark {
+                            input: 0,
+                            wm_micros: 1_000_000,
+                        }))
+                        .await
+                        .unwrap();
+                    }
+                    drop(tx);
+                };
+                let consumer = async {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let mut seen = vec![false; KEYS];
+                    let mut total = 0;
+                    while let Some(batch) = out_rx.recv().await {
+                        assert!(
+                            k.process_owner().usage().reservation_bytes < 512 * 1024,
+                            "whole-state scratch must not survive sink backpressure; mode={mode}"
+                        );
+                        for row in batch.rows() {
+                            let Scalar::Utf8(key) = &row.values[0] else {
+                                panic!("key")
+                            };
+                            let key: usize = key[..4].parse().unwrap();
+                            assert!(!seen[key]);
+                            seen[key] = true;
+                            assert_eq!(row.values[3], Scalar::utf8("aa"));
+                            assert_eq!(row.values[4], Scalar::Int64(if mode == 1 { 1 } else { 3 }));
+                            total += 1;
+                        }
+                        if total % 64 == 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    }
+                    assert_eq!(total, KEYS, "mode={mode}");
+                };
+                tokio::join!(producer, consumer);
+                job.wait().await.unwrap();
+            })
+            .await
+            .expect("bounded multikey pipeline must complete");
+        });
+        assert_eq!(k.live_tasks(), 0);
+        assert_eq!(k.process_owner().usage().physical_bytes, 0);
+    }
+}
+
+#[test]
 fn obs_job_mailboxes_are_attempt_scoped_and_cleanup_without_history() {
     let k = kernel();
     let capture = SharedCapture::new();

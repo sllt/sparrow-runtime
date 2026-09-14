@@ -24,6 +24,7 @@ const CHUNK: usize = 400;
 const SCENARIOS: &[&str] = &[
     "mqtt_filter_http",
     "file_count_window",
+    "file_multikey_minmax",
     "mqtt_http_queue_pressure",
     "file_chunked_no_checkpoint",
     "file_chunked_checkpoint",
@@ -38,6 +39,7 @@ struct Options {
     rounds: usize,
     mqtt_events: usize,
     file_events: usize,
+    file_keys: usize,
     rate: usize,
     checkpoint_events: usize,
     pressure_events: usize,
@@ -52,6 +54,7 @@ struct Options {
     sink_tuning: serde_json::Map<String, Value>,
     observe_ms: u64,
     checkpoint_before_sink: bool,
+    periodic_checkpoint_ms: Option<u64>,
     broker_pid: u32,
 }
 impl Options {
@@ -72,11 +75,16 @@ impl Options {
             rounds: 3,
             mqtt_events: 10_000,
             file_events: 80_000,
+            file_keys: 1024,
             rate: 1000,
             checkpoint_events: 8000,
             pressure_events: 1024,
             drain_secs: 15,
-            scenarios: SCENARIOS.iter().map(|s| (*s).into()).collect(),
+            scenarios: SCENARIOS
+                .iter()
+                .filter(|s| **s != "file_multikey_minmax")
+                .map(|s| (*s).into())
+                .collect(),
             window: WINDOW,
             sink_delay_ms: 0,
             metrics_ms: 0,
@@ -86,11 +94,13 @@ impl Options {
             sink_tuning: serde_json::Map::new(),
             observe_ms: 0,
             checkpoint_before_sink: false,
+            periodic_checkpoint_ms: None,
             broker_pid: 0,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             if arg == "--help" {
+                println!("Opt-in multikey: --scenarios file_multikey_minmax --engine sparrow --file-keys 1..1024; file-events must contain complete keys*window cycles");
                 println!("Optional diagnostic sampling: --metrics-ms 100 (0 disables; snapshots add measurement overhead)");
                 println!("Broker transport control: --broker-nodelay true|false (default false, recorded in metadata)");
                 println!("Sparrow ingress control: --inbox-wait-ms 0..1000 (omitted: server default; 0: immediate drop)");
@@ -118,6 +128,7 @@ impl Options {
                 "--rounds" => o.rounds = value.parse()?,
                 "--mqtt-events" => o.mqtt_events = value.parse()?,
                 "--file-events" => o.file_events = value.parse()?,
+                "--file-keys" => o.file_keys = value.parse()?,
                 "--checkpoint-events" => o.checkpoint_events = value.parse()?,
                 "--pressure-events" => o.pressure_events = value.parse()?,
                 "--rate" => o.rate = value.parse()?,
@@ -158,6 +169,7 @@ impl Options {
                 }
                 "--observe-ms" => o.observe_ms = value.parse()?,
                 "--checkpoint-before-sink" => o.checkpoint_before_sink = value.parse()?,
+                "--periodic-checkpoint-ms" => o.periodic_checkpoint_ms = Some(value.parse()?),
                 _ => return Err(format!("unknown option {arg}").into()),
             }
         }
@@ -187,6 +199,13 @@ impl Options {
         if o.inbox_wait_ms.is_some_and(|ms| ms > 1000) {
             return Err("--inbox-wait-ms must be in 0..=1000".into());
         }
+        if o.periodic_checkpoint_ms
+            .is_some_and(|ms| !(100..=86_400_000).contains(&ms))
+            || (o.periodic_checkpoint_ms.is_some()
+                && (o.engine != "sparrow" || o.scenarios.iter().any(|s| !s.starts_with("file"))))
+        {
+            return Err("periodic checkpoint requires Sparrow-only File scenarios and interval 100..=86400000 ms".into());
+        }
         if o.observe_ms != 0 && !(100..=60000).contains(&o.observe_ms) {
             return Err("--observe-ms must be 0 or 100..60000".into());
         }
@@ -207,6 +226,14 @@ impl Options {
             );
         }
         for scenario in &o.scenarios {
+            if scenario == "file_multikey_minmax"
+                && (o.engine != "sparrow"
+                    || !(1..=1024).contains(&o.file_keys)
+                    || o.file_events % (o.file_keys * o.window) != 0
+                    || o.periodic_checkpoint_ms.is_some())
+            {
+                return Err("multikey requires Sparrow-only, keys 1..=1024, events divisible by keys*window, and no periodic checkpoint".into());
+            }
             if scenario.starts_with("file") {
                 let n = if scenario.starts_with("file_chunked") {
                     o.checkpoint_events
@@ -367,6 +394,7 @@ impl Engine {
         file: bool,
         broker: u16,
         capture: &HttpCapture,
+        multikey: bool,
     ) -> Result<()> {
         if self.name == "sparrow" {
             for port in [capture.port(), broker] {
@@ -377,7 +405,10 @@ impl Engine {
                 )
                 .await?;
             }
-            let fields = if file {
+            let fields = if multikey {
+                json!([{"name":"device_id","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false},
+                    {"name":"name","type":"utf8","nullable":false},{"name":"ignored","type":"utf8","nullable":false}])
+            } else if file {
                 json!([
                     {"name":"device_id","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false}
                 ])
@@ -417,8 +448,12 @@ impl Engine {
         inbox_wait_ms: Option<u64>,
         source_tuning: &serde_json::Map<String, Value>,
         sink_tuning: &serde_json::Map<String, Value>,
+        periodic_checkpoint_ms: Option<u64>,
+        multikey: bool,
     ) -> Result<()> {
-        let sql = if file {
+        let sql = if multikey {
+            format!("SELECT device_id, SUM(v) AS s, MIN(name) AS lo, MAX(name) AS hi FROM {id} GROUP BY device_id, COUNT_WINDOW({window})")
+        } else if file {
             format!(
                 "SELECT device_id, SUM(v) AS s FROM {id} GROUP BY device_id, {}({window})",
                 if self.name == "sparrow" {
@@ -447,11 +482,16 @@ impl Engine {
             }
             let mut sink = json!({"kind":"http","url":capture.url(),"outbox_capacity":if small_queue {2} else {32}});
             sink.as_object_mut().unwrap().extend(sink_tuning.clone());
-            self.call(Method::PUT,&format!("/v1/pipelines/{id}"),Some(json!({
+            let mut spec = json!({
                 "stream":id,"sql":sql,"source":source,"fail_on_decode":true,
                 "sink":sink,
-                "recovery":if aligned {"aligned"} else {"restart_fresh"},"checkpoint_dir":data.with_extension("checkpoints")
-            }))).await?;
+                "recovery":if aligned {"aligned"} else {"restart_fresh"},"checkpoint_dir":data.with_extension("checkpoints"),
+            });
+            if let Some(ms) = periodic_checkpoint_ms {
+                spec["checkpoint"] = json!({"interval_ms":ms});
+            }
+            self.call(Method::PUT, &format!("/v1/pipelines/{id}"), Some(spec))
+                .await?;
             self.call(
                 Method::POST,
                 &format!("/v1/pipelines/{id}/start"),
@@ -544,6 +584,7 @@ struct Check {
     latencies: Vec<u64>,
     first: Option<Instant>,
     last: Option<Instant>,
+    multikey: Option<usize>,
 }
 fn integer(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| {
@@ -577,6 +618,7 @@ impl Check {
             latencies: Vec::new(),
             first: None,
             last: None,
+            multikey: None,
         }
     }
     fn expected(&self) -> usize {
@@ -603,7 +645,28 @@ impl Check {
         };
         for row in rows {
             self.rows += 1;
-            let index = if self.kind == Kind::File {
+            let index = if let Some(keys) = self.multikey {
+                row["device_id"]
+                    .as_str()
+                    .and_then(|s| s.strip_prefix('m'))
+                    .and_then(|s| s.get(..4))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|k| *k < keys && row["device_id"] == multikey_name(*k))
+                    .and_then(|key| {
+                        let window = self.window as u64;
+                        let keys = keys as u64;
+                        let base = window * key as u64 + keys * window * (window - 1) / 2;
+                        let stride = keys * window * window;
+                        integer(&row["s"])
+                            .filter(|s| *s >= base && (*s - base) % stride == 0)
+                            .map(|s| ((s - base) / stride) as usize * keys as usize + key)
+                    })
+                    .filter(|i| {
+                        *i < self.seen.len()
+                            && row["lo"] == "a".repeat(48)
+                            && row["hi"] == "z".repeat(48)
+                    })
+            } else if self.kind == Kind::File {
                 let stride = (self.window * self.window) as u64;
                 let base = (self.window * (self.window - 1) / 2) as u64;
                 integer(&row["s"])
@@ -658,7 +721,18 @@ impl Check {
             if !seen {
                 continue;
             }
-            let normalized = if self.kind == Kind::File {
+            let normalized = if let Some(keys) = self.multikey {
+                let w = self.window as u64;
+                let cycle = (i / keys) as u64;
+                let key = i % keys;
+                let sum = w * key as u64 + keys as u64 * (w * w * cycle + w * (w - 1) / 2);
+                format!(
+                    "{}:{sum}:{}:{}\n",
+                    multikey_name(key),
+                    "a".repeat(48),
+                    "z".repeat(48)
+                )
+            } else if self.kind == Kind::File {
                 let w = self.window as u64;
                 format!("d{}:{}\n", i % 8, w * w * i as u64 + w * (w - 1) / 2)
             } else {
@@ -1022,6 +1096,31 @@ fn write_rows(out: &mut impl Write, start: usize, end: usize, window: usize) -> 
     out.flush()?;
     Ok(())
 }
+
+fn multikey_name(key: usize) -> String {
+    format!("m{key:04}{}", "k".repeat(64))
+}
+fn write_multikey_rows(out: &mut impl Write, n: usize, window: usize, keys: usize) -> Result<()> {
+    let low = "a".repeat(48);
+    let high = "z".repeat(48);
+    let middle = "m".repeat(48);
+    let ignored = "x".repeat(256);
+    for i in 0..n {
+        let within = (i / keys) % window;
+        let name = match within {
+            0 => &low,
+            1 => &high,
+            _ => &middle,
+        };
+        writeln!(
+            out,
+            "{{\"device_id\":\"{}\",\"v\":{i},\"name\":\"{name}\",\"ignored\":\"{ignored}\"}}",
+            multikey_name(i % keys)
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
 async fn collect(check: &mut Check, capture: &HttpCapture, target: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1045,6 +1144,7 @@ async fn trial(
     let pressure = scenario == "mqtt_http_queue_pressure";
     let chunked = scenario.starts_with("file_chunked");
     let checkpoint = scenario == "file_chunked_checkpoint";
+    let multikey = scenario == "file_multikey_minmax";
     let id = format!("b_{}_{}_{}", engine.name, scenario, round);
     let capture = HttpCapture::start().await?;
     // Identical bodyless ACKs permit pooling in both clients. eKuiper 2.4.1
@@ -1057,12 +1157,14 @@ async fn trial(
     let data = o.out.join("data").join(format!("{id}.jsonl"));
     if !mqtt {
         let mut out = BufWriter::new(File::create(&data)?);
-        if !chunked {
+        if multikey {
+            write_multikey_rows(&mut out, n, o.window, o.file_keys)?;
+        } else if !chunked {
             write_rows(&mut out, 0, n, o.window)?;
         }
     }
     engine
-        .configure_stream(&id, !mqtt, broker, &capture)
+        .configure_stream(&id, !mqtt, broker, &capture, multikey)
         .await?;
     let sampling = Sampling::start(engine.process.id(), o.out.join(format!("{id}-rss.csv")));
     let activation_start = Instant::now();
@@ -1070,7 +1172,7 @@ async fn trial(
         .activate(
             &id,
             !mqtt,
-            chunked,
+            chunked || o.periodic_checkpoint_ms.is_some(),
             pressure,
             broker,
             &capture,
@@ -1079,6 +1181,8 @@ async fn trial(
             o.inbox_wait_ms,
             &o.source_tuning,
             &o.sink_tuning,
+            o.periodic_checkpoint_ms,
+            multikey,
         )
         .await?;
     let metric_samples = MetricsSampling::start(engine, &id, &o.out, o.metrics_ms)?;
@@ -1091,6 +1195,9 @@ async fn trial(
         o.observe_ms,
     )?;
     let mut check = Check::new(if mqtt { Kind::Mqtt } else { Kind::File }, n, o.window);
+    if multikey {
+        check.multikey = Some(o.file_keys);
+    }
     let mut start = activation_start;
     let mut publication_end = None;
     let mut checkpoint_ns = Vec::new();
@@ -1192,7 +1299,23 @@ async fn trial(
     if let Some(samples) = metric_samples {
         samples.finish().await?;
     }
-    let valid = check.valid() && capture.overflows() == 0;
+    let periodic_status = if o.periodic_checkpoint_ms.is_some() {
+        let status = engine
+            .call(Method::GET, &format!("/v1/pipelines/{id}/status"), None)
+            .await?;
+        fs::write(
+            o.out.join(format!("{id}-checkpoint-status.json")),
+            serde_json::to_vec_pretty(&status["checkpoint"])?,
+        )?;
+        Some(status["checkpoint"].clone())
+    } else {
+        None
+    };
+    let valid = check.valid()
+        && capture.overflows() == 0
+        && periodic_status
+            .as_ref()
+            .is_none_or(|s| s["succeeded_total"].as_u64().unwrap_or(0) > 0);
     let end = if valid {
         check.last.into_iter().chain(publication_end).max().unwrap()
     } else {
@@ -1211,6 +1334,7 @@ async fn trial(
         "sparrow_inbox_wait_ms_override":o.inbox_wait_ms,
         "source_tuning":o.source_tuning,"sink_tuning":o.sink_tuning,"observe_ms":o.observe_ms,
         "checkpoint_before_sink":o.checkpoint_before_sink,
+        "periodic_checkpoint_ms":o.periodic_checkpoint_ms,"periodic_checkpoint_status":periodic_status,
         "sink_delay_ms":if pressure {8} else {o.sink_delay_ms},
         "expected_output_rows":check.expected(),"output_rows":check.rows,
         "unique_rows":check.unique,"missing_rows":check.expected().saturating_sub(check.unique),
@@ -1277,12 +1401,13 @@ async fn run(mut o: Options) -> Result<()> {
         engines.push(Engine::start("ekuiper", &o, broker_port).await?);
     }
     let metadata = json!({"format":"sparrow-bench-v2","started_unix_us":unix_us(),"rounds":o.rounds,
-        "mqtt_events":o.mqtt_events,"file_events":o.file_events,"offered_rate":o.rate,
+        "mqtt_events":o.mqtt_events,"file_events":o.file_events,"file_keys":o.file_keys,"offered_rate":o.rate,
         "broker":"Mosquitto; shared for both engines","broker_pid":broker.id(),"broker_port":broker_port,
         "broker_tcp_nodelay":o.broker_nodelay,
         "sparrow_inbox_wait_ms_override":o.inbox_wait_ms,
         "source_tuning":o.source_tuning,"sink_tuning":o.sink_tuning,"observe_ms":o.observe_ms,
         "checkpoint_before_sink":o.checkpoint_before_sink,
+        "periodic_checkpoint_ms":o.periodic_checkpoint_ms,
         "socket_metrics":"ss sampled snapshots include MQTT and HTTP endpoints; not true peaks or packet traces; correlate endpoints with broker client IDs",
         "broker_metrics":"optional isolated-broker $SYS, includes observer traffic; missing topics are unavailable, never assumed zero",
         "driver_pid":std::process::id(),"memory_scope":"engine PID only; excludes common broker/capture/driver",
@@ -1307,17 +1432,21 @@ async fn run(mut o: Options) -> Result<()> {
                 } else {
                     engines.len() - 1 - idx
                 }];
-                if scenario.starts_with("file_chunked") && engine.name != "sparrow" {
+                if (scenario.starts_with("file_chunked") || scenario == "file_multikey_minmax")
+                    && engine.name != "sparrow"
+                {
                     continue;
                 }
                 let base = match scenario {
                     "mqtt_filter_http" => o.mqtt_events,
-                    "file_count_window" => o.file_events,
+                    "file_count_window" | "file_multikey_minmax" => o.file_events,
                     "mqtt_http_queue_pressure" => o.pressure_events,
                     _ => o.checkpoint_events,
                 };
                 let n = if round == 0 {
-                    let unit = if scenario.starts_with("file") {
+                    let unit = if scenario == "file_multikey_minmax" {
+                        o.window * o.file_keys
+                    } else if scenario.starts_with("file") {
                         o.window
                     } else {
                         8
@@ -1409,6 +1538,59 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn r10_multikey_oracle_checks_interleaved_min_max_sum_and_duplicates() {
+        let keys = 4;
+        let window = 8;
+        let n = keys * window * 3;
+        let mut bytes = Vec::new();
+        write_multikey_rows(&mut bytes, n, window, keys).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let rows: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut check = Check::new(Kind::File, n, window);
+        check.multikey = Some(keys);
+        let mut outputs = Vec::new();
+        for key in 0..keys {
+            let selected: Vec<_> = rows
+                .iter()
+                .filter(|r| r["device_id"] == multikey_name(key))
+                .collect();
+            for chunk in selected.chunks(window) {
+                let sum: u64 = chunk.iter().map(|r| r["v"].as_u64().unwrap()).sum();
+                let lo = chunk
+                    .iter()
+                    .map(|r| r["name"].as_str().unwrap())
+                    .min()
+                    .unwrap();
+                let hi = chunk
+                    .iter()
+                    .map(|r| r["name"].as_str().unwrap())
+                    .max()
+                    .unwrap();
+                outputs.push(json!({"device_id":multikey_name(key),"s":sum,"lo":lo,"hi":hi}));
+            }
+        }
+        check.accept(CapturedRequest {
+            body: serde_json::to_vec(&outputs).unwrap(),
+            received_at: Instant::now(),
+        });
+        assert!(check.valid());
+        assert_eq!(check.unique, keys * 3);
+        check.accept(CapturedRequest {
+            body: serde_json::to_vec(&outputs[0]).unwrap(),
+            received_at: Instant::now(),
+        });
+        assert_eq!(check.duplicate, 1);
+        outputs[0]["lo"] = json!("wrong");
+        check.accept(CapturedRequest {
+            body: serde_json::to_vec(&outputs[0]).unwrap(),
+            received_at: Instant::now(),
+        });
+        assert_eq!(check.invalid, 1);
+    }
     #[test]
     fn sink_light_windows_validate_exact_sums_and_keys() {
         for window in [8, 80, 800] {

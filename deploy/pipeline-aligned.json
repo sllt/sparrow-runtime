@@ -1,0 +1,9 @@
+{
+  "stream": "sensors",
+  "sql": "SELECT device_id, SUM(v) AS s FROM sensors GROUP BY device_id, COUNT_WINDOW(3)",
+  "source": {"kind": "file", "path": "/var/lib/sparrow/data/sensors.jsonl", "file_contract": "append_only"},
+  "sink": {"kind": "log"},
+  "recovery": "aligned",
+  "checkpoint_dir": "/var/lib/sparrow/checkpoints/sensors",
+  "checkpoint": {"interval_ms": 10000, "timeout_ms": 5000, "retain_generations": 3, "max_store_bytes": 33554432, "resume_latest": true}
+}

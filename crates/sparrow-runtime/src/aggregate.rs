@@ -76,9 +76,12 @@ impl Accumulator {
         const BASE: usize = 48;
         match self {
             Self::Min { v } | Self::Max { v } => {
-                BASE + v.as_ref().map(Scalar::tracked_bytes).unwrap_or(0)
+                BASE + v.as_ref().map(Scalar::resident_bytes).unwrap_or(0)
             }
-            Self::Count { .. } | Self::SumI64 { .. } | Self::SumU64 { .. } | Self::SumF64 { .. }
+            Self::Count { .. }
+            | Self::SumI64 { .. }
+            | Self::SumU64 { .. }
+            | Self::SumF64 { .. }
             | Self::Avg { .. } => BASE,
         }
     }
@@ -197,9 +200,15 @@ impl Accumulator {
 
     pub fn finish(&self) -> Scalar {
         match self {
-            Self::Count { rows, non_null, star } => {
-                Scalar::Int64(if *star { *rows as i64 } else { *non_null as i64 })
-            }
+            Self::Count {
+                rows,
+                non_null,
+                star,
+            } => Scalar::Int64(if *star {
+                *rows as i64
+            } else {
+                *non_null as i64
+            }),
             Self::SumI64 { sum, n } => {
                 if *n == 0 {
                     Scalar::Null
@@ -274,6 +283,54 @@ impl Accumulator {
                 encode_opt_scalar(v, out)?;
             }
         }
+        Ok(())
+    }
+
+    pub fn encoded_len(&self) -> Result<usize> {
+        Ok(match self {
+            Self::Count { .. } | Self::Avg { .. } => 18,
+            Self::SumI64 { .. } | Self::SumU64 { .. } | Self::SumF64 { .. } => 17,
+            Self::Min { v } | Self::Max { v } => {
+                2 + v
+                    .as_ref()
+                    .map(Scalar::encoded_value_len)
+                    .transpose()?
+                    .unwrap_or(0)
+            }
+        })
+    }
+
+    pub(crate) fn skip_encoded(src: &mut &[u8]) -> Result<()> {
+        let invalid = || {
+            SparrowError::new(
+                ErrorCode::CodecViolation,
+                "invalid or truncated accumulator encoding",
+            )
+        };
+        let Some((&tag, tail)) = src.split_first() else {
+            return Err(invalid());
+        };
+        *src = tail;
+        let size = match tag {
+            1 | 5 => 17,
+            2 | 3 | 4 => 16,
+            6 | 7 => {
+                let Some((&option, tail)) = src.split_first() else {
+                    return Err(invalid());
+                };
+                *src = tail;
+                return match option {
+                    0 => Ok(()),
+                    1 => Scalar::skip_encoded_value(src),
+                    _ => Err(invalid()),
+                };
+            }
+            _ => return Err(invalid()),
+        };
+        if src.len() < size {
+            return Err(invalid());
+        }
+        *src = &src[size..];
         Ok(())
     }
 
@@ -404,7 +461,11 @@ fn cmp_ord(a: &Scalar, b: &Scalar) -> Result<Option<std::cmp::Ordering>> {
         (Scalar::Bool(x), Scalar::Bool(y)) => Ok(Some(x.cmp(y))),
         _ => Err(SparrowError::new(
             ErrorCode::TypeMismatch,
-            format!("MIN/MAX cannot compare {} and {}", a.data_type(), b.data_type()),
+            format!(
+                "MIN/MAX cannot compare {} and {}",
+                a.data_type(),
+                b.data_type()
+            ),
         )),
     }
 }
@@ -465,14 +526,16 @@ mod tests {
     fn r05_min_max_tracked_bytes_include_payload() {
         let mut mn = Accumulator::new(AggFn::Min, DataType::Utf8, false).unwrap();
         assert_eq!(mn.tracked_bytes(), 48);
-        mn.update(&Scalar::utf8("xxxxxxxxxxxxxxxxxxxxxxxx")).unwrap();
+        mn.update(&Scalar::utf8("xxxxxxxxxxxxxxxxxxxxxxxx"))
+            .unwrap();
         assert!(
             mn.tracked_bytes() > 48,
             "MIN must bill the stored utf8 payload, got {}",
             mn.tracked_bytes()
         );
         let mut mx = Accumulator::new(AggFn::Max, DataType::Utf8, false).unwrap();
-        mx.update(&Scalar::utf8("yyyyyyyyyyyyyyyyyyyyyyyy")).unwrap();
+        mx.update(&Scalar::utf8("yyyyyyyyyyyyyyyyyyyyyyyy"))
+            .unwrap();
         assert!(mx.tracked_bytes() > 48);
     }
 
@@ -484,13 +547,9 @@ mod tests {
             retention_bytes: 200,
             ..ResourceBudget::compact()
         });
-        let mut st = MemoryState::<Accumulator>::new(
-            owner,
-            OperatorId::new(1),
-            StateSlotId::new(1),
-            16,
-        )
-        .unwrap();
+        let mut st =
+            MemoryState::<Accumulator>::new(owner, OperatorId::new(1), StateSlotId::new(1), 16)
+                .unwrap();
         let mut acc = Accumulator::new(AggFn::Min, DataType::Utf8, false).unwrap();
         acc.update(&Scalar::utf8(&"z".repeat(400))).unwrap();
         let err = st

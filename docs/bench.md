@@ -1,5 +1,11 @@
 # Full-service benchmark v2
 
+Current production-batch replay scripts: `production-build.sh`,
+`production-smoke.sh`, `production-performance.sh`. They keep original R9 and
+new binaries separate; the periodic on/off trial uses the explicit
+`--periodic-checkpoint-ms` driver flag. Historical measurements below do not
+automatically apply to the current candidate; see `docs/PRODUCTION.md`.
+
 Host-specific measurements, **not SLOs, exactly-once, or MQTT replay guarantees**.
 The old session/microbenchmark numbers are not comparable to these results.
 

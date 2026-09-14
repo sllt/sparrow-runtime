@@ -16,7 +16,7 @@ use sparrow_plan::{PhysicalPlan, PhysicalStage};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::barrier::{wait_outbox, AlignedAck, AlignedJob};
+use crate::barrier::{AlignedAck, AlignedJob};
 use crate::capture::SharedCapture;
 use crate::clock::RuntimeClock;
 use crate::dedup::DedupOperator;
@@ -380,7 +380,7 @@ impl Kernel {
         self.rt.as_ref().expect("live kernel runtime").block_on(f)
     }
 
-    pub fn submit(&self, req: JobRequest) -> Result<JobHandle> {
+    pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
         if req.plan.stages.len() < 2 {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
@@ -517,7 +517,11 @@ impl Kernel {
             timers: Arc::new(JobTimers::default()),
             min_remaining_work: Arc::new(AtomicU64::new(self.job_budget.work_units)),
             metrics: Arc::clone(&self.metrics),
-            aligned: req.aligned.clone(),
+            aligned: req
+                .aligned
+                .take()
+                .map(|job| crate::barrier::RuntimeAligned::adopt(job, &owner))
+                .transpose()?,
             observation: req.observation.clone(),
         };
         self.metrics.jobs_started.fetch_add(1, Ordering::Relaxed);
@@ -629,7 +633,7 @@ struct JobCtx {
     max_state_keys: usize,
     max_timers: usize,
     metrics: Arc<RuntimeMetrics>,
-    aligned: Option<AlignedJob>,
+    aligned: Option<Arc<crate::barrier::RuntimeAligned>>,
 }
 
 pub struct JobHandle {
@@ -1053,7 +1057,10 @@ async fn stage_loop(
                         }
                         let flush = tokio::select! {
                             _ = ctx.cancel.cancelled() => break,
-                            flush = wait_outbox(&aj.outbox, std::time::Duration::from_secs(5)) => flush,
+                            flush = aj.acks.wait_for_flush(checkpoint_id, &aj.outbox) => flush,
+                        };
+                        let Some(flush) = flush else {
+                            continue;
                         };
                         // Loss is sticky for this attempt: retrying a barrier
                         // cannot retroactively deliver a dropped batch.
@@ -1092,8 +1099,12 @@ async fn stage_loop(
                 ctx.max_state_keys,
                 ctx.max_timers,
             )?;
-            if let Some(freeze) = ctx.aligned.as_ref().and_then(|a| a.restore.as_ref()) {
-                op.restore_freeze(freeze)?;
+            let restore = ctx
+                .aligned
+                .as_ref()
+                .and_then(|a| a.restore.lock().expect("restore slot").take());
+            if let Some(restored) = restore {
+                op.restore_freeze(&restored.freeze)?;
             }
             window_stage(&ctx, &mut op, rx, &tx, &capture).await
         }
@@ -1117,13 +1128,25 @@ async fn stage_loop(
                 }
                 if let Some(batch) = batch {
                     consume_work(&ctx, batch.num_rows() as u64).await?;
+                    let scratch_bytes = batch
+                        .rows()
+                        .iter()
+                        .map(Row::resident_bytes)
+                        .sum::<usize>()
+                        .saturating_mul(8)
+                        .saturating_add(1024);
+                    let scratch = ctx
+                        .owner
+                        .acquire(sparrow_model::CreditKind::Reservation, scratch_bytes)?;
                     let started = std::time::Instant::now();
                     let result = op.on_batch(&batch, ctx.clock.now_micros());
                     if let Some(obs) = &ctx.observation {
                         obs.record(Latency::Dedup, started.elapsed());
                     }
                     let rows = result?;
-                    if let Some(out) = op.build_batch(rows)? {
+                    let out = op.build_metered_batch(rows)?;
+                    drop(scratch);
+                    if let Some(out) = out {
                         if !tx.send(out.with_origin(batch.origin())).await? {
                             break;
                         }
@@ -1191,6 +1214,7 @@ async fn emit_window(
     tx: &MailboxTx,
     capture: &SharedCapture,
     emission: crate::window::WindowEmission,
+    scratch: Option<sparrow_model::MemoryLease>,
 ) -> Result<bool> {
     if emission.future_dropped > 0 {
         ctx.metrics.record_future_dropped(emission.future_dropped);
@@ -1198,17 +1222,22 @@ async fn emit_window(
     if !emission.lates.is_empty() {
         capture.push_late(&emission.lates);
     }
-    if !send_rows_chunked(ctx, op, tx, emission.finals).await? {
-        return Ok(false);
+    let batches = build_rows_chunked(ctx, op, emission.finals)?;
+    drop(emission.lates);
+    drop(scratch); // all raw outputs now have their own resident-sized leases
+    for out in batches {
+        if !tx.send(out).await? {
+            return Ok(false);
+        }
     }
     if let Some(wm) = emission.pending_close {
         loop {
-            let chunk =
-                op.take_closed_chunk(wm, ctx.mailbox.max_items.max(1), ctx.mailbox.max_bytes)?;
-            if chunk.is_empty() {
+            let Some(out) =
+                op.take_closed_batch(wm, ctx.mailbox.max_items, ctx.mailbox.max_bytes)?
+            else {
                 break;
-            }
-            if !send_rows_chunked(ctx, op, tx, chunk).await? {
+            };
+            if !tx.send(out).await? {
                 return Ok(false);
             }
         }
@@ -1223,10 +1252,8 @@ async fn emit_window(
             return Ok(false);
         }
     }
-    ctx.metrics.record_state(
-        ctx.owner.usage().live_handles as u64,
-        ctx.owner.usage().retention_bytes as u64,
-    );
+    ctx.metrics
+        .record_state(op.key_count() as u64, op.retention_bytes() as u64);
     if let (Some(wm_in), Some(wm_out)) = (op.wm_in(), op.wm_out()) {
         ctx.metrics
             .record_watermark_lag(wm_in.saturating_sub(wm_out));
@@ -1234,34 +1261,47 @@ async fn emit_window(
     Ok(true)
 }
 
-async fn send_rows_chunked(
-    ctx: &JobCtx,
-    op: &WindowOperator,
-    tx: &MailboxTx,
-    rows: Vec<Row>,
-) -> Result<bool> {
+fn build_rows_chunked(ctx: &JobCtx, op: &WindowOperator, rows: Vec<Row>) -> Result<Vec<RowBatch>> {
     let max_rows = ctx.mailbox.max_items.max(1);
     let max_bytes = ctx.mailbox.max_bytes.max(1);
     let mut chunk = Vec::new();
     let mut bytes = 0usize;
+    let mut batches = Vec::new();
     for row in rows {
-        let sz = row.tracked_bytes().max(1);
+        let sz = row.resident_bytes().saturating_add(64);
         if !chunk.is_empty() && (chunk.len() >= max_rows || bytes.saturating_add(sz) > max_bytes) {
-            if let Some(out) = op.build_batch(std::mem::take(&mut chunk))? {
-                if !tx.send(out).await? {
-                    return Ok(false);
-                }
+            if let Some(out) = op.build_metered_batch(std::mem::take(&mut chunk))? {
+                batches.push(out);
             }
             bytes = 0;
         }
         bytes = bytes.saturating_add(sz);
         chunk.push(row);
     }
-    if let Some(out) = op.build_batch(chunk)? {
+    if let Some(out) = op.build_metered_batch(chunk)? {
+        batches.push(out);
+    }
+    Ok(batches)
+}
+
+async fn emit_due(
+    ctx: &JobCtx,
+    op: &mut WindowOperator,
+    tx: &MailboxTx,
+    now: i64,
+    n: &mut usize,
+) -> Result<bool> {
+    if !op.begin_due(now) {
+        return Ok(true);
+    }
+    while let Some(out) = op.take_closed_batch(now, ctx.mailbox.max_items, ctx.mailbox.max_bytes)? {
+        *n += out.num_rows();
         if !tx.send(out).await? {
             return Ok(false);
         }
     }
+    ctx.metrics
+        .record_state(op.key_count() as u64, op.retention_bytes() as u64);
     Ok(true)
 }
 
@@ -1294,20 +1334,7 @@ async fn window_stage(
                 _ = ctx.cancel.cancelled() => break,
                 _ = ctx.clock.sleep_until(deadline) => {}
             }
-            let rows = op.fire_due(ctx.clock.now_micros())?;
-            n += rows.len();
-            if !emit_window(
-                ctx,
-                op,
-                tx,
-                capture,
-                crate::window::WindowEmission {
-                    finals: rows,
-                    ..crate::window::WindowEmission::default()
-                },
-            )
-            .await?
-            {
+            if !emit_due(ctx, op, tx, ctx.clock.now_micros(), &mut n).await? {
                 break;
             }
             continue;
@@ -1320,6 +1347,9 @@ async fn window_stage(
                     Some(mut env) => {
                         let (batch, ctrl) = env.take();
                         if let Some(ctrl) = ctrl {
+                            // Freeze has its own pre-admitted encoding lease.
+                            // A failed checkpoint must abort that request, not
+                            // fail the live job while reserving unused output.
                             let emission = match ctrl {
                                 StreamControl::Watermark { input, wm_micros } => {
                                     op.observe_watermark(sparrow_model::InputId(input), wm_micros)?
@@ -1352,18 +1382,21 @@ async fn window_stage(
                                 }
                             };
                             n += emission.finals.len();
-                            if !emit_window(ctx, op, tx, capture, emission).await? {
+                            if !emit_window(ctx, op, tx, capture, emission,None).await? {
                                 input_closed = true;
                             }
                         }
                         if let Some(batch) = batch {
                             consume_work(ctx, batch.num_rows() as u64).await?;
+                            let now=ctx.clock.now_micros();
+                            if !emit_due(ctx,op,tx,now,&mut n).await? {break;}
+                            let scratch = op.working_credit(Some(&batch))?;
                             let started=std::time::Instant::now();
-                            let result=op.on_batch(&batch, ctx.clock.now_micros());
+                            let result=op.on_batch_without_timers(&batch,now);
                             if let Some(obs)=&ctx.observation {obs.record(Latency::Window,started.elapsed());}
                             let emission=result?;
                             n += emission.finals.len();
-                            if !emit_window(ctx, op, tx, capture, emission).await? {
+                            if !emit_window(ctx, op, tx, capture, emission,Some(scratch)).await? {
                                 input_closed = true;
                             }
                         }
@@ -1372,20 +1405,7 @@ async fn window_stage(
                 }
             }
             _ = ctx.clock.sleep_until(deadline) => {
-                let rows = op.fire_due(ctx.clock.now_micros())?;
-                n += rows.len();
-                if !emit_window(
-                    ctx,
-                    op,
-                    tx,
-                    capture,
-                    crate::window::WindowEmission {
-                        finals: rows,
-                        ..crate::window::WindowEmission::default()
-                    },
-                )
-                .await?
-                {
+                if !emit_due(ctx,op,tx,ctx.clock.now_micros(),&mut n).await? {
                     break;
                 }
             }

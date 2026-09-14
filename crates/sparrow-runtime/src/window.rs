@@ -73,6 +73,11 @@ pub struct WindowOperator {
     closed_index: BTreeMap<(i64, Vec<u8>), StateKey>,
     /// Agg input exprs bound to column indices once (P2-30).
     bound_aggs: Vec<Option<BoundExpr>>,
+    allocation: Vec<sparrow_expr::allocation::AllocationBound>,
+    variable_accs: bool,
+    closed_index_bytes: usize,
+    accumulator_scratch: Vec<Accumulator>,
+    accumulator_scratch_lease: Option<sparrow_model::MemoryLease>,
 }
 
 impl WindowOperator {
@@ -104,6 +109,17 @@ impl WindowOperator {
                 None => Ok(None),
             })
             .collect::<Result<Vec<_>>>()?;
+        let allocation = bound_aggs
+            .iter()
+            .flatten()
+            .map(sparrow_expr::allocation::AllocationBound::for_expr)
+            .collect();
+        let variable_accs = spec.aggs.iter().any(|a| {
+            matches!(
+                a.func,
+                sparrow_model::AggFn::Min | sparrow_model::AggFn::Max
+            )
+        });
         let store = match spec.kind {
             WindowKind::Count { .. } => WindowStore::Count(MemoryState::new(
                 Arc::clone(&owner),
@@ -128,6 +144,21 @@ impl WindowOperator {
         } else {
             None
         };
+        let accumulator_scratch_lease = if variable_accs {
+            Some(
+                owner.acquire(
+                    CreditKind::Reservation,
+                    spec.aggs
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Accumulator>())
+                        .saturating_add(64),
+                )?,
+            )
+        } else {
+            None
+        };
+        let accumulator_scratch =
+            Vec::with_capacity(if variable_accs { spec.aggs.len() } else { 0 });
         Ok(Self {
             operator,
             spec,
@@ -143,11 +174,94 @@ impl WindowOperator {
             default_input: InputId::SINGLE,
             closed_index: BTreeMap::new(),
             bound_aggs,
+            allocation,
+            variable_accs,
+            closed_index_bytes: 0,
+            accumulator_scratch,
+            accumulator_scratch_lease,
         })
     }
 
     pub fn output_schema(&self) -> &Schema {
         &self.output
+    }
+
+    /// Kernel scratch lifetime covers raw state keys, eager aggregate work,
+    /// removed state and emitted rows until a billed RowBatch owns the output.
+    /// Public raw Vec-returning helpers are not an owner-preserving API.
+    pub(crate) fn working_credit(
+        &self,
+        batch: Option<&RowBatch>,
+    ) -> Result<sparrow_model::MemoryLease> {
+        let input = batch
+            .map(|b| b.rows().iter().map(Row::resident_bytes).sum::<usize>())
+            .unwrap_or(0);
+        let rows = batch.map(RowBatch::num_rows).unwrap_or(0);
+        let base = input
+            .saturating_mul(4)
+            .saturating_add(
+                rows.saturating_mul(
+                    self.output
+                        .fields
+                        .len()
+                        .saturating_mul(96)
+                        .saturating_add(128),
+                ),
+            )
+            .saturating_add(
+                self.input
+                    .fields
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+            .saturating_add((self.spec.max_overlap as usize).saturating_mul(32))
+            .saturating_add(256);
+        let mut lease = self.owner.acquire(CreditKind::Reservation, base)?;
+        if let Some(batch) = batch {
+            let mut columns = vec![0usize; self.input.fields.len()];
+            for row in batch.rows() {
+                for (size, value) in columns.iter_mut().zip(&row.values) {
+                    *size = (*size).max(value.resident_bytes());
+                }
+            }
+            let mut allocation = 0usize;
+            let mut values = 0usize;
+            for bound in &self.allocation {
+                let e = bound.estimate(&columns);
+                allocation = allocation.saturating_add(e.allocated);
+                values = values.saturating_add(e.value);
+            }
+            let mut touched = 0usize;
+            // Only Count/PT may emit retained values while ingesting. ET closes
+            // separately in owned, bounded chunks. Numeric state has fixed size.
+            if self.variable_accs && !self.spec.kind.uses_event_time() {
+                for row in batch.rows() {
+                    let key =
+                        StateKey::new(self.operator, StateSlotId::new(SLOT), self.group_key(row));
+                    let bytes = match &self.store {
+                        WindowStore::Count(s) => s
+                            .get(&key)
+                            .filter(|e| match self.spec.kind {
+                                WindowKind::Count { size } => {
+                                    e.count.saturating_add(rows as u64) >= size
+                                }
+                                _ => false,
+                            })
+                            .map_or(0, |e| e.accs.iter().map(Accumulator::tracked_bytes).sum()),
+                        WindowStore::Tumble(s) => s
+                            .get(&key)
+                            .map_or(0, |e| e.accs.iter().map(Accumulator::tracked_bytes).sum()),
+                    };
+                    touched = touched.saturating_add(bytes);
+                }
+            }
+            lease.grow_to(
+                base.saturating_add(allocation.saturating_mul(2))
+                    .saturating_add(values.saturating_mul(rows).saturating_mul(4))
+                    .saturating_add(touched.saturating_mul(2)),
+            )?;
+        }
+        Ok(lease)
     }
 
     pub fn input_schema(&self) -> &Schema {
@@ -170,7 +284,7 @@ impl WindowOperator {
             WindowStore::Tumble(s) => s.retention_bytes(),
             WindowStore::Count(s) => s.retention_bytes(),
         };
-        state + self.closed_index.values().map(StateKey::index_bytes).sum::<usize>()
+        state.saturating_add(self.closed_index_bytes)
     }
 
     pub fn live_timers(&self) -> usize {
@@ -228,6 +342,22 @@ impl WindowOperator {
         let mut out = WindowEmission::default();
         let due = self.fire_due(now)?;
         out.finals.extend(due);
+        let next = self.on_batch_without_timers(batch, now)?;
+        out.finals.extend(next.finals);
+        out.lates = next.lates;
+        out.pending_close = next.pending_close;
+        out.future_dropped = next.future_dropped;
+        Ok(out)
+    }
+
+    /// Kernel drains due PT state separately; never materialize the keyspace
+    /// into an unowned Vec before processing this input batch.
+    pub(crate) fn on_batch_without_timers(
+        &mut self,
+        batch: &RowBatch,
+        now: i64,
+    ) -> Result<WindowEmission> {
+        let mut out = WindowEmission::default();
         for row in batch.rows() {
             let one = self.on_row(row, now)?;
             out.finals.extend(one.finals);
@@ -240,6 +370,17 @@ impl WindowOperator {
             }
         }
         Ok(out)
+    }
+
+    pub(crate) fn begin_due(&mut self, now: i64) -> bool {
+        if self.spec.kind.uses_event_time() {
+            return false;
+        }
+        let mut due = false;
+        while self.timers.pop_due(now).is_some() {
+            due = true;
+        }
+        due
     }
 
     pub fn fire_due(&mut self, now: i64) -> Result<Vec<Row>> {
@@ -255,13 +396,24 @@ impl WindowOperator {
     }
 
     fn on_row(&mut self, row: &Row, now: i64) -> Result<WindowEmission> {
+        if self.variable_accs && self.accumulator_scratch_lease.is_none() {
+            self.accumulator_scratch_lease = Some(
+                self.owner.acquire(
+                    CreditKind::Reservation,
+                    self.spec
+                        .aggs
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Accumulator>())
+                        .saturating_add(64),
+                )?,
+            );
+            self.accumulator_scratch = Vec::with_capacity(self.spec.aggs.len());
+        }
         match self.spec.kind {
-            WindowKind::TumblingProcessingTime { size_micros } => {
-                Ok(WindowEmission {
-                    finals: self.on_tumble_row(row, now, size_micros)?,
-                    ..WindowEmission::default()
-                })
-            }
+            WindowKind::TumblingProcessingTime { size_micros } => Ok(WindowEmission {
+                finals: self.on_tumble_row(row, now, size_micros)?,
+                ..WindowEmission::default()
+            }),
             WindowKind::Count { size } => Ok(WindowEmission {
                 finals: self.on_count_row(row, size)?,
                 ..WindowEmission::default()
@@ -296,8 +448,7 @@ impl WindowOperator {
                 }
             }
         }
-        self.hub
-            .observe_event(self.default_input, ts, now)?;
+        self.hub.observe_event(self.default_input, ts, now)?;
         let assigned = if let Some(slide) = slide {
             WindowKind::assign_hop(ts, size, slide, self.spec.max_overlap)?
         } else {
@@ -352,13 +503,24 @@ impl WindowOperator {
             self.index_insert(&sk, end)?;
         }
         if let WindowStore::Tumble(store) = &mut self.store {
+            if self.variable_accs {
+                return store.update_accounted(&sk, |entry, lease, key_bytes| {
+                    update_accs_metered(
+                        &self.bound_aggs,
+                        &self.spec,
+                        &mut entry.accs,
+                        &mut self.accumulator_scratch,
+                        row,
+                        lease,
+                        key_bytes,
+                    )
+                });
+            }
             if let Some(entry) = store.get_mut(&sk) {
                 update_accs(&self.bound_aggs, &self.spec, &mut entry.accs, row)?;
             }
-            if let Some(entry) = store.get(&sk) {
-                let bytes: usize = entry.accs.iter().map(Accumulator::tracked_bytes).sum();
-                store.recharge(&sk, bytes)?;
-            }
+            // Numeric accumulators never grow; MIN/MAX already use a
+            // pre-admitted replacement above. No post-update hash/re-bill.
         }
         Ok(())
     }
@@ -381,12 +543,7 @@ impl WindowOperator {
         let Some(wm_in) = self.hub.progress() else {
             return Ok(WindowEmission::default());
         };
-        let Some(proposed_out) = self
-            .holdback
-            .as_mut()
-            .expect("holdback")
-            .on_wm_in(wm_in)?
-        else {
+        let Some(proposed_out) = self.holdback.as_mut().expect("holdback").on_wm_in(wm_in)? else {
             return Ok(WindowEmission::default());
         };
         // Do not materialize every closed window here (P1-20 / R17).
@@ -420,11 +577,21 @@ impl WindowOperator {
                 _ => None,
             };
             if let Some(entry) = entry {
-                self.closed_index
-                    .remove(&(entry.window_end, k.encoded_bytes().to_vec()));
-                return Ok(Some(emit_tumble(&group_from_et_key(&k.key), &entry)));
+                self.index_remove(&k, entry.window_end);
+                let group = if self.spec.kind.uses_event_time() {
+                    group_from_et_key(&k.key)
+                } else {
+                    k.key.clone()
+                };
+                return Ok(Some(emit_tumble(&group, &entry)));
             }
-            self.closed_index.retain(|_, v| v != &k);
+            self.closed_index.retain(|_, v| {
+                let keep = v != &k;
+                if !keep {
+                    self.closed_index_bytes -= v.index_bytes();
+                }
+                keep
+            });
         }
     }
 
@@ -437,21 +604,33 @@ impl WindowOperator {
 
     fn index_insert(&mut self, key: &StateKey, window_end: i64) -> Result<()> {
         let indexed = key.indexed(&self.owner)?;
-        self.closed_index
+        let bytes = indexed.index_bytes();
+        let old = self
+            .closed_index
             .insert((window_end, key.encoded_bytes().to_vec()), indexed);
+        self.closed_index_bytes = self.closed_index_bytes.saturating_add(bytes)
+            - old.as_ref().map_or(0, StateKey::index_bytes);
         Ok(())
     }
 
     fn index_remove(&mut self, key: &StateKey, window_end: i64) {
-        self.closed_index
-            .remove(&(window_end, key.encoded_bytes().to_vec()));
+        if let Some(old) = self
+            .closed_index
+            .remove(&(window_end, key.encoded_bytes().to_vec()))
+        {
+            self.closed_index_bytes -= old.index_bytes();
+        }
     }
 
     fn rebuild_closed_index(&mut self) -> Result<()> {
         self.closed_index.clear();
+        self.closed_index_bytes = 0;
         if let WindowStore::Tumble(store) = &self.store {
             for (k, e) in store.iter() {
                 let indexed = k.indexed(&self.owner)?;
+                self.closed_index_bytes = self
+                    .closed_index_bytes
+                    .saturating_add(indexed.index_bytes());
                 self.closed_index
                     .insert((e.window_end, k.encoded_bytes().to_vec()), indexed);
             }
@@ -484,12 +663,64 @@ impl WindowOperator {
         Ok(out)
     }
 
+    /// Count only the due prefix that fits one output chunk. Admit before key
+    /// clones/removal, and convert to an owning batch before dropping scratch.
+    pub(crate) fn take_closed_batch(
+        &mut self,
+        cut: i64,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Option<RowBatch>> {
+        let mut work = 0usize;
+        let mut wire = 0usize;
+        let mut count = 0usize;
+        if let WindowStore::Tumble(store) = &self.store {
+            for ((end, _), key) in &self.closed_index {
+                if *end > cut || count >= max_rows.max(1) {
+                    break;
+                }
+                let Some(entry) = store.get(key) else {
+                    return Err(SparrowError::new(
+                        ErrorCode::Internal,
+                        "closed index has no state entry",
+                    ));
+                };
+                let bytes = entry
+                    .accs
+                    .iter()
+                    .map(Accumulator::tracked_bytes)
+                    .sum::<usize>()
+                    .saturating_add(key.tracked_bytes())
+                    .saturating_add(self.output.fields.len().saturating_mul(64))
+                    .saturating_add(128);
+                if count > 0 && wire.saturating_add(bytes) > max_bytes {
+                    break;
+                }
+                wire = wire.saturating_add(bytes);
+                work = work.saturating_add(bytes.saturating_mul(3));
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+        let _scratch = self
+            .owner
+            .acquire(CreditKind::Reservation, work.saturating_add(128))?;
+        let rows = self.take_closed_chunk(cut, count, max_bytes)?;
+        self.build_metered_batch(rows)
+    }
+
+    pub(crate) fn build_metered_batch(&self, rows: Vec<Row>) -> Result<Option<RowBatch>> {
+        finish_rows_metered(&self.output, rows, &self.owner)
+    }
+
     fn peek_closed_bytes(&self, wm_out: i64) -> Option<usize> {
         let key = self.next_closed_key(wm_out)?;
         match &self.store {
-            WindowStore::Tumble(store) => store.get(&key).map(|e| {
-                e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>() + 32
-            }),
+            WindowStore::Tumble(store) => store
+                .get(&key)
+                .map(|e| e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>() + 32),
             _ => None,
         }
     }
@@ -502,7 +733,10 @@ impl WindowOperator {
             )
         })?;
         let v = row.values.get(idx).ok_or_else(|| {
-            SparrowError::new(ErrorCode::InvalidArgument, "event-time column missing on row")
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "event-time column missing on row",
+            )
         })?;
         v.as_event_time_micros().ok_or_else(|| {
             SparrowError::new(
@@ -596,12 +830,22 @@ impl WindowOperator {
                 .schedule(TimerId::window(self.operator, end), end)?;
         }
         if let WindowStore::Tumble(store) = &mut self.store {
+            if self.variable_accs {
+                store.update_accounted(&sk, |entry, lease, key_bytes| {
+                    update_accs_metered(
+                        &self.bound_aggs,
+                        &self.spec,
+                        &mut entry.accs,
+                        &mut self.accumulator_scratch,
+                        row,
+                        lease,
+                        key_bytes,
+                    )
+                })?;
+                return Ok(late);
+            }
             if let Some(entry) = store.get_mut(&sk) {
                 update_accs(&self.bound_aggs, &self.spec, &mut entry.accs, row)?;
-            }
-            if let Some(entry) = store.get(&sk) {
-                let bytes: usize = entry.accs.iter().map(Accumulator::tracked_bytes).sum();
-                store.recharge(&sk, bytes)?;
             }
         }
         Ok(late)
@@ -620,18 +864,32 @@ impl WindowOperator {
         }
         let mut emit_row = None;
         if let WindowStore::Count(store) = &mut self.store {
-            if let Some(entry) = store.get_mut(&sk) {
+            let count;
+            if self.variable_accs {
+                store.update_accounted(&sk, |entry, lease, key_bytes| {
+                    update_accs_metered(
+                        &self.bound_aggs,
+                        &self.spec,
+                        &mut entry.accs,
+                        &mut self.accumulator_scratch,
+                        row,
+                        lease,
+                        key_bytes,
+                    )?;
+                    entry.count += 1;
+                    Ok(())
+                })?;
+                count = store.get(&sk).map_or(0, |entry| entry.count);
+            } else if let Some(entry) = store.get_mut(&sk) {
                 update_accs(&self.bound_aggs, &self.spec, &mut entry.accs, row)?;
                 entry.count += 1;
+                count = entry.count;
+            } else {
+                count = 0;
             }
-            if let Some(entry) = store.get(&sk) {
-                let bytes: usize = entry.accs.iter().map(Accumulator::tracked_bytes).sum();
-                let count = entry.count;
-                store.recharge(&sk, bytes)?;
-                if count >= size {
-                    if let Some(entry) = store.remove(&sk) {
-                        emit_row = Some(emit_count(&sk.key, &entry));
-                    }
+            if count >= size {
+                if let Some(entry) = store.remove(&sk) {
+                    emit_row = Some(emit_count(&sk.key, &entry));
                 }
             }
         }
@@ -639,32 +897,40 @@ impl WindowOperator {
     }
 
     fn flush_tumble_ends(&mut self, ends: &HashSet<i64>) -> Result<Vec<Row>> {
-        let victims: Vec<StateKey> = match &self.store {
-            WindowStore::Tumble(store) => store
-                .iter()
-                .filter(|(_, e)| ends.contains(&e.window_end))
-                .map(|(k, _)| k.clone())
-                .collect(),
-            _ => return Ok(Vec::new()),
-        };
         let mut out = Vec::new();
-        for k in victims {
-            let entry = match &mut self.store {
-                WindowStore::Tumble(store) => store.remove(&k),
-                _ => None,
-            };
-            if let Some(entry) = entry {
-                self.index_remove(&k, entry.window_end);
-                out.push(emit_tumble(&k.key, &entry));
+        let mut ends: Vec<_> = ends.iter().copied().collect();
+        ends.sort_unstable();
+        for end in ends {
+            loop {
+                let key = self
+                    .closed_index
+                    .range((end, Vec::new())..)
+                    .next()
+                    .filter(|((at, _), _)| *at == end)
+                    .map(|(_, k)| k.clone());
+                let Some(key) = key else {
+                    break;
+                };
+                let entry = match &mut self.store {
+                    WindowStore::Tumble(s) => s.remove(&key),
+                    _ => None,
+                };
+                self.index_remove(&key, end);
+                if let Some(entry) = entry {
+                    out.push(emit_tumble(&key.key, &entry));
+                }
             }
         }
         Ok(out)
     }
 
     fn group_key(&self, row: &Row) -> Vec<Scalar> {
+        // This is a short-lived key view while the input batch is borrowed.
+        // StateKey::new performs the owning detach; copying here as well
+        // allocated every UTF-8 key twice per input row.
         self.group_idx
             .iter()
-            .map(|&i| row.values[i].detach_copy())
+            .map(|&i| row.values[i].clone())
             .collect()
     }
 
@@ -682,7 +948,10 @@ impl WindowOperator {
             WindowStore::Count(s) => s.clear(),
         }
         self.closed_index.clear();
+        self.closed_index_bytes = 0;
         self.timers.cancel_all();
+        self.accumulator_scratch = Vec::new();
+        self.accumulator_scratch_lease = None;
     }
 
     pub fn max_state_keys(&self) -> usize {
@@ -700,20 +969,38 @@ impl WindowOperator {
             WindowStore::Tumble(s) => s
                 .iter()
                 .map(|(k, e)| {
-                    k.tracked_bytes()
-                        + e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>()
+                    k.key
+                        .iter()
+                        .map(|v| v.encoded_value_len().unwrap_or(0))
+                        .sum::<usize>()
+                        + e.accs
+                            .iter()
+                            .map(|a| a.encoded_len().unwrap_or(0))
+                            .sum::<usize>()
                         + ENTRY_OVERHEAD
                 })
                 .sum(),
             WindowStore::Count(s) => s
                 .iter()
                 .map(|(k, e)| {
-                    k.tracked_bytes()
-                        + e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>()
+                    k.key
+                        .iter()
+                        .map(|v| v.encoded_value_len().unwrap_or(0))
+                        .sum::<usize>()
+                        + e.accs
+                            .iter()
+                            .map(|a| a.encoded_len().unwrap_or(0))
+                            .sum::<usize>()
                         + ENTRY_OVERHEAD
                 })
                 .sum(),
         }
+    }
+
+    pub(crate) fn freeze_workspace_bytes(&self) -> usize {
+        self.key_count()
+            .saturating_mul(2 * std::mem::size_of::<usize>())
+            .saturating_add(64)
     }
 
     /// Fail closed before encode / CURRENT publish when the freeze would
@@ -760,6 +1047,10 @@ impl WindowOperator {
     pub fn encode_freeze_into(&self, out: &mut Vec<u8>, max_entries: usize) -> Result<()> {
         self.check_freeze_encode_bound(max_entries)?;
         let n = self.key_count();
+        // Sorted references are temporary workspace, not encoded payload.
+        let _sort_credit = self
+            .owner
+            .acquire(CreditKind::Reservation, self.freeze_workspace_bytes())?;
         out.extend_from_slice(&self.operator.raw().to_le_bytes());
         out.extend_from_slice(&StateSlotId::new(SLOT).raw().to_le_bytes());
         let kind = match &self.store {
@@ -857,13 +1148,21 @@ impl WindowOperator {
                 "checkpoint StateSlotKey does not match this window",
             ));
         }
+        // Admit copied keys/encoded indexes/accumulator containers before any
+        // state mutation. Decoded input ownership is a separate handoff lease.
+        let _scratch = self
+            .owner
+            .acquire(CreditKind::Reservation, freeze.restore_scratch_bytes())?;
         self.cleanup();
         match (&mut self.store, freeze.kind) {
             (WindowStore::Tumble(store), 0) => {
                 for e in &freeze.entries {
                     let sk = StateKey::new(self.operator, StateSlotId::new(SLOT), e.key.clone());
                     if store.get(&sk).is_some() {
-                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "checkpoint contains duplicate canonical keys; reset/replay required"));
+                        return Err(SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "checkpoint contains duplicate canonical keys; reset/replay required",
+                        ));
                     }
                     let bytes: usize = e.accs.iter().map(Accumulator::tracked_bytes).sum();
                     store.put(
@@ -881,7 +1180,10 @@ impl WindowOperator {
                 for e in &freeze.entries {
                     let sk = StateKey::new(self.operator, StateSlotId::new(SLOT), e.key.clone());
                     if store.get(&sk).is_some() {
-                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "checkpoint contains duplicate canonical keys; reset/replay required"));
+                        return Err(SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "checkpoint contains duplicate canonical keys; reset/replay required",
+                        ));
                     }
                     let bytes: usize = e.accs.iter().map(Accumulator::tracked_bytes).sum();
                     store.put(
@@ -930,7 +1232,12 @@ impl WindowOperator {
             f.wm_out,
             f.entries
                 .iter()
-                .map(|e| e.accs.iter().map(|a| format!("{:?}", a.finish())).collect::<Vec<_>>().join("+"))
+                .map(|e| e
+                    .accs
+                    .iter()
+                    .map(|a| format!("{:?}", a.finish()))
+                    .collect::<Vec<_>>()
+                    .join("+"))
                 .collect::<Vec<_>>()
                 .join(";")
         )
@@ -947,6 +1254,59 @@ pub struct WindowFreeze {
     pub wm_in: Option<i64>,
     pub wm_out: Option<i64>,
     pub last_effective: Option<i64>,
+}
+
+impl WindowFreeze {
+    /// Entries are rebuilt sequentially and immediately charged to retention.
+    /// Only one candidate key/value (plus bounded timer bookkeeping) needs
+    /// scratch; reserving three whole snapshots made valid checkpoints fail
+    /// under the very same job budget on restart.
+    fn restore_scratch_bytes(&self) -> usize {
+        let largest = self
+            .entries
+            .iter()
+            .map(|e| {
+                e.key
+                    .iter()
+                    .map(Scalar::resident_bytes)
+                    .sum::<usize>()
+                    .saturating_add(e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>())
+                    .saturating_add(256)
+            })
+            .max()
+            .unwrap_or(0);
+        largest
+            .saturating_mul(3)
+            .saturating_add(self.entries.len().saturating_mul(16))
+            .saturating_add(1024)
+    }
+    pub fn resident_bytes(&self) -> usize {
+        self.entries.iter().fold(
+            128usize.saturating_add(
+                self.entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<FrozenEntry>()),
+            ),
+            |total, e| {
+                total
+                    .saturating_add(e.key.iter().map(Scalar::resident_bytes).sum::<usize>())
+                    .saturating_add(
+                        e.key
+                            .capacity()
+                            .saturating_sub(e.key.len())
+                            .saturating_mul(std::mem::size_of::<Scalar>()),
+                    )
+                    .saturating_add(e.accs.iter().map(Accumulator::tracked_bytes).sum::<usize>())
+                    .saturating_add(
+                        e.accs
+                            .capacity()
+                            .saturating_sub(e.accs.len())
+                            .saturating_mul(std::mem::size_of::<Accumulator>()),
+                    )
+                    .saturating_add(128)
+            },
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1037,6 +1397,46 @@ fn update_accs(
     Ok(())
 }
 
+/// Reuse the candidate Vec; unchanged MIN/MAX do not detach payloads, acquire
+/// replacement retention or allocate a Vec on every row. Numeric siblings and
+/// COUNT still update. Any expression/growth failure preserves the old entry.
+fn update_accs_metered(
+    bound: &[Option<BoundExpr>],
+    spec: &WindowSpec,
+    accs: &mut Vec<Accumulator>,
+    scratch: &mut Vec<Accumulator>,
+    row: &Row,
+    lease: &mut sparrow_model::MemoryLease,
+    key_bytes: usize,
+) -> Result<()> {
+    scratch.clear();
+    if accs.len() != spec.aggs.len() || scratch.capacity() < accs.len() {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "accumulator shape exceeds admitted scratch",
+        ));
+    }
+    scratch.extend(accs.iter().cloned());
+    let result = (|| {
+        update_accs(bound, spec, scratch, row)?;
+        let bytes = key_bytes
+            .saturating_add(
+                scratch
+                    .iter()
+                    .map(Accumulator::tracked_bytes)
+                    .sum::<usize>(),
+            )
+            .max(1);
+        lease.grow_to(bytes)?;
+        std::mem::swap(accs, scratch);
+        scratch.clear(); // release old payload BEFORE refund
+        lease.shrink_to(bytes)?;
+        Ok(())
+    })();
+    scratch.clear();
+    result
+}
+
 fn emit_tumble(key: &[Scalar], entry: &TumbleEntry) -> Row {
     let mut values = key.to_vec();
     values.push(Scalar::Int64(entry.window_start));
@@ -1050,11 +1450,10 @@ fn emit_tumble(key: &[Scalar], entry: &TumbleEntry) -> Row {
 /// Count-window bounds are **in-window arrival ordinals**, not event-time.
 ///
 /// A closed window of `size` events emits the half-open range `[0, count)`
-/// (`window_start = 0`, `window_end = count`, and `count == size` at emit).
-/// These columns share names with tumble `window_start` / `window_end` but
-/// must not be read as timestamps (P3-47).
+/// (`count_start = 0`, `count_end = count`, and `count == size` at emit).
+/// They are deliberately named differently from PT/ET time bounds.
 pub const COUNT_WINDOW_BOUNDS: &str =
-    "count-window window_start/window_end are 0-based half-open arrival ordinals [0, count) within the closed window, not event-time micros";
+    "count-window count_start/count_end are 0-based half-open arrival ordinals [0, count) within the closed window, not event-time micros";
 
 fn emit_count(key: &[Scalar], entry: &CountEntry) -> Row {
     let mut values = key.to_vec();
@@ -1089,7 +1488,10 @@ pub fn resolve_keys(schema: &Schema, keys: &[String]) -> Result<Vec<usize>> {
     let mut idx = Vec::new();
     for k in keys {
         let i = schema.index_of_name(k).ok_or_else(|| {
-            SparrowError::new(ErrorCode::InvalidArgument, format!("unknown group key '{k}'"))
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("unknown group key '{k}'"),
+            )
         })?;
         idx.push(i);
     }
@@ -1125,6 +1527,28 @@ pub fn finish_rows(
     Ok(Some(b.finish()?))
 }
 
+pub(crate) fn finish_rows_metered(
+    schema: &Schema,
+    rows: Vec<Row>,
+    owner: &Arc<MemoryOwner>,
+) -> Result<Option<RowBatch>> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = RowBatchBuilder::new(
+        Arc::new(schema.clone()),
+        owner.clone(),
+        CreditKind::Reservation,
+        rows.len(),
+        owner.budget().reservation_bytes,
+    )?;
+    for row in rows {
+        let bytes = row.resident_bytes().saturating_add(64);
+        builder.push_accounted(row, bytes)?;
+    }
+    Ok(Some(builder.finish()?))
+}
+
 #[cfg(test)]
 mod review_tests {
     use super::*;
@@ -1135,11 +1559,242 @@ mod review_tests {
     use sparrow_plan::AggCall;
 
     #[test]
+    fn r10_live_scratch_does_not_reserve_the_entire_keyspace() {
+        let budget = ResourceBudget {
+            reservation_bytes: 1024 * 1024,
+            retention_bytes: 1024 * 1024,
+            ..ResourceBudget::compact()
+        };
+        let owner = MemoryOwner::new(budget);
+        let schema = Schema::new(
+            1,
+            vec![
+                Field::new(1, "k", DataType::Utf8, false),
+                Field::new(2, "v", DataType::Int64, false),
+            ],
+        )
+        .unwrap();
+        let spec = WindowSpec::new(
+            WindowKind::count(100_000).unwrap(),
+            vec!["k".into()],
+            vec![AggCall::new(
+                AggFn::Sum,
+                Some(Expr::Column { name: "v".into() }),
+                "s",
+            )],
+        );
+        let mut window =
+            WindowOperator::new(1.into(), spec, schema.clone(), owner.clone(), 1024, 2048).unwrap();
+        for n in 0..1024 {
+            let mut builder = RowBatchBuilder::new(
+                Arc::new(schema.clone()),
+                owner.clone(),
+                CreditKind::Reservation,
+                1,
+                4096,
+            )
+            .unwrap();
+            builder
+                .push(Row {
+                    values: vec![
+                        Scalar::utf8(format!("{n:04}{}", "k".repeat(300))),
+                        Scalar::Int64(1),
+                    ],
+                })
+                .unwrap();
+            let batch = builder.finish().unwrap();
+            let scratch = window
+                .working_credit(Some(&batch))
+                .expect("unrelated resident keys must not consume per-batch scratch");
+            window.on_batch(&batch, 0).unwrap();
+            drop(scratch);
+        }
+        assert_eq!(window.key_count(), 1024);
+        assert!(window.retention_bytes() > budget.retention_bytes / 2);
+        assert!(window.retention_bytes() < budget.retention_bytes);
+        window.cleanup();
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    #[test]
+    fn r10_minmax_retention_tracks_state_not_unrelated_input_width() {
+        let owner = MemoryOwner::new(ResourceBudget {
+            reservation_bytes: 1024 * 1024,
+            retention_bytes: 1024 * 1024,
+            ..ResourceBudget::compact()
+        });
+        let schema = Schema::new(
+            1,
+            vec![
+                Field::new(1, "k", DataType::Int64, false),
+                Field::new(2, "v", DataType::Utf8, false),
+                Field::new(3, "ignored", DataType::Utf8, false),
+            ],
+        )
+        .unwrap();
+        let spec = WindowSpec::new(
+            WindowKind::count(100_000).unwrap(),
+            vec!["k".into()],
+            vec![AggCall::new(
+                AggFn::Min,
+                Some(Expr::Column { name: "v".into() }),
+                "m",
+            )],
+        );
+        let mut window =
+            WindowOperator::new(1.into(), spec, schema.clone(), owner.clone(), 1024, 2048).unwrap();
+        for round in 0..3 {
+            for key in 0..128 {
+                let mut builder = RowBatchBuilder::new(
+                    Arc::new(schema.clone()),
+                    owner.clone(),
+                    CreditKind::Reservation,
+                    1,
+                    4096,
+                )
+                .unwrap();
+                builder
+                    .push(Row {
+                        values: vec![
+                            Scalar::Int64(key),
+                            Scalar::utf8(if round == 0 { "a" } else { "z" }),
+                            Scalar::utf8("x".repeat(1024)),
+                        ],
+                    })
+                    .unwrap();
+                let batch = builder.finish().unwrap();
+                let _scratch = window.working_credit(Some(&batch)).unwrap();
+                window.on_batch(&batch, 0).unwrap();
+            }
+            assert!(
+                window.retention_bytes() < 128 * 1024,
+                "a one-byte MIN must not retain an input-width worst-case lease"
+            );
+        }
+        assert!(window
+            .freeze()
+            .entries
+            .iter()
+            .all(|e| e.accs[0].finish() == Scalar::utf8("a")));
+        window.cleanup();
+        drop(window);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    #[test]
+    fn self_review_checkpoint_that_fits_live_budget_can_restore_same_budget() {
+        let budget = ResourceBudget {
+            reservation_bytes: 64 * 1024,
+            retention_bytes: 64 * 1024,
+            ..ResourceBudget::compact()
+        };
+        let owner = MemoryOwner::new(budget);
+        let schema = Schema::new(1, vec![Field::new(1, "v", DataType::Int64, false)]).unwrap();
+        let spec = WindowSpec::new(
+            WindowKind::count(128).unwrap(),
+            vec!["v".into()],
+            vec![AggCall::new(
+                AggFn::Sum,
+                Some(Expr::Column { name: "v".into() }),
+                "s",
+            )],
+        );
+        let mut live = WindowOperator::new(
+            1.into(),
+            spec.clone(),
+            schema.clone(),
+            owner.clone(),
+            256,
+            256,
+        )
+        .unwrap();
+        let mut found = false;
+        for v in 0..256 {
+            let mut b = RowBatchBuilder::new(
+                Arc::new(schema.clone()),
+                owner.clone(),
+                CreditKind::Reservation,
+                1,
+                512,
+            )
+            .unwrap();
+            b.push(Row {
+                values: vec![Scalar::Int64(v)],
+            })
+            .unwrap();
+            let batch = b.finish().unwrap();
+            {
+                let _scratch = live.working_credit(Some(&batch)).unwrap();
+                live.on_batch(&batch, 0).unwrap();
+            }
+            drop(batch);
+            // Decode uses exact-length vectors, not live freeze's growth capacity.
+            let freeze = live.freeze().clone();
+            if freeze.resident_bytes() * 4 + 1024 > budget.reservation_bytes {
+                drop(crate::barrier::EncodedFreeze::from_operator(&live, &owner, 256).unwrap());
+                let target = MemoryOwner::new(budget);
+                let adopted = crate::barrier::RuntimeAligned::adopt(
+                    crate::AlignedJob {
+                        restore: Some(freeze.clone()),
+                        acks: Default::default(),
+                        outbox: Arc::new(sparrow_model::InflightCounter::new()),
+                    },
+                    &target,
+                )
+                .unwrap();
+                let restored = adopted.restore.lock().unwrap().take().unwrap();
+                assert!(
+                    target
+                        .acquire(
+                            CreditKind::Reservation,
+                            restored.freeze.resident_bytes() * 3 + 1024
+                        )
+                        .is_err(),
+                    "fixture must reproduce the previous whole-snapshot overcharge"
+                );
+                let mut window = WindowOperator::new(
+                    1.into(),
+                    spec.clone(),
+                    schema.clone(),
+                    target.clone(),
+                    256,
+                    256,
+                )
+                .unwrap();
+                window.restore_freeze(&restored.freeze).expect(
+                    "a successful live checkpoint must not require four whole snapshots to restore",
+                );
+                assert_eq!(window.freeze(), freeze);
+                drop(restored);
+                window.cleanup();
+                assert_eq!(target.usage().physical_bytes, 0);
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "fixture must exercise the previous full-snapshot scratch threshold"
+        );
+    }
+
+    #[test]
     fn r3_closed_window_index_is_billed_and_released() {
         let mut window = op();
         let owner = Arc::clone(&window.owner);
-        window.on_row(&Row { values: vec![Scalar::utf8("indexed-key"), Scalar::Int64(1)] }, 0).unwrap();
-        let index_bytes: usize = window.closed_index.values().map(StateKey::index_bytes).sum();
+        window
+            .on_row(
+                &Row {
+                    values: vec![Scalar::utf8("indexed-key"), Scalar::Int64(1)],
+                },
+                0,
+            )
+            .unwrap();
+        let index_bytes: usize = window
+            .closed_index
+            .values()
+            .map(StateKey::index_bytes)
+            .sum();
         assert!(index_bytes > 0);
         assert_eq!(window.retention_bytes(), owner.usage().retention_bytes);
         window.cleanup();
@@ -1292,7 +1947,10 @@ mod review_tests {
             assert!(rounds <= 64, "chunked flush must make progress");
         }
         assert_eq!(total, 32, "every closed key must be emitted");
-        assert!(rounds > 1, "32 keys must not flush as a single mailbox burst");
+        assert!(
+            rounds > 1,
+            "32 keys must not flush as a single mailbox burst"
+        );
     }
 
     #[test]
@@ -1329,7 +1987,11 @@ mod review_tests {
         assert_eq!(out.finals.len(), 1);
         let row = &out.finals[0];
         assert_eq!(row.values[1], Scalar::Int64(0), "{COUNT_WINDOW_BOUNDS}");
-        assert_eq!(row.values[2], Scalar::Int64(2), "window_end is in-window count");
+        assert_eq!(
+            row.values[2],
+            Scalar::Int64(2),
+            "window_end is in-window count"
+        );
         assert_eq!(row.values[3], Scalar::Int64(3));
     }
 
@@ -1340,7 +2002,8 @@ mod review_tests {
         for i in 0..N {
             let end = 10 + ((i % 7) as i64) * 10;
             entries.push(FrozenEntry {
-                key: vec![Scalar::utf8(&format!("k{i:03}")), Scalar::Int64(0)],
+                // PT keys are group values only; ET additionally stores start.
+                key: vec![Scalar::utf8(&format!("k{i:03}"))],
                 window_start: 0,
                 window_end: end,
                 count: 0,
@@ -1404,8 +2067,10 @@ mod review_tests {
             "closing {N} keys via the ordered index must not O(n²) scan"
         );
         assert_eq!(got.len(), N, "every closed key must emit once");
-        let expected_pairs: Vec<(i64, String)> =
-            expected.into_iter().map(|(end, _, name)| (end, name)).collect();
+        let expected_pairs: Vec<(i64, String)> = expected
+            .into_iter()
+            .map(|(end, _, name)| (end, name))
+            .collect();
         assert_eq!(
             got, expected_pairs,
             "closed keys must emit in (window_end, encoded_key) order"

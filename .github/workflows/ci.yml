@@ -1,0 +1,83 @@
+name: production-gates
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '31 2 * * 1'
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: core-${{ runner.os }}-1.98.0-${{ hashFiles('Cargo.lock') }}
+      - name: Static checks and core/independent specifications
+        env:
+          DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          base="$DIFF_BASE"
+          if [[ ! "$base" =~ ^[0-9a-f]{40,64}$ ]] || ! git rev-parse --verify "$base^{commit}" >/dev/null 2>&1; then
+            base=$(git hash-object -t tree /dev/null)
+          fi
+          git diff --check "$base" HEAD
+          # Keep legacy formatting debt out of the R10 functional diff. Report
+          # it explicitly until a separate formatting-only cleanup is agreed.
+          if ! cargo fmt --all -- --check > artifacts/format.log 2>&1; then
+            echo '::warning::Legacy formatting debt remains; see format.log (not a blocking gate yet)'
+          fi
+          for script in scripts/*.sh; do bash -n "$script"; done
+          bash scripts/production-freeze-tests.sh artifacts core
+      - name: Scheduled deterministic repetitions (not a soak certificate)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          bash scripts/production-freeze-tests.sh artifacts production
+          bash scripts/production-repeat.sh artifacts 20
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-evidence
+          path: artifacts/
+  production:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: production-${{ runner.os }}-1.98.0-${{ hashFiles('Cargo.lock') }}
+      - name: Isolated no-demo tests and package
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          bash scripts/production-freeze-tests.sh artifacts production
+          if ! cargo clippy --locked --release --quiet --no-default-features -p sparrow-server -p sparrow-cli > artifacts/clippy.log 2>&1; then
+            tail -n 60 artifacts/clippy.log; exit 1
+          fi
+          bash scripts/production-build.sh artifacts/package
+          (cd artifacts/package && sha256sum -c SHA256SUMS)
+          bash scripts/production-smoke.sh artifacts/package artifacts/smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-evidence
+          path: artifacts/

@@ -267,6 +267,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
         recovery: recovery.into(),
         restore: None,
         checkpoint_dir: chk.map(|s| s.to_string()),
+        checkpoint: None,
         fail_on_decode: false,
     }
 }
@@ -414,6 +415,7 @@ fn mqtt_aligned_still_rejected() {
         recovery: "aligned".into(),
         restore: None,
         checkpoint_dir: None,
+        checkpoint: None,
         fail_on_decode: false,
     };
     assert_eq!(

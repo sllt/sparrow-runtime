@@ -16,6 +16,7 @@ pub const CATALOG_SCHEMA_VERSION: u32 = 2;
 pub const FORMAT_VERSION: u32 = 1;
 const AUDIT_CAP: usize = 200;
 const ATTEMPT_CAP: usize = 100;
+static CATALOG_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(128);
 
 /// Catalog handle. SQLite lives behind a mutex and is executed on the
 /// bounded blocking pool (`run_blocking`) from async paths (R26).
@@ -199,6 +200,28 @@ impl Store {
         spec: &PipelineSpec,
         expected_etag: Option<&str>,
     ) -> Result<PipelineRow> {
+        self.put_pipeline_with_activation(name, spec, expected_etag, false)
+    }
+
+    /// Restore publishes its configuration and desired revision atomically.
+    /// There is no intermediate "stop old, but accidentally restart fresh"
+    /// state if a request is cancelled or the process exits between steps.
+    pub fn put_pipeline_and_start(
+        &self,
+        name: &str,
+        spec: &PipelineSpec,
+        expected_etag: Option<&str>,
+    ) -> Result<PipelineRow> {
+        self.put_pipeline_with_activation(name, spec, expected_etag, true)
+    }
+
+    fn put_pipeline_with_activation(
+        &self,
+        name: &str,
+        spec: &PipelineSpec,
+        expected_etag: Option<&str>,
+        activate: bool,
+    ) -> Result<PipelineRow> {
         check_name(name)?;
         self.write(|c| {
             let current: Option<(u64, String)> = c
@@ -259,6 +282,7 @@ impl Store {
                 params![name, ts],
             )
             .map_err(db)?;
+            if activate {Self::start_revision(c,name,next)?;}
             Ok(PipelineRow {
                 name: name.to_string(),
                 latest_revision: next,
@@ -513,34 +537,36 @@ impl Store {
     /// reset to stopped so converge can start (or retry) the requested revision.
     /// Merely pruning history, stopping, or restarting the process cannot unlock.
     pub(crate) fn request_start_revision(&self, name: &str, revision: u64) -> Result<()> {
-        self.write(|c| {
-            let changed = c
-                .execute(
-                    "UPDATE desired_state SET desired_status='running', desired_revision=?1,
+        self.write(|c| Self::start_revision(c, name, revision))
+    }
+
+    fn start_revision(c: &Connection, name: &str, revision: u64) -> Result<()> {
+        let changed = c
+            .execute(
+                "UPDATE desired_state SET desired_status='running', desired_revision=?1,
                     updated_at=?2 WHERE name=?3",
-                    params![revision as i64, now_ms(), name],
-                )
-                .map_err(db)?;
-            let actual = c
-                .execute(
-                    "UPDATE actual_state SET
+                params![revision as i64, now_ms(), name],
+            )
+            .map_err(db)?;
+        let actual = c
+            .execute(
+                "UPDATE actual_state SET
                     actual_status=CASE WHEN actual_status='running' AND actual_revision=?3
                         THEN 'running' ELSE 'stopped' END,
                     actual_revision=CASE WHEN actual_status='running' AND actual_revision=?3
                         THEN actual_revision ELSE NULL END,
                     consecutive_failures=0, restart_blocked=0, last_error=NULL,
                     updated_at=?1 WHERE name=?2",
-                    params![now_ms(), name, revision as i64],
-                )
-                .map_err(db)?;
-            if changed != 1 || actual != 1 {
-                return Err(SparrowError::new(
-                    ErrorCode::InvalidSchema,
-                    "missing pipeline start state",
-                ));
-            }
-            Ok(())
-        })
+                params![now_ms(), name, revision as i64],
+            )
+            .map_err(db)?;
+        if changed != 1 || actual != 1 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidSchema,
+                "missing pipeline start state",
+            ));
+        }
+        Ok(())
     }
 
     pub fn desired(&self, name: &str) -> Result<DesiredState> {
@@ -630,6 +656,22 @@ impl Store {
     /// Process restart: in-memory jobs are gone. This is `restart_fresh`, not restore.
     pub fn reset_actual_after_process_restart(&self) -> Result<()> {
         self.write(|c| {
+            // Fixed-point replay requires a fresh explicit start after process
+            // restart. Do not silently replay days of output from an old pin.
+            let rows={
+                let mut query=c.prepare("SELECT name, desired_revision FROM desired_state WHERE desired_status='running'").map_err(db)?;
+                let rows=query.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<u64>>(1)?))).map_err(db)?;
+                rows.collect::<std::result::Result<Vec<_>,_>>().map_err(db)?
+            };
+            for (name,revision) in rows {
+                if let Some(revision)=revision {
+                    // Invalid revisions fail per pipeline during convergence;
+                    // they must not prevent healthy siblings from booting.
+                    if load_pipeline_revision(c,&name,revision).is_ok_and(|r| r.spec.fixed_snapshot_id().is_some()) {
+                        c.execute("UPDATE actual_state SET restart_blocked=1,last_error='held: fixed snapshot replay requires explicit start after process restart' WHERE name=?1",[&name]).map_err(db)?;
+                    }
+                }
+            }
             c.execute(
                 "UPDATE actual_state SET actual_status='stopped', updated_at=?1",
                 params![now_ms()],
@@ -836,9 +878,19 @@ impl Store {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
-        tokio::task::spawn_blocking(f)
-            .await
-            .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("catalog worker: {e}")))?
+        let permit = CATALOG_WORK.try_acquire().map_err(|_| {
+            SparrowError::new(
+                ErrorCode::ResourceExhausted,
+                "catalog/operation worker capacity exhausted",
+            )
+            .retryable(true)
+        })?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f()
+        })
+        .await
+        .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("catalog worker: {e}")))?
     }
 
     /// Next write runs to completion then rolls back (simulates crash mid-commit).
@@ -1535,6 +1587,7 @@ mod tests {
             recovery: "restart_fresh".into(),
             restore: None,
             checkpoint_dir: None,
+            checkpoint: None,
             fail_on_decode: false,
         }
     }
@@ -1681,6 +1734,85 @@ mod tests {
             "SQLite must not run on the async worker thread"
         );
         assert_eq!(store.get_stream("sensors").unwrap().name, "sensors");
+    }
+
+    #[test]
+    fn self_review_restore_revision_and_activation_commit_or_rollback_together() {
+        let s = Store::open_memory().unwrap();
+        let mut spec = r9_file_spec();
+        s.put_pipeline("restore", &spec, None).unwrap();
+        s.request_start_revision("restore", 1).unwrap();
+        s.set_actual("restore", "failed", Some(1), 7, Some("prior failure"))
+            .unwrap();
+        spec.restore = Some(crate::RestoreSpec {
+            kind: "checkpoint".into(),
+            snapshot_id: Some("42".into()),
+            client_id: None,
+        });
+        s.debug_fail_next_commit();
+        assert!(s
+            .put_pipeline_and_start("restore", &spec, Some("rev-1"))
+            .is_err());
+        assert_eq!(s.get_pipeline("restore").unwrap().latest_revision, 1);
+        assert!(s.get_pipeline("restore").unwrap().spec.restore.is_none());
+        assert!(s.get_pipeline_revision("restore", 2).is_err());
+        assert_eq!(s.desired("restore").unwrap().revision, Some(1));
+        assert_eq!(s.actual("restore").unwrap().status, "failed");
+        assert!(s.actual("restore").unwrap().restart_blocked);
+        let row = s
+            .put_pipeline_and_start("restore", &spec, Some("rev-1"))
+            .unwrap();
+        assert_eq!(row.latest_revision, 2);
+        assert_eq!(s.desired("restore").unwrap().revision, Some(2));
+        assert_eq!(s.desired("restore").unwrap().status, "running");
+        assert_eq!(s.actual("restore").unwrap().status, "stopped");
+        assert!(!s.actual("restore").unwrap().restart_blocked);
+        assert_eq!(
+            s.get_pipeline_revision("restore", 2)
+                .unwrap()
+                .spec
+                .restore
+                .unwrap()
+                .snapshot_id
+                .as_deref(),
+            Some("42")
+        );
+        assert!(s
+            .put_pipeline_and_start("restore", &spec, Some("rev-1"))
+            .is_err());
+        assert_eq!(s.get_pipeline("restore").unwrap().latest_revision, 2);
+        assert_eq!(s.desired("restore").unwrap().revision, Some(2));
+    }
+
+    #[test]
+    fn r10_process_restart_holds_fixed_replay_until_explicit_start() {
+        let s = Store::open_memory().unwrap();
+        let mut spec = r9_file_spec();
+        spec.restore = Some(crate::RestoreSpec {
+            kind: "checkpoint".into(),
+            snapshot_id: Some("1".into()),
+            client_id: None,
+        });
+        spec.checkpoint = Some(crate::CheckpointSpec {
+            resume_latest: true,
+            ..Default::default()
+        });
+        s.put_pipeline_and_start("fixed", &spec, None).unwrap();
+        s.set_actual("fixed", "running", Some(1), 1, None).unwrap();
+        s.reset_actual_after_process_restart().unwrap();
+        assert!(s.actual("fixed").unwrap().restart_blocked);
+        assert!(s
+            .actual("fixed")
+            .unwrap()
+            .last_error
+            .unwrap()
+            .contains("fixed snapshot"));
+        s.request_start_revision("fixed", 1).unwrap();
+        assert!(!s.actual("fixed").unwrap().restart_blocked);
+        assert_eq!(
+            s.get_pipeline("fixed").unwrap().spec.fixed_snapshot_id(),
+            Some(1)
+        );
     }
 
     #[test]

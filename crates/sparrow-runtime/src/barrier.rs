@@ -6,7 +6,9 @@
 //! pair with a later cut.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use sparrow_model::{ErrorCode, InflightCounter, Result, SparrowError};
 
@@ -15,20 +17,29 @@ use crate::window::WindowFreeze;
 /// Encoded state plus its working-memory lease. Moving an ACK never clones state.
 #[derive(Debug)]
 pub struct EncodedFreeze {
-    pub bytes: Vec<u8>,
-    pub lease: sparrow_model::MemoryLease,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) lease: sparrow_model::MemoryLease,
 }
 
 impl EncodedFreeze {
-    pub fn from_operator(op: &crate::window::WindowOperator,
-        owner: &Arc<sparrow_model::MemoryOwner>, max_keys: usize) -> Result<Self> {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn from_operator(
+        op: &crate::window::WindowOperator,
+        owner: &Arc<sparrow_model::MemoryOwner>,
+        max_keys: usize,
+    ) -> Result<Self> {
         op.check_freeze_encode_bound(max_keys)?;
         let capacity = op.estimated_freeze_bytes().saturating_add(256);
         let lease = owner.acquire(sparrow_model::CreditKind::Reservation, capacity)?;
         let mut bytes = Vec::with_capacity(capacity);
         op.encode_freeze_into(&mut bytes, max_keys)?;
         if bytes.len() > capacity {
-            return Err(SparrowError::new(ErrorCode::Internal, "freeze size estimate underflow"));
+            return Err(SparrowError::new(
+                ErrorCode::Internal,
+                "freeze size estimate underflow",
+            ));
         }
         Ok(Self { bytes, lease })
     }
@@ -54,10 +65,9 @@ pub enum AlignedAck {
 impl AlignedAck {
     pub fn checkpoint_id(&self) -> u64 {
         match self {
-            Self::WindowFrozen { checkpoint_id, .. } | Self::SinkFlushed { checkpoint_id, .. }
-            | Self::FreezeFailed { checkpoint_id, .. } => {
-                *checkpoint_id
-            }
+            Self::WindowFrozen { checkpoint_id, .. }
+            | Self::SinkFlushed { checkpoint_id, .. }
+            | Self::FreezeFailed { checkpoint_id, .. } => *checkpoint_id,
         }
     }
 }
@@ -67,6 +77,79 @@ pub struct AlignedJob {
     pub restore: Option<WindowFreeze>,
     pub acks: AlignedAcks,
     pub outbox: Arc<InflightCounter>,
+}
+
+/// Internal per-attempt handoff. Cloning a stage context must never deep-clone
+/// a decoded restore snapshot; the eligible Window consumes it exactly once.
+pub(crate) struct RuntimeAligned {
+    pub restore: Mutex<Option<RestoreState>>,
+    pub acks: AlignedAcks,
+    pub outbox: Arc<InflightCounter>,
+}
+pub(crate) struct RestoreState {
+    pub freeze: WindowFreeze,
+    // Payload drops before its adoption credit.
+    _lease: sparrow_model::MemoryLease,
+}
+impl RuntimeAligned {
+    pub fn adopt(job: AlignedJob, owner: &Arc<sparrow_model::MemoryOwner>) -> Result<Arc<Self>> {
+        let restore = job
+            .restore
+            .map(|freeze| {
+                let lease = owner.acquire(
+                    sparrow_model::CreditKind::Reservation,
+                    freeze.resident_bytes(),
+                )?;
+                Ok::<_, SparrowError>(RestoreState {
+                    freeze,
+                    _lease: lease,
+                })
+            })
+            .transpose()?;
+        Ok(Arc::new(Self {
+            restore: Mutex::new(restore),
+            acks: job.acks,
+            outbox: job.outbox,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod production_restore_tests {
+    use super::*;
+    #[test]
+    fn production_restore_context_shares_one_allocation_and_releases_after_consumption() {
+        let owner = sparrow_model::MemoryOwner::new(sparrow_model::ResourceBudget::compact());
+        let freeze = WindowFreeze {
+            operator: 1.into(),
+            slot: 1.into(),
+            kind: 1,
+            entries: vec![],
+            wm_in: None,
+            wm_out: None,
+            last_effective: None,
+        };
+        let expected = freeze.resident_bytes();
+        let shared = RuntimeAligned::adopt(
+            AlignedJob {
+                restore: Some(freeze),
+                acks: AlignedAcks::default(),
+                outbox: Arc::new(InflightCounter::new()),
+            },
+            &owner,
+        )
+        .unwrap();
+        let stages: Vec<_> = (0..64).map(|_| shared.clone()).collect();
+        assert_eq!(owner.usage().reservation_bytes, expected);
+        let restored = stages[0].restore.lock().unwrap().take().unwrap();
+        assert!(stages[1].restore.lock().unwrap().take().is_none());
+        drop(restored);
+        assert_eq!(
+            owner.usage().physical_bytes,
+            0,
+            "empty stage contexts must not retain decoded state"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,7 +163,14 @@ pub struct FlushOutcome {
 /// Late snapshots are dropped immediately, even if no next checkpoint occurs.
 #[derive(Clone, Default)]
 pub struct AlignedAcks {
-    active: Arc<Mutex<Option<(u64, tokio::sync::mpsc::Sender<AlignedAck>)>>>,
+    active: Arc<Mutex<Option<ActiveCheckpoint>>>,
+}
+
+struct ActiveCheckpoint {
+    id: u64,
+    sender: tokio::sync::mpsc::Sender<AlignedAck>,
+    deadline: Instant,
+    cancelled: CancellationToken,
 }
 
 pub struct CheckpointAcks {
@@ -91,29 +181,76 @@ pub struct CheckpointAcks {
 
 impl AlignedAcks {
     pub fn begin(&self, id: u64) -> Result<CheckpointAcks> {
+        self.begin_with_deadline(id, Instant::now() + Duration::from_secs(5))
+    }
+
+    pub fn begin_with_deadline(&self, id: u64, deadline: Instant) -> Result<CheckpointAcks> {
         let mut active = self.active.lock().expect("checkpoint ACK registry");
         if active.is_some() {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument, "checkpoint already active"));
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "checkpoint already active",
+            ));
         }
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
-        *active = Some((id, sender));
-        Ok(CheckpointAcks { registry: self.clone(), id, receiver })
+        *active = Some(ActiveCheckpoint {
+            id,
+            sender,
+            deadline,
+            cancelled: CancellationToken::new(),
+        });
+        Ok(CheckpointAcks {
+            registry: self.clone(),
+            id,
+            receiver,
+        })
     }
 
     pub fn is_active(&self, id: u64) -> bool {
-        self.active.lock().expect("checkpoint ACK registry").as_ref()
-            .is_some_and(|(active, _)| *active == id)
+        self.active
+            .lock()
+            .expect("checkpoint ACK registry")
+            .as_ref()
+            .is_some_and(|active| active.id == id)
+    }
+
+    /// Use the attempt's end-to-end deadline, not an independent sink timeout.
+    /// An abandoned barrier must not keep the sink blocked behind old work.
+    pub(crate) async fn wait_for_flush(
+        &self,
+        id: u64,
+        outbox: &InflightCounter,
+    ) -> Option<FlushOutcome> {
+        let (deadline, cancelled) = {
+            let active = self.active.lock().expect("checkpoint ACK registry");
+            let request = active.as_ref().filter(|request| request.id == id)?;
+            (request.deadline, request.cancelled.clone())
+        };
+        tokio::select! {
+            biased;
+            _ = cancelled.cancelled() => None,
+            outcome = wait_outbox(outbox, deadline.saturating_duration_since(Instant::now())) => Some(outcome),
+        }
     }
 
     pub async fn send(&self, ack: AlignedAck) {
-        let sender = self.active.lock().expect("checkpoint ACK registry").as_ref()
-            .filter(|(id, _)| *id == ack.checkpoint_id()).map(|(_, tx)| tx.clone());
-        if let Some(sender) = sender { let _ = sender.send(ack).await; }
+        let sender = self
+            .active
+            .lock()
+            .expect("checkpoint ACK registry")
+            .as_ref()
+            .filter(|request| request.id == ack.checkpoint_id())
+            .map(|request| request.sender.clone());
+        if let Some(sender) = sender {
+            let _ = sender.send(ack).await;
+        }
     }
 }
 
 impl CheckpointAcks {
-    pub async fn recv(&mut self) -> Option<AlignedAck> { self.receiver.recv().await }
+    pub async fn recv(&mut self) -> Option<AlignedAck> {
+        self.receiver.recv().await
+    }
 
     pub async fn wait(mut self, timeout: Duration) -> Result<BarrierAcks> {
         wait_aligned_acks(&mut self.receiver, self.id, timeout).await
@@ -122,8 +259,16 @@ impl CheckpointAcks {
 
 impl Drop for CheckpointAcks {
     fn drop(&mut self) {
-        let mut active = self.registry.active.lock().expect("checkpoint ACK registry");
-        if active.as_ref().is_some_and(|(id, _)| *id == self.id) { *active = None; }
+        let mut active = self
+            .registry
+            .active
+            .lock()
+            .expect("checkpoint ACK registry");
+        if active.as_ref().is_some_and(|request| request.id == self.id) {
+            if let Some(request) = active.take() {
+                request.cancelled.cancel();
+            }
+        }
         self.receiver.close();
         while self.receiver.try_recv().is_ok() {}
     }
@@ -210,12 +355,20 @@ pub async fn wait_aligned_acks(
         .await
         {
             Ok(Some(ack)) => {
-                if let AlignedAck::FreezeFailed { checkpoint_id, error } = ack {
-                    if checkpoint_id == expected { return Err(error); }
+                if let AlignedAck::FreezeFailed {
+                    checkpoint_id,
+                    error,
+                } = ack
+                {
+                    if checkpoint_id == expected {
+                        return Err(error);
+                    }
                     continue;
                 }
                 got.apply(expected, ack);
-                if got.flushed && (!got.flush_ok || got.dropped > 0) { break; }
+                if got.flushed && (!got.flush_ok || got.dropped > 0) {
+                    break;
+                }
             }
             Ok(None) | Err(_) => break,
         }
@@ -240,11 +393,67 @@ mod tests {
     use super::*;
     use sparrow_model::{OperatorId, StateSlotId};
 
+    #[tokio::test(start_paused = true)]
+    async fn self_review_flush_uses_attempt_deadline_and_releases_abandoned_barrier() {
+        let registry = AlignedAcks::default();
+        let outbox = Arc::new(InflightCounter::new());
+        outbox.enqueue();
+        let request = registry
+            .begin_with_deadline(1, Instant::now() + Duration::from_secs(8))
+            .unwrap();
+        let delayed = outbox.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            delayed.ack();
+        });
+        let start = Instant::now();
+        assert!(registry.wait_for_flush(1, &outbox).await.unwrap().ok);
+        assert!(start.elapsed() >= Duration::from_secs(6));
+        drop(request);
+
+        outbox.enqueue();
+        let request = registry
+            .begin_with_deadline(2, Instant::now() + Duration::from_secs(120))
+            .unwrap();
+        let waiting_registry = registry.clone();
+        let waiting_outbox = outbox.clone();
+        let waiting =
+            tokio::spawn(async move { waiting_registry.wait_for_flush(2, &waiting_outbox).await });
+        tokio::task::yield_now().await;
+        drop(request);
+        assert!(tokio::time::timeout(Duration::from_millis(10), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            outbox.pending(),
+            1,
+            "abandoning a barrier does not forge delivery ACKs"
+        );
+
+        let request = registry
+            .begin_with_deadline(3, Instant::now() + Duration::from_millis(100))
+            .unwrap();
+        let start = Instant::now();
+        assert!(!registry.wait_for_flush(3, &outbox).await.unwrap().ok);
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        assert!(start.elapsed() < Duration::from_millis(110));
+        drop(request);
+        outbox.ack();
+        assert!(registry.wait_for_flush(3, &outbox).await.is_none());
+    }
+
     fn leased_ack(owner: &Arc<sparrow_model::MemoryOwner>, id: u64) -> AlignedAck {
-        AlignedAck::WindowFrozen { checkpoint_id: id, freeze: EncodedFreeze {
-            bytes: vec![0; 128],
-            lease: owner.acquire(sparrow_model::CreditKind::Reservation, 128).unwrap(),
-        } }
+        AlignedAck::WindowFrozen {
+            checkpoint_id: id,
+            freeze: EncodedFreeze {
+                bytes: vec![0; 128],
+                lease: owner
+                    .acquire(sparrow_model::CreditKind::Reservation, 128)
+                    .unwrap(),
+            },
+        }
     }
 
     #[tokio::test]
@@ -273,9 +482,17 @@ mod tests {
         for id in 1..=2 {
             let request = registry.begin(id).unwrap();
             let failure = if id == 1 {
-                AlignedAck::FreezeFailed { checkpoint_id: id,
-                    error: SparrowError::new(ErrorCode::BoundExceeded, "freeze refused") }
-            } else { AlignedAck::SinkFlushed { checkpoint_id: id, ok: false, dropped: 1 } };
+                AlignedAck::FreezeFailed {
+                    checkpoint_id: id,
+                    error: SparrowError::new(ErrorCode::BoundExceeded, "freeze refused"),
+                }
+            } else {
+                AlignedAck::SinkFlushed {
+                    checkpoint_id: id,
+                    ok: false,
+                    dropped: 1,
+                }
+            };
             registry.send(failure).await;
             registry.send(leased_ack(&owner, id)).await;
             assert!(request.wait(Duration::from_secs(1)).await.is_err());
@@ -288,7 +505,10 @@ mod tests {
         let extra = leased_ack(&owner, 3);
         let sending = tokio::spawn(async move { tx.send(extra).await });
         tokio::task::yield_now().await;
-        assert!(!sending.is_finished(), "third ACK should wait on the bounded inbox");
+        assert!(
+            !sending.is_finished(),
+            "third ACK should wait on the bounded inbox"
+        );
         drop(request);
         sending.await.unwrap();
         assert_eq!(owner.usage().physical_bytes, 0);
@@ -305,7 +525,13 @@ mod tests {
         let request = registry.begin(5).unwrap();
         registry.send(leased_ack(&owner, 4)).await; // cannot pair with new flush
         registry.send(leased_ack(&owner, 5)).await;
-        registry.send(AlignedAck::SinkFlushed { checkpoint_id: 5, ok: true, dropped: 0 }).await;
+        registry
+            .send(AlignedAck::SinkFlushed {
+                checkpoint_id: 5,
+                ok: true,
+                dropped: 0,
+            })
+            .await;
         let accepted = request.wait(Duration::from_secs(1)).await.unwrap();
         assert_eq!(owner.usage().reservation_bytes, 128);
         drop(accepted);
@@ -321,14 +547,21 @@ mod tests {
         assert!(wait_outbox(&outbox, Duration::from_millis(1)).await.ok);
         outbox.enqueue();
         outbox.fail();
-        for _ in 0..3 { assert!(!wait_outbox(&outbox, Duration::from_millis(1)).await.ok); }
+        for _ in 0..3 {
+            assert!(!wait_outbox(&outbox, Duration::from_millis(1)).await.ok);
+        }
     }
 
     fn encoded(freeze: WindowFreeze) -> EncodedFreeze {
         let mut bytes = Vec::new();
         crate::checkpoint::encode_freeze(&freeze, &mut bytes, 1024).unwrap();
         let owner = sparrow_model::MemoryOwner::new(sparrow_model::ResourceBudget::compact());
-        let lease = owner.acquire(sparrow_model::CreditKind::Reservation, bytes.capacity().max(1)).unwrap();
+        let lease = owner
+            .acquire(
+                sparrow_model::CreditKind::Reservation,
+                bytes.capacity().max(1),
+            )
+            .unwrap();
         EncodedFreeze { bytes, lease }
     }
 

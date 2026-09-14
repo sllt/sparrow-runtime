@@ -72,11 +72,10 @@ impl BoundedTimers {
     /// Schedule or replace. Replacing cancels the previous generation.
     pub fn schedule(&mut self, id: TimerId, fire_at: i64) -> Result<u64> {
         if id.operator != self.operator {
-            return Err(SparrowError::new(
-                ErrorCode::Internal,
-                "timer operator mismatch",
-            )
-            .at_operator(self.operator));
+            return Err(
+                SparrowError::new(ErrorCode::Internal, "timer operator mismatch")
+                    .at_operator(self.operator),
+            );
         }
         let replacing = self.gens.contains_key(&id);
         if !replacing && self.gens.len() >= self.max {
@@ -120,6 +119,14 @@ impl BoundedTimers {
     /// Pop timers with `fire_at <= now` whose generation is still current.
     pub fn fire_due(&mut self, now: i64) -> Vec<TimerId> {
         let mut out = Vec::new();
+        while let Some(id) = self.pop_due(now) {
+            out.push(id);
+        }
+        out
+    }
+
+    /// Allocation-free drain for the production window path.
+    pub(crate) fn pop_due(&mut self, now: i64) -> Option<TimerId> {
         while let Some(Reverse((at, gen, ns))) = self.heap.peek().copied() {
             if at > now {
                 break;
@@ -133,14 +140,14 @@ impl BoundedTimers {
                 Some(&g) if g == gen && self.deadlines.get(&id) == Some(&at) => {
                     self.gens.remove(&id);
                     self.deadlines.remove(&id);
-                    out.push(id);
+                    return Some(id);
                 }
                 _ => {
                     // stale generation — already cancelled / replaced
                 }
             }
         }
-        out
+        None
     }
 
     fn compact_if_needed(&mut self) {

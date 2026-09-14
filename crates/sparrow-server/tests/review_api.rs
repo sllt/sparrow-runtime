@@ -18,6 +18,379 @@ const STREAM: &str = r#"{"fields":[
 ]}"#;
 
 #[test]
+fn r10_draining_rejects_new_mutations_but_keeps_authenticated_read_views() {
+    let kernel = Arc::new(sparrow_control::host_kernel_with_max_jobs(1).unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        let supervisor =
+            sparrow_control::Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        let state = AppState {
+            store: store.clone(),
+            supervisor,
+            token: Arc::new(TOKEN.into()),
+            safe_mode: false,
+        };
+        state.supervisor.begin_shutdown();
+        for request in [
+            auth_put("/v1/streams/sensors", STREAM),
+            auth_post("/v1/pipelines/new/start", "{}"),
+            auth_post("/v1/pipelines/new/restore", "{}"),
+            auth_post("/v1/pipelines/new/checkpoint", "{}"),
+        ] {
+            let (status, _) = call(&state, request).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert!(store.list_streams().unwrap().is_empty());
+        assert_eq!(
+            call(&state, auth_get("/v1/streams")).await.0,
+            StatusCode::OK
+        );
+        let unauthorized = Request::builder()
+            .method("PUT")
+            .uri("/v1/streams/sensors")
+            .body(Body::from(STREAM))
+            .unwrap();
+        assert_eq!(call(&state, unauthorized).await.0, StatusCode::UNAUTHORIZED);
+        state.supervisor.shutdown().await;
+    });
+}
+
+#[test]
+fn self_review_restore_api_atomically_requests_replacement_of_live_revision() {
+    let kernel = Arc::new(sparrow_control::host_kernel_with_max_jobs(1).unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let supervisor =
+            sparrow_control::Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        let state = AppState {
+            store: store.clone(),
+            supervisor,
+            token: Arc::new(TOKEN.into()),
+            safe_mode: false,
+        };
+        let path = tmp("self-review-restore.jsonl");
+        let checkpoint = tmp("self-review-restore-checkpoints");
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d\",\"v\":10}\n{\"device_id\":\"d\",\"v\":20}\n",
+        )
+        .unwrap();
+        let mut spec = restart_file_spec(&path);
+        spec.sql = Some(
+            "SELECT device_id, SUM(v) AS s FROM sensors GROUP BY device_id, COUNT_WINDOW(3)".into(),
+        );
+        spec.recovery = "aligned".into();
+        spec.checkpoint_dir = Some(checkpoint.to_string_lossy().into());
+        store.put_pipeline("restore", &spec, None).unwrap();
+        sparrow_control::request_start(&store, "restore", "test").unwrap();
+        state.supervisor.converge_once().await.unwrap();
+        let id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                state.supervisor.checkpoint_named("restore").await.unwrap();
+                let point = sparrow_runtime::CheckpointStore::open(&checkpoint)
+                    .unwrap()
+                    .recover_required()
+                    .unwrap();
+                if point.ingested_rows == 2 {
+                    break point.checkpoint_id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let first = state
+            .supervisor
+            .checkpoint_snapshot("restore")
+            .unwrap()
+            .unwrap()
+            .1;
+        let (code, body) = call(
+            &state,
+            auth_post(
+                "/v1/pipelines/restore/restore",
+                json!({"snapshot_id":id}).to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(body["audit_recorded"], true);
+        assert_eq!(store.desired("restore").unwrap().revision, Some(2));
+        assert_eq!(
+            store
+                .get_pipeline("restore")
+                .unwrap()
+                .spec
+                .restore
+                .unwrap()
+                .snapshot_id,
+            Some(id.to_string())
+        );
+        assert_eq!(
+            state
+                .supervisor
+                .checkpoint_snapshot("restore")
+                .unwrap()
+                .unwrap()
+                .0,
+            1,
+            "HTTP publication must not independently detach/stop the live attempt"
+        );
+        state.supervisor.converge_once().await.unwrap();
+        let (revision, second) = state
+            .supervisor
+            .checkpoint_snapshot("restore")
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision, 2);
+        assert_ne!(first.attempt, second.attempt);
+        assert_eq!(kernel.admitted_jobs(), 1);
+        assert!(!first.snapshot().active);
+        let (_, status) = call(&state, auth_get("/v1/pipelines/restore/status")).await;
+        assert_eq!(status["checkpoint"]["restored_from_checkpoint"], id);
+        state.supervisor.stop_all().await;
+        assert_eq!(kernel.process_owner().usage().physical_bytes, 0);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(checkpoint).unwrap();
+    });
+}
+
+#[test]
+fn production_update_checkpoint_and_stop_join_old_writer_before_replacement() {
+    let kernel = Arc::new(sparrow_control::host_kernel_with_max_jobs(1).unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let supervisor =
+            sparrow_control::Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        let path = tmp("production-lifecycle.jsonl");
+        let checkpoint = tmp("production-lifecycle-checkpoints");
+        std::fs::write(&path, b"{\"device_id\":\"d\",\"v\":1}\n").unwrap();
+        let mut spec = restart_file_spec(&path);
+        spec.sql = Some(
+            "SELECT device_id, SUM(v) AS s FROM sensors GROUP BY device_id, COUNT_WINDOW(3)".into(),
+        );
+        spec.recovery = "aligned".into();
+        spec.checkpoint_dir = Some(checkpoint.to_string_lossy().into());
+        spec.checkpoint = Some(sparrow_control::CheckpointSpec {
+            interval_ms: Some(100),
+            ..Default::default()
+        });
+        store.put_pipeline("race", &spec, None).unwrap();
+        sparrow_control::request_start(&store, "race", "test").unwrap();
+        supervisor.converge_once().await.unwrap();
+        let first = supervisor.checkpoint_snapshot("race").unwrap().unwrap().1;
+        // Two independent operations race at a bounded, reproducible boundary.
+        let (_checkpoint, ()) = tokio::join!(supervisor.checkpoint_named("race"), async {
+            let etag = store.get_pipeline("race").unwrap().etag;
+            spec.checkpoint.as_mut().unwrap().interval_ms = None;
+            let row = store.put_pipeline("race", &spec, Some(&etag)).unwrap();
+            sparrow_control::request_start_at(&store, "race", "test", Some(row.latest_revision))
+                .unwrap();
+            supervisor.converge_once().await.unwrap();
+        });
+        let (revision, second) = supervisor.checkpoint_snapshot("race").unwrap().unwrap();
+        assert_eq!(revision, 2);
+        assert_ne!(first.attempt, second.attempt);
+        assert!(!first.snapshot().active);
+        assert_eq!(
+            kernel.admitted_jobs(),
+            1,
+            "old/new attempts cannot overlap admission"
+        );
+        let (_checkpoint, stopped) = tokio::join!(
+            supervisor.checkpoint_named("race"),
+            supervisor.kill_named("race")
+        );
+        stopped.unwrap();
+        sparrow_control::request_stop(&store, "race", "test").unwrap();
+        supervisor.converge_once().await.unwrap();
+        assert!(supervisor.checkpoint_snapshot("race").unwrap().is_none());
+        assert_eq!(kernel.live_tasks(), 0);
+        assert_eq!(kernel.process_owner().usage().physical_bytes, 0);
+        let before = std::fs::read(checkpoint.join("CURRENT")).ok();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(std::fs::read(checkpoint.join("CURRENT")).ok(), before);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(checkpoint).unwrap();
+    });
+}
+
+#[test]
+fn production_periodic_checkpoint_restore_and_stop_are_one_attempt_scoped_flow() {
+    use std::io::Write;
+    let kernel = Arc::new(sparrow_control::host_kernel_with_max_jobs(1).unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let supervisor =
+            sparrow_control::Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        let state = AppState {
+            store: store.clone(),
+            supervisor,
+            token: Arc::new(TOKEN.into()),
+            safe_mode: false,
+        };
+        let path = tmp("production-auto.ndjson");
+        let checkpoint = tmp("production-checkpoints");
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d\",\"v\":10}\n{\"device_id\":\"d\",\"v\":20}\n",
+        )
+        .unwrap();
+        let mut spec = restart_file_spec(&path);
+        spec.sql = Some(
+            "SELECT device_id, SUM(v) AS s FROM sensors GROUP BY device_id, COUNT_WINDOW(3)".into(),
+        );
+        spec.recovery = "aligned".into();
+        spec.checkpoint_dir = Some(checkpoint.to_string_lossy().into());
+        spec.checkpoint = Some(sparrow_control::CheckpointSpec {
+            interval_ms: Some(100),
+            timeout_ms: 1000,
+            retain_generations: 2,
+            resume_latest: true,
+            ..Default::default()
+        });
+        store.put_pipeline("periodic", &spec, None).unwrap();
+        sparrow_control::request_start(&store, "periodic", "test").unwrap();
+        state.supervisor.converge_once().await.unwrap();
+        let id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(point) = sparrow_runtime::CheckpointStore::open(&checkpoint)
+                    .and_then(|s| s.recover_required())
+                {
+                    let (_, status) = call(&state, auth_get("/v1/pipelines/periodic/status")).await;
+                    if point.ingested_rows == 2
+                        && status["checkpoint"]["succeeded_total"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            > 0
+                    {
+                        break point.checkpoint_id;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (_, status) = call(&state, auth_get("/v1/pipelines/periodic/status")).await;
+        assert_eq!(status["checkpoint"]["available"], true);
+        let first_attempt = status["checkpoint"]["runtime_attempt_id"].clone();
+        assert_eq!(status["checkpoint"]["policy"]["interval_ms"], 100);
+        assert!(status["checkpoint"]["succeeded_total"].as_u64().unwrap() > 0);
+        let (code, inventory) = call(&state, auth_get("/v1/pipelines/periodic/checkpoints")).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(inventory["scope"], "running_attempt");
+        assert!(
+            inventory["storage"]["generations"]
+                .as_array()
+                .unwrap()
+                .len()
+                <= 2
+        );
+        state.supervisor.stop_all().await;
+        let current = std::fs::read(checkpoint.join("CURRENT")).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            std::fs::read(checkpoint.join("CURRENT")).unwrap(),
+            current,
+            "old scheduler must stop"
+        );
+        let (_, inventory) = call(&state, auth_get("/v1/pipelines/periodic/checkpoints")).await;
+        assert_eq!(inventory["scope"], "stored_latest_revision");
+        // Automatic resume is opt-in; no RestoreSpec needs to be injected.
+        sparrow_control::request_start(&store, "periodic", "test").unwrap();
+        state.supervisor.converge_once().await.unwrap();
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{{\"device_id\":\"d\",\"v\":30}}").unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, status) = call(&state, auth_get("/v1/pipelines/periodic/status")).await;
+                if status["observation"]["delivery"]["completed_rows_total"] == 1 {
+                    assert_ne!(status["checkpoint"]["runtime_attempt_id"], first_attempt);
+                    assert!(
+                        status["checkpoint"]["restored_from_checkpoint"]
+                            .as_u64()
+                            .unwrap()
+                            >= id
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state.supervisor.stop_all().await;
+        assert_eq!(kernel.process_owner().usage().physical_bytes, 0);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(checkpoint).unwrap();
+    });
+}
+
+#[test]
+fn production_diagnostic_export_is_allowlisted_and_auth_precedes_body_processing() {
+    let kernel = Arc::new(sparrow_control::host_kernel_with_max_jobs(1).unwrap());
+    kernel.block_on(async {
+        let store = Arc::new(Store::open_memory().unwrap());
+        store.put_stream("sensors", STREAM).unwrap();
+        let supervisor =
+            sparrow_control::Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        let state = AppState {
+            store: store.clone(),
+            supervisor,
+            token: Arc::new(TOKEN.into()),
+            safe_mode: false,
+        };
+        let path = tmp("production-diagnostic.ndjson");
+        let mut spec = restart_file_spec(&path);
+        spec.sql = Some("SELECT device_id FROM sensors WHERE device_id = 'never_export_me'".into());
+        store.put_pipeline("diagnostic", &spec, None).unwrap();
+        store
+            .audit(
+                "never_export_me",
+                "put_pipeline",
+                Some("diagnostic"),
+                Some("never_export_me"),
+                "ok",
+            )
+            .unwrap();
+        let (code, value) = call(&state, auth_get("/v1/pipelines/diagnostic/diagnose")).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(value["format"], "sparrow-diagnostic-v1");
+        let bytes = serde_json::to_string(&value).unwrap();
+        assert!(!bytes.contains("never_export_me"));
+        assert!(!bytes.contains(TOKEN));
+        assert!(bytes.len() < 128 * 1024);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/validate")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b'x'; 128 * 1024]))
+            .unwrap();
+        let (code, _) = call(&state, request).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, _) = call(
+            &state,
+            auth_post(
+                "/v1/pipelines/diagnostic/restore",
+                r#"{"snapshot_id":"bad"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(store.get_pipeline("diagnostic").unwrap().latest_revision, 1);
+    });
+}
+
+#[test]
 fn r9_status_schema_cache_invalidation_and_shared_histogram_contract() {
     let kernel = Arc::new(sparrow_control::host_kernel_with_max_jobs(1).unwrap());
     kernel.block_on(async {

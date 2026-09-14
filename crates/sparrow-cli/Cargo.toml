@@ -6,20 +6,21 @@ license.workspace = true
 description = "Thin composition root: wires connectors to sparrow-runtime without adding I/O deps to the kernel"
 
 [features]
-default = ["demo-io"]
-demo-io = ["sparrow-connectors/demo-io"]
+default = ["demo-io", "examples"]
+demo-io = ["examples", "sparrow-connectors/demo-io"]
+examples = ["dep:sparrow-model", "dep:sparrow-expr", "dep:sparrow-plan", "dep:sparrow-io", "dep:sparrow-runtime", "dep:sparrow-formats", "dep:sparrow-connectors", "dep:sparrow-testkit", "dep:tokio-util"]
 
 [dependencies]
-sparrow-model = { path = "../sparrow-model" }
-sparrow-expr = { path = "../sparrow-expr" }
-sparrow-plan = { path = "../sparrow-plan" }
-sparrow-io = { path = "../sparrow-io" }
-sparrow-runtime = { path = "../sparrow-runtime" }
-sparrow-formats = { path = "../sparrow-formats" }
-sparrow-connectors = { path = "../sparrow-connectors", default-features = false }
-sparrow-testkit = { path = "../sparrow-testkit" }
+sparrow-model = { path = "../sparrow-model", optional = true }
+sparrow-expr = { path = "../sparrow-expr", optional = true }
+sparrow-plan = { path = "../sparrow-plan", optional = true }
+sparrow-io = { path = "../sparrow-io", optional = true }
+sparrow-runtime = { path = "../sparrow-runtime", optional = true }
+sparrow-formats = { path = "../sparrow-formats", optional = true }
+sparrow-connectors = { path = "../sparrow-connectors", default-features = false, optional = true }
+sparrow-testkit = { path = "../sparrow-testkit", optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, optional = true }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
@@ -31,18 +32,22 @@ required-features = ["demo-io"]
 [[bin]]
 name = "v02_pt_tumble_avg"
 path = "src/bin/v02_pt_tumble_avg.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v02_count_window"
 path = "src/bin/v02_count_window.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v02_bounded_dedup"
 path = "src/bin/v02_bounded_dedup.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v02_static_table"
 path = "src/bin/v02_static_table.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v02_http_mqtt_loop"
@@ -52,42 +57,56 @@ required-features = ["demo-io"]
 [[bin]]
 name = "v03_et_tumble_avg"
 path = "src/bin/v03_et_tumble_avg.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v03_hop_overlap"
 path = "src/bin/v03_hop_overlap.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v03_idle_active"
 path = "src/bin/v03_idle_active.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v03_versioned_lookup"
 path = "src/bin/v03_versioned_lookup.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v04_file_checkpoint"
 path = "src/bin/v04_file_checkpoint.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v04_mqtt_reject"
 path = "src/bin/v04_mqtt_reject.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v04_graph_author"
 path = "src/bin/v04_graph_author.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v1_file_checkpoint"
 path = "src/bin/v1_file_checkpoint.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v1_mqtt_reject"
 path = "src/bin/v1_mqtt_reject.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "v1_soak"
 path = "src/bin/v1_soak.rs"
+required-features = ["examples"]
+
+[[bin]]
+name = "sparrowctl"
+path = "src/bin/sparrowctl.rs"
 
 [[bin]]
 name = "sparrow_bench"

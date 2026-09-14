@@ -1,5 +1,10 @@
 # Sparrow V1 report
 
+> Historical report for the build/date below, not certification of the current
+> candidate. Snapshot/state semantics and production operational features have
+> changed since this run; use [RUNTIME.md](RUNTIME.md) and
+> [PRODUCTION.md](PRODUCTION.md) for current contracts and matching evidence.
+
 Date: 2026-09-09  
 Host: `cargo test --workspace` + `scripts/v1-demo.sh` + `scripts/review-fix-demo.sh`
 

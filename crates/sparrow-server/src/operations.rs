@@ -1,0 +1,82 @@
+//! Bounded, authenticated operational views. No arbitrary file/log export.
+use super::*;
+
+pub(super) fn storage_json(s: &sparrow_runtime::checkpoint::CheckpointInventory) -> Value {
+    json!({"current":s.current,"pinned_for_attempt":s.pinned,"current_error_code":s.current_error.map(|e|e.as_str()),
+        "logical_file_bytes":s.bytes,"maintenance_error_code":s.maintenance_error.map(|e|e.as_str()),
+        "generations":s.generations.iter().map(|g|json!({"id":g.id,"bytes":g.bytes,"publication_proven":g.published,
+            "current":g.current,"compatibility":"checked_on_restore_not_by_listing"})).collect::<Vec<_>>()})
+}
+pub(super) fn checkpoint_status(state: &AppState, name: &str) -> Value {
+    let (revision, control) = match state.supervisor.checkpoint_snapshot(name) {
+        Ok(Some(s)) => s,
+        Ok(None) => return json!({"available":false,"reason":"no_active_aligned_attempt"}),
+        Err(_) => return json!({"available":false,"reason":"registry_busy"}),
+    };
+    let s = control.snapshot();
+    let mut value = json!({"available":true,"scope":"running_attempt","running_revision":revision,
+        "runtime_attempt_id":control.attempt,"policy":control.policy,
+        "active":s.active,"phase":s.phase,"last_trigger":s.last_trigger,
+        "started_total":s.started,"succeeded_total":s.succeeded,"failed_or_cancelled_total":s.failed,
+        "busy_requests_total":s.busy,"timed_out_waiters_total":s.timed_out_waiters,
+        "last_success_id":s.last_success_id,"restored_from_checkpoint":s.restored_from,
+        "last_error_code":s.last_error.map(|e|e.as_str())});
+    value["last_success_age_ms"] =
+        json!(s
+            .last_success_at
+            .map(|at| at.elapsed().as_millis().min(u64::MAX as u128) as u64));
+    value["storage"] = s.storage.as_ref().map(storage_json).unwrap_or(Value::Null);
+    value["contract"] = json!({"missed_ticks":"skip","interval_is_rpo_guarantee":false,
+        "waiter_timeout_cancels_blocking_commit":false,"automatic_replay_default":false,
+        "metadata_scope":"bounded_control_plane_not_payload_memory","snapshot":"attempt_local_component"});
+    value
+}
+
+pub(super) async fn checkpoints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_auth(&state, &headers)?;
+    let view = state
+        .supervisor
+        .checkpoint_inventory(&name)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        json!({"name":name,"revision":view.revision,"runtime_attempt_id":view.attempt,
+        "scope":view.scope,"storage_sample":view.storage_sample,"storage":storage_json(&view.storage),"listing_changes_current":false}),
+    ))
+}
+
+pub(super) async fn diagnose(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_auth(&state, &headers)?;
+    blocking_api(move || {
+        let body = status_body(&state, &name)?;
+        let audit = state.store.list_audit(64).map_err(ApiError::from)?;
+        let events: Vec<_> = audit.into_iter().filter(|e|e.target.as_deref()==Some(&name)).take(32)
+            .map(|e|json!({"at_ms":e.at_ms,"action":e.action,"outcome":e.outcome})).collect();
+        // Allowlist fields. Raw specs/SQL, destinations, SecretRefs, last_error
+        // strings and audit details can contain user data and are not exported.
+        let value = json!({"format":"sparrow-diagnostic-v1","name":name,
+            "build":{"package":env!("CARGO_PKG_VERSION"),"commit":option_env!("SPARROW_BUILD_COMMIT").unwrap_or("unknown"),
+                "demo_enabled":cfg!(feature="demo-io")},
+            "revision":body["revision"],
+            "actual":{"revision":body["actual"]["revision"],"status":body["actual"]["status"],
+                "consecutive_failures":body["actual"]["consecutive_failures"],"restart_blocked":body["actual"]["restart_blocked"]},
+            "effective":{"aligned_eligible":body["effective"]["aligned_eligible"],"recovery":body["effective"]["recovery"]},
+            "observation":body["observation"],"mailboxes":body["mailboxes"],"checkpoint":body["checkpoint"],
+            "histogram_contract":body["histogram_contract"],
+            "logs":{"kind":"bounded_audit_summaries","events":events,"free_form_logs_included":false,
+                "selection_scope":"latest_64_global_audit_events_then_target_filter","returned_limit":32,"empty_does_not_imply_no_history":true},
+            "redaction":"allowlisted_fields_no_raw_spec_sql_destinations_secrets_or_free_form_errors"});
+        if serde_json::to_vec(&value).map_err(|_|ApiError::from(SparrowError::new(ErrorCode::Internal,"diagnostic encoding")))?.len() > 128 * 1024 {
+            return Err(ApiError::from(SparrowError::new(ErrorCode::BoundExceeded,"diagnostic bundle exceeds 128 KiB")));
+        }
+        Ok(Json(value))
+    }).await
+}

@@ -10,7 +10,7 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 - Event-time tumbling + hopping windows, watermarks, holdback, late side output
 - Processing-time tumbling windows and count windows (arrival-order; they do **not** impersonate event-time)
 - Incremental COUNT/SUM/AVG/MIN/MAX (checked integer overflow)
-- Versioned as-of-event-time lookup (checkpoint binds table revision)
+- Versioned as-of-event-time lookup in embedded plans (not eligible for current Server aligned restore)
 - **Production** aligned single-job checkpoint (`aligned`) for a Replayable **File** source only — **not** default exactly-once
 - Recover only from verified committed checkpoints; missing/corrupt stores are rejected
 - MQTT replay is **unsupported**; MQTT cannot pretend durable restore
@@ -35,7 +35,8 @@ ordinals, not timestamps); PT/ET retain `window_start` / `window_end`.
 
 ## Quick start
 
-Requires a recent stable Rust toolchain (edition 2021). Uses the host default toolchain (no pinned rust-toolchain.toml).
+Rust **1.98.0** is pinned in `rust-toolchain.toml` (edition 2021).
+The production package profile is Linux x86_64; other targets need separate validation.
 
 ```bash
 export SPARROW_TOKEN=dev-token
@@ -69,6 +70,53 @@ File/replay pipelines may set `"recovery":"aligned"` and restore from a
 committed checkpoint via the **HTTP API** (`/start`, `/checkpoint`,
 `/restore`, `/kill`). This is **not** exactly-once. MQTT + `aligned` is
 still rejected.
+
+### Production operations candidate
+
+See [`docs/PRODUCTION.md`](docs/PRODUCTION.md) for fixed no-demo builds,
+deployment templates, authentication, backup/upgrade/rollback and fault handling.
+
+```bash
+bash scripts/production-build.sh /absolute/new/package
+# Production client: no embedded Kernel or demo/testkit dependencies.
+cargo build --locked --release -p sparrow-cli --bin sparrowctl --no-default-features
+sparrowctl status hot
+sparrowctl diagnose hot --output new-diagnostic.json
+sparrowctl checkpoints hot
+```
+
+File + an eligible single Count/ET window can opt into periodic checkpoints with
+`checkpoint.interval_ms`; `checkpoint.resume_latest=true` explicitly enables
+automatic replay. Both are off by default. Waiter timeout does not cancel an
+already-running durable filesystem commit. Numeric restore points are pinned
+for the attempt/configuration that depends on them. None of this promises
+exactly-once, a hard RPO, 72-hour stability or target-device certification.
+
+`effective.aligned_eligible` is based on a bound plan. Without successful
+binding it can be `null` (unknown), not optimistic `true`; clients must distinguish
+unknown from eligible. Status describes the latest stored revision, not an older
+running attempt. Check the reason field before enabling restore operations.
+
+## Diagnose a running pipeline
+
+```bash
+curl -s -H "Authorization: Bearer $SPARROW_TOKEN" \
+  http://127.0.0.1:43180/v1/pipelines/hot/status | \
+  jq '{actual, observation, mailboxes}'
+```
+
+`observation` separates connection/progress, Source inbox, Sink outbox, HTTP
+in-flight/encoded credit and bounded latency histograms for the **running
+attempt**. A quiet input is not automatically unhealthy; File append EOF is
+`waiting_for_append`. Unknown ages and insufficient percentile samples are null.
+The old `queue_metrics_available=false` gauges remain unavailable: use the new
+boundary views and Runtime `mailboxes`, not legacy zeroes. HTTP 2xx is not a
+business acknowledgement, and histogram percentiles are bucket upper bounds,
+not exact per-row p99. Contracts and test scope: [`docs/RUNTIME.md`](docs/RUNTIME.md).
+Histogram bucket boundaries and quantile rules are shared once at the response's
+top-level `histogram_contract` (status and metrics), rather than repeated inside
+each histogram. Runtime progress counters are independently sampled; delivery
+and queue conservation snapshots remain internally coherent.
 
 ## Build & test
 

@@ -49,7 +49,11 @@ pub enum FilePoll {
     Eof,
 }
 
-enum FramePoll { Frame(SourceFrame), Pending, Eof }
+enum FramePoll {
+    Frame(SourceFrame),
+    Pending,
+    Eof,
+}
 
 impl FileContract {
     /// Terminal watermark for a sealed/finite file. Large enough to close
@@ -146,6 +150,12 @@ impl FileReplaySource {
             )
         })?;
         let size = meta.len();
+        if !meta.is_file() {
+            return Err(ConnectorError::new(
+                ErrorCode::InvalidArgument,
+                "file replay requires a regular file",
+            ));
+        }
         let mut f = File::open(&path).map_err(|e| {
             ConnectorError::new(
                 ErrorCode::InvalidArgument,
@@ -181,6 +191,61 @@ impl FileReplaySource {
 
     pub fn identity(&self) -> &SourceIdentity {
         &self.identity
+    }
+
+    /// A durable cut must cover bytes appended since open, not just the
+    /// initial (possibly empty) file. This is cold I/O: call off the executor.
+    /// Fingerprints remain bounded prefix/middle/suffix samples, not a full
+    /// cryptographic integrity proof against arbitrary in-place modifications.
+    pub fn checkpoint_position(&self) -> ModelResult<SourcePosition> {
+        let io = |e: std::io::Error| {
+            SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                format!("checkpoint file identity: {e}"),
+            )
+        };
+        if !fs::metadata(&self.path).map_err(io)?.is_file() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "checkpoint source is not a regular file",
+            ));
+        }
+        let mut probe = File::open(&self.path).map_err(io)?;
+        let meta = probe.metadata().map_err(io)?;
+        if !meta.is_file() || meta.len() < self.offset {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "checkpoint source truncated or not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let opened = self.file.get_ref().metadata().map_err(io)?;
+            if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+                return Err(SparrowError::new(
+                    ErrorCode::UnsupportedRestore,
+                    "checkpoint source path replaced while old descriptor is active",
+                ));
+            }
+        }
+        self.check_identity(&self.identity)
+            .map_err(|e| SparrowError::new(e.code, e.to_string()))?;
+        let size = if self.contract == FileContract::AppendOnly {
+            self.offset
+        } else {
+            meta.len()
+        };
+        let fingerprint = content_fingerprint(&mut probe, size).map_err(io)?;
+        Ok(SourcePosition {
+            offset_bytes: self.offset,
+            record_index: self.record_index,
+            identity: SourceIdentity::file(
+                self.path.to_string_lossy().into_owned(),
+                size,
+                fingerprint,
+            ),
+        })
     }
 
     pub fn decode_frame(&self, frame: &SourceFrame) -> ModelResult<Option<Row>> {
@@ -350,33 +415,49 @@ impl FileReplaySource {
         self.record_index += 1;
         self.record_bytes = 0;
         if std::mem::take(&mut self.discarding) {
-            return Err(SparrowError::new(ErrorCode::MaxRecordSize,
-                format!("record exceeds {MAX_RECORD}B; skipped to next boundary")));
+            return Err(SparrowError::new(
+                ErrorCode::MaxRecordSize,
+                format!("record exceeds {MAX_RECORD}B; skipped to next boundary"),
+            ));
         }
-        if self.pending.last() == Some(&b'\n') { self.pending.pop(); }
-        if self.pending.last() == Some(&b'\r') { self.pending.pop(); }
-        if self.pending.is_empty() { return Ok(None); }
+        if self.pending.last() == Some(&b'\n') {
+            self.pending.pop();
+        }
+        if self.pending.last() == Some(&b'\r') {
+            self.pending.pop();
+        }
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
         Ok(Some(SourceFrame::new(std::mem::take(&mut self.pending), 0)))
     }
 
     fn read_frame(&mut self, mut scan_budget: usize) -> ModelResult<FramePoll> {
         loop {
-            if scan_budget == 0 { return Ok(FramePoll::Pending); }
-            let available = self.file.fill_buf().map_err(|e| {
-                SparrowError::new(ErrorCode::Internal, format!("read file: {e}"))
-            })?;
+            if scan_budget == 0 {
+                return Ok(FramePoll::Pending);
+            }
+            let available = self
+                .file
+                .fill_buf()
+                .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("read file: {e}")))?;
             if available.is_empty() {
                 // Keep a partial record on the same descriptor. A later read
                 // sees append data without rereading bytes already in pending.
                 if !self.contract.eof_is_terminal() || self.record_bytes == 0 {
                     return Ok(FramePoll::Eof);
                 }
-                return Ok(self.finish_record()?.map_or(FramePoll::Eof, FramePoll::Frame));
+                return Ok(self
+                    .finish_record()?
+                    .map_or(FramePoll::Eof, FramePoll::Frame));
             }
             let available = &available[..available.len().min(scan_budget)];
             let newline = available.iter().position(|&b| b == b'\n');
             let take = newline.map_or(available.len(), |i| i + 1);
-            let payload_len = self.pending.len().saturating_add(take)
+            let payload_len = self
+                .pending
+                .len()
+                .saturating_add(take)
                 .saturating_sub(usize::from(newline.is_some()));
             if payload_len > MAX_PENDING || self.discarding {
                 self.pending.clear();
@@ -388,7 +469,9 @@ impl FileReplaySource {
             scan_budget -= take;
             self.record_bytes += take as u64;
             if newline.is_some() {
-                if let Some(frame) = self.finish_record()? { return Ok(FramePoll::Frame(frame)); }
+                if let Some(frame) = self.finish_record()? {
+                    return Ok(FramePoll::Frame(frame));
+                }
             }
         }
     }
@@ -446,7 +529,9 @@ impl ReplayableSource for FileReplaySource {
             probe
                 .read_exact(&mut prev)
                 .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("seek read: {e}")))?;
-            if prev[0] != b'\n' && !(self.contract.eof_is_terminal() && pos.offset_bytes == live.size) {
+            if prev[0] != b'\n'
+                && !(self.contract.eof_is_terminal() && pos.offset_bytes == live.size)
+            {
                 return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
                     format!(
@@ -494,6 +579,48 @@ mod tests {
     use super::*;
     use sparrow_model::{DataType, Field, FieldId, SchemaId};
 
+    #[test]
+    fn production_empty_open_append_checkpoint_binds_consumed_prefix() {
+        let path = tmp("production-growing-cut");
+        fs::write(&path, b"").unwrap();
+        let mut cfg = FileReplayConfig::new(&path, schema());
+        cfg.contract = FileContract::AppendOnly;
+        let mut source = FileReplaySource::open(&cfg).unwrap();
+        fs::write(&path, b"{\"device_id\":\"d\",\"v\":1}\n").unwrap();
+        assert!(matches!(source.poll_decoded().unwrap(), FilePoll::Row(_)));
+        let point = source.checkpoint_position().unwrap();
+        assert!(point.identity.size > 0);
+        assert_eq!(point.identity.size, point.offset_bytes);
+        let mut resumed = FileReplaySource::open(&cfg).unwrap();
+        resumed.seek(&point).unwrap();
+        fs::write(&path, b"{\"device_id\":\"d\",\"v\":9}\n").unwrap();
+        let mut changed = FileReplaySource::open(&cfg).unwrap();
+        assert_eq!(
+            changed.seek(&point).unwrap_err().code,
+            ErrorCode::UnsupportedRestore
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_checkpoint_rejects_replaced_active_file_descriptor() {
+        let path = tmp("production-rotation");
+        fs::write(&path, b"").unwrap();
+        let mut cfg = FileReplayConfig::new(&path, schema());
+        cfg.contract = FileContract::AppendOnly;
+        let source = FileReplaySource::open(&cfg).unwrap();
+        let old = path.with_extension("old");
+        fs::rename(&path, &old).unwrap();
+        fs::write(&path, b"").unwrap();
+        assert_eq!(
+            source.checkpoint_position().unwrap_err().code,
+            ErrorCode::UnsupportedRestore
+        );
+        fs::remove_file(path).unwrap();
+        fs::remove_file(old).unwrap();
+    }
+
     fn schema() -> Schema {
         Schema::new(
             SchemaId::new(1),
@@ -522,7 +649,11 @@ mod tests {
         let bad = "x".repeat(70 * 1024);
         let body = format!("{bad}\n\r\n{{\"device_id\":\"ok\",\"v\":1}}\r\n");
         fs::write(&path, &body).unwrap();
-        for contract in [FileContract::AppendOnly, FileContract::Sealed, FileContract::Immutable] {
+        for contract in [
+            FileContract::AppendOnly,
+            FileContract::Sealed,
+            FileContract::Immutable,
+        ] {
             let mut cfg = FileReplayConfig::new(&path, schema());
             cfg.contract = contract;
             let mut src = FileReplaySource::open(&cfg).unwrap();
@@ -545,7 +676,11 @@ mod tests {
         use std::io::Write;
         let path = tmp("r4-large-partial");
         fs::write(&path, vec![b'x'; 1024 * 1024]).unwrap();
-        for contract in [FileContract::AppendOnly, FileContract::Sealed, FileContract::Immutable] {
+        for contract in [
+            FileContract::AppendOnly,
+            FileContract::Sealed,
+            FileContract::Immutable,
+        ] {
             let mut cfg = FileReplayConfig::new(&path, schema());
             cfg.contract = contract;
             let mut src = FileReplaySource::open(&cfg).unwrap();
@@ -559,7 +694,9 @@ mod tests {
                 assert_eq!(src.position().offset_bytes, 1024 * 1024);
                 assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Eof));
             } else {
-                for _ in 0..3 { assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Eof)); }
+                for _ in 0..3 {
+                    assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Eof));
+                }
                 assert_eq!(src.position().offset_bytes, 0);
             }
         }
@@ -569,7 +706,9 @@ mod tests {
         while matches!(src.poll_decoded().unwrap(), FilePoll::Pending) {}
         let cut = src.position();
         let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        append.write_all(b"x\n{\"device_id\":\"ok\",\"v\":1}\n").unwrap();
+        append
+            .write_all(b"x\n{\"device_id\":\"ok\",\"v\":1}\n")
+            .unwrap();
         append.flush().unwrap();
         assert!(matches!(src.poll_decoded().unwrap(), FilePoll::DecodeError));
         assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Row(_)));
@@ -584,7 +723,11 @@ mod tests {
     fn r3_partial_append_is_bounded_and_resumes_exactly_once() {
         use std::io::Write;
         let path = tmp("r3-half");
-        fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d2\",").unwrap();
+        fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d2\",",
+        )
+        .unwrap();
         let mut cfg = FileReplayConfig::new(&path, schema());
         cfg.contract = FileContract::AppendOnly;
         let mut src = FileReplaySource::open(&cfg).unwrap();
@@ -596,9 +739,13 @@ mod tests {
             assert!(src.pending.len() < 64);
         }
         let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writer.write_all(b"\"v\":2}\n{\"device_id\":\"d3\",\"v\":3}\n").unwrap();
+        writer
+            .write_all(b"\"v\":2}\n{\"device_id\":\"d3\",\"v\":3}\n")
+            .unwrap();
         for expected in [2, 3] {
-            let FilePoll::Row(row) = src.poll_decoded().unwrap() else { panic!("missing row") };
+            let FilePoll::Row(row) = src.poll_decoded().unwrap() else {
+                panic!("missing row")
+            };
             assert_eq!(row.values[1], sparrow_model::Scalar::Int64(expected));
         }
         assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Eof));
@@ -610,11 +757,17 @@ mod tests {
     fn r3_terminal_unterminated_record_and_restore_boundary() {
         for contract in [FileContract::Sealed, FileContract::Immutable] {
             let path = tmp("r3-last");
-            fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d2\",\"v\":2}").unwrap();
+            fs::write(
+                &path,
+                b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d2\",\"v\":2}",
+            )
+            .unwrap();
             let mut cfg = FileReplayConfig::new(&path, schema());
             cfg.contract = contract;
             let mut src = FileReplaySource::open(&cfg).unwrap();
-            for _ in 0..2 { assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Row(_))); }
+            for _ in 0..2 {
+                assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Row(_)));
+            }
             let cut = src.position();
             assert_eq!(cut.offset_bytes, fs::metadata(&path).unwrap().len());
             assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Eof));
@@ -830,8 +983,11 @@ mod tests {
     fn n14_append_only_batch_eof_then_growth() {
         use std::io::Write;
         let path = tmp("n14-append");
-        std::fs::write(&path, b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            b"{\"device_id\":\"d1\",\"v\":1}\n{\"device_id\":\"d1\",\"v\":2}\n",
+        )
+        .unwrap();
         let mut cfg = FileReplayConfig::new(&path, schema());
         cfg.contract = FileContract::AppendOnly;
         let mut src = FileReplaySource::open(&cfg).unwrap();

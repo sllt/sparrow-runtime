@@ -27,5 +27,5 @@ ring = "0.17"
 tracing = { version = "0.1.44", default-features = false }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 sparrow-testkit = { path = "../sparrow-testkit" }

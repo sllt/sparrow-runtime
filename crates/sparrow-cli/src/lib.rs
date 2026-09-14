@@ -1,5 +1,6 @@
 //! Composition root for M2. MQTT/HTTP crates are dependencies of *this*
 //! crate, not of `sparrow-runtime`.
+#![cfg(feature = "examples")]
 
 use sparrow_connectors::{
     HttpSink, HttpSinkConfig, IoDiagnostics, MapSecretResolver, MqttSource, MqttSourceConfig,

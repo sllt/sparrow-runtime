@@ -101,7 +101,8 @@ impl MemoryOwner {
             return Err(SparrowError::new(
                 ErrorCode::ResourceExhausted,
                 format!(
-                    "{}: {kind} headroom exhausted: used={used} request={bytes} cap={cap}", self.label,
+                    "{}: {kind} headroom exhausted: used={used} request={bytes} cap={cap}",
+                    self.label,
                     kind = kind.as_str()
                 ),
             )
@@ -141,7 +142,8 @@ impl MemoryOwner {
             return Err(SparrowError::new(
                 ErrorCode::ResourceExhausted,
                 format!(
-                    "{}: {kind} credits exhausted: used={used} request={bytes} cap={cap}", self.label,
+                    "{}: {kind} credits exhausted: used={used} request={bytes} cap={cap}",
+                    self.label,
                     kind = kind.as_str()
                 ),
             )
@@ -151,7 +153,11 @@ impl MemoryOwner {
             .context("request", bytes.to_string())
             .context("cap", cap.to_string()));
         }
-        let parent_lease = self.parent.as_ref().map(|p| p.acquire(kind, bytes)).transpose()?;
+        let parent_lease = self
+            .parent
+            .as_ref()
+            .map(|p| p.acquire(kind, bytes))
+            .transpose()?;
         self.ledger(kind).fetch_add(bytes, Ordering::SeqCst);
         let physical = self.physical.fetch_add(bytes, Ordering::SeqCst) + bytes;
         self.peak_physical.fetch_max(physical, Ordering::SeqCst);
@@ -211,21 +217,57 @@ impl MemoryLease {
 
     /// Grow an exclusively owned allocation without temporarily billing it twice.
     pub fn grow_to(&mut self, bytes: usize) -> Result<()> {
-        if bytes <= self.alloc.bytes { return Ok(()); }
-        let alloc = Arc::get_mut(&mut self.alloc).ok_or_else(||
-            SparrowError::new(ErrorCode::Internal, "cannot grow a shared lease"))?;
+        if bytes <= self.alloc.bytes {
+            return Ok(());
+        }
+        let alloc = Arc::get_mut(&mut self.alloc)
+            .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "cannot grow a shared lease"))?;
         let extra = bytes - alloc.bytes;
         let _gate = self.owner.lock.lock().expect("memory owner lock");
         let used = self.owner.ledger(alloc.kind).load(Ordering::SeqCst);
         if used.saturating_add(extra) > self.owner.budget.cap(alloc.kind) {
-            return Err(SparrowError::new(ErrorCode::ResourceExhausted,
-                format!("{}: {} credits exhausted while growing to {bytes}",
-                    self.owner.label, alloc.kind.as_str())).retryable(true));
+            return Err(SparrowError::new(
+                ErrorCode::ResourceExhausted,
+                format!(
+                    "{}: {} credits exhausted while growing to {bytes}",
+                    self.owner.label,
+                    alloc.kind.as_str()
+                ),
+            )
+            .retryable(true));
         }
-        if let Some(parent) = &mut alloc.parent_lease { parent.grow_to(bytes)?; }
-        self.owner.ledger(alloc.kind).fetch_add(extra, Ordering::SeqCst);
+        if let Some(parent) = &mut alloc.parent_lease {
+            parent.grow_to(bytes)?;
+        }
+        self.owner
+            .ledger(alloc.kind)
+            .fetch_add(extra, Ordering::SeqCst);
         let physical = self.owner.physical.fetch_add(extra, Ordering::SeqCst) + extra;
-        self.owner.peak_physical.fetch_max(physical, Ordering::SeqCst);
+        self.owner
+            .peak_physical
+            .fetch_max(physical, Ordering::SeqCst);
+        alloc.bytes = bytes;
+        Ok(())
+    }
+
+    /// Refund an exclusive allocation after its payload has shrunk. Shared
+    /// handles cannot change the common bill; parent and child refund together.
+    pub fn shrink_to(&mut self, bytes: usize) -> Result<()> {
+        if bytes >= self.alloc.bytes {
+            return Ok(());
+        }
+        let alloc = Arc::get_mut(&mut self.alloc).ok_or_else(|| {
+            SparrowError::new(ErrorCode::Internal, "cannot shrink a shared lease")
+        })?;
+        let refund = alloc.bytes - bytes;
+        let _gate = self.owner.lock.lock().expect("memory owner lock");
+        if let Some(parent) = &mut alloc.parent_lease {
+            parent.shrink_to(bytes)?;
+        }
+        self.owner
+            .ledger(alloc.kind)
+            .fetch_sub(refund, Ordering::SeqCst);
+        self.owner.physical.fetch_sub(refund, Ordering::SeqCst);
         alloc.bytes = bytes;
         Ok(())
     }
@@ -269,6 +311,25 @@ mod tests {
             max_state_keys: 32,
             max_timers: 32,
         })
+    }
+
+    #[test]
+    fn r10_shrink_refunds_parent_and_child_but_never_shared_payloads() {
+        let parent = owner();
+        let child = MemoryOwner::child(parent.clone(), parent.budget(), "child");
+        let mut lease = child.acquire(CreditKind::Retention, 800).unwrap();
+        let shared = lease.share();
+        assert!(lease.shrink_to(100).is_err());
+        assert_eq!(parent.usage().retention_bytes, 800);
+        drop(shared);
+        lease.shrink_to(100).unwrap();
+        assert_eq!(parent.usage().retention_bytes, 100);
+        assert_eq!(child.usage().retention_bytes, 100);
+        assert_eq!(parent.usage().peak_physical_bytes, 800);
+        lease.grow_to(200).unwrap();
+        drop(lease);
+        assert_eq!(parent.usage().physical_bytes, 0);
+        assert_eq!(child.usage().physical_bytes, 0);
     }
 
     #[test]
