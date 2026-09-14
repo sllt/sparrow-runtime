@@ -1684,6 +1684,7 @@ name = "sparrow-io"
 version = "0.1.0"
 dependencies = [
  "sparrow-model",
+ "tokio",
 ]
 
 [[package]]
@@ -1723,6 +1724,7 @@ dependencies = [
  "serde_json",
  "sparrow-connectors",
  "sparrow-control",
+ "sparrow-io",
  "sparrow-model",
  "sparrow-plan",
  "sparrow-runtime",

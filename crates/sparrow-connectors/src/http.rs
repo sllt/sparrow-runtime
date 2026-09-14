@@ -20,8 +20,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(feature = "demo-io")]
 use tokio::net::TcpStream;
+#[cfg(test)]
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use sparrow_io::observed::Receiver as ObservedReceiver;
+use sparrow_model::observation::{HealthState, Latency, DeliveryGuard, EncodedGuard};
 
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
@@ -33,6 +36,10 @@ use crate::tls::{http_client, TlsConfig};
 const MAX_OUTBOX: usize = 1024;
 const MAX_RETRIES: u32 = 8;
 const DELIVERY_OVERHEAD: usize = 512;
+
+#[cfg(test)]
+#[path = "mqtt/tls_fixture.rs"]
+mod observation_tls_fixture;
 
 #[derive(Clone, Debug)]
 pub struct HttpSinkConfig {
@@ -138,12 +145,14 @@ pub struct HttpSink {
 }
 
 struct Receipts {
+    observation: Option<DeliveryGuard>,
     batches: usize,
     outbox: Option<Arc<InflightCounter>>,
     diag: Arc<IoDiagnostics>,
 }
 impl Receipts {
     fn ack(&mut self) {
+        if let Some(guard)=&mut self.observation {guard.complete();}
         if let Some(outbox) = &self.outbox {
             for _ in 0..self.batches {
                 outbox.ack();
@@ -169,6 +178,7 @@ impl Drop for Receipts {
 }
 
 struct Delivery {
+    encoded_credit: EncodedGuard,
     bytes: Vec<u8>,
     lease: MemoryLease,
     schema: Arc<Schema>,
@@ -204,6 +214,7 @@ impl Delivery {
             if self.lease.grow_to(capacity + DELIVERY_OVERHEAD).is_err() {
                 return Err(MergeFailure::Separate(next));
             }
+            self.encoded_credit.resize(self.lease.bytes());
             if self
                 .bytes
                 .try_reserve_exact(capacity - self.bytes.len())
@@ -226,6 +237,7 @@ impl Delivery {
                     .fetch_add(self.receipts.batches as u64, Ordering::Relaxed);
                 return Err(MergeFailure::DiscardGroup(next));
             }
+            self.encoded_credit.resize(self.lease.bytes());
         }
         self.bytes.pop();
         if comma != 0 {
@@ -236,6 +248,7 @@ impl Delivery {
         self.bytes.push(b']');
         self.rows += next.rows;
         self.receipts.batches += next.receipts.batches;
+        if let (Some(guard),Some(other))=(&mut self.receipts.observation,next.receipts.observation.take()){guard.merge(other);}
         next.receipts.batches = 0;
         Ok(())
     }
@@ -271,10 +284,13 @@ impl HttpSink {
 
     pub async fn run(
         self,
-        mut rx: mpsc::Receiver<RowBatch>,
+        rx: impl Into<ObservedReceiver<RowBatch>>,
         cancel: CancellationToken,
         outbox: Option<Arc<InflightCounter>>,
     ) {
+        let mut rx=rx.into();
+        let _lifecycle=self.diag.observation.lifecycle(false);
+        self.diag.observation.health(false,HealthState::Ready,"http_request_ready_not_connected",None);
         let sink = Arc::new(self);
         let mut tasks = tokio::task::JoinSet::new();
         let mut group: Option<Delivery> = None;
@@ -301,9 +317,13 @@ impl HttpSink {
                     || g.first.elapsed() >= sink.config.linger
             }) && tasks.len() < sink.config.max_inflight
             {
-                let mut delivery = group.take().unwrap();
+                let delivery = group.take().unwrap();
                 let worker = sink.clone();
                 tasks.spawn(async move {
+                    // Move the WHOLE group into the future. Rust 2021 disjoint
+                    // field capture otherwise takes only bytes/receipts and
+                    // drops lease/encoded_credit before the request completes.
+                    let mut delivery = delivery;
                     worker.diag.http_inflight.fetch_add(1, Ordering::Relaxed);
                     let _inflight = HttpInflight(worker.diag.clone());
                     if worker
@@ -360,8 +380,9 @@ impl HttpSink {
         drop(group);
         drop(carry);
         tasks.shutdown().await;
-        while let Ok(_batch) = rx.try_recv() {
+        while let Ok(_batch) = rx.discard_next() {
             drop(Receipts {
+                observation: None,
                 batches: 1,
                 outbox: outbox.clone(),
                 diag: sink.diag.clone(),
@@ -375,7 +396,9 @@ impl HttpSink {
         outbox: Option<Arc<InflightCounter>>,
     ) -> Option<Delivery> {
         let first = tokio::time::Instant::now();
+        let _encode=self.diag.observation.timer(Latency::Encode);
         let receipts = Receipts {
+            observation:Some(self.diag.observation.delivery_guard(batch.num_rows(),batch.tracked_bytes(),batch.origin())),
             batches: 1,
             outbox,
             diag: self.diag.clone(),
@@ -387,17 +410,20 @@ impl HttpSink {
             .owner()
             .acquire(CreditKind::Reservation, DELIVERY_OVERHEAD)
             .map_err(|error| {
+                self.diag.observation.health(false,HealthState::Failed,"http_encode_budget",Some(error.code));
                 self.diag.http_budget_drops.fetch_add(1, Ordering::Relaxed);
                 error
             })
             .ok()?;
+        let mut encoded_credit=self.diag.observation.encoded_credit(lease.bytes());
         let bytes = encode_json_batch_bounded_with_capacity(
             batch.schema(),
             batch.rows(),
             self.config.batch_bytes,
-            |capacity| lease.grow_to(capacity + DELIVERY_OVERHEAD),
+            |capacity| {lease.grow_to(capacity+DELIVERY_OVERHEAD)?;encoded_credit.resize(lease.bytes());Ok(())},
         )
         .map_err(|error| {
+            self.diag.observation.health(false,HealthState::Failed,"http_encode_failed",Some(error.code));
             if error.code == ErrorCode::ResourceExhausted {
                 self.diag.http_budget_drops.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -407,6 +433,7 @@ impl HttpSink {
         })
         .ok()?;
         Some(Delivery {
+            encoded_credit,
             bytes,
             lease,
             schema: batch.schema_arc(),
@@ -434,35 +461,49 @@ impl HttpSink {
         }
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
+                self.diag.observation.health(false,HealthState::Reconnecting,"http_retry_backoff",None);
                 self.diag.http_retries.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(self.config.retry_backoff).await;
             }
             let Some(req) = template.try_clone() else {
+                self.diag.observation.health(false,HealthState::Failed,"http_request_build_failed",Some(ErrorCode::InvalidArgument));
                 // Invalid request construction (for example a malformed header)
                 // fails delivery; it must not panic the sink task.
                 self.diag.http_failed.fetch_add(1, Ordering::Relaxed);
                 return false;
             };
-            match req.send().await {
+            let mut request_observation=self.diag.observation.request();
+            let started=std::time::Instant::now();
+            let response=req.send().await;
+            self.diag.observation.record(Latency::HttpHeaders,started.elapsed());
+            match response {
                 Ok(mut resp) if resp.status().is_success() => {
+                    self.diag.observation.health(false,HealthState::Ready,"http_2xx_headers",None);
+                    self.diag.observation.progress(false,1);
                     // Consume small response bodies so reqwest can reuse HTTP/1.1
                     // connections. A 2xx already accepted the POST: a malformed or
                     // oversized response must not cause a duplicate retry.
                     let mut drained = 0usize;
-                    while let Ok(Some(chunk)) = resp.chunk().await {
-                        drained = drained.saturating_add(chunk.len());
-                        if drained > 64 * 1024 {
-                            break;
-                        }
-                    }
+                    let body_started=std::time::Instant::now();
+                    let complete=loop {match resp.chunk().await {
+                        Ok(Some(chunk))=>{drained=drained.saturating_add(chunk.len());if drained>64*1024{break false;}},
+                        Ok(None)=>break true,Err(_)=>break false,
+                    }};
+                    if complete {self.diag.observation.record(Latency::HttpBody,body_started.elapsed());}
+                    else {self.diag.observation.body_incomplete();}
+                    request_observation.finish();
                     return true;
                 }
                 Ok(resp) if resp.status().is_client_error() => {
+                    request_observation.finish();
+                    self.diag.observation.health(false,HealthState::Failed,"http_4xx",Some(ErrorCode::Internal));
                     // Do not retry 4xx (P1-22).
                     self.diag.http_failed.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
                 Ok(_) | Err(_) => {
+                    request_observation.finish();
+                    self.diag.observation.health(false,HealthState::Failed,"http_transport_or_server_error",Some(ErrorCode::Internal));
                     self.diag.http_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1325,6 +1366,8 @@ mod tests {
                 .unwrap();
         });
         let diag = IoDiagnostics::new();
+        let observation_owner=MemoryOwner::new(ResourceBudget::compact());
+        diag.observation.initialize(&observation_owner).unwrap();
         let sink = HttpSink::bind(
             HttpSinkConfig::demo(format!("http://127.0.0.1:{port}/ingest")),
             &MapSecretResolver::empty(),
@@ -1334,7 +1377,73 @@ mod tests {
         .unwrap();
         assert!(sink.post_bytes(b"[]").await);
         assert_eq!(diag.http_retries.load(Ordering::Relaxed), 0);
+        assert_eq!(diag.observation.delivery().unwrap().body_incomplete,1);
+        let hist=diag.observation.histograms();
+        assert_eq!(hist.iter().find(|(name,_)|*name=="http_response_body").unwrap().1.count,0);
+        assert_eq!(hist.iter().find(|(name,_)|*name=="http_response_headers").unwrap().1.count,1);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn obs_verified_https_reuses_connection_and_default_trust_rejects_fixture() {
+        use rustls::pki_types::{pem::PemObject,CertificateDer,PrivateKeyDer};
+        let _=rustls::crypto::ring::default_provider().install_default();
+        let server=rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(
+            vec![CertificateDer::from_pem_slice(observation_tls_fixture::CERT).unwrap()],
+            PrivateKeyDer::from_pem_slice(observation_tls_fixture::KEY).unwrap()).unwrap();
+        let acceptor=tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+        let served=tokio::spawn(async move{
+            let (socket,_)=listener.accept().await.unwrap();
+            let mut stream=acceptor.accept(socket).await.unwrap();
+            for _ in 0..2 {
+                let mut bytes=Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n[]") {let mut chunk=[0u8;1024];let n=stream.read(&mut chunk).await.unwrap();assert!(n>0);bytes.extend_from_slice(&chunk[..n]);assert!(bytes.len()<4096);}
+                stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n").await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                stream.write_all(b"[]").await.unwrap();
+            }
+            let (socket,_)=listener.accept().await.unwrap();assert!(acceptor.accept(socket).await.is_err());
+        });
+        let owner=MemoryOwner::new(ResourceBudget::compact());let diag=IoDiagnostics::new();diag.observation.initialize(&owner).unwrap();
+        let mut cfg=HttpSinkConfig::demo(format!("https://localhost:{port}/ingest"));cfg.max_retries=0;
+        let mut sink=HttpSink::bind(cfg.clone(),&MapSecretResolver::empty(),&TargetPolicy::allow("localhost",port),diag.clone()).unwrap();
+        // Test-only trust anchor, normal verification remains enabled. Production
+        // does not acquire a skip-verify or user-CA option from this fixture.
+        sink.client=reqwest::Client::builder().timeout(Duration::from_secs(2)).redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(reqwest::Certificate::from_pem(observation_tls_fixture::CA).unwrap()).build().unwrap();
+        for _ in 0..2{assert!(tokio::time::timeout(Duration::from_secs(3),sink.post_bytes(b"[]")).await.unwrap());}
+        let hist=diag.observation.histograms();let body=&hist.iter().find(|(n,_)|*n=="http_response_body").unwrap().1;
+        assert_eq!(body.count,2);assert!(body.max_us>=10_000);
+        let untrusted=HttpSink::bind(cfg,&MapSecretResolver::empty(),&TargetPolicy::allow("localhost",port),diag.clone()).unwrap();
+        assert!(!tokio::time::timeout(Duration::from_secs(3),untrusted.post_bytes(b"[]")).await.unwrap());
+        assert_eq!(diag.observation.delivery().unwrap().active_http_requests,0);
+        assert_eq!(diag.observation.endpoints().unwrap().1.state,HealthState::Failed);
+        tokio::time::timeout(Duration::from_secs(3),served).await.unwrap().unwrap();
+    }
+
+    #[cfg(feature="demo-io")]
+    #[tokio::test]
+    async fn obs_http_coalescing_cancel_reconciles_groups_encoded_credit_and_attempts() {
+        let http=HttpCapture::start().await.unwrap();http.set_delay_ms(500);
+        let owner=MemoryOwner::new(ResourceBudget::compact());let diag=IoDiagnostics::new();diag.observation.initialize(&owner).unwrap();
+        let mut cfg=HttpSinkConfig::demo(http.url());cfg.batch_rows=4;cfg.linger=Duration::from_millis(10);cfg.max_inflight=2;
+        let sink=HttpSink::bind(cfg,&MapSecretResolver::empty(),&TargetPolicy::allow("127.0.0.1",http.port()),diag.clone()).unwrap();
+        let (tx,rx)=sparrow_io::observed::channel(16);let q=tx.observer().unwrap();q.initialize(&owner).unwrap();
+        for n in 0..12{tx.try_send(number_batch(&owner,n).with_origin(sparrow_model::observation::OriginSpan::at(std::time::Instant::now()))).unwrap();}
+        let cancel=CancellationToken::new();let task=tokio::spawn(sink.run(rx,cancel.clone(),None));
+        tokio::time::timeout(Duration::from_secs(2),async{loop{
+            if diag.observation.delivery().unwrap().active_http_requests==2{break;}tokio::task::yield_now().await;
+        }}).await.unwrap();
+        assert!(diag.observation.delivery().unwrap().encoded_credit_bytes>0);
+        assert!(owner.usage().reservation_bytes>0);
+        cancel.cancel();tokio::time::timeout(Duration::from_secs(2),task).await.unwrap().unwrap();
+        let d=diag.observation.delivery().unwrap();
+        assert_eq!((d.active_groups,d.active_rows,d.active_bytes,d.encoded_credit_bytes,d.active_http_requests),(0,0,0,0,0));
+        assert_eq!(d.accepted_rows,d.completed_rows+d.failed_rows);
+        assert_eq!(d.http_attempts_started,d.http_attempts_finished+d.http_attempts_cancelled);
+        assert!(d.http_attempts_cancelled>0);assert_eq!(q.snapshot().unwrap().items,0);
+        drop((tx,q,diag));http.stop().await;assert_eq!(owner.usage().physical_bytes,0);
     }
 
     #[cfg(feature = "demo-io")]

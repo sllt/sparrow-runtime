@@ -11,6 +11,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use sparrow_io::observed::Sender as ObservedSender;
+use sparrow_model::observation::{HealthState, Latency, OriginSpan};
 
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
@@ -119,11 +121,16 @@ impl HttpPushSource {
         self.addr.port()
     }
 
-    pub async fn run(self, tx: mpsc::Sender<Row>, cancel: CancellationToken) {
+    pub async fn run(self, tx: impl Into<ObservedSender<Row>>, cancel: CancellationToken) {
+        let tx=tx.into();
+        let _lifecycle=self.diag.observation.lifecycle(true);
+        self.diag.observation.health(true,HealthState::Ready,"http_listening",None);
+        let mut tasks=tokio::task::JoinSet::new();
         let slots = Arc::new(Semaphore::new(self.config.max_concurrent.max(1)));
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
+                _ = tasks.join_next(), if !tasks.is_empty() => {},
                 accept = self.listener.accept() => {
                     match accept {
                         Ok((stream, _)) => {
@@ -140,7 +147,7 @@ impl HttpPushSource {
                             let path = self.config.path.clone();
                             let read_timeout = self.config.read_timeout;
                             let child = cancel.clone();
-                            tokio::spawn(async move {
+                            tasks.spawn(async move {
                                 let _permit = permit;
                                 let _ = handle_push(
                                     stream,
@@ -154,11 +161,12 @@ impl HttpPushSource {
                                 .await;
                             });
                         }
-                        Err(_) => break,
+                        Err(_) => { self.diag.observation.health(true,HealthState::Failed,"http_accept_failed",Some(ErrorCode::Internal));break; },
                     }
                 }
             }
         }
+        tasks.shutdown().await;
     }
 }
 
@@ -184,13 +192,14 @@ async fn write_status(mut stream: TcpStream, code: u16, body: &[u8]) -> Result<(
 
 async fn handle_push(
     mut stream: TcpStream,
-    tx: mpsc::Sender<Row>,
+    tx: impl Into<ObservedSender<Row>>,
     diag: Arc<IoDiagnostics>,
     codec: JsonCodec,
     path: String,
     cancel: CancellationToken,
     read_timeout: Duration,
 ) -> Result<()> {
+    let tx=tx.into();
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     let header_end = loop {
@@ -276,9 +285,13 @@ async fn handle_push(
     }
     body.truncate(content_len);
     diag.http_posted.fetch_add(1, Ordering::Relaxed);
+    let received_at=std::time::Instant::now();
+    diag.observation.progress(true,1);
     let frame = SourceFrame::new(body, 0);
-    match codec.decode_frame(&frame) {
-        Ok(Some(row)) => match tx.try_send(row) {
+    let decoded=codec.decode_frame(&frame);
+    diag.observation.record(Latency::Decode,received_at.elapsed());
+    match decoded {
+        Ok(Some(row)) => match tx.try_send_with_origin(row,OriginSpan::at(received_at)) {
             Ok(()) => {
                 let _ = write_status(stream, 202, b"ok").await;
             }

@@ -11,6 +11,7 @@ demo-io = ["sparrow-control/demo-io"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }
+sparrow-io = { path = "../sparrow-io", features = ["observation"] }
 sparrow-plan = { path = "../sparrow-plan" }
 sparrow-control = { path = "../sparrow-control", default-features = false }
 sparrow-connectors = { path = "../sparrow-connectors", default-features = false }

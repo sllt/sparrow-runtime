@@ -24,7 +24,7 @@ pub use supervisor::{
     request_start, request_start_at, request_stop, DemoIo, Supervisor,
 };
 pub use validate::{
-    bind_plan, binder_catalog, capabilities_json, effective_guarantees, explain_plan,
+    bind_plan, binder_catalog, capabilities_json, effective_guarantees, effective_guarantees_with_plan, explain_plan,
     explain_plan_with, honesty_json, replay_label_for_source,
     resolve_file_contract, store_policy, stream_schema, stream_to_schema, validate_aligned_plan,
     validate_io, DemoEndpoints, ExplainReport, StoreSecrets, HONESTY,

@@ -11,7 +11,7 @@ demo-io = []
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }
-sparrow-io = { path = "../sparrow-io" }
+sparrow-io = { path = "../sparrow-io", features = ["observation"] }
 sparrow-formats = { path = "../sparrow-formats" }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "macros", "rt", "time"] }
 tokio-util = { workspace = true }

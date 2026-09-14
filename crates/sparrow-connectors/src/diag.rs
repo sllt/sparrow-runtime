@@ -1,10 +1,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Process-wide I/O counters for ack/diagnostics. Live path only — not a
 /// checkpoint or delivery receipt.
 #[derive(Debug, Default)]
 pub struct IoDiagnostics {
+    pub observation: Arc<sparrow_model::observation::FlowObservation>,
+    pub source_queue: OnceLock<Arc<sparrow_io::observed::QueueObserver>>,
+    pub sink_queue: OnceLock<Arc<sparrow_io::observed::QueueObserver>>,
     pub mqtt_received: AtomicU64,
     pub mqtt_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub mqtt_inbox_metadata_bytes: AtomicU64,
@@ -33,6 +36,8 @@ pub struct IoDiagnostics {
 }
 
 impl IoDiagnostics {
+    pub fn observe_source<T>(&self, tx: &sparrow_io::observed::Sender<T>) { if let Some(q)=tx.observer(){let _=self.source_queue.set(q);} }
+    pub fn observe_sink<T>(&self, tx: &sparrow_io::observed::Sender<T>) { if let Some(q)=tx.observer(){let _=self.sink_queue.set(q);} }
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }

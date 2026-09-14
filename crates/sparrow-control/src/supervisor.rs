@@ -5,20 +5,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "demo-io")]
+use sparrow_connectors::{publish_qos0, sensor_json, EmbeddedBroker, HttpCapture};
 use sparrow_connectors::{
     FileReplayConfig, FileReplaySource, HttpPushSource, HttpSink, IoDiagnostics, LogSink, MqttSink,
     MqttSource,
 };
-#[cfg(feature = "demo-io")]
-use sparrow_connectors::{publish_qos0, sensor_json, EmbeddedBroker, HttpCapture};
+use sparrow_io::observed;
 use sparrow_io::ReplayableSource;
-use sparrow_model::{
-    InflightCounter, RecoveryPolicy, ResourceBudget, Result, SparrowError, StateSlotId,
-};
-use sparrow_plan::{PhysicalPlan, PhysicalStage, PlanLayout};
+use sparrow_model::observation::{HealthState, Latency};
+use sparrow_model::{InflightCounter, RecoveryPolicy, ResourceBudget, Result, SparrowError};
+use sparrow_plan::{PhysicalPlan, PlanLayout};
 use sparrow_runtime::{
-    AlignedAcks, AlignedJob, CheckpointSnapshot, CheckpointStore, IngressEvent,
-    JobHandle, JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, StreamControl,
+    AlignedAcks, AlignedJob, CheckpointSnapshot, CheckpointStore, IngressEvent, JobHandle,
+    JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, StreamControl,
 };
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -47,8 +47,12 @@ pub(crate) fn capacity_backoff(attempt: u32) -> Duration {
 }
 
 fn is_capacity_wait(error: &SparrowError) -> bool {
-    error.retryable && error.code == sparrow_model::ErrorCode::ResourceExhausted
-        && error.context.iter().any(|(key, value)| key == "admission" && value == "capacity")
+    error.retryable
+        && error.code == sparrow_model::ErrorCode::ResourceExhausted
+        && error
+            .context
+            .iter()
+            .any(|(key, value)| key == "admission" && value == "capacity")
 }
 
 #[cfg(feature = "demo-io")]
@@ -122,6 +126,8 @@ enum RunningKind {
 const STABLE_RUN: Duration = Duration::from_secs(30);
 
 struct RunningJob {
+    source_kind: &'static str,
+    sink_kind: &'static str,
     started_at: Instant,
     stable: bool,
     kind: RunningKind,
@@ -129,7 +135,46 @@ struct RunningJob {
     diag: Arc<IoDiagnostics>,
 }
 
+pub struct PipelineMailboxSnapshot {
+    pub running_revision: u64,
+    pub finished: bool,
+    pub cancel_requested: bool,
+    pub runtime: sparrow_runtime::mailbox_observe::JobMailboxSnapshot,
+}
+pub struct PipelineFlowSnapshot {
+    pub running_revision: u64,
+    pub runtime_attempt_id: u64,
+    pub finished: bool,
+    pub cancel_requested: bool,
+    pub source_kind: &'static str,
+    pub sink_kind: &'static str,
+    pub diagnostics: Arc<IoDiagnostics>,
+}
+fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
+    match spec.sink.kind.as_str() {
+        "log" => "log",
+        "mqtt" => "mqtt",
+        _ => "http",
+    }
+}
+
 impl RunningJob {
+    fn flow_snapshot(&self) -> PipelineFlowSnapshot {
+        PipelineFlowSnapshot {
+            running_revision: self.revision,
+            runtime_attempt_id: self.handle().attempt.raw(),
+            finished: self.is_finished(),
+            cancel_requested: self.handle().cancellation().is_cancelled(),
+            source_kind: self.source_kind,
+            sink_kind: self.sink_kind,
+            diagnostics: self.diag.clone(),
+        }
+    }
+    fn handle(&self) -> &JobHandle {
+        match &self.kind {
+            RunningKind::Live { handle, .. } | RunningKind::Aligned { handle, .. } => handle,
+        }
+    }
     fn is_finished(&self) -> bool {
         match &self.kind {
             RunningKind::Live { handle, .. } => handle.is_finished(),
@@ -242,20 +287,106 @@ impl Supervisor {
         }
         acc
     }
+    pub fn flow_snapshot(&self, name: &str) -> Result<Option<PipelineFlowSnapshot>> {
+        let jobs = self.running.try_lock().map_err(|_| {
+            SparrowError::new(
+                sparrow_model::ErrorCode::ResourceExhausted,
+                "runtime observation registry busy",
+            )
+        })?;
+        Ok(jobs.get(name).map(RunningJob::flow_snapshot))
+    }
+    pub async fn flow_snapshots(&self) -> Vec<(String, PipelineFlowSnapshot)> {
+        let jobs = self.running.lock().await;
+        jobs.iter()
+            .map(|(name, job)| (name.clone(), job.flow_snapshot()))
+            .collect()
+    }
+
+    /// Nonblocking lookup for synchronous status builders. Contention is unknown,
+    /// not an empty/healthy pipeline; callers must expose this distinction.
+    pub fn mailbox_snapshot(&self, name: &str) -> Result<Option<PipelineMailboxSnapshot>> {
+        let held = {
+            let jobs = self.running.try_lock().map_err(|_| {
+                SparrowError::new(
+                    sparrow_model::ErrorCode::ResourceExhausted,
+                    "runtime observation registry busy",
+                )
+            })?;
+            jobs.get(name).map(|job| {
+                (
+                    job.revision,
+                    job.handle().is_finished(),
+                    job.handle().cancellation().is_cancelled(),
+                    job.handle().mailbox_observer(),
+                )
+            })
+        };
+        Ok(
+            held.map(|(running_revision, finished, cancel_requested, observer)| {
+                PipelineMailboxSnapshot {
+                    running_revision,
+                    finished,
+                    cancel_requested,
+                    runtime: observer.snapshot(),
+                }
+            }),
+        )
+    }
+
+    pub async fn mailbox_snapshots(&self) -> Vec<(String, PipelineMailboxSnapshot)> {
+        let held: Vec<_> = {
+            let jobs = self.running.lock().await;
+            jobs.iter()
+                .map(|(name, job)| {
+                    (
+                        name.clone(),
+                        job.revision,
+                        job.handle().is_finished(),
+                        job.handle().cancellation().is_cancelled(),
+                        job.handle().mailbox_observer(),
+                    )
+                })
+                .collect()
+        };
+        held.into_iter()
+            .map(
+                |(name, running_revision, finished, cancel_requested, observer)| {
+                    (
+                        name,
+                        PipelineMailboxSnapshot {
+                            running_revision,
+                            finished,
+                            cancel_requested,
+                            runtime: observer.snapshot(),
+                        },
+                    )
+                },
+            )
+            .collect()
+    }
 
     pub async fn converge_once(&self) -> Result<()> {
         self.reap_finished().await;
         let stable_names: Vec<String> = {
             let mut jobs = self.running.lock().await;
-            jobs.iter_mut().filter_map(|(name, job)| {
-                if !job.stable && !job.is_finished() && job.started_at.elapsed() >= self.stable_run {
-                    job.stable = true;
-                    Some(name.clone())
-                } else { None }
-            }).collect()
+            jobs.iter_mut()
+                .filter_map(|(name, job)| {
+                    if !job.stable
+                        && !job.is_finished()
+                        && job.started_at.elapsed() >= self.stable_run
+                    {
+                        job.stable = true;
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         };
         for name in stable_names {
-            self.catalog(move |s| s.reset_consecutive_failures(&name)).await?;
+            self.catalog(move |s| s.reset_consecutive_failures(&name))
+                .await?;
         }
         let desired = self.catalog(|s| s.list_desired()).await?;
         for d in desired {
@@ -277,10 +408,7 @@ impl Supervisor {
                 if (a.status == "failed" || a.status == "waiting") && a.revision == d.revision {
                     // N8: per-pipeline due time. Never sleep here —
                     // a failed sibling must not stall healthy start/stop.
-                    if !self
-                        .retry_is_due(&d.name, a.consecutive_failures)
-                        .await
-                    {
+                    if !self.retry_is_due(&d.name, a.consecutive_failures).await {
                         continue;
                     }
                 } else {
@@ -303,12 +431,17 @@ impl Supervisor {
                             let name = name.clone();
                             move |s| {
                                 let previous = s.actual(&name)?;
-                                let still_waiting = waiting && previous.status == "waiting"
+                                let still_waiting = waiting
+                                    && previous.status == "waiting"
                                     && previous.revision == Some(rev);
-                                let attempt = previous.attempt_id.saturating_add(u64::from(!still_waiting));
+                                let attempt = previous
+                                    .attempt_id
+                                    .saturating_add(u64::from(!still_waiting));
                                 if waiting {
                                     s.set_waiting_failure(&name, rev, attempt, &msg)?;
-                                    if !still_waiting { s.insert_attempt(&name, rev, "waiting", Some(&msg))?; }
+                                    if !still_waiting {
+                                        s.insert_attempt(&name, rev, "waiting", Some(&msg))?;
+                                    }
                                 } else {
                                     s.set_actual(&name, "failed", Some(rev), attempt, Some(&msg))?;
                                     s.insert_attempt(&name, rev, "failed", Some(&msg))?;
@@ -324,12 +457,16 @@ impl Supervisor {
             } else {
                 self.clear_retry(&d.name).await;
                 let job = self.running.lock().await.remove(&d.name);
-                if let Some(job) = job { self.stop_job(job).await; }
+                if let Some(job) = job {
+                    self.stop_job(job).await;
+                }
                 let name = d.name.clone();
                 let revision = d.revision;
                 let _ = self
                     .catalog(move |s| {
-                        if s.actual(&name)?.status == "stopped" { return Ok(()); }
+                        if s.actual(&name)?.status == "stopped" {
+                            return Ok(());
+                        }
                         let attempt = s
                             .actual(&name)
                             .map(|a| a.attempt_id.saturating_add(1))
@@ -394,7 +531,9 @@ impl Supervisor {
 
     async fn retry_is_due(&self, name: &str, consecutive_failures: u64) -> bool {
         let mut map = self.next_retry_at.lock().await;
-        if consecutive_failures == 0 && !map.contains_key(name) { return true; }
+        if consecutive_failures == 0 && !map.contains_key(name) {
+            return true;
+        }
         let due = *map
             .entry(name.to_string())
             .or_insert_with(|| Instant::now() + retry_backoff(consecutive_failures));
@@ -418,7 +557,10 @@ impl Supervisor {
             retry_backoff(actual.map(|a| a.consecutive_failures).unwrap_or(1).max(1))
         };
         let due = Instant::now() + delay;
-        self.next_retry_at.lock().await.insert(name.to_string(), due);
+        self.next_retry_at
+            .lock()
+            .await
+            .insert(name.to_string(), due);
     }
 
     pub(crate) async fn clear_retry(&self, name: &str) {
@@ -432,7 +574,10 @@ impl Supervisor {
         let safe = self.safe_mode;
         self.catalog(move |s| {
             let a = s.actual(&name)?;
-            if a.status != "running" && a.status != "waiting" && a.consecutive_failures >= MAX_PIPELINE_ATTEMPTS {
+            if a.status != "running"
+                && a.status != "waiting"
+                && a.consecutive_failures >= MAX_PIPELINE_ATTEMPTS
+            {
                 let msg = format!(
                     "held: consecutive_failures {} reached cap {MAX_PIPELINE_ATTEMPTS}; last: {}",
                     a.consecutive_failures,
@@ -446,7 +591,10 @@ impl Supervisor {
             if safe && a.restart_blocked {
                 let msg = "held: safe-mode and last attempt failed";
                 if !a.last_error.as_deref().unwrap_or("").starts_with("held:") {
-                    let detail = format!("{msg}; last: {}", a.last_error.as_deref().unwrap_or("unknown"));
+                    let detail = format!(
+                        "{msg}; last: {}",
+                        a.last_error.as_deref().unwrap_or("unknown")
+                    );
                     s.set_last_error(&name, Some(&detail))?;
                 }
                 return Ok(None);
@@ -528,7 +676,9 @@ impl Supervisor {
         let note_s = note.to_string();
         self.catalog(move |s| {
             let previous = s.actual(&name_s)?;
-            let attempt = previous.attempt_id.saturating_add(u64::from(previous.status == "waiting"));
+            let attempt = previous
+                .attempt_id
+                .saturating_add(u64::from(previous.status == "waiting"));
             s.set_actual(&name_s, "running", Some(revision), attempt, None)?;
             s.insert_attempt(&name_s, revision, "running", Some(&note_s))
         })
@@ -549,15 +699,19 @@ impl Supervisor {
         let diag = IoDiagnostics::new();
         let inbox = spec.source.inbox_capacity.max(1);
         let outbox = spec.sink.outbox_capacity.max(1);
-        let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox);
+        let (tx_out, rx_out) = observed::channel(outbox);
+        diag.observe_sink(&tx_out);
         let capture = SharedCapture::disabled();
-        let mut request = JobRequest::new(plan, Vec::new(), capture);
+        let mut request =
+            JobRequest::new(plan, Vec::new(), capture).with_observation(diag.observation.clone());
         let (tx_in, tx_budgeted) = if kind == "mqtt" {
-            let (tx, rx) = tokio::sync::mpsc::channel(inbox);
+            let (tx, rx) = observed::channel(inbox);
+            diag.observe_source(&tx);
             request = request.with_budgeted_live_io(rx, tx_out);
             (None, Some(tx))
         } else {
-            let (tx, rx) = tokio::sync::mpsc::channel(inbox);
+            let (tx, rx) = observed::channel(inbox);
+            diag.observe_source(&tx);
             request = request.with_live_io(rx, tx_out);
             (Some(tx), None)
         };
@@ -587,7 +741,15 @@ impl Supervisor {
                 let owner = job.memory_owner();
                 let max_row_bytes = self.kernel.ingress_row_limit();
                 self.kernel.handle().spawn(async move {
-                    let r = mqtt.run_budgeted(tx_budgeted.expect("MQTT ingress"), cancel_job.clone(), owner, max_row_bytes).await.map_err(SparrowError::from);
+                    let r = mqtt
+                        .run_budgeted(
+                            tx_budgeted.expect("MQTT ingress"),
+                            cancel_job.clone(),
+                            owner,
+                            max_row_bytes,
+                        )
+                        .await
+                        .map_err(SparrowError::from);
                     if r.is_err() {
                         cancel_job.cancel();
                     }
@@ -611,6 +773,8 @@ impl Supervisor {
             None,
         )?;
         Ok(RunningJob {
+            source_kind: if kind == "mqtt" { "mqtt" } else { "http_push" },
+            sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
             stable: false,
             kind: RunningKind::Live {
@@ -651,16 +815,19 @@ impl Supervisor {
             FileReplaySource::open(&cfg).map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
         let inbox = spec.source.inbox_capacity.max(1);
         let outbox = spec.sink.outbox_capacity.max(1);
-        let (tx_ev, rx_ev) = tokio::sync::mpsc::channel(inbox);
-        let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox);
+        let diag = IoDiagnostics::new();
+        let (tx_ev, rx_ev) = observed::channel(inbox);
+        let (tx_out, rx_out) = observed::channel(outbox);
+        diag.observe_source(&tx_ev);
+        diag.observe_sink(&tx_out);
         let capture = SharedCapture::disabled();
         let job = self.kernel.submit(
             JobRequest::new(plan, Vec::new(), capture)
+                .with_observation(diag.observation.clone())
                 .with_live_events(rx_ev)
                 .with_live_out(tx_out),
         )?;
         let cancel = job.cancellation();
-        let diag = IoDiagnostics::new();
         let diag_src = Arc::clone(&diag);
         let source = self.kernel.handle().spawn({
             let cancel = cancel.clone();
@@ -692,6 +859,8 @@ impl Supervisor {
             None,
         )?;
         Ok(RunningJob {
+            source_kind: "file",
+            sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
             stable: false,
             kind: RunningKind::Live {
@@ -758,16 +927,19 @@ impl Supervisor {
         let layout = Arc::new(layout);
         let inbox = spec.source.inbox_capacity.max(1);
         let outbox_n = spec.sink.outbox_capacity.max(1);
-        let (tx_ev, rx_ev) = tokio::sync::mpsc::channel(inbox);
-        let (tx_out, rx_out) = tokio::sync::mpsc::channel(outbox_n);
+        let (tx_ev, rx_ev) = observed::channel(inbox);
+        let (tx_out, rx_out) = observed::channel(outbox_n);
         let acks = AlignedAcks::default();
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<AlignedCmd>(4);
         let outbox = Arc::new(InflightCounter::new());
         let diag = IoDiagnostics::new();
+        diag.observe_source(&tx_ev);
+        diag.observe_sink(&tx_out);
         let diag_src = Arc::clone(&diag);
         let metrics = Arc::clone(&self.kernel.metrics);
         let job = self.kernel.submit(
             JobRequest::new(plan, Vec::new(), SharedCapture::disabled())
+                .with_observation(diag.observation.clone())
                 .with_live_events(rx_ev)
                 .with_live_out(tx_out)
                 .with_aligned(AlignedJob {
@@ -785,6 +957,8 @@ impl Supervisor {
         let layout_r = Arc::clone(&layout);
         let checkpoint_timeout = self.checkpoint_timeout;
         let source_task = self.kernel.handle().spawn(async move {
+            let _lifecycle=diag_src.observation.lifecycle(true);
+            diag_src.observation.health(true,HealthState::Ready,"file_open",None);
             let mut terminal_sent = false;
             let mut next_file_poll = None;
             loop {
@@ -873,18 +1047,23 @@ impl Supervisor {
                     }
                     _ = crate::file_source::wait_for_file_poll(next_file_poll) => {
                         next_file_poll = None;
-                        let (src, polls) = crate::file_source::take_file_batch(source).await?;
+                        let started=std::time::Instant::now();
+                        let result=crate::file_source::take_file_batch(source).await;
+                        diag_src.observation.record(Latency::FileReadDecode,started.elapsed());
+                        let (src, polls) = result.map_err(|e|{diag_src.observation.health(true,HealthState::Failed,"file_read_failed",Some(e.code));e})?;
+                        let batch_ready=crate::file_source::observe_file_batch(&diag_src,&polls);
                         source = src;
                         *pos_r.lock().expect("pos") = source.position();
-                        for poll in polls {
-                            match crate::file_source::apply_file_poll(
-                                poll,
+                            match crate::file_source::apply_file_batch(
+                                polls,
                                 contract,
                                 &tx_ev,
                                 &diag_src,
                                 &mut terminal_sent,
                                 Some(&ingested_r),
                                 fail_on_decode,
+                                batch_ready,
+                                &child,
                             )
                             .await?
                             {
@@ -895,7 +1074,6 @@ impl Supervisor {
                                         + crate::file_source::FILE_EOF_POLL);
                                 }
                             }
-                        }
                     }
                 }
             }
@@ -910,6 +1088,8 @@ impl Supervisor {
             Some(Arc::clone(&outbox)),
         )?;
         Ok(RunningJob {
+            source_kind: "file",
+            sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
             stable: false,
             kind: RunningKind::Aligned {
@@ -927,7 +1107,7 @@ impl Supervisor {
     fn spawn_sink(
         &self,
         spec: &crate::spec::PipelineSpec,
-        rx_out: tokio::sync::mpsc::Receiver<sparrow_model::RowBatch>,
+        rx_out: observed::Receiver<sparrow_model::RowBatch>,
         cancel: CancellationToken,
         diag: Arc<IoDiagnostics>,
         demo: Option<&DemoEndpoints>,
@@ -1122,24 +1302,37 @@ pub fn host_kernel() -> Result<Kernel> {
     let max_jobs = match std::env::var("SPARROW_MAX_JOBS") {
         Ok(value) => parse_max_jobs(&value)?,
         Err(std::env::VarError::NotPresent) => 16,
-        Err(_) => return Err(SparrowError::new(sparrow_model::ErrorCode::InvalidArgument,
-            "SPARROW_MAX_JOBS must be an integer in 1..=256")),
+        Err(_) => {
+            return Err(SparrowError::new(
+                sparrow_model::ErrorCode::InvalidArgument,
+                "SPARROW_MAX_JOBS must be an integer in 1..=256",
+            ))
+        }
     };
     host_kernel_with_max_jobs(max_jobs)
 }
 
 pub fn parse_max_jobs(value: &str) -> Result<usize> {
-    value.parse::<usize>().ok().filter(|n| (1..=256).contains(n))
-        .ok_or_else(|| SparrowError::new(sparrow_model::ErrorCode::InvalidArgument,
-            "max_jobs must be an integer in 1..=256 (--max-jobs / SPARROW_MAX_JOBS)"))
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=256).contains(n))
+        .ok_or_else(|| {
+            SparrowError::new(
+                sparrow_model::ErrorCode::InvalidArgument,
+                "max_jobs must be an integer in 1..=256 (--max-jobs / SPARROW_MAX_JOBS)",
+            )
+        })
 }
 
 /// Scale the three process memory caps by the configured number of Compact
 /// jobs. These are admission/credit limits, not eagerly allocated memory.
 pub fn host_kernel_with_max_jobs(max_jobs: usize) -> Result<Kernel> {
     if !(1..=256).contains(&max_jobs) {
-        return Err(SparrowError::new(sparrow_model::ErrorCode::InvalidArgument,
-            "max_jobs must be in 1..=256"));
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::InvalidArgument,
+            "max_jobs must be in 1..=256",
+        ));
     }
     let job = ResourceBudget::compact();
     let budget = ResourceBudget {
@@ -1152,45 +1345,22 @@ pub fn host_kernel_with_max_jobs(max_jobs: usize) -> Result<Kernel> {
         .map(|p| p.get())
         .unwrap_or(4)
         .clamp(4, 16);
-    Kernel::new_with_job_budget(KernelOptions {
-        budget,
-        mailbox: MailboxConfig {
-            max_items: 32,
-            max_bytes: 256 * 1024,
+    Kernel::new_with_job_budget(
+        KernelOptions {
+            budget,
+            mailbox: MailboxConfig {
+                max_items: 32,
+                max_bytes: 256 * 1024,
+            },
+            worker_threads: n,
+            rows_per_batch: 8,
         },
-        worker_threads: n,
-        rows_per_batch: 8,
-    }, job)
-}
-
-fn window_from_plan(
-    plan: &PhysicalPlan,
-) -> Result<(
-    sparrow_model::OperatorId,
-    sparrow_plan::WindowSpec,
-    sparrow_model::Schema,
-)> {
-    for s in &plan.stages {
-        if let PhysicalStage::WindowAgg {
-            operator,
-            spec,
-            input,
-            ..
-        } = s
-        {
-            return Ok((*operator, spec.clone(), input.clone()));
-        }
-    }
-    Err(SparrowError::new(
-        sparrow_model::ErrorCode::FeatureUnavailable,
-        "aligned recovery requires a window operator in the plan",
-    ))
+        job,
+    )
 }
 
 pub(crate) fn layout_from_physical(plan: &PhysicalPlan) -> Result<PlanLayout> {
-    let (operator, spec, _) = window_from_plan(plan)?;
-    let pred = sparrow_plan::where_before_window_physical(plan);
-    Ok(PlanLayout::from_window(operator, StateSlotId::new(1), &spec).with_where(pred))
+    PlanLayout::from_physical(plan)
 }
 
 /// Request start: write desired state and return immediately.
@@ -1248,12 +1418,17 @@ mod r4_retry_tests {
         let plain = SparrowError::new(ErrorCode::ResourceExhausted, "memory allocation failed");
         assert!(plain.retryable);
         assert!(!is_capacity_wait(&plain));
-        assert!(!is_capacity_wait(&plain.clone().context("admission", "configuration")));
+        assert!(!is_capacity_wait(
+            &plain.clone().context("admission", "configuration")
+        ));
         let capacity = plain.context("admission", "capacity");
         assert!(is_capacity_wait(&capacity));
         assert!(!is_capacity_wait(&capacity.retryable(false)));
-        assert!(!is_capacity_wait(&SparrowError::new(ErrorCode::InvalidArgument, "bad plan")
-            .context("admission", "capacity").retryable(true)));
+        assert!(!is_capacity_wait(
+            &SparrowError::new(ErrorCode::InvalidArgument, "bad plan")
+                .context("admission", "capacity")
+                .retryable(true)
+        ));
     }
 
     #[test]

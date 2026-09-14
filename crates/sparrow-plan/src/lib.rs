@@ -10,6 +10,7 @@ use sparrow_model::{OperatorId, PipelineId, RevisionId, Schema};
 pub mod bind;
 pub mod bound;
 pub mod catalog;
+pub mod canonical;
 pub mod compat;
 pub mod explain;
 pub mod expr_spec;

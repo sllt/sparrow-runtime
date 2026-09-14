@@ -130,7 +130,7 @@ impl CompiledTransform {
             }
             builder.push(Row { values: values.into_owned() })?;
         }
-        finish_step(builder)
+        Ok(finish_step(builder)?.map(|out|out.with_origin(batch.origin())))
     }
 }
 

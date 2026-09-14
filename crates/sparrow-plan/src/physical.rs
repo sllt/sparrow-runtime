@@ -82,6 +82,36 @@ pub enum TransformStep {
 }
 
 impl PhysicalPlan {
+    /// The current barrier ACK/restore protocol has one state participant.
+    /// Keep this gate shared by API validation, layout construction and Kernel
+    /// admission so embedded callers cannot bypass the control-plane check.
+    pub fn aligned_window(&self) -> sparrow_model::Result<(OperatorId, &WindowSpec, &Schema)> {
+        use sparrow_model::{ErrorCode, SparrowError};
+        let mut window = None;
+        for stage in &self.stages {
+            match stage {
+                PhysicalStage::WindowAgg { operator, spec, input, .. } => {
+                    if matches!(spec.kind, WindowKind::TumblingProcessingTime { .. }) {
+                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                            "processing-time windows cannot use recovery=aligned (no PT timer on the aligned path)"));
+                    }
+                    if window.is_some() {
+                        return Err(SparrowError::new(ErrorCode::FeatureUnavailable,
+                            "aligned recovery supports exactly one window; multi-participant snapshots are not implemented"));
+                    }
+                    window = Some((*operator, spec, input));
+                }
+                PhysicalStage::Deduplicate { .. } | PhysicalStage::Lookup { .. } => {
+                    return Err(SparrowError::new(ErrorCode::FeatureUnavailable,
+                        "aligned recovery does not snapshot Dedup/Lookup; refuse dishonest strip"));
+                }
+                _ => {}
+            }
+        }
+        window.ok_or_else(|| SparrowError::new(ErrorCode::FeatureUnavailable,
+            "aligned recovery requires a window operator in the plan"))
+    }
+
     pub fn source_schema(&self) -> Option<&Schema> {
         self.stages.iter().find_map(|s| match s {
             PhysicalStage::MemorySource { schema, .. } => Some(schema),

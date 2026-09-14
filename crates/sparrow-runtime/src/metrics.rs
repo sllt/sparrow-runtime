@@ -11,6 +11,8 @@ pub struct RuntimeMetrics {
     pub jobs_stopped: AtomicU64,
     pub jobs_failed: AtomicU64,
     pub ingested_rows: AtomicU64,
+    /// Kernel: rows reaching the final plan sink, not intermediate window
+    /// emissions and not proof of external connector delivery/acknowledgement.
     pub emitted_rows: AtomicU64,
     pub queue_items: AtomicU64,
     pub queue_bytes: AtomicU64,

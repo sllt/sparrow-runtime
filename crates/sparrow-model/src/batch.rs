@@ -54,9 +54,12 @@ pub struct RowBatch {
     schema: Arc<Schema>,
     rows: Arc<Vec<Row>>,
     lease: MemoryLease,
+    origin: crate::observation::OriginSpan,
 }
 
 impl RowBatch {
+    pub fn origin(&self) -> crate::observation::OriginSpan { self.origin }
+    pub fn with_origin(mut self, origin: crate::observation::OriginSpan) -> Self { self.origin=origin; self }
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -85,23 +88,60 @@ impl RowBatch {
             schema: Arc::clone(&self.schema),
             rows: Arc::clone(&self.rows),
             lease: self.lease.share(),
+            origin: self.origin,
         }
     }
 
-    /// Copy rows for long-lived state. New physical alloc on `kind`.
+    /// Copy rows for long-lived state. Acquire destination credit BEFORE any
+    /// copy. Keep a conservative 2x resident estimate to cover Vec -> Arc copy
+    /// temporaries; this API deliberately overcharges until the copy is dropped.
     pub fn detach(&self, kind: CreditKind) -> Result<Self> {
+        let resident = self.rows.iter().fold(64usize, |n, row| n.saturating_add(row.resident_bytes()));
+        let lease = self.lease.owner().acquire(kind,
+            resident.saturating_mul(2).max(self.tracked_bytes()))?;
         let rows: Vec<Row> = self.rows.iter().map(Row::detach_copy).collect();
-        let lease = self.lease.detach(kind)?;
         Ok(Self {
             schema: Arc::clone(&self.schema),
             rows: Arc::new(rows),
             lease,
+            origin: self.origin,
         })
     }
 
-    pub fn into_rows(self) -> (Arc<Schema>, Vec<Row>, MemoryLease) {
-        let rows = Arc::try_unwrap(self.rows).unwrap_or_else(|a| (*a).clone());
-        (self.schema, rows, self.lease)
+    /// Consume into an owner-carrying row view. Never clone shared containers
+    /// or return data and its accounting lease as independently owned objects.
+    pub fn into_rows(self) -> OwnedRows {
+        OwnedRows { batch: self }
+    }
+
+    /// Retain a borrowed value past batch lifetime without refunding its credit.
+    /// Conservatively pins the whole batch; use `detach` for an independent copy.
+    pub fn retain_value(&self, row: usize, column: usize) -> Option<BatchValue> {
+        self.rows.get(row)?.values.get(column)?;
+        Some(BatchValue { batch: self.share(), row, column })
+    }
+}
+
+/// Owned read-only rows whose payload and lease cannot be separated.
+#[derive(Debug)]
+pub struct OwnedRows { batch: RowBatch }
+
+impl OwnedRows {
+    pub fn rows(&self) -> &[Row] { self.batch.rows() }
+    pub fn schema(&self) -> &Schema { self.batch.schema() }
+    pub fn share(&self) -> Self { Self { batch: self.batch.share() } }
+    pub fn into_batch(self) -> RowBatch { self.batch }
+}
+
+/// Owner-carrying scalar view. Raw `Scalar::clone` is not an accounting API;
+/// callers retaining runtime data should share this handle instead.
+#[derive(Debug)]
+pub struct BatchValue { batch: RowBatch, row: usize, column: usize }
+
+impl BatchValue {
+    pub fn value(&self) -> &Scalar { &self.batch.rows[self.row].values[self.column] }
+    pub fn share(&self) -> Self {
+        Self { batch: self.batch.share(), row: self.row, column: self.column }
     }
 }
 
@@ -243,6 +283,7 @@ impl RowBatchBuilder {
             schema: self.schema,
             rows: Arc::new(self.rows),
             lease,
+            origin: crate::observation::OriginSpan::missing(),
         })
     }
 }
@@ -396,12 +437,55 @@ mod tests {
         assert_eq!(owner.usage().physical_bytes, live.tracked_bytes());
         let retained = live.detach(CreditKind::Retention).unwrap();
         assert_ne!(live.lease().alloc_id(), retained.lease().alloc_id());
-        assert_eq!(owner.usage().physical_bytes, live.tracked_bytes() * 2);
+        assert!(retained.tracked_bytes() >= live.tracked_bytes());
+        assert_eq!(owner.usage().physical_bytes, live.tracked_bytes() + retained.tracked_bytes());
         drop(shared);
         drop(live);
         assert_eq!(owner.usage().reservation_bytes, 0);
         assert!(owner.usage().retention_bytes > 0);
         drop(retained);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    #[test]
+    fn base03_owned_rows_and_value_keep_credit_until_last_owner_drops() {
+        let owner = pool();
+        let mut b = RowBatchBuilder::new(schema(), owner.clone(), CreditKind::Reservation, 4, 1024).unwrap();
+        b.push(Row { values: vec![Scalar::Int64(7), Scalar::utf8("edge")] }).unwrap();
+        let batch = b.finish().unwrap();
+        let bytes = batch.tracked_bytes();
+        let ptr = batch.rows().as_ptr();
+        assert!(batch.retain_value(9, 0).is_none());
+        assert!(batch.retain_value(0, 9).is_none());
+        let value = batch.retain_value(0, 1).unwrap();
+        let rows = batch.share().into_rows();
+        assert_eq!(rows.rows().as_ptr(), ptr, "shared into_rows must not clone a Vec");
+        let rows2 = rows.share();
+        drop(batch);
+        drop(rows);
+        assert_eq!(owner.usage().reservation_bytes, bytes);
+        assert_eq!(rows2.rows()[0].values[0], Scalar::Int64(7));
+        drop(rows2.into_batch());
+        let value2 = value.share();
+        drop(value);
+        assert_eq!(value2.value(), &Scalar::utf8("edge"));
+        assert_eq!(owner.usage().reservation_bytes, bytes);
+        drop(value2);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    #[test]
+    fn base03_detach_failure_preserves_source_and_releases_destination_credit() {
+        let owner = pool();
+        let mut b = RowBatchBuilder::new(schema(), owner.clone(), CreditKind::Reservation, 4, 4096).unwrap();
+        b.push(Row { values: vec![Scalar::Int64(1), Scalar::utf8("x".repeat(2200))] }).unwrap();
+        let batch = b.finish().unwrap();
+        let bytes = batch.tracked_bytes();
+        assert_eq!(batch.detach(CreditKind::Retention).unwrap_err().code, ErrorCode::ResourceExhausted);
+        assert_eq!(owner.usage().retention_bytes, 0);
+        assert_eq!(owner.usage().physical_bytes, bytes);
+        assert_eq!(batch.rows()[0].values[0], Scalar::Int64(1));
+        drop(batch);
         assert_eq!(owner.usage().physical_bytes, 0);
     }
 }

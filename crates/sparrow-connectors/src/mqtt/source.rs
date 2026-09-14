@@ -9,6 +9,8 @@ use sparrow_model::{
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use sparrow_io::observed::Sender as ObservedSender;
+use sparrow_model::observation::{HealthState, Latency, OriginSpan};
 
 use super::codec::{Connect, Packet, Publish};
 use super::io::{connect_with_quickack, write_packet, MqttFramedReader};
@@ -193,9 +195,9 @@ pub struct MqttSource {
 }
 
 enum Ingress {
-    Plain(mpsc::Sender<Row>),
+    Plain(ObservedSender<Row>),
     Budgeted {
-        tx: mpsc::Sender<QueuedRow>,
+        tx: ObservedSender<QueuedRow>,
         owner: Arc<MemoryOwner>,
         queue: Arc<MemoryOwner>,
         max_row_bytes: usize,
@@ -251,23 +253,24 @@ impl MqttSource {
 
     /// Pump MQTT publishes into a bounded kernel ingress. A full inbox gets a
     /// bounded wait before dropping (`live_best_effort`); this is not an ack.
-    pub async fn run(self, tx: mpsc::Sender<Row>, cancel: CancellationToken) -> Result<()> {
+    pub async fn run(self, tx: impl Into<ObservedSender<Row>>, cancel: CancellationToken) -> Result<()> {
         if self.config.inbox_bytes.is_some() {
             return Err(ConnectorError::new(
                 ErrorCode::InvalidArgument,
                 "inbox_bytes requires run_budgeted",
             ));
         }
-        self.pump(Ingress::Plain(tx), cancel).await
+        self.pump(Ingress::Plain(tx.into()), cancel).await
     }
 
     pub async fn run_budgeted(
         self,
-        tx: mpsc::Sender<QueuedRow>,
+        tx: impl Into<ObservedSender<QueuedRow>>,
         cancel: CancellationToken,
         owner: Arc<MemoryOwner>,
         max_row_bytes: usize,
     ) -> Result<()> {
+        let tx=tx.into();
         if tx.max_capacity() != self.config.inbox_capacity {
             return Err(ConnectorError::new(ErrorCode::InvalidArgument, "MQTT inbox_capacity does not match channel"));
         }
@@ -279,7 +282,7 @@ impl MqttSource {
         budget.queue_bytes = bytes;
         let queue = MemoryOwner::child(owner.clone(), budget, "mqtt-inbox");
         self.diag.mqtt_accounted_sources.store(1, Ordering::Relaxed);
-        self.diag.mqtt_inbox_metadata_bytes.store(QueuedRow::channel_budget(self.config.inbox_capacity) as u64, Ordering::Relaxed);
+        self.diag.mqtt_inbox_metadata_bytes.store(tx.observer().map_or_else(||QueuedRow::channel_budget(self.config.inbox_capacity),|q|q.metadata_bytes()) as u64, Ordering::Relaxed);
         self.pump(
             Ingress::Budgeted {
                 tx,
@@ -293,6 +296,7 @@ impl MqttSource {
     }
 
     async fn pump(self, tx: Ingress, cancel: CancellationToken) -> Result<()> {
+        let _lifecycle=self.diag.observation.lifecycle(true);
         let mut backoff = self.config.reconnect_min;
         loop {
             if cancel.is_cancelled() {
@@ -311,9 +315,11 @@ impl MqttSource {
                                 | ErrorCode::BoundExceeded
                         ) =>
                 {
+                    self.diag.observation.health(true,HealthState::Failed,"decode_failed",Some(e.code));
                     return Err(e);
                 }
-                Err(_) => {
+                Err(error) => {
+                    self.diag.observation.health(true,HealthState::Reconnecting,"session_failed",Some(error.code));
                     self.diag.mqtt_reconnects.fetch_add(1, Ordering::Relaxed);
                     tokio::select! {
                         _ = cancel.cancelled() => return Ok(()),
@@ -326,6 +332,7 @@ impl MqttSource {
     }
 
     async fn session(&self, tx: &Ingress, cancel: &CancellationToken) -> Result<()> {
+        self.diag.observation.health(true,HealthState::Connecting,"mqtt_handshake",None);
         let mut stream = connect_with_quickack(
             &self.config.host,
             self.config.port,
@@ -372,7 +379,11 @@ impl MqttSource {
             )
             .await?;
             match reader.next(&mut stream).await? {
-                Packet::SubAck { .. } => {}
+                Packet::SubAck { packet_id: 1, codes } if codes == [0] => {}
+                Packet::SubAck { .. } => {
+                    return Err(ConnectorError::new(ErrorCode::PolicyDenied,
+                        "MQTT subscription rejected or mismatched SUBACK"));
+                }
                 other => {
                     return Err(ConnectorError::new(
                         ErrorCode::CodecViolation,
@@ -406,6 +417,7 @@ impl MqttSource {
             }
         };
 
+        self.diag.observation.health(true,HealthState::Ready,"mqtt_subscribed",None);
         let ping = self.config.keepalive / 2;
         let ping = if ping.is_zero() {
             Duration::from_secs(15)
@@ -430,22 +442,25 @@ impl MqttSource {
                 pkt = reader.next(&mut stream) => {
                     match pkt? {
                         Packet::Publish(Publish { payload, .. }) => {
+                            let received_at=std::time::Instant::now();
+                            self.diag.observation.progress(true,1);
                             self.diag.mqtt_received.fetch_add(1, Ordering::Relaxed);
                             let frame = SourceFrame::new(payload, 0);
                             let decoded = self.codec.decode_frame(&frame);
+                            self.diag.observation.record(Latency::Decode,received_at.elapsed());
                             drop(frame);
                             match decoded {
                                 Ok(Some(row)) => {
                                     self.diag.mqtt_decoded.fetch_add(1, Ordering::Relaxed);
                                     if let Ingress::Budgeted { tx, owner, queue, max_row_bytes } = tx {
-                                        if !self.deliver_budgeted(row, tx, owner, queue, *max_row_bytes, &mut stream, cancel, &mut next_ping, ping).await? {
+                                        if !self.deliver_budgeted(row, tx, owner, queue, *max_row_bytes, &mut stream, cancel, &mut next_ping, ping, OriginSpan::at(received_at)).await? {
                                             close_mqtt(&mut stream).await;
                                             return Ok(());
                                         }
                                         continue;
                                     }
                                     let Ingress::Plain(tx) = tx else { unreachable!() };
-                                    match tx.try_send(row) {
+                                    match tx.try_send_with_origin(row,OriginSpan::at(received_at)) {
                                         Ok(()) => {}
                                         Err(mpsc::error::TrySendError::Full(row)) => {
                                             if self.config.inbox_wait_timeout.is_zero() {
@@ -495,7 +510,7 @@ impl MqttSource {
     async fn deliver_budgeted(
         &self,
         row: Row,
-        tx: &mpsc::Sender<QueuedRow>,
+        tx: &ObservedSender<QueuedRow>,
         owner: &Arc<MemoryOwner>,
         queue: &Arc<MemoryOwner>,
         max_row_bytes: usize,
@@ -503,7 +518,9 @@ impl MqttSource {
         cancel: &CancellationToken,
         next_ping: &mut tokio::time::Instant,
         ping: Duration,
+        origin: OriginSpan,
     ) -> Result<bool> {
+        let _admission=self.diag.observation.timer(Latency::SourceAdmission);
         let bytes = QueuedRow::accounted_bytes(&row);
         if bytes > queue.budget().queue_bytes.min(max_row_bytes) {
             self.diag
@@ -530,6 +547,7 @@ impl MqttSource {
         let deadline = tokio::time::Instant::now() + self.config.inbox_wait_timeout;
         let mut row = Some(row);
         let mut waited = false;
+        let mut observed_wait:Option<sparrow_io::observed::Wait<'_>>=None;
         loop {
             if cancel.is_cancelled() {
                 return Ok(false);
@@ -538,7 +556,8 @@ impl MqttSource {
                 Ok(permit) => {
                     match QueuedRow::try_new(row.take().unwrap(), queue, &self.diag.mqtt_inbox) {
                         Ok(row) => {
-                            permit.send(row);
+                            if let Some(wait)=&mut observed_wait{wait.finish();}
+                            permit.send_with_origin(row,origin);
                             if waited {
                                 self.diag
                                     .mqtt_backpressure_recovered
@@ -566,6 +585,7 @@ impl MqttSource {
             }
             if !waited {
                 waited = true;
+                observed_wait=Some(tx.observe_wait());
                 self.diag
                     .mqtt_backpressure_waits
                     .fetch_add(1, Ordering::Relaxed);
@@ -600,12 +620,13 @@ impl MqttSource {
     async fn wait_for_inbox(
         &self,
         row: Row,
-        tx: &mpsc::Sender<Row>,
+        tx: &ObservedSender<Row>,
         stream: &mut super::io::MqttStream,
         cancel: &CancellationToken,
         next_ping: &mut tokio::time::Instant,
         ping: Duration,
     ) -> Result<bool> {
+        let mut observed_wait=tx.observe_wait();
         self.diag
             .mqtt_backpressure_waits
             .fetch_add(1, Ordering::Relaxed);
@@ -626,6 +647,7 @@ impl MqttSource {
                 }
                 reserved = &mut permit => {
                     let Ok(permit) = reserved else { return Ok(false) };
+                    observed_wait.finish();
                     permit.send(row);
                     self.diag.mqtt_backpressure_recovered.fetch_add(1, Ordering::Relaxed);
                     return Ok(true);
@@ -637,7 +659,7 @@ impl MqttSource {
 
 const MQTT_STOP_DEADLINE: Duration = Duration::from_millis(400);
 
-async fn close_mqtt(stream: &mut super::io::MqttStream) {
+pub(super) async fn close_mqtt(stream: &mut super::io::MqttStream) {
     let _ = tokio::time::timeout(MQTT_STOP_DEADLINE, async {
         let _ = write_packet(stream, &Packet::Disconnect).await;
         use tokio::io::AsyncWriteExt;
@@ -680,6 +702,64 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn obs_mqtt_health_distinguishes_connected_reconnecting_and_stopped() {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+        let (close_tx,close_rx)=tokio::sync::oneshot::channel();let end=CancellationToken::new();let server_end=end.clone();
+        let broker=tokio::spawn(async move{
+            let mut close=Some(close_rx);
+            for _ in 0..2{
+                let (socket,_)=listener.accept().await.unwrap();let mut stream:super::super::io::MqttStream=Box::pin(socket);
+                let mut reader=MqttFramedReader::new();assert!(matches!(reader.next(&mut stream).await.unwrap(),Packet::Connect(_)));
+                write_packet(&mut stream,&Packet::ConnAck{session_present:false,return_code:0}).await.unwrap();
+                assert!(matches!(reader.next(&mut stream).await.unwrap(),Packet::Subscribe{..}));
+                write_packet(&mut stream,&Packet::SubAck{packet_id:1,codes:vec![0]}).await.unwrap();
+                write_packet(&mut stream,&Packet::Publish(Publish{dup:false,qos:0,retain:false,topic:"sensors/json".into(),packet_id:None,payload:br#"{"device_id":"observed"}"#.to_vec()})).await.unwrap();
+                if let Some(close)=close.take(){close.await.unwrap();}else{server_end.cancelled().await;}
+            }
+        });
+        let owner=MemoryOwner::new(ResourceBudget::compact());let diag=IoDiagnostics::new();diag.observation.initialize(&owner).unwrap();
+        let mut cfg=MqttSourceConfig::demo("127.0.0.1",port,schema());cfg.reconnect_min=Duration::from_millis(100);
+        let source=MqttSource::bind(cfg,&MapSecretResolver::empty(),&TargetPolicy::allow("127.0.0.1",port),diag.clone()).unwrap();
+        let (tx,mut rx)=sparrow_io::observed::channel(32);tx.observer().unwrap().initialize(&owner).unwrap();
+        let cancel=CancellationToken::new();let task=tokio::spawn(source.run(tx,cancel.clone()));
+        assert!(tokio::time::timeout(Duration::from_secs(2),rx.recv()).await.unwrap().is_some());
+        assert_eq!(diag.observation.endpoints().unwrap().0.state,HealthState::Ready);
+        assert!(rx.last_origin().oldest_age(std::time::Instant::now()).is_some());
+        close_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2),async{loop{
+            if diag.observation.endpoints().unwrap().0.state==HealthState::Reconnecting{break;}tokio::task::yield_now().await;
+        }}).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2),rx.recv()).await.unwrap().is_some());
+        let status=diag.observation.endpoints().unwrap().0;assert_eq!(status.state,HealthState::Ready);assert!(status.failures>0);assert_eq!(status.progress_units,2);
+        cancel.cancel();tokio::time::timeout(Duration::from_secs(2),task).await.unwrap().unwrap().unwrap();
+        assert_eq!(diag.observation.endpoints().unwrap().0.state,HealthState::Stopped);
+        end.cancel();broker.await.unwrap();drop((rx,diag));assert_eq!(owner.usage().physical_bytes,0);
+    }
+
+    #[tokio::test]
+    async fn obs_denied_subscription_never_reports_ready() {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+        let broker=tokio::spawn(async move{
+            let (socket,_)=listener.accept().await.unwrap();let mut stream:super::super::io::MqttStream=Box::pin(socket);
+            let mut reader=MqttFramedReader::new();assert!(matches!(reader.next(&mut stream).await.unwrap(),Packet::Connect(_)));
+            write_packet(&mut stream,&Packet::ConnAck{session_present:false,return_code:0}).await.unwrap();
+            assert!(matches!(reader.next(&mut stream).await.unwrap(),Packet::Subscribe{..}));
+            write_packet(&mut stream,&Packet::SubAck{packet_id:1,codes:vec![128]}).await.unwrap();
+            let _=reader.next(&mut stream).await;
+        });
+        let owner=MemoryOwner::new(ResourceBudget::compact());let diag=IoDiagnostics::new();diag.observation.initialize(&owner).unwrap();
+        let mut cfg=MqttSourceConfig::demo("127.0.0.1",port,schema());cfg.reconnect_min=Duration::from_secs(1);
+        let source=MqttSource::bind(cfg,&MapSecretResolver::empty(),&TargetPolicy::allow("127.0.0.1",port),diag.clone()).unwrap();
+        let (tx,mut rx)=mpsc::channel(32);let cancel=CancellationToken::new();let task=tokio::spawn(source.run(tx,cancel.clone()));
+        tokio::time::timeout(Duration::from_secs(2),async{loop{
+            let e=diag.observation.endpoints().unwrap().0;assert_ne!(e.state,HealthState::Ready);
+            if e.failures>0{assert_eq!(e.last_error_code,Some(ErrorCode::PolicyDenied));break;}
+            tokio::task::yield_now().await;
+        }}).await.unwrap();
+        assert!(rx.try_recv().is_err());cancel.cancel();task.await.unwrap().unwrap();broker.await.unwrap();
+    }
+
     fn row(id: &str) -> Row {
         Row {
             values: vec![sparrow_model::Scalar::utf8(id)],
@@ -695,6 +775,7 @@ mod tests {
             budget.queue_bytes = QueuedRow::accounted_bytes(&row("same"));
             let queue = MemoryOwner::child(owner.clone(), budget, "inbox-test");
             let (tx, mut rx) = mpsc::channel(4);
+            let tx:ObservedSender<_>=tx.into();
             tx.send(QueuedRow::try_new(row("same"), &queue, &source.diag.mqtt_inbox).unwrap())
                 .await
                 .unwrap();
@@ -713,6 +794,7 @@ mod tests {
                 &cancel,
                 &mut next_ping,
                 ping,
+                OriginSpan::missing(),
             );
             let receive = async {
                 if recover {
@@ -739,6 +821,7 @@ mod tests {
         let source = inbox_source(Duration::from_millis(5));
         let owner = MemoryOwner::new(ResourceBudget::compact());
         let (tx, mut rx) = mpsc::channel(4);
+        let tx:ObservedSender<_>=tx.into();
         let (socket, _peer) = tokio::io::duplex(64);
         let mut stream: super::super::io::MqttStream = Box::pin(socket);
         let cancel = CancellationToken::new();
@@ -755,7 +838,8 @@ mod tests {
                     &mut stream,
                     &cancel,
                     &mut next_ping,
-                    ping
+                    ping,
+                    OriginSpan::missing()
                 )
                 .await
                 .unwrap());
@@ -770,6 +854,7 @@ mod tests {
     async fn backpressure_recovers_without_reordering_or_duplicating() {
         let source = inbox_source(Duration::from_millis(5));
         let (tx, mut rx) = mpsc::channel(1);
+        let tx:ObservedSender<_>=tx.into();
         tx.try_send(row("first")).unwrap();
         let (socket, _peer) = tokio::io::duplex(64);
         let mut stream: super::super::io::MqttStream = Box::pin(socket);
@@ -805,6 +890,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
         let source = inbox_source(Duration::from_millis(50));
         let (tx, mut rx) = mpsc::channel(1);
+        let tx:ObservedSender<_>=tx.into();
         tx.try_send(row("first")).unwrap();
         let (socket, mut peer) = tokio::io::duplex(64);
         let mut stream: super::super::io::MqttStream = Box::pin(socket);
@@ -837,6 +923,7 @@ mod tests {
         for close_receiver in [false, true] {
             let source = inbox_source(Duration::from_secs(1));
             let (tx, mut rx) = mpsc::channel(1);
+            let tx:ObservedSender<_>=tx.into();
             tx.try_send(row("first")).unwrap();
             let (socket, _peer) = tokio::io::duplex(64);
             let mut stream: super::super::io::MqttStream = Box::pin(socket);

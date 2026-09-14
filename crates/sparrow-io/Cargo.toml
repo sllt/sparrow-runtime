@@ -7,3 +7,7 @@ description = "Sparrow I/O contracts only in M0 (no MQTT/HTTP connectors)"
 
 [dependencies]
 sparrow-model.workspace = true
+tokio = { workspace = true, features = ["sync"], optional = true }
+
+[features]
+observation = ["dep:tokio"]

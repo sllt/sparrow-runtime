@@ -43,25 +43,303 @@ fn kernel() -> Kernel {
 }
 
 #[test]
+fn obs_job_mailboxes_are_attempt_scoped_and_cleanup_without_history() {
+    let k = kernel();
+    let capture = SharedCapture::new();
+    capture.stall.stall();
+    let input = (0..256)
+        .map(|i| Row {
+            values: vec![Scalar::Int64(i), Scalar::Float64(1.0)],
+        })
+        .collect();
+    let slow = k
+        .submit(JobRequest::new(pass_through_plan(), input, capture.clone()))
+        .unwrap();
+    let slow_owner = slow.memory_owner();
+    let slow_observer = slow.mailbox_observer();
+    let fast_capture = SharedCapture::new();
+    let fast = k
+        .submit(JobRequest::new(
+            pass_through_plan(),
+            rows(),
+            fast_capture.clone(),
+        ))
+        .unwrap();
+    let fast_observer = fast.mailbox_observer();
+    assert_ne!(
+        slow.mailbox_snapshot().runtime_attempt_id,
+        fast.mailbox_snapshot().runtime_attempt_id
+    );
+    k.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = slow.mailbox_snapshot();
+                if snapshot.initialized
+                    && snapshot.edges.iter().any(|e| e.queue.waiting_senders > 0)
+                    && snapshot
+                        .edges
+                        .iter()
+                        .any(|e| e.queue.consumer_held.items > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let s = slow.mailbox_snapshot();
+        assert!(s.edges.iter().any(|e| e.queue.queued.items > 0));
+        assert!(s.edges.iter().any(|e| e.queue.consumer_held.items > 0));
+        assert!(s
+            .edges
+            .iter()
+            .any(|e| e.queue.oldest_queued_data_age_us.is_some()));
+        tokio::time::timeout(std::time::Duration::from_secs(2), fast.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fast_capture.row_count(), 2);
+        let f = fast_observer.snapshot();
+        assert!(f.initialized);
+        assert!(f.edges.iter().all(|e| e.queue.queued.items == 0
+            && e.queue.credits_reserved_bytes == 0
+            && !e.queue.receiver_open));
+        tokio::time::timeout(std::time::Duration::from_secs(2), slow.stop())
+            .await
+            .unwrap()
+            .unwrap();
+    });
+    let s = slow_observer.snapshot();
+    assert!(s.edges.iter().all(|e| e.queue.queued.items == 0
+        && e.queue.consumer_held.items == 0
+        && e.queue.waiting_senders == 0
+        && e.queue.credits_reserved_bytes == 0));
+    assert_eq!(slow_owner.usage().reservation_bytes, 0);
+    assert_eq!(
+        slow_owner.usage().queue_bytes,
+        s.edges
+            .iter()
+            .map(|e| e.queue.metadata_bytes)
+            .sum::<usize>()
+    );
+    assert_eq!(k.admitted_jobs(), 0);
+    assert_eq!(k.queue_reserved(), 0);
+    drop((slow_observer, fast_observer));
+    assert_eq!(k.process_owner().usage().physical_bytes, 0);
+}
+
+#[test]
+fn obs_metadata_over_budget_is_rejected_before_job_start() {
+    let plan = pass_through_plan();
+    let cfg = MailboxConfig {
+        max_items: 4096,
+        max_bytes: 1024,
+    };
+    let k = Kernel::new(KernelOptions {
+        budget: ResourceBudget {
+            queue_bytes: 4096,
+            ..ResourceBudget::compact()
+        },
+        mailbox: cfg,
+        worker_threads: 2,
+        rows_per_batch: 4,
+    })
+    .unwrap();
+    assert!(k
+        .submit(JobRequest::new(plan, vec![], SharedCapture::new()))
+        .is_err());
+    assert_eq!(k.metrics.snapshot().jobs_started, 0);
+    assert_eq!(k.admitted_jobs(), 0);
+    assert_eq!(k.queue_reserved(), 0);
+    assert_eq!(k.process_owner().usage().physical_bytes, 0);
+}
+
+#[test]
+fn obs_boundary_origin_survives_transform_but_not_window_state() {
+    use sparrow_model::observation::{FlowObservation, OriginSpan};
+    use std::sync::Arc;
+    for window in [false, true] {
+        let k = kernel();
+        let plan = if window {
+            let bound = sparrow_plan::bind_window_linear(
+                PipelineId::new(1),
+                RevisionId::new(1),
+                "s".into(),
+                schema(),
+                None,
+                sparrow_plan::WindowSpec::new(
+                    sparrow_model::WindowKind::Count { size: 1 },
+                    vec!["id".into()],
+                    vec![sparrow_plan::AggCall::count_star("n")],
+                ),
+                "c".into(),
+            )
+            .unwrap();
+            physicalize(&bound, &PlanOptions { fuse: true })
+        } else {
+            let bound = bind_linear(
+                PipelineId::new(1),
+                RevisionId::new(1),
+                "s".into(),
+                schema(),
+                Some(Expr::Literal(Scalar::Bool(true))),
+                None,
+                None,
+                "c".into(),
+            )
+            .unwrap();
+            physicalize(&bound, &PlanOptions { fuse: true })
+        };
+        let (tx, rx) = sparrow_io::observed::channel(8);
+        let (out, mut output) = sparrow_io::observed::channel(8);
+        let source_queue = tx.observer().unwrap();
+        let sink_queue = out.observer().unwrap();
+        let obs = Arc::new(FlowObservation::default());
+        let job = k
+            .submit(
+                JobRequest::new(plan, vec![], SharedCapture::disabled())
+                    .with_live_io(rx, out)
+                    .with_observation(obs.clone()),
+            )
+            .unwrap();
+        let at = std::time::Instant::now();
+        k.block_on(async {
+            for row in rows() {
+                tx.send_with_origin(row, OriginSpan::at(at)).await.unwrap();
+            }
+            drop(tx);
+            let (result, collected) = tokio::join!(job.wait(), async {
+                let mut n = 0;
+                while let Some(batch) = output.recv().await {
+                    assert_eq!(
+                        batch
+                            .origin()
+                            .oldest_age(std::time::Instant::now())
+                            .is_some(),
+                        !window
+                    );
+                    n += batch.num_rows();
+                }
+                n
+            });
+            result.unwrap();
+            assert_eq!(collected, 2);
+        });
+        assert_eq!(source_queue.snapshot().unwrap().received, 2);
+        assert_eq!(sink_queue.snapshot().unwrap().items, 0);
+        drop((output, source_queue, sink_queue, obs));
+        assert_eq!(k.process_owner().usage().physical_bytes, 0);
+    }
+}
+
+#[test]
+fn base05_window_output_metrics_count_only_the_final_sink() {
+    use sparrow_plan::{bind_window_linear, AggCall, PhysicalStage, TransformStep, WindowSpec};
+    for keep in [true, false] {
+        let bound = bind_window_linear(
+            PipelineId::new(1),
+            RevisionId::new(1),
+            "s".into(),
+            schema(),
+            None,
+            WindowSpec::new(
+                sparrow_model::WindowKind::Count { size: 1 },
+                vec!["id".into()],
+                vec![AggCall::count_star("n")],
+            ),
+            "c".into(),
+        )
+        .unwrap();
+        let mut plan = physicalize(&bound, &PlanOptions { fuse: true });
+        let input = match plan.stages.last().unwrap() {
+            PhysicalStage::CaptureSink { schema, .. } => schema.clone(),
+            _ => unreachable!(),
+        };
+        plan.stages.insert(
+            plan.stages.len() - 1,
+            PhysicalStage::Transform {
+                steps: vec![TransformStep::Filter {
+                    operator: sparrow_model::OperatorId::new(99),
+                    predicate: Expr::Literal(Scalar::Bool(keep)),
+                    input,
+                }],
+            },
+        );
+        // One-row emission chunks exercise both the full-chunk and tail paths.
+        let k = Kernel::new(KernelOptions {
+            budget: ResourceBudget::compact(),
+            mailbox: MailboxConfig {
+                max_items: 1,
+                max_bytes: 64 * 1024,
+            },
+            worker_threads: 2,
+            rows_per_batch: 4,
+        })
+        .unwrap();
+        let capture = SharedCapture::new();
+        k.run(JobRequest::new(plan, rows(), capture.clone()))
+            .unwrap();
+        let expected = if keep { 2 } else { 0 };
+        assert_eq!(capture.row_count(), expected);
+        assert_eq!(k.metrics.snapshot().emitted_rows, expected as u64);
+        assert_eq!(k.metrics.snapshot().ingested_rows, 2);
+        assert_eq!(k.process_owner().usage().physical_bytes, 0);
+    }
+}
+
+#[test]
 fn byte_accounted_ingress_releases_queues_on_eof_and_cancel() {
-    use sparrow_model::{QueuedRow, QueueOccupancy};
-    use std::sync::{Arc, atomic::Ordering};
+    use sparrow_model::{QueueOccupancy, QueuedRow};
+    use std::sync::{atomic::Ordering, Arc};
     for stop in [false, true] {
         let k = kernel();
-        let bound = bind_linear(PipelineId::new(1), RevisionId::new(1), "s".into(), schema(), None, None, None, "c".into()).unwrap();
+        let bound = bind_linear(
+            PipelineId::new(1),
+            RevisionId::new(1),
+            "s".into(),
+            schema(),
+            None,
+            None,
+            None,
+            "c".into(),
+        )
+        .unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(4096);
         let (out, mut output) = tokio::sync::mpsc::channel(8);
-        let job = k.submit(JobRequest::new(physicalize(&bound, &PlanOptions { fuse: true }), Vec::new(), SharedCapture::disabled()).with_budgeted_live_io(rx, out)).unwrap();
+        let job = k
+            .submit(
+                JobRequest::new(
+                    physicalize(&bound, &PlanOptions { fuse: true }),
+                    Vec::new(),
+                    SharedCapture::disabled(),
+                )
+                .with_budgeted_live_io(rx, out),
+            )
+            .unwrap();
         let owner = job.memory_owner();
         let occupancy = Arc::new(QueueOccupancy::default());
         k.block_on(async {
-            for row in rows() { tx.send(QueuedRow::try_new(row, &owner, &occupancy).unwrap()).await.unwrap(); }
-            if stop { job.cancel(); }
+            for row in rows() {
+                tx.send(QueuedRow::try_new(row, &owner, &occupancy).unwrap())
+                    .await
+                    .unwrap();
+            }
+            if stop {
+                job.cancel();
+            }
             drop(tx);
             let drain = async { while output.recv().await.is_some() {} };
-            let wait = async { tokio::time::timeout(std::time::Duration::from_secs(2), job.wait()).await.unwrap().unwrap() };
+            let wait = async {
+                tokio::time::timeout(std::time::Duration::from_secs(2), job.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
             let (_, stats) = tokio::join!(drain, wait);
-            if !stop { assert_eq!(stats.ingested_rows, 2); }
+            if !stop {
+                assert_eq!(stats.ingested_rows, 2);
+            }
         });
         assert_eq!(occupancy.items.load(Ordering::Relaxed), 0);
         assert_eq!(owner.usage().live_handles, 0);
@@ -73,11 +351,22 @@ fn byte_accounted_ingress_releases_queues_on_eof_and_cancel() {
 fn ingest_is_counted_once_for_memory_live_eof_and_live_stop() {
     for mode in 0..5 {
         let k = kernel();
-        let bound = bind_linear(PipelineId::new(1), RevisionId::new(1),
-            "s".into(), schema(), None, None, None, "c".into()).unwrap();
+        let bound = bind_linear(
+            PipelineId::new(1),
+            RevisionId::new(1),
+            "s".into(),
+            schema(),
+            None,
+            None,
+            None,
+            "c".into(),
+        )
+        .unwrap();
         let plan = physicalize(&bound, &PlanOptions { fuse: true });
         if mode == 0 {
-            let stats = k.run(JobRequest::new(plan, rows(), SharedCapture::new())).unwrap();
+            let stats = k
+                .run(JobRequest::new(plan, rows(), SharedCapture::new()))
+                .unwrap();
             assert_eq!(stats.ingested_rows, 2);
             assert_eq!(k.metrics.snapshot().ingested_rows, 2);
             continue;
@@ -88,26 +377,43 @@ fn ingest_is_counted_once_for_memory_live_eof_and_live_stop() {
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(4);
         let (out, _output) = tokio::sync::mpsc::channel(4);
         let req = JobRequest::new(plan, Vec::new(), SharedCapture::new());
-        let req = if ordered { req.with_live_events(events_rx) } else { req.with_live_io(rx, out) };
+        let req = if ordered {
+            req.with_live_events(events_rx)
+        } else {
+            req.with_live_io(rx, out)
+        };
         let handle = k.submit(req).unwrap();
         k.block_on(async {
             for row in rows() {
-                if ordered { events_tx.send(IngressEvent::Row(row)).await.unwrap(); }
-                else { tx.send(row).await.unwrap(); }
+                if ordered {
+                    events_tx.send(IngressEvent::Row(row)).await.unwrap();
+                } else {
+                    tx.send(row).await.unwrap();
+                }
             }
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 while k.metrics.snapshot().ingested_rows < 2 {
                     tokio::task::yield_now().await;
                 }
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert_eq!(k.metrics.snapshot().ingested_rows, 2);
-            if stop { handle.cancel(); }
+            if stop {
+                handle.cancel();
+            }
             drop(tx);
             drop(events_tx);
             let stats = tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait())
-                .await.unwrap().unwrap();
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(stats.ingested_rows, 2);
-            assert_eq!(k.metrics.snapshot().ingested_rows, 2, "mode {mode}: completion double-counted ingress");
+            assert_eq!(
+                k.metrics.snapshot().ingested_rows,
+                2,
+                "mode {mode}: completion double-counted ingress"
+            );
         });
     }
 }
@@ -174,9 +480,7 @@ fn r01_user_stop_is_cancelled_ok() {
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let (out_tx, _out_rx) = tokio::sync::mpsc::channel(4);
     let h = k
-        .submit(
-            JobRequest::new(plan, Vec::new(), SharedCapture::new()).with_live_io(rx, out_tx),
-        )
+        .submit(JobRequest::new(plan, Vec::new(), SharedCapture::new()).with_live_io(rx, out_tx))
         .unwrap();
     let _ = tx;
     let stats = k.block_on(h.stop()).unwrap();
@@ -276,6 +580,68 @@ fn r18_ordered_ingress_emits_watermark_after_rows() {
 }
 
 #[test]
+fn r9_bulk_ingress_barrier_freezes_only_preceding_rows() {
+    use sparrow_model::observation::OriginSpan;
+    let plan = count_window_plan(None, 4);
+    let layout = sparrow_plan::PlanLayout::from_physical(&plan).unwrap();
+    let k = kernel();
+    let (tx, rx) = sparrow_io::observed::channel(8);
+    let capture = SharedCapture::new();
+    let acks = crate::AlignedAcks::default();
+    let request = acks.begin(1).unwrap();
+    let job = k
+        .submit(
+            JobRequest::new(plan, Vec::new(), capture.clone())
+                .with_live_events(rx)
+                .with_aligned(crate::AlignedJob {
+                    restore: None,
+                    acks,
+                    outbox: std::sync::Arc::new(sparrow_model::InflightCounter::new()),
+                }),
+        )
+        .unwrap();
+    k.block_on(async {
+        let mut events: Vec<_> = count_rows(&[1, 2])
+            .into_iter()
+            .map(IngressEvent::Row)
+            .collect();
+        events.push(IngressEvent::Control(StreamControl::CheckpointBarrier {
+            checkpoint_id: 1,
+        }));
+        events.extend(count_rows(&[3, 4]).into_iter().map(IngressEvent::Row));
+        tx.send_batch_with_origin(events, OriginSpan::at(std::time::Instant::now()))
+            .await
+            .unwrap();
+        let result = request
+            .wait(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let source =
+            sparrow_io::SourcePosition::start(sparrow_io::SourceIdentity::memory("r9", 4, 1));
+        let encoded = crate::CheckpointSnapshot::encode_frozen(
+            1,
+            &source,
+            2,
+            &layout,
+            None,
+            result.freeze.unwrap(),
+        )
+        .unwrap();
+        let snapshot = crate::CheckpointSnapshot::decode(&encoded.bytes).unwrap();
+        assert_eq!(
+            snapshot.window.entries.iter().map(|e| e.count).sum::<u64>(),
+            2
+        );
+        drop(encoded);
+        drop(tx);
+        let stats = job.wait().await.unwrap();
+        assert_eq!(stats.ingested_rows, 4);
+        assert_eq!(capture.row_count(), 1);
+    });
+    assert_eq!(k.process_owner().usage().physical_bytes, 0);
+}
+
+#[test]
 fn r01_stage_panic_is_job_failed() {
     let bound = bind_linear(
         PipelineId::new(1),
@@ -315,7 +681,9 @@ fn r01_downstream_fail_while_upstream_idle_shuts_down() {
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let (out_tx, out_rx) = tokio::sync::mpsc::channel(1);
     let h = k
-        .submit(JobRequest::new(plan, Vec::new(), SharedCapture::disabled()).with_live_io(rx, out_tx))
+        .submit(
+            JobRequest::new(plan, Vec::new(), SharedCapture::disabled()).with_live_io(rx, out_tx),
+        )
         .unwrap();
     k.block_on(async {
         tx.send(Row {
@@ -412,7 +780,9 @@ fn r25_blocked_sink_records_queue_pressure() {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1);
     let h = k
-        .submit(JobRequest::new(plan, Vec::new(), SharedCapture::disabled()).with_live_io(rx, out_tx))
+        .submit(
+            JobRequest::new(plan, Vec::new(), SharedCapture::disabled()).with_live_io(rx, out_tx),
+        )
         .unwrap();
     k.block_on(async {
         for i in 0..6 {
@@ -510,17 +880,37 @@ fn count_window_plan(filter: Option<Expr>, size: u64) -> sparrow_plan::PhysicalP
 fn r3_live_timer_metrics_and_job_cancel_count_are_real() {
     use sparrow_model::{SharedVirtualClock, WindowKind};
     use sparrow_plan::{bind_window_linear, AggCall, WindowSpec};
-    let spec = WindowSpec::new(WindowKind::tumbling_pt(1_000_000).unwrap(),
-        vec!["device_id".into()], vec![AggCall::count_star("n")]);
-    let bound = bind_window_linear(PipelineId::new(1), RevisionId::new(1), "sensors".into(),
-        count_schema(), None, spec, "out".into()).unwrap();
+    let spec = WindowSpec::new(
+        WindowKind::tumbling_pt(1_000_000).unwrap(),
+        vec!["device_id".into()],
+        vec![AggCall::count_star("n")],
+    );
+    let bound = bind_window_linear(
+        PipelineId::new(1),
+        RevisionId::new(1),
+        "sensors".into(),
+        count_schema(),
+        None,
+        spec,
+        "out".into(),
+    )
+    .unwrap();
     let plan = physicalize(&bound, &PlanOptions::default());
     let kernel = kernel();
     let (tx, rx) = tokio::sync::mpsc::channel(4);
-    let handle = kernel.submit(JobRequest::new(plan, Vec::new(), SharedCapture::disabled())
-        .with_live_events(rx).with_clock(crate::RuntimeClock::virtual_clock(SharedVirtualClock::new(0)))).unwrap();
+    let handle = kernel
+        .submit(
+            JobRequest::new(plan, Vec::new(), SharedCapture::disabled())
+                .with_live_events(rx)
+                .with_clock(crate::RuntimeClock::virtual_clock(SharedVirtualClock::new(
+                    0,
+                ))),
+        )
+        .unwrap();
     kernel.block_on(async {
-        tx.send(IngressEvent::Row(count_rows(&[1]).pop().unwrap())).await.unwrap();
+        tx.send(IngressEvent::Row(count_rows(&[1]).pop().unwrap()))
+            .await
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while kernel.metrics.snapshot().timers_live == 0 {
             assert!(std::time::Instant::now() < deadline);
@@ -744,8 +1134,12 @@ fn a1_aligned_runs_full_plan_through_kernel() {
     );
     let k = kernel();
     let capture = SharedCapture::new();
-    k.run(JobRequest::new(plan, count_rows(&[1, 2, 3, 4]), capture.clone()))
-        .unwrap();
+    k.run(JobRequest::new(
+        plan,
+        count_rows(&[1, 2, 3, 4]),
+        capture.clone(),
+    ))
+    .unwrap();
     assert_eq!(
         capture.row_count(),
         1,
@@ -813,7 +1207,10 @@ fn p0_4_barrier_waits_for_real_sink_flush() {
         }
         let elapsed = t0.elapsed();
         assert!(frozen, "window must freeze on the Kernel barrier");
-        assert!(flushed, "sink must ack after the real flush, not channel-empty");
+        assert!(
+            flushed,
+            "sink must ack after the real flush, not channel-empty"
+        );
         assert!(
             elapsed >= std::time::Duration::from_millis(200),
             "SinkFlushed in {elapsed:?} — barrier did not wait for sink ack"
@@ -843,15 +1240,20 @@ fn pass_through_plan() -> sparrow_plan::PhysicalPlan {
 fn p1_20_second_job_refused_when_process_queue_reserved() {
     let plan = pass_through_plan();
     assert!(plan.mailbox_count() >= 1);
+    let mailbox = MailboxConfig {
+        max_items: 4,
+        max_bytes: 3 * 1024,
+    };
+    let one_job = (mailbox.max_bytes
+        + crate::mailbox_observe::MailboxObserver::metadata_bytes(mailbox).unwrap())
+        * plan.mailbox_count();
     let k = Kernel::new(KernelOptions {
         budget: ResourceBudget {
-            queue_bytes: 4 * 1024,
+            // One job including observed channel metadata fits; two must not.
+            queue_bytes: one_job + one_job / 2,
             ..ResourceBudget::compact()
         },
-        mailbox: MailboxConfig {
-            max_items: 4,
-            max_bytes: 3 * 1024,
-        },
+        mailbox,
         worker_threads: 2,
         rows_per_batch: 4,
     })
@@ -878,7 +1280,10 @@ fn p1_20_second_job_refused_when_process_queue_reserved() {
         Err(e) => e,
     };
     assert_eq!(err.code, sparrow_model::ErrorCode::ResourceExhausted);
-    assert!(err.context.iter().any(|(key, value)| key == "admission" && value == "capacity"));
+    assert!(err
+        .context
+        .iter()
+        .any(|(key, value)| key == "admission" && value == "capacity"));
     assert!(
         err.message.contains("process queue") || err.message.contains("process memory"),
         "N jobs must not each get a full queue budget: {err}"
@@ -900,10 +1305,7 @@ fn p1_20_jobs_share_process_memory_owner() {
         )
         .unwrap();
     let q = owner
-        .acquire(
-            sparrow_model::CreditKind::Queue,
-            owner.budget().queue_bytes,
-        )
+        .acquire(sparrow_model::CreditKind::Queue, owner.budget().queue_bytes)
         .unwrap();
     let plan = pass_through_plan();
     let err = match k.submit(JobRequest::new(plan, rows(), SharedCapture::new())) {
@@ -991,7 +1393,6 @@ fn a2_utf8_tracked_used_on_runtime_path() {
         max_state_keys: 2,
         max_timers: 2,
     });
-    let err = Scalar::utf8_tracked(&owner, "0123456789abcdef extra")
-        .unwrap_err();
+    let err = Scalar::utf8_tracked(&owner, "0123456789abcdef extra").unwrap_err();
     assert_eq!(err.code, sparrow_model::ErrorCode::ResourceExhausted);
 }

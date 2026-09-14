@@ -26,9 +26,9 @@ use crate::window::{FrozenEntry, WindowFreeze};
 pub const CHECKPOINT_LABEL: &str = "aligned";
 pub const CHUNK_SIZE: usize = 4096;
 pub const MAGIC: &[u8; 4] = b"SPV1";
-/// Codec version. Unchanged in R2 N6 (entry-count caps stay decode-time;
-/// encode now fails closed against the same bound). Format bytes unchanged (P1-25).
-pub const SNAPSHOT_VERSION: u16 = 1;
+/// Version 2 requires full state semantics. Version 1 remains inspectable,
+/// but cannot authorize restore or be silently rewritten as version 2.
+pub const SNAPSHOT_VERSION: u16 = 2;
 pub const MANIFEST_MAGIC: &[u8; 4] = b"MAN2";
 pub const MANIFEST_VERSION: u16 = 1;
 /// Reject encode/commit payloads above this (R15).
@@ -141,16 +141,27 @@ impl CheckpointSnapshot {
     }
 
     /// Wrap the already encoded ACK in-place; no second state encode/clone.
-    pub fn encode_frozen(checkpoint_id: u64, source: &SourcePosition, ingested_rows: u64,
-        layout: &PlanLayout, table: Option<&TableRevisionBind>,
-        mut freeze: crate::barrier::EncodedFreeze) -> Result<crate::barrier::EncodedFreeze> {
+    pub fn encode_frozen(
+        checkpoint_id: u64,
+        source: &SourcePosition,
+        ingested_rows: u64,
+        layout: &PlanLayout,
+        table: Option<&TableRevisionBind>,
+        mut freeze: crate::barrier::EncodedFreeze,
+    ) -> Result<crate::barrier::EncodedFreeze> {
         let mut prefix = Vec::new();
         write_snapshot_prefix(&mut prefix, checkpoint_id, ingested_rows, source)?;
         let mut suffix = Vec::new();
         write_snapshot_suffix(&mut suffix, layout, table)?;
-        let total = prefix.len().saturating_add(freeze.bytes.len()).saturating_add(suffix.len());
+        let total = prefix
+            .len()
+            .saturating_add(freeze.bytes.len())
+            .saturating_add(suffix.len());
         if total as u64 > MAX_SNAPSHOT_BYTES {
-            return Err(SparrowError::new(ErrorCode::BoundExceeded, "snapshot exceeds byte cap"));
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "snapshot exceeds byte cap",
+            ));
         }
         freeze.lease.grow_to(total.max(freeze.bytes.capacity()))?;
         freeze.bytes.reserve_exact(total - freeze.bytes.len());
@@ -178,10 +189,10 @@ impl CheckpointSnapshot {
         src = &src[4..];
         let ver = u16::from_le_bytes(src[..2].try_into().unwrap());
         src = &src[2..];
-        if ver != SNAPSHOT_VERSION {
+        if ver != 1 && ver != SNAPSHOT_VERSION {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("checkpoint snapshot version {ver} unsupported (V1 codec is {SNAPSHOT_VERSION})"),
+                format!("checkpoint snapshot version {ver} unsupported (supported versions: 1 (inspect only), {SNAPSHOT_VERSION})"),
             ));
         }
         let checkpoint_id = u64::from_le_bytes(src[..8].try_into().unwrap());
@@ -190,16 +201,22 @@ impl CheckpointSnapshot {
         src = &src[8..];
         let source = decode_position(&mut src)?;
         let window = decode_freeze(&mut src, cap)?;
-        let layout = decode_layout(&mut src)?;
+        let layout = decode_layout(&mut src, ver)?;
         if layout.operator != window.operator || layout.slot != window.slot {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
                 "snapshot OperatorId/StateSlotKey does not match frozen window",
             ));
         }
-        let table = if src.is_empty() {
+        let table = if src.is_empty() && ver == 1 {
             None
         } else {
+            if src.is_empty() {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "truncated table tag",
+                ));
+            }
             let tag = src[0];
             src = &src[1..];
             match tag {
@@ -214,7 +231,6 @@ impl CheckpointSnapshot {
                     }
                     let version = u64::from_le_bytes(src[..8].try_into().unwrap());
                     src = &src[8..];
-                    let _ = src;
                     Some(TableRevisionBind { name, version })
                 }
                 _ => {
@@ -225,6 +241,12 @@ impl CheckpointSnapshot {
                 }
             }
         };
+        if !src.is_empty() {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "trailing snapshot bytes",
+            ));
+        }
         Ok(Self {
             checkpoint_id,
             source,
@@ -873,6 +895,21 @@ fn decode_opt_i64(src: &mut &[u8]) -> Result<Option<i64>> {
 }
 
 fn encode_layout(l: &PlanLayout, out: &mut Vec<u8>) -> Result<()> {
+    let semantics =
+        l.semantic_descriptor
+            .as_ref()
+            .filter(|s| s.has_input_schema())
+            .ok_or_else(|| {
+                SparrowError::new(ErrorCode::UnsupportedRestore,
+            "cannot write a checkpoint without complete state semantics; reset/replay required")
+            })?
+            .encode()?;
+    if l.keys.len() > u16::MAX as usize || l.aggs.len() > u16::MAX as usize {
+        return Err(SparrowError::new(
+            ErrorCode::BoundExceeded,
+            "plan layout item count exceeds codec bound",
+        ));
+    }
     out.extend_from_slice(&l.operator.raw().to_le_bytes());
     out.extend_from_slice(&l.slot.raw().to_le_bytes());
     out.push(l.window_kind);
@@ -902,10 +939,12 @@ fn encode_layout(l: &PlanLayout, out: &mut Vec<u8>) -> Result<()> {
     }
     encode_opt_i64(l.table_revision.map(|v| v as i64), out);
     out.extend_from_slice(&l.window_params_fingerprint.to_le_bytes());
+    out.extend_from_slice(&(semantics.len() as u32).to_le_bytes());
+    out.extend_from_slice(&semantics);
     Ok(())
 }
 
-fn decode_layout(src: &mut &[u8]) -> Result<PlanLayout> {
+fn decode_layout(src: &mut &[u8], version: u16) -> Result<PlanLayout> {
     if src.len() < 4 + 2 + 1 + 2 {
         return Err(SparrowError::new(
             ErrorCode::CodecViolation,
@@ -987,8 +1026,34 @@ fn decode_layout(src: &mut &[u8]) -> Result<PlanLayout> {
         let v = u64::from_le_bytes(src[..8].try_into().unwrap());
         *src = &src[8..];
         v
-    } else {
+    } else if version == 1 {
         0
+    } else {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "truncated window parameters",
+        ));
+    };
+    let semantic_descriptor = if version >= 2 {
+        if src.len() < 4 {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "truncated state semantics length",
+            ));
+        }
+        let len = u32::from_le_bytes(src[..4].try_into().unwrap()) as usize;
+        *src = &src[4..];
+        if len > sparrow_plan::canonical::MAX_STATE_SEMANTICS_BYTES || len > src.len() {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "state semantics length exceeds bound or snapshot",
+            ));
+        }
+        let semantics = sparrow_plan::canonical::StateSemantics::decode(&src[..len])?;
+        *src = &src[len..];
+        Some(semantics)
+    } else {
+        None
     };
     Ok(PlanLayout {
         operator,
@@ -1002,6 +1067,7 @@ fn decode_layout(src: &mut &[u8]) -> Result<PlanLayout> {
         table_name,
         table_revision,
         window_params_fingerprint,
+        semantic_descriptor,
     })
 }
 
@@ -1242,8 +1308,14 @@ mod tests {
             8,
         )
         .unwrap();
-        let mut b = RowBatchBuilder::new(Arc::new(schema), owner, CreditKind::Reservation, 2, 4096)
-            .unwrap();
+        let mut b = RowBatchBuilder::new(
+            Arc::new(schema.clone()),
+            owner,
+            CreditKind::Reservation,
+            2,
+            4096,
+        )
+        .unwrap();
         b.push(Row {
             values: vec![Scalar::utf8("d1"), Scalar::Int64(10)],
         })
@@ -1260,7 +1332,8 @@ mod tests {
             source: SourcePosition::start(SourceIdentity::memory("demo", 32, 1)),
             window: window.clone(),
             ingested_rows: 2,
-            layout: PlanLayout::from_window(OperatorId::new(7), window.slot, &spec),
+            layout: PlanLayout::from_window(OperatorId::new(7), window.slot, &spec)
+                .with_input_schema(&schema),
             table: None,
         }
     }
@@ -1280,25 +1353,130 @@ mod tests {
     }
 
     #[test]
+    fn r9_unknown_checkpoint_version_explains_inspection_and_restore_versions() {
+        let mut bytes = sample_snapshot(1).encode().unwrap();
+        bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
+        let error = CheckpointSnapshot::decode(&bytes).unwrap_err();
+        assert_eq!(error.code, ErrorCode::FeatureUnavailable);
+        assert!(error
+            .message
+            .contains("supported versions: 1 (inspect only), 2"));
+    }
+
+    #[test]
+    fn base02_legacy_snapshot_is_inspectable_but_not_reusable_or_rewritten() {
+        let snap = sample_snapshot(1);
+        let mut bytes = snap.encode().unwrap();
+        let descriptor = snap
+            .layout
+            .semantic_descriptor
+            .as_ref()
+            .unwrap()
+            .encode()
+            .unwrap();
+        let descriptor_start = bytes.len() - 1 - descriptor.len() - 4;
+        bytes.drain(descriptor_start..bytes.len() - 1);
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let dir = tmp();
+        let mut store = CheckpointStore::open(&dir).unwrap();
+        store.commit_encoded(1, &bytes).unwrap();
+        let current = fs::read(dir.join("CURRENT")).unwrap();
+        let legacy = store.recover_required().unwrap();
+        assert!(legacy.layout.semantic_descriptor.is_none());
+        assert_eq!(
+            legacy.check_compatible(&snap.layout).unwrap_err().code,
+            ErrorCode::UnsupportedRestore
+        );
+        assert!(
+            legacy.encode().is_err(),
+            "never stamp new semantics onto legacy state"
+        );
+        assert_eq!(fs::read(dir.join("CURRENT")).unwrap(), current);
+        assert_eq!(fs::read(dir.join("chk-00000001/0000.bin")).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn base02_descriptor_codec_rejects_truncation_oversize_and_trailing_bytes() {
+        let snap = sample_snapshot(1);
+        let bytes = snap.encode().unwrap();
+        let decoded = CheckpointSnapshot::decode(&bytes).unwrap();
+        decoded.check_compatible(&snap.layout).unwrap();
+        let descriptor_len = snap
+            .layout
+            .semantic_descriptor
+            .as_ref()
+            .unwrap()
+            .encode()
+            .unwrap()
+            .len();
+        let start = bytes.len() - 1 - descriptor_len - 4;
+        for end in start..bytes.len() {
+            assert!(
+                CheckpointSnapshot::decode(&bytes[..end]).is_err(),
+                "cut {end}"
+            );
+        }
+        let mut bad = bytes.clone();
+        bad[start..start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(CheckpointSnapshot::decode(&bad).is_err());
+        let mut bad = bytes.clone();
+        bad[start + 4..start + 8].copy_from_slice(b"SS99");
+        assert!(CheckpointSnapshot::decode(&bad).is_err());
+        let mut bad = bytes;
+        bad.push(0);
+        assert!(CheckpointSnapshot::decode(&bad).is_err());
+    }
+
+    #[test]
     fn r4_freeze_uses_live_reservation_headroom_without_double_billing() {
         use crate::barrier::EncodedFreeze;
         let owner = MemoryOwner::new(ResourceBudget::compact());
         let schema = count_schema();
-        let mut op = WindowOperator::new(OperatorId::WINDOW, count_spec(), schema.clone(), owner.clone(), 64, 8).unwrap();
+        let mut op = WindowOperator::new(
+            OperatorId::WINDOW,
+            count_spec(),
+            schema.clone(),
+            owner.clone(),
+            64,
+            8,
+        )
+        .unwrap();
         ingest_distinct_keys(&mut op, &schema, &owner, 1);
         op.check_freeze_encode_bound(64).unwrap();
-        assert_eq!(op.check_freeze_encode_bound(0).unwrap_err().code, ErrorCode::BoundExceeded);
+        assert_eq!(
+            op.check_freeze_encode_bound(0).unwrap_err().code,
+            ErrorCode::BoundExceeded
+        );
         let estimate = op.estimated_freeze_bytes() + 256;
-        let pressure = owner.acquire(CreditKind::Reservation, owner.budget().reservation_bytes - estimate + 1).unwrap();
+        let pressure = owner
+            .acquire(
+                CreditKind::Reservation,
+                owner.budget().reservation_bytes - estimate + 1,
+            )
+            .unwrap();
         let before = owner.usage().reservation_bytes;
-        assert_eq!(EncodedFreeze::from_operator(&op, &owner, 64).unwrap_err().code, ErrorCode::ResourceExhausted);
+        assert_eq!(
+            EncodedFreeze::from_operator(&op, &owner, 64)
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceExhausted
+        );
         assert_eq!(owner.usage().reservation_bytes, before);
         assert_eq!(op.key_count(), 1);
         drop(pressure);
         // Exactly estimate bytes of headroom: encode must not acquire twice.
-        let pressure = owner.acquire(CreditKind::Reservation, owner.budget().reservation_bytes - estimate).unwrap();
+        let pressure = owner
+            .acquire(
+                CreditKind::Reservation,
+                owner.budget().reservation_bytes - estimate,
+            )
+            .unwrap();
         let frozen = EncodedFreeze::from_operator(&op, &owner, 64).unwrap();
-        assert_eq!(owner.usage().reservation_bytes, owner.budget().reservation_bytes);
+        assert_eq!(
+            owner.usage().reservation_bytes,
+            owner.budget().reservation_bytes
+        );
         drop((frozen, pressure, op));
         assert_eq!(owner.usage().physical_bytes, 0);
     }
@@ -1310,15 +1488,25 @@ mod tests {
         let owner = MemoryOwner::new(ResourceBudget::compact());
         let mut bytes = Vec::new();
         encode_freeze(&snap.window, &mut bytes, 1024).unwrap();
-        let lease = owner.acquire(CreditKind::Reservation, bytes.capacity()).unwrap();
-        let encoded = CheckpointSnapshot::encode_frozen(snap.checkpoint_id, &snap.source,
-            snap.ingested_rows, &snap.layout, snap.table.as_ref(),
-            crate::barrier::EncodedFreeze { bytes, lease }).unwrap();
+        let lease = owner
+            .acquire(CreditKind::Reservation, bytes.capacity())
+            .unwrap();
+        let encoded = CheckpointSnapshot::encode_frozen(
+            snap.checkpoint_id,
+            &snap.source,
+            snap.ingested_rows,
+            &snap.layout,
+            snap.table.as_ref(),
+            crate::barrier::EncodedFreeze { bytes, lease },
+        )
+        .unwrap();
         assert_eq!(encoded.bytes, snap.encode().unwrap());
         assert!(owner.usage().reservation_bytes >= encoded.bytes.len());
         let dir = tmp();
         let mut store = CheckpointStore::open(&dir).unwrap();
-        store.commit_encoded(snap.checkpoint_id, &encoded.bytes).unwrap();
+        store
+            .commit_encoded(snap.checkpoint_id, &encoded.bytes)
+            .unwrap();
         assert_eq!(store.recover_required().unwrap(), snap);
         drop(encoded);
         assert_eq!(owner.usage().physical_bytes, 0);
@@ -1419,19 +1607,8 @@ mod tests {
                 last_effective: None,
             },
             ingested_rows: 1,
-            layout: PlanLayout {
-                operator: OperatorId::new(1),
-                slot: StateSlotId::new(1),
-                window_kind: 1,
-                keys: vec!["device_id".into()],
-                aggs: vec!["sum:s".into()],
-                event_time_field: None,
-                lateness_micros: 0,
-                where_fingerprint: 0,
-                table_name: None,
-                table_revision: None,
-                window_params_fingerprint: 0,
-            },
+            layout: PlanLayout::from_window(OperatorId::new(1), StateSlotId::new(1), &count_spec())
+                .with_input_schema(&count_schema()),
             table: None,
         };
         let bytes = snap.encode().unwrap();
@@ -1667,7 +1844,8 @@ mod tests {
             source: SourcePosition::start(SourceIdentity::memory("n6", 32, 1)),
             window: window.clone(),
             ingested_rows: N as u64,
-            layout: PlanLayout::from_window(OperatorId::new(7), window.slot, &spec),
+            layout: PlanLayout::from_window(OperatorId::new(7), window.slot, &spec)
+                .with_input_schema(&schema),
             table: None,
         };
         store.commit(&snap).unwrap();
@@ -1745,7 +1923,8 @@ mod tests {
             source: SourcePosition::start(SourceIdentity::memory("p114", 32, 1)),
             window: window.clone(),
             ingested_rows: 12,
-            layout: PlanLayout::from_window(OperatorId::new(7), window.slot, &spec),
+            layout: PlanLayout::from_window(OperatorId::new(7), window.slot, &spec)
+                .with_input_schema(&schema),
             table: None,
         };
         let cloned = snap.encode_with_max_state_keys(64).unwrap();

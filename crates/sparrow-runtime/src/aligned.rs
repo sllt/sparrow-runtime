@@ -44,10 +44,11 @@ impl AlignedSession {
         RecoveryPolicy::Aligned
     }
 
-    fn layout_for(operator: OperatorId, spec: &WindowSpec, table: Option<&TableRevisionBind>) -> PlanLayout {
+    fn layout_for(operator: OperatorId, spec: &WindowSpec, input: &Schema, table: Option<&TableRevisionBind>) -> PlanLayout {
         // R12: from_window now fingerprints size/slide and agg inputs.
         // R12: where_fingerprint is set (0 when no WHERE is attached).
-        let mut layout = PlanLayout::from_window(operator, StateSlotId::new(1), spec).with_where(None);
+        let mut layout = PlanLayout::from_window(operator, StateSlotId::new(1), spec)
+            .with_where(None).with_input_schema(input);
         if let Some(t) = table {
             layout = layout.with_table(&t.name, t.version);
         }
@@ -78,6 +79,8 @@ impl AlignedSession {
             snapshot_id: "aligned".into(),
         }
         .validate_with_policy(RecoveryPolicy::Aligned)?;
+        let layout = Self::layout_for(operator, &spec, &input, table.as_ref());
+        sparrow_plan::decide_state_reuse(&layout, &layout).into_result()?;
         let owner = MemoryOwner::new(budget);
         let op = WindowOperator::new(
             operator,
@@ -87,7 +90,6 @@ impl AlignedSession {
             budget.max_state_keys,
             budget.max_timers,
         )?;
-        let layout = Self::layout_for(operator, &spec, table.as_ref());
         let mut store = store;
         store.set_max_state_keys(budget.max_state_keys);
         Ok(Self {
@@ -130,7 +132,7 @@ impl AlignedSession {
         let mut store = store;
         store.set_max_state_keys(budget.max_state_keys);
         let snap = store.recover_required()?;
-        let live = Self::layout_for(operator, &spec, table.as_ref());
+        let live = Self::layout_for(operator, &spec, &input, table.as_ref());
         snap.check_compatible(&live)?;
         if snap.window.operator != operator {
             return Err(SparrowError::new(

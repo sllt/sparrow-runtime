@@ -1,8 +1,9 @@
 //! SQLite catalog. A committed desired-state change does **not** wait for
 //! MQTT/HTTP to come up — the supervisor converges afterwards.
 
+use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -26,6 +27,24 @@ pub struct Store {
 struct StoreInner {
     conn: Mutex<Connection>,
     fail_before_commit: AtomicBool,
+    stream_epoch: AtomicU64,
+    status_effective: Mutex<StatusEffectiveCache>,
+}
+
+const STATUS_EFFECTIVE_CACHE_CAP: usize = 64;
+const STATUS_EFFECTIVE_VALUE_CAP: usize = 4096;
+#[derive(Default)]
+struct StatusEffectiveCache {
+    entries: VecDeque<StatusEffectiveEntry>,
+    #[cfg(test)]
+    misses: usize,
+}
+struct StatusEffectiveEntry {
+    name: String,
+    // SQLite data_version detects writes through OTHER Store/connections;
+    // stream_epoch handles this connection's own schema writes.
+    key: (u64, u64, u64),
+    value: serde_json::Value,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +125,8 @@ impl Store {
             inner: Arc::new(StoreInner {
                 conn: Mutex::new(conn),
                 fail_before_commit: AtomicBool::new(false),
+                stream_epoch: AtomicU64::new(0),
+                status_effective: Mutex::new(StatusEffectiveCache::default()),
             }),
         })
     }
@@ -118,6 +139,8 @@ impl Store {
             inner: Arc::new(StoreInner {
                 conn: Mutex::new(conn),
                 fail_before_commit: AtomicBool::new(false),
+                stream_epoch: AtomicU64::new(0),
+                status_effective: Mutex::new(StatusEffectiveCache::default()),
             }),
         })
     }
@@ -136,6 +159,9 @@ impl Store {
                 params![name, schema_json, now_ms()],
             )
             .map_err(db)?;
+            // Under the connection/transaction lock. Failed commits may cause
+            // an extra cache miss, never a cached answer for the wrong schema.
+            self.inner.stream_epoch.fetch_add(1, Ordering::Relaxed);
             Ok(())
         })
     }
@@ -164,20 +190,7 @@ impl Store {
     }
 
     pub fn list_streams(&self) -> Result<Vec<StreamRow>> {
-        self.read(|c| {
-            let mut stmt = c
-                .prepare("SELECT name, schema_json FROM streams ORDER BY name")
-                .map_err(db)?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok(StreamRow {
-                        name: r.get(0)?,
-                        schema_json: r.get(1)?,
-                    })
-                })
-                .map_err(db)?;
-            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db)
-        })
+        self.read(load_streams)
     }
 
     pub fn put_pipeline(
@@ -259,6 +272,87 @@ impl Store {
         self.read(|c| load_pipeline(c, name))
     }
 
+    /// Latest stored spec and its effective guarantees, not the running plan.
+    /// Binding stays outside the catalog mutex; only small, bounded results
+    /// are cached. Failed binding remains a readable status with unknown eligibility.
+    pub fn effective_pipeline_status(
+        &self,
+        name: &str,
+    ) -> Result<(PipelineRow, serde_json::Value)> {
+        let (row, key, cached, streams) = self.read(|c| {
+            let version: u64 = c
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .map_err(db)?;
+            let row = load_pipeline(c, name)?;
+            let key = (
+                row.latest_revision,
+                self.inner.stream_epoch.load(Ordering::Relaxed),
+                version,
+            );
+            let mut cache = self
+                .inner
+                .status_effective
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = cache
+                .entries
+                .iter()
+                .position(|e| e.name == name && e.key == key)
+            {
+                let entry = cache.entries.remove(i).expect("cache index");
+                let value = entry.value.clone();
+                cache.entries.push_back(entry);
+                return Ok((row, key, Some(value), Vec::new()));
+            }
+            drop(cache);
+            Ok((row, key, None, load_streams(c)?))
+        })?;
+        if let Some(value) = cached {
+            return Ok((row, value));
+        }
+        let plan = (|| {
+            let mut catalog = sparrow_plan::Catalog::new();
+            for stream in streams {
+                catalog.insert(
+                    stream.name.clone(),
+                    crate::validate::stream_to_schema(&stream)?,
+                );
+            }
+            crate::validate::bind_plan(&row.spec, &catalog, name, row.latest_revision)
+        })();
+        let effective = match plan {
+            Ok(plan) => crate::validate::effective_guarantees_with_plan(&row.spec, &plan),
+            Err(e) => {
+                let mut value = crate::validate::effective_guarantees(&row.spec);
+                value["aligned_eligible"] = serde_json::Value::Null;
+                value["aligned_eligibility_reason"] =
+                    serde_json::json!(format!("plan_bind_failed: {}", e.message));
+                value
+            }
+        };
+        let mut cache = self
+            .inner
+            .status_effective
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        {
+            cache.misses += 1;
+        }
+        cache.entries.retain(|e| e.name != name);
+        if serde_json::to_vec(&effective).is_ok_and(|v| v.len() <= STATUS_EFFECTIVE_VALUE_CAP) {
+            if cache.entries.len() == STATUS_EFFECTIVE_CACHE_CAP {
+                cache.entries.pop_front();
+            }
+            cache.entries.push_back(StatusEffectiveEntry {
+                name: name.into(),
+                key,
+                value: effective.clone(),
+            });
+        }
+        Ok((row, effective))
+    }
+
     /// Load the spec for a specific revision (R23). Does not rewrite latest.
     pub fn get_pipeline_revision(&self, name: &str, revision: u64) -> Result<PipelineRow> {
         self.read(|c| load_pipeline_revision(c, name, revision))
@@ -279,7 +373,10 @@ impl Store {
         if !status.is_desired() {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
-                format!("desired status must be running or stopped, got '{}'", status.as_str()),
+                format!(
+                    "desired status must be running or stopped, got '{}'",
+                    status.as_str()
+                ),
             ));
         }
         self.write(|c| {
@@ -322,12 +419,25 @@ impl Store {
     }
 
     /// Capacity/temporary admission failures wait without consuming the crash cap.
-    pub fn set_waiting_failure(&self, name: &str, revision: u64, attempt: u64, error: &str) -> Result<()> {
+    pub fn set_waiting_failure(
+        &self,
+        name: &str,
+        revision: u64,
+        attempt: u64,
+        error: &str,
+    ) -> Result<()> {
         self.set_actual_inner(name, "waiting", Some(revision), attempt, Some(error), false)
     }
 
-    fn set_actual_inner(&self, name: &str, status: &str, revision: Option<u64>,
-        attempt_id: u64, last_error: Option<&str>, count_failure: bool) -> Result<()> {
+    fn set_actual_inner(
+        &self,
+        name: &str,
+        status: &str,
+        revision: Option<u64>,
+        attempt_id: u64,
+        last_error: Option<&str>,
+        count_failure: bool,
+    ) -> Result<()> {
         let status = PipelineStatus::parse(status)?;
         self.write(|c| {
             let prev: i64 = c
@@ -404,23 +514,30 @@ impl Store {
     /// Merely pruning history, stopping, or restarting the process cannot unlock.
     pub(crate) fn request_start_revision(&self, name: &str, revision: u64) -> Result<()> {
         self.write(|c| {
-            let changed = c.execute(
-                "UPDATE desired_state SET desired_status='running', desired_revision=?1,
+            let changed = c
+                .execute(
+                    "UPDATE desired_state SET desired_status='running', desired_revision=?1,
                     updated_at=?2 WHERE name=?3",
-                params![revision as i64, now_ms(), name],
-            ).map_err(db)?;
-            let actual = c.execute(
-                "UPDATE actual_state SET
+                    params![revision as i64, now_ms(), name],
+                )
+                .map_err(db)?;
+            let actual = c
+                .execute(
+                    "UPDATE actual_state SET
                     actual_status=CASE WHEN actual_status='running' AND actual_revision=?3
                         THEN 'running' ELSE 'stopped' END,
                     actual_revision=CASE WHEN actual_status='running' AND actual_revision=?3
                         THEN actual_revision ELSE NULL END,
                     consecutive_failures=0, restart_blocked=0, last_error=NULL,
                     updated_at=?1 WHERE name=?2",
-                params![now_ms(), name, revision as i64],
-            ).map_err(db)?;
+                    params![now_ms(), name, revision as i64],
+                )
+                .map_err(db)?;
             if changed != 1 || actual != 1 {
-                return Err(SparrowError::new(ErrorCode::InvalidSchema, "missing pipeline start state"));
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    "missing pipeline start state",
+                ));
             }
             Ok(())
         })
@@ -816,6 +933,21 @@ fn load_pipeline(c: &Connection, name: &str) -> Result<PipelineRow> {
     })
 }
 
+fn load_streams(c: &Connection) -> Result<Vec<StreamRow>> {
+    let mut stmt = c
+        .prepare("SELECT name, schema_json FROM streams ORDER BY name")
+        .map_err(db)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(StreamRow {
+                name: r.get(0)?,
+                schema_json: r.get(1)?,
+            })
+        })
+        .map_err(db)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db)
+}
+
 fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -911,8 +1043,11 @@ fn init(conn: &Connection) -> Result<()> {
                     params![CATALOG_SCHEMA_VERSION.to_string(), FORMAT_VERSION.to_string()],
                 ).map_err(db)?;
             } else {
-                conn.execute("UPDATE meta SET value=?1 WHERE key='catalog_schema_version'",
-                    [CATALOG_SCHEMA_VERSION.to_string()]).map_err(db)?;
+                conn.execute(
+                    "UPDATE meta SET value=?1 WHERE key='catalog_schema_version'",
+                    [CATALOG_SCHEMA_VERSION.to_string()],
+                )
+                .map_err(db)?;
             }
             Ok(())
         })();
@@ -927,10 +1062,14 @@ fn init(conn: &Connection) -> Result<()> {
 
 fn migrate_restart_blocked(conn: &Connection) -> Result<()> {
     let has_latch = {
-        let mut stmt = conn.prepare("PRAGMA table_info(actual_state)").map_err(db)?;
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(actual_state)")
+            .map_err(db)?;
         let columns = stmt.query_map([], |r| r.get::<_, String>(1)).map_err(db)?;
         let mut found = false;
-        for column in columns { found |= column.map_err(db)? == "restart_blocked"; }
+        for column in columns {
+            found |= column.map_err(db)? == "restart_blocked";
+        }
         found
     };
     if !has_latch {
@@ -1030,7 +1169,10 @@ pub fn secrets_key_required() -> bool {
 }
 
 fn env_nonempty(name: &str) -> bool {
-    std::env::var(name).ok().map(|s| !s.is_empty()).unwrap_or(false)
+    std::env::var(name)
+        .ok()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
 }
 
 /// Decision used at store open and when sealing. `configured` / `required`
@@ -1223,6 +1365,125 @@ fn hex_val(c: u8) -> std::result::Result<u8, ()> {
 mod tests {
     use super::*;
     use crate::spec::{PipelineSpec, SinkSpec, SourceSpec};
+
+    const R9_SCHEMA: &str = r#"{"fields":[{"name":"device_id","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false}]}"#;
+    fn r9_file_spec() -> PipelineSpec {
+        let mut s = spec();
+        s.source.kind = "file".into();
+        s.source.path = Some("fixture.ndjson".into());
+        s.sql = Some(
+            "SELECT device_id, SUM(v) AS s FROM sensors GROUP BY device_id, COUNT_WINDOW(2)".into(),
+        );
+        s
+    }
+    fn r9_misses(store: &Store) -> usize {
+        store.inner.status_effective.lock().unwrap().misses
+    }
+
+    #[test]
+    fn r9_status_cache_hits_and_invalidates_schema_revision_and_failed_binding() {
+        let s = Store::open_memory().unwrap();
+        s.put_stream("sensors", R9_SCHEMA).unwrap();
+        let mut spec = r9_file_spec();
+        s.put_pipeline("cached", &spec, None).unwrap();
+        assert_eq!(
+            s.effective_pipeline_status("cached").unwrap().1["aligned_eligible"],
+            true
+        );
+        for _ in 0..20 {
+            assert_eq!(
+                s.effective_pipeline_status("cached").unwrap().1["aligned_eligible"],
+                true
+            );
+        }
+        assert_eq!(r9_misses(&s), 1);
+        s.put_stream(
+            "sensors",
+            r#"{"fields":[{"name":"wrong","type":"int64","nullable":false}]}"#,
+        )
+        .unwrap();
+        let (row, failed) = s.effective_pipeline_status("cached").unwrap();
+        assert_eq!(
+            row.latest_revision, 1,
+            "schema changes do not bump pipeline revision"
+        );
+        assert!(failed["aligned_eligible"].is_null());
+        assert!(failed["aligned_eligibility_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("plan_bind_failed:"));
+        s.effective_pipeline_status("cached").unwrap();
+        assert_eq!(r9_misses(&s), 2);
+        s.put_stream("sensors", R9_SCHEMA).unwrap();
+        assert_eq!(
+            s.effective_pipeline_status("cached").unwrap().1["aligned_eligible"],
+            true
+        );
+        spec.sql = Some("SELECT device_id FROM sensors".into());
+        s.put_pipeline("cached", &spec, Some("rev-1")).unwrap();
+        let (row, effective) = s.effective_pipeline_status("cached").unwrap();
+        assert_eq!(row.latest_revision, 2);
+        assert_eq!(effective["aligned_eligible"], false);
+        assert_eq!(r9_misses(&s), 4);
+        assert_eq!(s.inner.status_effective.lock().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn r9_status_cache_is_bounded_and_does_not_cross_stores() {
+        let s = Store::open_memory().unwrap();
+        s.put_stream("sensors", R9_SCHEMA).unwrap();
+        for n in 0..STATUS_EFFECTIVE_CACHE_CAP + 10 {
+            let name = format!("p{n}");
+            s.put_pipeline(&name, &r9_file_spec(), None).unwrap();
+            s.effective_pipeline_status(&name).unwrap();
+        }
+        assert_eq!(
+            s.inner.status_effective.lock().unwrap().entries.len(),
+            STATUS_EFFECTIVE_CACHE_CAP
+        );
+        let other = Store::open_memory().unwrap();
+        other.put_pipeline("p0", &r9_file_spec(), None).unwrap();
+        assert!(other.effective_pipeline_status("p0").unwrap().1["aligned_eligible"].is_null());
+        assert_eq!(r9_misses(&other), 1);
+    }
+
+    #[test]
+    fn r9_status_cache_invalidates_other_connection_and_failed_transaction() {
+        let path = std::env::temp_dir().join(format!(
+            "sparrow-r9-status-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let s = Store::open(&path).unwrap();
+        s.put_stream("sensors", R9_SCHEMA).unwrap();
+        s.put_pipeline("cached", &r9_file_spec(), None).unwrap();
+        assert_eq!(
+            s.effective_pipeline_status("cached").unwrap().1["aligned_eligible"],
+            true
+        );
+        let other = Store::open(&path).unwrap();
+        other
+            .put_stream(
+                "sensors",
+                r#"{"fields":[{"name":"wrong","type":"int64","nullable":false}]}"#,
+            )
+            .unwrap();
+        assert!(s.effective_pipeline_status("cached").unwrap().1["aligned_eligible"].is_null());
+        other.put_stream("sensors", R9_SCHEMA).unwrap();
+        assert_eq!(
+            s.effective_pipeline_status("cached").unwrap().1["aligned_eligible"],
+            true
+        );
+        s.inner.fail_before_commit.store(true, Ordering::SeqCst);
+        assert!(s.put_stream("sensors", "{}").is_err());
+        assert_eq!(
+            s.effective_pipeline_status("cached").unwrap().1["aligned_eligible"],
+            true
+        );
+        drop(other);
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn spec() -> PipelineSpec {
         PipelineSpec {
@@ -1424,17 +1685,36 @@ mod tests {
 
     #[test]
     fn r6_start_preserves_only_matching_running_revision() {
-        for status in ["stopped", "starting", "waiting", "failed", "completed", "running"] {
+        for status in [
+            "stopped",
+            "starting",
+            "waiting",
+            "failed",
+            "completed",
+            "running",
+        ] {
             let s = Store::open_memory().unwrap();
             s.put_pipeline("hot", &spec(), None).unwrap();
             // Desired running alone must not preserve a failed/waiting actual row.
             s.set_desired("hot", "running", Some(1)).unwrap();
-            s.set_actual("hot", "failed", Some(1), 6, Some("previous fault")).unwrap();
-            s.set_actual("hot", status, Some(1), 7, Some("test status")).unwrap();
+            s.set_actual("hot", "failed", Some(1), 6, Some("previous fault"))
+                .unwrap();
+            s.set_actual("hot", status, Some(1), 7, Some("test status"))
+                .unwrap();
             s.request_start_revision("hot", 1).unwrap();
             let actual = s.actual("hot").unwrap();
-            assert_eq!(actual.status.as_str(), if status == "running" { "running" } else { "stopped" });
-            assert_eq!(actual.revision, if status == "running" { Some(1) } else { None });
+            assert_eq!(
+                actual.status.as_str(),
+                if status == "running" {
+                    "running"
+                } else {
+                    "stopped"
+                }
+            );
+            assert_eq!(
+                actual.revision,
+                if status == "running" { Some(1) } else { None }
+            );
             assert_eq!(actual.attempt_id, 7);
             assert_eq!(actual.consecutive_failures, 0);
             assert!(!actual.restart_blocked);
@@ -1462,11 +1742,14 @@ mod tests {
         let s = Store::open_memory().unwrap();
         s.put_pipeline("hot", &spec(), None).unwrap();
         s.debug_fail_next_commit();
-        assert!(s.set_actual("hot", "failed", Some(1), 1, Some("fault")).is_err());
+        assert!(s
+            .set_actual("hot", "failed", Some(1), 1, Some("fault"))
+            .is_err());
         assert!(!s.actual("hot").unwrap().restart_blocked);
         assert_eq!(s.actual("hot").unwrap().status, "stopped");
 
-        s.set_actual("hot", "failed", Some(1), 1, Some("fault")).unwrap();
+        s.set_actual("hot", "failed", Some(1), 1, Some("fault"))
+            .unwrap();
         s.insert_attempt("hot", 1, "failed", Some("fault")).unwrap();
         assert!(s.actual("hot").unwrap().restart_blocked);
         s.debug_fail_next_commit();
@@ -1475,7 +1758,10 @@ mod tests {
         assert_eq!(s.actual("hot").unwrap().status, "failed");
         assert!(s.actual("hot").unwrap().restart_blocked);
         s.reset_consecutive_failures("hot").unwrap();
-        assert!(s.actual("hot").unwrap().restart_blocked, "crash count is not the safe-mode latch");
+        assert!(
+            s.actual("hot").unwrap().restart_blocked,
+            "crash count is not the safe-mode latch"
+        );
         s.reset_actual_after_process_restart().unwrap();
         assert!(s.actual("hot").unwrap().restart_blocked);
 
@@ -1485,8 +1771,11 @@ mod tests {
         assert!(!s.actual("hot").unwrap().restart_blocked);
         assert_eq!(s.actual("hot").unwrap().consecutive_failures, 0);
         assert!(s.actual("hot").unwrap().last_error.is_none());
-        assert_eq!(s.last_attempt("hot").unwrap().unwrap().outcome, "failed",
-            "unlock must not require destroying historical failure evidence");
+        assert_eq!(
+            s.last_attempt("hot").unwrap().unwrap().outcome,
+            "failed",
+            "unlock must not require destroying historical failure evidence"
+        );
     }
 
     fn legacy_v1_catalog() -> Connection {
@@ -1520,26 +1809,64 @@ mod tests {
         init(&c).unwrap();
         assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 2);
         assert_eq!(meta_u32(&c, "format_version").unwrap(), 1);
-        for (name, expected) in [("a", true), ("b", true), ("c", true), ("d", false), ("e", false), ("f", false), ("g", true)] {
-            let blocked: bool = c.query_row("SELECT restart_blocked FROM actual_state WHERE name=?1", [name], |r| r.get(0)).unwrap();
+        for (name, expected) in [
+            ("a", true),
+            ("b", true),
+            ("c", true),
+            ("d", false),
+            ("e", false),
+            ("f", false),
+            ("g", true),
+        ] {
+            let blocked: bool = c
+                .query_row(
+                    "SELECT restart_blocked FROM actual_state WHERE name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap();
             assert_eq!(blocked, expected, "migration for {name}");
         }
-        let error: String = c.query_row("SELECT last_error FROM actual_state WHERE name='b'", [], |r| r.get(0)).unwrap();
+        let error: String = c
+            .query_row(
+                "SELECT last_error FROM actual_state WHERE name='b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(error, "history-only failure");
-        c.execute("UPDATE actual_state SET restart_blocked=0 WHERE name='b'", []).unwrap();
+        c.execute(
+            "UPDATE actual_state SET restart_blocked=0 WHERE name='b'",
+            [],
+        )
+        .unwrap();
         init(&c).unwrap();
-        let blocked: bool = c.query_row("SELECT restart_blocked FROM actual_state WHERE name='b'", [], |r| r.get(0)).unwrap();
-        assert!(!blocked, "v2 reopen must not reconstruct a cleared latch from stale history");
+        let blocked: bool = c
+            .query_row(
+                "SELECT restart_blocked FROM actual_state WHERE name='b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !blocked,
+            "v2 reopen must not reconstruct a cleared latch from stale history"
+        );
     }
 
     #[test]
     fn r5_failed_migration_rolls_back_column_and_version() {
         let c = legacy_v1_catalog();
-        c.execute_batch("CREATE TRIGGER fail_migration BEFORE UPDATE ON actual_state
-            BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;").unwrap();
+        c.execute_batch(
+            "CREATE TRIGGER fail_migration BEFORE UPDATE ON actual_state
+            BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+        )
+        .unwrap();
         assert!(init(&c).is_err());
         assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 1);
-        assert!(c.prepare("SELECT restart_blocked FROM actual_state").is_err());
+        assert!(c
+            .prepare("SELECT restart_blocked FROM actual_state")
+            .is_err());
         c.execute_batch("DROP TRIGGER fail_migration;").unwrap();
         init(&c).unwrap();
         assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 2);
@@ -1570,7 +1897,11 @@ mod tests {
         assert!(err.message.contains("pretty_please"), "{}", err.message);
         let err = s.set_desired("hot", "failed", Some(1)).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
-        assert!(err.message.contains("running or stopped"), "{}", err.message);
+        assert!(
+            err.message.contains("running or stopped"),
+            "{}",
+            err.message
+        );
         let err = s
             .set_actual("hot", "on-fire", Some(1), 1, None)
             .unwrap_err();

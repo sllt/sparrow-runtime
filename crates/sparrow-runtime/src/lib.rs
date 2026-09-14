@@ -15,6 +15,7 @@ pub mod kernel;
 pub mod linear;
 pub mod lookup;
 pub mod mailbox;
+pub mod mailbox_observe;
 pub mod metrics;
 pub mod state;
 pub mod timer;

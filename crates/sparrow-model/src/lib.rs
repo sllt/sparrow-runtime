@@ -23,7 +23,7 @@ pub mod types;
 pub mod watermark;
 pub mod window;
 
-pub use batch::{Row, RowBatch, RowBatchBuilder};
+pub use batch::{BatchValue, OwnedRows, Row, RowBatch, RowBatchBuilder};
 pub use budget::WorkBudget;
 pub use clock::{InstantSource, SharedVirtualClock, WallClock};
 pub use delivery::{
@@ -31,6 +31,7 @@ pub use delivery::{
 };
 pub use error::{ErrorCode, Result, SparrowError};
 pub use frame::{CodecBounds, CodecBoundary, SourceFrame, DEFAULT_MAX_RECORD_BYTES};
+pub mod observation;
 pub use ids::{
     FieldId, JobAttemptId, OperatorId, PipelineId, RevisionId, SchemaId, StateSlotId, StateSlotKey,
 };

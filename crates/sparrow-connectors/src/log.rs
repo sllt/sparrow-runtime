@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use sparrow_formats::encode_json_row;
 use sparrow_model::{InflightCounter, RestoreClaim, RowBatch};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
+use sparrow_io::observed::Receiver as ObservedReceiver;
+use sparrow_model::observation::HealthState;
 use crate::error::Result;
 
 #[derive(Clone, Debug)]
@@ -66,19 +67,25 @@ impl LogSink {
 
     pub async fn run(
         self,
-        mut rx: mpsc::Receiver<RowBatch>,
+        rx: impl Into<ObservedReceiver<RowBatch>>,
         cancel: CancellationToken,
         outbox: Option<Arc<InflightCounter>>,
     ) {
+        let mut rx=rx.into();
+        let _lifecycle=self.diag.observation.lifecycle(false);
+        self.diag.observation.health(false,HealthState::Ready,"log_writer_ready",None);
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 next = rx.recv() => {
                     match next {
                         Some(batch) => {
-                            self.write_batch(&batch);
+                            let mut delivered=self.diag.observation.delivery_guard(batch.num_rows(),batch.tracked_bytes(),batch.origin());
+                            let ok=self.write_batch(&batch);
+                            if ok {delivered.complete();self.diag.observation.progress(false,batch.num_rows());}
+                            else{self.diag.observation.health(false,HealthState::Failed,"log_encode_failed",Some(sparrow_model::ErrorCode::CodecViolation));}
                             if let Some(o) = &outbox {
-                                o.ack();
+                                if ok{o.ack();}else{o.fail();}
                             }
                         }
                         None => break,
@@ -88,7 +95,8 @@ impl LogSink {
         }
     }
 
-    fn write_batch(&self, batch: &RowBatch) {
+    fn write_batch(&self, batch: &RowBatch) -> bool {
+        let mut ok=true;
         let schema = batch.schema();
         let mut guard = self.lines.lock().expect("log");
         for row in batch.rows() {
@@ -100,7 +108,8 @@ impl LogSink {
                 }
                 guard.push(line);
                 self.diag.log_written.fetch_add(1, Ordering::Relaxed);
-            }
+            }else{ok=false;}
         }
+        ok
     }
 }

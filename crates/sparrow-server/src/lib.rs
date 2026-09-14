@@ -13,18 +13,16 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sparrow_control::{
-    bind_plan, binder_catalog, capabilities_json, effective_guarantees, explain_plan_with,
-    honesty_json, replay_label_for_source,
-    request_start, request_start_at, request_stop, stream_schema, validate_aligned_plan,
-    validate_io, DemoIo,
-    PipelineSpec,
-    RestoreSpec, Store, StreamSpec, Supervisor, HONESTY,
-};
 #[cfg(feature = "demo-io")]
 use sparrow_control::DemoHarness;
-use sparrow_runtime::Kernel;
+use sparrow_control::{
+    bind_plan, binder_catalog, capabilities_json, explain_plan_with, honesty_json,
+    replay_label_for_source, request_start, request_start_at, request_stop, stream_schema,
+    validate_aligned_plan, validate_io, DemoIo, PipelineSpec, RestoreSpec, Store, StreamSpec,
+    Supervisor, HONESTY,
+};
 use sparrow_model::{ErrorCode, SparrowError};
+use sparrow_runtime::Kernel;
 use tower_http::limit::RequestBodyLimitLayer;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:43180";
@@ -83,9 +81,9 @@ impl From<SparrowError> for ApiError {
                 StatusCode::BAD_REQUEST
             }
             ErrorCode::PolicyDenied | ErrorCode::SecretMissing => StatusCode::FORBIDDEN,
-            ErrorCode::UnsupportedDelivery | ErrorCode::UnsupportedRestore | ErrorCode::FeatureUnavailable => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            ErrorCode::UnsupportedDelivery
+            | ErrorCode::UnsupportedRestore
+            | ErrorCode::FeatureUnavailable => StatusCode::UNPROCESSABLE_ENTITY,
             ErrorCode::MaxRecordSize | ErrorCode::BoundExceeded => StatusCode::PAYLOAD_TOO_LARGE,
             ErrorCode::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
             ErrorCode::Cancelled => StatusCode::CONFLICT,
@@ -120,8 +118,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> ApiResult<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(f).await.map_err(|e| ApiError::from(
-        SparrowError::new(ErrorCode::Internal, format!("API worker: {e}"))))?
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        ApiError::from(SparrowError::new(
+            ErrorCode::Internal,
+            format!("API worker: {e}"),
+        ))
+    })?
 }
 
 fn require_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
@@ -134,7 +136,10 @@ fn require_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
         // P1-29: do not touch SQLite on auth failure (sync audit is a DoS / wipe vector).
         return Err(ApiError {
             status: StatusCode::UNAUTHORIZED,
-            err: SparrowError::new(ErrorCode::PolicyDenied, "unauthorized: bearer token required"),
+            err: SparrowError::new(
+                ErrorCode::PolicyDenied,
+                "unauthorized: bearer token required",
+            ),
         });
     }
     Ok("token".into())
@@ -144,7 +149,10 @@ fn tokens_equal(a: &str, b: &str) -> bool {
     if a.len() != b.len() || a.is_empty() {
         return false;
     }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn if_match(headers: &HeaderMap) -> Option<String> {
@@ -199,18 +207,28 @@ async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> ApiR
     Ok(Json(capabilities_json()))
 }
 
-async fn validate(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
+async fn validate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
     let actor = require_auth(&state, &headers)?;
     blocking_api(move || {
         let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
         let report = run_validate(&state, &spec)?;
-        let _ = state.store.audit(&actor, "validate", spec.sql.as_deref(), None, "ok");
+        let _ = state
+            .store
+            .audit(&actor, "validate", spec.sql.as_deref(), None, "ok");
         Ok(Json(report))
     })
     .await
 }
 
-async fn explain(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
+async fn explain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
     let _ = require_auth(&state, &headers)?;
     blocking_api(move || {
         let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
@@ -219,7 +237,11 @@ async fn explain(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
     .await
 }
 
-async fn test_plan(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
+async fn test_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
     let _ = require_auth(&state, &headers)?;
     blocking_api(move || {
         let spec = PipelineSpec::from_json(&body).map_err(ApiError::from)?;
@@ -236,7 +258,10 @@ async fn test_plan(State(state): State<AppState>, headers: HeaderMap, body: Byte
 
 fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
     spec.check_delivery().map_err(ApiError::from)?;
-    let stream = state.store.get_stream(&spec.stream).map_err(ApiError::from)?;
+    let stream = state
+        .store
+        .get_stream(&spec.stream)
+        .map_err(ApiError::from)?;
     let schema = stream_schema(
         &stream.name,
         &serde_json::from_str::<StreamSpec>(&stream.schema_json).map_err(|e| {
@@ -256,6 +281,10 @@ fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
     if let Value::Object(map) = &mut body {
         map.insert("accepted".into(), json!(true));
         map.insert("stream".into(), json!(spec.stream));
+        map.insert(
+            "effective".into(),
+            sparrow_control::effective_guarantees_with_plan(spec, &plan),
+        );
     }
     Ok(body)
 }
@@ -263,6 +292,7 @@ fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
 fn run_explain(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
     let catalog = binder_catalog(&state.store).map_err(ApiError::from)?;
     let plan = bind_plan(spec, &catalog, spec.stream.as_str(), 0).map_err(ApiError::from)?;
+    validate_aligned_plan(spec, &plan).map_err(ApiError::from)?;
     let recovery = spec
         .check_delivery()
         .map(|(_, r)| r)
@@ -284,6 +314,7 @@ fn run_explain(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
         "replay": e.replay,
         "honesty": e.honesty,
         "experimental": e.experimental,
+        "effective": sparrow_control::effective_guarantees_with_plan(spec, &plan),
     }))
 }
 
@@ -327,8 +358,7 @@ async fn graph_explain(
         })?;
         let spec = sparrow_plan::GraphSpec::from_json(text).map_err(ApiError::from)?;
         let catalog = binder_catalog(&state.store).map_err(ApiError::from)?;
-        let report = sparrow_plan::explain_graph(&spec, &catalog)
-            .map_err(ApiError::from)?;
+        let report = sparrow_plan::explain_graph(&spec, &catalog).map_err(ApiError::from)?;
         Ok(Json(json!({
             "accepted": report.accepted,
             "stages": report.stages,
@@ -361,7 +391,10 @@ async fn put_stream(
         let json = serde_json::to_string(&spec).map_err(|e| {
             ApiError::from(SparrowError::new(ErrorCode::InvalidArgument, e.to_string()))
         })?;
-        state.store.put_stream(&name, &json).map_err(ApiError::from)?;
+        state
+            .store
+            .put_stream(&name, &json)
+            .map_err(ApiError::from)?;
         state
             .store
             .audit(&actor, "put_stream", Some(&name), None, "ok")
@@ -474,9 +507,30 @@ async fn pipeline_status(
 }
 
 fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
-    let row = state.store.get_pipeline(name).map_err(ApiError::from)?;
+    let (row, mut effective) = state
+        .store
+        .effective_pipeline_status(name)
+        .map_err(ApiError::from)?;
     let desired = state.store.desired(name).ok();
     let actual = state.store.actual(name).ok();
+    // Describe the stored latest revision, not a possibly older running attempt.
+    // Failed binding must not make status unreadable or claim eligibility.
+    effective["scope"] = json!("stored_latest_revision");
+    effective["revision"] = json!(row.latest_revision);
+    let mailboxes = match state.supervisor.mailbox_snapshot(name) {
+        Ok(Some(snapshot)) => mailbox_snapshot_json(&snapshot),
+        Ok(None) => {
+            json!({"available": false, "scope": "runtime_mailboxes", "reason": "no_active_attempt"})
+        }
+        Err(_) => {
+            json!({"available": false, "scope": "runtime_mailboxes", "reason": "registry_busy"})
+        }
+    };
+    let observation = match state.supervisor.flow_snapshot(name) {
+        Ok(Some(s)) => flow_snapshot_json(&s),
+        Ok(None) => json!({"available":false,"reason":"no_active_attempt"}),
+        Err(_) => json!({"available":false,"reason":"registry_busy"}),
+    };
     Ok(json!({
         "name": row.name,
         "revision": row.latest_revision,
@@ -500,14 +554,186 @@ fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
             "unsupported"
         },
         "honesty": HONESTY,
-        "effective": effective_guarantees(&row.spec),
+        "effective": effective,
+        "mailboxes": mailboxes,
+        "observation": observation,
+        "histogram_contract": histogram_contract_json(),
     }))
+}
+
+fn queue_depth_json(depth: &sparrow_runtime::mailbox_observe::QueueDepth) -> Value {
+    json!({"items": depth.items, "data_batches": depth.data_batches, "rows": depth.rows,
+        "controls": depth.controls, "accounted_bytes": depth.accounted_bytes})
+}
+
+fn histogram_json(h: &sparrow_model::observation::HistogramSnapshot) -> Value {
+    json!({"samples":h.count,"sum_us":h.sum_us,"max_us":if h.count>0{Some(h.max_us)}else{None},
+        "buckets":h.buckets,
+        "p50_upper_us":h.percentile_upper_us(50),"p95_upper_us":h.percentile_upper_us(95),"p99_upper_us":h.percentile_upper_us(99)})
+}
+fn histogram_contract_json() -> Value {
+    json!({"bucket_upper_us":(0..32).map(|i|if i<31{Some(1u64<<i)}else{None}).collect::<Vec<_>>(),
+        "quantile_min_samples":100,"scope":"attempt_cumulative","quantile_kind":"bucket_upper_bound","overflow_is_unbounded":true})
+}
+fn endpoint_json(e: &sparrow_model::observation::EndpointSnapshot) -> Value {
+    json!({"state":e.state.as_str(),"reason":e.reason,"changed_age_us":e.changed_age_us,
+        "last_progress_age_us":e.progress_age_us,"progress_units_total":e.progress_units,"failures_total":e.failures,
+        "last_error_code":e.last_error_code.map(|c|c.as_str()),"silence_is_failure":false})
+}
+fn boundary_queue_json(q: Option<&std::sync::Arc<sparrow_io::observed::QueueObserver>>) -> Value {
+    let Some(q) = q else {
+        return json!({"available":false,"reason":"unobserved_channel"});
+    };
+    let Some(s) = q.snapshot() else {
+        return json!({"available":false,"reason":"initializing"});
+    };
+    json!({"available":true,"capacity_items":s.capacity,"queued_items":s.items,"queued_rows":s.rows,
+        "queued_logical_bytes":s.bytes,"peak_items":s.peak_items,"peak_logical_bytes":s.peak_bytes,
+        "metadata_bytes":q.metadata_bytes(),"oldest_queued_age_us":s.oldest_age_us,"receiver_open":s.receiver_open,
+        "enqueued_total":s.enqueued,"received_total":s.received,"discarded_on_close_total":s.discarded,
+        "waiting_senders":s.waiting,"capacity_waits_total":s.waits,"aborted_waits_total":s.aborted_waits,
+        "residence_sample_every":sparrow_io::observed::RESIDENCE_SAMPLE_EVERY,
+        "residence":histogram_json(&s.residence),"capacity_wait":histogram_json(&s.capacity_wait),
+        "bytes_are_rss":false,"age_origin":"channel_publish","controls_included":true})
+}
+fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> Value {
+    let diag = &s.diagnostics;
+    let Some((source, sink)) = diag.observation.endpoints() else {
+        return json!({"available":false,"reason":"initializing"});
+    };
+    let source_queue = boundary_queue_json(diag.source_queue.get());
+    let sink_queue = boundary_queue_json(diag.sink_queue.get());
+    let io = diag.snapshot();
+    let delivery = diag.observation.delivery().unwrap_or_default();
+    let mut reasons = Vec::new();
+    if s.cancel_requested {
+        reasons.push("cancellation_requested");
+    }
+    if s.finished {
+        reasons.push("execution_ended");
+    }
+    if matches!(
+        source.state,
+        sparrow_model::observation::HealthState::Connecting
+            | sparrow_model::observation::HealthState::Reconnecting
+            | sparrow_model::observation::HealthState::Failed
+    ) {
+        reasons.push("source_connection_or_failure");
+    }
+    if matches!(
+        sink.state,
+        sparrow_model::observation::HealthState::Reconnecting
+            | sparrow_model::observation::HealthState::Failed
+    ) {
+        reasons.push("sink_retry_or_failure");
+    }
+    if source_queue["queued_items"].as_u64().unwrap_or(0) > 0 {
+        reasons.push("source_queue_nonempty");
+    }
+    if sink_queue["queued_items"].as_u64().unwrap_or(0) > 0 {
+        reasons.push("sink_queue_nonempty");
+    }
+    if io.mqtt_pending_bytes > 0 {
+        reasons.push("source_admission_pending");
+    }
+    if io.http_inflight > 0 {
+        reasons.push("http_delivery_inflight");
+    }
+    if delivery.failed_groups > 0 {
+        reasons.push("delivery_failures_recorded_this_attempt");
+    }
+    // No arbitrary inactivity threshold: a quiet source may be perfectly fine.
+    if reasons.is_empty() {
+        reasons.push("no_current_pressure_evidence");
+    }
+    let latency: serde_json::Map<String, Value> = diag
+        .observation
+        .histograms()
+        .into_iter()
+        .map(|(n, h)| (n.into(), histogram_json(&h)))
+        .collect();
+    json!({"available":true,"running_revision":s.running_revision,"runtime_attempt_id":s.runtime_attempt_id,
+        "scope":"active_runtime_attempt","retention":"active_handles_only","clock":"process_monotonic",
+        "snapshot_consistency":"per_component_not_cross_pipeline_atomic",
+        "source_kind":s.source_kind,"sink_kind":s.sink_kind,"source":endpoint_json(&source),"sink":endpoint_json(&sink),
+        "execution_finished":s.finished,"cancel_requested":s.cancel_requested,"diagnosis_reasons":reasons,
+        "source_inbox":source_queue,"sink_outbox":sink_queue,
+        "source_pending_accounted_bytes":if s.source_kind=="mqtt"{Some(io.mqtt_pending_bytes)}else{None},
+        "runtime_progress":{"ingested_rows":delivery.runtime_ingested_rows,"emitted_rows":delivery.runtime_emitted_rows,
+            "transform_filtered_rows":delivery.transform_filtered_rows,"scope":"this_attempt_only_not_external_ack",
+            "snapshot_consistency":"independently_sampled_monotonic_counters"},
+        "legacy_io_counters":{"scope":"this_attempt_both_source_and_sink_roles_not_source_only",
+            "mqtt_received":io.mqtt_received,"mqtt_decoded":io.mqtt_decoded,"mqtt_bad":io.mqtt_dropped_bad,
+            "mqtt_full":io.mqtt_dropped_full,"mqtt_budget":io.mqtt_dropped_budget,"mqtt_oversize":io.mqtt_dropped_oversize,
+            "http_posted":io.http_posted,"http_failed":io.http_failed,"http_encode_errors":io.http_encode_errors,
+            "http_budget_drops":io.http_budget_drops,"http_dropped":io.http_dropped,"http_retries":io.http_retries,
+            "decode_errors":io.decode_errors,"budget_and_full_may_overlap":true},
+        "http_active_delivery_groups":io.http_inflight,
+        "delivery":{"active_input_batches":delivery.active_groups,"active_rows":delivery.active_rows,
+            "encoded_credit_bytes":delivery.encoded_credit_bytes,"peak_encoded_credit_bytes":delivery.peak_encoded_credit_bytes,
+            "active_http_requests":delivery.active_http_requests,"http_attempts_started_total":delivery.http_attempts_started,
+            "http_attempts_finished_total":delivery.http_attempts_finished,"http_attempts_cancelled_total":delivery.http_attempts_cancelled,
+            "active_input_accounted_bytes":delivery.active_bytes,"peak_input_batches":delivery.peak_groups,"peak_input_accounted_bytes":delivery.peak_bytes,
+            "dequeued_batches_total":delivery.accepted_groups,"dequeued_rows_total":delivery.accepted_rows,
+            "completed_batches_total":delivery.completed_groups,"completed_rows_total":delivery.completed_rows,
+            "failed_or_cancelled_batches_total":delivery.failed_groups,"failed_or_cancelled_rows_total":delivery.failed_rows,
+            "unknown_origin_batches_total":delivery.unknown_origin_groups,"http_incomplete_response_bodies_total":delivery.body_incomplete},
+        "latency":latency,
+        "latency_contract":{"http_completion":"2xx_headers_then_bounded_body_drain_attempt_not_business_ack",
+            "mqtt_completion":"qos0_socket_write_not_broker_ack","log_completion":"local_write_attempt_not_durable",
+            "samples":"operation_or_coalesced_delivery_group_not_per_row; failures_included_except_http_body_completed_only",
+            "local_origin":if s.source_kind=="file"{"decoded_file_batch_ready"}else{"complete_local_request_or_publish_before_decode"},
+            "origin_propagation":"conservative_input_batch_bounds; window_aggregate_outputs_unknown",
+            "device_event_age_available":false,"broker_wait_available":false,"business_ack_available":false,
+            "restored_monotonic_age_available":false,"payload_semantics_changed":false}})
+}
+
+fn mailbox_snapshot_json(s: &sparrow_control::supervisor::PipelineMailboxSnapshot) -> Value {
+    let runtime = &s.runtime;
+    json!({
+        "available": runtime.initialized,
+        "reason": if runtime.initialized { "observed" } else { "initializing" },
+        "scope": "runtime_mailboxes",
+        "running_revision": s.running_revision,
+        "plan_revision": runtime.plan_revision,
+        "pipeline_id": runtime.pipeline_id,
+        "runtime_attempt_id": runtime.runtime_attempt_id,
+        "execution_finished": s.finished,
+        "cancel_requested": s.cancel_requested,
+        "clock": "process_monotonic",
+        "age_origin": "mailbox_enqueue",
+        "coverage": {"source_inbox": false, "sink_outbox": false, "transport": false, "end_to_end_age": false},
+        "edges": runtime.edges.iter().map(|e| {
+            let q = &e.queue;
+            let mut value = json!({
+                "edge_index": e.edge_index, "from_stage": e.from_stage, "to_stage": e.to_stage,
+                "from_kind": e.from_kind, "to_kind": e.to_kind,
+                "max_items": q.max_items, "max_bytes": q.max_bytes, "metadata_bytes": q.metadata_bytes,
+                "receiver_open": q.receiver_open,
+                "queued": queue_depth_json(&q.queued), "consumer_held": queue_depth_json(&q.consumer_held),
+                "credits_reserved_bytes": q.credits_reserved_bytes,
+                "peak_queued_items": q.peak_queued_items, "peak_queued_bytes": q.peak_queued_bytes,
+                "oldest_queued_age_us": q.oldest_queued_age_us, "oldest_queued_data_age_us": q.oldest_queued_data_age_us,
+                "residence": histogram_json(&q.residence),
+                "send_attempts_total": q.send_attempts_total, "enqueued_items_total": q.enqueued_items_total,
+                "received_items_total": q.received_items_total, "discarded_on_close_total": q.discarded_on_close_total,
+                "aborted_sends_total": q.aborted_sends_total, "blocked_sends_total": q.blocked_sends_total,
+                "waiting_senders": q.waiting_senders, "completed_waits_total": q.completed_waits_total,
+                "completed_wait_us_total": q.completed_wait_us_total, "max_completed_wait_us": q.max_completed_wait_us,
+            });
+            value["accounting_valid"] = json!(q.accounting_errors_total == 0);
+            value["accounting_errors_total"] = json!(q.accounting_errors_total);
+            value
+        }).collect::<Vec<_>>(),
+    })
 }
 
 async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
     let snap = state.supervisor.kernel().metrics.snapshot();
     let io = state.supervisor.io_snapshot().await;
+    let mailbox_jobs = state.supervisor.mailbox_snapshots().await;
+    let flow_jobs = state.supervisor.flow_snapshots().await;
     let io_fields = json!({
             "mqtt_received": io.mqtt_received,
             "mqtt_pending_bytes": io.mqtt_pending_bytes,
@@ -540,6 +766,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
     });
     Ok(Json(json!({
         "jobs_started": snap.jobs_started,
+        "histogram_contract": histogram_contract_json(),
         "jobs_stopped": snap.jobs_stopped,
         "jobs_failed": snap.jobs_failed,
         "ingested_rows": snap.ingested_rows,
@@ -547,7 +774,10 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         "queue_items": snap.queue_items,
         "queue_bytes": snap.queue_bytes,
         "queue_metrics_available": false,
+        "mailboxes": {"available": true, "scope": "runtime_mailboxes", "retention": "active_handles_only",
+            "jobs": mailbox_jobs.iter().map(|(name, snapshot)| json!({"name": name, "observation": mailbox_snapshot_json(snapshot)})).collect::<Vec<_>>()},
         "io_scope": "running_attempts",
+        "observations":{"retention":"active_handles_only","jobs":flow_jobs.iter().map(|(name,s)|json!({"name":name,"observation":flow_snapshot_json(s)})).collect::<Vec<_>>()},
         "state_keys": snap.state_keys,
         "state_bytes": snap.state_bytes,
         "live_samples": snap.live_samples,
@@ -566,7 +796,10 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
     })))
 }
 
-async fn list_pipelines(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+async fn list_pipelines(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
     blocking_api(move || {
         let names = state.store.list_pipeline_names().map_err(ApiError::from)?;
@@ -688,8 +921,13 @@ async fn kill_pipeline(
     let actor = require_auth(&state, &headers)?;
     let state_c = state.clone();
     let name_c = name.clone();
-    blocking_api(move || request_stop(&state_c.store, &name_c, &actor).map_err(ApiError::from)).await?;
-    state.supervisor.kill_named(&name).await.map_err(ApiError::from)?;
+    blocking_api(move || request_stop(&state_c.store, &name_c, &actor).map_err(ApiError::from))
+        .await?;
+    state
+        .supervisor
+        .kill_named(&name)
+        .await
+        .map_err(ApiError::from)?;
     state.supervisor.wake();
     blocking_api(move || Ok(Json(status_body(&state, &name)?))).await
 }
@@ -721,10 +959,19 @@ async fn put_allow(
 ) -> ApiResult<Json<Value>> {
     let actor = require_auth(&state, &headers)?;
     blocking_api(move || {
-        state.store.put_allow(&body.host, body.port).map_err(ApiError::from)?;
         state
             .store
-            .audit(&actor, "allowlist", Some(&format!("{}:{}", body.host, body.port)), None, "ok")
+            .put_allow(&body.host, body.port)
+            .map_err(ApiError::from)?;
+        state
+            .store
+            .audit(
+                &actor,
+                "allowlist",
+                Some(&format!("{}:{}", body.host, body.port)),
+                None,
+                "ok",
+            )
             .map_err(ApiError::from)?;
         Ok(Json(json!({"host": body.host, "port": body.port})))
     })
@@ -750,20 +997,26 @@ async fn put_secret(
                 "secret value exceeds 4KiB",
             )));
         }
-        state.store.put_secret(&name, &body.value).map_err(ApiError::from)?;
         state
             .store
-            .audit(&actor, "put_secret", Some(&name), Some("value redacted"), "ok")
+            .put_secret(&name, &body.value)
+            .map_err(ApiError::from)?;
+        state
+            .store
+            .audit(
+                &actor,
+                "put_secret",
+                Some(&name),
+                Some("value redacted"),
+                "ok",
+            )
             .map_err(ApiError::from)?;
         Ok(StatusCode::NO_CONTENT)
     })
     .await
 }
 
-async fn list_audit(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+async fn list_audit(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_auth(&state, &headers)?;
     blocking_api(move || {
         let rows = state.store.list_audit(50).map_err(ApiError::from)?;
@@ -872,9 +1125,10 @@ pub async fn boot(
     };
     let store_c = Arc::clone(&store);
     let demo_c = demo.clone();
-    let supervisor = tokio::task::spawn_blocking(move ||
-        Supervisor::new(store_c, kernel, safe_mode, demo_c))
-        .await.map_err(|e| SparrowError::new(ErrorCode::Internal, format!("boot: {e}")))??;
+    let supervisor =
+        tokio::task::spawn_blocking(move || Supervisor::new(store_c, kernel, safe_mode, demo_c))
+            .await
+            .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("boot: {e}")))??;
     let state = AppState {
         store,
         supervisor: Arc::clone(&supervisor),
@@ -886,9 +1140,9 @@ pub async fn boot(
 }
 
 pub async fn serve(state: AppState, addr: SocketAddr) -> Result<(), SparrowError> {
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        SparrowError::new(ErrorCode::Internal, format!("bind {addr}: {e}"))
-    })?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("bind {addr}: {e}")))?;
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -953,14 +1207,23 @@ mod tests {
             Ok(())
         }));
         rx.await.unwrap();
-        tokio::time::timeout(Duration::from_millis(80), tokio::time::sleep(Duration::from_millis(10))).await.unwrap();
-        assert!(!worker.is_finished(), "blocking work must not monopolize this thread");
+        tokio::time::timeout(
+            Duration::from_millis(80),
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !worker.is_finished(),
+            "blocking work must not monopolize this thread"
+        );
         worker.await.unwrap().unwrap();
     }
 
     #[test]
     fn p3_56_resource_exhausted_and_cancelled_not_500() {
-        let r = ApiError::from(SparrowError::new(ErrorCode::ResourceExhausted, "cap")).into_response();
+        let r =
+            ApiError::from(SparrowError::new(ErrorCode::ResourceExhausted, "cap")).into_response();
         assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
         let r = ApiError::from(SparrowError::new(ErrorCode::Cancelled, "gone")).into_response();
         assert_eq!(r.status(), StatusCode::CONFLICT);

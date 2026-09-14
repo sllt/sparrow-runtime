@@ -444,37 +444,7 @@ pub fn validate_aligned_plan(
     if let Some(dir) = &spec.checkpoint_dir {
         check_data_path(std::path::Path::new(dir)).map_err(io)?;
     }
-    let mut has_window = false;
-    for stage in &plan.stages {
-        match stage {
-            sparrow_plan::PhysicalStage::WindowAgg { spec: w, .. } => {
-                has_window = true;
-                if matches!(
-                    w.kind,
-                    sparrow_model::WindowKind::TumblingProcessingTime { .. }
-                ) {
-                    return Err(SparrowError::new(
-                        ErrorCode::UnsupportedRestore,
-                        "processing-time windows cannot use recovery=aligned (capabilities: recovery_pt_window=restart_fresh; no PT timer on the aligned path)",
-                    ));
-                }
-            }
-            sparrow_plan::PhysicalStage::Deduplicate { .. }
-            | sparrow_plan::PhysicalStage::Lookup { .. } => {
-                return Err(SparrowError::new(
-                    ErrorCode::FeatureUnavailable,
-                    "aligned recovery does not snapshot Dedup/Lookup; refuse dishonest strip",
-                ));
-            }
-            _ => {}
-        }
-    }
-    if !has_window {
-        return Err(SparrowError::new(
-            ErrorCode::FeatureUnavailable,
-            "aligned recovery requires a window operator in the plan",
-        ));
-    }
+    sparrow_plan::PlanLayout::from_physical(plan)?;
     Ok(())
 }
 
@@ -541,7 +511,7 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
         ReplaySupport::Unsupported.as_str()
     };
     let recovery_risk = if recovery.is_aligned() && replayable {
-        "committed_checkpoint_only"
+        "aligned_plan_not_validated"
     } else if replayable {
         "restart_fresh_loses_in_memory_state"
     } else {
@@ -553,9 +523,35 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
         "replay": replay,
         "exactly_once": false,
         "recovery_risk": recovery_risk,
-        "aligned_eligible": replayable,
+        "aligned_eligible": if replayable { serde_json::Value::Null } else { serde_json::json!(false) },
+        "aligned_eligibility_reason": if replayable { "requires_bound_plan" } else { "source_not_replayable" },
         "honesty": HONESTY,
     })
+}
+
+/// Eligibility is a property of both the replayable source and the bound plan,
+/// independent of whether the stored spec currently requests aligned recovery.
+pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> serde_json::Value {
+    let mut value = effective_guarantees(spec);
+    if matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
+        match sparrow_plan::PlanLayout::from_physical(plan) {
+            Ok(_) => {
+                value["aligned_eligible"] = serde_json::json!(true);
+                value["aligned_eligibility_reason"] = serde_json::json!("single_supported_window");
+                if spec.recovery == "aligned" {
+                    value["recovery_risk"] = serde_json::json!("committed_checkpoint_only");
+                }
+            }
+            Err(e) => {
+                value["aligned_eligible"] = serde_json::json!(false);
+                value["aligned_eligibility_reason"] = serde_json::json!(e.message);
+                if spec.recovery == "aligned" {
+                    value["recovery_risk"] = serde_json::json!("aligned_plan_rejected");
+                }
+            }
+        }
+    }
+    value
 }
 
 fn io(err: sparrow_connectors::ConnectorError) -> SparrowError {
@@ -694,7 +690,8 @@ mod tests {
         assert!(spec.check_delivery().is_ok());
         let g = effective_guarantees(&spec);
         assert_eq!(g["recovery"], "aligned");
-        assert_eq!(g["recovery_risk"], "committed_checkpoint_only");
+        assert_eq!(g["recovery_risk"], "aligned_plan_not_validated");
+        assert!(g["aligned_eligible"].is_null());
     }
 
     #[test]

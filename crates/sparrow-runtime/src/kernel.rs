@@ -6,9 +6,11 @@ use std::sync::Arc;
 
 use std::collections::HashMap;
 
+use sparrow_io::observed::{Payload, Receiver as ObservedReceiver, Sender as ObservedSender};
+use sparrow_model::observation::{FlowObservation, Latency, OriginSpan};
 use sparrow_model::{
-    DeliveryContract, ErrorCode, JobAttemptId, MemoryOwner, PipelineId, ResourceBudget, RestoreClaim,
-    Result, Row, RowBatch, SparrowError, WorkBudget,
+    DeliveryContract, ErrorCode, JobAttemptId, MemoryOwner, PipelineId, ResourceBudget,
+    RestoreClaim, Result, Row, RowBatch, SparrowError, WorkBudget,
 };
 use sparrow_plan::{PhysicalPlan, PhysicalStage};
 use tokio::task::{JoinHandle, JoinSet};
@@ -19,9 +21,10 @@ use crate::capture::SharedCapture;
 use crate::clock::RuntimeClock;
 use crate::dedup::DedupOperator;
 use crate::lookup::{LookupOperator, ReferenceTable, VersionedReferenceTable};
-use crate::mailbox::{channel, MailboxConfig, MailboxRx, MailboxTx, StreamControl};
-use crate::transform::{CompiledTransform, build_source_batches, build_source_batches_shared};
+use crate::mailbox::{channel_observed, MailboxConfig, MailboxRx, MailboxTx, StreamControl};
+use crate::mailbox_observe::{JobMailboxObserver, JobMailboxSnapshot};
 use crate::metrics::RuntimeMetrics;
+use crate::transform::{build_source_batches, build_source_batches_shared, CompiledTransform};
 use crate::window::WindowOperator;
 
 #[derive(Clone, Debug)]
@@ -49,10 +52,11 @@ pub struct JobRequest {
     pub rows: Vec<Row>,
     pub capture: SharedCapture,
     /// Live ingress. When set, `MemorySource` reads rows here instead of `rows`.
-    pub live_in: Option<tokio::sync::mpsc::Receiver<Row>>,
-    pub budgeted_in: Option<tokio::sync::mpsc::Receiver<sparrow_model::QueuedRow>>,
+    pub live_in: Option<ObservedReceiver<Row>>,
+    pub budgeted_in: Option<ObservedReceiver<sparrow_model::QueuedRow>>,
     /// Live egress. `CaptureSink` also forwards batches here (bounded backpressure).
-    pub live_out: Option<tokio::sync::mpsc::Sender<RowBatch>>,
+    pub live_out: Option<ObservedSender<RowBatch>>,
+    pub observation: Option<Arc<FlowObservation>>,
     /// Process clock. Virtual clocks are required for deterministic PT windows.
     pub clock: RuntimeClock,
     /// Static reference-table snapshots frozen at submit. Running jobs keep these Arcs.
@@ -64,7 +68,7 @@ pub struct JobRequest {
     /// Live watermark / idle marks (optional; alongside `live_in`).
     pub live_ctrl: Option<tokio::sync::mpsc::Receiver<StreamControl>>,
     /// Single ordered ingress (row | punctuation). Preferred over split channels.
-    pub live_events: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
+    pub live_events: Option<ObservedReceiver<IngressEvent>>,
     /// Test-only: panic inside the first non-source stage.
     pub inject_panic: bool,
     /// Production aligned recovery hooks (Kernel path; not AlignedSession).
@@ -77,6 +81,20 @@ pub enum IngressEvent {
     Row(Row),
     Control(StreamControl),
 }
+impl Payload for IngressEvent {
+    fn rows(&self) -> usize {
+        match self {
+            Self::Row(_) => 1,
+            Self::Control(_) => 0,
+        }
+    }
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Row(row) => row.resident_bytes(),
+            Self::Control(_) => 1,
+        }
+    }
+}
 
 impl JobRequest {
     pub fn new(plan: PhysicalPlan, rows: Vec<Row>, capture: SharedCapture) -> Self {
@@ -87,6 +105,7 @@ impl JobRequest {
             live_in: None,
             budgeted_in: None,
             live_out: None,
+            observation: None,
             clock: RuntimeClock::wall(),
             tables: HashMap::new(),
             versioned_tables: HashMap::new(),
@@ -103,9 +122,17 @@ impl JobRequest {
         self
     }
 
-    pub fn with_budgeted_live_io(mut self, input: tokio::sync::mpsc::Receiver<sparrow_model::QueuedRow>, output: tokio::sync::mpsc::Sender<RowBatch>) -> Self {
-        self.budgeted_in = Some(input);
-        self.live_out = Some(output);
+    pub fn with_observation(mut self, observation: Arc<FlowObservation>) -> Self {
+        self.observation = Some(observation);
+        self
+    }
+    pub fn with_budgeted_live_io(
+        mut self,
+        input: impl Into<ObservedReceiver<sparrow_model::QueuedRow>>,
+        output: impl Into<ObservedSender<RowBatch>>,
+    ) -> Self {
+        self.budgeted_in = Some(input.into());
+        self.live_out = Some(output.into());
         self
     }
 
@@ -116,9 +143,9 @@ impl JobRequest {
 
     pub fn with_live_events(
         mut self,
-        live_events: tokio::sync::mpsc::Receiver<IngressEvent>,
+        live_events: impl Into<ObservedReceiver<IngressEvent>>,
     ) -> Self {
-        self.live_events = Some(live_events);
+        self.live_events = Some(live_events.into());
         self
     }
 
@@ -145,26 +172,23 @@ impl JobRequest {
         self
     }
 
-    pub fn with_live_ctrl(
-        mut self,
-        live_ctrl: tokio::sync::mpsc::Receiver<StreamControl>,
-    ) -> Self {
+    pub fn with_live_ctrl(mut self, live_ctrl: tokio::sync::mpsc::Receiver<StreamControl>) -> Self {
         self.live_ctrl = Some(live_ctrl);
         self
     }
 
     pub fn with_live_io(
         mut self,
-        live_in: tokio::sync::mpsc::Receiver<Row>,
-        live_out: tokio::sync::mpsc::Sender<RowBatch>,
+        live_in: impl Into<ObservedReceiver<Row>>,
+        live_out: impl Into<ObservedSender<RowBatch>>,
     ) -> Self {
-        self.live_in = Some(live_in);
-        self.live_out = Some(live_out);
+        self.live_in = Some(live_in.into());
+        self.live_out = Some(live_out.into());
         self
     }
 
-    pub fn with_live_out(mut self, live_out: tokio::sync::mpsc::Sender<RowBatch>) -> Self {
-        self.live_out = Some(live_out);
+    pub fn with_live_out(mut self, live_out: impl Into<ObservedSender<RowBatch>>) -> Self {
+        self.live_out = Some(live_out.into());
         self
     }
 }
@@ -199,15 +223,33 @@ struct TimerReporter<'a> {
 impl TimerReporter<'_> {
     fn sample(&mut self, live: usize, cancelled: u64) {
         if live >= self.live {
-            self.ctx.timers.live.fetch_add(live - self.live, Ordering::Relaxed);
-            self.ctx.metrics.timers_live.fetch_add((live - self.live) as u64, Ordering::Relaxed);
+            self.ctx
+                .timers
+                .live
+                .fetch_add(live - self.live, Ordering::Relaxed);
+            self.ctx
+                .metrics
+                .timers_live
+                .fetch_add((live - self.live) as u64, Ordering::Relaxed);
         } else {
-            self.ctx.timers.live.fetch_sub(self.live - live, Ordering::Relaxed);
-            self.ctx.metrics.timers_live.fetch_sub((self.live - live) as u64, Ordering::Relaxed);
+            self.ctx
+                .timers
+                .live
+                .fetch_sub(self.live - live, Ordering::Relaxed);
+            self.ctx
+                .metrics
+                .timers_live
+                .fetch_sub((self.live - live) as u64, Ordering::Relaxed);
         }
         let delta = cancelled.saturating_sub(self.cancelled);
-        self.ctx.timers.cancelled.fetch_add(delta, Ordering::Relaxed);
-        self.ctx.metrics.timers_cancelled.fetch_add(delta, Ordering::Relaxed);
+        self.ctx
+            .timers
+            .cancelled
+            .fetch_add(delta, Ordering::Relaxed);
+        self.ctx
+            .metrics
+            .timers_cancelled
+            .fetch_add(delta, Ordering::Relaxed);
         self.live = live;
         self.cancelled = cancelled;
     }
@@ -261,9 +303,16 @@ impl Kernel {
     }
 
     pub fn new_with_job_budget(opts: KernelOptions, job_budget: ResourceBudget) -> Result<Self> {
-        for kind in [sparrow_model::CreditKind::Reservation, sparrow_model::CreditKind::Retention, sparrow_model::CreditKind::Queue] {
+        for kind in [
+            sparrow_model::CreditKind::Reservation,
+            sparrow_model::CreditKind::Retention,
+            sparrow_model::CreditKind::Queue,
+        ] {
             if job_budget.cap(kind) == 0 || job_budget.cap(kind) > opts.budget.cap(kind) {
-                return Err(SparrowError::new(ErrorCode::InvalidArgument, "job quota must fit process budget"));
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "job quota must fit process budget",
+                ));
             }
         }
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -295,8 +344,15 @@ impl Kernel {
         self.opts.budget
     }
 
-    pub fn job_budget(&self) -> ResourceBudget { self.job_budget }
-    pub fn ingress_row_limit(&self) -> usize { self.opts.mailbox.max_bytes.min(self.job_budget.reservation_bytes) }
+    pub fn job_budget(&self) -> ResourceBudget {
+        self.job_budget
+    }
+    pub fn ingress_row_limit(&self) -> usize {
+        self.opts
+            .mailbox
+            .max_bytes
+            .min(self.job_budget.reservation_bytes)
+    }
 
     /// Process-wide memory owner shared by every job on this kernel (P1-20).
     pub fn process_owner(&self) -> &Arc<MemoryOwner> {
@@ -313,7 +369,11 @@ impl Kernel {
 
     /// Tokio handle for composition-root connector tasks (MQTT/HTTP).
     pub fn handle(&self) -> tokio::runtime::Handle {
-        self.rt.as_ref().expect("live kernel runtime").handle().clone()
+        self.rt
+            .as_ref()
+            .expect("live kernel runtime")
+            .handle()
+            .clone()
     }
 
     pub fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
@@ -321,10 +381,52 @@ impl Kernel {
     }
 
     pub fn submit(&self, req: JobRequest) -> Result<JobHandle> {
+        if req.plan.stages.len() < 2 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "physical plan needs source and sink",
+            ));
+        }
+        if req.aligned.is_some() {
+            sparrow_plan::PlanLayout::from_physical(&req.plan)?;
+        }
         let _gate = self.admit_lock.lock().expect("job admission");
         DeliveryContract::V0_3.validate_restore(&RestoreClaim::None)?;
-        let ingress_metadata = req.budgeted_in.as_ref().map(|rx| sparrow_model::QueuedRow::channel_budget(rx.max_capacity())).unwrap_or(0);
-        let job_queue_need = self.opts.mailbox.max_bytes.saturating_mul(req.plan.mailbox_count().max(1)).saturating_add(ingress_metadata);
+        let boundary_queues: Vec<_> = [
+            req.live_in.as_ref().and_then(|r| r.observer()),
+            req.budgeted_in.as_ref().and_then(|r| r.observer()),
+            req.live_events.as_ref().and_then(|r| r.observer()),
+            req.live_out.as_ref().and_then(|t| t.observer()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let ingress_metadata = req
+            .budgeted_in
+            .as_ref()
+            .filter(|r| r.observer().is_none())
+            .map(|rx| sparrow_model::QueuedRow::channel_budget(rx.max_capacity()))
+            .unwrap_or(0);
+        let boundary_metadata = boundary_queues
+            .iter()
+            .map(|o| o.metadata_bytes())
+            .sum::<usize>();
+        let observation_metadata =
+            JobMailboxObserver::metadata_bytes(self.opts.mailbox, req.plan.mailbox_count())?;
+        let metadata_need = ingress_metadata
+            .saturating_add(observation_metadata)
+            .saturating_add(boundary_metadata)
+            .saturating_add(if req.observation.is_some() {
+                FlowObservation::metadata_bytes()
+            } else {
+                0
+            });
+        let job_queue_need = self
+            .opts
+            .mailbox
+            .max_bytes
+            .saturating_mul(req.plan.mailbox_count().max(1))
+            .saturating_add(metadata_need);
         if job_queue_need > self.job_budget.queue_bytes {
             return Err(SparrowError::new(ErrorCode::ResourceExhausted,
                 format!("job queue quota: plan needs {job_queue_need}B > {}B; reduce mailboxes or increase job budget",
@@ -335,18 +437,29 @@ impl Kernel {
             &req.plan,
             &self.process_owner,
             &self.queue_reserved,
-            ingress_metadata,
+            metadata_need,
         )?;
         // Reserve each admitted job's quota so a growing job cannot consume
         // a sibling's allowance. Physical allocations still bill the parent.
         let jobs = self.admitted_jobs.load(Ordering::SeqCst).saturating_add(1);
         if jobs.saturating_mul(self.job_budget.retention_bytes) > self.opts.budget.retention_bytes
-            || jobs.saturating_mul(self.job_budget.reservation_bytes) > self.opts.budget.reservation_bytes {
-            return Err(SparrowError::new(ErrorCode::ResourceExhausted,
-                format!("capacity: {}/{} jobs admitted; retry later", jobs - 1,
+            || jobs.saturating_mul(self.job_budget.reservation_bytes)
+                > self.opts.budget.reservation_bytes
+        {
+            return Err(SparrowError::new(
+                ErrorCode::ResourceExhausted,
+                format!(
+                    "capacity: {}/{} jobs admitted; retry later",
+                    jobs - 1,
                     (self.opts.budget.retention_bytes / self.job_budget.retention_bytes.max(1))
-                        .min(self.opts.budget.reservation_bytes / self.job_budget.reservation_bytes.max(1))))
-                .retryable(true).context("admission", "capacity"));
+                        .min(
+                            self.opts.budget.reservation_bytes
+                                / self.job_budget.reservation_bytes.max(1)
+                        )
+                ),
+            )
+            .retryable(true)
+            .context("admission", "capacity"));
         }
         self.queue_reserved.fetch_add(queue_need, Ordering::SeqCst);
         self.admitted_jobs.fetch_add(1, Ordering::SeqCst);
@@ -355,22 +468,41 @@ impl Kernel {
             jobs: Arc::clone(&self.admitted_jobs),
             bytes: queue_need,
         };
-        self.metrics
-            .jobs_started
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let attempt = JobAttemptId::new(self.next_attempt.fetch_add(1, Ordering::SeqCst));
         let cancel = CancellationToken::new();
-        let owner = MemoryOwner::child(Arc::clone(&self.process_owner), self.job_budget,
-            format!("pipeline={} attempt={}", req.plan.pipeline.raw(), attempt.raw()));
+        let owner = MemoryOwner::child(
+            Arc::clone(&self.process_owner),
+            self.job_budget,
+            format!(
+                "pipeline={} attempt={}",
+                req.plan.pipeline.raw(),
+                attempt.raw()
+            ),
+        );
         let ingress_memory = if ingress_metadata > 0 {
-            Some(Arc::new(owner.acquire(sparrow_model::CreditKind::Queue, ingress_metadata)
-                .map_err(|e| e.retryable(true).context("admission", "capacity"))?))
-        } else { None };
+            Some(Arc::new(
+                owner
+                    .acquire(sparrow_model::CreditKind::Queue, ingress_metadata)
+                    .map_err(|e| e.retryable(true).context("admission", "capacity"))?,
+            ))
+        } else {
+            None
+        };
+        for q in &boundary_queues {
+            q.initialize(&owner)?;
+        }
+        if let Some(obs) = &req.observation {
+            obs.initialize(&owner)?;
+        }
+        let mailboxes =
+            JobMailboxObserver::new(&req.plan, attempt.raw(), self.opts.mailbox, &owner)
+                .map_err(|e| e.retryable(true).context("admission", "capacity"))?;
         let work = Arc::new(WorkBudget::new(self.job_budget.work_units));
         let ctx = JobCtx {
             pipeline: req.plan.pipeline,
             attempt,
             owner: Arc::clone(&owner),
+            mailboxes: mailboxes.clone(),
             ingress_memory,
             work,
             cancel: cancel.clone(),
@@ -386,11 +518,18 @@ impl Kernel {
             min_remaining_work: Arc::new(AtomicU64::new(self.job_budget.work_units)),
             metrics: Arc::clone(&self.metrics),
             aligned: req.aligned.clone(),
+            observation: req.observation.clone(),
         };
-        let handle = self.rt.as_ref().expect("live kernel runtime").spawn(run_job(ctx, req, admit));
+        self.metrics.jobs_started.fetch_add(1, Ordering::Relaxed);
+        let handle = self
+            .rt
+            .as_ref()
+            .expect("live kernel runtime")
+            .spawn(run_job(ctx, req, admit));
         Ok(JobHandle {
             attempt,
             owner,
+            mailboxes,
             cancel,
             handle,
             live: Arc::clone(&self.live_tasks),
@@ -426,7 +565,11 @@ fn admit_process(
     ingress_metadata: usize,
 ) -> Result<usize> {
     let mailboxes = plan.mailbox_count().max(1);
-    let need = opts.mailbox.max_bytes.saturating_mul(mailboxes).saturating_add(ingress_metadata);
+    let need = opts
+        .mailbox
+        .max_bytes
+        .saturating_mul(mailboxes)
+        .saturating_add(ingress_metadata);
     if need > opts.budget.queue_bytes {
         return Err(SparrowError::new(
             ErrorCode::ResourceExhausted,
@@ -434,7 +577,8 @@ fn admit_process(
                 "queue admission: {mailboxes} mailboxes × {}B > queue cap {}",
                 opts.mailbox.max_bytes, opts.budget.queue_bytes
             ),
-        ).retryable(false));
+        )
+        .retryable(false));
     }
     let live_q = queue_reserved.load(Ordering::SeqCst);
     if live_q.saturating_add(need) > opts.budget.queue_bytes {
@@ -466,6 +610,8 @@ fn admit_process(
 }
 
 struct JobCtx {
+    observation: Option<Arc<FlowObservation>>,
+    mailboxes: Arc<JobMailboxObserver>,
     timers: Arc<JobTimers>,
     min_remaining_work: Arc<AtomicU64>,
     pipeline: PipelineId,
@@ -489,6 +635,7 @@ struct JobCtx {
 pub struct JobHandle {
     pub attempt: JobAttemptId,
     owner: Arc<MemoryOwner>,
+    mailboxes: Arc<JobMailboxObserver>,
     cancel: CancellationToken,
     handle: JoinHandle<Result<JobStats>>,
     live: Arc<AtomicUsize>,
@@ -496,7 +643,15 @@ pub struct JobHandle {
 }
 
 impl JobHandle {
-    pub fn memory_owner(&self) -> Arc<MemoryOwner> { Arc::clone(&self.owner) }
+    pub fn mailbox_snapshot(&self) -> JobMailboxSnapshot {
+        self.mailboxes.snapshot()
+    }
+    pub fn mailbox_observer(&self) -> Arc<JobMailboxObserver> {
+        self.mailboxes.clone()
+    }
+    pub fn memory_owner(&self) -> Arc<MemoryOwner> {
+        Arc::clone(&self.owner)
+    }
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
@@ -513,9 +668,7 @@ impl JobHandle {
 
     pub async fn stop(self) -> Result<JobStats> {
         self.cancel.cancel();
-        self.metrics
-            .jobs_stopped
-            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.jobs_stopped.fetch_add(1, Ordering::Relaxed);
         match self.wait().await {
             Ok(mut stats) => {
                 stats.cancelled = true;
@@ -550,11 +703,12 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
 
     let mut txs = Vec::new();
     let mut rxs: Vec<Option<MailboxRx>> = Vec::new();
-    for _ in 0..n.saturating_sub(1) {
-        let (tx, rx) = channel(ctx.mailbox, ctx.cancel.clone())?;
+    for i in 0..n.saturating_sub(1) {
+        let (tx, rx) = channel_observed(ctx.mailbox, ctx.cancel.clone(), ctx.mailboxes.edge(i))?;
         txs.push(tx);
         rxs.push(Some(rx));
     }
+    ctx.mailboxes.initialized();
 
     let JobRequest {
         plan,
@@ -571,6 +725,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
         mut live_events,
         inject_panic,
         aligned: _,
+        observation: _,
     } = req;
 
     let mut set = JoinSet::new();
@@ -580,11 +735,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
         } else {
             None
         };
-        let rx = if i == 0 {
-            None
-        } else {
-            rxs[i - 1].take()
-        };
+        let rx = if i == 0 { None } else { rxs[i - 1].take() };
         let ctx = clone_ctx(&ctx);
         let is_source = matches!(stage, PhysicalStage::MemorySource { .. });
         let is_sink = matches!(stage, PhysicalStage::CaptureSink { .. });
@@ -664,6 +815,8 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
 
 fn clone_ctx(ctx: &JobCtx) -> JobCtx {
     JobCtx {
+        observation: ctx.observation.clone(),
+        mailboxes: ctx.mailboxes.clone(),
         timers: Arc::clone(&ctx.timers),
         min_remaining_work: Arc::clone(&ctx.min_remaining_work),
         pipeline: ctx.pipeline,
@@ -711,11 +864,11 @@ fn spawn_stage(
     tx: Option<MailboxTx>,
     rows: Vec<Row>,
     capture: SharedCapture,
-    live_in: Option<tokio::sync::mpsc::Receiver<Row>>,
-    budgeted_in: Option<tokio::sync::mpsc::Receiver<sparrow_model::QueuedRow>>,
-    live_out: Option<tokio::sync::mpsc::Sender<RowBatch>>,
+    live_in: Option<ObservedReceiver<Row>>,
+    budgeted_in: Option<ObservedReceiver<sparrow_model::QueuedRow>>,
+    live_out: Option<ObservedSender<RowBatch>>,
     live_ctrl: Option<tokio::sync::mpsc::Receiver<StreamControl>>,
-    live_events: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
+    live_events: Option<ObservedReceiver<IngressEvent>>,
     trailing_controls: Vec<StreamControl>,
     inject_panic: bool,
 ) {
@@ -730,6 +883,7 @@ fn spawn_stage(
         }
         let work = Arc::clone(&ctx.work);
         let min_remaining = Arc::clone(&ctx.min_remaining_work);
+        let is_source = matches!(&stage, PhysicalStage::MemorySource { .. });
         let result = stage_loop(
             ctx,
             stage,
@@ -746,7 +900,9 @@ fn spawn_stage(
         )
         .await;
         min_remaining.fetch_min(work.remaining(), Ordering::Relaxed);
-        result
+        // Window stages return their output count. Do not add intermediate
+        // emissions to JobStats.ingested_rows when joining all stage tasks.
+        result.map(|rows| if is_source { rows } else { 0 })
     });
 }
 
@@ -757,18 +913,17 @@ async fn stage_loop(
     tx: Option<MailboxTx>,
     rows: Vec<Row>,
     capture: SharedCapture,
-    live_in: Option<tokio::sync::mpsc::Receiver<Row>>,
-    budgeted_in: Option<tokio::sync::mpsc::Receiver<sparrow_model::QueuedRow>>,
-    live_out: Option<tokio::sync::mpsc::Sender<RowBatch>>,
+    live_in: Option<ObservedReceiver<Row>>,
+    budgeted_in: Option<ObservedReceiver<sparrow_model::QueuedRow>>,
+    live_out: Option<ObservedSender<RowBatch>>,
     live_ctrl: Option<tokio::sync::mpsc::Receiver<StreamControl>>,
-    live_events: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
+    live_events: Option<ObservedReceiver<IngressEvent>>,
     trailing_controls: Vec<StreamControl>,
 ) -> Result<usize> {
     match stage {
         PhysicalStage::MemorySource { schema, .. } => {
-            let tx = tx.ok_or_else(|| {
-                SparrowError::new(ErrorCode::Internal, "source missing mailbox")
-            })?;
+            let tx =
+                tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "source missing mailbox"))?;
             if let Some(input) = budgeted_in {
                 return budgeted_live_source(ctx, schema, tx, input).await;
             }
@@ -776,13 +931,25 @@ async fn stage_loop(
                 return live_source(ctx, schema, tx, LiveInput::Ordered(events)).await;
             }
             if let Some(live_in) = live_in {
-                return live_source(ctx, schema, tx, LiveInput::Split { rows: live_in, controls: live_ctrl }).await;
+                return live_source(
+                    ctx,
+                    schema,
+                    tx,
+                    LiveInput::Split {
+                        rows: live_in,
+                        controls: live_ctrl,
+                    },
+                )
+                .await;
             }
             let batches = build_source_batches(schema, rows, &ctx.owner, ctx.rows_per_batch)?;
             let mut n = 0usize;
             for b in batches {
                 n += b.num_rows();
                 ctx.metrics.record_ingest(b.num_rows() as u64);
+                if let Some(obs) = &ctx.observation {
+                    obs.runtime_rows(true, b.num_rows());
+                }
                 if !tx.send(b).await? {
                     return Ok(n);
                 }
@@ -796,12 +963,11 @@ async fn stage_loop(
         }
         PhysicalStage::Transform { steps } => {
             let compiled = CompiledTransform::new(&steps)?;
-            let tx = tx.ok_or_else(|| {
-                SparrowError::new(ErrorCode::Internal, "transform missing tx")
-            })?;
-            let rx = rx.as_mut().ok_or_else(|| {
-                SparrowError::new(ErrorCode::Internal, "transform missing rx")
-            })?;
+            let tx =
+                tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "transform missing tx"))?;
+            let rx = rx
+                .as_mut()
+                .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "transform missing rx"))?;
             while let Some(mut env) = rx.recv().await? {
                 let (batch, ctrl) = env.take();
                 if let Some(ctrl) = ctrl {
@@ -810,11 +976,27 @@ async fn stage_loop(
                     }
                 }
                 if let Some(batch) = batch {
-                    if ctx.work.would_exhaust(compiled.work_units(batch.num_rows())) {
+                    if ctx
+                        .work
+                        .would_exhaust(compiled.work_units(batch.num_rows()))
+                    {
                         tokio::task::yield_now().await;
                         ctx.work.begin_quantum();
                     }
-                    if let Some(out) = compiled.apply(&batch, &ctx.owner, &ctx.work)? {
+                    let started = std::time::Instant::now();
+                    let result = compiled.apply(&batch, &ctx.owner, &ctx.work);
+                    if let Some(obs) = &ctx.observation {
+                        obs.record(Latency::Transform, started.elapsed());
+                    }
+                    if let (Some(obs), Ok(output)) = (&ctx.observation, &result) {
+                        obs.filtered(
+                            batch
+                                .num_rows()
+                                .saturating_sub(output.as_ref().map_or(0, |b| b.num_rows())),
+                        );
+                    }
+                    if let Some(out) = result? {
+                        let out = out.with_origin(batch.origin());
                         if !tx.send(out).await? {
                             return Ok(0);
                         }
@@ -824,9 +1006,9 @@ async fn stage_loop(
             Ok(0)
         }
         PhysicalStage::CaptureSink { schema, .. } => {
-            let rx = rx.as_mut().ok_or_else(|| {
-                SparrowError::new(ErrorCode::Internal, "sink missing rx")
-            })?;
+            let rx = rx
+                .as_mut()
+                .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "sink missing rx"))?;
             while let Some(mut env) = rx.recv().await? {
                 capture.stall.wait_if_stalled(&ctx.cancel).await;
                 if ctx.cancel.is_cancelled() {
@@ -834,7 +1016,12 @@ async fn stage_loop(
                 }
                 let (batch, ctrl) = env.take();
                 if let Some(batch) = batch {
+                    // Count final plan output once, not every intermediate
+                    // window emission (which may still be filtered downstream).
                     ctx.metrics.record_emit(batch.num_rows() as u64);
+                    if let Some(obs) = &ctx.observation {
+                        obs.runtime_rows(false, batch.num_rows());
+                    }
                     capture.push(&schema, batch.rows());
                     if let Some(out) = &live_out {
                         if let Some(aj) = &ctx.aligned {
@@ -861,7 +1048,9 @@ async fn stage_loop(
                     if let Some(aj) = &ctx.aligned {
                         // Timeout or drop is a failed flush, not a job death.
                         // The supervisor refuses commit; late acks keep their id.
-                        if !aj.acks.is_active(checkpoint_id) { continue; }
+                        if !aj.acks.is_active(checkpoint_id) {
+                            continue;
+                        }
                         let flush = tokio::select! {
                             _ = ctx.cancel.cancelled() => break,
                             flush = wait_outbox(&aj.outbox, std::time::Duration::from_secs(5)) => flush,
@@ -890,12 +1079,11 @@ async fn stage_loop(
             input,
             output: _,
         } => {
-            let tx = tx.ok_or_else(|| {
-                SparrowError::new(ErrorCode::Internal, "window missing tx")
-            })?;
-            let rx = rx.as_mut().ok_or_else(|| {
-                SparrowError::new(ErrorCode::Internal, "window missing rx")
-            })?;
+            let tx =
+                tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "window missing tx"))?;
+            let rx = rx
+                .as_mut()
+                .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "window missing rx"))?;
             let mut op = WindowOperator::new(
                 operator,
                 spec,
@@ -914,12 +1102,11 @@ async fn stage_loop(
             spec,
             input,
         } => {
-            let tx = tx.ok_or_else(|| {
-                SparrowError::new(ErrorCode::Internal, "dedup missing tx")
-            })?;
-            let rx = rx.as_mut().ok_or_else(|| {
-                SparrowError::new(ErrorCode::Internal, "dedup missing rx")
-            })?;
+            let tx =
+                tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "dedup missing tx"))?;
+            let rx = rx
+                .as_mut()
+                .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "dedup missing rx"))?;
             let mut op = DedupOperator::new(operator, spec, input, Arc::clone(&ctx.owner))?;
             while let Some(mut env) = rx.recv().await? {
                 let (batch, ctrl) = env.take();
@@ -930,9 +1117,14 @@ async fn stage_loop(
                 }
                 if let Some(batch) = batch {
                     consume_work(&ctx, batch.num_rows() as u64).await?;
-                    let rows = op.on_batch(&batch, ctx.clock.now_micros())?;
+                    let started = std::time::Instant::now();
+                    let result = op.on_batch(&batch, ctx.clock.now_micros());
+                    if let Some(obs) = &ctx.observation {
+                        obs.record(Latency::Dedup, started.elapsed());
+                    }
+                    let rows = result?;
                     if let Some(out) = op.build_batch(rows)? {
-                        if !tx.send(out).await? {
+                        if !tx.send(out.with_origin(batch.origin())).await? {
                             break;
                         }
                     }
@@ -947,12 +1139,11 @@ async fn stage_loop(
             output: _,
             ..
         } => {
-            let tx = tx.ok_or_else(|| {
-                SparrowError::new(ErrorCode::Internal, "lookup missing tx")
-            })?;
-            let rx = rx.as_mut().ok_or_else(|| {
-                SparrowError::new(ErrorCode::Internal, "lookup missing rx")
-            })?;
+            let tx =
+                tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "lookup missing tx"))?;
+            let rx = rx
+                .as_mut()
+                .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "lookup missing rx"))?;
             let op = if let Some(ver) = ctx.versioned_tables.get(&spec.table).cloned() {
                 LookupOperator::new_versioned(spec, ver, input, Arc::clone(&ctx.owner))?
             } else {
@@ -976,9 +1167,14 @@ async fn stage_loop(
                 }
                 if let Some(batch) = batch {
                     consume_work(&ctx, batch.num_rows() as u64).await?;
-                    let rows = op.on_batch(&batch)?;
+                    let started = std::time::Instant::now();
+                    let result = op.on_batch(&batch);
+                    if let Some(obs) = &ctx.observation {
+                        obs.record(Latency::Lookup, started.elapsed());
+                    }
+                    let rows = result?;
                     if let Some(out) = op.build_batch(rows)? {
-                        if !tx.send(out).await? {
+                        if !tx.send(out.with_origin(batch.origin())).await? {
                             break;
                         }
                     }
@@ -1007,7 +1203,8 @@ async fn emit_window(
     }
     if let Some(wm) = emission.pending_close {
         loop {
-            let chunk = op.take_closed_chunk(wm, ctx.mailbox.max_items.max(1), ctx.mailbox.max_bytes)?;
+            let chunk =
+                op.take_closed_chunk(wm, ctx.mailbox.max_items.max(1), ctx.mailbox.max_bytes)?;
             if chunk.is_empty() {
                 break;
             }
@@ -1031,7 +1228,8 @@ async fn emit_window(
         ctx.owner.usage().retention_bytes as u64,
     );
     if let (Some(wm_in), Some(wm_out)) = (op.wm_in(), op.wm_out()) {
-        ctx.metrics.record_watermark_lag(wm_in.saturating_sub(wm_out));
+        ctx.metrics
+            .record_watermark_lag(wm_in.saturating_sub(wm_out));
     }
     Ok(true)
 }
@@ -1050,7 +1248,6 @@ async fn send_rows_chunked(
         let sz = row.tracked_bytes().max(1);
         if !chunk.is_empty() && (chunk.len() >= max_rows || bytes.saturating_add(sz) > max_bytes) {
             if let Some(out) = op.build_batch(std::mem::take(&mut chunk))? {
-                ctx.metrics.record_emit(out.num_rows() as u64);
                 if !tx.send(out).await? {
                     return Ok(false);
                 }
@@ -1061,7 +1258,6 @@ async fn send_rows_chunked(
         chunk.push(row);
     }
     if let Some(out) = op.build_batch(chunk)? {
-        ctx.metrics.record_emit(out.num_rows() as u64);
         if !tx.send(out).await? {
             return Ok(false);
         }
@@ -1076,7 +1272,11 @@ async fn window_stage(
     tx: &MailboxTx,
     capture: &SharedCapture,
 ) -> Result<usize> {
-    let mut timer_reporter = TimerReporter { ctx, live: 0, cancelled: 0 };
+    let mut timer_reporter = TimerReporter {
+        ctx,
+        live: 0,
+        cancelled: 0,
+    };
     let mut input_closed = false;
     let mut n = 0usize;
     loop {
@@ -1158,7 +1358,10 @@ async fn window_stage(
                         }
                         if let Some(batch) = batch {
                             consume_work(ctx, batch.num_rows() as u64).await?;
-                            let emission = op.on_batch(&batch, ctx.clock.now_micros())?;
+                            let started=std::time::Instant::now();
+                            let result=op.on_batch(&batch, ctx.clock.now_micros());
+                            if let Some(obs)=&ctx.observation {obs.record(Latency::Window,started.elapsed());}
+                            let emission=result?;
                             n += emission.finals.len();
                             if !emit_window(ctx, op, tx, capture, emission).await? {
                                 input_closed = true;
@@ -1196,14 +1399,20 @@ async fn window_stage(
 /// Legacy split channels are adapted at the boundary; batching, accounting,
 /// cancellation and punctuation forwarding have one implementation.
 enum LiveInput {
-    Ordered(tokio::sync::mpsc::Receiver<IngressEvent>),
+    Ordered(ObservedReceiver<IngressEvent>),
     Split {
-        rows: tokio::sync::mpsc::Receiver<Row>,
+        rows: ObservedReceiver<Row>,
         controls: Option<tokio::sync::mpsc::Receiver<StreamControl>>,
     },
 }
 
 impl LiveInput {
+    fn last_origin(&self) -> OriginSpan {
+        match self {
+            Self::Ordered(rx) => rx.last_origin(),
+            Self::Split { rows, .. } => rows.last_origin(),
+        }
+    }
     async fn recv(&mut self) -> Option<IngressEvent> {
         match self {
             Self::Ordered(rx) => rx.recv().await,
@@ -1225,10 +1434,19 @@ impl LiveInput {
         }
     }
 
-    fn try_recv(&mut self) -> std::result::Result<IngressEvent, tokio::sync::mpsc::error::TryRecvError> {
+    fn try_recv_many(&mut self, out: &mut Vec<(IngressEvent, OriginSpan)>, limit: usize) {
         match self {
-            Self::Ordered(rx) => rx.try_recv(),
-            Self::Split { rows, .. } => rows.try_recv().map(IngressEvent::Row),
+            Self::Ordered(rx) => {
+                rx.try_recv_many(out, limit);
+            }
+            Self::Split { rows, .. } => {
+                for _ in 0..limit {
+                    let Ok(row) = rows.try_recv() else {
+                        break;
+                    };
+                    out.push((IngressEvent::Row(row), rows.last_origin()));
+                }
+            }
         }
     }
 
@@ -1244,36 +1462,59 @@ async fn budgeted_live_source(
     ctx: JobCtx,
     schema: sparrow_model::Schema,
     tx: MailboxTx,
-    mut rx: tokio::sync::mpsc::Receiver<sparrow_model::QueuedRow>,
+    mut rx: ObservedReceiver<sparrow_model::QueuedRow>,
 ) -> Result<usize> {
     let schema = Arc::new(schema);
     let mut n = 0;
     let mut carry = None;
-    let cap = ctx.mailbox.max_bytes.min(ctx.owner.budget().reservation_bytes);
+    let cap = ctx
+        .mailbox
+        .max_bytes
+        .min(ctx.owner.budget().reservation_bytes);
     loop {
-        if ctx.cancel.is_cancelled() { return Ok(n); }
+        if ctx.cancel.is_cancelled() {
+            return Ok(n);
+        }
         let first = match carry.take() {
             Some(row) => Some(row),
             None => tokio::select! { biased;
                 _ = ctx.cancel.cancelled() => return Ok(n),
-                row = rx.recv() => row,
+                row = rx.recv() => row.map(|r|(r,rx.last_origin())),
             },
         };
-        let Some(first) = first else { return Ok(n) };
-        let mut builder = sparrow_model::RowBatchBuilder::new(schema.clone(), ctx.owner.clone(),
-            sparrow_model::CreditKind::Reservation, ctx.rows_per_batch, cap)?;
+        let Some((first, mut origin)) = first else {
+            return Ok(n);
+        };
+        let mut builder = sparrow_model::RowBatchBuilder::new(
+            schema.clone(),
+            ctx.owner.clone(),
+            sparrow_model::CreditKind::Reservation,
+            ctx.rows_per_batch,
+            cap,
+        )?;
         first.push_into(&mut builder)?;
         while builder.num_rows() < ctx.rows_per_batch {
             match rx.try_recv() {
-                Ok(row) if builder.current_bytes().saturating_add(row.bytes()) <= cap => row.push_into(&mut builder)?,
-                Ok(row) => { carry = Some(row); break; }
+                Ok(row) if builder.current_bytes().saturating_add(row.bytes()) <= cap => {
+                    origin.merge(rx.last_origin());
+                    row.push_into(&mut builder)?;
+                }
+                Ok(row) => {
+                    carry = Some((row, rx.last_origin()));
+                    break;
+                }
                 Err(_) => break,
             }
         }
-        let batch = builder.finish()?;
+        let batch = builder.finish()?.with_origin(origin);
         n += batch.num_rows();
         ctx.metrics.record_ingest(batch.num_rows() as u64);
-        if !tx.send(batch).await? { return Ok(n); }
+        if let Some(obs) = &ctx.observation {
+            obs.runtime_rows(true, batch.num_rows());
+        }
+        if !tx.send(batch).await? {
+            return Ok(n);
+        }
     }
 }
 
@@ -1285,6 +1526,7 @@ async fn live_source(
 ) -> Result<usize> {
     let schema = Arc::new(schema);
     let mut n = 0usize;
+    let mut ready = Vec::new();
     loop {
         tokio::select! {
             biased;
@@ -1293,55 +1535,22 @@ async fn live_source(
                 let Some(ev) = ev else {
                     return Ok(n);
                 };
-                match ev {
-                    IngressEvent::Row(first) => {
-                        let mut buf = vec![first];
-                        while buf.len() < ctx.rows_per_batch {
-                            match events.try_recv() {
-                                Ok(IngressEvent::Row(row)) => buf.push(row),
-                                Ok(IngressEvent::Control(c)) => {
-                                    let batches = build_source_batches_shared(
-                                        schema.clone(),
-                                        std::mem::take(&mut buf),
-                                        &ctx.owner,
-                                        ctx.rows_per_batch,
-                                    )?;
-                                    for b in batches {
-                                        n += b.num_rows();
-                                        ctx.metrics.record_ingest(b.num_rows() as u64);
-                                        if !tx.send(b).await? {
-                                            return Ok(n);
-                                        }
-                                    }
-                                    if !tx.send_control(c).await? {
-                                        return Ok(n);
-                                    }
-                                    break;
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        if !buf.is_empty() {
-                            let batches = build_source_batches_shared(
-                                schema.clone(),
-                                buf,
-                                &ctx.owner,
-                                ctx.rows_per_batch,
-                            )?;
-                            for b in batches {
-                                n += b.num_rows();
-                                ctx.metrics.record_ingest(b.num_rows() as u64);
-                                if !tx.send(b).await? {
-                                    return Ok(n);
-                                }
-                            }
+                ready.push((ev, events.last_origin()));
+                events.try_recv_many(&mut ready, ctx.rows_per_batch.saturating_sub(1));
+                let mut rows = Vec::new();
+                let mut origin = OriginSpan::default();
+                for (event, at) in ready.drain(..) {
+                    match event {
+                        IngressEvent::Row(row) => { rows.push(row); origin.merge(at); }
+                        IngressEvent::Control(control) => {
+                            if !publish_live_rows(&ctx, &schema, &tx, &mut rows, origin, &mut n).await?
+                                || !tx.send_control(control).await? { return Ok(n); }
+                            origin = OriginSpan::default();
                         }
                     }
-                    IngressEvent::Control(c) => {
-                        if !tx.send_control(c).await? {
-                            return Ok(n);
-                        }
-                    }
+                }
+                if !publish_live_rows(&ctx, &schema, &tx, &mut rows, origin, &mut n).await? {
+                    return Ok(n);
                 }
                 while let Some(control) = events.ready_control() {
                     if !tx.send_control(control).await? { return Ok(n); }
@@ -1349,4 +1558,33 @@ async fn live_source(
             }
         }
     }
+}
+
+async fn publish_live_rows(
+    ctx: &JobCtx,
+    schema: &Arc<sparrow_model::Schema>,
+    tx: &MailboxTx,
+    rows: &mut Vec<Row>,
+    origin: OriginSpan,
+    n: &mut usize,
+) -> Result<bool> {
+    if rows.is_empty() {
+        return Ok(true);
+    }
+    for batch in build_source_batches_shared(
+        schema.clone(),
+        std::mem::take(rows),
+        &ctx.owner,
+        ctx.rows_per_batch,
+    )? {
+        *n += batch.num_rows();
+        ctx.metrics.record_ingest(batch.num_rows() as u64);
+        if let Some(obs) = &ctx.observation {
+            obs.runtime_rows(true, batch.num_rows());
+        }
+        if !tx.send(batch.with_origin(origin)).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

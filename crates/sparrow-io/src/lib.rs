@@ -9,6 +9,8 @@ use sparrow_model::{
 use sparrow_model::error::ErrorCode;
 
 pub mod replay;
+#[cfg(feature = "observation")]
+pub mod observed;
 
 pub use replay::{
     fnv1a64, MemoryReplaySource, ReplayCapabilities, ReplaySupport, ReplayableSource,
