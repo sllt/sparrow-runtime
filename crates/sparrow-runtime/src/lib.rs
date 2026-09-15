@@ -22,11 +22,15 @@ pub mod timer;
 pub mod transform;
 pub mod watermark;
 pub mod window;
+pub mod pipeline_checkpoint;
+pub use pipeline_checkpoint::PipelineSnapshot;
+#[cfg(test)]
+mod k1_tests;
 
 pub use aligned::{run_until, AlignedSession};
 pub use barrier::{
     wait_aligned_acks, wait_outbox, AlignedAck, AlignedAcks, AlignedJob, BarrierAcks, CheckpointAcks,
-    FlushOutcome,
+    FlushOutcome, PipelineRestore, ParticipantAcks, ParticipantOutcome,
 };
 pub use capture::{CaptureMode, SharedCapture, StallGate};
 pub use checkpoint::{

@@ -11,7 +11,7 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 - Processing-time tumbling windows and count windows (arrival-order; they do **not** impersonate event-time)
 - Incremental COUNT/SUM/AVG/MIN/MAX (checked integer overflow)
 - Versioned as-of-event-time lookup in embedded plans (not eligible for current Server aligned restore)
-- **Production** aligned single-job checkpoint (`aligned`) for a Replayable **File** source only — **not** default exactly-once
+- Aligned single-job checkpoint (`aligned`) for Replayable **File**: zero state, one Count/ET window, or two Count windows in a linear chain — **not** default exactly-once
 - Recover only from verified committed checkpoints; missing/corrupt stores are rejected
 - MQTT replay is **unsupported**; MQTT cannot pretend durable restore
 - A default process restart is a **fresh attempt**, not restore
@@ -85,12 +85,22 @@ sparrowctl diagnose hot --output new-diagnostic.json
 sparrowctl checkpoints hot
 ```
 
-File + an eligible single Count/ET window can opt into periodic checkpoints with
+File + zero state, one eligible Count/ET window, or two Count windows can opt into periodic checkpoints with
 `checkpoint.interval_ms`; `checkpoint.resume_latest=true` explicitly enables
 automatic replay. Both are off by default. Waiter timeout does not cancel an
 already-running durable filesystem commit. Numeric restore points are pinned
 for the attempt/configuration that depends on them. None of this promises
 exactly-once, a hard RPO, 72-hour stability or target-device certification.
+
+K1 uses snapshot v3 with a complete participant manifest and a persisted state
+generation. It does **not** automatically migrate R10's v1/v2 snapshots: keep the
+old binary/backup or explicitly start fresh in a new checkpoint directory.
+The Server refuses mixed legacy/v3 writes. RCP2 semantics permit changes after the last
+stateful operator (stateless filters/projections included) while preserving the
+source cut; source and all state dependencies must match. Older plain CP01 snapshots
+retain full-computation matching. Source may continue after barrier injection,
+but commits still require every participant and the real Sink flush.
+Examples: `deploy/pipeline-k1-zero.json`, `deploy/pipeline-k1-two-count.json`.
 
 `effective.aligned_eligible` is based on a bound plan. Without successful
 binding it can be `null` (unknown), not optimistic `true`; clients must distinguish

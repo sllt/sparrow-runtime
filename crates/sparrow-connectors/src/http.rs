@@ -297,20 +297,23 @@ impl HttpSink {
         let mut carry: Option<Delivery> = None;
         let mut closed = false;
         let mut flush = false;
-        let mut force_flush = false;
+        let mut force_flush: Option<u64> = None;
         loop {
             if cancel.is_cancelled() {
                 break;
             }
-            if outbox.as_ref().is_some_and(|o| o.pending() == 0) {
-                force_flush = false;
+            if force_flush.is_some_and(|target| outbox.as_ref().is_some_and(|o| o.acked().saturating_add(o.failed()) >= target)) {
+                force_flush = None;
             }
             if group.is_none() && tasks.len() < sink.config.max_inflight {
                 group = carry.take();
             }
             if group.as_ref().is_some_and(|g| {
                 flush
-                    || force_flush
+                    // A barrier drains a prefix, not one POST per Runtime
+                    // batch. Keep merging already queued data into full HTTP
+                    // batches; only its final partial group bypasses linger.
+                    || (force_flush.is_some() && rx.is_empty())
                     || closed
                     || g.rows >= sink.config.batch_rows
                     || g.bytes.len() >= sink.config.batch_bytes
@@ -344,7 +347,7 @@ impl HttpSink {
                 biased;
                 _ = cancel.cancelled() => break,
                 _ = tasks.join_next(), if !tasks.is_empty() => {},
-                _ = async { match &outbox { Some(o) => o.flush_requested().await, None => std::future::pending().await } } => { force_flush = true; },
+                target = async { match &outbox { Some(o) => { o.flush_requested().await; o.requested_flush_through() }, None => std::future::pending().await } } => { force_flush = Some(target); },
                 _ = async { match &group { Some(g) => tokio::time::sleep_until(g.first + sink.config.linger).await, None => std::future::pending().await } }, if group.is_some() && !flush => { flush = true; },
                 next = rx.recv(), if !closed && carry.is_none() && !flush && tasks.len() < sink.config.max_inflight => {
                     match next {
@@ -1121,6 +1124,40 @@ mod tests {
             assert_eq!(owner.usage().physical_bytes, 0);
             http.stop().await;
         }
+    }
+
+    #[cfg(feature = "demo-io")]
+    #[tokio::test]
+    async fn r11_checkpoint_flush_keeps_queued_prefix_batched_and_flushes_only_the_tail() {
+        let http = HttpCapture::start().await.unwrap();
+        http.set_status(204);
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let outbox = Arc::new(InflightCounter::new());
+        let diag = IoDiagnostics::new();
+        let mut cfg = HttpSinkConfig::demo(http.url());
+        cfg.batch_rows = 8;
+        cfg.batch_bytes = 4096;
+        cfg.linger = Duration::from_secs(1);
+        cfg.max_inflight = 4;
+        let sink = HttpSink::bind(cfg, &MapSecretResolver::empty(),
+            &TargetPolicy::allow("127.0.0.1", http.port()), diag.clone()).unwrap();
+        let (tx, rx) = mpsc::channel(32);
+        // This is exactly the barrier condition: every prefix batch has been
+        // enqueued, the producer is held at the cut, but HTTP may still be busy.
+        for n in 0..18 { outbox.enqueue(); tx.send(number_batch(&owner, n)).await.unwrap(); }
+        outbox.request_flush();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(sink.run(rx, cancel.clone(), Some(outbox.clone())));
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while outbox.pending() > 0 { tokio::time::sleep(Duration::from_millis(1)).await; }
+        }).await.expect("partial tail must bypass linger without waiting for EOF");
+        let requests = http.drain_requests();
+        let mut widths: Vec<_> = requests.iter().map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap().as_array().unwrap().len()).collect();
+        widths.sort_unstable();
+        assert_eq!(widths, vec![2,8,8], "flush must not turn every Runtime batch into a separate POST");
+        assert_eq!(outbox.acked(),18);assert_eq!(outbox.failed(),0);
+        cancel.cancel();task.await.unwrap();drop(tx);
+        assert_eq!(owner.usage().physical_bytes,0);http.stop().await;
     }
 
     #[cfg(feature = "demo-io")]

@@ -58,7 +58,7 @@ for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl; do
     fi
     install -m 755 "$target/$host/release/$binary" "$out/bin/$binary"
 done
-cp deploy/sparrow.service deploy/production.env.example deploy/pipeline-aligned.json "$out/deploy/"
+cp deploy/sparrow.service deploy/production.env.example deploy/pipeline-aligned.json deploy/pipeline-k1-zero.json deploy/pipeline-k1-two-count.json "$out/deploy/"
 cp docs/PRODUCTION.md "$out/docs/"
 "$out/bin/sparrow-server" --version > "$out/evidence/server-version.txt"
 "$out/bin/sparrowctl" --version > "$out/evidence/cli-version.txt"

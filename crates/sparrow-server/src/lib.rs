@@ -842,6 +842,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
     });
     Ok(Json(json!({
         "jobs_started": snap.jobs_started,
+        "state_accounting_errors_total": state.supervisor.kernel().process_owner().accounting_errors_total(),
         "histogram_contract": histogram_contract_json(),
         "jobs_stopped": snap.jobs_stopped,
         "jobs_failed": snap.jobs_failed,

@@ -279,10 +279,10 @@ fn r24_start_failure_is_actual_failed() {
         let store = Arc::new(Store::open_memory().unwrap());
         store.put_stream("sensors", STREAM).unwrap();
         let path = tmp("missing.ndjson");
-        // Aligned without a window operator — start path must fail closed.
+        // PT remains unsupported in K1; zero-state File is now recoverable.
         let spec = file_spec(
             &path.to_string_lossy(),
-            "SELECT device_id FROM sensors",
+            "SELECT device_id, COUNT(*) AS n FROM sensors GROUP BY device_id, TUMBLE(PROCESSING_TIME, INTERVAL '1' SECOND)",
             "aligned",
             None,
         );
@@ -887,8 +887,7 @@ fn n4_stale_barrier_ack_not_used_for_next_checkpoint() {
 
         let snap = CheckpointStore::open(&chk)
             .unwrap()
-            .recover_committed()
-            .unwrap()
+            .recover_pipeline_required()
             .expect("committed snapshot");
         assert_eq!(snap.checkpoint_id, id);
         assert_eq!(
@@ -896,7 +895,7 @@ fn n4_stale_barrier_ack_not_used_for_next_checkpoint() {
             "cut must be the freeze covering all ingested rows, not a stale ack + new pos: {snap:?}"
         );
         assert_eq!(snap.source.record_index, 5, "{:?}", snap.source);
-        let leftover: u64 = snap.window.entries.iter().map(|e| e.count).sum();
+        let leftover: u64 = snap.windows[0].entries.iter().map(|e| e.count).sum();
         assert_eq!(
             leftover, 1,
             "COUNT_WINDOW(2) at 5 rows leftover=1; empty freeze from barrier #1 \
@@ -1387,15 +1386,14 @@ fn n15_aligned_checkpoint_records_real_duration_and_bytes() {
         );
         let recovered = CheckpointStore::open(&chk)
             .unwrap()
-            .recover_committed()
-            .unwrap()
+            .recover_pipeline_required()
             .expect("CURRENT");
-        let encoded = recovered
-            .encode_with_max_state_keys(kernel.budget().max_state_keys)
-            .unwrap();
+        let encoded_bytes: u64 = std::fs::read_dir(chk.join(format!("chk-{:08}",recovered.checkpoint_id)))
+            .unwrap().map(|entry|entry.unwrap()).filter(|entry|entry.path().extension().is_some_and(|ext|ext=="bin"))
+            .map(|entry|entry.metadata().unwrap().len()).sum();
         assert_eq!(
             metrics.checkpoint_bytes,
-            encoded.len() as u64,
+            encoded_bytes,
             "checkpoint_bytes must be the spawn_blocking payload length"
         );
         sup.kill_named("n15").await.unwrap();

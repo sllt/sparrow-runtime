@@ -9,7 +9,7 @@ pub fn inventory() -> Value {
             "graph":"linear","delivery":"live_best_effort","recovery":"restart_fresh",
             "configuration":"requires_schema_target_secret_and_budget_validation",
             "time_modes":["none","count","processing_time_tumbling","event_time_tumbling","event_time_hopping"],
-            "state":"current_linear_operators_only; aligned_requires_separate_single_window_checks",
+            "state":"current_linear_operators_only; aligned_requires_separate_participant_checks",
             "certification":"not_claimed_by_static_inventory"})
             })
         })
@@ -19,8 +19,9 @@ pub fn inventory() -> Value {
             "pure_deterministic":true,"entries":sparrow_expr::semantics::FUNCTIONS.iter().map(|f|json!({"name":f.name,
                 "min_args":f.min_args,"max_args":f.max_args,"input":f.input,"null_policy":f.null_policy,
                 "output_bound":f.output_bound,"work_bound":f.work_bound})).collect::<Vec<_>>()},
-        "aligned":{"source":"file","state_shapes":["single_count_window","single_et_tumbling_window","single_et_hopping_window"],
-            "excluded":["zero_state","multiple_states","processing_time_window","deduplicate","lookup","multiple_sources"],
+        "aligned":{"source":"file","state_shapes":["zero_state","single_count_window","single_et_tumbling_window","single_et_hopping_window","two_count_windows"],
+            "snapshot_version":3,"max_state_participants":2,"old_snapshot_migration":"explicit_fresh_or_original_backup_binary_no_automatic_conversion",
+            "excluded":["more_than_two_states","mixed_time_multiple_states","processing_time_window","deduplicate","lookup","multiple_sources","branching"],
             "additional_checks":["complete_state_semantics","source_identity","committed_checkpoint","required_sink_flush"],
             "periodic_checkpoint":true,"automatic_replay":"explicit_resume_latest_or_restore_only"},
         "backend":{"layout":"row","prepared":true,"fusion":true,"arrow":false,"jit":false,"dag":false},

@@ -76,7 +76,29 @@ restore 在一个 catalog 事务内同时发布含 RestoreSpec 的新 revision �
 | max_store_bytes | 33554432 | 1 MiB～1 GiB |
 | resume_latest | false | bool |
 
-只支持 File/replay + 单 Count/ET tumble/ET hop aligned。先验证完整状态语义与 File 身份；零/多状态、PT/Dedup/Lookup/MQTT 恢复被拒绝。每个 attempt 只有一个排队/进行中请求，手动和自动共用 gate，错过 tick 跳过，不积累无限任务。
+K1 支持单 File/replay → 线性计算 → 单 required Sink 的零状态、单 Count/ET tumble/ET hop，以及两个 Count 窗口串联。双状态混合时间策略、超过两个状态、PT/Dedup/Lookup、分支/多源/MQTT 入口恢复仍拒绝。进入 state 的 key 和 MIN/MAX 值须由现有 Scalar snapshot codec 支持，nested/Dynamic 状态值不开放；无状态计算或 COUNT(*) 的无关宽列不因此一概拒绝。每个 attempt 仍只有一个排队/进行中请求，手动和自动共用 gate。
+
+每次切点必须收齐当前 attempt 的 Source、全部状态实例、required Sink ACK；零状态不是免除 Source/Sink 责任。实例以 operator/slot/shard（当前 slot=1、shard=0）区分，相同 ACK 幂等，冲突/未知 ACK 拒绝，旧 attempt/旧 checkpoint ACK 不补齐新切点。只有全部 freeze 和真实 Sink flush 成功才能发布 CURRENT；prepared ACK 集合及已编码快照不能由外部调用者任意构造为“可信”。
+
+恢复前先校验完整参与者集合，再在同一 Job owner 下准备所有窗口；缺失/重复实例、错误 accumulator/key 类型或边界、预算不足均在 Kernel 输入激活前拒绝。`max_state_keys` 仍是**每个算子**的上限，不因两个参与者静默减半；最多两个参与者限定总条目工作量，完整 snapshot 总上限仍为 8 MiB，所有参与者共享 Job 的 reservation/retention，不各得一整份预算。
+
+`append_only` 的空文件/暂无追加继续保持可 checkpoint；全过滤也推进真实 source cut。`sealed/immutable` 保留终止水位后完成 Job 的既有行为，不为 K1 改成永久 Running；需要 checkpoint 必须在活跃期间完成，不能把已经完成的有限作业宣称为仍可接收新 checkpoint 请求。
+
+状态实例身份与 snapshot 序号不同：fresh/reset 在任何输出前，用 OS 安全随机源生成并持久化 128-bit `STATE_GENERATION`（`SG01`）；写入/同步失败不激活 Kernel。兼容恢复沿用快照里的 generation，配置 revision 和执行 attempt 可以变化。`checkpoint.state_generation` 为 32 位十六进制标识；随机碰撞概率约 2^-128，不是时钟/进程号拼接。该 marker **不是 CURRENT/提交证明**，不用于跳过源码、状态或输出完成校验；K1 尚不把它当作已经实现的业务输出 ID 或 exactly-once。
+
+快照 v3 保持 `CPL1` 外层参与者清单，在旧 reader 可读取的 `CP01` 语义字段中使用 `RCP2` 封套保存完整诊断计算和状态依赖前缀；其余包含 source cut、各 state frame、attempt/revision/generation。恢复必须匹配 Source 身份/schema、每个状态实例及其全部上游计算（仍保留全局函数语义版本检查）；线性管道比较到最后一个窗口。末端下游 Filter/Map/Project 可以调整，零状态管道可调整过滤/投影而不重放文件头，状态中暴露 `downstream_semantics_changed`。两窗口之间的计算仍影响第二窗口，窗口参数/schema/参与者变化仍拒绝。改变输出逻辑不撤销已发送的 HTTP 副作用，也不提供 exactly-once。
+
+历史 K1 plain `CP01` 快照仍可读取，但保持原来的**完整计算严格匹配**合同；需要下游更新时，先用原计算在本版本提交一个 RCP2 恢复点，再更新配置。旧 K1 可以完整解析新 CURRENT 的外层结构，但必须在计算兼容检查明确拒绝，不把未知 manifest 当损坏、偷偷回退到更老的 plain CP01。R11 开发中曾试用的 CPL2 仅保留读取，新写入不使用它。R10 SPV1 v1/v2 不自动迁移，Server 在输入激活和 generation 写入前拒绝向含旧格式历史的目录写 v3，包括 `resume_latest=false`。不要靠删除旧代绕过检查；选择新目录 fresh 或恢复原二进制和同一备份时点的整套目录。
+
+**R10 回滚限制：**旧二进制遇到混合 v2/v3 目录可能跳过 v3、恢复旧 v2 并重复输出；“不兼容即拒绝”仅在没有可回退旧代的单 codec 目录得到旧二进制保证。K1 的 guard 阻止正常 Server 创建这种混合目录，但不能修补外部工具或历史版本已经混写的目录。回滚必须先核对全部历史 codec，在副本上验证，不能只看 CURRENT。
+
+切点捕获与 barrier 注入保持同一 Source 驱动内的 FIFO 顺序；之后 Source 可继续读取。单飞 checkpoint worker 独立收齐 ACK，再在 blocking pool 编码/提交，不要求 durable outbox，也不跳过 required Sink flush。停止、读失败和 EOF 都收尾该 worker；已经进入阻塞提交的工作不能因 API 超时/取消而 detach，持有 gate、lease 和目录锁直到结束。满队列时 worker 仍独立被调度，不依赖 Source 的批次 send 返回。
+
+`checkpoints`/`diagnose` 同时展示 `STATE_GENERATION` marker 与各快照的版本/revision/attempt/generation，允许识别同一 v3 目录中的 fresh lineage。头部元数据仅作有界诊断，运行中缓存于启动/最近完成提交；不代替 CRC、MANIFEST、PUBLISHED 和兼容性校验，未知/损坏头部为 null。marker 不是恢复依据，兼容恢复相同 marker 不重复写盘。
+
+**旧 codec 不自动迁移**：K1 Server 拒绝 R10 的 SPV1 v1/v2；R10 也不能恢复 v3。底层 Store 仍识别旧 codec 的完整性以安全管理旧历史，但不把格式不兼容当成损坏，偷偷回退成一个旧格式/旧位置。升级需保留原二进制和整套备份，或明确选择新目录 fresh；没有在线/离线自动转换工具。旧 `CheckpointSnapshot`/`PlanLayout` 和 legacy barrier helper 仅保留嵌入单窗口合同；Server 的零/单/双状态统一走 `PipelineSnapshot` / `PipelineRestore` / `wait_participants`。没有开通 DAG 或 broker 无损恢复。
+
+嵌入 API 变更：已有 `AlignedJob` struct literal 需显式补 `pipeline: None` 才保留 legacy 路径；K1 使用 `pipeline: Some(PipelineRestore { plan, generation, restore })`，不同时填写 legacy `restore`。非 Server 的组合层必须自行持久化 fresh generation、提供有序 cut 和真实 Sink 完成计数；Kernel 不替外部来源伪造可重放保证。
 
 HTTP/CLI 等待超时不撤销已开始的阻塞持久化；gate 持有到 source actor 真正完成。检查 `checkpoint.active/phase/last_success_id/timed_out_waiters_total` 再决定重试。周期不是硬 RPO，`last_success_age_ms` 是本 attempt 成功提交后的单调时钟年龄，恢复旧点时为 null，不伪造历史时间。磁盘信息是有界快照，不能当作跨组件事务快照。
 
@@ -126,15 +148,15 @@ checkpoint 单份 8 MiB、MANIFEST 256 KiB、最多 4096 chunks；读取前和�
 
 R10 修正 scratch 公式：Window/Dedup 不再每批预留两倍全部 retention，保留量/关闭索引使用 O(1) 计数；本批输入与真正到期的有界输出分别准入。raw 输出转成 owning batch 后、异步发送前释放 scratch，不能在输出仍未接管时提前退款。MIN/MAX 复用候选容器，值未变化不 detach；只有增长才扩 lease，替换成功后按实际大小退款。融合表达式分别估计共享值大小与新分配，不再按列数/融合次数乘算整行。快照 wire 估算与 resident 估算分离，排序引用数组另行短期计费。
 
-`max_state_keys` 是数量上限，不是任意宽度状态一定装得下的承诺。Server 当前每 Job 为 4 MiB reservation / 4 MiB retention、1024 keys；4096 keys 并非默认 Server 支持的 benchmark 档位。总预算、输入宽度、累加器/索引和并发输出仍共同约束准入，过大配置应调整数据/资源，不靠静默扩大测试预算宣称通过。R10 的匹配验证记录独立于下方历史 v7/自审证据。
+`max_state_keys` 是数量上限，不是任意宽度状态一定装得下的承诺。Server 每 Job 为共享的 4 MiB reservation / 4 MiB retention，key 上限为每 operator 1024；K1 双状态允许两者各 1024，但不各给一份 Job 字节预算。单 operator 4096 keys 并非默认支持档位。总预算、输入宽度、累加器/索引和并发输出仍共同约束准入，不能靠静默扩大测试预算宣称通过。
 
 `/metrics.state_keys/state_bytes` 是最近一次 Window 采样，不是所有 Job 的总和；key 数现在取实际状态项，不再错误地使用 MemoryLease handle 数。`state_sample_scope` 明确这一限制。
 
-恢复快照进入 Kernel 时只接手一份受计费的 decoded state，stage context 共享一次性 slot；唯一 Window 消费并重建后立即释放原件。修复了此前 `AlignedJob::clone` 把整个 WindowFreeze 复制到每个 stage、并持有至 Job 结束的问题。重建按逐项处理的最大 key/accumulator 暂存及有界 timer bookkeeping 预留，不再额外预留三份完整快照。scratch 不足在修改状态之前拒绝；逐项 retention/index 准入仍可能失败，此时启动失败并清理新任务，不承诺任意快照或任意预算都可恢复，也不把 raw helper 宣称为事务式原地更新。
+R10 去掉了按 stage 深拷贝整个恢复快照的问题；K1 接手完整实例集合，在同一 owner 下准备各 Window，按实例重建后立即释放其 decoded handoff，阶段上下文只共享已准备的实例容器。重建按逐项最大 key/accumulator 暂存及有界 bookkeeping 预留，不额外预留三份完整快照。scratch/retention/index 准入失败则清理全部准备结果，不激活输入；仍不承诺任意快照或任意预算都可恢复，也不把 raw helper 宣称为事务式原地更新。
 
 ## 自审前 v7 验证记录（2026-09-14）
 
-> 以下为历史证据；本轮最新结果见 [R10 修复与复验](#r10-validation)。
+> 以下为历史证据；最新 K1 结果见 [K1 实现与验收](#k1-validation)，R10 单独保留。
 
 以下数字和指纹仅对应自审前 v7，不是后续修复代码的新证据；自审后的复验单独记录，不覆盖原始失败或性能样本。
 
@@ -245,3 +267,111 @@ File 20 个正式试次 + 8 个 warmup、周期开关 8 个正式试次 + 4 个 
 - 多 key driver：`a8129b5eeec8eb2b51ed1c89cc16be2f750ab22f2f5f6e8efb485a0ef97af734`；干净 HEAD Server：`82399108c9f4f06f2429bc7618d50a5fa8d6b8e02be568feac9befe6bb0ac385`。
 
 目标设备、真实 WAN/netem、24/72 h 长稳、掉电/flash 失败模型仍未放行；没有 commit/push/tag/安装服务。R10 的有限范围修复验证不等于整个 MEM arena、K1 恢复协议或正式生产认证完成。
+
+<a id="k1-validation"></a>
+## K1 实现与验收（2026-09-14）
+
+> 本节保留 R11 修复前 K1 v8 的历史数据与当时判断。RCP2、source 并行推进及增强 smoke 属于 R11，不能用本节旧数字为其背书；当前实现合同以上文为准。
+
+基线为已提交/推送的 **`9a92527`**，功能位于独立分支 `feat/k1-checkpoint-participants`，尚未提交或推送。不是修改 R10 的历史证据，也不更改版本号/tag。实现范围、v3 迁移规则与有限文件 EOF 行为见本页当前运行合同。
+
+**功能批次已闭合，性能按场景分别放行，不是所有门禁全绿。** 真实 Source → 零/单/双状态 → required Sink → 持久化 → 新进程恢复已贯通；没有新增 broker、outbox、DAG、UI 或 Arrow/JIT。Source/Sink 配置参数可调整不等于全计算语义都可复用，恢复仍要求匹配实例集合和 CP01 描述。
+
+| 验证 | 本轮结果 |
+|---|---|
+| 默认核心 / 独立无 demo | **525/0 / 32/0**（后者 Server 30 + CLI 2）；各 feature profile 单独测试并冻结 |
+| 固定二进制重复 | **120 × 20 = 2,400/0**；跨 profile 重复不视作独立用例 |
+| 实际 Kernel 切点矩阵 | 零/单/双 Count，空输入/全过滤/部分/完全闭合切点；原始输入独立求和校验；单 ET tumble/hop 的水位/状态恢复 |
+| 配额与故障 | 双实例各 **1024 keys** 编码/恢复通过，共享字节预算不倍增；部分 freeze 配额失败后可重试；慢 Sink 真确认、取消释放；缺失状态在输入前拒绝；坏 codec/未发布代不提交或不恢复 |
+| 实际 API/进程 | 零状态/双 Count 的手动、周期、选点恢复；kill -9 后分别输出 **101 / 21**，各仅一条；generation 延续；generation 持久化失败时 `jobs_started=0`、`ingested_rows=0` |
+| 旧格式 | 真实 R10→K1、K1→R10 都拒绝不兼容恢复，CURRENT 不变、无输出；不是自动迁移成功 |
+| 原操作闭环 | sum=60/150/240、真实备份回读、固定点 held、20 次启停 fd **12→12**、SIGTERM/锁释放及原七类负向用例通过 |
+| checkpoint API 延迟 | 零/双状态各 **240** 个正式样本；p50 **7.778 / 7.349 ms**，p99 **15.024 / 13.569 ms**，max **17.419 / 14.504 ms**；含对齐、Sink 和磁盘，不是逐行延迟/硬暂停上界 |
+| 恢复到 Running | 零/双状态 **63 / 62 ms**，仅各一次真实进程样本，含 CLI 轮询/启动，不当作恢复 p99 或大状态保证 |
+| MQTT 回归 | 2k 输入/s，10,000 输入 → **7,500/7,500** 输出，无缺失/重复；capture-arrival p99 **11.320 ms**；467 POST / 3 TCP；观察 66 个视图、132 个边界队列、132 个 mailbox 样本守恒 |
+| 静态/构建 | `git diff --check`、脚本语法、独立 production build/包 SHA256 与 clippy 通过（保留 warnings）；本机未运行 Cargo 编译，云端 CI 未执行 |
+
+### 性能：保留 100 ms 压力点失败，不靠改门槛过关
+
+所有正式与 warmup 试次均按真实输出校验，同输入规模的正式 hash 一致；以下比值使用各组中位数。fresh 路径与 R10 固定二进制比较；周期 on/off **都运行 K1**，不把旧版无法运行的 aligned 零/双状态当作基线。普通路径目标 ≥0.97，周期目标 ≥0.90；RSS 阈值沿用各脚本预登记值，未降低。
+
+| 形状 | 吞吐比 | RSS 差 | 结论 |
+|---|---:|---:|---|
+| 既有单窗口 File 80k / 400k，K1 / R10 | **0.9946 / 0.9962** | +52 / +36 KiB | 原 3% 门槛通过 |
+| 零状态 fresh 32k，K1 / R10 | **0.9816** | −4 KiB | 通过；不是内存节省证明 |
+| 双 Count fresh 131072，K1 / R10 | **1.0055** | +328 KiB | 通过，小幅差异不夸大 |
+| 单窗口周期 100 ms，on/off | **1.0061** | +584 KiB | 通过；4 次正式 on 试次各成功提交 13 次、失败 0 |
+| 双 Count 周期 100 ms，on/off | **0.9732** | +148 KiB | 通过；提交 10/12/12/12，失败 0 |
+| **零状态 + 20 ms Sink + 100 ms 周期**，6400 输入 | **0.8443** | +144 KiB | **性能门禁未过**；正确性通过，不伪装为全绿 |
+| 同一零状态压力配置，扩大至 25600 输入、100 ms | **0.8625** | −172 KiB | **仍未过**；提交 71/66/67/66，失败 0，保留复测反例 |
+| 同一 25600 输入/慢 Sink，周期改为 **500 ms** | **1.0088** | +320 KiB | 该配置通过；4 次各提交 11 次、失败 0 |
+
+按当前实现，aligned 切点需要等待 required Sink 完成并同步提交；高频切点会中断持续输出的流水执行。频率对照支持这是该负载下的重要开销来源，但未将 flush、文件轮询相位和 fsync 各自耗时完全分离。**500 ms 的通过不是 100 ms 已被代码优化**：本批保留安全切点语义，不通过跳过 Sink 确认、只在空闲时伪造周期成功或修改阈值提分。此慢 Sink/零状态组合不按 100 ms 性能目标放行；500 ms 是本机已测配置，模板 10 s 及真实目标环境仍需按 RPO/负载验收。并行前缀 ACK/持久输出协议留在后续可靠链路工作，不在 K1 偷换保证。
+
+### 复现与来源
+
+原始目录：`/workspace/bench-compare/k1-artifacts-20260914/`；源码：`/workspace/bench-compare/k1-source-20260914/`。最终用 `validation-v8/`、`package-v8/`、`smoke-v8/`、`k1-smoke-v8c/`、`regression-v8/`、`performance-v8/`、`performance-v8-two/`、`zero-interval-100/500/`、`manual-states-0/2/` 与 `mqtt-regression-v8/`，不覆盖旧版本数据。
+
+```sh
+bash scripts/production-k1-smoke.sh PACKAGE NEW_EVIDENCE_DIR OPTIONAL_R10_SERVER
+bash scripts/production-k1-performance.sh NEW_EVIDENCE_DIR FROZEN_DRIVER R10_SERVER K1_SERVER
+# 同输入规模，单独验证不同频率；默认 100 ms 的失败样本仍保留。
+K1_PERF_STATES=0 K1_PERF_MODES=periodic bash scripts/production-k1-performance.sh NEW_DIR DRIVER R10 K1 500 25600
+```
+
+保留开发失败记录：旧测试把零状态当作错误的预期已换成新的正向验证/仍不支持 PT 的负向验证；保持 sealed EOF 完成的回归未放宽。`package-v5/v6` 曾命中共享 **显式 x86 target** 的旧依赖，虽然源码存在 `semantics`，旧 rlib 没有该模块；只清默认 target 不够。显式 target 的工作区包缓存清理后重建成功，第三方缓存保留。归档保留 mtime 时不能只信 Cargo 的 Fresh 提示；建议独立 checkout/target，并校验源码清单和实际二进制。smoke 首次端口碰撞、脚本误用不存在的 CLI metrics 命令也保留，随后固定非 ephemeral 端口、调用已存在 API 复验。手动延迟计划误写 chunk=800，实际 driver `CHUNK=400`；修正单独记录，240 个样本没有改动或删减。
+
+- 源码基线 **9a92527** + 完整 patch SHA256：`abe92f9edd95b4dd99757d40439f542a858bf039e5e17e6ce06d4a4bdb64a641`。
+- **240** 文件清单 SHA256：`70db97c096053b74800c0d7046850dbec5efa17c439085ef3f698608ad58dc32`；干净基线重放并逐文件校验。
+- Server：`e989e1903bf7571de50d26617d3efb765843337d249163b9961c6fc3ba7dca77`。
+- CLI：`5bc2ce61be23de013287d786acd2e92880eb8202d7a0a13bb420717e2f29115b`。
+- K1 driver：`34330536f714268ed7482d4282041604fb9db5ec8744a54581aeabdba622f2f0`。
+
+本节不等于正式发行或全配置性能放行。100 ms 零状态慢 Sink 压力点、真实 WAN/netem、目标设备、24/72 h 长稳和掉电介质验收仍未放行；未 commit/push/tag/部署。K1 可以进入集中 review，下一功能模块仍为 K2 可靠输入/输出。
+
+<a id="r11-validation"></a>
+## R11 收尾与独立自查（2026-09-15）
+
+最终受测候选为 `package-v8`，源码基线 `9a92527` 加 K1/R11 补丁；以下不覆盖任意网络、设备和断电场景。原始目录 `/workspace/bench-compare/r11-artifacts-20260915/`，源码 `/workspace/bench-compare/r11-source-20260915/`。本机未 Cargo 编译，服务器分组测试、冻结二进制后重复执行；完整入口 `sparrow-r11-final-validation.sh`，`final-v8.exit=0`。v8 相对 v7 最后校正了 API 的 plain CP01 兼容提示和对应断言，仍重新执行全部最终门槛，不将 v7 数字冒充最终版本。
+
+### 修复与自查闭环
+
+- CI 事件 diff base 无效时回退 first parent，无 parent 则明确 warning/跳过，不再空树扫描；历史行尾空白修复。CI 单独 worktree/target 构建固定 R10 基线，旧 codec smoke 成为必跑项；缺基线为 PARTIAL、退出 4。没有把本机/服务器脚本执行说成 GitHub 云端 CI 已运行。
+- File 在按序捕获 cut、注入 barrier 后继续读取，独立单飞 worker 收齐 ACK 后提交；取消/EOF/读错误等待 worker 收尾，不能 detach 正在执行的 blocking commit。多 chunk 的目录同步合并为发布 ACK/MANIFEST 前一次，文件同步及 CURRENT/PUBLISHED 顺序不变。
+- **性能反例与根因：**只做 source 并行的 v5，零状态 100 ms 仍为 0.8413，25600 输入为 0.8466。发现 HTTP `force_flush` 让每个 Runtime batch 都变成小 POST，同一 6400 试次请求数 112→157；独立测试修前为 18 个单行 POST，修后为 `8+8+2` 三个 POST。现在合并已排队前缀，只让尾部跳过 linger，并按请求时 sent 计数结束强制状态；不改变 required Sink ACK 条件。
+- **自查发现的回滚反例：**中间候选 CPL2 外层令旧 K1 在混合历史中静默回退到 checkpoint 1，重复输出 `6,6`，真实进程记录在 `k1-rollback-before/`。最终改为旧 Store 可完整解析的 CPL1 外层和 CP01-compatible RCP2 语义封套，在兼容检查明确拒绝。`k1-smoke-v8/` 验证 plain CP01 升级可恢复，生成新点后旧 K1 回滚拒绝、CURRENT 不变、只有一条 `6`；不是删旧代绕过问题。
+- 状态依赖前缀允许最后状态之后的计算更新，旧 plain CP01 保持全计算严格匹配；窗口之间的变更拒绝。R10 v1/v2 目录在 fresh/restore 两条 Server 路径都拒绝混写。所有准备窗口缺失拒绝、去掉深拷贝 handoff 的 Clone、共用 FreezeHeader、按实例配额、freeze workspace 与精确 metadata Vec 容量均已处理。
+- 补齐 key/accumulator/COUNT/ET 边界、未知/重复实例、同值/冲突 State ACK、owner 隔离、generation 初始化/写失败、64 实例、legacy reader 与多 chunk 诊断测试。失败用消息区分而非仅错误码/超时，freeze 失败当场检查退款。held 保留原错误，快照诊断展示版本/revision/attempt/generation。
+- 辅助 retention/index 计数 release 下检查加减，错误计入 `state_accounting_errors_total` 并使 stage 失败，不静默 wrap/归零；锁采用 exclusive create、已有路径不带 create 重开，避免替换为 dangling symlink 后在目标处创建文件。旧 CRC/GC 验证不因缓存诊断头而省略。
+
+### 最终匹配验收
+
+| 检查 | package-v8 结果 |
+|---|---|
+| 核心 / 独立无 demo | **540 / 34** 通过；后者 Server 32 + CLI 2，`validation-v8/` |
+| 重复与静态 | **140 × 20 = 2800** 通过；clippy 退出 0，历史 warnings 保留；脚本语法、diff check、CI 四种 base 输入通过 |
+| 生产 smoke | 输出 60/150/240，20 次启停 FD **12→12**，7 项负向、固定点 held、SIGTERM join、实际备份恢复通过 |
+| 强化 K1 smoke | kill 前已有输出，零状态总输出 **[200,101]**，双 Count **[21,57]**，不是 fresh 重放也能通过的 oracle；两个进程恢复观测均 63 ms（单次、含 CLI 轮询，非 p99） |
+| 升级 / 回滚 | R10 双向 codec 拒绝、旧目录 fresh 拒绝且不激活 Job；历史 K1 升级/回滚反例修后通过。CI 的可复现基线为 R10，未提交 K1 历史包的进程测试是服务器附加项，Rust 另覆盖旧 reader 外层语法 |
+| 手动 checkpoint | 零/双状态各 32000 输入 × 3 轮，CHUNK=400，各 **240** 个测量；p50/p99 分别 **7.411/14.596 ms**、**7.466/14.277 ms**，含对齐、Sink、API/磁盘，不是逐行延迟或硬停顿上界 |
+| MQTT 回归 | 10000 输入、2000/s，过滤后 **7500/7500**，无缺失/重复/错误；845 POST、1 TCP，capture 到达 p99 **6429 μs**。仅短回归，不代替 keepalive/长稳认证 |
+
+性能保持原阈值：fresh **≥0.97**、周期 on/off **≥0.90**，RSS 增量 **≤2048 KiB**；所有 warmup/测量输出正确且各匹配负载 hash 相同，无丢失/重复。最终候选预先登记三组 fresh ABBA，全部 36 条测量样本合并（每 variant 18 条），未删掉任意一次试次。
+
+| 负载 / 比较 | 吞吐比 | RSS 增量 KiB | 结论 |
+|---|---:|---:|---|
+| 零状态 fresh 32000，R11/R10，三组 ABBA | **0.9870** | 224 | 通过 |
+| 双 Count fresh 131072，R11/R10，三组 ABBA | **0.9928** | 232 | 通过 |
+| 零状态 6400 / 20 ms Sink / 100 ms，R11 on/off | **0.9994** | 124 | 通过，强制 flush 不再拆碎排队前缀 |
+| 双 Count 6400 / 20 ms Sink / 100 ms，R11 on/off | **0.9475** | 428 | 通过，有约 5.3% 开销，不宣称所有形状零成本 |
+| 零状态 25600 / 20 ms Sink / 100 ms，R11 on/off | **1.0059** | 256 | 通过 |
+
+周期 checkpoint 每个测量试次均实际成功且失败数为 0：零状态小规模 18/轮、双 Count 12/轮、零状态大规模 58/59/59/58。`performance-v8`、`fresh-v8-1/2`、`zero-100-v8` 均退出 0。v6 的首个 fresh 零状态比值 0.96938 曾略低于门槛，保留原失败及预先登记的两组复查；最终 v8 独立登记/执行完整三组，不把 v6/v7 结果混入最终汇总。
+
+来源与复现：driver 为冻结 K1 v8（SHA256 `34330536f714268ed7482d4282041604fb9db5ec8744a54581aeabdba622f2f0`），R10 对照为已核对源码的固定生产包，均未在共享 target 重编译。脚本 `production-k1-performance.sh` 默认跑 fresh+periodic；额外 fresh 用 `K1_PERF_MODES=fresh`，大规模用 `K1_PERF_STATES=0 K1_PERF_MODES=periodic ... 100 25600`。原始计划、每组 summary、日志和 `.exit` 都在证据目录。
+
+- 完整代码/脚本补丁 SHA256：`f2242a1a25004a4ddc5f6ade6b532a76d9d6a3b6c58dbad34bbf0ffc3b426df1`，从干净 `9a92527` 重放，**241 文件**逐一校验。
+- 源码清单 SHA256：`e2501d41e4940f40cd9ea6015c28764ca67d48bc2d6cf0d2464624fc40777bc4`，与生产包 source manifest 相同。
+- Server SHA256：`6feffdd99734885bf3777a5c3fd211bf5186284fbefb0ca594fc2b49d7d2abde`；CLI：`9d7df7ca6ce43988f55096a52fa75f7b7fc700046bdaeefa72b9aaa7c7ea2a19`。
+
+保留开发过程反例：CPL1/CPL2 查找 fixture、API If-Match/allowlist/busy polling、直接 Window 测试需消费 pending emission 才推进 holdback，均在 `core-v1..v4` 与 direct API 日志中；没有改预算或放宽原断言来制造通过。R11 的 MIN/MAX 批内 key 缓存、上一代 CRC/GC IO 缓存和 held catalog 读缓存仍为后续低优先级优化，不冒充本轮已实现。真实 WAN/netem、目标设备、24/72 h 长稳和掉电仍未认证；本批不自动 push/tag/部署。

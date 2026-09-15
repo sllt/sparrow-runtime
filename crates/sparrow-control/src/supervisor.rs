@@ -15,9 +15,11 @@ use sparrow_io::observed;
 use sparrow_io::ReplayableSource;
 use sparrow_model::observation::{HealthState, Latency};
 use sparrow_model::{InflightCounter, RecoveryPolicy, ResourceBudget, Result, SparrowError};
-use sparrow_plan::{PhysicalPlan, PlanLayout};
+use sparrow_plan::{PhysicalPlan, CheckpointPlan};
+#[cfg(test)]
+use sparrow_plan::PlanLayout;
 use sparrow_runtime::{
-    AlignedAcks, AlignedJob, CheckpointSnapshot, CheckpointStore, IngressEvent, JobHandle,
+    AlignedAcks, AlignedJob, PipelineSnapshot, PipelineRestore, CheckpointStore, IngressEvent, JobHandle,
     JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, StreamControl,
 };
 use tokio::sync::{Mutex, Notify};
@@ -523,6 +525,8 @@ impl Supervisor {
                     generations: Vec::new(),
                     bytes: 0,
                     maintenance_error: None,
+                    state_generation_marker: None,
+                    marker_error: None,
                 }
             };
             Ok(PipelineCheckpointInventory {
@@ -906,8 +910,8 @@ impl Supervisor {
                     .transpose()?.is_some_and(|r|r.spec.fixed_snapshot_id().is_some());
                 if fixed {
                     let msg = "held: fixed snapshot replay requires explicit start after failure or process restart";
-                    if a.last_error.as_deref() != Some(msg) {
-                        s.set_last_error(&name, Some(msg))?;
+                    if !a.last_error.as_deref().unwrap_or("").starts_with("held:") {
+                        s.set_last_error(&name, Some(&format!("{msg}; last: {}", a.last_error.as_deref().unwrap_or("unknown"))))?;
                     }
                     return Ok(None);
                 }
@@ -1264,7 +1268,8 @@ impl Supervisor {
         target_policy: &sparrow_connectors::TargetPolicy,
     ) -> Result<RunningJob> {
         crate::validate::validate_aligned_plan(spec, &plan)?;
-        let layout = Arc::new(layout_from_physical(&plan)?);
+        let layout = Arc::new(CheckpointPlan::from_physical(&plan)?);
+        let checkpoint_revision = plan.revision.raw();
         let chk = spec
             .checkpoint_dir
             .clone()
@@ -1290,10 +1295,10 @@ impl Supervisor {
         let max_keys = self.kernel.job_budget().max_state_keys;
         // Fingerprinting, bounded snapshot reads and cursor verification are
         // cold filesystem work; never block a Tokio executor worker on them.
-        let (source, store, restore_freeze, ingested0, restored_from, inventory) = self
+        let (source, store, restore_freeze, ingested0, restored_from, inventory, state_generation, downstream_changed) = self
             .store
             .run_blocking(move || {
-                let mut store = CheckpointStore::open_exclusive(
+                let mut store = CheckpointStore::open_pipeline_exclusive(
                     std::path::Path::new(&chk),
                     max_keys,
                     restore_policy.retention(),
@@ -1312,20 +1317,20 @@ impl Supervisor {
                         "checkpoint history exists without CURRENT; refusing automatic fresh start",
                     ));
                 }
-                let (restore_freeze, ingested0, restored_from) = if restore {
+                let (restore_freeze, ingested0, restored_from, state_generation, downstream_changed) = if restore {
                     let requested = selected
                         .as_ref()
                         .and_then(|s| s.snapshot_id.as_deref())
                         .filter(|s| !s.is_empty() && *s != "aligned");
                     let snap = if let Some(id) = requested {
-                        store.recover_id(id.parse().map_err(|_| {
+                        store.recover_pipeline_id(id.parse().map_err(|_| {
                             SparrowError::new(
                                 sparrow_model::ErrorCode::InvalidArgument,
                                 "snapshot_id must be aligned or an integer",
                             )
                         })?)?
                     } else {
-                        store.recover_required()?
+                        store.recover_pipeline_required()?
                     };
                     snap.check_compatible(&restore_layout)?;
                     source.seek(&snap.source)?;
@@ -1333,13 +1338,21 @@ impl Supervisor {
                         store.pin_recovery_point(snap.checkpoint_id)?;
                     }
                     (
-                        Some(snap.window),
+                        Some(snap.windows),
                         snap.ingested_rows,
                         Some(snap.checkpoint_id),
+                        snap.generation,
+                        snap.plan.semantics != restore_layout.semantics,
                     )
                 } else {
-                    (None, 0, None)
+                    use ring::rand::{SecureRandom,SystemRandom};
+                    let mut generation=[0u8;16];
+                    SystemRandom::new().fill(&mut generation).map_err(|_|SparrowError::new(sparrow_model::ErrorCode::Internal,"state generation randomness unavailable"))?;
+                    (None, 0, None, generation, false)
                 };
+                // Durable before Kernel/source activation. Fresh/reset gets a new
+                // random 128-bit identity; compatible recovery preserves its ID.
+                store.activate_state_generation(state_generation)?;
                 let inventory = store.inventory()?;
                 Ok((
                     source,
@@ -1348,6 +1361,8 @@ impl Supervisor {
                     ingested0,
                     restored_from,
                     inventory,
+                    state_generation,
+                    downstream_changed,
                 ))
             })
             .await?;
@@ -1374,7 +1389,8 @@ impl Supervisor {
                 .with_live_events(rx_ev)
                 .with_live_out(tx_out)
                 .with_aligned(AlignedJob {
-                    restore: restore_freeze,
+                    restore: None,
+                    pipeline: Some(PipelineRestore {plan:layout.clone(),generation:state_generation,restore:restore_freeze}),
                     acks: acks.clone(),
                     outbox: Arc::clone(&outbox),
                 }),
@@ -1386,8 +1402,11 @@ impl Supervisor {
         let store_r = Arc::clone(&store);
         let layout_r = Arc::clone(&layout);
         let checkpoint_timeout = Duration::from_millis(policy.timeout_ms);
+        let checkpoint_owner = job.memory_owner();
         let checkpoint = CheckpointControl::new(policy.clone(), job.attempt.raw(), inventory);
         checkpoint.restored_from(restored_from);
+        checkpoint.state_generation(state_generation);
+        checkpoint.downstream_changed(downstream_changed);
         let scheduler = policy.interval_ms.map(|_| {
             self.kernel.handle().spawn(periodic_checkpoints(
                 cmd_tx.clone(),
@@ -1400,6 +1419,12 @@ impl Supervisor {
             diag_src.observation.health(true,HealthState::Ready,"file_open",None);
             let mut terminal_sent = false;
             let mut next_file_poll = None;
+            // Independent polling is important: publishing a file batch may
+            // itself wait for mailbox capacity. A future only polled at the
+            // top-level select could starve while that branch is awaiting.
+            let checkpoint_cancel = child.child_token();
+            let mut workers = tokio::task::JoinSet::new();
+            let source_result: Result<()> = async {
             loop {
                 if child.is_cancelled() {
                     return Ok(());
@@ -1407,6 +1432,9 @@ impl Supervisor {
                 tokio::select! {
                     biased;
                     _ = child.cancelled() => return Ok(()),
+                    Some(joined) = workers.join_next(), if !workers.is_empty() => {
+                        joined.map_err(|e| SparrowError::new(sparrow_model::ErrorCode::Internal, format!("checkpoint task: {e}")))?;
+                    }
                     cmd = cmd_rx.recv() => {
                         let Some(AlignedCmd::Checkpoint { reply, mut admission }) = cmd else {
                             return Ok(());
@@ -1431,21 +1459,21 @@ impl Supervisor {
                             ingested_r.load(std::sync::atomic::Ordering::SeqCst);
                         // The timeout includes barrier injection. Dropping this future
                         // drops its request inbox, so late encoded ACKs release leases.
-                        let aligned = async {
+                        let inject = async {
                             let request = acks.begin_with_deadline(id, admission.deadline)?;
                             tx_ev.send(IngressEvent::Control(StreamControl::CheckpointBarrier {
                                 checkpoint_id: id,
                             })).await.map_err(|_| SparrowError::new(
                                 sparrow_model::ErrorCode::Cancelled, "aligned source ended before barrier"))?;
-                            request.wait(checkpoint_timeout).await
+                            Ok::<_, SparrowError>(request)
                         };
                         let result = tokio::select! {
                             _ = child.cancelled() => return Ok(()),
-                            result = tokio::time::timeout_at(admission.deadline, aligned) =>
+                            result = tokio::time::timeout_at(admission.deadline, inject) =>
                                 result.unwrap_or_else(|_| Err(SparrowError::new(
                                     sparrow_model::ErrorCode::ResourceExhausted, "aligned checkpoint timed out"))),
                         };
-                        let acks = match result {
+                        let request = match result {
                             Ok(a) => a,
                             Err(e) => {
                                 // Abandon this id so late freeze/flush cannot
@@ -1456,15 +1484,36 @@ impl Supervisor {
                                 continue;
                             }
                         };
-                        let freeze = acks.freeze.expect("aligned freeze");
                         let layout = Arc::clone(&layout_r);
                         let store = Arc::clone(&store_r);
+                        let owner = checkpoint_owner.clone();
+                        let metrics = metrics.clone();
+                        let checkpoint_cancel = checkpoint_cancel.clone();
+                        // Cut and barrier publication above remain inline and
+                        // ordered. Later rows may now flow, but publication still
+                        // requires every frozen participant and the real Sink ACK.
+                        workers.spawn(async move {
+                        let aligned = tokio::select! {
+                            _ = checkpoint_cancel.cancelled() => return,
+                            result = tokio::time::timeout_at(admission.deadline, request.wait_participants(checkpoint_timeout)) =>
+                                result.unwrap_or_else(|_| Err(SparrowError::new(sparrow_model::ErrorCode::ResourceExhausted, "aligned checkpoint timed out"))),
+                        };
+                        let acks = match aligned {
+                            Ok(acks) => acks,
+                            Err(error) => {
+                                metrics.record_checkpoint_abort();
+                                admission.finish(&Err(error.clone()), None);
+                                let _ = reply.send(Err(error));
+                                return;
+                            }
+                        };
+                        if checkpoint_cancel.is_cancelled() { return; }
                         admission.phase("committing");
                         let committed = tokio::task::spawn_blocking(move || {
                             let started = std::time::Instant::now();
                             let mut store = store.lock().expect("store");
-                            let payload = CheckpointSnapshot::encode_frozen(
-                                id, &cut_source, cut_ingested, &layout, None, freeze)?;
+                            let payload = PipelineSnapshot::encode_frozen(
+                                id, &cut_source, cut_ingested, checkpoint_revision, &layout, acks, &owner, max_keys)?;
                             let payload_len = payload.bytes().len() as u64;
                             let id = store.commit_prepared(&payload)?;
                             let storage = store.inventory().ok();
@@ -1500,6 +1549,7 @@ impl Supervisor {
                                 let _ = reply.send(Err(e));
                             }
                         }
+                        });
                     }
                     _ = crate::file_source::wait_for_file_poll(next_file_poll) => {
                         next_file_poll = None;
@@ -1532,6 +1582,15 @@ impl Supervisor {
                     }
                 }
             }
+            }.await;
+            if source_result.is_err() || child.is_cancelled() { checkpoint_cancel.cancel(); }
+            // Never detach a blocking commit on EOF, read failure or stop. Its
+            // admission permit, frozen leases and exclusive store live through
+            // durable completion, including after an HTTP waiter times out.
+            while let Some(joined) = workers.join_next().await {
+                joined.map_err(|e| SparrowError::new(sparrow_model::ErrorCode::Internal, format!("checkpoint task: {e}")))?;
+            }
+            source_result
         });
         let sink_result = self.spawn_sink(
             spec,
@@ -1864,6 +1923,7 @@ pub fn host_kernel_with_max_jobs(max_jobs: usize) -> Result<Kernel> {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn layout_from_physical(plan: &PhysicalPlan) -> Result<PlanLayout> {
     PlanLayout::from_physical(plan)
 }

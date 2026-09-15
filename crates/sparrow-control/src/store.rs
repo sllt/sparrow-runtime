@@ -668,7 +668,7 @@ impl Store {
                     // Invalid revisions fail per pipeline during convergence;
                     // they must not prevent healthy siblings from booting.
                     if load_pipeline_revision(c,&name,revision).is_ok_and(|r| r.spec.fixed_snapshot_id().is_some()) {
-                        c.execute("UPDATE actual_state SET restart_blocked=1,last_error='held: fixed snapshot replay requires explicit start after process restart' WHERE name=?1",[&name]).map_err(db)?;
+                        c.execute("UPDATE actual_state SET restart_blocked=1,last_error=CASE WHEN last_error LIKE 'held:%' THEN last_error ELSE 'held: fixed snapshot replay requires explicit start after process restart; last: ' || COALESCE(last_error,'unknown') END WHERE name=?1",[&name]).map_err(db)?;
                     }
                 }
             }
@@ -1475,7 +1475,8 @@ mod tests {
         s.put_pipeline("cached", &spec, Some("rev-1")).unwrap();
         let (row, effective) = s.effective_pipeline_status("cached").unwrap();
         assert_eq!(row.latest_revision, 2);
-        assert_eq!(effective["aligned_eligible"], false);
+        assert_eq!(effective["aligned_eligible"], true);
+        assert_eq!(effective["aligned_eligibility_reason"], "zero_state_file_cut");
         assert_eq!(r9_misses(&s), 4);
         assert_eq!(s.inner.status_effective.lock().unwrap().entries.len(), 1);
     }

@@ -1,12 +1,12 @@
 # Sparrow Post-V1 完整开发 TODO
 
-更新日期：2026-09-14。
+更新日期：2026-09-15。
 
 设计依据：根目录 `Sparrow_Post_V1_Roadmap_Arrow_JIT_Final.md`，包含 2026-09-12 实施补充；同时追踪原始蓝图、计划评审与历史 ADR，文档范围、取舍及章节对应见 [§18 覆盖矩阵](#design-coverage)。运行合同与已验证证据以 [RUNTIME.md](RUNTIME.md) 为准，并核对其对应源码/构建。本文件负责把设计转成执行任务，不替代设计文档，也不把设计接口当成已存在的 API。
 
-**当前批次：在 `4f70407` 上完成生产化九个限定工作包、自审五项修复后，已补修 R10 的计费/快照/恢复/停机问题并完成有限范围复验，见 [R10 记录](PRODUCTION.md#r10-validation)。最新默认核心 513、独立无 demo Server 28 + CLI 2 项通过，关键 107 × 20 轮通过；1024-key MIN/MAX/SUM ABBA、真实进程恢复与 MQTT 120 s 验证通过。v7/自审旧数字独立保留，不充当本轮证据。全仓格式化后置，不混入功能修复。尚未 commit/push/tag/部署；版本仍为 0.1.0。下一步集中 review/固定候选，并执行阶段 3 的目标设备、真实网络与长稳门禁；不能据此勾完 OPS-04/QA-08 或宣称生产认证。**
+**当前批次：本次交付收录通过独立自查和匹配源码复验的 K1/R11，基线 R10 为 `9a92527`。核心 540、独立无 demo 34、关键 140 × 20 轮通过；原零状态/20 ms 慢 Sink/100 ms 周期门槛已通过，32k/131072 fresh 三组 ABBA 合并也通过原阈值。修前失败样本、HTTP flush 拆批根因，以及自查发现并修复的旧 K1 回滚风险均保留，详见 [R11 记录](PRODUCTION.md#r11-validation)。版本仍为 0.1.0，未 push/tag/部署；目标设备、真实网络、24/72 h 和掉电门槛仍保留。用户已确认下一大阶段按 NATS JetStream 路线推进 K2，K1 提交不混入 K2 半成品。**
 
-**最新优先级决定（2026-09-14）：核心优先，替代此前“先工作台”及“先 IoT 模板”的推荐。下一整批为通用 checkpoint / 状态参与者协议；随后优先可靠输入与输出、真正 DAG、IoT 状态算子。运维平台、Graph Designer 与体验扩展后置，Arrow/JIT 仍是有证据门槛的可选优化。基础核心已能运行，不等于核心全部完成或任意业务都可生产使用。完整批次、前置和验收见 [§3.4](#core-first-batches)，实际执行与版本顺序见 [§17](#release-sequence)。本次只更新计划，未开始实现这些新功能。**
+**最新优先级决定（2026-09-14）：核心优先。K1 为当前整批；之后是 K2 可靠输入与输出、K3 真正 DAG、K4 IoT 状态算子。运维平台、Graph Designer 与体验扩展后置，Arrow/JIT 仍有独立证据门槛。K1 只开放受测线性组合，不等于核心全部完成或任意业务都可生产使用。完整范围和依赖见 [§3.4](#core-first-batches)，版本顺序见 [§17](#release-sequence)。**
 
 ## 导航
 
@@ -123,7 +123,7 @@
 | 核心边界 | 当前可以做什么 | 未完成部分及实际影响 | 优先批次 |
 |---|---|---|---|
 | 执行与算子 | 现有线性 SQL/Graph、prepared Row、已支持窗口/聚合和有界队列 | 分支、多输出、多源合流还不是完整运行能力 | K3 |
-| 状态恢复 | 已验证范围内的 File + 单 Count/ET tumble/ET hop aligned | 无窗口清洗/转发的零状态 checkpoint、多状态一致恢复仍待实现；“计划能运行”不等于“计划能恢复” | K1 |
+| 状态恢复 | K1 已实现 File 零状态、单 Count/ET tumble/ET hop、双 Count 串联 | 其他多状态/混合时间/DAG 仍拒绝；旧 snapshot 不自动迁移；恢复能力不等于可靠输入输出 | K1 验收 / K2 / K3 |
 | 实时来源 | MQTT 接入、keepalive、背压与有限重试 | best-effort 不承诺断连/过载/崩溃无损；缺 checkpoint-aware ACK、来源身份、重投递及保留范围协议 | K2a |
 | 输出交付 | HTTP 响应体消费、连接复用、合批、并发和真实 flush | 没有持久 HTTP outbox；未知响应可能导致重复，不能保证崩溃后继续交付所有未确认输出 | K2b |
 | IoT 业务状态 | 可复用现有表达式、窗口和参考表 | 变化检测、Deadband、迟滞及其状态/时间/reset 合同是待做的核心业务能力，不是 UI 周边 | K4 |
@@ -257,14 +257,14 @@ B/C/E 编号只用于追踪旧计划；当前优先级以 K0～K5 为准：**当
 <a id="core-first-batches"></a>
 ### 3.4 核心优先：整批开发、依赖与验收
 
-K0～K5 是执行批次别名，不增加或替换原任务 ID，不预留真实版本号。**每次交付一个完整、可运行且有失败反例的核心增量，不以新增 trait、codec 或几个 helper 作为整批完成。** 当前功能状态以 §2.4 为准；下表全部新增核心能力仍未完成。
+K0～K5 是执行批次别名，不增加或替换原任务 ID，不预留真实版本号。**每次交付一个完整、可运行且有失败反例的核心增量，不以新增 trait、codec 或几个 helper 作为整批完成。** K1 功能和有限范围复验完成，保留明确的高频压力点性能限制；K2～K5 尚未实现。
 
 #### 3.4.1 大模块顺序与交付效果
 
 | 优先批次 | 模块 / 原任务 | 必须交付的闭环 | 做完后新增的实际能力 |
 |---|---|---|---|
 | K0：当前收尾，持续最高优先 | 当前 review、PUB/OPS-04/QA 适用范围 | 修复 review 阻断问题；冻结可追溯候选；按平台/负载做网络、设备、长稳与恢复验收 | 为现有受限支持范围取得发行证据；不宣称新核心已实现 |
-| **K1：下一整批** | **通用 checkpoint / 状态参与者**；STATE-01～05、REL-14 的 File 子集、所用 MEM/SEM/CFG/QA | 复用现有 Coordinator/Supervisor，贯通有限参与者、File 零状态、既有单状态和选定线性多状态的保存/恢复；CLI/API、兼容与故障验证一起交付 | 恢复不再被硬编码成“必须恰好一个 Window”；先开放经过验收的线性形状，不等于任意图可恢复 |
+| **K1：已实现，待 review** | **通用 checkpoint / 状态参与者**；STATE-01～05、REL-14 的 File 子集、所用 MEM/SEM/CFG/QA | 协议、零/单/双 Count 保存恢复、generation、API/CLI/codec 拒绝矩阵与匹配服务器证据已闭合；100 ms 压力点不按性能门槛放行 | 恢复不再硬编码为“必须恰好一个 Window”；不等于任意图可恢复 |
 | K2a：可靠入口 | REL-00～06/08～14、AGE-01 来源身份子集 | 只选一条来源路线；拉取/预取/未确认预算、checkpoint-aware ACK、运行中/重启后去重、保留范围、独占/旧 attempt 隔离、毒消息与有限 retry/DLQ | 对选定来源解释哪些数据可以重放、何时确认、历史何时失效；不是只增加一个 broker 连接器 |
 | K2b：可靠输出，与 K2a 对齐 | REL-07/08、STATE-04、HTTP-06/07 | 稳定输出 ID、required 确认层级、未知 HTTP 结果、重试/重放与重复语义；按下游断网自治需求决定是否交付独立持久 outbox | 明确已接纳/已持久化/远端已确认的差异；选用 outbox 后才可承诺其持久接纳范围内的重启续送 |
 | K3：真实 DAG 内核 | DAG-01～07、STATE/AGE/MEM 适用部分 | 单源 Branch/Route/多 Sink → 多源 UnionAll/时间进度 → 多输入 aligned；分别通过预算、慢/失败支路、取消与恢复矩阵 | 真正执行分支和合流，而不只是画图；按已通过的阶段开放 capability，DAG-08 页面不在本批 |
@@ -273,7 +273,7 @@ K0～K5 是执行批次别名，不增加或替换原任务 ID，不预留真实
 
 K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和故障切点必须一起设计；必要时独立发布已闭合的子集，但不能提前宣传端到端可靠保证。K3a/b 不依赖选用 JetStream，K4 的基本值过滤也不依赖完整 DAG；这是默认优先级，不是强制等待所有前项清零的瀑布。
 
-#### 3.4.2 下一整批 K1：不是只放开准入判断
+#### 3.4.2 当前整批 K1：不是只放开准入判断
 
 | 内部工作包 | 实现与验证范围 | 验收出口 |
 |---|---|---|
@@ -319,8 +319,8 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
 
 ### 4.1 BASE 补正状态
 
-- [x] **BASE-01 — 当前单窗口 aligned 准入修复。** Validate/Explain/Start/Kernel 共用实际计划检查；合法单窗口接受，零/多窗口、PT、Dedup、Lookup 拒绝。维护正负回归；新状态节点加入时必须重审准入。
-- [x] **BASE-02 — 完整规范语义与恢复兼容检查。** `SS02` 覆盖窗口策略、输入 schema、全部上游计算与完整字面量；内容比较、64 KiB/深度 64 上限、旧格式拒绝复用均已有验证。函数语义变化须显式版本化。
+- [x] **BASE-01 — 当前支持矩阵的 aligned 准入。** K1 Server 与 participant-mode Kernel 共用 `CheckpointPlan`：File 零状态、单 Count/ET、双 Count 通过；PT、Dedup、Lookup、多源、其他多状态拒绝。旧 legacy embedding gate 仍限单窗口，新实例不能绕过 prepare。
+- [x] **BASE-02 — 完整规范语义与恢复兼容检查。** 旧单窗口保留 `SS02`；K1 `CP01` 覆盖完整线性计算（含下游）、字段/字面量/窗口语义，`CPL1` 绑定实例身份与 codec。64 KiB/深度 64 上限、内容比较和旧格式明确拒绝保留；函数语义变化须显式版本化。
 - [ ] **BASE-03 — 受控数据所有权与分配准入整体闭合（部分完成）。** 依赖 MEM-01～04。完成标准是声明范围内不存在提前退款或分配后补账，不是仅引入一个 wrapper。
   - [x] detach 先获取目标信用，覆盖保守复制峰值。
   - [x] `OwnedRows` 避免 shared container 的隐式复制与数据/lease 分离。
@@ -503,11 +503,11 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
 
 ### 8.1 先演进共享状态协议，不给纯转发塞假窗口
 
-- [ ] **STATE-01 — 有限参与者集合。** prepare 收集稳定 `OperatorId + StateSlotId + ShardId` 及 required 输入/Sink；显式上限和单 Job 归属。ACK 带 checkpoint/participant/attempt 身份，未知或旧 ACK 不补齐切点，重复 ACK 幂等，失败保留根因。
-- [ ] **STATE-02 — 零状态 checkpoint。** 用 Replayable File 的无窗口清洗/转发贯通 source cut、required 输出完成、manifest 和恢复；禁止用虚拟窗口规避协议改造。对应 REL-14 的首个可发布子集。
-- [ ] **STATE-03 — 多状态 snapshot/restore。** 每个声明参与者有 codec、依赖、timer 和兼容描述；freeze 不互相覆盖，缺失节点不以空状态补齐。新增 codec 有显式版本读取/拒绝路径，旧数据不自动拼成新证明。
-- [ ] **STATE-04 — generation/实例身份。** 成功兼容恢复延续身份；fresh/reset 在输出前持久化新 generation，或采用有唯一性证明的可重建机制。区分配置 revision、执行 attempt、state generation 与业务 episode；后端切换不改变业务 ID。
-- [ ] **STATE-05 — 协议故障与控制进展。** 覆盖并发 checkpoint、超时/取消、重复/延迟/未知 ACK、部分 freeze 失败、Sink 失败、磁盘满、恢复缺参与者；数据或 pending ACK 满时控制仍可前进或有限失败。
+- [x] **STATE-01 — 有限参与者集合（K1 支持矩阵）。** prepare 收集稳定 operator/slot/shard 及 Source/required Sink；最多 64 个实例、2 个 state、slot=1/shard=0，冻结负载属于同一 Job owner。ACK 绑定 attempt/checkpoint/participant，重复幂等、冲突/未知拒绝，旧 ACK 不补齐切点。
+- [x] **STATE-02 — 零状态 checkpoint（File 子集）。** 无窗口清洗/转发实际贯通 source cut、required Sink、manifest 和进程恢复；覆盖空 append-only 文件与全过滤，不塞虚拟窗口。REL-14 的其他实时入口仍未完成。
+- [x] **STATE-03 — 多状态 snapshot/restore（K1 支持矩阵）。** 单 Count/ET 与双 Count 共用 v3/CPL1，RCP2 将完整诊断语义与状态依赖前缀分离；plain CP01 保留原完整计算严格规则。新外层保持旧 K1 可读后明确兼容拒绝，避免未知格式触发回退；R10 codec 不迁移，Server 拒绝在旧格式目录混写。两处各 1024 keys 共享预算；其他组合、节点及 DAG 需另扩 codec/依赖/时间矩阵。
+- [x] **STATE-04 — generation/实例身份（K1 File/Row 子集）。** fresh/reset 用安全随机源生成并在输入前持久化 128-bit SG01；恢复保留 generation，revision/attempt 单列。写入失败不激活 Kernel；真实重启验证身份延续。业务输出 ID/episode 归 REL-07/IoT，其他后端切换仍须随功能验证，不能借此宣称已实现。
+- [x] **STATE-05 — 协议故障与控制进展（K1 支持矩阵）。** R11 补齐恢复拒绝分支、冲突/幂等 State ACK、超时与配额失败区分、即时退款、升级/回滚及进程输出反重放 oracle；Source/barrier 后并行推进且退出等待真实提交结束。修复 HTTP checkpoint 强制 flush 拆批后，原 100 ms/20 ms Sink 门槛在 6400 与 25600 输入均通过，保留全部旧失败样本；不是用 500 ms 替代。140 × 20 重复通过；真实 kill -9 仍不是断电认证。
 
 **STATE 不是完整 DAG 恢复**：先支持线性零/多状态及已声明输出，多输入对齐在 DAG-07 验收后开放。
 
@@ -869,7 +869,7 @@ commit / build / raw evidence：
 下一动作 / 阻塞条件：
 ```
 
-**当前执行队列（2026-09-14 核心优先调整）：** 基线为 `4f70407` 加 R10 受测补丁，最新证据为 `r10-artifacts-20260914/`；旧 v7/自审记录独立保留。K0 的本轮缺陷已修复并完成有限范围回归，继续用户 review/候选冻结/阶段 3 发行验收；下一功能整批为 **K1（STATE-01～05 的 File 零/单/选定线性多状态闭环）**，随后 K2 可靠输入/输出 → K3 DAG → K4 IoT；K5 平台后置。K2 的部署与独立 outbox 决策不阻塞 K1。OBS-03 netem、AGE-01 完整业务 provenance、OPS-04 长时验收与 QA-08 保持未关闭；新增核心尚未实现，未 commit/push/tag/发版。
+**当前执行队列（2026-09-15）：** K1/R11 通过独立自查、恢复/回滚/资源反例和原高频性能门槛；最终证据为 `r11-artifacts-20260915/package-v8` 及匹配验证，详见 [R11 记录](PRODUCTION.md#r11-validation)。下一整批为 **K2 可靠输入/输出**，用户已批准 NATS JetStream 路线；先做 SDK/服务配置 conformance，随后完成来源身份、ACK/去重/独占、输出身份/确认、poison 与恢复故障闭环。独立磁盘 outbox 仍按部署需求选择，不因选择 broker 就声称本地断网续送。随后 K3 DAG → K4 IoT，K5 平台后置；OBS-03、完整 AGE-01、OPS-04 和 QA-08 仍未关闭，不自动 push/tag/发行。
 
 ### 16.4 后续维护步骤
 

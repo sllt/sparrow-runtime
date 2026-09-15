@@ -5,7 +5,7 @@
 > changed since this run; use [RUNTIME.md](RUNTIME.md) and
 > [PRODUCTION.md](PRODUCTION.md) for current contracts and matching evidence.
 
-Date: 2026-09-09  
+Date: 2026-09-09
 Host: `cargo test --workspace` + `scripts/v1-demo.sh` + `scripts/review-fix-demo.sh`
 
 V1 is a **long-running Edge Runtime** with **explicit, capability-conditioned

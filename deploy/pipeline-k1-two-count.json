@@ -1,0 +1,19 @@
+{
+  "stream": "sensors",
+  "graph": {
+    "version": 1, "pipeline_id": 1, "revision_id": 1,
+    "nodes": [
+      {"id": 1, "kind": "memory_source", "table": "sensors", "out": [10]},
+      {"id": 10, "kind": "window_agg", "keys": ["device_id"], "window": {"kind": "count", "size": 3},
+       "aggs": [{"fn": "sum", "expr": {"k": "col", "name": "v"}, "alias": "s"}], "out": [11]},
+      {"id": 11, "kind": "window_agg", "keys": ["device_id"], "window": {"kind": "count", "size": 2},
+       "aggs": [{"fn": "sum", "expr": {"k": "col", "name": "s"}, "alias": "total"}], "out": [20]},
+      {"id": 20, "kind": "capture_sink", "name": "out"}
+    ]
+  },
+  "source": {"kind": "file", "path": "/var/lib/sparrow/data/sensors.jsonl", "file_contract": "append_only"},
+  "sink": {"kind": "log"},
+  "recovery": "aligned",
+  "checkpoint_dir": "/var/lib/sparrow/checkpoints/two-count",
+  "checkpoint": {"interval_ms": 10000, "timeout_ms": 5000, "retain_generations": 3, "max_store_bytes": 33554432, "resume_latest": true}
+}

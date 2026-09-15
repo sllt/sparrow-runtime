@@ -170,6 +170,7 @@ impl<V> MemoryState<V> {
     /// Variable-size production update: admit the complete replacement before
     /// cloning/evaluating, retain old state on every failure. The caller's
     /// bound includes candidate containers and detached payloads.
+    #[cfg(test)]
     pub fn update_bounded<F>(&mut self, key: &StateKey, value_bound: usize, update: F) -> Result<()>
     where
         V: Clone,
@@ -200,7 +201,7 @@ impl<V> MemoryState<V> {
         entry
             .lease
             .shrink_to(key_bytes.saturating_add(actual).max(1))?;
-        self.retained_bytes = self.retained_bytes - old_bytes + entry.lease.bytes();
+        self.retained_bytes = self.owner.replace_accounted_bytes(self.retained_bytes, old_bytes, entry.lease.bytes());
         Ok(())
     }
 
@@ -217,7 +218,7 @@ impl<V> MemoryState<V> {
         };
         let before = entry.lease.bytes();
         let result = update(&mut entry.value, &mut entry.lease, entry.key_bytes);
-        self.retained_bytes = self.retained_bytes - before + entry.lease.bytes();
+        self.retained_bytes = self.owner.replace_accounted_bytes(self.retained_bytes, before, entry.lease.bytes());
         result
     }
 
@@ -258,13 +259,13 @@ impl<V> MemoryState<V> {
             },
         );
         self.retained_bytes =
-            self.retained_bytes.saturating_add(bytes) - old.as_ref().map_or(0, |e| e.lease.bytes());
+            self.owner.replace_accounted_bytes(self.retained_bytes, old.as_ref().map_or(0, |e| e.lease.bytes()), bytes);
         Ok(())
     }
 
     pub fn remove(&mut self, key: &StateKey) -> Option<V> {
         self.entries.remove(key).map(|e| {
-            self.retained_bytes -= e.lease.bytes();
+            self.retained_bytes = self.owner.replace_accounted_bytes(self.retained_bytes, e.lease.bytes(), 0);
             e.value
         })
     }
@@ -282,7 +283,7 @@ impl<V> MemoryState<V> {
         }
         let lease = self.owner.acquire(CreditKind::Retention, bytes)?;
         if let Some(entry) = self.entries.get_mut(key) {
-            self.retained_bytes = self.retained_bytes - entry.lease.bytes() + lease.bytes();
+            self.retained_bytes = self.owner.replace_accounted_bytes(self.retained_bytes, entry.lease.bytes(), lease.bytes());
             entry.lease = lease;
         }
         Ok(())
@@ -292,7 +293,7 @@ impl<V> MemoryState<V> {
         self.entries.retain(|k, e| {
             let keep = pred(k, &e.value);
             if !keep {
-                self.retained_bytes -= e.lease.bytes();
+                self.retained_bytes = self.owner.replace_accounted_bytes(self.retained_bytes, e.lease.bytes(), 0);
             }
             keep
         });

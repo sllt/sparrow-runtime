@@ -19,14 +19,21 @@ impl FileLock {
             }
         }
         let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true);
+        options.create_new(true).read(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options
-            .open(path)
+        // Exclusive creation never follows a dangling symlink. Existing names
+        // are opened WITHOUT create, so a check/open race cannot create a file
+        // at a substituted target. fstat/lstat below still validates identity.
+        let file = match options.open(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                options.create_new(false).create(false).open(path)
+            }
+            result => result,
+        }
             .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("open lock: {e}")))?;
         let opened = file
             .metadata()

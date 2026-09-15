@@ -1,5 +1,17 @@
 # Runtime ownership (A3 / A4)
 
+> R11：Source 在切点/barrier 按序发布后继续读取，独立单飞 worker 收集 ACK 并提交，退出等待真实阻塞工作收尾。恢复使用 RCP2 的全部状态上游前缀，完整计算保留作诊断；plain CP01 仍按旧严格合同。CPL1 外层可被旧 K1 完整读取后明确拒绝，避免未知新格式导致偷偷回退。详见 [当前恢复合同](PRODUCTION.md#周期-checkpoint-与恢复)。下方 K1 v8 数字是历史基线，不是 R11 复测结果。
+
+R11 HTTP flush 修复：强制 flush 只跳过已排队前缀最后不足一批的 linger，不能把每个 Runtime batch 都拆成 POST。强制状态按请求时的 sent 计数退出，避免新 epoch 到达而错过 `pending()==0` 时把强制模式永久带入后续流量。该计数仅控制合批策略，**不是** checkpoint 的前缀 ACK；Sink barrier 仍等待全部真实 receipts 完成。`Receiver::is_empty()` 仅作合批调度提示，不作为提交证据。
+
+R11 最终匹配复验（2026-09-15 / package-v8）：540 核心、34 独立无 demo、140×20 重复与进程恢复/旧版本回滚反例通过。零状态 100 ms/20 ms Sink 在 6400/25600 输入的 on/off 比为 0.9994/1.0059；双 Count 为 0.9475，均过原 ≥0.90 门槛。fresh 三组 ABBA 过原 ≥0.97 门槛；详见 [完整 R11 证据](PRODUCTION.md#r11-validation)。不是 WAN、设备或 24/72 h 认证。
+
+Window/Dedup 输出 lease 按 `resident_bytes() + 64` 而非逻辑编码字节计费，mailbox permit 使用真实 lease bytes。相同字节容量容纳的输出行可能更少、背压更早，不能沿用旧 `tracked_bytes` 的行数估计。输出先构建本次全部 chunks，再释放 scratch 后发送；瞬时峰值包括 scratch 与这些输出 leases，不是只有一个 chunk。辅助 retention/index 计数使用 checked subtraction/addition；不变量错误记录 `state_accounting_errors_total` 并使所属 stage 失败，不静默 wrap 或清零，owner leases 正常随失败释放。
+
+> K1 已将 Server aligned 路径扩展为 File 零状态、单 Count/ET 窗口和双 Count 串联；当前协议、codec 迁移与限制见 [PRODUCTION.md](PRODUCTION.md#周期-checkpoint-与恢复)。下文 R9/R10 历史记录中的 single-window 限制仅描述当时受测版本，不覆盖 K1。旧嵌入 `PlanLayout`/`CheckpointSnapshot` helper 仍限单窗口。
+
+> K1 匹配复验：核心 525、独立无 demo 32、关键 120×20 通过；真实进程/旧 codec 双向拒绝、双实例各 1024 keys 通过。零状态 + 20 ms 慢 Sink + 100 ms 周期未过性能门禁，500 ms 频率对照通过；不是全配置/长稳认证。完整数据见 [K1 记录](PRODUCTION.md#k1-validation)。
+
 `compact_kernel()` builds a 2-worker Tokio runtime for tests and in-process
 demos. It is **not** the production I/O pool.
 
@@ -29,6 +41,8 @@ admission checks both per-job and process queue capacity and space for every
 admitted job's quotas. A plan exceeding its own queue quota is a configuration
 failure (not retryable capacity contention).
 `Kernel::new_with_job_budget` lets embedders set both budgets explicitly.
+
+K1 的状态参与者共享上述 Job owner。key 数上限沿用每个 operator 的定义；最多两个 state 限制聚合恢复工作量，snapshot 总字节/暂存/恢复 credit 不按参与者倍增。所有实例在输入激活前一次性校验、逐个重建并释放 decoded handoff，不把第一份状态复制给每个 stage。
 
 The root budget is **process-wide**. Each job's child `MemoryOwner` also
 bills the root. Admission tracks live mailbox reservations and per-job
@@ -697,9 +711,9 @@ Frozen benchmark driver SHA-256:
 - Default delivery remains `live_best_effort + restart_fresh`; no
   exactly-once or MQTT replay guarantee is added.
 
-### Aligned admission and semantic compatibility (BASE-01/02)
+### Legacy R9/R10 aligned admission and semantic compatibility (BASE-01/02)
 
-Aligned Server jobs require a replayable file source and **exactly one** Count
+R9/R10 aligned Server jobs required a replayable file source and **exactly one** Count
 or event-time window. Zero/multiple windows, processing-time windows, Dedup and
 Lookup remain unsupported, not silently stripped. Validate, explain, start and
 embedded Kernel admission share the plan gate; rejection precedes job quota
@@ -942,7 +956,7 @@ for the changed candidate.
   Retention protects CURRENT and any numeric RestoreSpec dependency; a pin
   makes the effective minimum two generations, never an unbounded history.
 - Periodic restore supports the existing File + single Count/ET tumble/ET hop
-  aligned shapes only. `resume_latest=false` remains the default. Missing,
+  aligned shapes only in this pre-K1 record. `resume_latest=false` remains the default. Missing,
   incompatible or unverified state never silently becomes a fresh start.
 - File cuts refresh sampled identity over consumed bytes, including files that
   were empty at open. Unix active descriptor/path replacement is refused.

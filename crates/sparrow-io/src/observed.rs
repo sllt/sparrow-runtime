@@ -448,6 +448,9 @@ fn popped(s: &mut State, discard: bool) -> OriginSpan {
     v.origin
 }
 impl<T> Receiver<T> {
+    /// Scheduling hint only; never proof that delivered work was acknowledged.
+    pub fn is_empty(&self) -> bool { self.rx.is_empty() }
+
     pub fn observer(&self) -> Option<Arc<QueueObserver>> {
         self.observer.clone()
     }

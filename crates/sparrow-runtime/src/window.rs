@@ -81,6 +81,53 @@ pub struct WindowOperator {
 }
 
 impl WindowOperator {
+    pub(crate) fn operator_id(&self) -> OperatorId { self.operator }
+
+    /// K1 validates every restored instance before input activation. Legacy raw
+    /// restore retains its separate embedding contract.
+    pub(crate) fn validate_participant_restore(&self, freeze:&WindowFreeze) -> Result<()> {
+        let invalid = || SparrowError::new(ErrorCode::UnsupportedRestore,"restored window state does not match participant schema/accumulators/bounds");
+        let count = matches!(self.spec.kind,WindowKind::Count {..});
+        if freeze.operator!=self.operator || freeze.slot!=StateSlotId::new(SLOT) || freeze.kind!=u8::from(count) { return Err(invalid()); }
+        let expected = empty_accs(&self.spec,&self.input)?;
+        for entry in &freeze.entries {
+            if entry.key.len()!=self.group_idx.len()+usize::from(self.spec.kind.uses_event_time()) || entry.accs.len()!=expected.len() { return Err(invalid()); }
+            for (value,idx) in entry.key.iter().zip(&self.group_idx) {
+                let field=&self.input.fields[*idx];
+                if !value.matches_type(&field.data_type) && !(value.is_null() && field.nullable) { return Err(invalid()); }
+            }
+            if let WindowKind::Count {size} = self.spec.kind {
+                if entry.count==0 || entry.count>=size { return Err(invalid()); }
+            } else {
+                let (size,slide)=match self.spec.kind {
+                    WindowKind::TumblingEventTime {size_micros}=>(size_micros,size_micros),
+                    WindowKind::HoppingEventTime {size_micros,slide_micros}=>(size_micros,slide_micros),
+                    _=>return Err(invalid()),
+                };
+                if entry.window_start.checked_add(size)!=Some(entry.window_end) || entry.window_start.rem_euclid(slide)!=0
+                    || entry.key.last()!=Some(&Scalar::Int64(entry.window_start)) { return Err(invalid()); }
+            }
+            for ((actual,prototype),call) in entry.accs.iter().zip(&expected).zip(&self.spec.aggs) {
+                if std::mem::discriminant(actual)!=std::mem::discriminant(prototype) { return Err(invalid()); }
+                let n=match actual {
+                    Accumulator::Count {rows,non_null,star}=>{
+                        if *star!=call.count_star || non_null>rows || (count && *rows!=entry.count) { return Err(invalid()); }
+                        *rows
+                    }
+                    Accumulator::SumI64 {n,..}|Accumulator::SumU64 {n,..}|Accumulator::SumF64 {n,..}|Accumulator::Avg {n,..}=>*n,
+                    Accumulator::Min {v}|Accumulator::Max {v}=>{
+                        if let Some(v)=v {
+                            if v.is_null() || v.is_nan() || !v.matches_type(&call.input_type(&self.input)?) { return Err(invalid()); }
+                        }
+                        0
+                    }
+                };
+                if count && n>entry.count {return Err(invalid());}
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(
         operator: OperatorId,
         spec: WindowSpec,
@@ -588,7 +635,7 @@ impl WindowOperator {
             self.closed_index.retain(|_, v| {
                 let keep = v != &k;
                 if !keep {
-                    self.closed_index_bytes -= v.index_bytes();
+                    self.closed_index_bytes = self.owner.replace_accounted_bytes(self.closed_index_bytes, v.index_bytes(), 0);
                 }
                 keep
             });
@@ -608,8 +655,7 @@ impl WindowOperator {
         let old = self
             .closed_index
             .insert((window_end, key.encoded_bytes().to_vec()), indexed);
-        self.closed_index_bytes = self.closed_index_bytes.saturating_add(bytes)
-            - old.as_ref().map_or(0, StateKey::index_bytes);
+        self.closed_index_bytes = self.owner.replace_accounted_bytes(self.closed_index_bytes, old.as_ref().map_or(0, StateKey::index_bytes), bytes);
         Ok(())
     }
 
@@ -618,7 +664,7 @@ impl WindowOperator {
             .closed_index
             .remove(&(window_end, key.encoded_bytes().to_vec()))
         {
-            self.closed_index_bytes -= old.index_bytes();
+            self.closed_index_bytes = self.owner.replace_accounted_bytes(self.closed_index_bytes, old.index_bytes(), 0);
         }
     }
 
@@ -1029,7 +1075,8 @@ impl WindowOperator {
         }
         let live = self.retention_bytes();
         let budget = self.owner.budget();
-        if live > budget.retention_bytes || estimate > budget.reservation_bytes {
+        let working = estimate.saturating_add(self.freeze_workspace_bytes());
+        if live > budget.retention_bytes || working > budget.reservation_bytes {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
                 format!(
@@ -1736,6 +1783,7 @@ mod review_tests {
                 let adopted = crate::barrier::RuntimeAligned::adopt(
                     crate::AlignedJob {
                         restore: Some(freeze.clone()),
+                        pipeline: None,
                         acks: Default::default(),
                         outbox: Arc::new(sparrow_model::InflightCounter::new()),
                     },

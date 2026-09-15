@@ -120,6 +120,9 @@ mod tests {
     #[test]
     fn r10_every_registered_function_has_an_evaluator_and_allocation_rule() {
         for f in super::FUNCTIONS {
+            if matches!(f.allocation, super::OutputAllocation::AsciiUtf8) {
+                assert_eq!((f.min_args, f.max_args), (1, Some(1)), "ASCII allocation bound only covers unary functions");
+            }
             let values = vec![sparrow_model::Scalar::Null; f.min_args];
             crate::check_call_arity(f.name, values.len()).unwrap();
             assert!(

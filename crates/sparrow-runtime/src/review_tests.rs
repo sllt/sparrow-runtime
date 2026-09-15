@@ -745,6 +745,7 @@ fn r9_bulk_ingress_barrier_freezes_only_preceding_rows() {
                 .with_aligned(crate::AlignedJob {
                     restore: None,
                     acks,
+                    pipeline: None,
                     outbox: std::sync::Arc::new(sparrow_model::InflightCounter::new()),
                 }),
         )
@@ -1314,6 +1315,7 @@ fn p0_4_barrier_waits_for_real_sink_flush() {
                 .with_aligned(crate::AlignedJob {
                     restore: None,
                     acks: ack_tx,
+                    pipeline: None,
                     outbox: std::sync::Arc::clone(&outbox),
                 }),
         )
@@ -1351,6 +1353,7 @@ fn p0_4_barrier_waits_for_real_sink_flush() {
                 Ok(Some(crate::AlignedAck::WindowFrozen { .. })) => frozen = true,
                 Ok(Some(crate::AlignedAck::SinkFlushed { .. })) => flushed = true,
                 Ok(Some(crate::AlignedAck::FreezeFailed { error, .. })) => panic!("{error}"),
+                Ok(Some(crate::AlignedAck::Participant { .. })) => panic!("participant ACK on legacy fixture"),
                 Ok(None) | Err(_) => break,
             }
         }

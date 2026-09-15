@@ -444,7 +444,7 @@ pub fn validate_aligned_plan(
     if let Some(dir) = &spec.checkpoint_dir {
         check_data_path(std::path::Path::new(dir)).map_err(io)?;
     }
-    sparrow_plan::PlanLayout::from_physical(plan)?;
+    sparrow_plan::CheckpointPlan::from_physical(plan)?;
     Ok(())
 }
 
@@ -535,10 +535,18 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
 pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
     if matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
-        match sparrow_plan::PlanLayout::from_physical(plan) {
-            Ok(_) => {
+        match sparrow_plan::CheckpointPlan::from_physical(plan) {
+            Ok(manifest) => {
                 value["aligned_eligible"] = serde_json::json!(true);
-                value["aligned_eligibility_reason"] = serde_json::json!("single_supported_window");
+                value["aligned_eligibility_reason"] = serde_json::json!(match manifest.states.len() {0=>"zero_state_file_cut",1=>"single_supported_window",_=>"two_count_window_participants"});
+                value["checkpoint_participants"] = serde_json::json!({"source":manifest.source.raw(),"required_sink":manifest.sink.raw(),
+                    "snapshot_version":sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION,
+                    "manifest_version":"CPL1","semantics_version":"CP01+RCP2","restore_compatibility":"source_and_every_state_upstream_prefix",
+                    "downstream_changes":"allowed_after_last_state; plain_CP01_snapshots_remain_full_plan_strict; external_outputs_are_not_rolled_back",
+                    "states":manifest.states.iter().map(|state|match state.id {
+                        sparrow_plan::ParticipantId::State {operator,slot,shard}=>serde_json::json!({"operator":operator.raw(),"slot":slot.raw(),"shard":shard,"codec":state.codec,"window_kind":state.window_kind}),
+                        _=>unreachable!(),
+                    }).collect::<Vec<_>>(),"scope":"single_file_single_required_sink_tested_linear_shapes","certified":false});
                 if spec.recovery == "aligned" {
                     value["recovery_risk"] = serde_json::json!("committed_checkpoint_only");
                 }

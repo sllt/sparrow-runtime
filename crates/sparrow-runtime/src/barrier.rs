@@ -5,7 +5,8 @@
 //! Acks carry `checkpoint_id`. Stale ids from a timed-out barrier must not
 //! pair with a later cut.
 
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -13,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use sparrow_model::{ErrorCode, InflightCounter, Result, SparrowError};
 
 use crate::window::WindowFreeze;
+use sparrow_plan::{CheckpointPlan, ParticipantId};
 
 /// Encoded state plus its working-memory lease. Moving an ACK never clones state.
 #[derive(Debug)]
@@ -22,6 +24,18 @@ pub struct EncodedFreeze {
 }
 
 impl EncodedFreeze {
+    pub(crate) fn identity(&self) -> Result<(ParticipantId, u8, usize)> {
+        let header = crate::checkpoint::FreezeHeader::parse(&self.bytes)?;
+        Ok((
+            ParticipantId::State {
+                operator: header.operator,
+                slot: header.slot,
+                shard: 0,
+            },
+            header.kind,
+            header.entries,
+        ))
+    }
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -47,6 +61,12 @@ impl EncodedFreeze {
 
 #[derive(Debug)]
 pub enum AlignedAck {
+    Participant {
+        attempt: u64,
+        checkpoint_id: u64,
+        participant: ParticipantId,
+        outcome: ParticipantOutcome,
+    },
     FreezeFailed {
         checkpoint_id: u64,
         error: SparrowError,
@@ -65,16 +85,19 @@ pub enum AlignedAck {
 impl AlignedAck {
     pub fn checkpoint_id(&self) -> u64 {
         match self {
-            Self::WindowFrozen { checkpoint_id, .. }
+            Self::Participant { checkpoint_id, .. }
+            | Self::WindowFrozen { checkpoint_id, .. }
             | Self::SinkFlushed { checkpoint_id, .. }
             | Self::FreezeFailed { checkpoint_id, .. } => *checkpoint_id,
         }
     }
 }
 
-#[derive(Clone)]
 pub struct AlignedJob {
     pub restore: Option<WindowFreeze>,
+    /// K1 mode. Legacy embedding callers leave this None; the Server always
+    /// uses the participant protocol, including its zero/single-window cases.
+    pub pipeline: Option<PipelineRestore>,
     pub acks: AlignedAcks,
     pub outbox: Arc<InflightCounter>,
 }
@@ -82,7 +105,9 @@ pub struct AlignedJob {
 /// Internal per-attempt handoff. Cloning a stage context must never deep-clone
 /// a decoded restore snapshot; the eligible Window consumes it exactly once.
 pub(crate) struct RuntimeAligned {
+    pub participant_mode: bool,
     pub restore: Mutex<Option<RestoreState>>,
+    pub windows: Mutex<BTreeMap<sparrow_model::OperatorId, crate::window::WindowOperator>>,
     pub acks: AlignedAcks,
     pub outbox: Arc<InflightCounter>,
 }
@@ -107,10 +132,146 @@ impl RuntimeAligned {
             })
             .transpose()?;
         Ok(Arc::new(Self {
+            participant_mode: false,
             restore: Mutex::new(restore),
+            windows: Mutex::new(BTreeMap::new()),
             acks: job.acks,
             outbox: job.outbox,
         }))
+    }
+
+    /// Validate and restore every participant before any stage/source is spawned.
+    /// All decoded state shares one admission budget and is released per instance.
+    pub(crate) fn prepare(
+        job: AlignedJob,
+        plan: &sparrow_plan::PhysicalPlan,
+        owner: &Arc<sparrow_model::MemoryOwner>,
+        attempt: u64,
+        max_keys: usize,
+        max_timers: usize,
+    ) -> Result<Arc<Self>> {
+        let Some(pipeline) = job.pipeline else {
+            return Self::adopt(job, owner);
+        };
+        if job.restore.is_some() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "cannot combine legacy and participant restore",
+            ));
+        }
+        pipeline
+            .plan
+            .check_compatible(&CheckpointPlan::from_physical(plan)?)?;
+        let mut restored = BTreeMap::new();
+        if let Some(states) = pipeline.restore {
+            if states.iter().any(|s| s.entries.len() > max_keys)
+                || states.len() != pipeline.plan.states.len()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    "restore participant/per-instance entry limit",
+                ));
+            }
+            for freeze in states {
+                let participant = ParticipantId::State {
+                    operator: freeze.operator,
+                    slot: freeze.slot,
+                    shard: 0,
+                };
+                if !pipeline.plan.states.iter().any(|s| s.id == participant)
+                    || restored.contains_key(&freeze.operator)
+                {
+                    return Err(SparrowError::new(
+                        ErrorCode::UnsupportedRestore,
+                        "unknown or duplicate restored participant",
+                    ));
+                }
+                let lease = owner.acquire(
+                    sparrow_model::CreditKind::Reservation,
+                    freeze.resident_bytes(),
+                )?;
+                restored.insert(
+                    freeze.operator,
+                    RestoreState {
+                        freeze,
+                        _lease: lease,
+                    },
+                );
+            }
+        }
+        let mut windows = BTreeMap::new();
+        for stage in &plan.stages {
+            if let sparrow_plan::PhysicalStage::WindowAgg {
+                operator,
+                spec,
+                input,
+                ..
+            } = stage
+            {
+                let mut window = crate::window::WindowOperator::new(
+                    *operator,
+                    spec.clone(),
+                    input.clone(),
+                    owner.clone(),
+                    max_keys,
+                    max_timers,
+                )?;
+                if let Some(restored) = restored.remove(operator) {
+                    window.validate_participant_restore(&restored.freeze)?;
+                    window.restore_freeze(&restored.freeze)?;
+                }
+                windows.insert(*operator, window);
+            }
+        }
+        if !restored.is_empty() {
+            return Err(SparrowError::new(ErrorCode::Internal, "unconsumed restored participant"));
+        }
+        job.acks
+            .configure(pipeline.plan, attempt, pipeline.generation)?;
+        Ok(Arc::new(Self {
+            participant_mode: true,
+            restore: Mutex::new(None),
+            windows: Mutex::new(windows),
+            acks: job.acks,
+            outbox: job.outbox,
+        }))
+    }
+}
+
+pub struct PipelineRestore {
+    pub plan: Arc<CheckpointPlan>,
+    pub generation: [u8; 16],
+    /// None is fresh; Some(empty) is a restored zero-state plan.
+    pub restore: Option<Vec<WindowFreeze>>,
+}
+
+#[derive(Debug)]
+pub enum ParticipantOutcome {
+    SourceCut,
+    State(EncodedFreeze),
+    Sink(FlushOutcome),
+    Failed(SparrowError),
+}
+
+struct ParticipantAttempt {
+    plan: Arc<CheckpointPlan>,
+    attempt: u64,
+    generation: [u8; 16],
+}
+
+#[derive(Debug)]
+pub struct ParticipantAcks {
+    pub(crate) attempt: u64,
+    pub(crate) generation: [u8; 16],
+    pub(crate) freezes: Vec<EncodedFreeze>,
+}
+
+impl ParticipantAcks {
+    pub fn attempt(&self) -> u64 {
+        self.attempt
+    }
+    pub fn state_count(&self) -> usize {
+        self.freezes.len()
     }
 }
 
@@ -133,6 +294,7 @@ mod production_restore_tests {
         let shared = RuntimeAligned::adopt(
             AlignedJob {
                 restore: Some(freeze),
+                pipeline: None,
                 acks: AlignedAcks::default(),
                 outbox: Arc::new(InflightCounter::new()),
             },
@@ -164,6 +326,7 @@ pub struct FlushOutcome {
 #[derive(Clone, Default)]
 pub struct AlignedAcks {
     active: Arc<Mutex<Option<ActiveCheckpoint>>>,
+    participants: Arc<OnceLock<ParticipantAttempt>>,
 }
 
 struct ActiveCheckpoint {
@@ -180,6 +343,97 @@ pub struct CheckpointAcks {
 }
 
 impl AlignedAcks {
+    pub(crate) fn configure(
+        &self,
+        plan: Arc<CheckpointPlan>,
+        attempt: u64,
+        generation: [u8; 16],
+    ) -> Result<()> {
+        plan.validate()?;
+        if generation == [0; 16] {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "state generation must be initialized before input",
+            ));
+        }
+        if self.active.lock().expect("checkpoint registry").is_some()
+            || self
+                .participants
+                .set(ParticipantAttempt {
+                    plan,
+                    attempt,
+                    generation,
+                })
+                .is_err()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "checkpoint registry cannot be reused across attempts",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn source_cut(&self, checkpoint_id: u64) {
+        if let Some(p) = self.participants.get() {
+            self.send(AlignedAck::Participant {
+                attempt: p.attempt,
+                checkpoint_id,
+                participant: ParticipantId::Source(p.plan.source),
+                outcome: ParticipantOutcome::SourceCut,
+            })
+            .await;
+        }
+    }
+
+    pub(crate) async fn state_frozen(
+        &self,
+        checkpoint_id: u64,
+        operator: sparrow_model::OperatorId,
+        freeze: Result<EncodedFreeze>,
+    ) {
+        let ack = if let Some(p) = self.participants.get() {
+            AlignedAck::Participant {
+                attempt: p.attempt,
+                checkpoint_id,
+                participant: ParticipantId::window(operator),
+                outcome: match freeze {
+                    Ok(f) => ParticipantOutcome::State(f),
+                    Err(e) => ParticipantOutcome::Failed(e),
+                },
+            }
+        } else {
+            match freeze {
+                Ok(freeze) => AlignedAck::WindowFrozen {
+                    checkpoint_id,
+                    freeze,
+                },
+                Err(error) => AlignedAck::FreezeFailed {
+                    checkpoint_id,
+                    error,
+                },
+            }
+        };
+        self.send(ack).await;
+    }
+
+    pub(crate) async fn sink_flushed(&self, checkpoint_id: u64, flush: FlushOutcome) {
+        let ack = if let Some(p) = self.participants.get() {
+            AlignedAck::Participant {
+                attempt: p.attempt,
+                checkpoint_id,
+                participant: ParticipantId::Sink(p.plan.sink),
+                outcome: ParticipantOutcome::Sink(flush),
+            }
+        } else {
+            AlignedAck::SinkFlushed {
+                checkpoint_id,
+                ok: flush.ok,
+                dropped: flush.dropped,
+            }
+        };
+        self.send(ack).await;
+    }
     pub fn begin(&self, id: u64) -> Result<CheckpointAcks> {
         self.begin_with_deadline(id, Instant::now() + Duration::from_secs(5))
     }
@@ -192,7 +446,11 @@ impl AlignedAcks {
                 "checkpoint already active",
             ));
         }
-        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let capacity = self
+            .participants
+            .get()
+            .map_or(2, |p| p.plan.states.len() + 2);
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
         *active = Some(ActiveCheckpoint {
             id,
             sender,
@@ -248,6 +506,123 @@ impl AlignedAcks {
 }
 
 impl CheckpointAcks {
+    pub async fn wait_participants(mut self, timeout: Duration) -> Result<ParticipantAcks> {
+        let config = self.registry.participants.get().ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "participant registry not prepared",
+            )
+        })?;
+        let plan = config.plan.clone();
+        let attempt = config.attempt;
+        let generation = config.generation;
+        let expected = plan.participants();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut freezes = BTreeMap::new();
+        let mut bytes = 0usize;
+        let deadline = Instant::now() + timeout;
+        while seen.len() < expected.len() {
+            let ack = tokio::time::timeout_at(deadline, self.receiver.recv())
+                .await
+                .map_err(|_| {
+                    SparrowError::new(
+                        ErrorCode::ResourceExhausted,
+                        "participant checkpoint alignment timed out",
+                    )
+                })?
+                .ok_or_else(|| {
+                    SparrowError::new(ErrorCode::Cancelled, "participant ACK channel closed")
+                })?;
+            let AlignedAck::Participant {
+                attempt: got_attempt,
+                checkpoint_id,
+                participant,
+                outcome,
+            } = ack
+            else {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "legacy ACK cannot satisfy participant checkpoint",
+                ));
+            };
+            if got_attempt != attempt || checkpoint_id != self.id {
+                continue;
+            }
+            if !expected.contains(&participant) {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "unknown checkpoint participant ACK",
+                ));
+            }
+            match (participant, outcome) {
+                (_, ParticipantOutcome::Failed(e)) => return Err(e),
+                (ParticipantId::Source(_), ParticipantOutcome::SourceCut) => {
+                    seen.insert(participant);
+                }
+                (
+                    ParticipantId::Sink(_),
+                    ParticipantOutcome::Sink(FlushOutcome {
+                        ok: true,
+                        dropped: 0,
+                    }),
+                ) => {
+                    seen.insert(participant);
+                }
+                (ParticipantId::State { .. }, ParticipantOutcome::State(freeze)) => {
+                    let (id, kind, _) = freeze.identity()?;
+                    let state = plan
+                        .states
+                        .iter()
+                        .find(|s| s.id == participant)
+                        .expect("expected state");
+                    if id != participant || kind != state.freeze_kind() {
+                        return Err(SparrowError::new(
+                            ErrorCode::CodecViolation,
+                            "participant freeze identity/kind mismatch",
+                        ));
+                    }
+                    if let Some(previous) = freezes.get(&participant) {
+                        let previous: &EncodedFreeze = previous;
+                        if previous.bytes() != freeze.bytes() {
+                            return Err(SparrowError::new(
+                                ErrorCode::CodecViolation,
+                                "conflicting repeated participant freeze",
+                            ));
+                        }
+                        continue;
+                    }
+                    seen.insert(participant);
+                    bytes = bytes.saturating_add(freeze.bytes().len());
+                    if bytes as u64 > crate::checkpoint::MAX_SNAPSHOT_BYTES {
+                        return Err(SparrowError::new(
+                            ErrorCode::BoundExceeded,
+                            "total checkpoint state exceeds byte limit",
+                        ));
+                    }
+                    freezes.insert(participant, freeze);
+                }
+                (ParticipantId::Sink(_), ParticipantOutcome::Sink(_)) => {
+                    return Err(SparrowError::new(ErrorCode::ResourceExhausted,"barrier did not align: required sink flush failed or dropped output; refusing commit"));
+                }
+                _ => {
+                    return Err(SparrowError::new(
+                        ErrorCode::CodecViolation,
+                        "wrong checkpoint participant ACK role",
+                    ))
+                }
+            }
+        }
+        // Encode in plan order, not ACK arrival or numeric operator order.
+        Ok(ParticipantAcks {
+            attempt,
+            generation,
+            freezes: plan
+                .states
+                .iter()
+                .map(|s| freezes.remove(&s.id).expect("complete state ACK set"))
+                .collect(),
+        })
+    }
     pub async fn recv(&mut self) -> Option<AlignedAck> {
         self.receiver.recv().await
     }
@@ -392,6 +767,141 @@ pub async fn wait_aligned_acks(
 mod tests {
     use super::*;
     use sparrow_model::{OperatorId, StateSlotId};
+
+    fn k1_zero_registry() -> AlignedAcks {
+        let registry = AlignedAcks::default();
+        registry
+            .configure(
+                Arc::new(CheckpointPlan {
+                    source: 1.into(),
+                    sink: 20.into(),
+                    states: vec![],
+                    semantics: b"CP01test".to_vec(),
+                    recovery_prefix_len: Some(8),
+                }),
+                7,
+                [7; 16],
+            )
+            .unwrap();
+        registry
+    }
+
+    fn k1_source(attempt: u64, participant: ParticipantId) -> AlignedAck {
+        AlignedAck::Participant {
+            attempt,
+            checkpoint_id: 1,
+            participant,
+            outcome: ParticipantOutcome::SourceCut,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn k1_zero_state_still_requires_source_and_sink_and_ignores_old_attempt() {
+        let registry = k1_zero_registry();
+        let request = registry.begin(1).unwrap();
+        registry
+            .send(k1_source(6, ParticipantId::Source(1.into())))
+            .await;
+        registry
+            .sink_flushed(
+                1,
+                FlushOutcome {
+                    ok: true,
+                    dropped: 0,
+                },
+            )
+            .await;
+        assert!(request
+            .wait_participants(Duration::from_millis(50))
+            .await
+            .is_err());
+        assert!(!registry.is_active(1));
+        let request = registry.begin(2).unwrap();
+        registry.source_cut(2).await;
+        registry
+            .sink_flushed(
+                2,
+                FlushOutcome {
+                    ok: true,
+                    dropped: 0,
+                },
+            )
+            .await;
+        let result = request
+            .wait_participants(Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(result.freezes.is_empty());
+        assert_eq!(result.attempt, 7);
+        let request = registry.begin(3).unwrap();
+        let sender = registry.clone();
+        let sending = tokio::spawn(async move {
+            sender.source_cut(3).await;
+            sender.source_cut(3).await;
+            sender
+                .sink_flushed(
+                    3,
+                    FlushOutcome {
+                        ok: true,
+                        dropped: 0,
+                    },
+                )
+                .await;
+        });
+        assert_eq!(
+            request
+                .wait_participants(Duration::from_millis(50))
+                .await
+                .unwrap()
+                .state_count(),
+            0
+        );
+        sending.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn k1_unknown_role_and_failed_sink_fail_without_waiting_for_timeout() {
+        for case in 1..4 {
+            let registry = k1_zero_registry();
+            let request = registry.begin(1).unwrap();
+            registry.source_cut(1).await;
+            match case {
+                1 => {
+                    registry
+                        .send(k1_source(7, ParticipantId::Source(99.into())))
+                        .await
+                }
+                2 => {
+                    registry
+                        .send(k1_source(7, ParticipantId::Sink(20.into())))
+                        .await
+                }
+                _ => {
+                    registry
+                        .sink_flushed(
+                            1,
+                            FlushOutcome {
+                                ok: false,
+                                dropped: 1,
+                            },
+                        )
+                        .await
+                }
+            }
+            let error = request
+                .wait_participants(Duration::from_millis(50))
+                .await
+                .unwrap_err();
+            let expected = match case { 1 => "unknown checkpoint participant", 2 => "wrong checkpoint participant", _ => "required sink flush failed" };
+            assert!(error.message.contains(expected), "{error}");
+            assert!(!registry.is_active(1));
+            let plan = registry.participants.get().unwrap().plan.clone();
+            assert!(
+                registry.configure(plan, 8, [8; 16]).is_err(),
+                "registry cannot be shared by a new attempt"
+            );
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn self_review_flush_uses_attempt_deadline_and_releases_abandoned_barrier() {

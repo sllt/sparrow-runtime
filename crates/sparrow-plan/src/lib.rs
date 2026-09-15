@@ -11,6 +11,7 @@ pub mod bind;
 pub mod bound;
 pub mod catalog;
 pub mod canonical;
+pub mod checkpoint;
 pub mod compat;
 pub mod explain;
 pub mod expr_spec;
@@ -27,6 +28,7 @@ pub use explain::{
     et_tumble_template, explain_bound, explain_graph, validate_graph, GraphExplain, REPLAY_UNBOUND,
 };
 pub use graph::{GraphSpec, GRAPH_SPEC_VERSION};
+pub use checkpoint::{CheckpointPlan, ParticipantId, StateParticipant};
 pub use physical::{physicalize, PhysicalPlan, PhysicalStage, PlanOptions, TransformStep};
 pub use compat::{
     decide_state_reuse, expr_fingerprint, where_before_window, where_before_window_physical,

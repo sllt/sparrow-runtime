@@ -40,6 +40,7 @@ struct Options {
     mqtt_events: usize,
     file_events: usize,
     file_keys: usize,
+    file_state_stages: usize,
     rate: usize,
     checkpoint_events: usize,
     pressure_events: usize,
@@ -76,6 +77,7 @@ impl Options {
             mqtt_events: 10_000,
             file_events: 80_000,
             file_keys: 1024,
+            file_state_stages: 1,
             rate: 1000,
             checkpoint_events: 8000,
             pressure_events: 1024,
@@ -100,6 +102,7 @@ impl Options {
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             if arg == "--help" {
+                println!("K1 File shapes: --file-state-stages 0|1|2 (Sparrow-only); 0 requires --window 1; 2 uses Count(window/2) -> Count(2)");
                 println!("Opt-in multikey: --scenarios file_multikey_minmax --engine sparrow --file-keys 1..1024; file-events must contain complete keys*window cycles");
                 println!("Optional diagnostic sampling: --metrics-ms 100 (0 disables; snapshots add measurement overhead)");
                 println!("Broker transport control: --broker-nodelay true|false (default false, recorded in metadata)");
@@ -129,6 +132,7 @@ impl Options {
                 "--mqtt-events" => o.mqtt_events = value.parse()?,
                 "--file-events" => o.file_events = value.parse()?,
                 "--file-keys" => o.file_keys = value.parse()?,
+                "--file-state-stages" => o.file_state_stages = value.parse()?,
                 "--checkpoint-events" => o.checkpoint_events = value.parse()?,
                 "--pressure-events" => o.pressure_events = value.parse()?,
                 "--rate" => o.rate = value.parse()?,
@@ -210,9 +214,9 @@ impl Options {
             return Err("--observe-ms must be 0 or 100..60000".into());
         }
         if o.scenarios.is_empty()
-            || o.window < 8
+            || (o.window < 8 && !(o.window == 1 && o.file_state_stages == 0))
             || o.window > 10_000
-            || o.window % 8 != 0
+            || (o.window % 8 != 0 && !(o.window == 1 && o.file_state_stages == 0))
             || o.sink_delay_ms > 1000
             || (o.metrics_ms != 0 && !(100..=60_000).contains(&o.metrics_ms))
             || o.scenarios
@@ -226,6 +230,15 @@ impl Options {
             );
         }
         for scenario in &o.scenarios {
+            if o.file_state_stages > 2
+                || (o.file_state_stages != 1
+                    && (o.engine != "sparrow"
+                        || !scenario.starts_with("file")
+                        || scenario == "file_multikey_minmax"))
+                || (o.file_state_stages == 0 && o.window != 1)
+            {
+                return Err("file-state-stages requires Sparrow-only File (not multikey), stages 0..=2; zero state requires window=1".into());
+            }
             if scenario == "file_multikey_minmax"
                 && (o.engine != "sparrow"
                     || !(1..=1024).contains(&o.file_keys)
@@ -251,6 +264,17 @@ impl Options {
         Ok(o)
     }
 }
+fn two_count_graph(id: &str, window: usize) -> Value {
+    json!({"version":1,"pipeline_id":1,"revision_id":1,"nodes":[
+        {"id":1,"kind":"memory_source","table":id,"out":[10]},
+        {"id":10,"kind":"window_agg","keys":["device_id"],"window":{"kind":"count","size":window/2},
+            "aggs":[{"fn":"sum","expr":{"k":"col","name":"v"},"alias":"partial_s"}],"out":[11]},
+        {"id":11,"kind":"window_agg","keys":["device_id"],"window":{"kind":"count","size":2},
+            "aggs":[{"fn":"sum","expr":{"k":"col","name":"partial_s"},"alias":"s"}],"out":[20]},
+        {"id":20,"kind":"capture_sink","name":"out"}
+    ]})
+}
+
 fn unix_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -450,9 +474,12 @@ impl Engine {
         sink_tuning: &serde_json::Map<String, Value>,
         periodic_checkpoint_ms: Option<u64>,
         multikey: bool,
+        file_state_stages: usize,
     ) -> Result<()> {
         let sql = if multikey {
             format!("SELECT device_id, SUM(v) AS s, MIN(name) AS lo, MAX(name) AS hi FROM {id} GROUP BY device_id, COUNT_WINDOW({window})")
+        } else if file && file_state_stages == 0 {
+            format!("SELECT device_id, v AS s FROM {id}")
         } else if file {
             format!(
                 "SELECT device_id, SUM(v) AS s FROM {id} GROUP BY device_id, {}({window})",
@@ -489,6 +516,10 @@ impl Engine {
             });
             if let Some(ms) = periodic_checkpoint_ms {
                 spec["checkpoint"] = json!({"interval_ms":ms});
+            }
+            if file && file_state_stages == 2 {
+                spec.as_object_mut().unwrap().remove("sql");
+                spec["graph"] = two_count_graph(id, window);
             }
             self.call(Method::PUT, &format!("/v1/pipelines/{id}"), Some(spec))
                 .await?;
@@ -1183,6 +1214,7 @@ async fn trial(
             &o.sink_tuning,
             o.periodic_checkpoint_ms,
             multikey,
+            o.file_state_stages,
         )
         .await?;
     let metric_samples = MetricsSampling::start(engine, &id, &o.out, o.metrics_ms)?;
@@ -1401,7 +1433,7 @@ async fn run(mut o: Options) -> Result<()> {
         engines.push(Engine::start("ekuiper", &o, broker_port).await?);
     }
     let metadata = json!({"format":"sparrow-bench-v2","started_unix_us":unix_us(),"rounds":o.rounds,
-        "mqtt_events":o.mqtt_events,"file_events":o.file_events,"file_keys":o.file_keys,"offered_rate":o.rate,
+        "mqtt_events":o.mqtt_events,"file_events":o.file_events,"file_keys":o.file_keys,"file_state_stages":o.file_state_stages,"offered_rate":o.rate,
         "broker":"Mosquitto; shared for both engines","broker_pid":broker.id(),"broker_port":broker_port,
         "broker_tcp_nodelay":o.broker_nodelay,
         "sparrow_inbox_wait_ms_override":o.inbox_wait_ms,
@@ -1538,6 +1570,40 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn k1_zero_and_two_state_benchmark_oracle_uses_raw_input_sums() {
+        for window in [1, 128, 800] {
+            let n = window * 16;
+            let mut bytes = Vec::new();
+            write_rows(&mut bytes, 0, n, window).unwrap();
+            let rows: Vec<Value> = String::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .map(|s| serde_json::from_str(s).unwrap())
+                .collect();
+            let mut check = Check::new(Kind::File, n, window);
+            for chunk in rows.chunks_exact(window) {
+                let sum: u64 = if window == 1 {
+                    chunk[0]["v"].as_u64().unwrap()
+                } else {
+                    chunk
+                        .chunks_exact(window / 2)
+                        .map(|half| half.iter().map(|r| r["v"].as_u64().unwrap()).sum::<u64>())
+                        .sum()
+                };
+                check.accept(CapturedRequest {
+                    body: serde_json::to_vec(&json!({"device_id":chunk[0]["device_id"],"s":sum}))
+                        .unwrap(),
+                    received_at: Instant::now(),
+                });
+            }
+            assert!(check.valid());
+            assert_eq!(check.unique, n / window);
+        }
+        let graph = two_count_graph("sensors", 128);
+        assert_eq!(graph["nodes"][1]["window"]["size"], 64);
+        assert_eq!(graph["nodes"][2]["window"]["size"], 2);
+    }
     #[test]
     fn r10_multikey_oracle_checks_interleaved_min_max_sum_and_duplicates() {
         let keys = 4;

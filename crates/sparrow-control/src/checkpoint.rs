@@ -64,6 +64,8 @@ pub struct CheckpointStatus {
     pub last_error: Option<ErrorCode>,
     pub last_success_id: Option<u64>,
     pub restored_from: Option<u64>,
+    pub state_generation: Option<[u8;16]>,
+    pub downstream_semantics_changed: bool,
     pub last_success_at: Option<tokio::time::Instant>,
     pub storage: Option<sparrow_runtime::checkpoint::CheckpointInventory>,
 }
@@ -99,6 +101,12 @@ impl CheckpointControl {
         // A parsed CURRENT pointer alone is not a verified success. Restore
         // calls this only after snapshot compatibility and source seek succeed.
         s.last_success_id = id;
+    }
+    pub fn state_generation(&self,generation:[u8;16]) {
+        self.state.lock().unwrap_or_else(|e|e.into_inner()).state_generation=Some(generation);
+    }
+    pub fn downstream_changed(&self, changed: bool) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).downstream_semantics_changed = changed;
     }
     pub fn timeout(&self) -> Duration {
         Duration::from_millis(self.policy.timeout_ms)
@@ -202,6 +210,8 @@ pub(crate) mod tests {
                 generations: vec![],
                 bytes: 0,
                 maintenance_error: None,
+                state_generation_marker: None,
+                marker_error: None,
             },
         )
     }

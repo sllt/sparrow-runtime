@@ -206,6 +206,49 @@ fn bound() -> SparrowError {
     )
 }
 
+/// Full diagnostic computation plus the prefix affecting restored state.
+/// In a linear plan, the last window's prefix contains every earlier window's
+/// dependencies. A stateless plan depends only on the source identity/schema.
+pub(crate) fn checkpoint_pipeline(plan: &PhysicalPlan) -> Result<(Vec<u8>, usize)> {
+    let mut w = Writer::default();
+    w.raw(b"CP01")?;
+    w.raw(&sparrow_expr::semantics::VERSION.to_le_bytes())?;
+    w.bytes(sparrow_expr::semantics::EVALUATION.as_bytes())?;
+    let mut recovery_prefix_len = 0;
+    for stage in &plan.stages {
+        match stage {
+            PhysicalStage::MemorySource { operator, name, schema } => {
+                w.tag(0)?; w.raw(&operator.raw().to_le_bytes())?; w.bytes(name.as_bytes())?; w.schema(schema)?;
+                recovery_prefix_len = w.0.len();
+            }
+            PhysicalStage::Transform { steps } => for step in steps {
+                match step {
+                    TransformStep::Filter { predicate, input, .. } => {
+                        w.tag(1)?; w.schema(input)?; w.expr(predicate,0)?;
+                    }
+                    TransformStep::Project { exprs, input, output, .. }
+                    | TransformStep::Map { exprs, input, output, .. } => {
+                        w.tag(if matches!(step, TransformStep::Project { .. }) { 2 } else { 3 })?;
+                        w.schema(input)?; w.schema(output)?; w.len(exprs.len())?;
+                        for expr in exprs { w.expr(expr,0)?; }
+                    }
+                }
+            },
+            PhysicalStage::WindowAgg { operator, spec, input, output } => {
+                w.tag(4)?; w.raw(&operator.raw().to_le_bytes())?;
+                w.bytes(&StateSemantics::window(spec)?.encode()?)?;
+                w.schema(input)?; w.schema(output)?;
+                recovery_prefix_len = w.0.len();
+            }
+            PhysicalStage::CaptureSink { operator, schema, .. } => {
+                w.tag(5)?; w.raw(&operator.raw().to_le_bytes())?; w.schema(schema)?;
+            }
+            _ => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"unsupported checkpoint computation")),
+        }
+    }
+    Ok((w.0, recovery_prefix_len))
+}
+
 #[derive(Default)]
 struct Writer(Vec<u8>);
 impl Writer {

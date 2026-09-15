@@ -2,9 +2,15 @@
 use super::*;
 
 pub(super) fn storage_json(s: &sparrow_runtime::checkpoint::CheckpointInventory) -> Value {
+    fn hex(id: [u8;16]) -> String { id.iter().map(|b|format!("{b:02x}")).collect() }
     json!({"current":s.current,"pinned_for_attempt":s.pinned,"current_error_code":s.current_error.map(|e|e.as_str()),
+        "state_generation_marker":s.state_generation_marker.map(hex),"marker_error_code":s.marker_error.map(|e|e.as_str()),
         "logical_file_bytes":s.bytes,"maintenance_error_code":s.maintenance_error.map(|e|e.as_str()),
         "generations":s.generations.iter().map(|g|json!({"id":g.id,"bytes":g.bytes,"publication_proven":g.published,
+            "snapshot_version":g.metadata.as_ref().map(|m|m.version),
+            "revision":g.metadata.as_ref().and_then(|m|m.revision),"attempt":g.metadata.as_ref().and_then(|m|m.attempt),
+            "state_generation":g.metadata.as_ref().and_then(|m|m.generation).map(hex),
+            "metadata_scope":"cached_header_only_not_integrity_or_restore_authorization",
             "current":g.current,"compatibility":"checked_on_restore_not_by_listing"})).collect::<Vec<_>>()})
 }
 pub(super) fn checkpoint_status(state: &AppState, name: &str) -> Value {
@@ -20,6 +26,9 @@ pub(super) fn checkpoint_status(state: &AppState, name: &str) -> Value {
         "started_total":s.started,"succeeded_total":s.succeeded,"failed_or_cancelled_total":s.failed,
         "busy_requests_total":s.busy,"timed_out_waiters_total":s.timed_out_waiters,
         "last_success_id":s.last_success_id,"restored_from_checkpoint":s.restored_from,
+        "state_generation":s.state_generation.map(|id|id.iter().map(|b|format!("{b:02x}")).collect::<String>()),
+        "downstream_semantics_changed":s.downstream_semantics_changed,
+        "restore_compatibility":"source_and_all_state_upstream_prefixes; plain_CP01_requires_full_computation_match",
         "last_error_code":s.last_error.map(|e|e.as_str())});
     value["last_success_age_ms"] =
         json!(s

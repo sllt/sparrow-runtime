@@ -17,6 +17,7 @@ pub struct InflightCounter {
     /// the barrier is processed still belong to that cut.
     marked_failed: AtomicU64,
     flush_requested: AtomicBool,
+    flush_through: AtomicU64,
     flush_waker: std::sync::Mutex<Option<std::task::Waker>>,
 }
 
@@ -27,9 +28,14 @@ impl InflightCounter {
 
     /// Wake the single sink collector so an aligned cut never waits for linger.
     pub fn request_flush(&self) {
+        self.flush_through.fetch_max(self.sent(), Ordering::SeqCst);
         self.flush_requested.store(true, Ordering::SeqCst);
         if let Some(waker) = self.flush_waker.lock().expect("flush waker").take() { waker.wake(); }
     }
+
+    /// Only bounds the collector's bypass-linger hint. Checkpoint completion
+    /// still uses real receipts and pending()==0 at the ordered Sink barrier.
+    pub fn requested_flush_through(&self) -> u64 { self.flush_through.load(Ordering::SeqCst) }
 
     pub async fn flush_requested(&self) {
         std::future::poll_fn(|cx| {
@@ -94,6 +100,19 @@ impl InflightCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r11_flush_hint_has_a_fixed_prefix_even_if_new_batches_arrive() {
+        let c = InflightCounter::new();
+        c.enqueue(); c.enqueue(); c.request_flush();
+        assert_eq!(c.requested_flush_through(),2);
+        c.ack(); c.ack(); c.enqueue();
+        assert_eq!(c.pending(),1);
+        assert_eq!(c.requested_flush_through(),2,"new epoch must not extend an old linger override");
+        assert_eq!(c.acked(),c.requested_flush_through());
+        c.request_flush(); assert_eq!(c.requested_flush_through(),3);
+        c.fail(); assert_eq!(c.pending(),0); assert_eq!(c.drops_since_mark(),1);
+    }
 
     #[test]
     fn pending_tracks_unacked() {

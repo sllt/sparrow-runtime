@@ -124,7 +124,7 @@ impl DedupOperator {
         let bytes = sk.index_bytes();
         let old = self.expiry.insert((self.expire_at(last_seen), encoded), sk);
         self.expiry_bytes =
-            self.expiry_bytes.saturating_add(bytes) - old.as_ref().map_or(0, StateKey::index_bytes);
+            self.owner.replace_accounted_bytes(self.expiry_bytes, old.as_ref().map_or(0, StateKey::index_bytes), bytes);
         Ok(())
     }
 
@@ -133,7 +133,7 @@ impl DedupOperator {
             .expiry
             .remove(&(self.expire_at(last_seen), sk.encoded_bytes().to_vec()))
         {
-            self.expiry_bytes -= old.index_bytes();
+            self.expiry_bytes = self.owner.replace_accounted_bytes(self.expiry_bytes, old.index_bytes(), 0);
         }
     }
 
@@ -150,7 +150,7 @@ impl DedupOperator {
             let Some((_, sk)) = self.expiry.pop_first() else {
                 break;
             };
-            self.expiry_bytes -= sk.index_bytes();
+            self.expiry_bytes = self.owner.replace_accounted_bytes(self.expiry_bytes, sk.index_bytes(), 0);
             self.state.remove(&sk);
         }
     }

@@ -16,7 +16,7 @@ use sparrow_plan::{PhysicalPlan, PhysicalStage};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::barrier::{AlignedAck, AlignedJob};
+use crate::barrier::AlignedJob;
 use crate::capture::SharedCapture;
 use crate::clock::RuntimeClock;
 use crate::dedup::DedupOperator;
@@ -387,8 +387,12 @@ impl Kernel {
                 "physical plan needs source and sink",
             ));
         }
-        if req.aligned.is_some() {
-            sparrow_plan::PlanLayout::from_physical(&req.plan)?;
+        if let Some(aligned) = &req.aligned {
+            if let Some(pipeline) = &aligned.pipeline {
+                pipeline.plan.check_compatible(&sparrow_plan::CheckpointPlan::from_physical(&req.plan)?)?;
+            } else {
+                sparrow_plan::PlanLayout::from_physical(&req.plan)?;
+            }
         }
         let _gate = self.admit_lock.lock().expect("job admission");
         DeliveryContract::V0_3.validate_restore(&RestoreClaim::None)?;
@@ -520,7 +524,7 @@ impl Kernel {
             aligned: req
                 .aligned
                 .take()
-                .map(|job| crate::barrier::RuntimeAligned::adopt(job, &owner))
+                .map(|job| crate::barrier::RuntimeAligned::prepare(job, &req.plan, &owner, attempt.raw(), self.job_budget.max_state_keys, self.job_budget.max_timers))
                 .transpose()?,
             observation: req.observation.clone(),
         };
@@ -959,7 +963,7 @@ async fn stage_loop(
                 }
             }
             for c in trailing_controls {
-                if !tx.send_control(c).await? {
+                if !publish_source_control(&ctx, &tx, c).await? {
                     return Ok(n);
                 }
             }
@@ -1067,14 +1071,7 @@ async fn stage_loop(
                         if flush.ok && flush.dropped == 0 {
                             aj.outbox.mark();
                         }
-                        let _ = aj
-                            .acks
-                            .send(AlignedAck::SinkFlushed {
-                                checkpoint_id,
-                                ok: flush.ok,
-                                dropped: flush.dropped,
-                            })
-                            .await;
+                        aj.acks.sink_flushed(checkpoint_id, flush).await;
                     }
                 }
             }
@@ -1091,14 +1088,18 @@ async fn stage_loop(
             let rx = rx
                 .as_mut()
                 .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "window missing rx"))?;
-            let mut op = WindowOperator::new(
+            let prepared = ctx.aligned.as_ref().and_then(|a|a.windows.lock().expect("prepared windows").remove(&operator));
+            if prepared.is_none() && ctx.aligned.as_ref().is_some_and(|a| a.participant_mode) {
+                return Err(SparrowError::new(ErrorCode::Internal, "prepared checkpoint participant missing"));
+            }
+            let mut op = if let Some(window)=prepared { window } else { WindowOperator::new(
                 operator,
                 spec,
                 input,
                 Arc::clone(&ctx.owner),
                 ctx.max_state_keys,
                 ctx.max_timers,
-            )?;
+            )? };
             let restore = ctx
                 .aligned
                 .as_ref()
@@ -1363,11 +1364,8 @@ async fn window_stage(
                                 StreamControl::CheckpointBarrier { checkpoint_id } => {
                                     if let Some(aj) = &ctx.aligned {
                                         if aj.acks.is_active(checkpoint_id) {
-                                            let ack = match crate::barrier::EncodedFreeze::from_operator(&op, &ctx.owner, ctx.max_state_keys) {
-                                                Ok(freeze) => AlignedAck::WindowFrozen { checkpoint_id, freeze },
-                                                Err(error) => AlignedAck::FreezeFailed { checkpoint_id, error },
-                                            };
-                                            aj.acks.send(ack).await;
+                                            let frozen = crate::barrier::EncodedFreeze::from_operator(&op, &ctx.owner, ctx.max_state_keys);
+                                            aj.acks.state_frozen(checkpoint_id,op.operator_id(),frozen).await;
                                         }
                                     }
                                     if !tx
@@ -1564,7 +1562,7 @@ async fn live_source(
                         IngressEvent::Row(row) => { rows.push(row); origin.merge(at); }
                         IngressEvent::Control(control) => {
                             if !publish_live_rows(&ctx, &schema, &tx, &mut rows, origin, &mut n).await?
-                                || !tx.send_control(control).await? { return Ok(n); }
+                                || !publish_source_control(&ctx,&tx,control).await? { return Ok(n); }
                             origin = OriginSpan::default();
                         }
                     }
@@ -1573,7 +1571,7 @@ async fn live_source(
                     return Ok(n);
                 }
                 while let Some(control) = events.ready_control() {
-                    if !tx.send_control(control).await? { return Ok(n); }
+                    if !publish_source_control(&ctx,&tx,control).await? { return Ok(n); }
                 }
             }
         }
@@ -1606,5 +1604,12 @@ async fn publish_live_rows(
             return Ok(false);
         }
     }
+    Ok(true)
+}
+
+async fn publish_source_control(ctx:&JobCtx, tx:&MailboxTx, control:StreamControl) -> Result<bool> {
+    let checkpoint_id=match &control { StreamControl::CheckpointBarrier {checkpoint_id}=>Some(*checkpoint_id), _=>None };
+    if !tx.send_control(control).await? {return Ok(false);}
+    if let (Some(id),Some(aligned))=(checkpoint_id,&ctx.aligned) { aligned.acks.source_cut(id).await; }
     Ok(true)
 }

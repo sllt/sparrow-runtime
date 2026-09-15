@@ -38,6 +38,7 @@ pub struct MemoryOwner {
     live_handles: AtomicUsize,
     /// Expansion watermark observed by builders (not silent growth).
     peak_builder_bytes: AtomicUsize,
+    accounting_errors: AtomicU64,
     /// Serializes credit checks so two acquires cannot oversubscribe.
     lock: Mutex<()>,
 }
@@ -56,6 +57,7 @@ impl MemoryOwner {
             peak_physical: AtomicUsize::new(0),
             live_handles: AtomicUsize::new(0),
             peak_builder_bytes: AtomicUsize::new(0),
+            accounting_errors: AtomicU64::new(0),
             lock: Mutex::new(()),
         })
     }
@@ -86,6 +88,23 @@ impl MemoryOwner {
 
     pub fn peak_builder_bytes(&self) -> usize {
         self.peak_builder_bytes.load(Ordering::SeqCst)
+    }
+
+    pub fn accounting_errors_total(&self) -> u64 { self.accounting_errors.load(Ordering::Relaxed) }
+
+    /// Task-owned auxiliary ledgers must not wrap in release builds or hide
+    /// corruption by becoming zero. The Kernel contains a stage panic as a
+    /// failed attempt and drops its leases; the parent retains the error count.
+    pub fn replace_accounted_bytes(&self, total: usize, old: usize, new: usize) -> usize {
+        total.checked_sub(old).and_then(|n| n.checked_add(new)).unwrap_or_else(|| {
+            self.record_accounting_error();
+            panic!("state accounting invariant violated: total={total} old={old} new={new}")
+        })
+    }
+
+    fn record_accounting_error(&self) {
+        self.accounting_errors.fetch_add(1, Ordering::Relaxed);
+        if let Some(parent) = &self.parent { parent.record_accounting_error(); }
     }
 
     /// Fail closed if `used + bytes` would exceed `kind`'s cap.
@@ -300,6 +319,19 @@ impl Drop for MemoryLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r11_state_ledger_underflow_and_overflow_fail_closed_in_release() {
+        let parent = MemoryOwner::new(ResourceBudget::compact());
+        let child = MemoryOwner::child(parent.clone(), ResourceBudget::compact(), "fixture");
+        assert_eq!(child.replace_accounted_bytes(10, 4, 2), 8);
+        for (total, old, new) in [(0, 1, 0), (usize::MAX, 0, 1)] {
+            assert!(std::panic::catch_unwind(|| child.replace_accounted_bytes(total, old, new)).is_err());
+        }
+        assert_eq!(child.accounting_errors_total(), 2);
+        assert_eq!(parent.accounting_errors_total(), 2);
+        assert_eq!(parent.usage().physical_bytes, 0);
+    }
 
     fn owner() -> Arc<MemoryOwner> {
         MemoryOwner::new(ResourceBudget {
