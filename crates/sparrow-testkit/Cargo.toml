@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Sparrow fixtures, virtual clock, capture sink, and demos"
 
+[features]
+jetstream = ["dep:async-nats", "dep:tokio", "dep:serde_json"]
+
 [dependencies]
 sparrow-model.workspace = true
 sparrow-expr.workspace = true
@@ -12,6 +15,9 @@ sparrow-plan.workspace = true
 sparrow-io.workspace = true
 sparrow-runtime.workspace = true
 sparrow-sql.workspace = true
+async-nats = { version = "=0.50.0", optional = true, default-features = false, features = ["ring", "jetstream", "kv", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
+tokio = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }
 
 [[example]]
 name = "m0_pipeline_smoke"

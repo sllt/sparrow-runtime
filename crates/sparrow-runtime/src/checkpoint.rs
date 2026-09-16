@@ -310,7 +310,7 @@ pub struct CheckpointStore {
     maintenance_error: Option<ErrorCode>,
     pinned: Option<u64>,
     read_only: bool,
-    pipeline_only: bool,
+    pipeline_version: Option<u16>,
     // Diagnostic headers only. Never used by validation, recovery or GC.
     metadata_cache: std::sync::Mutex<std::collections::BTreeMap<u64, SnapshotMetadata>>,
 }
@@ -409,7 +409,7 @@ impl CheckpointStore {
             maintenance_error: None,
             pinned: None,
             read_only: !create,
-            pipeline_only: false,
+            pipeline_version: None,
             metadata_cache: Default::default(),
         })
     }
@@ -446,20 +446,35 @@ impl CheckpointStore {
     /// Refuse mixing codecs before any generation activation or input. R10
     /// cannot be retroactively taught to reject v3 instead of falling back.
     pub fn open_pipeline_exclusive(dir: impl Into<PathBuf>, max_keys: usize, retention: CheckpointRetention) -> Result<Self> {
+        Self::open_profile_exclusive(dir,max_keys,retention,3)
+    }
+
+    /// K2 never shares writable history with File/v3, including explicit fresh
+    /// starts. Prevent a source switch from hiding a foreign CURRENT behind a
+    /// new generation and breaking later downgrade/restore behavior.
+    pub fn open_reliable_exclusive(dir: impl Into<PathBuf>, max_keys: usize, retention: CheckpointRetention) -> Result<Self> {
+        Self::open_profile_exclusive(dir,max_keys,retention,4)
+    }
+
+    fn open_profile_exclusive(dir: impl Into<PathBuf>, max_keys: usize, retention: CheckpointRetention, version:u16) -> Result<Self> {
         let mut store = Self::open_exclusive(dir, max_keys, retention)?;
         for id in list_generation_ids(&store.dir)? {
             let chk = store.dir.join(format!("chk-{id:08}"));
             for file in ["0000.bin", "0000.bin.part"] {
                 let path = chk.join(file);
                 if !path.exists() { continue; }
-                let bytes = read_bounded(&path, CHUNK_SIZE as u64)?;
+                let bytes = read_bounded(&path, CHUNK_SIZE as u64).map_err(|e|e.context("checkpoint_guard_generation",id.to_string()).context("checkpoint_guard","unreadable_history_cannot_be_classified; preserve_directory_and_inspect_backup"))?;
                 if bytes.starts_with(MAGIC) && matches!(bytes.get(4..6), Some([1 | 2, 0])) {
                     return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
                         "legacy single-window checkpoint history: refusing K1 writes in this directory; retain the original backup/binary and explicitly choose a new checkpoint directory"));
                 }
+                if bytes.starts_with(MAGIC) && bytes.len()>=6 && bytes[4..6]!=version.to_le_bytes() {
+                    return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                        "checkpoint source profile mismatch: File/v3 and JetStream/v4 require separate directories; retain original history"));
+                }
             }
         }
-        store.pipeline_only = true;
+        store.pipeline_version = Some(version);
         Ok(store)
     }
 
@@ -483,7 +498,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if version == 3 {
+        if matches!(version,3|4) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {
@@ -636,8 +651,8 @@ impl CheckpointStore {
         };
         // Legacy/read handles may have been opened before a different writer
         // published and pruned generations. Recheck under the writer lock.
-        if self.pipeline_only && payload.get(4..6) != Some(&[3, 0]) {
-            return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "K1 writer cannot publish legacy snapshots"));
+        if self.pipeline_version.is_some_and(|version|payload.get(4..6)!=Some(version.to_le_bytes().as_slice())) {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "profile writer cannot publish legacy or foreign source snapshots"));
         }
         let disk_next = list_generation_ids(&self.dir)?
             .into_iter()

@@ -38,6 +38,9 @@ use crate::validate::{
 /// increments on start/stop/running/failed; it must not trigger this hold.
 pub(crate) const MAX_PIPELINE_ATTEMPTS: u64 = 16;
 
+#[cfg(feature="jetstream")]
+mod jetstream_source;
+
 /// Per-pipeline backoff, capped at 32 seconds; never sleep in converge.
 /// A successful launch is not a stable recovery: reset after 30s running.
 pub(crate) fn retry_backoff(consecutive_failures: u64) -> Duration {
@@ -499,12 +502,12 @@ impl Supervisor {
             if row.spec.recovery != "aligned"
                 || !matches!(
                     row.spec.source.kind.as_str(),
-                    "file" | "file_replay" | "replay"
+                    "file" | "file_replay" | "replay" | "jetstream"
                 )
             {
                 return Err(SparrowError::new(
                     sparrow_model::ErrorCode::FeatureUnavailable,
-                    "aligned File configuration required",
+                    "aligned replayable source configuration required",
                 ));
             }
             let path = row.spec.checkpoint_dir.clone().unwrap_or_else(|| {
@@ -705,6 +708,11 @@ impl Supervisor {
                     if !job.stable
                         && !job.is_finished()
                         && job.started_at.elapsed() >= self.stable_run
+                        // Uptime alone can repeatedly reset a slow poison loop.
+                        // Reliable attempts need durable input progress as well.
+                        && (job.source_kind!="jetstream" || matches!(&job.kind,
+                            RunningKind::Aligned{checkpoint,..} if checkpoint.snapshot().reliable_source
+                                .is_some_and(|s|s.committed_cut>s.restored_cut)))
                     {
                         job.stable = true;
                         Some(name.clone())
@@ -1003,6 +1011,8 @@ impl Supervisor {
         let recovery = RecoveryPolicy::parse(&spec.recovery)?;
 
         let job = match spec.source.kind.as_str() {
+            #[cfg(feature="jetstream")]
+            "jetstream" => self.start_jetstream(&spec,schema,plan,&policy).await?,
             "file" | "file_replay" | "replay" => {
                 self.start_file(name, &spec, schema, plan, recovery, &policy)
                     .await?
@@ -1468,7 +1478,7 @@ impl Supervisor {
                             Ok::<_, SparrowError>(request)
                         };
                         let result = tokio::select! {
-                            _ = child.cancelled() => return Ok(()),
+                            _ = child.cancelled() => {metrics.record_checkpoint_abort();return Ok(());},
                             result = tokio::time::timeout_at(admission.deadline, inject) =>
                                 result.unwrap_or_else(|_| Err(SparrowError::new(
                                     sparrow_model::ErrorCode::ResourceExhausted, "aligned checkpoint timed out"))),
@@ -1494,7 +1504,7 @@ impl Supervisor {
                         // requires every frozen participant and the real Sink ACK.
                         workers.spawn(async move {
                         let aligned = tokio::select! {
-                            _ = checkpoint_cancel.cancelled() => return,
+                            _ = checkpoint_cancel.cancelled() => {metrics.record_checkpoint_abort();return;},
                             result = tokio::time::timeout_at(admission.deadline, request.wait_participants(checkpoint_timeout)) =>
                                 result.unwrap_or_else(|_| Err(SparrowError::new(sparrow_model::ErrorCode::ResourceExhausted, "aligned checkpoint timed out"))),
                         };
@@ -1507,7 +1517,7 @@ impl Supervisor {
                                 return;
                             }
                         };
-                        if checkpoint_cancel.is_cancelled() { return; }
+                        if checkpoint_cancel.is_cancelled() { metrics.record_checkpoint_abort();return; }
                         admission.phase("committing");
                         let committed = tokio::task::spawn_blocking(move || {
                             let started = std::time::Instant::now();
@@ -1750,7 +1760,14 @@ impl Supervisor {
                         )
                     })?;
                 }
-                r.map(|_| ()).and(src)
+                // Source failures may cancel Kernel to unblock its bounded
+                // inbox. Preserve that root cause instead of replacing poison,
+                // retention or ACK errors with consequential Cancelled.
+                match (r,src) {
+                    (_,Err(e))=>Err(e),
+                    (Err(e),_)=>Err(e),
+                    (Ok(_),Ok(()))=>Ok(()),
+                }
             }
         }
     }

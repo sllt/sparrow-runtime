@@ -38,3 +38,6 @@ mod review_tests;
 
 #[cfg(test)]
 mod r4_tests;
+
+#[cfg(all(test,feature="jetstream",feature="demo-io"))]
+mod k2_tests;

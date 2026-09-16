@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 # Run one feature profile once, then freeze its exact test executables.
-# Usage: bash scripts/production-freeze-tests.sh ARTIFACT_DIR core|production
+# Usage: bash scripts/production-freeze-tests.sh ARTIFACT_DIR core|production|reliable
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
-art=${1:?artifact directory required}; profile=${2:?core or production required}
-case "$profile" in core|production) ;; *) exit 2;; esac
+art=${1:?artifact directory required}; profile=${2:?core, production or reliable required}
+case "$profile" in core|production|reliable) ;; *) exit 2;; esac
+if [[ "$profile" == reliable && ! -x "${SPARROW_NATS_SERVER:-}" ]]; then
+    printf 'SKIPPED reliable: set SPARROW_NATS_SERVER to the pinned isolated-test broker; no full K2 PASS claimed\n' >&2
+    exit 4
+fi
 command -v cargo >/dev/null; command -v jq >/dev/null; command -v sha256sum >/dev/null
 mkdir -p "$art"; art=$(cd "$art" && pwd)
 test ! -e "$art/$profile-test-binaries.json"
 test ! -e "$art/$profile-messages.jsonl"
 extra=(); if [[ "$profile" == production ]]; then extra=(--no-default-features -p sparrow-server -p sparrow-cli); fi
+if [[ "$profile" == reliable ]]; then extra=(--features sparrow-server/jetstream); fi
 if ! cargo test --locked --release --quiet --message-format=json "${extra[@]}" \
     > "$art/$profile-messages.jsonl" 2> "$art/$profile-build.log"; then
     printf 'TEST_PROFILE_FAILED %s; logs: %s\n' "$profile" "$art" >&2

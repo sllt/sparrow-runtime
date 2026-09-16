@@ -9,6 +9,7 @@ use sparrow_plan::{CheckpointPlan, ParticipantId};
 use std::sync::Arc;
 
 pub const PIPELINE_SNAPSHOT_VERSION: u16 = 3;
+pub const RELIABLE_SNAPSHOT_VERSION: u16 = 4;
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
 
 #[derive(Debug, PartialEq)]
@@ -21,6 +22,7 @@ pub struct PipelineSnapshot {
     pub generation: [u8; 16],
     pub plan: CheckpointPlan,
     pub windows: Vec<WindowFreeze>,
+    pub next_output: Option<sparrow_model::OutputSequence>,
 }
 
 fn invalid(message: &str) -> SparrowError {
@@ -82,6 +84,9 @@ impl PipelineSnapshot {
         max_keys: usize,
     ) -> Result<EncodedSnapshot> {
         plan.validate()?;
+        if acks.next_output.is_some() != (source.identity.kind == "jetstream-v1") {
+            return Err(invalid("reliable output cursor and source profile disagree"));
+        }
         if source.identity.path.len() > MAX_SOURCE_METADATA
             || source.identity.kind.len() > MAX_SOURCE_METADATA
             || acks.freezes.len() != plan.states.len()
@@ -104,16 +109,20 @@ impl PipelineSnapshot {
         // Include the state count and first frame length now. Appending either
         // after filling a large manifest must not double a whole metadata Vec.
         let mut prefix = Vec::with_capacity(
-            104 + source.identity.kind.len() + source.identity.path.len() + manifest.len(),
+            104 + usize::from(acks.next_output.is_some())*24 + source.identity.kind.len() + source.identity.path.len() + manifest.len(),
         );
         prefix.extend_from_slice(crate::checkpoint::MAGIC);
-        prefix.extend_from_slice(&PIPELINE_SNAPSHOT_VERSION.to_le_bytes());
+        prefix.extend_from_slice(&if acks.next_output.is_some(){RELIABLE_SNAPSHOT_VERSION}else{PIPELINE_SNAPSHOT_VERSION}.to_le_bytes());
         prefix.extend_from_slice(&checkpoint_id.to_le_bytes());
         prefix.extend_from_slice(&ingested_rows.to_le_bytes());
         crate::checkpoint::encode_position(source, &mut prefix)?;
         prefix.extend_from_slice(&acks.attempt.to_le_bytes());
         prefix.extend_from_slice(&revision.to_le_bytes());
         prefix.extend_from_slice(&acks.generation);
+        if let Some(position)=acks.next_output {
+            prefix.extend_from_slice(&position.epoch());
+            prefix.extend_from_slice(&position.first().to_le_bytes());
+        }
         prefix.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
         prefix.extend_from_slice(&manifest);
         prefix.extend_from_slice(&(acks.freezes.len() as u16).to_le_bytes());
@@ -184,10 +193,12 @@ impl PipelineSnapshot {
     ) -> Result<Self> {
         if bytes.len() as u64 > MAX_SNAPSHOT_BYTES
             || take(&mut bytes, 4)? != crate::checkpoint::MAGIC
-            || u16::from_le_bytes(take(&mut bytes, 2)?.try_into().unwrap())
-                != PIPELINE_SNAPSHOT_VERSION
         {
             return Err(invalid("unsupported pipeline snapshot magic/version/size"));
+        }
+        let version=u16::from_le_bytes(take(&mut bytes,2)?.try_into().unwrap());
+        if !matches!(version,PIPELINE_SNAPSHOT_VERSION|RELIABLE_SNAPSHOT_VERSION) {
+            return Err(invalid("unsupported pipeline snapshot version"));
         }
         let checkpoint_id = u64_value(&mut bytes)?;
         let ingested_rows = u64_value(&mut bytes)?;
@@ -215,6 +226,14 @@ impl PipelineSnapshot {
         }
         if attempt == 0 {
             return Err(invalid("pipeline snapshot lacks attempt identity"));
+        }
+        let next_output=if version==RELIABLE_SNAPSHOT_VERSION {
+            let epoch=take(&mut bytes,16)?.try_into().unwrap();
+            Some(sparrow_model::OutputSequence::new(epoch,u64_value(&mut bytes)?)
+                .map_err(|_|invalid("invalid reliable output position"))?)
+        } else {None};
+        if next_output.is_some() != (source.identity.kind=="jetstream-v1") {
+            return Err(invalid("reliable snapshot lacks source/output identity"));
         }
         let length = u32_value(&mut bytes)?;
         let plan = CheckpointPlan::decode(take(&mut bytes, length)?)?;
@@ -269,6 +288,7 @@ impl PipelineSnapshot {
             generation,
             plan,
             windows,
+            next_output,
         })
     }
 }
@@ -287,7 +307,7 @@ impl StoredSnapshot {
         }
     }
     pub(crate) fn decode(bytes: &[u8], max_keys: usize, materialize: bool) -> Result<Self> {
-        if bytes.get(4..6) == Some(PIPELINE_SNAPSHOT_VERSION.to_le_bytes().as_slice()) {
+        if matches!(bytes.get(4..6),Some([3|4,0])) {
             Ok(Self::Pipeline(PipelineSnapshot::decode_mode(
                 bytes,
                 max_keys,

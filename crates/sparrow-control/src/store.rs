@@ -1545,6 +1545,7 @@ mod tests {
             sql: Some("SELECT device_id FROM sensors".into()),
             graph: None,
             source: SourceSpec {
+                jetstream: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
                 port: Some(1883),

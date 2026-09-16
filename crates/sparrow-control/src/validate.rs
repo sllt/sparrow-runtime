@@ -102,6 +102,7 @@ pub fn bind_plan(
 pub fn replay_label_for_source(kind: &str) -> &'static str {
     match kind {
         "file" | "file_replay" | "replay" => "replayable",
+        "jetstream" if cfg!(feature="jetstream") => "replayable",
         "mqtt" | "mqtt_source" | "http_push" | "http" => "unsupported",
         _ => sparrow_plan::REPLAY_UNBOUND,
     }
@@ -188,6 +189,14 @@ pub fn validate_io(
 ) -> Result<()> {
     spec.check_delivery()?;
     match spec.source.kind.as_str() {
+        #[cfg(feature="jetstream")]
+        "jetstream" => {
+            let config=spec.source.jetstream.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"JetStream config required"))?;
+            config.reader().validate()?;
+            config.connection().validate(policy)?;
+            check_data_path(std::path::Path::new(spec.checkpoint_dir.as_deref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"checkpoint_dir required"))?)).map_err(io)?;
+            if let Some(reference)=&config.token_secret { secrets.resolve(reference).map_err(io)?; }
+        }
         "mqtt" => {
             refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
             let mqtt = mqtt_config(&spec.source, schema.clone(), demo, "validate")?;
@@ -432,7 +441,8 @@ pub fn validate_aligned_plan(
     if !recovery.is_aligned() {
         return Ok(());
     }
-    if !matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
+    if !matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay")
+        && !(cfg!(feature="jetstream") && spec.source.kind=="jetstream") {
         return Err(SparrowError::new(
             ErrorCode::UnsupportedRestore,
             "aligned recovery requires a ReplayableSource (file); MQTT replay remains unsupported",
@@ -445,6 +455,10 @@ pub fn validate_aligned_plan(
         check_data_path(std::path::Path::new(dir)).map_err(io)?;
     }
     sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    if spec.source.kind=="jetstream" && plan.stages.iter().any(|stage|
+        matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}))) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state or one/two Count windows only; event/processing-time replay context not verified"));
+    }
     Ok(())
 }
 
@@ -492,6 +506,12 @@ pub fn capabilities_json() -> serde_json::Value {
                 "delivery": file.delivery.as_str(),
                 "recovery": file.recovery.as_str(),
                 "aligned": true,
+            },
+            {
+                "kind":"jetstream","enabled_by_build":cfg!(feature="jetstream"),"maturity":"preview",
+                "replay":if cfg!(feature="jetstream"){"replayable"}else{"unavailable"},
+                "delivery":"checkpointed_at_least_once","recovery":"aligned","requires_eligible_profile":true,
+                "certified":false,
             }
         ],
         "honesty": HONESTY,
@@ -505,7 +525,8 @@ pub fn reject_named_delivery(name: &str) -> Result<DeliveryGuarantee> {
 /// Effective delivery + recovery + risk for a stored pipeline spec.
 pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
     let recovery = RecoveryPolicy::parse(&spec.recovery).unwrap_or(RecoveryPolicy::RestartFresh);
-    let replayable = matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay");
+    let reliable=cfg!(feature="jetstream") && spec.source.kind=="jetstream";
+    let replayable = matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") || reliable;
     let replay = if replayable {
         ReplaySupport::Replayable.as_str()
     } else {
@@ -519,7 +540,7 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
         "no_durable_restore; live_best_effort_drops_ok"
     };
     serde_json::json!({
-        "delivery": DeliveryGuarantee::LiveBestEffort.as_str(),
+        "delivery": if reliable {DeliveryGuarantee::CheckpointedAtLeastOnce.as_str()} else {DeliveryGuarantee::LiveBestEffort.as_str()},
         "recovery": recovery.as_str(),
         "replay": replay,
         "exactly_once": false,
@@ -534,6 +555,30 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
 /// independent of whether the stored spec currently requests aligned recovery.
 pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
+    if spec.source.kind=="jetstream" {
+        let accepted=spec.basic_check().and_then(|_|spec.check_delivery()).and_then(|_|validate_aligned_plan(spec,plan));
+        value["requested_delivery"]=serde_json::json!(spec.delivery);
+        if accepted.is_err() {value["delivery"]=serde_json::json!("unavailable");}
+        value["aligned_eligible"]=serde_json::json!(accepted.is_ok());
+        value["aligned_eligibility_reason"]=serde_json::json!(accepted.err().map_or_else(||"jetstream_zero_or_one_two_count_windows".into(),|e|e.message));
+        value["checkpoint_participants"]=serde_json::json!({"snapshot_version":4,"scope":"single_jetstream_single_required_http_sink",
+            "restore_compatibility":"full_computation_and_source_reader_binding","downstream_changes":"rejected_until_explicit_lineage_fork",
+            "confirmation":"HTTP_2xx_acceptance_not_business_commit","source_ack":"after_durable_checkpoint","output_ids":"128bit_epoch_64bit_ordinal",
+            "certified":false,"maturity":"preview","poison":"fail_then_finite_retry_or_held","durable_outbox":false,"dlq":false});
+        value["recovery_risk"]=serde_json::json!("uncommitted_outputs_may_repeat_with_stable_ids; retention_expiry_refuses_restore; no_HA");
+        if let Some(config)=&spec.source.jetstream {
+            value["jetstream_execution"]=serde_json::json!({
+                "input_batching":"already_ready_rows_bounded_by_kernel_and_pull",
+                "idle_backoff_ms":{"initial":5,"maximum":250,"nonempty_fetch":0},
+                "idle_steady_pulls_per_second_max":4,
+                "ack_policy":"explicit","ack_concurrency":16,"ack_attempts":3,
+                "checkpoint_timeout":"abort_checkpoint_keep_attempt_without_ACK; bootstrap_blocks_input",
+                "sdk_reservation_bytes":512usize*1024+32*config.pull_bytes+(config.pull_messages+2)*4608,
+                "ack_workspace_bytes":64*1024,
+                "payload_admission":"shared_Job_budget_not_protocol_max_payload"});
+        }
+        return value;
+    }
     if matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
         match sparrow_plan::CheckpointPlan::from_physical(plan) {
             Ok(manifest) => {
@@ -541,7 +586,7 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
                 value["aligned_eligibility_reason"] = serde_json::json!(match manifest.states.len() {0=>"zero_state_file_cut",1=>"single_supported_window",_=>"two_count_window_participants"});
                 value["checkpoint_participants"] = serde_json::json!({"source":manifest.source.raw(),"required_sink":manifest.sink.raw(),
                     "snapshot_version":sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION,
-                    "manifest_version":"CPL1","semantics_version":"CP01+RCP2","restore_compatibility":"source_and_every_state_upstream_prefix",
+                    "manifest_version":"CPL1","semantics_version":"CP01+RCP2","restore_compatibility":"source_and_all_state_upstream_prefixes; plain_CP01_full_plan_strict",
                     "downstream_changes":"allowed_after_last_state; plain_CP01_snapshots_remain_full_plan_strict; external_outputs_are_not_rolled_back",
                     "states":manifest.states.iter().map(|state|match state.id {
                         sparrow_plan::ParticipantId::State {operator,slot,shard}=>serde_json::json!({"operator":operator.raw(),"slot":slot.raw(),"shard":shard,"codec":state.codec,"window_kind":state.window_kind}),
@@ -629,6 +674,7 @@ mod tests {
             sql: Some("SELECT device_id FROM sensors".into()),
             graph: None,
             source: SourceSpec {
+                jetstream: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
                 port: Some(1883),
@@ -707,6 +753,7 @@ mod tests {
     #[test]
     fn v02_default_mqtt_client_id_is_unique_per_instance() {
         let src = SourceSpec {
+            jetstream: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),
@@ -749,6 +796,7 @@ mod tests {
     #[test]
     fn p0_11_mqtt_credentials_require_tls() {
         let mut src = SourceSpec {
+            jetstream: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),

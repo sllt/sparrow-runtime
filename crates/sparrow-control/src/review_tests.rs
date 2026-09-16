@@ -225,6 +225,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
         graph: None,
         source: SourceSpec {
             kind: "file".into(),
+            jetstream: None,
             host: None,
             port: None,
             topic: "sensors/json".into(),
@@ -373,6 +374,7 @@ fn mqtt_aligned_still_rejected() {
         graph: None,
         source: SourceSpec {
             kind: "mqtt".into(),
+            jetstream: None,
             host: Some("127.0.0.1".into()),
             port: Some(1883),
             topic: "t".into(),

@@ -15,6 +15,11 @@ pub fn inventory() -> Value {
         })
         .collect();
     json!({"version":1,"combinations":combinations,
+        "jetstream":{"enabled_by_build":cfg!(feature="jetstream"),"maturity":"preview","requires_feature":"jetstream",
+            "source":"jetstream","sink":"http","delivery":"checkpointed_at_least_once","recovery":"aligned","snapshot_version":4,
+            "state_shapes":["zero_state","single_count_window","two_count_windows"],"consumer_scope":"cooperative_single_node_no_HA",
+            "poison":"fail_finite_retry_or_held","dlq":false,"durable_outbox":false,"automatic_resume_required":true,
+            "source_filtering":false,"semantic_fork_and_fixed_replay":false,"certified":false},
         "function_semantics":{"version":sparrow_expr::semantics::VERSION,"evaluation":sparrow_expr::semantics::EVALUATION,
             "pure_deterministic":true,"entries":sparrow_expr::semantics::FUNCTIONS.iter().map(|f|json!({"name":f.name,
                 "min_args":f.min_args,"max_args":f.max_args,"input":f.input,"null_policy":f.null_policy,

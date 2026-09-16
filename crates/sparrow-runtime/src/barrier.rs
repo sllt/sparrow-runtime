@@ -250,6 +250,7 @@ pub enum ParticipantOutcome {
     SourceCut,
     State(EncodedFreeze),
     Sink(FlushOutcome),
+    ReliableSink { flush: FlushOutcome, next_output: sparrow_model::OutputSequence },
     Failed(SparrowError),
 }
 
@@ -264,9 +265,11 @@ pub struct ParticipantAcks {
     pub(crate) attempt: u64,
     pub(crate) generation: [u8; 16],
     pub(crate) freezes: Vec<EncodedFreeze>,
+    pub(crate) next_output: Option<sparrow_model::OutputSequence>,
 }
 
 impl ParticipantAcks {
+    pub fn next_output(&self) -> Option<sparrow_model::OutputSequence> { self.next_output }
     pub fn attempt(&self) -> u64 {
         self.attempt
     }
@@ -318,6 +321,7 @@ mod production_restore_tests {
 pub struct FlushOutcome {
     pub ok: bool,
     pub dropped: u64,
+    pub timed_out: bool,
 }
 
 /// Only the active checkpoint owns an ACK inbox. Dropping its request on
@@ -327,6 +331,7 @@ pub struct FlushOutcome {
 pub struct AlignedAcks {
     active: Arc<Mutex<Option<ActiveCheckpoint>>>,
     participants: Arc<OnceLock<ParticipantAttempt>>,
+    output: Arc<OnceLock<sparrow_model::OutputSequence>>,
 }
 
 struct ActiveCheckpoint {
@@ -343,6 +348,15 @@ pub struct CheckpointAcks {
 }
 
 impl AlignedAcks {
+    /// Configure before Kernel admission. The CaptureSink owns advancement;
+    /// checkpointing receives the cursor in its actual Sink barrier ACK.
+    pub fn with_output_sequence(self, sequence: sparrow_model::OutputSequence) -> Result<Self> {
+        if self.participants.get().is_some() || self.output.set(sequence).is_err() {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,"output cursor must be initialized exactly once before input"));
+        }
+        Ok(self)
+    }
+    pub(crate) fn output_sequence(&self) -> Option<sparrow_model::OutputSequence> { self.output.get().copied() }
     pub(crate) fn configure(
         &self,
         plan: Arc<CheckpointPlan>,
@@ -417,13 +431,20 @@ impl AlignedAcks {
         self.send(ack).await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn sink_flushed(&self, checkpoint_id: u64, flush: FlushOutcome) {
+        self.sink_flushed_with_output(checkpoint_id,flush,None).await;
+    }
+    pub(crate) async fn sink_flushed_with_output(&self, checkpoint_id: u64, flush: FlushOutcome, output: Option<sparrow_model::OutputSequence>) {
         let ack = if let Some(p) = self.participants.get() {
             AlignedAck::Participant {
                 attempt: p.attempt,
                 checkpoint_id,
                 participant: ParticipantId::Sink(p.plan.sink),
-                outcome: ParticipantOutcome::Sink(flush),
+                outcome: match output {
+                    Some(next_output) => ParticipantOutcome::ReliableSink{flush,next_output},
+                    None => ParticipantOutcome::Sink(flush),
+                },
             }
         } else {
             AlignedAck::SinkFlushed {
@@ -520,6 +541,8 @@ impl CheckpointAcks {
         let mut seen = std::collections::BTreeSet::new();
         let mut freezes = BTreeMap::new();
         let mut bytes = 0usize;
+        let initial_output=self.registry.output_sequence();
+        let mut next_output=None;
         let deadline = Instant::now() + timeout;
         while seen.len() < expected.len() {
             let ack = tokio::time::timeout_at(deadline, self.receiver.recv())
@@ -528,7 +551,7 @@ impl CheckpointAcks {
                     SparrowError::new(
                         ErrorCode::ResourceExhausted,
                         "participant checkpoint alignment timed out",
-                    )
+                    ).context("checkpoint_outcome", "timeout")
                 })?
                 .ok_or_else(|| {
                     SparrowError::new(ErrorCode::Cancelled, "participant ACK channel closed")
@@ -564,8 +587,17 @@ impl CheckpointAcks {
                     ParticipantOutcome::Sink(FlushOutcome {
                         ok: true,
                         dropped: 0,
+                        timed_out: false,
                     }),
-                ) => {
+                ) if initial_output.is_none() => {
+                    seen.insert(participant);
+                }
+                (ParticipantId::Sink(_),ParticipantOutcome::ReliableSink{flush:FlushOutcome{ok:true,dropped:0,timed_out:false},next_output:position}) => {
+                    if !initial_output.is_some_and(|start|start.epoch()==position.epoch() && start.first()<=position.first())
+                        || next_output.is_some_and(|previous|previous!=position) {
+                        return Err(SparrowError::new(ErrorCode::CodecViolation,"invalid/conflicting reliable Sink output cursor"));
+                    }
+                    next_output=Some(position);
                     seen.insert(participant);
                 }
                 (ParticipantId::State { .. }, ParticipantOutcome::State(freeze)) => {
@@ -601,7 +633,12 @@ impl CheckpointAcks {
                     }
                     freezes.insert(participant, freeze);
                 }
-                (ParticipantId::Sink(_), ParticipantOutcome::Sink(_)) => {
+                (ParticipantId::Sink(_), ParticipantOutcome::Sink(FlushOutcome{timed_out:true,dropped:0,..})) |
+                (ParticipantId::Sink(_), ParticipantOutcome::ReliableSink{flush:FlushOutcome{timed_out:true,dropped:0,..},..}) => {
+                    return Err(SparrowError::new(ErrorCode::ResourceExhausted,"required sink flush timed out").context("checkpoint_outcome","timeout"));
+                }
+                (ParticipantId::Sink(_), ParticipantOutcome::Sink(_)) |
+                (ParticipantId::Sink(_), ParticipantOutcome::ReliableSink{..}) => {
                     return Err(SparrowError::new(ErrorCode::ResourceExhausted,"barrier did not align: required sink flush failed or dropped output; refusing commit"));
                 }
                 _ => {
@@ -616,6 +653,7 @@ impl CheckpointAcks {
         Ok(ParticipantAcks {
             attempt,
             generation,
+            next_output,
             freezes: plan
                 .states
                 .iter()
@@ -700,8 +738,8 @@ pub async fn wait_outbox(outbox: &InflightCounter, timeout: Duration) -> FlushOu
     let deadline = Instant::now() + timeout;
     while outbox.pending() > 0 {
         if Instant::now() >= deadline {
-            let dropped = outbox.drops_since_mark().max(outbox.pending());
-            return FlushOutcome { ok: false, dropped };
+            let dropped = outbox.drops_since_mark();
+            return FlushOutcome { ok: false, dropped, timed_out: true };
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
@@ -709,6 +747,7 @@ pub async fn wait_outbox(outbox: &InflightCounter, timeout: Duration) -> FlushOu
     FlushOutcome {
         ok: dropped == 0,
         dropped,
+        timed_out: false,
     }
 }
 
@@ -808,6 +847,7 @@ mod tests {
                 FlushOutcome {
                     ok: true,
                     dropped: 0,
+                    timed_out: false,
                 },
             )
             .await;
@@ -824,6 +864,7 @@ mod tests {
                 FlushOutcome {
                     ok: true,
                     dropped: 0,
+                    timed_out: false,
                 },
             )
             .await;
@@ -844,6 +885,7 @@ mod tests {
                     FlushOutcome {
                         ok: true,
                         dropped: 0,
+                        timed_out: false,
                     },
                 )
                 .await;
@@ -883,6 +925,7 @@ mod tests {
                             FlushOutcome {
                                 ok: false,
                                 dropped: 1,
+                                timed_out: false,
                             },
                         )
                         .await
@@ -1052,7 +1095,9 @@ mod tests {
     async fn r3_pending_timeout_can_recover_without_forgiving_loss() {
         let outbox = InflightCounter::new();
         outbox.enqueue();
-        assert!(!wait_outbox(&outbox, Duration::from_millis(1)).await.ok);
+        let timed=wait_outbox(&outbox, Duration::from_millis(1)).await;
+        assert!(timed.timed_out && !timed.ok);
+        assert_eq!(timed.dropped,0,"timeout is not evidence of dropped output");
         outbox.ack();
         assert!(wait_outbox(&outbox, Duration::from_millis(1)).await.ok);
         outbox.enqueue();

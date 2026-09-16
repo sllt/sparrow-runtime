@@ -14,6 +14,49 @@ use tower::ServiceExt;
 #[path = "review_api/r11.rs"]
 mod r11;
 
+#[test]
+fn k2_api_feature_profile_permissions_and_envelope_are_honest_before_io() {
+    let kernel=Arc::new(sparrow_control::host_kernel_with_max_jobs(1).unwrap());
+    kernel.block_on(async {
+        let store=Arc::new(Store::open_memory().unwrap());store.put_stream("sensors",STREAM).unwrap();
+        store.put_allow("127.0.0.1",4222).unwrap();store.put_allow("127.0.0.1",8081).unwrap();
+        let supervisor=sparrow_control::Supervisor::new(store.clone(),kernel.clone(),false,None).unwrap();
+        let state=AppState{store:store.clone(),supervisor,token:Arc::new(TOKEN.into()),safe_mode:false};
+        let dir=tmp("k2-validate-does-not-start");
+        let mut spec:Value=serde_json::from_str(include_str!("../../../deploy/pipeline-jetstream.json")).unwrap();
+        spec["checkpoint_dir"]=json!(dir);
+        let body=serde_json::to_string(&spec).unwrap();
+        let request=Request::builder().method("POST").uri("/v1/validate").body(Body::from(body.clone())).unwrap();
+        assert_eq!(call(&state,request).await.0,StatusCode::UNAUTHORIZED);
+        let enabled=sparrow_control::capabilities_json()["inventory"]["jetstream"]["enabled_by_build"]==true;
+        let (status,view)=call(&state,auth_post("/v1/explain",&body)).await;
+        if enabled {
+            assert_eq!(status,StatusCode::OK,"{view}");assert_eq!(view["delivery"],"checkpointed_at_least_once");
+            assert_eq!(view["experimental"],true);assert_eq!(view["effective"]["checkpoint_participants"]["snapshot_version"],4);
+            assert_eq!(view["effective"]["checkpoint_participants"]["certified"],false);
+            for change in [0,1,2,3,4,5] {
+                let mut bad=spec.clone();
+                match change {
+                    0=>bad["checkpoint"]["resume_latest"]=json!(false),
+                    1=>bad["checkpoint"]["interval_ms"]=Value::Null,
+                    2=>bad["sink"]["kind"]=json!("log"),
+                    3=>bad["restore"]=json!({"kind":"checkpoint","snapshot_id":"1"}),
+                    4=>bad["source"]["jetstream"]["servers"]=json!(["nats://name:inline-private-token@127.0.0.1:4222"]),
+                    _=>bad["source"]["topic"]=json!("input.filtered"),
+                }
+                let (status,error)=call(&state,auth_post("/v1/validate",&bad.to_string())).await;
+                assert!(!status.is_success(),"{change}: {error}");assert!(!error.to_string().contains("inline-private-token"));
+            }
+        } else {assert!(!status.is_success());assert_eq!(view["error"]["code"],"feature_unavailable");}
+        assert!(!dir.exists(),"validate/explain must not activate source/store");assert_eq!(kernel.live_tasks(),0);
+        let mut mqtt=spec;mqtt["source"]=json!({"kind":"mqtt","host":"127.0.0.1","port":1883});mqtt["recovery"]=json!("restart_fresh");
+        mqtt.as_object_mut().unwrap().remove("checkpoint");
+        let (status,error)=call(&state,auth_post("/v1/validate",&mqtt.to_string())).await;
+        assert!(!status.is_success());assert_eq!(error["error"]["code"],"unsupported_delivery");
+        state.supervisor.shutdown().await;
+    });
+}
+
 const TOKEN: &str = "review-api-token";
 const STREAM: &str = r#"{"fields":[
   {"name":"device_id","type":"utf8","nullable":false},

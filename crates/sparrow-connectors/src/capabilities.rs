@@ -79,7 +79,11 @@ pub fn refuse_unsupported_recovery(
 }
 
 pub fn refuse_delivery_name(name: &str) -> Result<DeliveryGuarantee> {
-    DeliveryGuarantee::parse(name).map_err(|e| ConnectorError::new(e.code, e.to_string()))
+    let guarantee=DeliveryGuarantee::parse(name).map_err(|e| ConnectorError::new(e.code, e.to_string()))?;
+    if guarantee!=DeliveryGuarantee::LiveBestEffort {
+        return Err(ConnectorError::new(ErrorCode::UnsupportedDelivery,"checkpointed delivery requires a validated JetStream pipeline; standalone live connectors cannot claim it"));
+    }
+    Ok(guarantee)
 }
 
 pub fn refuse_recovery_name(name: &str) -> Result<RecoveryPolicy> {

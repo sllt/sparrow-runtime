@@ -13,18 +13,24 @@ pub enum DeliveryGuarantee {
     /// Drop-ok live path. Records may be lost on backpressure, crash, or
     /// operator failure. This is the only supported live guarantee.
     LiveBestEffort,
+    /// Opt-in JetStream profile: required HTTP 2xx acceptance before durable
+    /// checkpoint and input ACK. Retention and eligible-plan gates are required;
+    /// this is NOT downstream business completion or exactly-once.
+    CheckpointedAtLeastOnce,
 }
 
 impl DeliveryGuarantee {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::LiveBestEffort => "live_best_effort",
+            Self::CheckpointedAtLeastOnce => "checkpointed_at_least_once",
         }
     }
 
     pub fn parse(name: &str) -> Result<Self> {
         match name {
             "live_best_effort" | "LiveBestEffort" => Ok(Self::LiveBestEffort),
+            "checkpointed_at_least_once" => Ok(Self::CheckpointedAtLeastOnce),
             "exactly_once" | "exactly-once" | "at_least_once" | "at-least-once" => {
                 Err(SparrowError::new(
                     ErrorCode::UnsupportedDelivery,

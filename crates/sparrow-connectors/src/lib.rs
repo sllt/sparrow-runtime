@@ -12,6 +12,8 @@ pub mod error;
 pub mod file_replay;
 pub mod http;
 pub mod http_push;
+#[cfg(feature = "jetstream")]
+pub mod jetstream;
 pub mod log;
 pub mod mqtt;
 pub mod policy;

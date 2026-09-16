@@ -81,12 +81,12 @@ jobs:
           bash scripts/production-smoke.sh artifacts/package artifacts/smoke
           # Keep baseline artifacts out of the candidate's incremental cache.
           baseline=9a925275d362400c398037532903efdb8c4f8a8d
-          git worktree add --detach artifacts/r10-source "$baseline"
-          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/artifacts/r10-target" SPARROW_BUILD_COMMIT="$baseline" \
-            cargo build --manifest-path artifacts/r10-source/Cargo.toml --locked --release --quiet \
+          git worktree add --detach "$RUNNER_TEMP/r10-source" "$baseline"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/r10-target" SPARROW_BUILD_COMMIT="$baseline" \
+            cargo build --manifest-path "$RUNNER_TEMP/r10-source/Cargo.toml" --locked --release --quiet \
             --no-default-features -p sparrow-server --bin sparrow-server > artifacts/r10-build.log 2>&1
-          sha256sum artifacts/r10-target/release/sparrow-server > artifacts/r10-binary.sha256
-          bash scripts/production-k1-smoke.sh artifacts/package artifacts/k1-smoke artifacts/r10-target/release/sparrow-server
+          sha256sum "$RUNNER_TEMP/r10-target/release/sparrow-server" > artifacts/r10-binary.sha256
+          bash scripts/production-k1-smoke.sh artifacts/package artifacts/k1-smoke "$RUNNER_TEMP/r10-target/release/sparrow-server"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

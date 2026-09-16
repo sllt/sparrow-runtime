@@ -1,0 +1,37 @@
+{
+  "stream": "sensors",
+  "sql": "SELECT device_id, v FROM sensors",
+  "source": {
+    "kind": "jetstream",
+    "inbox_capacity": 16,
+    "jetstream": {
+      "servers": ["nats://127.0.0.1:4222"],
+      "namespace": "edge_local_account",
+      "stream": "SENSORS",
+      "consumer": "sparrow_sensors",
+      "ownership_bucket": "SPARROW_OWNERS",
+      "max_pending": 128,
+      "pending_bytes": 262144,
+      "pull_messages": 8,
+      "pull_bytes": 73728
+    }
+  },
+  "sink": {
+    "kind": "http",
+    "url": "http://127.0.0.1:8081/events",
+    "batch_rows": 64,
+    "batch_bytes": 262144,
+    "linger_ms": 5,
+    "max_inflight": 1
+  },
+  "delivery": "checkpointed_at_least_once",
+  "recovery": "aligned",
+  "checkpoint_dir": "/var/lib/sparrow/checkpoints/jetstream-sensors",
+  "checkpoint": {
+    "interval_ms": 1000,
+    "timeout_ms": 5000,
+    "retain_generations": 3,
+    "max_store_bytes": 33554432,
+    "resume_latest": true
+  }
+}

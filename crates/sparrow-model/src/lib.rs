@@ -17,6 +17,7 @@ pub mod ids;
 pub mod inflight;
 pub mod ingress;
 pub mod memory;
+pub mod output;
 pub mod resource;
 pub mod scalar;
 pub mod types;
@@ -38,6 +39,7 @@ pub use ids::{
 pub use inflight::InflightCounter;
 pub use ingress::{QueuedRow, QueueOccupancy};
 pub use memory::{MemoryLease, MemoryOwner};
+pub use output::OutputSequence;
 pub use resource::{CreditKind, CreditUsage, ResourceBudget};
 pub use scalar::{DynamicValue, Scalar};
 pub use types::{DataType, Field, Schema};

@@ -1080,7 +1080,7 @@ impl WindowOperator {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
                 format!(
-                    "freeze encode requires live {live}B / retention {}B and encoded {estimate}B / reservation {}B; refusing encode before CURRENT",
+                    "freeze encode requires live {live}B / retention {}B and working {working}B (encoded {estimate}B) / reservation {}B; refusing encode before CURRENT",
                     budget.retention_bytes, budget.reservation_bytes
                 ),
             ));

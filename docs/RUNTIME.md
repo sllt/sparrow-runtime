@@ -1,12 +1,22 @@
 # Runtime ownership (A3 / A4)
 
+R12/K2 执行更新：JetStream 在 Source 侧合并已就绪记录，只有整批成功入队后才推进 published cut；非空 pull 完成不 sleep，仅真正空闲时按 5～250 ms 退避。durable cut 通过有独立 64 KiB 额度的 worker 做最多 16 路 Explicit ACK、每条最多 3 次确认尝试，stop 取消并 join；默认 File 仍不携带 NATS SDK。checkpoint busy 不是 Job 错误，flush 超时单独标记（不伪造 dropped），JetStream 放弃该次提交但继续背压；真实输出/存储错误仍结束 attempt。具体合同与本批测试证据见 [JETSTREAM.md](JETSTREAM.md)。
+
+> K2 新增可选 JetStream Preview，**默认关闭，不替代下方 R11 生产基线**。单来源、零/单 Count/双 Count、单 required HTTP；空 checkpoint 固定 epoch，真实 Sink cut 保存输出 ordinal，durable publication 后才逐消息 ACK。v4 与 File/v3 目录隔离，语义切换/历史 replay/HA/DLQ/outbox 未开放。SDK bootstrap 先占真实 Job slot，同一 owner 的资源与目录锁保持到实际 I/O 关闭；详见 [K2 合同与证据](JETSTREAM.md)。
+
+K2 自查纠正了默认 File 输入的布局回归：新批次不能把完整 `RowBatch` 内联到所有 `IngressEvent` 中。可靠批次改用有独立 metadata lease 的间接句柄，普通事件保持薄布局；Box 先释放再归还 metadata credit。原 v12 零状态 fresh 比值 0.9582 未过 ≥0.97 门槛，失败样本保留；相同参数的 v13 ABBA 为 0.9980（双 Count 1.0149），输出 oracle 一致。这不是提升所有链路性能的声明。
+
+K2 v13 历史收尾：553 reliable 核心、35 独立 no-demo、23×20 专项重复、真实 SIGKILL/ACK 丢失/写入失败/保留过期、默认进程与 File 升级回退通过。100 ms 周期 / 20 ms 应用响应等待 on/off 为 1.0076/1.0133，失败提交 0；源码与二进制指纹见 [历史 K2 证据](JETSTREAM.md#k2-v13)，不作为 R12 或 NATS 容量数据。
+
+R12（2026-09-16）匹配复验：556 核心、35 no-demo、32×20 专项、进程故障与默认路径门槛通过。NATS 单管线预装排空 ABBA 相对 v13 为零状态 17.99×/单 Count 10.98×；默认 2k/s 短程 p99 约 16.5～16.8 ms，10k/s 有积压、p99 约 436～460 ms，不冒充持续 20k/s 或生产容量认证。详细口径、失败样本、源码与二进制指纹见 [R12 证据](JETSTREAM.md#r12-validation)。仍无 TLS/WAN、目标介质掉电与 24/72 h 认证。
+
 > R11：Source 在切点/barrier 按序发布后继续读取，独立单飞 worker 收集 ACK 并提交，退出等待真实阻塞工作收尾。恢复使用 RCP2 的全部状态上游前缀，完整计算保留作诊断；plain CP01 仍按旧严格合同。CPL1 外层可被旧 K1 完整读取后明确拒绝，避免未知新格式导致偷偷回退。详见 [当前恢复合同](PRODUCTION.md#周期-checkpoint-与恢复)。下方 K1 v8 数字是历史基线，不是 R11 复测结果。
 
 R11 HTTP flush 修复：强制 flush 只跳过已排队前缀最后不足一批的 linger，不能把每个 Runtime batch 都拆成 POST。强制状态按请求时的 sent 计数退出，避免新 epoch 到达而错过 `pending()==0` 时把强制模式永久带入后续流量。该计数仅控制合批策略，**不是** checkpoint 的前缀 ACK；Sink barrier 仍等待全部真实 receipts 完成。`Receiver::is_empty()` 仅作合批调度提示，不作为提交证据。
 
 R11 最终匹配复验（2026-09-15 / package-v8）：540 核心、34 独立无 demo、140×20 重复与进程恢复/旧版本回滚反例通过。零状态 100 ms/20 ms Sink 在 6400/25600 输入的 on/off 比为 0.9994/1.0059；双 Count 为 0.9475，均过原 ≥0.90 门槛。fresh 三组 ABBA 过原 ≥0.97 门槛；详见 [完整 R11 证据](PRODUCTION.md#r11-validation)。不是 WAN、设备或 24/72 h 认证。
 
-Window/Dedup 输出 lease 按 `resident_bytes() + 64` 而非逻辑编码字节计费，mailbox permit 使用真实 lease bytes。相同字节容量容纳的输出行可能更少、背压更早，不能沿用旧 `tracked_bytes` 的行数估计。输出先构建本次全部 chunks，再释放 scratch 后发送；瞬时峰值包括 scratch 与这些输出 leases，不是只有一个 chunk。辅助 retention/index 计数使用 checked subtraction/addition；不变量错误记录 `state_accounting_errors_total` 并使所属 stage 失败，不静默 wrap 或清零，owner leases 正常随失败释放。
+Window/Dedup 输出 lease 按 `resident_bytes() + 64` 而非逻辑编码字节计费，mailbox permit 使用真实 lease bytes。相同字节容量容纳的输出行可能更少、背压更早，不能沿用旧 `tracked_bytes` 的行数估计。输出先构建本次全部 chunks，再释放 scratch 后发送；瞬时峰值包括 scratch 与这些输出 leases，不是只有一个 chunk。辅助 retention/index 计数使用 checked subtraction/addition；不变量错误记录 `state_accounting_errors_total` 后 panic，不静默 wrap 或清零。正常 stage 路径由 Kernel 捕获为 JobFailed；prepare/恢复调用者路径不能据此假定具有同一个 stage panic 边界，合法恢复输入先经完整校验。owner leases 随 unwind 释放。
 
 > K1 已将 Server aligned 路径扩展为 File 零状态、单 Count/ET 窗口和双 Count 串联；当前协议、codec 迁移与限制见 [PRODUCTION.md](PRODUCTION.md#周期-checkpoint-与恢复)。下文 R9/R10 历史记录中的 single-window 限制仅描述当时受测版本，不覆盖 K1。旧嵌入 `PlanLayout`/`CheckpointSnapshot` helper 仍限单窗口。
 

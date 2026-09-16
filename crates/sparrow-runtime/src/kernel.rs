@@ -48,6 +48,8 @@ impl Default for KernelOptions {
 
 /// Kernel job. Live I/O is optional channels so MQTT/HTTP stay out of this crate.
 pub struct JobRequest {
+    /// Optional connector bootstrap reservation, minted by this Kernel only.
+    pub source_admission: Option<SourceAdmission>,
     pub plan: PhysicalPlan,
     pub rows: Vec<Row>,
     pub capture: SharedCapture,
@@ -79,18 +81,43 @@ pub struct JobRequest {
 #[derive(Debug)]
 pub enum IngressEvent {
     Row(Row),
+    /// Pre-admitted decoded rows, ordered with barriers on the same channel.
+    Batch(BoxedIngressBatch),
     Control(StreamControl),
+}
+
+/// Keep the optional reliable variant as small as a Row, so existing File
+/// event channels and bulk copies do not inherit a whole inline RowBatch.
+/// Field order deliberately frees the Box before refunding its metadata lease.
+#[derive(Debug)]
+pub struct BoxedIngressBatch {
+    batch:Box<RowBatch>,
+    metadata:sparrow_model::MemoryLease,
+}
+impl BoxedIngressBatch {
+    fn into_batch(self)->RowBatch {self.batch.share()}
+}
+impl IngressEvent {
+    pub fn admitted_batch(batch:RowBatch)->Result<Self> {
+        if batch.output_sequence().is_some() {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,"final output identity cannot be injected at source ingress"));
+        }
+        let metadata=batch.lease().owner().acquire(sparrow_model::CreditKind::Reservation,std::mem::size_of::<RowBatch>())?;
+        Ok(Self::Batch(BoxedIngressBatch{batch:Box::new(batch),metadata}))
+    }
 }
 impl Payload for IngressEvent {
     fn rows(&self) -> usize {
         match self {
             Self::Row(_) => 1,
+            Self::Batch(batch) => batch.batch.num_rows(),
             Self::Control(_) => 0,
         }
     }
     fn bytes(&self) -> usize {
         match self {
             Self::Row(row) => row.resident_bytes(),
+            Self::Batch(batch) => batch.batch.tracked_bytes().saturating_add(batch.metadata.bytes()),
             Self::Control(_) => 1,
         }
     }
@@ -99,6 +126,7 @@ impl Payload for IngressEvent {
 impl JobRequest {
     pub fn new(plan: PhysicalPlan, rows: Vec<Row>, capture: SharedCapture) -> Self {
         Self {
+            source_admission: None,
             plan,
             rows,
             capture,
@@ -119,6 +147,11 @@ impl JobRequest {
 
     pub fn with_aligned(mut self, aligned: AlignedJob) -> Self {
         self.aligned = Some(aligned);
+        self
+    }
+
+    pub fn with_source_admission(mut self, admission: SourceAdmission) -> Self {
+        self.source_admission = Some(admission);
         self
     }
 
@@ -264,7 +297,7 @@ impl Drop for TimerReporter<'_> {
 /// Process-wide queue reservation released when the job task ends.
 struct QueueAdmit {
     reserved: Arc<AtomicUsize>,
-    jobs: Arc<AtomicUsize>,
+    _slot: Arc<SourceSlot>,
     bytes: usize,
 }
 
@@ -273,8 +306,12 @@ impl Drop for QueueAdmit {
         if self.bytes > 0 {
             self.reserved.fetch_sub(self.bytes, Ordering::SeqCst);
         }
-        self.jobs.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+struct SourceSlot { jobs:Arc<AtomicUsize> }
+impl Drop for SourceSlot {
+    fn drop(&mut self) {self.jobs.fetch_sub(1,Ordering::SeqCst);}
 }
 
 pub struct Kernel {
@@ -292,7 +329,50 @@ pub struct Kernel {
     pub metrics: Arc<RuntimeMetrics>,
 }
 
+/// Single-use bridge for async connector setup BEFORE Kernel input activation.
+/// Holding this does not bypass job admission or give the connector a second
+/// independent quota. A token cannot be cloned or moved to another Kernel/plan.
+#[must_use]
+pub struct SourceAdmission {
+    process: Arc<MemoryOwner>,
+    owner: Arc<MemoryOwner>,
+    pipeline: PipelineId,
+    attempt: JobAttemptId,
+    slot:Arc<SourceSlot>,
+}
+impl SourceAdmission {
+    pub fn owner(&self) -> Arc<MemoryOwner> { self.owner.clone() }
+    pub fn attempt(&self) -> JobAttemptId { self.attempt }
+    /// The connector keeps this through actual shutdown, not just Kernel task
+    /// completion. Otherwise a closing SDK could spend a replacement's quota.
+    pub fn lifecycle_guard(&self)->Arc<dyn Send+Sync> {self.slot.clone()}
+}
+
 impl Kernel {
+    pub fn prepare_source_admission(&self, pipeline: PipelineId) -> Result<SourceAdmission> {
+        let _gate=self.admit_lock.lock().expect("source admission");
+        self.source_admission_locked(pipeline)
+    }
+
+    fn source_admission_locked(&self,pipeline:PipelineId)->Result<SourceAdmission> {
+        let jobs=self.admitted_jobs.load(Ordering::SeqCst).saturating_add(1);
+        let max=(self.opts.budget.retention_bytes/self.job_budget.retention_bytes.max(1))
+            .min(self.opts.budget.reservation_bytes/self.job_budget.reservation_bytes.max(1));
+        if jobs>max {
+            return Err(SparrowError::new(ErrorCode::ResourceExhausted,
+                format!("capacity: {}/{} jobs admitted; retry later",jobs-1,max))
+                .retryable(true).context("admission","capacity"));
+        }
+        self.admitted_jobs.fetch_add(1,Ordering::SeqCst);
+        let slot=Arc::new(SourceSlot{jobs:self.admitted_jobs.clone()});
+        let attempt = JobAttemptId::new(self.next_attempt.fetch_add(1, Ordering::SeqCst));
+        Ok(SourceAdmission {
+            process: self.process_owner.clone(),
+            owner: MemoryOwner::child(self.process_owner.clone(), self.job_budget,
+                format!("pipeline={} attempt={}", pipeline.raw(), attempt.raw())),
+            pipeline, attempt, slot,
+        })
+    }
     pub fn new(opts: KernelOptions) -> Result<Self> {
         let mut job = opts.budget;
         // Default four-way byte isolation. Embedders can explicitly choose
@@ -353,6 +433,7 @@ impl Kernel {
             .max_bytes
             .min(self.job_budget.reservation_bytes)
     }
+    pub fn ingress_batch_rows(&self) -> usize { self.opts.rows_per_batch }
 
     /// Process-wide memory owner shared by every job on this kernel (P1-20).
     pub fn process_owner(&self) -> &Arc<MemoryOwner> {
@@ -381,6 +462,10 @@ impl Kernel {
     }
 
     pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
+        if req.source_admission.as_ref().is_some_and(|a|
+            !Arc::ptr_eq(&a.process, &self.process_owner) || a.pipeline != req.plan.pipeline) {
+            return Err(SparrowError::new(ErrorCode::PolicyDenied, "source admission belongs to another Kernel or pipeline"));
+        }
         if req.plan.stages.len() < 2 {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
@@ -388,6 +473,9 @@ impl Kernel {
             ));
         }
         if let Some(aligned) = &req.aligned {
+            if aligned.acks.output_sequence().is_some() && (req.live_out.is_none() || aligned.pipeline.is_none()) {
+                return Err(SparrowError::new(ErrorCode::InvalidArgument,"reliable output requires a live required sink and participant checkpoint"));
+            }
             if let Some(pipeline) = &aligned.pipeline {
                 pipeline.plan.check_compatible(&sparrow_plan::CheckpointPlan::from_physical(&req.plan)?)?;
             } else {
@@ -443,46 +531,21 @@ impl Kernel {
             &self.queue_reserved,
             metadata_need,
         )?;
-        // Reserve each admitted job's quota so a growing job cannot consume
-        // a sibling's allowance. Physical allocations still bill the parent.
-        let jobs = self.admitted_jobs.load(Ordering::SeqCst).saturating_add(1);
-        if jobs.saturating_mul(self.job_budget.retention_bytes) > self.opts.budget.retention_bytes
-            || jobs.saturating_mul(self.job_budget.reservation_bytes)
-                > self.opts.budget.reservation_bytes
-        {
-            return Err(SparrowError::new(
-                ErrorCode::ResourceExhausted,
-                format!(
-                    "capacity: {}/{} jobs admitted; retry later",
-                    jobs - 1,
-                    (self.opts.budget.retention_bytes / self.job_budget.retention_bytes.max(1))
-                        .min(
-                            self.opts.budget.reservation_bytes
-                                / self.job_budget.reservation_bytes.max(1)
-                        )
-                ),
-            )
-            .retryable(true)
-            .context("admission", "capacity"));
-        }
+        // A prepared connector already owns its job quota. Ordinary jobs
+        // acquire the same slot here; neither path charges admission twice.
+        let admission=match req.source_admission.take() {
+            Some(admission)=>admission,
+            None=>self.source_admission_locked(req.plan.pipeline)?,
+        };
         self.queue_reserved.fetch_add(queue_need, Ordering::SeqCst);
-        self.admitted_jobs.fetch_add(1, Ordering::SeqCst);
         let admit = QueueAdmit {
             reserved: Arc::clone(&self.queue_reserved),
-            jobs: Arc::clone(&self.admitted_jobs),
+            _slot: admission.slot,
             bytes: queue_need,
         };
-        let attempt = JobAttemptId::new(self.next_attempt.fetch_add(1, Ordering::SeqCst));
+        let attempt = admission.attempt;
         let cancel = CancellationToken::new();
-        let owner = MemoryOwner::child(
-            Arc::clone(&self.process_owner),
-            self.job_budget,
-            format!(
-                "pipeline={} attempt={}",
-                req.plan.pipeline.raw(),
-                attempt.raw()
-            ),
-        );
+        let owner = admission.owner;
         let ingress_memory = if ingress_metadata > 0 {
             Some(Arc::new(
                 owner
@@ -734,6 +797,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
         inject_panic,
         aligned: _,
         observation: _,
+        source_admission: _,
     } = req;
 
     let mut set = JoinSet::new();
@@ -1014,6 +1078,7 @@ async fn stage_loop(
             Ok(0)
         }
         PhysicalStage::CaptureSink { schema, .. } => {
+            let mut next_output=ctx.aligned.as_ref().and_then(|a|a.acks.output_sequence());
             let rx = rx
                 .as_mut()
                 .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "sink missing rx"))?;
@@ -1024,6 +1089,12 @@ async fn stage_loop(
                 }
                 let (batch, ctrl) = env.take();
                 if let Some(batch) = batch {
+                    let batch=if let Some(position)=next_output {
+                        let following=position.advance(batch.num_rows())?;
+                        let batch=batch.with_output_sequence(position)?;
+                        next_output=Some(following);
+                        batch
+                    } else {batch};
                     // Count final plan output once, not every intermediate
                     // window emission (which may still be filtered downstream).
                     ctx.metrics.record_emit(batch.num_rows() as u64);
@@ -1071,7 +1142,7 @@ async fn stage_loop(
                         if flush.ok && flush.dropped == 0 {
                             aj.outbox.mark();
                         }
-                        aj.acks.sink_flushed(checkpoint_id, flush).await;
+                        aj.acks.sink_flushed_with_output(checkpoint_id, flush, next_output).await;
                     }
                 }
             }
@@ -1560,6 +1631,22 @@ async fn live_source(
                 for (event, at) in ready.drain(..) {
                     match event {
                         IngressEvent::Row(row) => { rows.push(row); origin.merge(at); }
+                        IngressEvent::Batch(batch) => {
+                            let batch=batch.into_batch();
+                            if !Arc::ptr_eq(batch.lease().owner(),&ctx.owner) {
+                                return Err(SparrowError::new(ErrorCode::PolicyDenied,"ingress batch belongs to another Job memory owner"));
+                            }
+                            if batch.schema()!=schema.as_ref() || batch.num_rows()>ctx.rows_per_batch {
+                                return Err(SparrowError::new(ErrorCode::InvalidSchema,"ingress batch schema/row bound differs from live source"));
+                            }
+                            if !publish_live_rows(&ctx,&schema,&tx,&mut rows,origin,&mut n).await? {return Ok(n);}
+                            origin=OriginSpan::default();
+                            let count=batch.num_rows();
+                            ctx.metrics.record_ingest(count as u64);
+                            if let Some(obs)=&ctx.observation {obs.runtime_rows(true,count);}
+                            n+=count;
+                            if !tx.send(batch.with_origin(at)).await? {return Ok(n);}
+                        }
                         IngressEvent::Control(control) => {
                             if !publish_live_rows(&ctx, &schema, &tx, &mut rows, origin, &mut n).await?
                                 || !publish_source_control(&ctx,&tx,control).await? { return Ok(n); }

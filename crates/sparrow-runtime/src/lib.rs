@@ -40,7 +40,7 @@ pub use checkpoint::{
 pub use clock::RuntimeClock;
 pub use coordinator::{CheckpointCoordinator, CheckpointPhase};
 pub use kernel::{
-    IngressEvent, JobHandle, JobRequest, JobStats, Kernel, KernelOptions,
+    IngressEvent, JobHandle, JobRequest, JobStats, Kernel, KernelOptions, SourceAdmission,
 };
 pub use linear::{drain, LinearExecutor, RuntimeConfig};
 pub use lookup::{ReferenceTable, VersionedReferenceTable};

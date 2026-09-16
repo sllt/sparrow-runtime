@@ -1,0 +1,132 @@
+use super::connection::{error, MAX_MESSAGE_BYTES};
+use async_nats::jetstream::stream::{Info, RetentionPolicy, StorageType};
+use sparrow_model::{ErrorCode, Result};
+
+/// The exact created timestamp (not a 64-bit lossy hash) survives restarts but
+/// changes on stream recreation. namespace identifies the configured account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamIdentity {
+    pub namespace: String,
+    pub stream: String,
+    pub created_nanos: i128,
+    reader_binding: Option<(String, String)>,
+}
+impl StreamIdentity {
+    pub fn from_info(namespace: &str, info: &Info) -> Result<Self> {
+        check_name(namespace)?;
+        check_name(&info.config.name)?;
+        Ok(Self {
+            namespace: namespace.to_owned(),
+            stream: info.config.name.clone(),
+            created_nanos: info.created.unix_timestamp_nanos(),
+            reader_binding: None,
+        })
+    }
+    pub(super) fn with_reader(mut self, bucket: &str, consumer: &str) -> Self {
+        self.reader_binding = Some((bucket.into(), consumer.into()));
+        self
+    }
+    pub fn position(&self, sequence: u64, records: u64) -> sparrow_io::SourcePosition {
+        sparrow_io::SourcePosition {
+            offset_bytes: sequence,
+            record_index: records,
+            identity: sparrow_io::SourceIdentity {
+                kind: "jetstream-v1".into(),
+                path: match &self.reader_binding {
+                    Some((bucket, consumer)) => format!(
+                        "{}:{}:{}:{bucket}:{consumer}",
+                        self.namespace, self.stream, self.created_nanos
+                    ),
+                    None => format!("{}:{}:{}", self.namespace, self.stream, self.created_nanos),
+                },
+                size: 0,
+                fingerprint: 0,
+            },
+        }
+    }
+    pub fn check_position(&self, position: &sparrow_io::SourcePosition) -> Result<()> {
+        if self
+            .position(position.offset_bytes, position.record_index)
+            .identity
+            != position.identity
+        {
+            return Err(error(
+                ErrorCode::UnsupportedRestore,
+                "JetStream account/stream generation differs from checkpoint",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn check_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(error(
+            ErrorCode::InvalidArgument,
+            "JetStream names require 1..=128 ASCII alphanumeric, underscore or dash",
+        ));
+    }
+    Ok(())
+}
+
+/// Conservative initial admission: a finite, file-backed Limits stream with
+/// prefix-only expiry. No interior deletion, subject eviction, transformations,
+/// mirrors or new message modes. Repeat on health ticks and before checkpoint/restore.
+/// Broker admin is trusted not to change and revert policies between checks;
+/// delivery sequences independently detect observed gaps in the reader.
+pub fn check_stream(info: &Info, next_required: u64) -> Result<()> {
+    let c = &info.config;
+    check_name(&c.name)?;
+    if c.storage != StorageType::File
+        || c.retention != RetentionPolicy::Limits
+        || c.no_ack
+        || !c.deny_delete
+        || !c.deny_purge
+        || c.allow_rollup
+        || c.max_messages_per_subject > 0
+        || c.discard_new_per_subject
+        || c.max_bytes <= 0
+        || c.max_bytes > 64 * 1024 * 1024 * 1024
+        || c.max_message_size <= 0
+        || c.max_message_size as usize > MAX_MESSAGE_BYTES
+        || c.max_consumers <= 0
+        || c.max_consumers > 128
+        || c.num_replicas != 1
+        || c.mirror.is_some()
+        || c.sources.is_some()
+        || c.subject_transform.is_some()
+        || c.republish.is_some()
+        || !c.template_owner.is_empty()
+        || c.allow_message_ttl
+        || c.subject_delete_marker_ttl.is_some()
+        || c.allow_message_schedules
+        || c.allow_message_counter
+        || c.allow_batch_publish
+        || c.allow_atomic_publish
+        || c.first_sequence.is_some_and(|n| n > 1)
+        || c.subjects.is_empty()
+        || c.subjects.len() > 32
+        || c.subjects.iter().any(|s| s.len() > 256)
+        || info.state.deleted_count.unwrap_or(0) != 0
+    {
+        return Err(error(
+            ErrorCode::UnsupportedRestore,
+            "JetStream stream policy outside verified single-node Limits/File profile",
+        ));
+    }
+    if next_required == 0
+        || next_required > info.state.last_sequence.saturating_add(1)
+        || info.state.first_sequence > next_required
+    {
+        return Err(error(
+            ErrorCode::UnsupportedRestore,
+            "JetStream required replay range no longer retained; refusing to skip input",
+        ));
+    }
+    Ok(())
+}

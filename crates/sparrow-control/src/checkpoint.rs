@@ -66,8 +66,24 @@ pub struct CheckpointStatus {
     pub restored_from: Option<u64>,
     pub state_generation: Option<[u8;16]>,
     pub downstream_semantics_changed: bool,
+    pub reliable_source: Option<ReliableSourceStatus>,
     pub last_success_at: Option<tokio::time::Instant>,
     pub storage: Option<sparrow_runtime::checkpoint::CheckpointInventory>,
+}
+#[derive(Clone, Debug)]
+pub struct ReliableSourceStatus {
+    pub restored_cut:u64,
+    pub published_cut:u64,
+    pub committed_cut:u64,
+    pub pending_messages:usize,
+    pub pending_bytes:usize,
+    pub max_pending_messages:usize,
+    pub max_pending_bytes:usize,
+    pub sampled_at:tokio::time::Instant,
+    pub redeliveries:u64,
+    pub pull_requests:u64,
+    pub ack_retries:u64,
+    pub retention_available:usize,
 }
 pub struct CheckpointControl {
     pub policy: CheckpointSpec,
@@ -76,6 +92,9 @@ pub struct CheckpointControl {
     gate: Arc<Semaphore>,
 }
 impl CheckpointControl {
+    pub fn observe_reliable_source(&self,status:ReliableSourceStatus) {
+        self.state.lock().unwrap_or_else(|e|e.into_inner()).reliable_source=Some(status);
+    }
     pub fn new(
         policy: CheckpointSpec,
         attempt: u64,
@@ -112,26 +131,31 @@ impl CheckpointControl {
         Duration::from_millis(self.policy.timeout_ms)
     }
     pub fn begin(self: &Arc<Self>, trigger: &'static str) -> Result<CheckpointAdmission> {
-        let permit = self.gate.clone().try_acquire_owned().map_err(|_| {
+        self.try_begin(trigger)?.ok_or_else(|| SparrowError::new(
+            ErrorCode::ResourceExhausted, "checkpoint already queued or active").retryable(true))
+    }
+    /// Contention is an expected scheduling outcome, never a source failure.
+    pub fn try_begin(self: &Arc<Self>, trigger: &'static str) -> Result<Option<CheckpointAdmission>> {
+        let permit = match self.gate.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.busy = s.busy.saturating_add(1);
-            SparrowError::new(
-                ErrorCode::ResourceExhausted,
-                "checkpoint already queued or active",
-            )
-            .retryable(true)
-        })?;
+                return Ok(None);
+            }
+            Err(_) => return Err(SparrowError::new(ErrorCode::Cancelled, "checkpoint admission closed")),
+        };
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.active = true;
         s.started = s.started.saturating_add(1);
         s.phase = "queued";
         s.last_trigger = Some(trigger);
-        Ok(CheckpointAdmission {
+        Ok(Some(CheckpointAdmission {
             control: self.clone(),
             _permit: permit,
             finished: false,
             deadline: tokio::time::Instant::now() + self.timeout(),
-        })
+        }))
     }
     pub fn waiter_timeout(&self) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -195,6 +219,26 @@ impl Drop for CheckpointAdmission {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn k2_checkpoint_source_full_contention_is_not_a_fatal_error() {
+        let control=control();
+        std::thread::scope(|scope| {
+            let barrier=Arc::new(std::sync::Barrier::new(3));
+            for trigger in ["manual","source_full"] {
+                let control=control.clone();let barrier=barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let admission=control.try_begin(trigger).unwrap();
+                    barrier.wait();
+                    drop(admission);
+                });
+            }
+            barrier.wait();barrier.wait();
+        });
+        assert_eq!(control.snapshot().started,1);
+        assert_eq!(control.snapshot().busy,1);
+        assert!(control.try_begin("periodic").unwrap().is_some());
+    }
     pub(crate) fn control() -> Arc<CheckpointControl> {
         CheckpointControl::new(
             CheckpointSpec {

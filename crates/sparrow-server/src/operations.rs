@@ -28,13 +28,26 @@ pub(super) fn checkpoint_status(state: &AppState, name: &str) -> Value {
         "last_success_id":s.last_success_id,"restored_from_checkpoint":s.restored_from,
         "state_generation":s.state_generation.map(|id|id.iter().map(|b|format!("{b:02x}")).collect::<String>()),
         "downstream_semantics_changed":s.downstream_semantics_changed,
-        "restore_compatibility":"source_and_all_state_upstream_prefixes; plain_CP01_requires_full_computation_match",
+        "restore_compatibility":"source_and_all_state_upstream_prefixes; plain_CP01_full_plan_strict",
         "last_error_code":s.last_error.map(|e|e.as_str())});
     value["last_success_age_ms"] =
         json!(s
             .last_success_at
             .map(|at| at.elapsed().as_millis().min(u64::MAX as u128) as u64));
     value["storage"] = s.storage.as_ref().map(storage_json).unwrap_or(Value::Null);
+    value["reliable_source"]=s.reliable_source.as_ref().map(|r|json!({
+        "redeliveries_total":r.redeliveries,"pull_requests_total":r.pull_requests,"ack_retries_total":r.ack_retries,
+        "retention_available_bytes":r.retention_available,
+        "restored_cut":r.restored_cut,"published_cut":r.published_cut,"committed_cut":r.committed_cut,
+        "pending_messages":r.pending_messages,"pending_bytes":r.pending_bytes,
+        "max_pending_messages":r.max_pending_messages,"max_pending_bytes":r.max_pending_bytes,
+        "sample_age_ms":r.sampled_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        "sample_scope":"start_checkpoint_ACK_completion_and_5s_progress; not_per_record",
+        "pending_includes_unconfirmed_ACKs":true,"ack_basis":"durable_checkpoint_plus_required_HTTP_2xx",
+        "business_completion_claimed":false})).unwrap_or(Value::Null);
+    if s.reliable_source.is_some() {
+        value["restore_compatibility"]=json!("full_computation_and_source_reader_binding; semantic_fork_and_fixed_replay_rejected");
+    }
     value["contract"] = json!({"missed_ticks":"skip","interval_is_rpo_guarantee":false,
         "waiter_timeout_cancels_blocking_commit":false,"automatic_replay_default":false,
         "metadata_scope":"bounded_control_plane_not_payload_memory","snapshot":"attempt_local_component"});

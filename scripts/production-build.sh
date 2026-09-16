@@ -6,6 +6,8 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 out=${1:?new package directory required}
 mode=${SPARROW_BUILD_MODE:-candidate}
+jetstream=${SPARROW_JETSTREAM:-0}
+case "$jetstream" in 0|1) ;; *) printf 'SPARROW_JETSTREAM must be 0 or 1\n' >&2; exit 2;; esac
 case "$mode" in candidate|release) ;; *) printf 'invalid SPARROW_BUILD_MODE\n' >&2; exit 2;; esac
 if [[ "$mode" == release ]]; then
     [[ $(git rev-parse --show-toplevel) == "$root" ]] || exit 2
@@ -44,11 +46,16 @@ cargo --version > "$out/evidence/cargo.txt"
 cp Cargo.lock "$out/evidence/Cargo.lock"
 for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl; do
     package=${pair%:*}; binary=${pair#*:}
+    features=()
+    if [[ "$jetstream" == 1 && "$binary" == sparrow-server ]]; then features=(--features jetstream); fi
     cargo build --locked --release --quiet --target "$host" --no-default-features -p "$package" --bin "$binary" \
+        "${features[@]}" \
         > "$out/evidence/$binary-build.log" 2>&1
     cargo tree --locked --target "$host" --no-default-features -p "$package" -e normal,build \
+        "${features[@]}" \
         > "$out/evidence/$binary-dependencies.txt"
     cargo tree --locked --target "$host" --no-default-features -p "$package" -e features \
+        "${features[@]}" \
         > "$out/evidence/$binary-features.txt"
     if grep -Eq 'feature "demo-io"|(^|[[:space:]])(arrow|cranelift)(-[[:alnum:]_-]+)? v' "$out/evidence/$binary-features.txt"; then
         printf 'Unexpected production feature/dependency\n' >&2; exit 3
@@ -56,16 +63,31 @@ for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl; do
     if [[ "$binary" == sparrowctl ]] && grep -Eq 'sparrow-(runtime|testkit|connectors) v' "$out/evidence/$binary-dependencies.txt"; then
         printf 'CLI must not link the runtime/testkit/connectors\n' >&2; exit 3
     fi
+    if grep -Eq 'sparrow-testkit v' "$out/evidence/$binary-dependencies.txt"; then
+        printf 'Testkit must not enter production dependency graph\n' >&2; exit 3
+    fi
+    if grep -Eq '(tokio-websockets|openssl-sys) v' "$out/evidence/$binary-dependencies.txt"; then
+        printf 'Unexpected WebSocket/native OpenSSL production dependency\n' >&2; exit 3
+    fi
+    if [[ "$jetstream" == 0 || "$binary" == sparrowctl ]] && grep -q 'async-nats v' "$out/evidence/$binary-dependencies.txt"; then
+        printf 'NATS SDK leaked into a feature-off production binary\n' >&2; exit 3
+    fi
     install -m 755 "$target/$host/release/$binary" "$out/bin/$binary"
 done
 cp deploy/sparrow.service deploy/production.env.example deploy/pipeline-aligned.json deploy/pipeline-k1-zero.json deploy/pipeline-k1-two-count.json "$out/deploy/"
 cp docs/PRODUCTION.md "$out/docs/"
+if [[ "$jetstream" == 1 ]]; then
+    cp deploy/pipeline-jetstream.json deploy/nats-jetstream-local.conf.example "$out/deploy/"
+    cp docs/JETSTREAM.md "$out/docs/"
+fi
 "$out/bin/sparrow-server" --version > "$out/evidence/server-version.txt"
 "$out/bin/sparrowctl" --version > "$out/evidence/cli-version.txt"
 jq -n --arg commit "$SPARROW_BUILD_COMMIT" --arg target "$host" --arg mode "$mode" \
+    --argjson jetstream "$jetstream" \
     --arg source "$(sha256sum "$out/evidence/source-files.sha256" | cut -d' ' -f1)" \
     '{format:"sparrow-build-v1",source_commit:$commit,source_manifest_sha256:$source,
       target:$target,rust:"1.98.0",profile:"release",build_mode:$mode,default_features:false,
+      jetstream_enabled:($jetstream==1),jetstream_maturity:"preview_not_profile_certified",
       binaries:["sparrow-server","sparrowctl"],certification:"requires_matching_test_evidence"}' > "$out/build.json"
 (cd "$out" && find bin deploy docs evidence -type f -print | LC_ALL=C sort | while IFS= read -r file_path; do sha256sum "$file_path"; done; sha256sum build.json) > "$out/SHA256SUMS"
 printf 'PRODUCTION_PACKAGE_OK %s\n' "$out"

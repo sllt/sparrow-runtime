@@ -168,6 +168,19 @@ pub fn encode_json_batch_bounded_with_capacity(
     limit: usize,
     admit: impl FnMut(usize) -> Result<()>,
 ) -> Result<Vec<u8>> {
+    encode_json_output_bounded_with_capacity(schema, rows, None, limit, admit)
+}
+
+/// Opt-in reliable output envelope. Identity is independent of transport batch
+/// splitting, and is not inserted into (or allowed to shadow) user row fields.
+pub fn encode_json_output_bounded_with_capacity(
+    schema: &Schema,
+    rows: &[Row],
+    sequence: Option<sparrow_model::OutputSequence>,
+    limit: usize,
+    admit: impl FnMut(usize) -> Result<()>,
+) -> Result<Vec<u8>> {
+    if let Some(sequence) = sequence { sequence.advance(rows.len())?; }
     use std::io::Write;
     struct Limited<F> {
         bytes: Vec<u8>,
@@ -241,7 +254,13 @@ pub fn encode_json_batch_bounded_with_capacity(
                 out.write_all(b",")
                     .map_err(|e| SparrowError::new(ErrorCode::BoundExceeded, e.to_string()))?;
             }
+            if let Some(sequence) = sequence {
+                out.append(b"{\"id\":\"")?;
+                out.append(&sequence.id_ascii(i)?)?;
+                out.append(b"\",\"data\":")?;
+            }
             encode_json_row_into(schema, row, &mut out)?;
+            if sequence.is_some() { out.append(b"}")?; }
         }
         out.write_all(b"]")
             .map_err(|e| SparrowError::new(ErrorCode::BoundExceeded, e.to_string()))?;
@@ -739,6 +758,31 @@ fn map_json_de_error(err: serde_json::Error, max_depth: usize) -> SparrowError {
 mod tests {
     use super::*;
     use sparrow_model::{Field, FieldId, SchemaId};
+
+    #[test]
+    fn k2_output_envelope_is_batch_independent_collision_safe_and_bounded() {
+        use sparrow_model::OutputSequence;
+        let schema=Schema::new(1,vec![Field::new(1,"id",DataType::Utf8,false)]).unwrap();
+        let rows:Vec<_>=(0..7).map(|i|Row{values:vec![Scalar::utf8(format!("user-{i}"))]}).collect();
+        let first=OutputSequence::new([1;16],5).unwrap();
+        let encode=|rows:&[Row],sequence,limit,admit| encode_json_output_bounded_with_capacity(&schema,rows,sequence,limit,admit);
+        let admit=|_|Ok(());
+        let bytes=encode(&rows,Some(first),4096,admit).unwrap();
+        let whole:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(whole[0]["data"]["id"],"user-0");assert_ne!(whole[0]["id"],"user-0");
+        let mut split=Vec::new();
+        for range in [0..2,2..3,3..7] {
+            let part=encode(&rows[range.clone()],Some(first.advance(range.start).unwrap()),4096,admit).unwrap();
+            split.extend(serde_json::from_slice::<Vec<serde_json::Value>>(&part).unwrap());
+        }
+        assert_eq!(whole,serde_json::json!(split));
+        assert!(encode(&rows,Some(first),bytes.len()-1,admit).is_err());
+        assert_eq!(encode(&rows,None,4096,admit).unwrap(),encode_json_batch(&schema,&rows).unwrap());
+        let exhausted=OutputSequence::new([1;16],u64::MAX).unwrap();
+        assert!(encode(&rows,Some(exhausted),4096,admit).is_err());
+        let denied=encode_json_output_bounded_with_capacity(&schema,&rows,Some(first),4096,|_|Err(SparrowError::new(ErrorCode::ResourceExhausted,"denied"))).unwrap_err();
+        assert_eq!(denied.code,ErrorCode::ResourceExhausted);
+    }
 
     fn schema() -> Schema {
         Schema::new(

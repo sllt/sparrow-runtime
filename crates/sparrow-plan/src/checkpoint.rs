@@ -348,7 +348,7 @@ impl CheckpointPlan {
             Ok(head)
         }
         let version = take(&mut bytes, 4)?;
-        if version != b"CPL1" && version != b"CPL2" {
+        if version != b"CPL1" {
             return Err(rejected("unsupported checkpoint plan codec"));
         }
         let source = OperatorId::new(u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap()));
@@ -381,11 +381,7 @@ impl CheckpointPlan {
             return Err(rejected("checkpoint semantics exceeds bound"));
         }
         let mut semantics = take(&mut bytes, n)?;
-        let recovery_prefix_len = if version == b"CPL2" {
-            // Read-only compatibility with the unpublished R11 development
-            // candidate. New writers never emit this unsafe outer version.
-            Some(u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap()) as usize)
-        } else if semantics.starts_with(RECOVERY_PREFIX_MAGIC) {
+        let recovery_prefix_len = if semantics.starts_with(RECOVERY_PREFIX_MAGIC) {
             semantics = &semantics[RECOVERY_PREFIX_MAGIC.len()..];
             Some(u32::from_le_bytes(take(&mut semantics, 4)?.try_into().unwrap()) as usize)
         } else {

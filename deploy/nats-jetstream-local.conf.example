@@ -1,0 +1,14 @@
+# Preview fixture/profile example for NATS Server 2.14.6, NOT an installer.
+# Loopback only. Remote deployments need verified TLS and scoped credentials.
+host: 127.0.0.1
+port: 4222
+max_payload: 65536
+max_control_line: 4096
+jetstream {
+  store_dir: /var/lib/nats/sparrow
+  max_file_store: 1GB
+  max_memory_store: 16MB
+  sync_interval: always
+}
+# Provision input stream and ownership bucket separately. Sparrow must not
+# silently create/relax broker policies. See docs/JETSTREAM.md.

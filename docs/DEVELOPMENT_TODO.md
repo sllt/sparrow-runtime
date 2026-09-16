@@ -1,12 +1,16 @@
 # Sparrow Post-V1 完整开发 TODO
 
-更新日期：2026-09-15。
+更新日期：2026-09-16。
 
 设计依据：根目录 `Sparrow_Post_V1_Roadmap_Arrow_JIT_Final.md`，包含 2026-09-12 实施补充；同时追踪原始蓝图、计划评审与历史 ADR，文档范围、取舍及章节对应见 [§18 覆盖矩阵](#design-coverage)。运行合同与已验证证据以 [RUNTIME.md](RUNTIME.md) 为准，并核对其对应源码/构建。本文件负责把设计转成执行任务，不替代设计文档，也不把设计接口当成已存在的 API。
 
 **当前批次：本次交付收录通过独立自查和匹配源码复验的 K1/R11，基线 R10 为 `9a92527`。核心 540、独立无 demo 34、关键 140 × 20 轮通过；原零状态/20 ms 慢 Sink/100 ms 周期门槛已通过，32k/131072 fresh 三组 ABBA 合并也通过原阈值。修前失败样本、HTTP flush 拆批根因，以及自查发现并修复的旧 K1 回滚风险均保留，详见 [R11 记录](PRODUCTION.md#r11-validation)。版本仍为 0.1.0，未 push/tag/部署；目标设备、真实网络、24/72 h 和掉电门槛仍保留。用户已确认下一大阶段按 NATS JetStream 路线推进 K2，K1 提交不混入 K2 半成品。**
 
 **最新优先级决定（2026-09-14）：核心优先。K1 为当前整批；之后是 K2 可靠输入与输出、K3 真正 DAG、K4 IoT 状态算子。运维平台、Graph Designer 与体验扩展后置，Arrow/JIT 仍有独立证据门槛。K1 只开放受测线性组合，不等于核心全部完成或任意业务都可生产使用。完整范围和依赖见 [§3.4](#core-first-batches)，版本顺序见 [§17](#release-sequence)。**
+
+**K2 实施进展（2026-09-15）：K1/R11 已提交 `6fb20c2`，未 push；后续工作在 `feat/k2-jetstream-reliability`，没有混入该提交。JetStream 首批 Preview 已贯通真实 Source→Kernel→HTTP→checkpoint→ACK/恢复，完成自查修复及限定矩阵测试，见 [JETSTREAM.md](JETSTREAM.md)。默认关闭；选择 fail/held、broker 保留/重放，不实现独立 outbox 或 DLQ。固定历史 replay、语义 fork、TLS/真实 RTT/容量与长稳等剩余门禁不假报完成，REL 父任务保持未勾选；当前仍收尾 K2，不自动转入 K3 或平台。**
+
+R12 收尾（2026-09-16）已完成本批实现、自查及匹配复验：checkpoint 仲裁/超时分流、真实空闲退避、输入合批、有界并发 Explicit ACK、broker 侧提交失败 oracle 和验证入口已落实。556 核心、35 no-demo、32×20 专项及进程故障通过；NATS 预装排空相对 v13 为零状态 17.99×/单 Count 10.98×，但持续写入 10k 档仍有积压，不承诺低延迟 20k/s。默认 File 原性能门槛通过；详见 [R12 证据](JETSTREAM.md#r12-validation)。随本次 K2/R12 提交归档，未 push/tag/部署；仍是 Preview，TLS/WAN/长稳与完整 REL 未完成。
 
 ## 导航
 
@@ -514,6 +518,16 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
 入口：`crates/sparrow-runtime/src/barrier.rs`、`coordinator.rs`、`checkpoint.rs`、`aligned.rs`、`kernel.rs`；`crates/sparrow-plan/src/compat.rs`；`crates/sparrow-control/src/supervisor.rs`。
 
 ### 8.2 来源选择和 REL 完整合同
+
+本批已实现的 **Preview 子集**（不替代下列完整父任务）：
+
+- [x] 用户批准 NATS 路线；固定 SDK 0.50.0 / Server 2.14.6，feature-off 入口明确拒绝。
+- [x] 单 stream 全顺序来源/reader 身份、consumer sequence 连续性、有界 pending 与运行中重投递去重。
+- [x] 同一 Job owner/提前 Job slot/实际 SDK 关闭与锁保留；headers、保留原始 Bytes、稀疏 schema 和 ingress Box 元数据计费。
+- [x] 空 bootstrap checkpoint、v4 Source/state/输出 cut、HTTP 2xx 后 durable publication 再 ACK；稳定逐行 ID，不由 batch 划分生成。
+- [x] 零/单 Count/双 Count 的限定路径；进程强杀、输出后写入失败、提交后 ACK 实际丢失、保留过期、误用 consumer、poison/业务拒绝反例。
+- [x] 静态验证/Explain、现有带鉴权审计的启停/checkpoint/恢复列表、状态及 Preview 模板；普通 File 路径性能回归已定位并按原门槛复测。
+- [ ] 完整 REL 发布关闭：剩余恢复/迁移操作与选用的扩展处置、实际部署 TLS/RTT/容量/长稳和完整平台失败模型；不把以上短程证据等同 Supported/Profile-certified。
 
 - [ ] **REL-00 — 需求、来源与部署决策（新增执行项）。** 允许 NATS 且确需可靠输入时，按 Final 的建议先验证 JetStream pull；已有 Kafka 标准或不能新增 broker 时另选路线。记录选定 SDK/版本、保留策略、确认层级和投入上限；不同时建设三种持久化体系。
 - [ ] **REL-01 — 稳定来源身份。** stream/partition/源代次/sequence 或 position 规范编码；重连、过滤和恢复 reader 不改变身份，复用 AGE/P0 来源合同。

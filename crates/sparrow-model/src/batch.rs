@@ -55,9 +55,18 @@ pub struct RowBatch {
     rows: Arc<Vec<Row>>,
     lease: MemoryLease,
     origin: crate::observation::OriginSpan,
+    output_sequence: Option<crate::OutputSequence>,
 }
 
 impl RowBatch {
+    pub fn output_sequence(&self) -> Option<crate::OutputSequence> { self.output_sequence }
+    /// Final-output envelope only. Validate the next cursor BEFORE publication,
+    /// including the last ordinal (which must leave a representable next cut).
+    pub fn with_output_sequence(mut self, sequence: crate::OutputSequence) -> Result<Self> {
+        sequence.advance(self.num_rows())?;
+        self.output_sequence = Some(sequence);
+        Ok(self)
+    }
     pub fn origin(&self) -> crate::observation::OriginSpan { self.origin }
     pub fn with_origin(mut self, origin: crate::observation::OriginSpan) -> Self { self.origin=origin; self }
     pub fn schema(&self) -> &Schema {
@@ -89,6 +98,7 @@ impl RowBatch {
             rows: Arc::clone(&self.rows),
             lease: self.lease.share(),
             origin: self.origin,
+            output_sequence: self.output_sequence,
         }
     }
 
@@ -105,6 +115,7 @@ impl RowBatch {
             rows: Arc::new(rows),
             lease,
             origin: self.origin,
+            output_sequence: self.output_sequence,
         })
     }
 
@@ -284,6 +295,7 @@ impl RowBatchBuilder {
             rows: Arc::new(self.rows),
             lease,
             origin: crate::observation::OriginSpan::missing(),
+            output_sequence: None,
         })
     }
 }

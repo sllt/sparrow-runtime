@@ -130,6 +130,147 @@ fn r11_freeze(operator: u32) -> crate::WindowFreeze {
     }
 }
 
+#[test]
+fn k2_source_bootstrap_uses_exact_job_owner_and_rejects_foreign_tokens() {
+    let k=kernel();let other=kernel();
+    let admission=k.prepare_source_admission(1.into()).unwrap();
+    let owner=admission.owner();let attempt=admission.attempt();
+    let guard=admission.lifecycle_guard();
+    let lease=owner.acquire(CreditKind::Reservation,8192).unwrap();
+    assert_eq!(k.admitted_jobs(),1,"async bootstrap reserves a real job quota");
+    let job=k.submit(JobRequest::new(plan(0,true),vec![],SharedCapture::disabled()).with_source_admission(admission)).unwrap();
+    assert_eq!(job.attempt,attempt);assert!(Arc::ptr_eq(&owner,&job.memory_owner()));
+    k.block_on(job.stop()).unwrap();
+    assert_eq!(k.admitted_jobs(),1,"Kernel completion must not free a still-closing SDK's quota");
+    assert_eq!(owner.usage().physical_bytes,8192,"SDK bootstrap lease may outlive Kernel tasks and cannot be refunded early");
+    drop(lease);drop(guard);assert_eq!(owner.usage().physical_bytes,0);
+    let foreign=k.prepare_source_admission(1.into()).unwrap();
+    assert!(other.submit(JobRequest::new(plan(0,true),vec![],SharedCapture::disabled()).with_source_admission(foreign)).is_err());
+    let wrong=k.prepare_source_admission(2.into()).unwrap();
+    assert!(k.submit(JobRequest::new(plan(0,true),vec![],SharedCapture::disabled()).with_source_admission(wrong)).is_err());
+    assert_eq!(k.admitted_jobs(),0);assert_eq!(other.admitted_jobs(),0);
+    assert_eq!(k.process_owner().usage().physical_bytes,0);
+}
+
+#[test]
+fn k2_bootstrap_cannot_steal_live_job_quota_before_queue_admission() {
+    let budget=ResourceBudget::compact();
+    let k=Kernel::new_with_job_budget(KernelOptions{budget,mailbox:MailboxConfig{max_items:2,max_bytes:64*1024},worker_threads:2,rows_per_batch:2},budget).unwrap();
+    let bootstrap=k.prepare_source_admission(1.into()).unwrap();
+    assert_eq!(k.admitted_jobs(),1);assert_eq!(k.process_owner().usage().physical_bytes,0);
+    let denied=k.prepare_source_admission(2.into()).err().unwrap();
+    assert!(denied.context.iter().any(|(k,v)|k=="admission" && v=="capacity"));
+    assert!(k.submit(JobRequest::new(plan(0,true),vec![],SharedCapture::disabled())).is_err());
+    drop(bootstrap);assert_eq!(k.admitted_jobs(),0);
+    k.run(JobRequest::new(plan(0,true),vec![],SharedCapture::disabled())).unwrap();
+    assert_eq!(k.admitted_jobs(),0);assert_eq!(k.queue_reserved(),0);
+}
+
+#[test]
+fn k2_admitted_batch_does_not_widen_legacy_events_and_bills_box_before_allocation() {
+    #[allow(dead_code)]
+    enum PreviousWideEvent {Row(Row),Batch(sparrow_model::RowBatch),Control(StreamControl)}
+    assert!(std::mem::size_of::<IngressEvent>()<=std::mem::size_of::<Row>()+8);
+    assert!(std::mem::size_of::<PreviousWideEvent>()>std::mem::size_of::<IngressEvent>());
+    eprintln!("K2_INGRESS_LAYOUT inline_variant_bytes={} thin_variant_bytes={} row_batch_bytes={}",
+        std::mem::size_of::<PreviousWideEvent>(),std::mem::size_of::<IngressEvent>(),std::mem::size_of::<sparrow_model::RowBatch>());
+    let schema=Arc::new(Schema::new(1,vec![Field::new(1,"v",DataType::Int64,false)]).unwrap());
+    for enough in [true,false] {
+        let mut budget=ResourceBudget::compact();if !enough {budget.reservation_bytes=1;}
+        let owner=MemoryOwner::new(budget);
+        let batch=sparrow_model::RowBatchBuilder::new(schema.clone(),owner.clone(),CreditKind::Reservation,1,1).unwrap().finish().unwrap();
+        let result=IngressEvent::admitted_batch(batch);
+        assert_eq!(result.is_ok(),enough);
+        if enough {assert!(owner.usage().reservation_bytes>=1+std::mem::size_of::<sparrow_model::RowBatch>());}
+        drop(result);assert_eq!(owner.usage().physical_bytes,0);
+    }
+}
+
+#[test]
+fn k2_reliable_sink_cursor_is_cut_local_and_snapshot_v4_is_not_legacy() {
+    for windows in 0..=2 {
+        let kernel=kernel();
+        kernel.block_on(async {
+            let physical=plan(windows,true);
+            let manifest=Arc::new(CheckpointPlan::from_physical(&physical).unwrap());
+            let first=sparrow_model::OutputSequence::new([3;16],1).unwrap();
+            let acks=AlignedAcks::default().with_output_sequence(first).unwrap();
+            let (tx,rx)=sparrow_io::observed::channel(2);
+            let (out,mut received)=sparrow_io::observed::channel::<sparrow_model::RowBatch>(16);
+            let counter=Arc::new(InflightCounter::new());
+            let count=counter.clone();
+            let handle=kernel.submit(JobRequest::new(physical,vec![],SharedCapture::disabled())
+                .with_live_events(rx).with_live_out(out).with_aligned(AlignedJob{restore:None,
+                    pipeline:Some(PipelineRestore{plan:manifest.clone(),generation:[3;16],restore:None}),acks:acks.clone(),outbox:counter})).unwrap();
+            let sink=tokio::spawn(async move {
+                let mut result=Vec::new();
+                while let Some(batch)=received.recv().await {
+                    let sequence=batch.output_sequence().expect("reliable output envelope");
+                    for i in 0..batch.num_rows() {result.push(sequence.id_ascii(i).unwrap());}
+                    count.ack();
+                }
+                result
+            });
+            let owner=handle.memory_owner();
+            let request=acks.begin(1).unwrap();
+            for v in 1..=6 {tx.send(IngressEvent::Row(row(v))).await.unwrap();}
+            tx.send(IngressEvent::Control(StreamControl::CheckpointBarrier{checkpoint_id:1})).await.unwrap();
+            // Later inputs are deliberately queued before reading barrier ACKs.
+            // They MUST NOT advance the checkpoint's Sink cursor.
+            for v in 7..=12 {tx.send(IngressEvent::Row(row(v))).await.unwrap();}
+            let aligned=request.wait_participants(Duration::from_secs(2)).await.unwrap();
+            let expected=match windows {0=>6,1=>2,_=>1};
+            assert_eq!(aligned.next_output().unwrap().first(),1+expected);
+            let mut source=sparrow_io::SourcePosition::start(sparrow_io::SourceIdentity::memory("fixture",0,0));
+            source.identity.kind="jetstream-v1".into();source.offset_bytes=6;source.record_index=6;
+            let encoded=PipelineSnapshot::encode_frozen(1,&source,6,1,&manifest,aligned,&owner,1024).unwrap();
+            assert_eq!(&encoded.bytes()[4..6],&4u16.to_le_bytes());
+            let decoded=PipelineSnapshot::decode(encoded.bytes(),1024).unwrap();
+            assert_eq!(decoded.next_output,Some(first.advance(expected as usize).unwrap()));
+            assert_eq!(decoded.windows.len(),windows);
+            assert!(crate::CheckpointSnapshot::decode(encoded.bytes()).is_err());
+            let dir=tmp();let mut store=CheckpointStore::open_reliable_exclusive(&dir,1024,Default::default()).unwrap();
+            store.commit_prepared(&encoded).unwrap();
+            assert_eq!(store.recover_pipeline_required().unwrap().next_output,decoded.next_output);
+            assert_eq!(store.inventory().unwrap().generations[0].metadata.as_ref().unwrap().version,4);
+            drop(tx);handle.wait().await.unwrap();let all=sink.await.unwrap();
+            assert_eq!(all.len(),expected as usize*2);
+            assert_eq!(all,(0..all.len()).map(|i|first.id_ascii(i).unwrap()).collect::<Vec<_>>());
+            drop(encoded);drop(store);std::fs::remove_dir_all(dir).unwrap();assert_eq!(owner.usage().physical_bytes,0);
+        });
+    }
+}
+
+#[test]
+fn k2_file_and_reliable_writer_profiles_refuse_mixing_and_invalid_output_identity() {
+    for reliable in [false,true] {
+        let owner=MemoryOwner::new(ResourceBudget::compact());let dir=tmp();
+        let manifest=CheckpointPlan::from_physical(&plan(0,true)).unwrap();
+        let mut source=sparrow_io::SourcePosition::start(sparrow_io::SourceIdentity::memory("profile",0,0));
+        if reliable {source.identity.kind="jetstream-v1".into();}
+        let encoded=PipelineSnapshot::encode_frozen(1,&source,0,1,&manifest,crate::ParticipantAcks {
+            attempt:1,generation:[3;16],freezes:vec![],
+            next_output:reliable.then(||sparrow_model::OutputSequence::new([3;16],1).unwrap()),
+        },&owner,1024).unwrap();
+        if reliable {
+            let at=94+source.identity.kind.len()+source.identity.path.len();
+            let mut corrupt=encoded.bytes().to_vec();corrupt[at..at+16].fill(0);
+            assert!(PipelineSnapshot::decode(&corrupt,1024).is_err());
+            let mut corrupt=encoded.bytes().to_vec();corrupt[at+16..at+24].fill(0);
+            assert!(PipelineSnapshot::decode(&corrupt,1024).is_err());
+        }
+        let mut wrong=if reliable {CheckpointStore::open_pipeline_exclusive(&dir,1024,Default::default())}else{CheckpointStore::open_reliable_exclusive(&dir,1024,Default::default())}.unwrap();
+        assert!(wrong.commit_prepared(&encoded).is_err());drop(wrong);assert!(!dir.join("CURRENT").exists());
+        let mut correct=if reliable {CheckpointStore::open_reliable_exclusive(&dir,1024,Default::default())}else{CheckpointStore::open_pipeline_exclusive(&dir,1024,Default::default())}.unwrap();
+        correct.commit_prepared(&encoded).unwrap();drop(correct);
+        let before=std::fs::read(dir.join("CURRENT")).unwrap();
+        let wrong=if reliable {CheckpointStore::open_pipeline_exclusive(&dir,1024,Default::default())}else{CheckpointStore::open_reliable_exclusive(&dir,1024,Default::default())};
+        assert!(wrong.err().unwrap().message.contains("source profile mismatch"));
+        assert_eq!(before,std::fs::read(dir.join("CURRENT")).unwrap());
+        drop(encoded);assert_eq!(owner.usage().physical_bytes,0);std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 fn r11_encoded(
     freeze: &crate::WindowFreeze,
     owner: &Arc<MemoryOwner>,
@@ -451,6 +592,7 @@ fn r11_state_ack_duplicates_conflicts_and_single_flight_are_explicit() {
                         crate::FlushOutcome {
                             ok: true,
                             dropped: 0,
+                            timed_out: false,
                         },
                     )
                     .await;
@@ -662,6 +804,7 @@ fn r11_legacy_store_guard_readonly_generation_and_owner_isolation() {
             attempt: 1,
             generation: [1; 16],
             freezes: vec![r11_encoded(&r11_freeze(10), &other)],
+            next_output: None,
         },
         &owner,
         1024,
@@ -867,6 +1010,7 @@ fn r11_pipeline_decode_identity_and_multichunk_metadata_are_bounded() {
         crate::ParticipantAcks {
             attempt: 9,
             generation: [3; 16],
+            next_output: None,
             freezes: vec![
                 r11_encoded(&r11_freeze(10), &owner),
                 r11_encoded(&r11_freeze(11), &owner),
@@ -952,6 +1096,7 @@ fn r11_mixed_legacy_pipeline_history_is_refused_without_pruning_or_fallback() {
         crate::ParticipantAcks {
             attempt: 2,
             generation: [2; 16],
+            next_output: None,
             freezes: vec![r11_encoded(&r11_freeze(10), &owner)],
         },
         &owner,
@@ -1164,7 +1309,8 @@ fn k1_partial_restore_rejected_before_input_and_failed_preparation_refunds_all()
         crate::ParticipantAcks {
             attempt: 1,
             generation: [42; 16],
-            freezes: vec![]
+            freezes: vec![],
+            next_output: None,
         },
         &owner,
         1024
@@ -1427,11 +1573,9 @@ fn k1_partial_freeze_budget_failure_is_retryable_without_job_loss_or_leases() {
             error.message.contains("credits exhausted"),
             "must be freeze pressure, not timeout: {error}"
         );
-        assert_eq!(
-            owner.usage().reservation_bytes,
-            usage + pressure.bytes(),
-            "failed freeze must release immediately, not only on job exit"
-        );
+        tokio::time::timeout(Duration::from_secs(2),async {
+            while owner.usage().reservation_bytes!=usage+pressure.bytes() {tokio::task::yield_now().await;}
+        }).await.expect("in-flight sibling freezes must release after abandoned checkpoint, not only on job exit");
         drop(pressure);
         let third = acks.begin(3).unwrap();
         tx.send(IngressEvent::Control(StreamControl::CheckpointBarrier {

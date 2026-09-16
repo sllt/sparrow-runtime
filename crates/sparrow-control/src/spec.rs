@@ -41,6 +41,8 @@ pub struct PipelineSpec {
 #[serde(deny_unknown_fields)]
 pub struct SourceSpec {
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jetstream: Option<JetStreamSpec>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -84,6 +86,50 @@ pub struct SourceSpec {
     /// emit final ET windows and then complete.
     #[serde(default)]
     pub file_contract: Option<String>,
+}
+
+/// K2 is opt-in and intentionally narrower than File aligned recovery. The
+/// wire shape remains readable on feature-off binaries, which reject it before
+/// creating a connection, reader or checkpoint generation.
+#[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JetStreamSpec {
+    pub servers: Vec<String>,
+    pub namespace: String,
+    pub stream: String,
+    pub consumer: String,
+    pub ownership_bucket: String,
+    #[serde(default)]
+    pub token_secret: Option<String>,
+    #[serde(default="js_pending")]
+    pub max_pending: usize,
+    #[serde(default="js_pending_bytes")]
+    pub pending_bytes: usize,
+    #[serde(default="js_pull")]
+    pub pull_messages: usize,
+    #[serde(default="js_pull_bytes")]
+    pub pull_bytes: usize,
+}
+fn js_pending()->usize {128}
+fn js_pending_bytes()->usize {256*1024}
+fn js_pull()->usize {8}
+fn js_pull_bytes()->usize {72*1024}
+impl JetStreamSpec {
+    #[cfg(feature="jetstream")]
+    pub(crate) fn connection(&self)->sparrow_connectors::jetstream::ConnectionConfig {
+        sparrow_connectors::jetstream::ConnectionConfig {
+            servers:self.servers.clone(),token_secret:self.token_secret.clone(),
+            subscription_capacity:self.pull_messages+2,pull_bytes:self.pull_bytes,
+        }
+    }
+    #[cfg(feature="jetstream")]
+    pub(crate) fn reader(&self)->sparrow_connectors::jetstream::ReaderConfig {
+        sparrow_connectors::jetstream::ReaderConfig {
+            namespace:self.namespace.clone(),stream:self.stream.clone(),consumer:self.consumer.clone(),
+            ownership_bucket:self.ownership_bucket.clone(),max_pending:self.max_pending,pending_bytes:self.pending_bytes,
+            pull_messages:self.pull_messages,pull_bytes:self.pull_bytes,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -228,6 +274,29 @@ impl PipelineSpec {
     }
 
     pub fn basic_check(&self) -> Result<()> {
+        if self.source.jetstream.is_some() != (self.source.kind=="jetstream") {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,"source.jetstream is required exclusively for kind=jetstream"));
+        }
+        if self.source.kind=="jetstream" {
+            #[cfg(not(feature="jetstream"))]
+            return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"JetStream support requires the jetstream build feature"));
+            #[cfg(feature="jetstream")]
+            {
+                self.source.jetstream.as_ref().expect("checked JetStream config").reader().validate()?;
+                if self.delivery!="checkpointed_at_least_once" || self.recovery!="aligned" || self.sink.kind!="http" || self.sink.skip_verify || self.source.skip_verify
+                    || self.checkpoint_dir.as_deref().is_none_or(str::is_empty)
+                    || !self.checkpoint.as_ref().is_some_and(|p|p.resume_latest && p.interval_ms.is_some())
+                    || self.restore.as_ref().is_some_and(|r|r.kind!="checkpoint" || r.snapshot_id.as_deref().is_some_and(|id|id!="aligned" && !id.is_empty())) {
+                    return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream requires aligned, explicit checkpoint_dir, periodic resume_latest, verified HTTP sink; fixed replay/reset is not yet exposed"));
+                }
+                if self.source.host.is_some() || self.source.port.is_some() || self.source.path.is_some() || self.source.bind.is_some()
+                    || self.source.client_id.is_some() || self.source.username_secret.is_some() || self.source.password_secret.is_some()
+                    || self.source.use_demo_io || self.source.tls || self.source.file_contract.is_some() || self.source.qos!=0
+                    || !self.source.clean_session || self.source.topic!=default_topic() {
+                    return Err(SparrowError::new(ErrorCode::InvalidArgument,"JetStream connection options belong in source.jetstream; mixed connector fields refused"));
+                }
+            }
+        }
         if !(1..=4096).contains(&self.source.inbox_capacity)
             || !(1..=4096).contains(&self.sink.outbox_capacity)
         {
@@ -239,11 +308,11 @@ impl PipelineSpec {
         if let Some(policy) = &self.checkpoint {
             policy.validate()?;
             if self.recovery != "aligned"
-                || !matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay")
+                || !matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay" | "jetstream")
             {
                 return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
-                    "checkpoint policy requires aligned File/replay",
+                    "checkpoint policy requires aligned File/replay or JetStream",
                 ));
             }
         }
@@ -339,9 +408,13 @@ impl PipelineSpec {
 
     pub fn check_delivery(&self) -> Result<(DeliveryGuarantee, RecoveryPolicy)> {
         let g = DeliveryGuarantee::parse(&self.delivery)?;
+        if (g==DeliveryGuarantee::CheckpointedAtLeastOnce) != (cfg!(feature="jetstream") && self.source.kind=="jetstream") {
+            return Err(SparrowError::new(ErrorCode::UnsupportedDelivery,"checkpointed_at_least_once is required exclusively for an enabled JetStream profile"));
+        }
         let r = RecoveryPolicy::parse(&self.recovery)?;
         let claim = self.restore_claim()?;
-        let replayable = matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay");
+        let replayable = matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay")
+            || (cfg!(feature="jetstream") && self.source.kind=="jetstream");
         sparrow_model::check_recovery_capabilities(&self.source.kind, replayable, r, &claim)?;
         Ok((g, r))
     }

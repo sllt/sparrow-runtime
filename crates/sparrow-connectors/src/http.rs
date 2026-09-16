@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use sparrow_formats::encode_json_batch_bounded_with_capacity;
+use sparrow_formats::encode_json_output_bounded_with_capacity;
 use sparrow_model::{
     CreditKind, ErrorCode, InflightCounter, MemoryLease, RestoreClaim, RowBatch, Schema,
 };
@@ -419,9 +419,10 @@ impl HttpSink {
             })
             .ok()?;
         let mut encoded_credit=self.diag.observation.encoded_credit(lease.bytes());
-        let bytes = encode_json_batch_bounded_with_capacity(
+        let bytes = encode_json_output_bounded_with_capacity(
             batch.schema(),
             batch.rows(),
+            batch.output_sequence(),
             self.config.batch_bytes,
             |capacity| {lease.grow_to(capacity+DELIVERY_OVERHEAD)?;encoded_credit.resize(lease.bytes());Ok(())},
         )

@@ -199,6 +199,10 @@ See `docs/v1-report.md`.
 
 Production / `--no-default-features`: `EmbeddedBroker`, `HttpCapture`, and `DemoHarness` are compiled out (`#[cfg(feature = "demo-io")]`). Runtime `--demo-io` then fails with `feature_unavailable`. Default features stay on so demos and `cargo test --workspace` keep the in-process broker.
 
+Optional **JetStream Preview**: build with `SPARROW_JETSTREAM=1` using `scripts/production-build.sh`. It adds checkpoint-backed HTTP acceptance, stable output IDs, bounded replay and explicit failure for supported zero/Count-window pipelines; it is not a default dependency, distributed HA, a durable HTTP outbox or a production certification. See [the exact profile and recovery restrictions](docs/JETSTREAM.md).
+
+R12 adds ready-input batching, bounded asynchronous Explicit ACKs, idle pull backoff and nonfatal checkpoint timeouts. The [reproducible broker/process tests and scoped NATS benchmarks](docs/JETSTREAM.md#r12-validation) distinguish backlog-drain throughput from sustained input capacity; 10k/s paced tests still show queueing.
+
 Flags: `--bind` `--token` `--catalog` `--max-jobs` `--safe-mode` `--demo-io` `--allow-remote`.
 
 **Safe-mode restart protection:** failure holds survive history pruning and process

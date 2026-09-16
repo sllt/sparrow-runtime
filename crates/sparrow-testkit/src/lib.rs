@@ -3,6 +3,8 @@
 pub mod capture;
 pub mod clock;
 pub mod fixtures;
+#[cfg(feature="jetstream")]
+pub mod nats;
 
 pub use capture::CaptureSink;
 pub use clock::{Clock, VirtualClock};

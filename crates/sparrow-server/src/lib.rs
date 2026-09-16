@@ -371,7 +371,12 @@ fn run_explain(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
         .map(|(_, r)| r)
         .unwrap_or(sparrow_model::RecoveryPolicy::RestartFresh);
     let replay = replay_label_for_source(&spec.source.kind);
-    let e = explain_plan_with(&plan, recovery, replay);
+    let mut e = explain_plan_with(&plan, recovery, replay);
+    if spec.source.kind=="jetstream" {
+        e.delivery="checkpointed_at_least_once";
+        e.guarantee="JetStream replay + HTTP 2xx acceptance + durable checkpoint before ACK; not business exactly-once".into();
+        e.experimental=true;
+    }
     Ok(json!({
         "accepted": e.accepted,
         "stages": e.stages,
@@ -621,13 +626,9 @@ fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
             "restart_blocked": a.restart_blocked,
             "last_error": a.last_error,
         })),
-        "delivery": "live_best_effort",
+        "delivery": effective["delivery"],
         "recovery": row.spec.recovery.clone(),
-        "replay": if matches!(row.spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
-            "replayable"
-        } else {
-            "unsupported"
-        },
+        "replay": replay_label_for_source(&row.spec.source.kind),
         "honesty": HONESTY,
         "effective": effective,
         "mailboxes": mailboxes,

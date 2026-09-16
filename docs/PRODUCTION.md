@@ -2,6 +2,8 @@
 
 本页说明当前实现合同，不是目标设备认证或正式发行公告。Linux x86_64、Rust 1.98.0、锁定 Cargo.lock；Row/prepared/fusion，线性执行。Arrow/JIT/DAG、HA、可靠 MQTT、持久 HTTP outbox 均未开启。版本号仍为 0.1.0，tag/push 另行授权。
 
+新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
+
 ## 构建与追溯
 
 ```sh
@@ -88,11 +90,13 @@ K1 支持单 File/replay → 线性计算 → 单 required Sink 的零状态、�
 
 快照 v3 保持 `CPL1` 外层参与者清单，在旧 reader 可读取的 `CP01` 语义字段中使用 `RCP2` 封套保存完整诊断计算和状态依赖前缀；其余包含 source cut、各 state frame、attempt/revision/generation。恢复必须匹配 Source 身份/schema、每个状态实例及其全部上游计算（仍保留全局函数语义版本检查）；线性管道比较到最后一个窗口。末端下游 Filter/Map/Project 可以调整，零状态管道可调整过滤/投影而不重放文件头，状态中暴露 `downstream_semantics_changed`。两窗口之间的计算仍影响第二窗口，窗口参数/schema/参与者变化仍拒绝。改变输出逻辑不撤销已发送的 HTTP 副作用，也不提供 exactly-once。
 
-历史 K1 plain `CP01` 快照仍可读取，但保持原来的**完整计算严格匹配**合同；需要下游更新时，先用原计算在本版本提交一个 RCP2 恢复点，再更新配置。旧 K1 可以完整解析新 CURRENT 的外层结构，但必须在计算兼容检查明确拒绝，不把未知 manifest 当损坏、偷偷回退到更老的 plain CP01。R11 开发中曾试用的 CPL2 仅保留读取，新写入不使用它。R10 SPV1 v1/v2 不自动迁移，Server 在输入激活和 generation 写入前拒绝向含旧格式历史的目录写 v3，包括 `resume_latest=false`。不要靠删除旧代绕过检查；选择新目录 fresh 或恢复原二进制和同一备份时点的整套目录。
+历史 K1 plain `CP01` 快照仍可读取，但保持原来的**完整计算严格匹配**合同；需要下游更新时，先用原计算在本版本提交一个 RCP2 恢复点，再更新配置。旧 K1 可以完整解析新 CURRENT 的外层结构，但必须在计算兼容检查明确拒绝，不把未知 manifest 当损坏、偷偷回退到更老的 plain CP01。未发布的 R11 开发 CPL2 不属于支持格式，R12 移除该只读分支。R10 SPV1 v1/v2 不自动迁移，Server 在输入激活和 generation 写入前拒绝向含旧格式历史的目录写 v3，包括 `resume_latest=false`。不要靠删除旧代绕过检查；选择新目录 fresh 或恢复原二进制和同一备份时点的整套目录。
 
 **R10 回滚限制：**旧二进制遇到混合 v2/v3 目录可能跳过 v3、恢复旧 v2 并重复输出；“不兼容即拒绝”仅在没有可回退旧代的单 codec 目录得到旧二进制保证。K1 的 guard 阻止正常 Server 创建这种混合目录，但不能修补外部工具或历史版本已经混写的目录。回滚必须先核对全部历史 codec，在副本上验证，不能只看 CURRENT。
 
 切点捕获与 barrier 注入保持同一 Source 驱动内的 FIFO 顺序；之后 Source 可继续读取。单飞 checkpoint worker 独立收齐 ACK，再在 blocking pool 编码/提交，不要求 durable outbox，也不跳过 required Sink flush。停止、读失败和 EOF 都收尾该 worker；已经进入阻塞提交的工作不能因 API 超时/取消而 detach，持有 gate、lease 和目录锁直到结束。满队列时 worker 仍独立被调度，不依赖 Source 的批次 send 返回。
+
+Source 不再停读也扩大了可能重复输出的窗口：Sink barrier 完成后可以发送 cut 之后的数据，而 CURRENT 仍在提交；此间崩溃会从上一提交点恢复，期间已发出的外部输出也可能重放。这没有改变 at-least-once 边界，不是 exactly-once；外部接收方需要幂等。
 
 `checkpoints`/`diagnose` 同时展示 `STATE_GENERATION` marker 与各快照的版本/revision/attempt/generation，允许识别同一 v3 目录中的 fresh lineage。头部元数据仅作有界诊断，运行中缓存于启动/最近完成提交；不代替 CRC、MANIFEST、PUBLISHED 和兼容性校验，未知/损坏头部为 null。marker 不是恢复依据，兼容恢复相同 marker 不重复写盘。
 
