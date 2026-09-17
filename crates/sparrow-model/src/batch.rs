@@ -56,9 +56,13 @@ pub struct RowBatch {
     lease: MemoryLease,
     origin: crate::observation::OriginSpan,
     output_sequence: Option<crate::OutputSequence>,
+    source_operator: Option<crate::OperatorId>,
 }
 
 impl RowBatch {
+    /// Present for non-aggregated graph records; UnionAll never rewrites it.
+    pub fn source_operator(&self) -> Option<crate::OperatorId> { self.source_operator }
+    pub fn with_source_operator(mut self, source: Option<crate::OperatorId>) -> Self { self.source_operator = source; self }
     pub fn output_sequence(&self) -> Option<crate::OutputSequence> { self.output_sequence }
     /// Final-output envelope only. Validate the next cursor BEFORE publication,
     /// including the last ordinal (which must leave a representable next cut).
@@ -99,6 +103,7 @@ impl RowBatch {
             lease: self.lease.share(),
             origin: self.origin,
             output_sequence: self.output_sequence,
+            source_operator: self.source_operator,
         }
     }
 
@@ -116,6 +121,7 @@ impl RowBatch {
             lease,
             origin: self.origin,
             output_sequence: self.output_sequence,
+            source_operator: self.source_operator,
         })
     }
 
@@ -296,6 +302,7 @@ impl RowBatchBuilder {
             lease,
             origin: crate::observation::OriginSpan::missing(),
             output_sequence: None,
+            source_operator: None,
         })
     }
 }

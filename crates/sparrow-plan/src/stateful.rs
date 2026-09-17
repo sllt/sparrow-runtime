@@ -1,10 +1,214 @@
 //! V0.2 stateful operator specs shared by Graph and SQL binders.
 
+use serde::{Deserialize, Serialize};
 use sparrow_expr::Expr;
 use sparrow_model::{
     check_hop_overlap_bound, AggFn, DataType, ErrorCode, EventTimeBinding, Field, FieldId, Result,
     Schema, SchemaId, SparrowError, WindowKind, DEFAULT_MAX_HOP_OVERLAP,
 };
+
+/// How an IoT state operator handles a row whose configured value fields are
+/// missing, NULL, or otherwise not a usable sensor value.
+///
+/// This is deliberately part of the plan contract instead of being a runtime
+/// fallback.  `Error` fails the attempt; `Ignore` leaves the per-key state
+/// unchanged and accounts the skipped row in the runtime diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvalidValuePolicy {
+    Error,
+    Ignore,
+}
+
+/// Deadband comparison mode.  Relative values are ratios (`0.05` is 5%).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeadbandMode {
+    Absolute,
+    Relative,
+}
+
+/// Which previous value is used as the deadband reference point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeadbandBaseline {
+    LastInput,
+    LastOutput,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeadbandSpec {
+    pub mode: DeadbandMode,
+    pub baseline: DeadbandBaseline,
+    pub threshold: f64,
+}
+
+impl DeadbandSpec {
+    pub fn validate(&self) -> Result<()> {
+        if !self.threshold.is_finite() || self.threshold < 0.0 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "deadband threshold must be finite and >= 0",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Shared state contract for the first IoT value operators.
+///
+/// The operator keeps one detached value per key.  `ttl_micros == 0` means
+/// no time-based eviction; it does not remove the mandatory `max_keys` and
+/// memory bounds.  The plan binder validates field types against the input
+/// schema via [`Self::validate`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IotSpec {
+    pub keys: Vec<String>,
+    pub fields: Vec<String>,
+    pub emit_first: bool,
+    pub ttl_micros: i64,
+    pub max_keys: usize,
+    pub invalid: InvalidValuePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadband: Option<DeadbandSpec>,
+}
+
+impl IotSpec {
+    fn validate_params(&self) -> Result<()> {
+        validate_names(&self.keys, "keys", 16)?;
+        validate_names(&self.fields, "fields", 16)?;
+        if self.ttl_micros < 0 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "IoT ttl_micros must be >= 0 (zero disables TTL)",
+            ));
+        }
+        if self.max_keys == 0 {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "IoT max_keys must be > 0",
+            ));
+        }
+        if let Some(deadband) = &self.deadband {
+            deadband.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Validate this specification against a concrete input schema.  Keeping
+    /// the schema in the public validation entry point prevents an embedded
+    /// caller from constructing a physically typed but semantically invalid
+    /// IoT stage.
+    pub fn validate(&self, input: &Schema) -> Result<()> {
+        self.validate_params()?;
+        for name in &self.keys {
+            let field = input.field_by_name(name).ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("IoT key field '{name}' is missing from input schema"),
+                )
+            })?;
+            if field.nullable {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    format!("IoT key field '{name}' must be non-nullable"),
+                ));
+            }
+            if !iot_key_type(&field.data_type) {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    format!("IoT key field '{name}' has unsupported type {}", field.data_type),
+                ));
+            }
+        }
+        for name in &self.fields {
+            let field = input.field_by_name(name).ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("IoT value field '{name}' is missing from input schema"),
+                )
+            })?;
+            if !iot_value_type(&field.data_type) {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    format!("IoT value field '{name}' has unsupported type {}", field.data_type),
+                ));
+            }
+        }
+        if let Some(deadband) = &self.deadband {
+            if self.fields.len() != 1 {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "deadband requires exactly one value field",
+                ));
+            }
+            let field = input.field_by_name(&self.fields[0]).expect("validated value field");
+            if !matches!(
+                field.data_type,
+                DataType::Int64 | DataType::UInt64 | DataType::Float64
+            ) {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    "deadband value field must be Int64, UInt64, or Float64",
+                ));
+            }
+            deadband.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Stable kind tag used by the checkpoint participant registry.  These
+    /// values intentionally do not overlap the WindowKind tags.
+    pub fn state_kind_tag(&self) -> u8 {
+        if self.deadband.is_some() { 5 } else { 4 }
+    }
+}
+
+fn validate_names(names: &[String], label: &str, max: usize) -> Result<()> {
+    if names.is_empty() || names.len() > max {
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            format!("IoT {label} must contain 1..={max} fields"),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if name.is_empty() || !seen.insert(name) {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("IoT {label} must contain unique non-empty field names"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn iot_key_type(ty: &DataType) -> bool {
+    matches!(
+        ty,
+        DataType::Bool
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Utf8
+            | DataType::Bytes
+            | DataType::TimestampMicrosUTC
+    )
+}
+
+fn iot_value_type(ty: &DataType) -> bool {
+    matches!(
+        ty,
+        DataType::Bool
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Bytes
+            | DataType::TimestampMicrosUTC
+    )
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggCall {

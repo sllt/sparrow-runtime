@@ -18,6 +18,10 @@ pub mod expr_spec;
 pub mod graph;
 pub mod physical;
 pub mod stateful;
+#[cfg(test)]
+mod k3_tests;
+#[cfg(test)]
+mod k4_tests;
 
 pub use bind::{
     bind_dedup_linear, bind_graph, bind_linear, bind_lookup_linear, bind_window_linear,
@@ -35,8 +39,8 @@ pub use compat::{
     PlanLayout, StateReuse,
 };
 pub use stateful::{
-    agg_result_type, lookup_output_schema, window_output_schema, AggCall, DedupSpec, LookupSpec,
-    WindowSpec,
+    agg_result_type, lookup_output_schema, window_output_schema, AggCall, DeadbandBaseline,
+    DeadbandMode, DeadbandSpec, DedupSpec, InvalidValuePolicy, IotSpec, LookupSpec, WindowSpec,
 };
 
 /// M0 linear stub, still used by the sync `LinearExecutor`.

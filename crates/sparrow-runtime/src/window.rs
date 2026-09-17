@@ -67,6 +67,7 @@ pub struct WindowOperator {
     hub: WatermarkHub,
     holdback: Option<OutputHoldback>,
     default_input: InputId,
+    external_watermarks: bool,
     /// Ordered closable tumble keys: `(window_end, encoded_key) → StateKey`.
     /// `take_closed_one` / `peek_closed_bytes` pop the first closed entry
     /// instead of scanning every key and `to_vec()`-ing candidates (N11).
@@ -81,6 +82,13 @@ pub struct WindowOperator {
 }
 
 impl WindowOperator {
+    pub(crate) fn is_processing_time(&self)->bool {matches!(self.spec.kind,WindowKind::TumblingProcessingTime {..})}
+    pub(crate) fn finish_input(&mut self)->Result<WindowEmission> {
+        self.hub.mark_active(self.default_input)?;
+        self.hub.set_watermark(self.default_input,i64::MAX)?;
+        self.drain_watermark()
+    }
+    pub(crate) fn use_external_watermarks(&mut self) { self.external_watermarks = true; }
     pub(crate) fn operator_id(&self) -> OperatorId { self.operator }
 
     /// K1 validates every restored instance before input activation. Legacy raw
@@ -219,6 +227,7 @@ impl WindowOperator {
             hub,
             holdback,
             default_input: InputId::SINGLE,
+            external_watermarks: false,
             closed_index: BTreeMap::new(),
             bound_aggs,
             allocation,
@@ -495,7 +504,7 @@ impl WindowOperator {
                 }
             }
         }
-        self.hub.observe_event(self.default_input, ts, now)?;
+        if !self.external_watermarks { self.hub.observe_event(self.default_input, ts, now)?; }
         let assigned = if let Some(slide) = slide {
             WindowKind::assign_hop(ts, size, slide, self.spec.max_overlap)?
         } else {

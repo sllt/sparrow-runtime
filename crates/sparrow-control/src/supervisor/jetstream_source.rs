@@ -103,6 +103,12 @@ impl Supervisor {
         target_policy: &sparrow_connectors::TargetPolicy,
     ) -> Result<RunningJob> {
         validate_aligned_plan(spec, &plan)?;
+        if plan.has_iot() {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "JetStream + IoT state operators are not in the K4 aligned profile; use restart_fresh or File/replay",
+            ));
+        }
         let config = spec
             .source
             .jetstream
@@ -169,7 +175,9 @@ impl Supervisor {
         .await?;
         let ingested = snapshot.as_ref().map_or(0, |s| s.ingested_rows);
         let restored_from = snapshot.as_ref().map(|s| s.checkpoint_id);
-        let restore = snapshot.map(|s| s.windows);
+        let (restore, restore_iot) = snapshot
+            .map(|s| (Some(s.windows), s.iot))
+            .unwrap_or_else(|| (None, Vec::new()));
         let revision = plan.revision.raw();
         let (tx, rx) = observed::channel(spec.source.inbox_capacity);
         let (tx_out, rx_out) = observed::channel(spec.sink.outbox_capacity);
@@ -190,6 +198,7 @@ impl Supervisor {
                         plan: manifest.clone(),
                         generation,
                         restore,
+                        iot: restore_iot,
                     }),
                     acks: acks.clone(),
                     outbox: outbox.clone(),
@@ -260,6 +269,7 @@ impl Supervisor {
             cancel.clone(),
         )));
         Ok(RunningJob {
+            graph_ports: None,
             source_kind: "jetstream",
             sink_kind: "http",
             started_at: Instant::now(),

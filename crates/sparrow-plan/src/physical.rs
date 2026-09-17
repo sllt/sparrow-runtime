@@ -2,7 +2,7 @@
 //! Filter → Project → Map fuse into one transform stage.
 
 use crate::bound::{BoundKind, BoundLogicalPlan, BoundNode};
-use crate::stateful::{DedupSpec, LookupSpec, WindowSpec};
+use crate::stateful::{DedupSpec, IotSpec, LookupSpec, WindowSpec};
 use sparrow_expr::Expr;
 use sparrow_model::{
     DeliveryContract, OperatorId, PipelineId, RecoveryPolicy, RevisionId, Schema, WindowKind,
@@ -24,10 +24,30 @@ pub struct PhysicalPlan {
     pub pipeline: PipelineId,
     pub revision: RevisionId,
     pub stages: Vec<PhysicalStage>,
+    /// None retains the original linear ABI/fast path. Explicit graph edges
+    /// index physical chains; edge order is stable, never HashMap iteration.
+    pub edges: Option<Vec<PhysicalEdge>>,
+    pub side_outputs: Vec<(usize, crate::graph::SideOutputSpec)>,
+    pub source_times: Vec<(OperatorId, sparrow_model::EventTimeBinding)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhysicalEdge {
+    pub from: usize,
+    pub to: usize,
+    pub port: OperatorId,
+    pub best_effort: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PhysicalStage {
+    Branch { operator: OperatorId, input: Schema },
+    Route {
+        operator: OperatorId, input: Schema, mode: crate::graph::RouteMode,
+        cases: Vec<(Expr, OperatorId)>, default: OperatorId,
+    },
+    UnionAll { operator: OperatorId, input: Schema },
+    BestEffortSink { operator: OperatorId, name: String, schema: Schema },
     MemorySource {
         operator: OperatorId,
         name: String,
@@ -58,6 +78,13 @@ pub enum PhysicalStage {
         input: Schema,
         output: Schema,
     },
+    /// Keyed IoT value state. It is not a WindowAgg and has its own state
+    /// codec/participant identity when a recovery profile opts in.
+    Iot {
+        operator: OperatorId,
+        spec: IotSpec,
+        input: Schema,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -82,11 +109,18 @@ pub enum TransformStep {
 }
 
 impl PhysicalPlan {
+    pub fn edge_pairs(&self) -> Vec<(usize, usize)> {
+        match &self.edges {
+            Some(edges) => edges.iter().map(|e| (e.from, e.to)).collect(),
+            None => (0..self.stages.len().saturating_sub(1)).map(|i| (i, i + 1)).collect(),
+        }
+    }
     /// The current barrier ACK/restore protocol has one state participant.
     /// Keep this gate shared by API validation, layout construction and Kernel
     /// admission so embedded callers cannot bypass the control-plane check.
     pub fn aligned_window(&self) -> sparrow_model::Result<(OperatorId, &WindowSpec, &Schema)> {
         use sparrow_model::{ErrorCode, SparrowError};
+        if self.edges.is_some() { return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "DAG requires the graph checkpoint protocol")); }
         let mut window = None;
         for stage in &self.stages {
             match stage {
@@ -105,6 +139,10 @@ impl PhysicalPlan {
                     return Err(SparrowError::new(ErrorCode::FeatureUnavailable,
                         "aligned recovery does not snapshot Dedup/Lookup; refuse dishonest strip"));
                 }
+                PhysicalStage::Iot { .. } => {
+                    return Err(SparrowError::new(ErrorCode::FeatureUnavailable,
+                        "legacy PlanLayout cannot represent IoT state; use the IoT checkpoint participant codec"));
+                }
                 _ => {}
             }
         }
@@ -120,7 +158,7 @@ impl PhysicalPlan {
     }
 
     pub fn mailbox_count(&self) -> usize {
-        self.stages.len().saturating_sub(1)
+        self.edges.as_ref().map_or_else(|| self.stages.len().saturating_sub(1), Vec::len)
     }
 
     pub fn fused(&self) -> bool {
@@ -170,6 +208,10 @@ impl PhysicalPlan {
         })
     }
 
+    pub fn has_iot(&self) -> bool {
+        self.stages.iter().any(|stage| matches!(stage, PhysicalStage::Iot { .. }))
+    }
+
     /// Honesty label for the plan under `recovery`.
     ///
     /// Does not cite a milestone contract (V0.3 etc.). Windowed
@@ -204,6 +246,15 @@ impl PhysicalPlan {
 }
 
 pub fn physicalize(plan: &BoundLogicalPlan, opts: &PlanOptions) -> PhysicalPlan {
+    if !plan.source_times.is_empty() || !plan.side_outputs.is_empty() || plan.nodes.iter().any(|n| n.downstream.len() > 1 || matches!(n.kind,
+        BoundKind::Branch { .. } | BoundKind::Route { .. } | BoundKind::UnionAll { .. } | BoundKind::BestEffortSink { .. }))
+        || plan.nodes.iter().filter(|n| matches!(n.kind, BoundKind::MemorySource { .. })).count() > 1 {
+        return physicalize_graph(plan, opts);
+    }
+    physicalize_linear(plan, opts)
+}
+
+fn physicalize_linear(plan: &BoundLogicalPlan, opts: &PlanOptions) -> PhysicalPlan {
     let ordered = linearize(&plan.nodes);
     let mut stages = Vec::new();
     let mut pending: Vec<TransformStep> = Vec::new();
@@ -219,6 +270,22 @@ pub fn physicalize(plan: &BoundLogicalPlan, opts: &PlanOptions) -> PhysicalPlan 
 
     for node in ordered {
         match &node.kind {
+            BoundKind::Branch { input, .. } => {
+                flush(&mut pending, &mut stages);
+                stages.push(PhysicalStage::Branch { operator: node.id, input: input.clone() });
+            }
+            BoundKind::Route { input, mode, cases, default, .. } => {
+                flush(&mut pending, &mut stages);
+                stages.push(PhysicalStage::Route { operator: node.id, input: input.clone(), mode: *mode, cases: cases.clone(), default: *default });
+            }
+            BoundKind::UnionAll { input } => {
+                flush(&mut pending, &mut stages);
+                stages.push(PhysicalStage::UnionAll { operator: node.id, input: input.clone() });
+            }
+            BoundKind::BestEffortSink { name, schema } => {
+                flush(&mut pending, &mut stages);
+                stages.push(PhysicalStage::BestEffortSink { operator: node.id, name: name.clone(), schema: schema.clone() });
+            }
             BoundKind::MemorySource { name, schema } => {
                 flush(&mut pending, &mut stages);
                 stages.push(PhysicalStage::MemorySource {
@@ -318,6 +385,14 @@ pub fn physicalize(plan: &BoundLogicalPlan, opts: &PlanOptions) -> PhysicalPlan 
                     output: output.clone(),
                 });
             }
+            BoundKind::Iot { spec, input } => {
+                flush(&mut pending, &mut stages);
+                stages.push(PhysicalStage::Iot {
+                    operator: node.id,
+                    spec: spec.clone(),
+                    input: input.clone(),
+                });
+            }
         }
     }
     flush(&mut pending, &mut stages);
@@ -325,7 +400,45 @@ pub fn physicalize(plan: &BoundLogicalPlan, opts: &PlanOptions) -> PhysicalPlan 
         pipeline: plan.pipeline,
         revision: plan.revision,
         stages,
+        edges: None,
+        side_outputs: vec![],
+        source_times: vec![],
     }
+}
+
+fn physicalize_graph(plan: &BoundLogicalPlan, opts: &PlanOptions) -> PhysicalPlan {
+    use std::collections::BTreeMap;
+    let mut stages = Vec::new();
+    let mut indices = BTreeMap::new();
+    for node in &plan.nodes {
+        let single = BoundLogicalPlan { pipeline: plan.pipeline, revision: plan.revision, nodes: vec![BoundNode { downstream: vec![], ..node.clone() }], side_outputs: vec![], source_times: vec![] };
+        let mut stage = physicalize_linear(&single, &PlanOptions { fuse: false }).stages.remove(0);
+        let parents: Vec<_> = plan.nodes.iter().filter(|n| n.downstream.contains(&node.id)).collect();
+        if opts.fuse && parents.len() == 1 && parents[0].downstream.len() == 1 {
+            if let Some(&index) = indices.get(&parents[0].id) {
+                if let (Some(PhysicalStage::Transform { steps: before }), PhysicalStage::Transform { steps: after }) = (stages.get_mut(index), &mut stage) {
+                    before.append(after);
+                    indices.insert(node.id, index);
+                    continue;
+                }
+            }
+        }
+        indices.insert(node.id, stages.len());
+        stages.push(stage);
+    }
+    let mut edges = Vec::new();
+    for node in &plan.nodes {
+        let best_effort = match &node.kind {
+            BoundKind::Branch { best_effort, .. } | BoundKind::Route { best_effort, .. } => best_effort.as_slice(),
+            _ => &[],
+        };
+        for dest in &node.downstream {
+            let from = indices[&node.id]; let to = indices[dest];
+            let side_drop = plan.side_outputs.iter().any(|(id,s)|*id==node.id&&s.to==dest.raw()&&s.full==crate::graph::SideOutputFull::Drop);
+            if from != to { edges.push(PhysicalEdge { from, to, port: *dest, best_effort: best_effort.contains(dest)||side_drop }); }
+        }
+    }
+    PhysicalPlan { pipeline: plan.pipeline, revision: plan.revision, stages, edges: Some(edges), side_outputs: plan.side_outputs.iter().map(|(id,s)|(indices[id],s.clone())).collect(), source_times: plan.source_times.clone() }
 }
 
 fn linearize(nodes: &[BoundNode]) -> Vec<&BoundNode> {

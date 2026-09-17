@@ -14,6 +14,10 @@ pub mod capability;
 mod file_source;
 
 pub use spec::{PipelineSpec, RestoreSpec, SinkSpec, SourceSpec, StreamSpec};
+#[cfg(all(test,feature="demo-io"))]
+mod k3_tests;
+#[cfg(all(test,feature="demo-io"))]
+mod k4_tests;
 pub use checkpoint::CheckpointSpec;
 pub use status::PipelineStatus;
 pub use store::{

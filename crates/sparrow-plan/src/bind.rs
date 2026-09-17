@@ -13,6 +13,12 @@ use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sparrow_model::{AggFn, OperatorId, PipelineId, RevisionId, Schema, SchemaId, WindowKind};
 
 pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPlan> {
+    if spec.version != crate::graph::GRAPH_SPEC_VERSION {
+        return Err(SparrowError::new(ErrorCode::FeatureUnavailable, "unsupported GraphSpec version"));
+    }
+    if spec.nodes.len() > 64 || spec.nodes.iter().map(|n| n.out.len()).sum::<usize>() > 128 {
+        return Err(SparrowError::new(ErrorCode::BoundExceeded, "graph exceeds 64 nodes / 128 edges"));
+    }
     let mut cat = catalog.clone();
     cat.extend_from_spec(&spec.catalog)?;
     if spec.nodes.is_empty() {
@@ -42,7 +48,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
         }
     }
     reject_cycles(spec)?;
-    reject_fan_in(spec)?;
+    validate_ports(spec)?;
 
     let order = topo(spec)?;
     let by_id: HashMap<u32, &NodeSpec> = spec.nodes.iter().map(|n| (n.id, n)).collect();
@@ -52,7 +58,45 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
 
     for id in order {
         let node = by_id[&id];
+        if node.iot.is_some() && !matches!(node.kind.as_str(), "change_detect" | "deadband") {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("node {}: iot configuration is only valid for change_detect/deadband", node.id),
+            ));
+        }
         let kind = match node.kind.as_str() {
+            "branch" | "route" | "switch" | "union_all" => {
+                let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
+                    SparrowError::new(ErrorCode::InvalidArgument, format!("node {id} has no input"))
+                })?;
+                let best_effort = node.best_effort.iter().copied().map(OperatorId::new).collect();
+                match node.kind.as_str() {
+                    "branch" => BoundKind::Branch { input, best_effort },
+                    "union_all" => BoundKind::UnionAll { input },
+                    _ => {
+                        let mode = node.route_mode.ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, format!("route {id} requires route_mode")))?;
+                        let default = node.default_out.ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, format!("route {id} requires default_out")))?;
+                        let routes = node.routes.as_ref().ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, format!("route {id} requires routes")))?;
+                        if routes.is_empty() || routes.len() > 16 || !node.out.contains(&default) {
+                            return Err(SparrowError::new(ErrorCode::InvalidArgument, format!("route {id}: invalid cases/default port")));
+                        }
+                        let mut cases = Vec::new();
+                        let mut destinations = HashSet::new();
+                        for route in routes {
+                            if !node.out.contains(&route.to) || !destinations.insert(route.to) || route.to == default {
+                                return Err(SparrowError::new(ErrorCode::InvalidArgument, format!("route {id}: duplicate or missing output port")));
+                            }
+                            let expr = route.predicate.clone().into_expr()?;
+                            validate_predicate(&expr, &input).map_err(|e| e.at_operator(OperatorId::new(id)))?;
+                            cases.push((expr, OperatorId::new(route.to)));
+                        }
+                        if destinations.len() + 1 != node.out.len() {
+                            return Err(SparrowError::new(ErrorCode::InvalidArgument, format!("route {id}: unused output port")));
+                        }
+                        BoundKind::Route { input, mode, cases, default: OperatorId::new(default), best_effort }
+                    }
+                }
+            }
             "memory_source" => {
                 let table = node
                     .table
@@ -78,7 +122,12 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                 let predicate = pred_spec.clone().into_expr()?;
                 validate_predicate(&predicate, &input)?;
                 incoming_schema.insert(id, input.clone());
-                BoundKind::Filter { predicate, input }
+                if let Some(side) = &node.side_output {
+                    let primary = *node.out.iter().find(|dest| **dest != side.to).expect("validated side port");
+                    BoundKind::Route { input, mode: crate::graph::RouteMode::FirstMatch,
+                        cases: vec![(predicate, OperatorId::new(primary))], default: OperatorId::new(side.to),
+                        best_effort: if side.full == crate::graph::SideOutputFull::Drop {vec![OperatorId::new(side.to)]} else {vec![]} }
+                } else { BoundKind::Filter { predicate, input } }
             }
             "project" | "map" => {
                 let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
@@ -119,13 +168,15 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     }
                 }
             }
-            "capture_sink" => {
+            "capture_sink" | "best_effort_sink" => {
                 let schema = incoming_schema.get(&id).cloned().ok_or_else(|| {
                     SparrowError::new(ErrorCode::InvalidArgument, format!("sink {id} has no input"))
                 })?;
-                BoundKind::CaptureSink {
-                    name: node.name.clone().unwrap_or_else(|| "capture".into()),
-                    schema,
+                let name = node.name.clone().unwrap_or_else(|| "capture".into());
+                if node.kind == "best_effort_sink" {
+                    BoundKind::BestEffortSink { name, schema }
+                } else {
+                    BoundKind::CaptureSink { name, schema }
                 }
             }
             "window_agg" | "tumble_pt" | "count_window" => {
@@ -184,6 +235,39 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     output,
                 }
             }
+            "change_detect" | "deadband" => {
+                let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
+                    SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("{} {id} has no input", node.kind),
+                    )
+                })?;
+                let spec = node.iot.clone().ok_or_else(|| {
+                    SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("{} {id} requires iot configuration", node.kind),
+                    )
+                })?;
+                match node.kind.as_str() {
+                    "change_detect" if spec.deadband.is_some() => {
+                        return Err(SparrowError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("change_detect {id} must not contain deadband configuration"),
+                        ));
+                    }
+                    "deadband" if spec.deadband.is_none() => {
+                        return Err(SparrowError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("deadband {id} requires deadband configuration"),
+                        ));
+                    }
+                    _ => {}
+                }
+                spec.validate(&input)
+                    .map_err(|e| e.at_operator(OperatorId::new(id)))?;
+                incoming_schema.insert(id, input.clone());
+                BoundKind::Iot { spec, input }
+            }
             "hop" | "tumble_et" | "event_time_window" => {
                 let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
                     SparrowError::new(
@@ -224,14 +308,26 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
             }
         };
 
+        if node.side_output.as_ref().is_some_and(|s|s.kind==crate::graph::SideOutputKind::Late)
+            && !matches!(&kind,BoundKind::WindowAgg {spec,..} if spec.kind.uses_event_time()) {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,format!("node {id}: late side output requires an event-time window")));
+        }
         for dest in &node.out {
-            if incoming_schema.contains_key(dest) && !matches!(kind, BoundKind::MemorySource { .. } | BoundKind::Filter { .. } | BoundKind::Project { .. } | BoundKind::Map { .. }) {
-                // sink has no output schema to propagate
+            let side_schema = node.side_output.as_ref().filter(|s|s.to==*dest).map(|s|match s.kind {
+                crate::graph::SideOutputKind::DecodeError => crate::graph::decode_error_schema(),
+                crate::graph::SideOutputKind::Late => match &kind { BoundKind::WindowAgg { input, spec, .. } if spec.kind.uses_event_time() => input.clone(), _ => kind.output_schema().clone() },
+                _ => kind.output_schema().clone(),
+            });
+            let schema = side_schema.as_ref().unwrap_or_else(||kind.output_schema());
+            if let Some(existing) = incoming_schema.get(dest) {
+                if existing.fields != schema.fields {
+                    return Err(SparrowError::new(ErrorCode::TypeMismatch, format!("node {dest}: UnionAll inputs require identical ordered fields, types and nullability")));
+                }
             }
-            if !matches!(kind, BoundKind::CaptureSink { .. }) {
+            if !matches!(kind, BoundKind::CaptureSink { .. } | BoundKind::BestEffortSink { .. }) {
                 incoming_schema
                     .entry(*dest)
-                    .or_insert_with(|| kind.output_schema().clone());
+                    .or_insert_with(|| schema.clone());
             }
         }
 
@@ -248,16 +344,66 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
         .count();
     let sinks = bound
         .iter()
-        .filter(|n| matches!(n.kind, BoundKind::CaptureSink { .. }))
+        .filter(|n| matches!(n.kind, BoundKind::CaptureSink { .. } | BoundKind::BestEffortSink { .. }))
         .count();
-    if sources != 1 || sinks != 1 {
+    if sources == 0 || sinks == 0 {
         return Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
-            format!("V0.3 linear plans must have exactly one source and one sink (got {sources}/{sinks})"),
+            format!("graph requires sources and sinks (got {sources}/{sinks})"),
         ));
     }
 
+    let mut source_times = Vec::new();
+    for node in &spec.nodes {
+        if node.kind == "memory_source" {
+            if let Some(field)=&node.event_time_field {
+                let schema=bound.iter().find(|n|n.id.raw()==node.id).unwrap().kind.output_schema();
+                let index=schema.index_of_name(field).ok_or_else(||SparrowError::new(ErrorCode::InvalidSchema,"source event-time field missing"))?;
+                if schema.fields[index].nullable || !matches!(schema.fields[index].data_type,sparrow_model::DataType::Int64|sparrow_model::DataType::TimestampMicrosUTC) {return Err(SparrowError::new(ErrorCode::TypeMismatch,"source event-time requires non-null Int64/TimestampMicrosUTC"));}
+                let time=sparrow_model::EventTimeBinding {field:field.clone(),out_of_orderness_micros:node.out_of_orderness_micros.unwrap_or(0),max_future_skew_micros:Some(node.max_future_skew_micros.unwrap_or(sparrow_model::DEFAULT_MAX_FUTURE_SKEW_MICROS))};
+                time.validate()?;source_times.push((OperatorId::new(node.id),time));
+            }
+        }
+    }
+    let graph = sources > 1 || spec.nodes.iter().any(|n|n.out.len()>1||n.kind=="union_all");
+    if graph && bound.iter().any(|n|matches!(&n.kind,BoundKind::WindowAgg {spec,..} if spec.kind.uses_event_time())) && source_times.len()!=sources {
+        return Err(SparrowError::new(ErrorCode::InvalidArgument,"event-time DAG requires explicit event_time_field on every source"));
+    }
+    if !source_times.is_empty() {
+        for node in &bound {
+            if let BoundKind::WindowAgg {spec,..}=&node.kind {
+                if let Some(binding)=spec.binding() {
+                    let allowed=binding.max_future_skew_micros.unwrap_or(i64::MAX);
+                    if source_times.iter().any(|(_,time)|time.max_future_skew_micros.unwrap_or(i64::MAX)>allowed) {
+                        return Err(SparrowError::new(ErrorCode::InvalidArgument,"source future-skew allowance cannot exceed a downstream event-time window allowance"));
+                    }
+                }
+            }
+        }
+        let mut times:HashMap<OperatorId,Option<String>>=HashMap::new();
+        for node in &bound {
+            let incoming=times.get(&node.id).cloned().flatten();
+            let output=match &node.kind {
+                BoundKind::MemorySource {..}=>source_times.iter().find(|(id,_)|*id==node.id).map(|(_,t)|t.field.clone()),
+                BoundKind::Project {exprs,output,..}|BoundKind::Map {exprs,output,..}=>incoming.as_ref().and_then(|field|exprs.iter().zip(&output.fields).find_map(|(expr,f)|if matches!(expr,Expr::Column {name} if name==field){Some(f.name.clone())}else{None})),
+                BoundKind::WindowAgg {spec,..}=>{
+                    if spec.kind.uses_event_time() && incoming.as_ref()!=spec.event_time_field.as_ref(){return Err(SparrowError::new(ErrorCode::InvalidArgument,format!("window {}: event-time lineage lost, transformed or incompatible across inputs",node.id.raw())));}
+                    None
+                },
+                _=>incoming,
+            };
+            for dest in &node.downstream {
+                let side=spec.nodes.iter().find(|n|n.id==node.id.raw()).and_then(|n|n.side_output.as_ref()).is_some_and(|s|s.to==dest.raw());
+                let next=if side{None}else{output.clone()};
+                if let Some(previous)=times.get(dest){if previous!=&next{return Err(SparrowError::new(ErrorCode::InvalidArgument,format!("node {}: incompatible input time attributes",dest.raw())));}}
+                else{times.insert(*dest,next);}
+            }
+        }
+    }
+
     Ok(BoundLogicalPlan {
+        source_times,
+        side_outputs: spec.nodes.iter().filter_map(|n|n.side_output.clone().map(|s|(OperatorId::new(n.id),s))).collect(),
         pipeline: PipelineId::new(spec.pipeline_id),
         revision: RevisionId::new(spec.revision_id),
         nodes: bound,
@@ -350,6 +496,8 @@ pub fn bind_linear(
         downstream: Vec::new(),
     });
     Ok(BoundLogicalPlan {
+        side_outputs: vec![],
+        source_times: vec![],
         pipeline,
         revision,
         nodes,
@@ -502,6 +650,8 @@ fn bind_after_source(
         downstream: Vec::new(),
     });
     Ok(BoundLogicalPlan {
+        side_outputs: vec![],
+        source_times: vec![],
         pipeline,
         revision,
         nodes,
@@ -654,23 +804,56 @@ fn link(nodes: &mut [BoundNode], from: OperatorId, to: OperatorId) {
     }
 }
 
-fn reject_fan_in(spec: &GraphSpec) -> Result<()> {
+fn validate_ports(spec: &GraphSpec) -> Result<()> {
     let mut inbound: HashMap<u32, u32> = HashMap::new();
     for n in &spec.nodes {
         for d in &n.out {
             *inbound.entry(*d).or_insert(0) += 1;
-            if inbound[d] > 1 {
-                return Err(SparrowError::new(
-                    ErrorCode::FeatureUnavailable,
-                    format!("fan-in on node {d} is not part of V0.3 (multi-input watermark is an operator API, not Graph fan-in)"),
-                ));
-            }
         }
-        if n.out.len() > 1 {
-            return Err(SparrowError::new(
-                ErrorCode::FeatureUnavailable,
-                    format!("fan-out on node {} is not part of V0.3", n.id),
-            ));
+        if n.out.iter().collect::<HashSet<_>>().len() != n.out.len() || n.out.len() > 16 {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument, format!("node {}: duplicate edges or more than 16 outputs", n.id)));
+        }
+    }
+    let mut lossy = HashSet::new();
+    for id in topo(spec)? {
+        let n = spec.nodes.iter().find(|n| n.id == id).unwrap();
+        let inputs = inbound.get(&id).copied().unwrap_or(0);
+        let side = usize::from(n.side_output.is_some());
+        if let Some(side) = &n.side_output {
+            let valid = match side.kind {
+                crate::graph::SideOutputKind::DecodeError => n.kind=="memory_source",
+                crate::graph::SideOutputKind::RuleReject => n.kind=="filter",
+                crate::graph::SideOutputKind::Late => matches!(n.kind.as_str(),"window_agg"|"tumble_et"|"event_time_window"|"hop"),
+            };
+            if !valid || !n.out.contains(&side.to) {return Err(SparrowError::new(ErrorCode::InvalidArgument,format!("node {id}: invalid side output kind/port")));}
+        }
+        let valid = match n.kind.as_str() {
+            "memory_source" => inputs == 0 && n.out.len() == 1 + side,
+            "capture_sink" | "best_effort_sink" => inputs == 1 && n.out.is_empty(),
+            "branch" | "route" | "switch" => inputs == 1 && !n.out.is_empty(),
+            "union_all" => (2..=16).contains(&inputs) && n.out.len() == 1,
+            _ => inputs == 1 && n.out.len() == 1 + side,
+        };
+        if !valid {
+            return Err(SparrowError::new(ErrorCode::FeatureUnavailable, format!("node {id}: invalid input/output arity; use explicit Branch/Route/UnionAll")));
+        }
+        let router = matches!(n.kind.as_str(), "branch" | "route" | "switch");
+        if (n.out_of_orderness_micros.is_some()||n.max_future_skew_micros.is_some())&&(n.kind!="memory_source"||n.event_time_field.is_none()) {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,format!("node {id}: source watermark options require memory_source.event_time_field")));
+        }
+        if (!router && !n.best_effort.is_empty()) || n.best_effort.iter().any(|d| !n.out.contains(d))
+            || n.best_effort.iter().collect::<HashSet<_>>().len() != n.best_effort.len() {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument, format!("node {id}: invalid best_effort edges")));
+        }
+        if !matches!(n.kind.as_str(), "route" | "switch") && (n.routes.is_some() || n.route_mode.is_some() || n.default_out.is_some()) {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument, format!("node {id}: routing options on a non-route node")));
+        }
+        if lossy.contains(&id) && matches!(n.kind.as_str(), "capture_sink" | "union_all") {
+            return Err(SparrowError::new(ErrorCode::PolicyDenied, format!("node {id}: a lossy branch cannot merge or reach a required sink")));
+        }
+        if n.kind=="best_effort_sink"&&!lossy.contains(&id){return Err(SparrowError::new(ErrorCode::PolicyDenied,format!("node {id}: best_effort_sink requires an explicit lossy branch edge")));}
+        for dest in &n.out {
+            if lossy.contains(&id) || n.best_effort.contains(dest) || n.side_output.as_ref().is_some_and(|s|s.to==*dest&&s.full==crate::graph::SideOutputFull::Drop) { lossy.insert(*dest); }
         }
     }
     Ok(())

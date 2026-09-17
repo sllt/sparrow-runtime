@@ -1540,6 +1540,7 @@ mod tests {
 
     fn spec() -> PipelineSpec {
         PipelineSpec {
+            graph_io: None,
             version: 1,
             stream: "sensors".into(),
             sql: Some("SELECT device_id FROM sensors".into()),

@@ -24,11 +24,19 @@ impl StallGate {
     }
 
     pub async fn wait_if_stalled(&self, cancel: &CancellationToken) {
-        while self.stalled.load(Ordering::SeqCst) {
+        // Preserve the production disabled-capture fast path. A stalled
+        // waiter must register before rechecking the condition: release uses
+        // notify_waiters, which cannot save a notification for a late waiter.
+        if !self.stalled.load(Ordering::SeqCst) { return; }
+        loop {
+            let notified=self.go.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.stalled.load(Ordering::SeqCst) { return; }
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return,
-                _ = self.go.notified() => {}
+                _ = notified => {}
             }
         }
     }

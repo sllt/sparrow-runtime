@@ -2,6 +2,7 @@
 //! Field order and Dynamic object order are significant; float bits are exact.
 
 use crate::{PhysicalPlan, PhysicalStage, TransformStep, WindowSpec};
+use crate::stateful::{DeadbandBaseline, DeadbandMode, InvalidValuePolicy, IotSpec};
 use sparrow_expr::Expr;
 use sparrow_model::{
     DataType, DynamicValue, ErrorCode, Field, Result, Scalar, Schema, SparrowError, WindowKind,
@@ -240,6 +241,14 @@ pub(crate) fn checkpoint_pipeline(plan: &PhysicalPlan) -> Result<(Vec<u8>, usize
                 w.schema(input)?; w.schema(output)?;
                 recovery_prefix_len = w.0.len();
             }
+            PhysicalStage::Iot { operator, spec, input } => {
+                // Tag 6 is new and is only emitted for an IoT state stage;
+                // legacy plans never take this arm, so their bytes stay
+                // byte-for-byte unchanged.  IoT recovery uses the complete
+                // descriptor (no RCP2 downstream-prefix relaxation).
+                w.tag(6)?; w.raw(&operator.raw().to_le_bytes())?;
+                w.iot(spec)?; w.schema(input)?;
+            }
             PhysicalStage::CaptureSink { operator, schema, .. } => {
                 w.tag(5)?; w.raw(&operator.raw().to_le_bytes())?; w.schema(schema)?;
             }
@@ -247,6 +256,43 @@ pub(crate) fn checkpoint_pipeline(plan: &PhysicalPlan) -> Result<(Vec<u8>, usize
         }
     }
     Ok((w.0, recovery_prefix_len))
+}
+
+/// Strict full-graph recovery identity. No downstream-only compatibility for
+/// graphs: topology, routes, input schemas and every required sink are dependencies.
+pub(crate) fn checkpoint_graph(plan: &PhysicalPlan, sources: &[sparrow_model::OperatorId], sinks: &[sparrow_model::OperatorId]) -> Result<Vec<u8>> {
+    let mut w = Writer::default();
+    w.raw(b"CP01DAG1")?;
+    for ids in [sources, sinks] {
+        w.raw(&(ids.len() as u16).to_le_bytes())?;
+        for id in ids { w.raw(&id.raw().to_le_bytes())?; }
+    }
+    w.raw(&sparrow_expr::semantics::VERSION.to_le_bytes())?;
+    w.bytes(sparrow_expr::semantics::EVALUATION.as_bytes())?;
+    for stage in &plan.stages {
+        match stage {
+            PhysicalStage::Branch { operator, input } | PhysicalStage::UnionAll { operator, input } => {
+                w.tag(if matches!(stage, PhysicalStage::Branch { .. }) { 10 } else { 11 })?;
+                w.raw(&operator.raw().to_le_bytes())?; w.schema(input)?;
+            }
+            PhysicalStage::Route { operator, input, mode, cases, default } => {
+                w.tag(12)?; w.raw(&operator.raw().to_le_bytes())?; w.schema(input)?;
+                w.tag(u8::from(*mode == crate::graph::RouteMode::AllMatch))?;
+                w.len(cases.len())?;
+                for (expr, dest) in cases { w.expr(expr, 0)?; w.raw(&dest.raw().to_le_bytes())?; }
+                w.raw(&default.raw().to_le_bytes())?;
+            }
+            _ => {
+                let single = PhysicalPlan { pipeline: plan.pipeline, revision: plan.revision, stages: vec![stage.clone()], edges: None, side_outputs: vec![], source_times: vec![] };
+                w.bytes(&checkpoint_pipeline(&single)?.0)?;
+            }
+        }
+    }
+    for edge in plan.edges.as_ref().expect("graph topology") {
+        w.raw(&(edge.from as u32).to_le_bytes())?; w.raw(&(edge.to as u32).to_le_bytes())?;
+        w.raw(&edge.port.raw().to_le_bytes())?; w.tag(u8::from(edge.best_effort))?;
+    }
+    Ok(w.0)
 }
 
 #[derive(Default)]
@@ -454,6 +500,44 @@ impl Writer {
                 self.bytes(key.as_bytes())
             }
         }
+    }
+
+    fn iot(&mut self, spec: &IotSpec) -> Result<()> {
+        self.len(spec.keys.len())?;
+        for key in &spec.keys { self.bytes(key.as_bytes())?; }
+        self.len(spec.fields.len())?;
+        for field in &spec.fields { self.bytes(field.as_bytes())?; }
+        self.tag(u8::from(spec.emit_first))?;
+        self.raw(&spec.ttl_micros.to_le_bytes())?;
+        self.raw(&(spec.max_keys as u64).to_le_bytes())?;
+        self.tag(match spec.invalid {
+            InvalidValuePolicy::Error => 0,
+            InvalidValuePolicy::Ignore => 1,
+        })?;
+        match &spec.deadband {
+            None => self.tag(0)?,
+            Some(deadband) => {
+                self.tag(1)?;
+                self.tag(match deadband.mode {
+                    DeadbandMode::Absolute => 0,
+                    DeadbandMode::Relative => 1,
+                })?;
+                self.tag(match deadband.baseline {
+                    DeadbandBaseline::LastInput => 0,
+                    DeadbandBaseline::LastOutput => 1,
+                })?;
+                // -0.0 is the same threshold as +0.0 under the validated
+                // >=0 contract; canonicalize it so config spelling cannot
+                // manufacture a false state incompatibility.
+                let bits = if deadband.threshold == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    deadband.threshold.to_bits()
+                };
+                self.raw(&bits.to_le_bytes())?;
+            }
+        }
+        Ok(())
     }
 }
 

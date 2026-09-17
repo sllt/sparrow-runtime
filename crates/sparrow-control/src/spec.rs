@@ -18,6 +18,8 @@ pub struct PipelineSpec {
     pub sql: Option<String>,
     #[serde(default)]
     pub graph: Option<GraphSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_io: Option<GraphIoSpec>,
     pub source: SourceSpec,
     pub sink: SinkSpec,
     #[serde(default = "live")]
@@ -35,6 +37,13 @@ pub struct PipelineSpec {
     /// `IoDiagnostics.decode_errors`. Also enabled by `SPARROW_FAIL_ON_DECODE=1`.
     #[serde(default)]
     pub fail_on_decode: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphIoSpec {
+    pub sources: std::collections::BTreeMap<u32, SourceSpec>,
+    pub sinks: std::collections::BTreeMap<u32, SinkSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -274,10 +283,39 @@ impl PipelineSpec {
     }
 
     pub fn basic_check(&self) -> Result<()> {
+        let graph_uses_iot = self.graph.as_ref().is_some_and(|graph| {
+            graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node.kind.as_str(), "change_detect" | "deadband"))
+        });
+        if let Some(io) = &self.graph_io {
+            if self.graph.is_none() || io.sources.is_empty() || io.sinks.is_empty() || io.sources.len() > 16 || io.sinks.len() > 16 {
+                return Err(SparrowError::new(ErrorCode::InvalidArgument,"graph_io requires graph and 1..16 explicit source/sink bindings"));
+            }
+            if io.sources.values().next() != Some(&self.source) || io.sinks.values().next() != Some(&self.sink) {
+                return Err(SparrowError::new(ErrorCode::InvalidArgument,"legacy source/sink must match the lowest graph_io operator IDs (no shadow configuration)"));
+            }
+            for source in io.sources.values() {
+                if source.kind == "jetstream" {
+                    return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"JetStream remains on its tested linear reliability profile"));
+                }
+                let mut single = self.clone(); single.graph_io = None; single.source = source.clone(); single.basic_check()?;
+            }
+            for sink in io.sinks.values() {
+                let mut single = self.clone(); single.graph_io = None; single.sink = sink.clone(); single.basic_check()?;
+            }
+        }
         if self.source.jetstream.is_some() != (self.source.kind=="jetstream") {
             return Err(SparrowError::new(ErrorCode::InvalidArgument,"source.jetstream is required exclusively for kind=jetstream"));
         }
         if self.source.kind=="jetstream" {
+            if graph_uses_iot {
+                return Err(SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "JetStream + IoT state operators are not in the K4 profile",
+                ));
+            }
             #[cfg(not(feature="jetstream"))]
             return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"JetStream support requires the jetstream build feature"));
             #[cfg(feature="jetstream")]

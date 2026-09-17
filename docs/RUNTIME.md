@@ -1,5 +1,9 @@
 # Runtime ownership (A3 / A4)
 
+K3 开发候选新增真实 DAG：显式物理边、Branch/Route/UnionAll、多 Connector、有限 side output 与 File 多输入/required HTTP checkpoint。图使用独立 v5 profile 与完整图严格兼容，不改变线性 File/v3 或 JetStream/v4 合同；ET 图必须显式声明 Source time，不能由快输入抢跑 watermark。详细范围、预算、best-effort 脱离策略、恢复限制与本轮验收见 [DAG.md](DAG.md)。这不是任意图/全场景生产认证。
+
+K4 Preview 新增 `change_detect` / `deadband`：按 key 保存 detached 前值，显式首值、无效值、绝对/相对阈值与比较基准；正 TTL 为单调 processing-time 空闲过期，受 key、逻辑 timer 和 bytes 预算约束。支持的 File→HTTP aligned 组合要求 TTL=0，并使用独立 v6 profile，完整语义严格恢复；不扩展 JetStream、ET/PT 或告警生命周期。已完成全局 Review 和限定矩阵复验：630 核心、36 no-demo、50×20 K4、24×20 K3、32 项 K2、真实进程故障与三组 File ABBA 均通过。配置、限制与构建证据见 [IOT.md](IOT.md#k4-validation)；未提交或发版，不替代目标设备/真实网络/长稳门禁。
+
 R12/K2 执行更新：JetStream 在 Source 侧合并已就绪记录，只有整批成功入队后才推进 published cut；非空 pull 完成不 sleep，仅真正空闲时按 5～250 ms 退避。durable cut 通过有独立 64 KiB 额度的 worker 做最多 16 路 Explicit ACK、每条最多 3 次确认尝试，stop 取消并 join；默认 File 仍不携带 NATS SDK。checkpoint busy 不是 Job 错误，flush 超时单独标记（不伪造 dropped），JetStream 放弃该次提交但继续背压；真实输出/存储错误仍结束 attempt。具体合同与本批测试证据见 [JETSTREAM.md](JETSTREAM.md)。
 
 > K2 新增可选 JetStream Preview，**默认关闭，不替代下方 R11 生产基线**。单来源、零/单 Count/双 Count、单 required HTTP；空 checkpoint 固定 epoch，真实 Sink cut 保存输出 ordinal，durable publication 后才逐消息 ACK。v4 与 File/v3 目录隔离，语义切换/历史 replay/HA/DLQ/outbox 未开放。SDK bootstrap 先占真实 Job slot，同一 owner 的资源与目录锁保持到实际 I/O 关闭；详见 [K2 合同与证据](JETSTREAM.md)。
@@ -401,7 +405,7 @@ can explicitly use `observed_channel` with a `MemoryOwner`.
 The API uses `running_revision` for the active control-plane revision and
 `runtime_attempt_id` for the Kernel execution ID, distinct from the catalog's
 lifecycle-transition `actual.attempt_id`. `plan_revision` is the physical plan
-revision (a GraphSpec may carry a different value). Stage indexes are scoped to
+revision (Server now binds it to the committed catalog revision; the saved authoring GraphSpec is not rewritten). Stage indexes are scoped to
 that plan/attempt, not stable identifiers across revisions. No device/payload
 labels or unbounded completed-job registry are created.
 

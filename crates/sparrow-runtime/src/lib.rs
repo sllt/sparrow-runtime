@@ -11,6 +11,7 @@ pub mod checkpoint;
 pub mod clock;
 pub mod coordinator;
 pub mod dedup;
+pub mod iot;
 pub mod kernel;
 pub mod linear;
 pub mod lookup;
@@ -24,8 +25,13 @@ pub mod watermark;
 pub mod window;
 pub mod pipeline_checkpoint;
 pub use pipeline_checkpoint::PipelineSnapshot;
+pub use iot::{IotFreeze, IotOperator};
 #[cfg(test)]
 mod k1_tests;
+#[cfg(test)]
+mod k3_tests;
+#[cfg(test)]
+mod k4_tests;
 
 pub use aligned::{run_until, AlignedSession};
 pub use barrier::{
@@ -40,7 +46,7 @@ pub use checkpoint::{
 pub use clock::RuntimeClock;
 pub use coordinator::{CheckpointCoordinator, CheckpointPhase};
 pub use kernel::{
-    IngressEvent, JobHandle, JobRequest, JobStats, Kernel, KernelOptions, SourceAdmission,
+    GraphInput, GraphOutput, IngressEvent, JobHandle, JobRequest, JobStats, Kernel, KernelOptions, SourceAdmission,
 };
 pub use linear::{drain, LinearExecutor, RuntimeConfig};
 pub use lookup::{ReferenceTable, VersionedReferenceTable};

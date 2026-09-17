@@ -46,12 +46,17 @@ impl GraphExplain {
             .iter()
             .map(stage_label)
             .collect::<Vec<_>>();
-        let physical = plan
+        let mut physical: Vec<String> = plan
             .stages
             .iter()
             .enumerate()
             .map(|(i, s)| format!("{i}:{}", stage_label(s)))
             .collect();
+        if let Some(edges)=&plan.edges {
+            physical.extend(edges.iter().enumerate().map(|(id,e)|format!("edge:{id} chain:{} -> chain:{} port:{} contract:{}",e.from,e.to,e.port.raw(),if e.best_effort{"best_effort; full=data_drop; control_full=detach_branch"}else{"required; full=backpressure"})));
+            physical.extend(plan.source_times.iter().map(|(id,time)|format!("source_time:{} field:{} out_of_orderness_micros:{}",id.raw(),time.field,time.out_of_orderness_micros)));
+            physical.extend(plan.side_outputs.iter().map(|(i,side)|format!("side_output:chain:{i} kind:{:?} port:{} full:{:?}",side.kind,side.to,side.full)));
+        }
         let fused = plan.fused();
         let fusion = if fused {
             "adjacent Filter→Project→Map fused into one transform stage".into()
@@ -123,6 +128,19 @@ fn describe_state(plan: &PhysicalPlan) -> String {
             PhysicalStage::Lookup { spec, operator, .. } => {
                 bits.push(format!("lookup op={} table={}", operator.raw(), spec.table));
             }
+            PhysicalStage::Iot { spec, operator, .. } => {
+                bits.push(format!(
+                    "iot op={} kind={} keys={} fields={} emit_first={} ttl_micros={} max_keys={} invalid={:?}",
+                    operator.raw(),
+                    if spec.deadband.is_some() { "deadband" } else { "change_detect" },
+                    spec.keys.join(","),
+                    spec.fields.join(","),
+                    spec.emit_first,
+                    spec.ttl_micros,
+                    spec.max_keys,
+                    spec.invalid
+                ));
+            }
             _ => {}
         }
     }
@@ -135,6 +153,10 @@ fn describe_state(plan: &PhysicalPlan) -> String {
 
 fn stage_label(s: &PhysicalStage) -> String {
     match s {
+        PhysicalStage::Branch { .. } => "branch:broadcast".into(),
+        PhysicalStage::Route { mode, .. } => format!("route:{mode:?}"),
+        PhysicalStage::UnionAll { .. } => "union_all:per-input-ordered".into(),
+        PhysicalStage::BestEffortSink { name, .. } => format!("sink:{name}:best_effort"),
         PhysicalStage::MemorySource { name, .. } => format!("source:{name}"),
         PhysicalStage::Transform { steps } => {
             let kinds: Vec<&str> = steps
@@ -151,6 +173,11 @@ fn stage_label(s: &PhysicalStage) -> String {
         PhysicalStage::WindowAgg { spec, .. } => format!("window:{:?}", spec.kind),
         PhysicalStage::Deduplicate { .. } => "dedup".into(),
         PhysicalStage::Lookup { spec, .. } => format!("lookup:{}", spec.table),
+        PhysicalStage::Iot { spec, .. } => if spec.deadband.is_some() {
+            "iot:deadband".into()
+        } else {
+            "iot:change_detect".into()
+        },
     }
 }
 
@@ -209,6 +236,10 @@ pub fn bound_kinds(bound: &BoundLogicalPlan) -> Vec<String> {
         .nodes
         .iter()
         .map(|n| match &n.kind {
+            BoundKind::Branch { .. } => "branch".into(),
+            BoundKind::Route { .. } => "route".into(),
+            BoundKind::UnionAll { .. } => "union_all".into(),
+            BoundKind::BestEffortSink { name, .. } => format!("sink:{name}:best_effort"),
             BoundKind::MemorySource { name, .. } => format!("source:{name}"),
             BoundKind::Filter { .. } => "filter".into(),
             BoundKind::Project { .. } => "project".into(),
@@ -216,6 +247,11 @@ pub fn bound_kinds(bound: &BoundLogicalPlan) -> Vec<String> {
             BoundKind::WindowAgg { spec, .. } => format!("window:{:?}", spec.kind),
             BoundKind::Deduplicate { .. } => "dedup".into(),
             BoundKind::Lookup { spec, .. } => format!("lookup:{}", spec.table),
+            BoundKind::Iot { spec, .. } => if spec.deadband.is_some() {
+                "iot:deadband".into()
+            } else {
+                "iot:change_detect".into()
+            },
             BoundKind::CaptureSink { name, .. } => format!("sink:{name}"),
         })
         .collect()

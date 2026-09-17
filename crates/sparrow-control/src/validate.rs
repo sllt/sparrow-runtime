@@ -86,7 +86,7 @@ pub fn bind_plan(
     spec.check_delivery()?;
     let pipeline = PipelineId::new(fnv(name) as u64);
     let rev = RevisionId::new(revision);
-    let bound = if let Some(sql) = &spec.sql {
+    let mut bound = if let Some(sql) = &spec.sql {
         bind_sql(sql, catalog, pipeline, rev)?
     } else if let Some(graph) = &spec.graph {
         bind_graph(graph, catalog)?
@@ -96,7 +96,28 @@ pub fn bind_plan(
             "exactly one of sql or graph",
         ));
     };
-    Ok(physicalize(&bound, &PlanOptions { fuse: true }))
+    // Authoring GraphSpec is preserved in the catalog; execution identity is
+    // the named pipeline and its committed revision, not client-supplied IDs.
+    bound.pipeline=pipeline;bound.revision=rev;
+    let plan = physicalize(&bound, &PlanOptions { fuse: true });
+    if let Some(io) = &spec.graph_io {
+        let sources: std::collections::BTreeSet<_> = plan.stages.iter().filter_map(|s|match s { sparrow_plan::PhysicalStage::MemorySource { operator,.. } => Some(operator.raw()),_=>None }).collect();
+        let sinks: std::collections::BTreeSet<_> = plan.stages.iter().filter_map(|s|match s { sparrow_plan::PhysicalStage::CaptureSink { operator,.. } | sparrow_plan::PhysicalStage::BestEffortSink { operator,.. } => Some(operator.raw()),_=>None }).collect();
+        if plan.edges.is_none() || sources != io.sources.keys().copied().collect() || sinks != io.sinks.keys().copied().collect() {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,"graph_io must bind every graph source/sink ID exactly once"));
+        }
+        for (stage,side) in &plan.side_outputs {
+            if side.kind==sparrow_plan::graph::SideOutputKind::DecodeError {
+                let sparrow_plan::PhysicalStage::MemorySource {operator,..}=&plan.stages[*stage] else{unreachable!()};
+                if spec.effective_fail_on_decode() || !matches!(io.sources[&operator.raw()].kind.as_str(),"file"|"file_replay"|"replay") {
+                    return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"decode-error side outputs currently require File input and fail_on_decode=false"));
+                }
+            }
+        }
+    } else if plan.edges.is_some() {
+        return Err(SparrowError::new(ErrorCode::InvalidArgument,"DAG pipelines require explicit graph_io source/sink bindings"));
+    }
+    Ok(plan)
 }
 
 pub fn replay_label_for_source(kind: &str) -> &'static str {
@@ -106,6 +127,21 @@ pub fn replay_label_for_source(kind: &str) -> &'static str {
         "mqtt" | "mqtt_source" | "http_push" | "http" => "unsupported",
         _ => sparrow_plan::REPLAY_UNBOUND,
     }
+}
+
+pub fn replay_label_for_spec(spec: &PipelineSpec) -> &'static str {
+    spec.graph_io.as_ref().map_or_else(
+        || replay_label_for_source(&spec.source.kind),
+        |io| {
+            if io.sources.values().all(|source| {
+                matches!(source.kind.as_str(), "file" | "file_replay" | "replay")
+            }) {
+                "replayable"
+            } else {
+                "unsupported"
+            }
+        },
+    )
 }
 
 pub fn explain_plan(plan: &PhysicalPlan) -> ExplainReport {
@@ -188,10 +224,34 @@ pub fn validate_io(
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
     spec.check_delivery()?;
-    match spec.source.kind.as_str() {
+    if let Some(io) = &spec.graph_io {
+        for (operator, source) in &io.sources {
+            validate_source_io(spec, source, schema, secrets, policy, demo)
+                .map_err(|e| e.at_operator((*operator).into()))?;
+        }
+        for (operator, sink) in &io.sinks {
+            validate_sink_io(sink, secrets, policy, demo)
+                .map_err(|e| e.at_operator((*operator).into()))?;
+        }
+        return Ok(());
+    }
+
+    validate_source_io(spec, &spec.source, schema, secrets, policy, demo)?;
+    validate_sink_io(&spec.sink, secrets, policy, demo)
+}
+
+fn validate_source_io(
+    spec: &PipelineSpec,
+    source: &SourceSpec,
+    schema: &Schema,
+    secrets: &dyn SecretResolver,
+    policy: &TargetPolicy,
+    demo: Option<&DemoEndpoints>,
+) -> Result<()> {
+    match source.kind.as_str() {
         #[cfg(feature="jetstream")]
         "jetstream" => {
-            let config=spec.source.jetstream.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"JetStream config required"))?;
+            let config=source.jetstream.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"JetStream config required"))?;
             config.reader().validate()?;
             config.connection().validate(policy)?;
             check_data_path(std::path::Path::new(spec.checkpoint_dir.as_deref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"checkpoint_dir required"))?)).map_err(io)?;
@@ -199,16 +259,16 @@ pub fn validate_io(
         }
         "mqtt" => {
             refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
-            let mqtt = mqtt_config(&spec.source, schema.clone(), demo, "validate")?;
+            let mqtt = mqtt_config(source, schema.clone(), demo, "validate")?;
             mqtt.validate(secrets, policy).map_err(io)?;
         }
         "http_push" => {
             refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
-            let push = http_push_config(&spec.source, schema.clone())?;
+            let push = http_push_config(source, schema.clone())?;
             push.validate(secrets, policy).map_err(io)?;
         }
         "file" | "file_replay" | "replay" => {
-            let path = spec.source.path.clone().ok_or_else(|| {
+            let path = source.path.clone().ok_or_else(|| {
                 SparrowError::new(
                     ErrorCode::InvalidArgument,
                     "file source requires source.path",
@@ -222,7 +282,10 @@ pub fn validate_io(
             let mut cfg = FileReplayConfig::new(path, schema.clone());
             cfg.restore = spec.restore_claim()?;
             cfg.recovery = recovery;
-            cfg.contract = resolve_file_contract(spec, recovery)?;
+            let mut source_spec = spec.clone();
+            source_spec.graph_io = None;
+            source_spec.source = source.clone();
+            cfg.contract = resolve_file_contract(&source_spec, recovery)?;
             cfg.validate().map_err(io)?;
         }
         other => {
@@ -232,14 +295,23 @@ pub fn validate_io(
             ));
         }
     }
-    match spec.sink.kind.as_str() {
+    Ok(())
+}
+
+fn validate_sink_io(
+    sink: &SinkSpec,
+    secrets: &dyn SecretResolver,
+    policy: &TargetPolicy,
+    demo: Option<&DemoEndpoints>,
+) -> Result<()> {
+    match sink.kind.as_str() {
         "http" => {
-            let http = http_config(&spec.sink, demo)?;
+            let http = http_config(sink, demo)?;
             http.validate(secrets, policy).map_err(io)?;
         }
         "log" => {}
         "mqtt" => {
-            let mqtt = mqtt_sink_config(&spec.sink, demo)?;
+            let mqtt = mqtt_sink_config(sink, demo)?;
             mqtt.validate(secrets, policy).map_err(io)?;
         }
         other => {
@@ -250,6 +322,57 @@ pub fn validate_io(
         }
     }
     Ok(())
+}
+
+/// Validate graph connector settings against the schemas of the physical
+/// source/sink chains.  The legacy [`validate_io`] entry point is retained for
+/// callers that only have the pipeline stream schema; Server validation uses
+/// this plan-aware variant so a graph source bound to another catalog table is
+/// not checked with the first/top-level stream schema.
+pub fn validate_io_with_plan(
+    spec: &PipelineSpec,
+    schema: &Schema,
+    plan: &PhysicalPlan,
+    secrets: &dyn SecretResolver,
+    policy: &TargetPolicy,
+    demo: Option<&DemoEndpoints>,
+) -> Result<()> {
+    spec.check_delivery()?;
+    let Some(io) = &spec.graph_io else {
+        return validate_io(spec, schema, secrets, policy, demo);
+    };
+
+    for (operator, source) in &io.sources {
+        let actual = graph_endpoint_schema(plan, *operator, true)?;
+        validate_source_io(spec, source, &actual, secrets, policy, demo)
+            .map_err(|e| e.at_operator((*operator).into()))?;
+    }
+    for (operator, sink) in &io.sinks {
+        let _actual = graph_endpoint_schema(plan, *operator, false)?;
+        validate_sink_io(sink, secrets, policy, demo)
+            .map_err(|e| e.at_operator((*operator).into()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn graph_endpoint_schema(plan: &PhysicalPlan, operator: u32, source: bool) -> Result<Schema> {
+    plan.stages
+        .iter()
+        .find_map(|stage| match stage {
+            sparrow_plan::PhysicalStage::MemorySource { operator: id, schema, .. }
+                if source && id.raw() == operator => Some(schema.clone()),
+            sparrow_plan::PhysicalStage::CaptureSink { operator: id, schema, .. }
+                if !source && id.raw() == operator => Some(schema.clone()),
+            sparrow_plan::PhysicalStage::BestEffortSink { operator: id, schema, .. }
+                if !source && id.raw() == operator => Some(schema.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("graph I/O operator {operator} has no physical endpoint schema"),
+            )
+        })
 }
 
 pub fn mqtt_config(
@@ -441,6 +564,34 @@ pub fn validate_aligned_plan(
     if !recovery.is_aligned() {
         return Ok(());
     }
+    if plan.has_iot() && spec.graph_io.is_none() {
+        validate_linear_iot_profile(spec)?;
+    }
+    if plan.has_iot() && spec.source.kind == "jetstream" {
+        return Err(SparrowError::new(
+            ErrorCode::FeatureUnavailable,
+            "JetStream + IoT state operators are not in the K4 aligned profile",
+        ));
+    }
+    if plan.has_iot()
+        && plan.stages.iter().any(|stage| {
+            matches!(
+                stage,
+                sparrow_plan::PhysicalStage::Iot { spec, .. } if spec.ttl_micros != 0
+            )
+        })
+    {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "aligned IoT state requires ttl_micros=0; processing-time TTL is restart_fresh only",
+        ));
+    }
+    if let Some(io) = &spec.graph_io {
+        if spec.checkpoint_dir.as_deref().is_none_or(str::is_empty) || io.sources.values().any(|s| !matches!(s.kind.as_str(),"file"|"file_replay"|"replay"))
+            || io.sinks.values().any(|s|s.kind!="http") {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"graph aligned requires explicit checkpoint_dir, replayable File inputs and required HTTP outputs"));
+        }
+    }
     if !matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay")
         && !(cfg!(feature="jetstream") && spec.source.kind=="jetstream") {
         return Err(SparrowError::new(
@@ -458,6 +609,22 @@ pub fn validate_aligned_plan(
     if spec.source.kind=="jetstream" && plan.stages.iter().any(|stage|
         matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}))) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state or one/two Count windows only; event/processing-time replay context not verified"));
+    }
+    Ok(())
+}
+
+fn validate_linear_iot_profile(spec: &PipelineSpec) -> Result<()> {
+    if spec.checkpoint_dir.as_deref().is_none_or(str::is_empty) {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "linear aligned IoT recovery requires an explicit checkpoint_dir and HTTP sink",
+        ));
+    }
+    if spec.sink.kind != "http" {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "linear aligned IoT recovery requires an explicit checkpoint_dir and HTTP sink",
+        ));
     }
     Ok(())
 }
@@ -551,10 +718,58 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
     })
 }
 
+fn iot_ttls(plan: &PhysicalPlan) -> Vec<i64> {
+    plan.stages
+        .iter()
+        .filter_map(|stage| match stage {
+            sparrow_plan::PhysicalStage::Iot { spec, .. } => Some(spec.ttl_micros),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Eligibility is a property of both the replayable source and the bound plan,
 /// independent of whether the stored spec currently requests aligned recovery.
 pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
+    let recovery = RecoveryPolicy::parse(&spec.recovery).unwrap_or(RecoveryPolicy::RestartFresh);
+    if plan.has_iot() {
+        value["iot"] = serde_json::json!({
+            "operators":["change_detect","deadband"],
+            "state":"bounded_task_owned_key_state",
+            "recovery":if recovery.is_aligned() {"aligned_v6_ttl_disabled"} else {"restart_fresh_empty_state_no_persisted_generation"},
+            "continuity":if recovery.is_aligned() {"preserved_from_compatible_v6_checkpoint"} else {"not_preserved_on_restart_or_reset"},
+            "ttl_micros":iot_ttls(plan)
+        });
+    }
+    if plan.edges.is_some() {
+        let mut aligned=spec.clone();aligned.recovery="aligned".into();
+        let eligibility=validate_aligned_plan(&aligned,plan);
+        value["graph"]=serde_json::json!("dag");
+        value["aligned_eligible"]=serde_json::json!(eligibility.is_ok());
+        value["aligned_eligibility_reason"]=serde_json::json!(eligibility.err().map_or_else(||"graph_required_file_count_participants".into(),|e|e.message));
+        let iot = plan.has_iot();
+        let iot_ttl = iot_ttls(plan);
+        value["checkpoint_participants"]=serde_json::json!({
+            "scope":if iot {"graph_File_required_HTTP_stateless_Count_or_IoT"} else {"graph_File_required_HTTP_stateless_or_Count"},
+            "snapshot_version":if iot {6} else {5},
+            "manifest":"CPL1/CP01DAG1",
+            "restore_compatibility":if iot {"strict_full_graph_all_source_cursors_and_IoT_state; separate_directory_from_v3_v4_v5"} else {"strict_full_graph_and_all_source_cursors; separate_directory_from_v3_v4"},
+            "certified":false
+        });
+        if iot {
+            value["iot"] = serde_json::json!({
+                "operators":["change_detect","deadband"],
+                "state":"bounded_task_owned_key_state",
+                "recovery":if spec.recovery=="aligned" {"aligned_v6_ttl_disabled"} else {"restart_fresh_empty_state_no_persisted_generation"},
+                "continuity":if spec.recovery=="aligned" {"preserved_from_compatible_v6_checkpoint"} else {"not_preserved_on_restart_or_reset"},
+                "ttl_micros":iot_ttl
+            });
+        }
+        value["recovery_risk"]=serde_json::json!(if spec.recovery=="aligned"{"external_outputs_may_repeat; no_cross_sink_rollback; Count_Union_interleaving_not_global_order"}else{"restart_fresh_loses_graph_state"});
+        value["replay"]=serde_json::json!(if spec.graph_io.as_ref().is_some_and(|io|io.sources.values().all(|s|matches!(s.kind.as_str(),"file"|"file_replay"|"replay"))){"replayable"}else{"unsupported"});
+        return value;
+    }
     if spec.source.kind=="jetstream" {
         let accepted=spec.basic_check().and_then(|_|spec.check_delivery()).and_then(|_|validate_aligned_plan(spec,plan));
         value["requested_delivery"]=serde_json::json!(spec.delivery);
@@ -580,18 +795,43 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
         return value;
     }
     if matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
-        match sparrow_plan::CheckpointPlan::from_physical(plan) {
+        let checkpoint_plan = if plan.has_iot() {
+            validate_linear_iot_profile(spec)
+                .and_then(|_| sparrow_plan::CheckpointPlan::from_physical(plan))
+        } else {
+            sparrow_plan::CheckpointPlan::from_physical(plan)
+        };
+        match checkpoint_plan {
             Ok(manifest) => {
                 value["aligned_eligible"] = serde_json::json!(true);
-                value["aligned_eligibility_reason"] = serde_json::json!(match manifest.states.len() {0=>"zero_state_file_cut",1=>"single_supported_window",_=>"two_count_window_participants"});
+                let iot = plan.has_iot();
+                let iot_ttl = iot_ttls(plan);
+                value["aligned_eligibility_reason"] = serde_json::json!(if iot {
+                    "IoT_state_participants_v6"
+                } else {
+                    match manifest.states.len() {
+                        0=>"zero_state_file_cut",
+                        1=>"single_supported_window",
+                        _=>"two_count_window_participants",
+                    }
+                });
                 value["checkpoint_participants"] = serde_json::json!({"source":manifest.source.raw(),"required_sink":manifest.sink.raw(),
-                    "snapshot_version":sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION,
-                    "manifest_version":"CPL1","semantics_version":"CP01+RCP2","restore_compatibility":"source_and_all_state_upstream_prefixes; plain_CP01_full_plan_strict",
-                    "downstream_changes":"allowed_after_last_state; plain_CP01_snapshots_remain_full_plan_strict; external_outputs_are_not_rolled_back",
+                    "snapshot_version":if iot {6} else {sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION},
+                    "manifest_version":"CPL1","semantics_version":if iot {"CP01_full_plan_IoT_state"} else {"CP01+RCP2"},"restore_compatibility":if iot {"source_all_state_and_full_plan_semantics; separate_directory_from_v3_v4_v5"} else {"source_and_all_state_upstream_prefixes; plain_CP01_full_plan_strict"},
+                    "downstream_changes":if iot {"full_plan_change_requires_explicit_fresh_or_compatible_v6_restore; external_outputs_are_not_rolled_back"} else {"allowed_after_last_state; plain_CP01_snapshots_remain_full_plan_strict; external_outputs_are_not_rolled_back"},
                     "states":manifest.states.iter().map(|state|match state.id {
                         sparrow_plan::ParticipantId::State {operator,slot,shard}=>serde_json::json!({"operator":operator.raw(),"slot":slot.raw(),"shard":shard,"codec":state.codec,"window_kind":state.window_kind}),
                         _=>unreachable!(),
                     }).collect::<Vec<_>>(),"scope":"single_file_single_required_sink_tested_linear_shapes","certified":false});
+                if iot {
+                    value["iot"] = serde_json::json!({
+                        "operators":["change_detect","deadband"],
+                        "state":"bounded_task_owned_key_state",
+                        "recovery":if spec.recovery=="aligned" {"aligned_v6_ttl_disabled"} else {"restart_fresh_empty_state_no_persisted_generation"},
+                        "continuity":if spec.recovery=="aligned" {"preserved_from_compatible_v6_checkpoint"} else {"not_preserved_on_restart_or_reset"},
+                        "ttl_micros":iot_ttl
+                    });
+                }
                 if spec.recovery == "aligned" {
                     value["recovery_risk"] = serde_json::json!("committed_checkpoint_only");
                 }
@@ -599,6 +839,22 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
             Err(e) => {
                 value["aligned_eligible"] = serde_json::json!(false);
                 value["aligned_eligibility_reason"] = serde_json::json!(e.message);
+                if plan.has_iot() {
+                    value["checkpoint_participants"] = serde_json::json!({
+                        "scope":"single_file_single_required_sink_iot",
+                        "snapshot_version":6,
+                        "profile":"iot_v6",
+                        "eligible":false,
+                        "certified":false
+                    });
+                    value["iot"] = serde_json::json!({
+                        "operators":["change_detect","deadband"],
+                        "state":"bounded_task_owned_key_state",
+                        "recovery":"restart_fresh_empty_state_no_persisted_generation",
+                        "continuity":"not_preserved_on_restart_or_reset",
+                        "ttl_micros":iot_ttls(plan)
+                    });
+                }
                 if spec.recovery == "aligned" {
                     value["recovery_risk"] = serde_json::json!("aligned_plan_rejected");
                 }
@@ -669,6 +925,7 @@ mod tests {
     #[test]
     fn rejects_checkpoint_and_at_least_once() {
         let mut spec = PipelineSpec {
+            graph_io: None,
             version: 1,
             stream: "sensors".into(),
             sql: Some("SELECT device_id FROM sensors".into()),

@@ -81,12 +81,18 @@ impl RuntimeClock {
                 None => std::future::pending::<()>().await,
             },
             ClockInner::Virtual { clock, wake } => loop {
+                // Register BEFORE checking time. notify_waiters does not save a
+                // permit: advancing between the old check and registration
+                // could leave a PT window asleep forever at permanent EOF.
+                let notified=wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if let Some(d) = deadline {
                     if clock.now_micros() >= d {
                         return;
                     }
                 }
-                wake.notified().await;
+                notified.await;
                 if deadline.is_none() {
                     return;
                 }

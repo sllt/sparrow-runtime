@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "stream": "telemetry",
+  "source": {
+    "kind": "file",
+    "path": "/var/lib/sparrow/data/k4-deadband.ndjson",
+    "file_contract": "sealed",
+    "inbox_capacity": 8
+  },
+  "sink": {
+    "kind": "http",
+    "url": "http://127.0.0.1:18082/telemetry",
+    "outbox_capacity": 8,
+    "batch_rows": 32,
+    "linger_ms": 5
+  },
+  "recovery": "restart_fresh",
+  "graph": {
+    "version": 1,
+    "pipeline_id": 402,
+    "revision_id": 1,
+    "nodes": [
+      {"id": 1, "kind": "memory_source", "table": "telemetry", "out": [2]},
+      {
+        "id": 2,
+        "kind": "deadband",
+        "iot": {
+          "keys": ["device_id"],
+          "fields": ["temperature"],
+          "emit_first": true,
+          "ttl_micros": 5000000,
+          "max_keys": 1024,
+          "invalid": "error",
+          "deadband": {
+            "mode": "absolute",
+            "baseline": "last_output",
+            "threshold": 1.0
+          }
+        },
+        "out": [3]
+      },
+      {"id": 3, "kind": "capture_sink", "name": "deadband"}
+    ]
+  }
+}

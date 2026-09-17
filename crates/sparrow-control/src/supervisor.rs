@@ -30,7 +30,7 @@ use crate::checkpoint::{CheckpointAdmission, CheckpointControl, CheckpointSpec};
 use crate::store::{ActualState, Store};
 use crate::validate::{
     bind_plan, binder_catalog, http_config, http_push_config, mqtt_config, mqtt_sink_config,
-    store_policy, stream_to_schema, validate_aligned_plan, validate_io, DemoEndpoints,
+    store_policy, stream_to_schema, validate_aligned_plan, validate_io_with_plan, DemoEndpoints,
     StoreSecrets,
 };
 
@@ -40,6 +40,7 @@ pub(crate) const MAX_PIPELINE_ATTEMPTS: u64 = 16;
 
 #[cfg(feature="jetstream")]
 mod jetstream_source;
+mod graph;
 
 /// Per-pipeline backoff, capped at 32 seconds; never sleep in converge.
 /// A successful launch is not a stable recovery: reset after 30s running.
@@ -210,6 +211,7 @@ mod production_checkpoint_tests {
                 let source=kernel.handle().spawn(async move {let _lease=lease;let _=wait.await;Ok(())});
                 let sink=kernel.handle().spawn(async {});
                 sup.running.lock().await.insert("delayed".into(),RunningJob {
+                    graph_ports:None,
                     source_kind:"file",sink_kind:"log",started_at:Instant::now(),stable:false,revision:1,
                     diag:IoDiagnostics::new(),kind:RunningKind::Live{handle,source,sink},
                 });
@@ -279,6 +281,7 @@ mod production_checkpoint_tests {
 }
 
 struct RunningJob {
+    graph_ports: Option<Arc<GraphPortDiagnostics>>,
     source_kind: &'static str,
     sink_kind: &'static str,
     started_at: Instant,
@@ -295,6 +298,7 @@ pub struct PipelineMailboxSnapshot {
     pub runtime: sparrow_runtime::mailbox_observe::JobMailboxSnapshot,
 }
 pub struct PipelineFlowSnapshot {
+    pub graph_ports: Option<Arc<GraphPortDiagnostics>>,
     pub running_revision: u64,
     pub runtime_attempt_id: u64,
     pub finished: bool,
@@ -302,6 +306,18 @@ pub struct PipelineFlowSnapshot {
     pub source_kind: &'static str,
     pub sink_kind: &'static str,
     pub diagnostics: Arc<IoDiagnostics>,
+}
+
+pub struct GraphPortDiagnostics {
+    pub sources: std::collections::BTreeMap<u32, Arc<IoDiagnostics>>,
+    pub sinks: std::collections::BTreeMap<u32, Arc<IoDiagnostics>>,
+}
+impl GraphPortDiagnostics {
+    pub fn snapshot(&self)->sparrow_connectors::IoSnapshot {
+        let mut snapshot=sparrow_connectors::IoSnapshot::default();
+        for port in self.sources.values().chain(self.sinks.values()){snapshot.add_assign(&port.snapshot());}
+        snapshot
+    }
 }
 pub struct PipelineCheckpointInventory {
     pub revision: u64,
@@ -321,6 +337,7 @@ fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
 impl RunningJob {
     fn flow_snapshot(&self) -> PipelineFlowSnapshot {
         PipelineFlowSnapshot {
+            graph_ports: self.graph_ports.clone(),
             running_revision: self.revision,
             runtime_attempt_id: self.handle().attempt.raw(),
             finished: self.is_finished(),
@@ -556,7 +573,7 @@ impl Supervisor {
         let g = self.running.lock().await;
         let mut acc = sparrow_connectors::IoSnapshot::default();
         for j in g.values() {
-            acc.add_assign(&j.diag.snapshot());
+            acc.add_assign(&j.graph_ports.as_ref().map_or_else(||j.diag.snapshot(),|ports|ports.snapshot()));
         }
         acc
     }
@@ -968,9 +985,16 @@ impl Supervisor {
                     let schema = stream_to_schema(&stream)?;
                     let catalog = binder_catalog(s)?;
                     let policy = store_policy(s, demo.as_ref())?;
-                    validate_io(&row.spec, &schema, &secrets, &policy, demo.as_ref())?;
                     let plan = bind_plan(&row.spec, &catalog, &name, revision)?;
                     validate_aligned_plan(&row.spec, &plan)?;
+                    validate_io_with_plan(
+                        &row.spec,
+                        &schema,
+                        &plan,
+                        &secrets,
+                        &policy,
+                        demo.as_ref(),
+                    )?;
                     Ok((row.spec, schema, plan, policy))
                 }
             })
@@ -1010,7 +1034,9 @@ impl Supervisor {
         .await?;
         let recovery = RecoveryPolicy::parse(&spec.recovery)?;
 
-        let job = match spec.source.kind.as_str() {
+        let job = if spec.graph_io.is_some() {
+            self.start_graph(&spec, plan, &policy).await?
+        } else { match spec.source.kind.as_str() {
             #[cfg(feature="jetstream")]
             "jetstream" => self.start_jetstream(&spec,schema,plan,&policy).await?,
             "file" | "file_replay" | "replay" => {
@@ -1021,7 +1047,7 @@ impl Supervisor {
                 self.start_live(name, &spec, schema, plan, kind, demo, &policy)
                     .await?
             }
-        };
+        }};
 
         let old = {
             let mut g = self.running.lock().await;
@@ -1154,6 +1180,7 @@ impl Supervisor {
             }
         };
         Ok(RunningJob {
+            graph_ports: None,
             source_kind: if kind == "mqtt" { "mqtt" } else { "http_push" },
             sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
@@ -1254,6 +1281,7 @@ impl Supervisor {
             }
         };
         Ok(RunningJob {
+            graph_ports: None,
             source_kind: "file",
             sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
@@ -1303,16 +1331,25 @@ impl Supervisor {
         let restore_layout = layout.clone();
         let restore_policy = policy.clone();
         let max_keys = self.kernel.job_budget().max_state_keys;
+        let iot_profile = plan.has_iot();
         // Fingerprinting, bounded snapshot reads and cursor verification are
         // cold filesystem work; never block a Tokio executor worker on them.
-        let (source, store, restore_freeze, ingested0, restored_from, inventory, state_generation, downstream_changed) = self
+        let (source, store, restore_freeze, restore_iot, ingested0, restored_from, inventory, state_generation, downstream_changed) = self
             .store
             .run_blocking(move || {
-                let mut store = CheckpointStore::open_pipeline_exclusive(
-                    std::path::Path::new(&chk),
-                    max_keys,
-                    restore_policy.retention(),
-                )?;
+                let mut store = if iot_profile {
+                    CheckpointStore::open_iot_exclusive(
+                        std::path::Path::new(&chk),
+                        max_keys,
+                        restore_policy.retention(),
+                    )?
+                } else {
+                    CheckpointStore::open_pipeline_exclusive(
+                        std::path::Path::new(&chk),
+                        max_keys,
+                        restore_policy.retention(),
+                    )?
+                };
                 let mut source = FileReplaySource::open(&cfg)
                     .map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
                 let inventory = store.inventory()?;
@@ -1327,7 +1364,7 @@ impl Supervisor {
                         "checkpoint history exists without CURRENT; refusing automatic fresh start",
                     ));
                 }
-                let (restore_freeze, ingested0, restored_from, state_generation, downstream_changed) = if restore {
+                let (restore_freeze, restore_iot, ingested0, restored_from, state_generation, downstream_changed) = if restore {
                     let requested = selected
                         .as_ref()
                         .and_then(|s| s.snapshot_id.as_deref())
@@ -1349,6 +1386,7 @@ impl Supervisor {
                     }
                     (
                         Some(snap.windows),
+                        snap.iot,
                         snap.ingested_rows,
                         Some(snap.checkpoint_id),
                         snap.generation,
@@ -1358,7 +1396,7 @@ impl Supervisor {
                     use ring::rand::{SecureRandom,SystemRandom};
                     let mut generation=[0u8;16];
                     SystemRandom::new().fill(&mut generation).map_err(|_|SparrowError::new(sparrow_model::ErrorCode::Internal,"state generation randomness unavailable"))?;
-                    (None, 0, None, generation, false)
+                    (None, Vec::new(), 0, None, generation, false)
                 };
                 // Durable before Kernel/source activation. Fresh/reset gets a new
                 // random 128-bit identity; compatible recovery preserves its ID.
@@ -1368,6 +1406,7 @@ impl Supervisor {
                     source,
                     store,
                     restore_freeze,
+                    restore_iot,
                     ingested0,
                     restored_from,
                     inventory,
@@ -1400,7 +1439,7 @@ impl Supervisor {
                 .with_live_out(tx_out)
                 .with_aligned(AlignedJob {
                     restore: None,
-                    pipeline: Some(PipelineRestore {plan:layout.clone(),generation:state_generation,restore:restore_freeze}),
+                    pipeline: Some(PipelineRestore {plan:layout.clone(),generation:state_generation,restore:restore_freeze,iot:restore_iot}),
                     acks: acks.clone(),
                     outbox: Arc::clone(&outbox),
                 }),
@@ -1624,6 +1663,7 @@ impl Supervisor {
             }
         };
         Ok(RunningJob {
+            graph_ports: None,
             source_kind: "file",
             sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),

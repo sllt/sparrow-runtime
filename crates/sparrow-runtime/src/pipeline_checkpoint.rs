@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 pub const PIPELINE_SNAPSHOT_VERSION: u16 = 3;
 pub const RELIABLE_SNAPSHOT_VERSION: u16 = 4;
+pub const GRAPH_SNAPSHOT_VERSION: u16 = 5;
+pub const IOT_SNAPSHOT_VERSION: u16 = 6;
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
 
 #[derive(Debug, PartialEq)]
@@ -22,6 +24,7 @@ pub struct PipelineSnapshot {
     pub generation: [u8; 16],
     pub plan: CheckpointPlan,
     pub windows: Vec<WindowFreeze>,
+    pub iot: Vec<crate::iot::IotFreeze>,
     pub next_output: Option<sparrow_model::OutputSequence>,
 }
 
@@ -84,6 +87,13 @@ impl PipelineSnapshot {
         max_keys: usize,
     ) -> Result<EncodedSnapshot> {
         plan.validate()?;
+        if (plan.has_iot() || plan.is_graph()) && acks.next_output.is_some() {
+            return Err(invalid("IoT/graph checkpoint does not admit the JetStream output profile"));
+        }
+        if (plan.has_iot() || plan.is_graph())
+            && (source.identity.kind == "file-dag-v1") != plan.is_graph() {
+            return Err(invalid("checkpoint source topology mismatch"));
+        }
         if acks.next_output.is_some() != (source.identity.kind == "jetstream-v1") {
             return Err(invalid("reliable output cursor and source profile disagree"));
         }
@@ -112,7 +122,7 @@ impl PipelineSnapshot {
             104 + usize::from(acks.next_output.is_some())*24 + source.identity.kind.len() + source.identity.path.len() + manifest.len(),
         );
         prefix.extend_from_slice(crate::checkpoint::MAGIC);
-        prefix.extend_from_slice(&if acks.next_output.is_some(){RELIABLE_SNAPSHOT_VERSION}else{PIPELINE_SNAPSHOT_VERSION}.to_le_bytes());
+        prefix.extend_from_slice(&if plan.has_iot(){IOT_SNAPSHOT_VERSION}else if plan.is_graph(){GRAPH_SNAPSHOT_VERSION}else if acks.next_output.is_some(){RELIABLE_SNAPSHOT_VERSION}else{PIPELINE_SNAPSHOT_VERSION}.to_le_bytes());
         prefix.extend_from_slice(&checkpoint_id.to_le_bytes());
         prefix.extend_from_slice(&ingested_rows.to_le_bytes());
         crate::checkpoint::encode_position(source, &mut prefix)?;
@@ -197,7 +207,7 @@ impl PipelineSnapshot {
             return Err(invalid("unsupported pipeline snapshot magic/version/size"));
         }
         let version=u16::from_le_bytes(take(&mut bytes,2)?.try_into().unwrap());
-        if !matches!(version,PIPELINE_SNAPSHOT_VERSION|RELIABLE_SNAPSHOT_VERSION) {
+        if !matches!(version,PIPELINE_SNAPSHOT_VERSION|RELIABLE_SNAPSHOT_VERSION|GRAPH_SNAPSHOT_VERSION|IOT_SNAPSHOT_VERSION) {
             return Err(invalid("unsupported pipeline snapshot version"));
         }
         let checkpoint_id = u64_value(&mut bytes)?;
@@ -237,11 +247,20 @@ impl PipelineSnapshot {
         }
         let length = u32_value(&mut bytes)?;
         let plan = CheckpointPlan::decode(take(&mut bytes, length)?)?;
+        if (version == IOT_SNAPSHOT_VERSION) != plan.has_iot() {
+            return Err(invalid("IoT checkpoint version/manifest mismatch"));
+        }
+        if version != IOT_SNAPSHOT_VERSION && (version==GRAPH_SNAPSHOT_VERSION)!=plan.is_graph(){return Err(invalid("graph checkpoint version/manifest mismatch"));}
+        if matches!(version, IOT_SNAPSHOT_VERSION | GRAPH_SNAPSHOT_VERSION)
+            && (source.identity.kind == "file-dag-v1") != plan.is_graph() {
+            return Err(invalid("checkpoint source topology mismatch"));
+        }
         let n = u16::from_le_bytes(take(&mut bytes, 2)?.try_into().unwrap()) as usize;
         if n != plan.states.len() {
             return Err(invalid("missing/extra checkpoint state participant"));
         }
         let mut windows = Vec::with_capacity(if materialize { n } else { 0 });
+        let mut iot = Vec::with_capacity(if materialize { n } else { 0 });
         let per_participant = crate::checkpoint::freeze_entry_cap(max_keys);
         let mut remaining = per_participant
             .checked_mul(plan.states.len())
@@ -255,6 +274,16 @@ impl PipelineSnapshot {
                     ErrorCode::BoundExceeded,
                     "total decoded participant entry limit",
                 ));
+            }
+            if participant.codec == sparrow_plan::checkpoint::IOT_STATE_CODEC {
+                let freeze = crate::iot::IotFreeze::decode_mode(&mut frame, per_participant, materialize)?;
+                remaining -= entries;
+                if !frame.is_empty() || participant.id != ParticipantId::iot(freeze.operator)
+                    || freeze.kind != participant.freeze_kind() {
+                    return Err(invalid("IoT checkpoint state identity or codec mismatch"));
+                }
+                if materialize { iot.push(freeze); }
+                continue;
             }
             let freeze =
                 crate::checkpoint::decode_freeze_mode(&mut frame, per_participant, materialize)?;
@@ -288,6 +317,7 @@ impl PipelineSnapshot {
             generation,
             plan,
             windows,
+            iot,
             next_output,
         })
     }
@@ -307,7 +337,7 @@ impl StoredSnapshot {
         }
     }
     pub(crate) fn decode(bytes: &[u8], max_keys: usize, materialize: bool) -> Result<Self> {
-        if matches!(bytes.get(4..6),Some([3|4,0])) {
+        if matches!(bytes.get(4..6),Some([3|4|5|6,0])) {
             Ok(Self::Pipeline(PipelineSnapshot::decode_mode(
                 bytes,
                 max_keys,

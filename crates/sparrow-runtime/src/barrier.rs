@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use sparrow_model::{ErrorCode, InflightCounter, Result, SparrowError};
+use sparrow_model::{ErrorCode, InflightCounter, MemoryOwner, Result, SparrowError};
 
 use crate::window::WindowFreeze;
 use sparrow_plan::{CheckpointPlan, ParticipantId};
@@ -54,6 +54,20 @@ impl EncodedFreeze {
                 ErrorCode::Internal,
                 "freeze size estimate underflow",
             ));
+        }
+        Ok(Self { bytes, lease })
+    }
+
+    pub fn from_iot(op: &crate::iot::IotOperator, owner: &Arc<MemoryOwner>, max_keys: usize) -> Result<Self> {
+        let capacity = op.estimated_freeze_bytes().saturating_add(256);
+        if capacity as u64 > crate::checkpoint::MAX_SNAPSHOT_BYTES {
+            return Err(SparrowError::new(ErrorCode::BoundExceeded, "IoT freeze exceeds snapshot bound"));
+        }
+        let lease = owner.acquire(sparrow_model::CreditKind::Reservation, capacity)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        op.encode_freeze_into(&mut bytes, max_keys)?;
+        if bytes.len() > capacity {
+            return Err(SparrowError::new(ErrorCode::Internal, "IoT freeze estimate underflow"));
         }
         Ok(Self { bytes, lease })
     }
@@ -108,6 +122,7 @@ pub(crate) struct RuntimeAligned {
     pub participant_mode: bool,
     pub restore: Mutex<Option<RestoreState>>,
     pub windows: Mutex<BTreeMap<sparrow_model::OperatorId, crate::window::WindowOperator>>,
+    pub iot: Mutex<BTreeMap<sparrow_model::OperatorId, crate::iot::IotOperator>>,
     pub acks: AlignedAcks,
     pub outbox: Arc<InflightCounter>,
 }
@@ -135,6 +150,7 @@ impl RuntimeAligned {
             participant_mode: false,
             restore: Mutex::new(restore),
             windows: Mutex::new(BTreeMap::new()),
+            iot: Mutex::new(BTreeMap::new()),
             acks: job.acks,
             outbox: job.outbox,
         }))
@@ -163,9 +179,14 @@ impl RuntimeAligned {
             .plan
             .check_compatible(&CheckpointPlan::from_physical(plan)?)?;
         let mut restored = BTreeMap::new();
+        let mut restored_iot = BTreeMap::new();
+        if pipeline.restore.is_none() && !pipeline.iot.is_empty() {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "IoT state supplied without restored participant envelope"));
+        }
         if let Some(states) = pipeline.restore {
             if states.iter().any(|s| s.entries.len() > max_keys)
-                || states.len() != pipeline.plan.states.len()
+                || pipeline.iot.iter().any(|s| s.entries.len() > max_keys)
+                || states.len().saturating_add(pipeline.iot.len()) != pipeline.plan.states.len()
             {
                 return Err(SparrowError::new(
                     ErrorCode::BoundExceeded,
@@ -198,8 +219,20 @@ impl RuntimeAligned {
                     },
                 );
             }
+            for freeze in pipeline.iot {
+                let participant = ParticipantId::iot(freeze.operator);
+                if !pipeline.plan.states.iter().any(|s| s.id == participant
+                    && s.codec == sparrow_plan::checkpoint::IOT_STATE_CODEC
+                    && s.freeze_kind() == freeze.kind)
+                    || restored_iot.contains_key(&freeze.operator) {
+                    return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "unknown or duplicate restored IoT participant"));
+                }
+                let lease = owner.acquire(sparrow_model::CreditKind::Reservation, freeze.resident_bytes())?;
+                restored_iot.insert(freeze.operator, (freeze, lease));
+            }
         }
         let mut windows = BTreeMap::new();
+        let mut iot = BTreeMap::new();
         for stage in &plan.stages {
             if let sparrow_plan::PhysicalStage::WindowAgg {
                 operator,
@@ -222,8 +255,18 @@ impl RuntimeAligned {
                 }
                 windows.insert(*operator, window);
             }
+            if let sparrow_plan::PhysicalStage::Iot { operator, spec, input } = stage {
+                let mut op = crate::iot::IotOperator::new(*operator, spec.clone(), input.clone(), owner.clone())
+                    .map_err(|error| error.at_operator(*operator))?;
+                if let Some((freeze, lease)) = restored_iot.remove(operator) {
+                    op.restore(&freeze).map_err(|error| error.at_operator(*operator))?;
+                    drop(freeze);
+                    drop(lease);
+                }
+                iot.insert(*operator, op);
+            }
         }
-        if !restored.is_empty() {
+        if !restored.is_empty() || !restored_iot.is_empty() {
             return Err(SparrowError::new(ErrorCode::Internal, "unconsumed restored participant"));
         }
         job.acks
@@ -232,6 +275,7 @@ impl RuntimeAligned {
             participant_mode: true,
             restore: Mutex::new(None),
             windows: Mutex::new(windows),
+            iot: Mutex::new(iot),
             acks: job.acks,
             outbox: job.outbox,
         }))
@@ -243,6 +287,9 @@ pub struct PipelineRestore {
     pub generation: [u8; 16],
     /// None is fresh; Some(empty) is a restored zero-state plan.
     pub restore: Option<Vec<WindowFreeze>>,
+    /// IoT frames are separate codecs; Some(empty) windows plus these frames
+    /// represents a restored IoT-only plan, never a fresh reset.
+    pub iot: Vec<crate::iot::IotFreeze>,
 }
 
 #[derive(Debug)]
@@ -389,11 +436,15 @@ impl AlignedAcks {
     }
 
     pub(crate) async fn source_cut(&self, checkpoint_id: u64) {
+        let source = self.participants.get().map(|p|p.plan.source);
+        if let Some(source) = source { self.source_cut_for(checkpoint_id, source).await; }
+    }
+    pub(crate) async fn source_cut_for(&self, checkpoint_id: u64, source: sparrow_model::OperatorId) {
         if let Some(p) = self.participants.get() {
             self.send(AlignedAck::Participant {
                 attempt: p.attempt,
                 checkpoint_id,
-                participant: ParticipantId::Source(p.plan.source),
+                participant: ParticipantId::Source(source),
                 outcome: ParticipantOutcome::SourceCut,
             })
             .await;
@@ -431,16 +482,31 @@ impl AlignedAcks {
         self.send(ack).await;
     }
 
+    pub(crate) async fn iot_frozen(&self, checkpoint_id: u64, operator: sparrow_model::OperatorId, freeze: Result<EncodedFreeze>) {
+        let Some(p) = self.participants.get() else { return; };
+        self.send(AlignedAck::Participant {
+            attempt: p.attempt,
+            checkpoint_id,
+            participant: ParticipantId::iot(operator),
+            outcome: match freeze { Ok(freeze) => ParticipantOutcome::State(freeze), Err(error) => ParticipantOutcome::Failed(error) },
+        }).await;
+    }
+
     #[cfg(test)]
     pub(crate) async fn sink_flushed(&self, checkpoint_id: u64, flush: FlushOutcome) {
         self.sink_flushed_with_output(checkpoint_id,flush,None).await;
     }
+    #[cfg(test)]
     pub(crate) async fn sink_flushed_with_output(&self, checkpoint_id: u64, flush: FlushOutcome, output: Option<sparrow_model::OutputSequence>) {
+        let sink = self.participants.get().map(|p|p.plan.sink);
+        self.sink_flushed_for(checkpoint_id, flush, output, sink).await;
+    }
+    pub(crate) async fn sink_flushed_for(&self, checkpoint_id: u64, flush: FlushOutcome, output: Option<sparrow_model::OutputSequence>, sink: Option<sparrow_model::OperatorId>) {
         let ack = if let Some(p) = self.participants.get() {
             AlignedAck::Participant {
                 attempt: p.attempt,
                 checkpoint_id,
-                participant: ParticipantId::Sink(p.plan.sink),
+                participant: ParticipantId::Sink(sink.unwrap_or(p.plan.sink)),
                 outcome: match output {
                     Some(next_output) => ParticipantOutcome::ReliableSink{flush,next_output},
                     None => ParticipantOutcome::Sink(flush),
@@ -470,7 +536,7 @@ impl AlignedAcks {
         let capacity = self
             .participants
             .get()
-            .map_or(2, |p| p.plan.states.len() + 2);
+            .map_or(2, |p| p.plan.participants().len());
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
         *active = Some(ActiveCheckpoint {
             id,
@@ -491,6 +557,11 @@ impl AlignedAcks {
             .expect("checkpoint ACK registry")
             .as_ref()
             .is_some_and(|active| active.id == id)
+    }
+
+    pub(crate) fn abandonment(&self, id: u64) -> Option<CancellationToken> {
+        self.active.lock().expect("checkpoint ACK registry").as_ref()
+            .filter(|request| request.id == id).map(|request| request.cancelled.clone())
     }
 
     /// Use the attempt's end-to-end deadline, not an independent sink timeout.

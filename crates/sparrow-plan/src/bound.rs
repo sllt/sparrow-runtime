@@ -3,13 +3,15 @@
 use sparrow_expr::{infer_type, Expr};
 use sparrow_model::{OperatorId, PipelineId, RevisionId, Schema};
 
-use crate::stateful::{DedupSpec, LookupSpec, WindowSpec};
+use crate::stateful::{DedupSpec, IotSpec, LookupSpec, WindowSpec};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundLogicalPlan {
     pub pipeline: PipelineId,
     pub revision: RevisionId,
     pub nodes: Vec<BoundNode>,
+    pub side_outputs: Vec<(OperatorId, crate::graph::SideOutputSpec)>,
+    pub source_times: Vec<(OperatorId, sparrow_model::EventTimeBinding)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -21,6 +23,16 @@ pub struct BoundNode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoundKind {
+    Branch { input: Schema, best_effort: Vec<OperatorId> },
+    Route {
+        input: Schema,
+        mode: crate::graph::RouteMode,
+        cases: Vec<(Expr, OperatorId)>,
+        default: OperatorId,
+        best_effort: Vec<OperatorId>,
+    },
+    UnionAll { input: Schema },
+    BestEffortSink { name: String, schema: Schema },
     MemorySource {
         name: String,
         schema: Schema,
@@ -57,17 +69,23 @@ pub enum BoundKind {
         input: Schema,
         output: Schema,
     },
+    /// Bounded keyed IoT value state. This is deliberately separate from
+    /// WindowAgg: it has no window timestamps or aggregate accumulator.
+    Iot { spec: IotSpec, input: Schema },
 }
 
 impl BoundKind {
     pub fn output_schema(&self) -> &Schema {
         match self {
+            Self::Branch { input, .. } | Self::Route { input, .. } | Self::UnionAll { input } => input,
+            Self::BestEffortSink { schema, .. } => schema,
             Self::MemorySource { schema, .. } => schema,
             Self::Filter { input, .. } => input,
             Self::Project { output, .. } | Self::Map { output, .. } => output,
             Self::CaptureSink { schema, .. } => schema,
             Self::WindowAgg { output, .. } | Self::Lookup { output, .. } => output,
             Self::Deduplicate { input, .. } => input,
+            Self::Iot { input, .. } => input,
         }
     }
 }

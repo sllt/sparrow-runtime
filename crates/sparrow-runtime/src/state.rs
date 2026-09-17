@@ -312,6 +312,13 @@ impl<V> MemoryState<V> {
         self.entries.clear();
         self.retained_bytes = 0;
     }
+
+    /// Release the bucket allocation as well as entries. Callers with a
+    /// separate high-water table lease may refund it only after this returns.
+    pub(crate) fn clear_and_release_capacity(&mut self) {
+        self.entries = HashMap::new();
+        self.retained_bytes = 0;
+    }
 }
 
 #[cfg(test)]

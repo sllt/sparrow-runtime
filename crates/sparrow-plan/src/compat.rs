@@ -367,6 +367,9 @@ mod tests {
         );
         let output = crate::window_output_schema(&schema, &spec).unwrap();
         crate::PhysicalPlan {
+            edges: None,
+            side_outputs: vec![],
+            source_times: vec![],
             pipeline: sparrow_model::PipelineId::new(1),
             revision: sparrow_model::RevisionId::new(1),
             stages: vec![
@@ -833,6 +836,9 @@ mod tests {
         );
         let out = crate::window_output_schema(&schema, &spec).unwrap();
         let plan = PhysicalPlan {
+            edges: None,
+            side_outputs: vec![],
+            source_times: vec![],
             pipeline: PipelineId::new(1),
             revision: RevisionId::new(1),
             stages: vec![

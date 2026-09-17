@@ -20,6 +20,9 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 当前里程碑 / current milestone: **V1**（production aligned recovery + coordinator + observability）。
 
 Runtime contracts and compatibility notes: [`docs/RUNTIME.md`](docs/RUNTIME.md).
+K3 DAG Preview (Branch/Route/UnionAll, multiple I/O, bounded side outputs and a separate File graph checkpoint profile): [`docs/DAG.md`](docs/DAG.md).
+K4 IoT Preview (change detection, deadband, bounded keyed state and a separate v6 recovery profile; scoped review/test evidence): [`docs/IOT.md`](docs/IOT.md).
+Non-blocking issues and optimization backlog: [`docs/OPTIMIZATION_BACKLOG.md`](docs/OPTIMIZATION_BACKLOG.md).
 MQTT ingress now has decoded-byte accounting and optional Linux QUICKACK;
 HTTP sinks support opt-in batch/linger and bounded concurrency (default serial).
 See the runtime contracts before changing queue, body or ordering settings.
@@ -178,7 +181,7 @@ release.
 
 **Not shipped:** WASM operator runtime (optional spike under
 `experiments/wasm-spike/`, off default build), Graph Designer UI, session
-late merge, retract, stream-stream join, NATS, distributed shuffle.
+late merge, retract, stream-stream join, distributed shuffle. NATS JetStream is an optional, default-off Preview; see [`docs/JETSTREAM.md`](docs/JETSTREAM.md).
 
 See `docs/v1-report.md`.
 

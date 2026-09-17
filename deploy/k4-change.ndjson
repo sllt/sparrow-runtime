@@ -1,0 +1,6 @@
+{"device_id":"edge-a","temperature":20.0}
+{"device_id":"edge-a","temperature":20.0}
+{"device_id":"edge-b","temperature":null}
+{"device_id":"edge-b","temperature":5.0}
+{"device_id":"edge-a","temperature":21.5}
+{"device_id":"edge-b","temperature":5.0}

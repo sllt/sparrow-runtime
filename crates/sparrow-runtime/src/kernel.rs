@@ -27,6 +27,9 @@ use crate::metrics::RuntimeMetrics;
 use crate::transform::{build_source_batches, build_source_batches_shared, CompiledTransform};
 use crate::window::WindowOperator;
 
+mod graph;
+pub use graph::{GraphInput, GraphOutput};
+
 #[derive(Clone, Debug)]
 pub struct KernelOptions {
     pub budget: ResourceBudget,
@@ -48,6 +51,8 @@ impl Default for KernelOptions {
 
 /// Kernel job. Live I/O is optional channels so MQTT/HTTP stay out of this crate.
 pub struct JobRequest {
+    pub graph_inputs: HashMap<sparrow_model::OperatorId, GraphInput>,
+    pub graph_outputs: HashMap<sparrow_model::OperatorId, GraphOutput>,
     /// Optional connector bootstrap reservation, minted by this Kernel only.
     pub source_admission: Option<SourceAdmission>,
     pub plan: PhysicalPlan,
@@ -80,6 +85,8 @@ pub struct JobRequest {
 /// Ordered live ingress envelope (R18).
 #[derive(Debug)]
 pub enum IngressEvent {
+    /// Only an explicitly wired decode-error side port may accept this marker.
+    DecodeError,
     Row(Row),
     /// Pre-admitted decoded rows, ordered with barriers on the same channel.
     Batch(BoxedIngressBatch),
@@ -109,6 +116,7 @@ impl IngressEvent {
 impl Payload for IngressEvent {
     fn rows(&self) -> usize {
         match self {
+            Self::DecodeError => 1,
             Self::Row(_) => 1,
             Self::Batch(batch) => batch.batch.num_rows(),
             Self::Control(_) => 0,
@@ -116,6 +124,7 @@ impl Payload for IngressEvent {
     }
     fn bytes(&self) -> usize {
         match self {
+            Self::DecodeError => 1,
             Self::Row(row) => row.resident_bytes(),
             Self::Batch(batch) => batch.batch.tracked_bytes().saturating_add(batch.metadata.bytes()),
             Self::Control(_) => 1,
@@ -126,6 +135,8 @@ impl Payload for IngressEvent {
 impl JobRequest {
     pub fn new(plan: PhysicalPlan, rows: Vec<Row>, capture: SharedCapture) -> Self {
         Self {
+            graph_inputs: HashMap::new(),
+            graph_outputs: HashMap::new(),
             source_admission: None,
             plan,
             rows,
@@ -462,6 +473,15 @@ impl Kernel {
     }
 
     pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
+        graph::validate_request(&req)?;
+        for stage in &req.plan.stages {
+            if let PhysicalStage::Iot { operator, spec, input } = stage {
+                spec.validate(input).map_err(|e| e.at_operator(*operator))?;
+                if spec.ttl_micros > 0 && self.job_budget.max_timers == 0 {
+                    return Err(SparrowError::new(ErrorCode::ResourceExhausted, "IoT TTL requires a bounded timer slot").at_operator(*operator));
+                }
+            }
+        }
         if req.source_admission.as_ref().is_some_and(|a|
             !Arc::ptr_eq(&a.process, &self.process_owner) || a.pipeline != req.plan.pipeline) {
             return Err(SparrowError::new(ErrorCode::PolicyDenied, "source admission belongs to another Kernel or pipeline"));
@@ -473,6 +493,9 @@ impl Kernel {
             ));
         }
         if let Some(aligned) = &req.aligned {
+            if req.plan.has_iot() && aligned.acks.output_sequence().is_some() {
+                return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "IoT state is not enabled for JetStream recovery"));
+            }
             if aligned.acks.output_sequence().is_some() && (req.live_out.is_none() || aligned.pipeline.is_none()) {
                 return Err(SparrowError::new(ErrorCode::InvalidArgument,"reliable output requires a live required sink and participant checkpoint"));
             }
@@ -484,7 +507,7 @@ impl Kernel {
         }
         let _gate = self.admit_lock.lock().expect("job admission");
         DeliveryContract::V0_3.validate_restore(&RestoreClaim::None)?;
-        let boundary_queues: Vec<_> = [
+        let mut boundary_queues: Vec<_> = [
             req.live_in.as_ref().and_then(|r| r.observer()),
             req.budgeted_in.as_ref().and_then(|r| r.observer()),
             req.live_events.as_ref().and_then(|r| r.observer()),
@@ -493,12 +516,21 @@ impl Kernel {
         .into_iter()
         .flatten()
         .collect();
+        for input in req.graph_inputs.values() {
+            if let Some(observer) = input.events.as_ref().and_then(|r| r.observer()) { boundary_queues.push(observer); }
+            if let Some(observer) = input.live.as_ref().and_then(|r| r.observer()) { boundary_queues.push(observer); }
+            if let Some(observer) = input.budgeted.as_ref().and_then(|r| r.observer()) { boundary_queues.push(observer); }
+        }
+        for output in req.graph_outputs.values() {
+            if let Some(observer) = output.live.as_ref().and_then(|t| t.observer()) { boundary_queues.push(observer); }
+        }
         let ingress_metadata = req
             .budgeted_in
             .as_ref()
             .filter(|r| r.observer().is_none())
             .map(|rx| sparrow_model::QueuedRow::channel_budget(rx.max_capacity()))
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_add(req.graph_inputs.values().filter_map(|input|input.budgeted.as_ref()).filter(|rx|rx.observer().is_none()).map(|rx|sparrow_model::QueuedRow::channel_budget(rx.max_capacity())).sum::<usize>());
         let boundary_metadata = boundary_queues
             .iter()
             .map(|o| o.metadata_bytes())
@@ -566,6 +598,14 @@ impl Kernel {
                 .map_err(|e| e.retryable(true).context("admission", "capacity"))?;
         let work = Arc::new(WorkBudget::new(self.job_budget.work_units));
         let ctx = JobCtx {
+            graph_memory: if req.plan.edges.is_some() {Some(Arc::new(owner.acquire(sparrow_model::CreditKind::Reservation,graph::metadata_bytes(&req.plan))?))}else{None},
+            side_port: None,
+            graph_mode: false,
+            source_time: None,
+            side_output: None,
+            optional_branch: false,
+            source_operator: None,
+            sink_outbox: None,
             pipeline: req.plan.pipeline,
             attempt,
             owner: Arc::clone(&owner),
@@ -681,6 +721,14 @@ fn admit_process(
 }
 
 struct JobCtx {
+    graph_memory: Option<Arc<sparrow_model::MemoryLease>>,
+    side_port: Option<u32>,
+    graph_mode: bool,
+    source_time: Option<Arc<graph::SourceTime>>,
+    optional_branch: bool,
+    side_output: Option<(MailboxTx, bool)>,
+    source_operator: Option<sparrow_model::OperatorId>,
+    sink_outbox: Option<Arc<sparrow_model::InflightCounter>>,
     observation: Option<Arc<FlowObservation>>,
     mailboxes: Arc<JobMailboxObserver>,
     timers: Arc<JobTimers>,
@@ -764,6 +812,7 @@ impl JobHandle {
 }
 
 async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<JobStats> {
+    if req.plan.edges.is_some() { return graph::run(ctx, req).await; }
     let n = req.plan.stages.len();
     if n < 2 {
         return Err(SparrowError::new(
@@ -798,6 +847,8 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
         aligned: _,
         observation: _,
         source_admission: _,
+        graph_inputs: _,
+        graph_outputs: _,
     } = req;
 
     let mut set = JoinSet::new();
@@ -887,6 +938,14 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
 
 fn clone_ctx(ctx: &JobCtx) -> JobCtx {
     JobCtx {
+        graph_memory: ctx.graph_memory.clone(),
+        side_port: ctx.side_port,
+        graph_mode: ctx.graph_mode,
+        source_time: ctx.source_time.clone(),
+        optional_branch: ctx.optional_branch,
+        side_output: ctx.side_output.clone(),
+        source_operator: ctx.source_operator,
+        sink_outbox: ctx.sink_outbox.clone(),
         observation: ctx.observation.clone(),
         mailboxes: ctx.mailboxes.clone(),
         timers: Arc::clone(&ctx.timers),
@@ -956,6 +1015,9 @@ fn spawn_stage(
         let work = Arc::clone(&ctx.work);
         let min_remaining = Arc::clone(&ctx.min_remaining_work);
         let is_source = matches!(&stage, PhysicalStage::MemorySource { .. });
+        let optional = ctx.optional_branch;
+        let local_cancel = ctx.cancel.clone();
+        let branch_metrics=ctx.metrics.clone();
         let result = stage_loop(
             ctx,
             stage,
@@ -974,7 +1036,8 @@ fn spawn_stage(
         min_remaining.fetch_min(work.remaining(), Ordering::Relaxed);
         // Window stages return their output count. Do not add intermediate
         // emissions to JobStats.ingested_rows when joining all stage tasks.
-        result.map(|rows| if is_source { rows } else { 0 })
+        if optional && result.is_err() { local_cancel.cancel(); branch_metrics.graph_branch_failures.fetch_add(1,Ordering::Relaxed); Ok(0) }
+        else { result.map(|rows| if is_source { rows } else { 0 }) }
     });
 }
 
@@ -993,6 +1056,9 @@ async fn stage_loop(
     trailing_controls: Vec<StreamControl>,
 ) -> Result<usize> {
     match stage {
+        PhysicalStage::Branch { .. } | PhysicalStage::Route { .. } | PhysicalStage::UnionAll { .. } => {
+            Err(SparrowError::new(ErrorCode::InvalidArgument, "graph operator requires explicit topology"))
+        }
         PhysicalStage::MemorySource { schema, .. } => {
             let tx =
                 tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "source missing mailbox"))?;
@@ -1000,19 +1066,13 @@ async fn stage_loop(
                 return budgeted_live_source(ctx, schema, tx, input).await;
             }
             if let Some(events) = live_events {
-                return live_source(ctx, schema, tx, LiveInput::Ordered(events)).await;
+                return if ctx.graph_mode {live_source::<true>(ctx,schema,tx,LiveInput::Ordered(events)).await}
+                    else{live_source::<false>(ctx,schema,tx,LiveInput::Ordered(events)).await};
             }
             if let Some(live_in) = live_in {
-                return live_source(
-                    ctx,
-                    schema,
-                    tx,
-                    LiveInput::Split {
-                        rows: live_in,
-                        controls: live_ctrl,
-                    },
-                )
-                .await;
+                let input=LiveInput::Split {rows:live_in,controls:live_ctrl};
+                return if ctx.graph_mode {live_source::<true>(ctx,schema,tx,input).await}
+                    else{live_source::<false>(ctx,schema,tx,input).await};
             }
             let batches = build_source_batches(schema, rows, &ctx.owner, ctx.rows_per_batch)?;
             let mut n = 0usize;
@@ -1022,7 +1082,7 @@ async fn stage_loop(
                 if let Some(obs) = &ctx.observation {
                     obs.runtime_rows(true, b.num_rows());
                 }
-                if !tx.send(b).await? {
+                if !graph::send_source(&ctx,&tx,b.with_source_operator(ctx.source_operator)).await? {
                     return Ok(n);
                 }
             }
@@ -1031,6 +1091,7 @@ async fn stage_loop(
                     return Ok(n);
                 }
             }
+            if ctx.graph_mode {publish_source_control(&ctx,&tx,StreamControl::EndOfInput).await?;}
             Ok(n)
         }
         PhysicalStage::Transform { steps } => {
@@ -1068,7 +1129,7 @@ async fn stage_loop(
                         );
                     }
                     if let Some(out) = result? {
-                        let out = out.with_origin(batch.origin());
+                        let out = out.with_origin(batch.origin()).with_source_operator(batch.source_operator());
                         if !tx.send(out).await? {
                             return Ok(0);
                         }
@@ -1077,17 +1138,35 @@ async fn stage_loop(
             }
             Ok(0)
         }
-        PhysicalStage::CaptureSink { schema, .. } => {
+        PhysicalStage::CaptureSink { schema, operator, .. } | PhysicalStage::BestEffortSink { schema, operator, .. } => {
+            let mut ended=false;
+            let sink_outbox = ctx.sink_outbox.as_ref().or_else(||ctx.aligned.as_ref().map(|a|&a.outbox));
             let mut next_output=ctx.aligned.as_ref().and_then(|a|a.acks.output_sequence());
             let rx = rx
                 .as_mut()
                 .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "sink missing rx"))?;
-            while let Some(mut env) = rx.recv().await? {
+            loop {
+                let envelope=if !ctx.graph_mode {rx.recv().await?}else{tokio::select! {
+                    biased;
+                    _=ctx.cancel.cancelled()=>None,
+                    _=async {let counter=sink_outbox.expect("graph live sink counter");while counter.failed()==0{tokio::time::sleep(std::time::Duration::from_millis(10)).await;}},if ctx.graph_mode&&sink_outbox.is_some()=>{
+                        return Err(SparrowError::new(ErrorCode::JobFailed,"graph sink reported failed output").at_operator(operator));
+                    },
+                    result=rx.recv()=>result?,
+                }};
+                let Some(mut env)=envelope else{
+                    if ctx.graph_mode&&!ended&&!ctx.cancel.is_cancelled(){return Err(SparrowError::new(ErrorCode::JobFailed,"graph sink input closed without EOF").at_operator(operator));}
+                    break;
+                };
                 capture.stall.wait_if_stalled(&ctx.cancel).await;
                 if ctx.cancel.is_cancelled() {
                     break;
                 }
                 let (batch, ctrl) = env.take();
+                if ctx.graph_mode {
+                    if matches!(ctrl,Some(StreamControl::EndOfInput)){ended=true;}
+                    if ended&&batch.is_some(){return Err(SparrowError::new(ErrorCode::JobFailed,"graph sink received data after EOF").at_operator(operator));}
+                }
                 if let Some(batch) = batch {
                     let batch=if let Some(position)=next_output {
                         let following=position.advance(batch.num_rows())?;
@@ -1103,19 +1182,22 @@ async fn stage_loop(
                     }
                     capture.push(&schema, batch.rows());
                     if let Some(out) = &live_out {
-                        if let Some(aj) = &ctx.aligned {
-                            aj.outbox.enqueue();
+                        if let Some(outbox) = sink_outbox {
+                            outbox.enqueue();
                         }
                         tokio::select! {
                             biased;
                             _ = ctx.cancel.cancelled() => {
-                                if let Some(aj) = &ctx.aligned { aj.outbox.fail(); }
+                                if let Some(outbox) = sink_outbox { outbox.fail(); }
                                 break;
                             },
                             sent = out.send(batch.share()) => {
                                 if sent.is_err() {
-                                    if let Some(aj) = &ctx.aligned {
-                                        aj.outbox.fail();
+                                    if let Some(outbox) = sink_outbox {
+                                        outbox.fail();
+                                    }
+                                    if ctx.graph_mode && !ctx.optional_branch {
+                                        return Err(SparrowError::new(ErrorCode::JobFailed,"required graph sink closed before accepting output").at_operator(operator));
                                     }
                                     break;
                                 }
@@ -1132,7 +1214,7 @@ async fn stage_loop(
                         }
                         let flush = tokio::select! {
                             _ = ctx.cancel.cancelled() => break,
-                            flush = aj.acks.wait_for_flush(checkpoint_id, &aj.outbox) => flush,
+                            flush = aj.acks.wait_for_flush(checkpoint_id, sink_outbox.expect("aligned outbox")) => flush,
                         };
                         let Some(flush) = flush else {
                             continue;
@@ -1140,10 +1222,16 @@ async fn stage_loop(
                         // Loss is sticky for this attempt: retrying a barrier
                         // cannot retroactively deliver a dropped batch.
                         if flush.ok && flush.dropped == 0 {
-                            aj.outbox.mark();
+                            sink_outbox.expect("aligned outbox").mark();
                         }
-                        aj.acks.sink_flushed_with_output(checkpoint_id, flush, next_output).await;
+                        aj.acks.sink_flushed_for(checkpoint_id, flush, next_output, Some(operator)).await;
                     }
+                }
+            }
+            if ctx.graph_mode&&!ctx.cancel.is_cancelled() {
+                if let Some(counter)=sink_outbox {
+                    let flush=tokio::select!{biased;_=ctx.cancel.cancelled()=>return Ok(0),flush=crate::barrier::wait_outbox(counter,std::time::Duration::from_secs(30))=>flush};
+                    if !flush.ok||flush.timed_out||flush.dropped!=0{return Err(SparrowError::new(ErrorCode::JobFailed,"required graph sink final flush failed").at_operator(operator));}
                 }
             }
             Ok(0)
@@ -1171,6 +1259,7 @@ async fn stage_loop(
                 ctx.max_state_keys,
                 ctx.max_timers,
             )? };
+            if ctx.graph_mode { op.use_external_watermarks(); }
             let restore = ctx
                 .aligned
                 .as_ref()
@@ -1178,7 +1267,22 @@ async fn stage_loop(
             if let Some(restored) = restore {
                 op.restore_freeze(&restored.freeze)?;
             }
-            window_stage(&ctx, &mut op, rx, &tx, &capture).await
+            if ctx.graph_mode {window_stage::<true>(&ctx, &mut op, rx, &tx, &capture).await}
+            else{window_stage::<false>(&ctx, &mut op, rx, &tx, &capture).await}
+        }
+        PhysicalStage::Iot { operator, spec, input } => {
+            let tx = tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "IoT missing tx"))?;
+            let rx = rx.as_mut().ok_or_else(|| SparrowError::new(ErrorCode::Internal, "IoT missing rx"))?;
+            let prepared = ctx.aligned.as_ref().and_then(|a| a.iot.lock().expect("prepared IoT state").remove(&operator));
+            if prepared.is_none() && ctx.aligned.as_ref().is_some_and(|a| a.participant_mode) {
+                return Err(SparrowError::new(ErrorCode::Internal, "prepared IoT checkpoint participant missing").at_operator(operator));
+            }
+            let mut op = match prepared {
+                Some(op) => op,
+                None => crate::iot::IotOperator::new(operator, spec, input, ctx.owner.clone())
+                    .map_err(|error| error.at_operator(operator))?,
+            };
+            iot_stage(&ctx, &mut op, rx, &tx).await.map_err(|e| e.at_operator(operator))
         }
         PhysicalStage::Deduplicate {
             operator,
@@ -1219,7 +1323,7 @@ async fn stage_loop(
                     let out = op.build_metered_batch(rows)?;
                     drop(scratch);
                     if let Some(out) = out {
-                        if !tx.send(out.with_origin(batch.origin())).await? {
+                        if !tx.send(out.with_origin(batch.origin()).with_source_operator(batch.source_operator())).await? {
                             break;
                         }
                     }
@@ -1269,7 +1373,7 @@ async fn stage_loop(
                     }
                     let rows = result?;
                     if let Some(out) = op.build_batch(rows)? {
-                        if !tx.send(out.with_origin(batch.origin())).await? {
+                        if !tx.send(out.with_origin(batch.origin()).with_source_operator(batch.source_operator())).await? {
                             break;
                         }
                     }
@@ -1278,6 +1382,102 @@ async fn stage_loop(
             Ok(0)
         }
     }
+}
+
+struct IotReporter {
+    metrics: Arc<RuntimeMetrics>,
+    previous: crate::iot::IotStats,
+    keys: u64,
+    bytes: u64,
+}
+
+impl IotReporter {
+    fn sample(&mut self, op: &crate::iot::IotOperator) {
+        let current = op.stats();
+        for (counter, value, previous) in [
+            (&self.metrics.iot_input_rows, current.input_rows, self.previous.input_rows),
+            (&self.metrics.iot_emitted_rows, current.emitted_rows, self.previous.emitted_rows),
+            (&self.metrics.iot_filtered_rows, current.filtered_rows, self.previous.filtered_rows),
+            (&self.metrics.iot_invalid_rows, current.invalid_rows, self.previous.invalid_rows),
+            (&self.metrics.iot_expired_keys, current.expired_keys, self.previous.expired_keys),
+        ] { counter.fetch_add(value.saturating_sub(previous), Ordering::Relaxed); }
+        for (counter, previous, value) in [
+            (&self.metrics.iot_state_keys, &mut self.keys, op.key_count() as u64),
+            (&self.metrics.iot_state_bytes, &mut self.bytes, op.retention_bytes() as u64),
+        ] {
+            if value >= *previous { counter.fetch_add(value - *previous, Ordering::Relaxed); }
+            else { counter.fetch_sub(*previous - value, Ordering::Relaxed); }
+            *previous = value;
+        }
+        self.previous = current;
+    }
+}
+
+impl Drop for IotReporter {
+    fn drop(&mut self) {
+        self.metrics.iot_state_keys.fetch_sub(self.keys, Ordering::Relaxed);
+        self.metrics.iot_state_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// TTL is local monotonic idle time, never event time or wall-clock age. The
+/// aligned profile refuses positive TTL until a replayable time policy exists.
+async fn iot_stage(ctx: &JobCtx, op: &mut crate::iot::IotOperator, rx: &mut MailboxRx, tx: &MailboxTx) -> Result<usize> {
+    let started = tokio::time::Instant::now();
+    let now = || if ctx.clock.is_virtual() { ctx.clock.now_micros() }
+        else { started.elapsed().as_micros().min(i64::MAX as u128) as i64 };
+    let mut reporter = IotReporter { metrics: ctx.metrics.clone(), previous: Default::default(), keys: 0, bytes: 0 };
+    let mut timers = TimerReporter { ctx, live: 0, cancelled: 0 };
+    let mut ended = false;
+    loop {
+        reporter.sample(op);
+        let deadline = op.next_deadline();
+        timers.sample(op.pending_timers(), 0);
+        let envelope = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => break,
+            _ = async {
+                if ctx.clock.is_virtual() { ctx.clock.sleep_until(deadline).await; }
+                else if let Some(at) = deadline.and_then(|at| started.checked_add(std::time::Duration::from_micros(at.max(0) as u64))) {
+                    tokio::time::sleep_until(at).await;
+                } else { std::future::pending::<()>().await; }
+            }, if deadline.is_some() => { op.expire(now()); continue; },
+            envelope = rx.recv() => envelope?,
+        };
+        let Some(mut envelope) = envelope else {
+            if ctx.graph_mode && !ended && !ctx.cancel.is_cancelled() {
+                return Err(SparrowError::new(ErrorCode::JobFailed, "IoT input closed without EOF"));
+            }
+            break;
+        };
+        let (batch, control) = envelope.take();
+        if let Some(batch) = batch {
+            if ended { return Err(SparrowError::new(ErrorCode::JobFailed, "IoT data after EOF")); }
+            consume_work(ctx, batch.num_rows() as u64).await?;
+            let output = op.on_batch(&batch, now());
+            reporter.sample(op);
+            if let Some(output) = output? {
+                if !tx.send(output.with_origin(batch.origin()).with_source_operator(batch.source_operator())).await? { break; }
+            }
+        }
+        if let Some(control) = control {
+            match &control {
+                StreamControl::CheckpointBarrier { checkpoint_id } => {
+                    if let Some(aligned) = &ctx.aligned {
+                        if !aligned.acks.is_active(*checkpoint_id) { continue; }
+                        let freeze = crate::barrier::EncodedFreeze::from_iot(op, &ctx.owner, ctx.max_state_keys);
+                        aligned.acks.iot_frozen(*checkpoint_id, op.operator_id(), freeze).await;
+                    }
+                }
+                StreamControl::EndOfInput => ended = true,
+                _ => {}
+            }
+            if !tx.send_control(control).await? { break; }
+        }
+    }
+    reporter.sample(op);
+    op.cleanup();
+    Ok(0)
 }
 
 async fn emit_window(
@@ -1295,7 +1495,9 @@ async fn emit_window(
         capture.push_late(&emission.lates);
     }
     let batches = build_rows_chunked(ctx, op, emission.finals)?;
-    drop(emission.lates);
+    if ctx.side_output.is_some() && !emission.lates.is_empty() {
+        if let Some(batch) = op.build_late_batch(emission.lates)? { graph::publish_side(ctx, batch).await?; }
+    } else { drop(emission.lates); }
     drop(scratch); // all raw outputs now have their own resident-sized leases
     for out in batches {
         if !tx.send(out).await? {
@@ -1377,7 +1579,7 @@ async fn emit_due(
     Ok(true)
 }
 
-async fn window_stage(
+async fn window_stage<const GRAPH:bool>(
     ctx: &JobCtx,
     op: &mut WindowOperator,
     rx: &mut MailboxRx,
@@ -1390,6 +1592,8 @@ async fn window_stage(
         cancelled: 0,
     };
     let mut input_closed = false;
+    let mut eof_received=false;
+    let mut deferred_eof=false;
     let mut n = 0usize;
     loop {
         timer_reporter.sample(op.live_timers(), op.cancelled_timers());
@@ -1419,10 +1623,18 @@ async fn window_stage(
                     Some(mut env) => {
                         let (batch, ctrl) = env.take();
                         if let Some(ctrl) = ctrl {
+                            let forward_activity=matches!(ctrl,StreamControl::Idle {..}|StreamControl::Active {..}).then(||ctrl.clone());
+                            let side_control=ctrl.clone();
                             // Freeze has its own pre-admitted encoding lease.
                             // A failed checkpoint must abort that request, not
                             // fail the live job while reserving unused output.
                             let emission = match ctrl {
+                                StreamControl::EndOfInput=>{
+                                    if !GRAPH{return Err(SparrowError::new(ErrorCode::InvalidArgument,"explicit EOF belongs to graph ingress"));}
+                                    eof_received=true;
+                                    if op.is_processing_time(){input_closed=true;deferred_eof=true;crate::window::WindowEmission::default()}
+                                    else{op.finish_input()?}
+                                },
                                 StreamControl::Watermark { input, wm_micros } => {
                                     op.observe_watermark(sparrow_model::InputId(input), wm_micros)?
                                 }
@@ -1454,8 +1666,12 @@ async fn window_stage(
                             if !emit_window(ctx, op, tx, capture, emission,None).await? {
                                 input_closed = true;
                             }
+                            if let Some(control)=forward_activity { if !tx.send_control(control).await? {return Ok(n);} }
+                            if matches!(side_control,StreamControl::EndOfInput)&&!deferred_eof {if !tx.send_control(StreamControl::EndOfInput).await?{return Ok(n);}}
+                            if let Some((side,drop_when_full))=&ctx.side_output {graph::publish_control(ctx,side,*drop_when_full,side_control).await?;}
                         }
                         if let Some(batch) = batch {
+                            if GRAPH&&eof_received {return Err(SparrowError::new(ErrorCode::JobFailed,"window data after EOF").at_operator(op.operator_id()));}
                             consume_work(ctx, batch.num_rows() as u64).await?;
                             let now=ctx.clock.now_micros();
                             if !emit_due(ctx,op,tx,now,&mut n).await? {break;}
@@ -1470,7 +1686,10 @@ async fn window_stage(
                             }
                         }
                     }
-                    None => input_closed = true,
+                    None => {
+                        if GRAPH&&!eof_received&&!ctx.cancel.is_cancelled(){return Err(SparrowError::new(ErrorCode::JobFailed,"window input closed without EOF").at_operator(op.operator_id()));}
+                        input_closed=true;
+                    },
                 }
             }
             _ = ctx.clock.sleep_until(deadline) => {
@@ -1480,6 +1699,7 @@ async fn window_stage(
             }
         }
     }
+    if deferred_eof&&!ctx.cancel.is_cancelled(){tx.send_control(StreamControl::EndOfInput).await?;}
     op.cleanup();
     timer_reporter.sample(op.live_timers(), op.cancelled_timers());
     Ok(n)
@@ -1572,6 +1792,7 @@ async fn budgeted_live_source(
             },
         };
         let Some((first, mut origin)) = first else {
+            if ctx.graph_mode&&!ctx.cancel.is_cancelled(){return Err(SparrowError::new(ErrorCode::JobFailed,"live graph input closed without EOF"));}
             return Ok(n);
         };
         let mut builder = sparrow_model::RowBatchBuilder::new(
@@ -1595,19 +1816,19 @@ async fn budgeted_live_source(
                 Err(_) => break,
             }
         }
-        let batch = builder.finish()?.with_origin(origin);
+        let batch = builder.finish()?.with_origin(origin).with_source_operator(ctx.source_operator);
         n += batch.num_rows();
         ctx.metrics.record_ingest(batch.num_rows() as u64);
         if let Some(obs) = &ctx.observation {
             obs.runtime_rows(true, batch.num_rows());
         }
-        if !tx.send(batch).await? {
+        if !graph::send_source(&ctx,&tx,batch).await? {
             return Ok(n);
         }
     }
 }
 
-async fn live_source(
+async fn live_source<const GRAPH:bool>(
     ctx: JobCtx,
     schema: sparrow_model::Schema,
     tx: MailboxTx,
@@ -1615,6 +1836,7 @@ async fn live_source(
 ) -> Result<usize> {
     let schema = Arc::new(schema);
     let mut n = 0usize;
+    let mut ended=false;
     let mut ready = Vec::new();
     loop {
         tokio::select! {
@@ -1622,6 +1844,7 @@ async fn live_source(
             _ = ctx.cancel.cancelled() => return Ok(n),
             ev = events.recv() => {
                 let Some(ev) = ev else {
+                    if GRAPH&&!ended&&!ctx.cancel.is_cancelled(){return Err(SparrowError::new(ErrorCode::JobFailed,"ordered graph input closed without explicit EOF"));}
                     return Ok(n);
                 };
                 ready.push((ev, events.last_origin()));
@@ -1629,7 +1852,22 @@ async fn live_source(
                 let mut rows = Vec::new();
                 let mut origin = OriginSpan::default();
                 for (event, at) in ready.drain(..) {
+                    if GRAPH {
+                        if ended&&!matches!(event,IngressEvent::Control(StreamControl::CheckpointBarrier {..})|IngressEvent::Control(StreamControl::EndOfInput)){
+                            return Err(SparrowError::new(ErrorCode::JobFailed,"graph source data/control after EOF"));
+                        }
+                        if matches!(event,IngressEvent::Control(StreamControl::EndOfInput)){ended=true;}
+                    }
                     match event {
+                        IngressEvent::DecodeError => {
+                            if !publish_live_rows(&ctx,&schema,&tx,&mut rows,origin,&mut n).await? {return Ok(n);}
+                            origin=OriginSpan::default();
+                            let source=ctx.source_operator.ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"decode side output requires graph source identity"))?;
+                            let _scratch=ctx.owner.acquire(sparrow_model::CreditKind::Reservation,512)?;
+                            let mut builder=sparrow_model::RowBatchBuilder::new(Arc::new(sparrow_plan::graph::decode_error_schema()),ctx.owner.clone(),sparrow_model::CreditKind::Reservation,1,512)?;
+                            builder.push(Row {values:vec![sparrow_model::Scalar::UInt64(source.raw() as u64),sparrow_model::Scalar::utf8("CodecViolation")]})?;
+                            graph::publish_side(&ctx,builder.finish()?.with_source_operator(Some(source)).with_origin(at)).await?;
+                        }
                         IngressEvent::Row(row) => { rows.push(row); origin.merge(at); }
                         IngressEvent::Batch(batch) => {
                             let batch=batch.into_batch();
@@ -1645,7 +1883,7 @@ async fn live_source(
                             ctx.metrics.record_ingest(count as u64);
                             if let Some(obs)=&ctx.observation {obs.runtime_rows(true,count);}
                             n+=count;
-                            if !tx.send(batch.with_origin(at)).await? {return Ok(n);}
+                            if !graph::send_source(&ctx,&tx,batch.with_origin(at).with_source_operator(ctx.source_operator)).await? {return Ok(n);}
                         }
                         IngressEvent::Control(control) => {
                             if !publish_live_rows(&ctx, &schema, &tx, &mut rows, origin, &mut n).await?
@@ -1687,7 +1925,7 @@ async fn publish_live_rows(
         if let Some(obs) = &ctx.observation {
             obs.runtime_rows(true, batch.num_rows());
         }
-        if !tx.send(batch.with_origin(origin)).await? {
+        if !graph::send_source(ctx,tx,batch.with_origin(origin).with_source_operator(ctx.source_operator)).await? {
             return Ok(false);
         }
     }
@@ -1695,8 +1933,13 @@ async fn publish_live_rows(
 }
 
 async fn publish_source_control(ctx:&JobCtx, tx:&MailboxTx, control:StreamControl) -> Result<bool> {
+    graph::source_activity(ctx,&control);
+    if let Some((side,drop_when_full))=&ctx.side_output { graph::publish_control(ctx, side, *drop_when_full, control.clone()).await?; }
     let checkpoint_id=match &control { StreamControl::CheckpointBarrier {checkpoint_id}=>Some(*checkpoint_id), _=>None };
     if !tx.send_control(control).await? {return Ok(false);}
-    if let (Some(id),Some(aligned))=(checkpoint_id,&ctx.aligned) { aligned.acks.source_cut(id).await; }
+    if let (Some(id),Some(aligned))=(checkpoint_id,&ctx.aligned) {
+        if let Some(source) = ctx.source_operator { aligned.acks.source_cut_for(id, source).await; }
+        else { aligned.acks.source_cut(id).await; }
+    }
     Ok(true)
 }

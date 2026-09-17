@@ -219,6 +219,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
 
 fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> PipelineSpec {
     PipelineSpec {
+        graph_io: None,
         version: 1,
         stream: "sensors".into(),
         sql: Some(sql.into()),
@@ -368,6 +369,7 @@ fn r23_start_named_uses_desired_revision_not_latest() {
 #[test]
 fn mqtt_aligned_still_rejected() {
     let spec = PipelineSpec {
+        graph_io: None,
         version: 1,
         stream: "sensors".into(),
         sql: Some("SELECT device_id FROM sensors".into()),

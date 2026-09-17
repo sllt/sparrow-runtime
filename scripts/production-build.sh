@@ -76,6 +76,11 @@ for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl; do
 done
 cp deploy/sparrow.service deploy/production.env.example deploy/pipeline-aligned.json deploy/pipeline-k1-zero.json deploy/pipeline-k1-two-count.json "$out/deploy/"
 cp docs/PRODUCTION.md "$out/docs/"
+cp docs/DAG.md "$out/docs/"
+cp deploy/pipeline-k3-graph.json "$out/deploy/"
+cp docs/IOT.md "$out/docs/"
+cp deploy/pipeline-k4-change.json deploy/pipeline-k4-deadband.json deploy/k4-change.ndjson deploy/k4-deadband.ndjson deploy/k4-change.expected.json deploy/k4-deadband.expected.json "$out/deploy/"
+cp deploy/stream-k4-telemetry.json "$out/deploy/"
 if [[ "$jetstream" == 1 ]]; then
     cp deploy/pipeline-jetstream.json deploy/nats-jetstream-local.conf.example "$out/deploy/"
     cp docs/JETSTREAM.md "$out/docs/"

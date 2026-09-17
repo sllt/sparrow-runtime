@@ -7,6 +7,19 @@ use std::time::Duration;
 /// Process-wide (or session-wide) counters for V1 observability.
 #[derive(Debug, Default)]
 pub struct RuntimeMetrics {
+    /// Per-IoT-operator processing counters, not Source delivery counts.
+    pub iot_input_rows: AtomicU64,
+    pub iot_emitted_rows: AtomicU64,
+    pub iot_filtered_rows: AtomicU64,
+    pub iot_invalid_rows: AtomicU64,
+    pub iot_expired_keys: AtomicU64,
+    pub iot_state_keys: AtomicU64,
+    pub iot_state_bytes: AtomicU64,
+    /// Explicitly lossy graph edges only; never counts required output.
+    pub graph_dropped_rows: AtomicU64,
+    pub graph_side_rows: AtomicU64,
+    pub graph_detached_branches: AtomicU64,
+    pub graph_branch_failures: AtomicU64,
     pub jobs_started: AtomicU64,
     pub jobs_stopped: AtomicU64,
     pub jobs_failed: AtomicU64,
@@ -84,6 +97,17 @@ impl RuntimeMetrics {
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
+            iot_input_rows: self.iot_input_rows.load(Ordering::Relaxed),
+            iot_emitted_rows: self.iot_emitted_rows.load(Ordering::Relaxed),
+            iot_filtered_rows: self.iot_filtered_rows.load(Ordering::Relaxed),
+            iot_invalid_rows: self.iot_invalid_rows.load(Ordering::Relaxed),
+            iot_expired_keys: self.iot_expired_keys.load(Ordering::Relaxed),
+            iot_state_keys: self.iot_state_keys.load(Ordering::Relaxed),
+            iot_state_bytes: self.iot_state_bytes.load(Ordering::Relaxed),
+            graph_dropped_rows: self.graph_dropped_rows.load(Ordering::Relaxed),
+            graph_side_rows: self.graph_side_rows.load(Ordering::Relaxed),
+            graph_detached_branches: self.graph_detached_branches.load(Ordering::Relaxed),
+            graph_branch_failures: self.graph_branch_failures.load(Ordering::Relaxed),
             jobs_started: self.jobs_started.load(Ordering::Relaxed),
             jobs_stopped: self.jobs_stopped.load(Ordering::Relaxed),
             jobs_failed: self.jobs_failed.load(Ordering::Relaxed),
@@ -108,6 +132,17 @@ impl RuntimeMetrics {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
+    pub iot_input_rows: u64,
+    pub iot_emitted_rows: u64,
+    pub iot_filtered_rows: u64,
+    pub iot_invalid_rows: u64,
+    pub iot_expired_keys: u64,
+    pub iot_state_keys: u64,
+    pub iot_state_bytes: u64,
+    pub graph_dropped_rows: u64,
+    pub graph_side_rows: u64,
+    pub graph_detached_branches: u64,
+    pub graph_branch_failures: u64,
     pub jobs_started: u64,
     pub jobs_stopped: u64,
     pub jobs_failed: u64,
@@ -132,12 +167,19 @@ impl MetricsSnapshot {
     /// Structured log line (budgeted labels only).
     pub fn log_line(&self) -> String {
         format!(
-            "{{\"event\":\"sparrow_metrics\",\"jobs_started\":{},\"jobs_stopped\":{},\"jobs_failed\":{},\"ingested_rows\":{},\"emitted_rows\":{},\"queue_items\":{},\"queue_bytes\":{},\"watermark_lag_micros\":{},\"checkpoint_duration_micros\":{},\"checkpoint_bytes\":{},\"checkpoint_commits\":{},\"checkpoint_aborts\":{},\"state_keys\":{},\"state_bytes\":{},\"live_samples\":{},\"future_dropped\":{},\"timers_live\":{},\"timers_cancelled\":{}}}",
+            "{{\"event\":\"sparrow_metrics\",\"jobs_started\":{},\"jobs_stopped\":{},\"jobs_failed\":{},\"ingested_rows\":{},\"emitted_rows\":{},\"iot_input_rows\":{},\"iot_emitted_rows\":{},\"iot_filtered_rows\":{},\"iot_invalid_rows\":{},\"iot_expired_keys\":{},\"iot_state_keys\":{},\"iot_state_bytes\":{},\"queue_items\":{},\"queue_bytes\":{},\"watermark_lag_micros\":{},\"checkpoint_duration_micros\":{},\"checkpoint_bytes\":{},\"checkpoint_commits\":{},\"checkpoint_aborts\":{},\"state_keys\":{},\"state_bytes\":{},\"live_samples\":{},\"future_dropped\":{},\"timers_live\":{},\"timers_cancelled\":{}}}",
             self.jobs_started,
             self.jobs_stopped,
             self.jobs_failed,
             self.ingested_rows,
             self.emitted_rows,
+            self.iot_input_rows,
+            self.iot_emitted_rows,
+            self.iot_filtered_rows,
+            self.iot_invalid_rows,
+            self.iot_expired_keys,
+            self.iot_state_keys,
+            self.iot_state_bytes,
             self.queue_items,
             self.queue_bytes,
             self.watermark_lag_micros,
@@ -171,5 +213,29 @@ mod tests {
         let line = s.log_line();
         assert!(line.contains("\"event\":\"sparrow_metrics\""));
         assert!(!line.contains("device_id"));
+    }
+
+    #[test]
+    fn iot_metrics_log_line_includes_k4_fields() {
+        let m = RuntimeMetrics::new();
+        m.iot_input_rows.fetch_add(3, Ordering::Relaxed);
+        m.iot_emitted_rows.fetch_add(2, Ordering::Relaxed);
+        m.iot_filtered_rows.fetch_add(1, Ordering::Relaxed);
+        m.iot_invalid_rows.fetch_add(1, Ordering::Relaxed);
+        m.iot_expired_keys.fetch_add(4, Ordering::Relaxed);
+        m.iot_state_keys.fetch_add(5, Ordering::Relaxed);
+        m.iot_state_bytes.fetch_add(128, Ordering::Relaxed);
+        let line = m.snapshot().log_line();
+        for field in [
+            "\"iot_input_rows\":3",
+            "\"iot_emitted_rows\":2",
+            "\"iot_filtered_rows\":1",
+            "\"iot_invalid_rows\":1",
+            "\"iot_expired_keys\":4",
+            "\"iot_state_keys\":5",
+            "\"iot_state_bytes\":128",
+        ] {
+            assert!(line.contains(field), "missing {field} in {line}");
+        }
     }
 }

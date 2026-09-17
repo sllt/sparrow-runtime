@@ -45,6 +45,9 @@ impl MailboxConfig {
 /// Watermark / idle punctuation travelling with the dataflow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamControl {
+    /// Permanent data completion. Channels closing without this mark in a
+    /// graph are failures/cancellation, never authorization for final time.
+    EndOfInput,
     Watermark {
         input: u16,
         wm_micros: i64,
@@ -168,17 +171,30 @@ fn channel_inner(
 
 impl MailboxTx {
     pub async fn send(&self, batch: RowBatch) -> Result<bool> {
-        self.send_inner(Some(batch), None).await
+        self.send_inner(Some(batch), None, true).await
+    }
+
+    /// Nonblocking best-effort DATA admission. Control always uses send_control.
+    pub async fn try_send(&self, batch: RowBatch) -> Result<bool> {
+        self.send_inner(Some(batch), None, false).await
     }
 
     pub async fn send_control(&self, control: StreamControl) -> Result<bool> {
-        self.send_inner(None, Some(control)).await
+        self.send_inner(None, Some(control), true).await
+    }
+
+    pub(crate) async fn try_send_control(&self, control: StreamControl) -> Result<bool> {
+        self.send_inner(None, Some(control), false).await
+    }
+    pub(crate) fn cancel_path(&self) -> bool {
+        let active=!self.cancel.is_cancelled();self.cancel.cancel();active
     }
 
     async fn send_inner(
         &self,
         batch: Option<RowBatch>,
         control: Option<StreamControl>,
+        wait: bool,
     ) -> Result<bool> {
         let mut observation = SendObservation::new(self.observer.clone());
         let n = batch
@@ -198,6 +214,7 @@ impl MailboxTx {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::Closed) => return Err(closed()),
             Err(tokio::sync::TryAcquireError::NoPermits) => {
+                if !wait { return Ok(false); }
                 observation.blocked();
                 tokio::select! {
                     biased;
@@ -230,6 +247,7 @@ impl MailboxTx {
             Ok(slot) => slot,
             Err(mpsc::error::TrySendError::Closed(_)) => return Err(closed()),
             Err(mpsc::error::TrySendError::Full(_)) => {
+                if !wait { return Ok(false); }
                 observation.blocked();
                 tokio::select! {
                     biased;
@@ -281,6 +299,31 @@ impl MailboxTx {
 }
 
 impl MailboxRx {
+    pub(crate) fn barrier_blocked(&self,blocked:bool) {
+        if let Some(observer)=&self.observer{if let Some(progress)=&mut observer.lock().snapshot.input_progress{progress.barrier_blocked=blocked;}}
+    }
+    /// Poll one physical input without consuming other inputs or spawning a
+    /// relay. UnionAll rotates the first polled edge after each envelope.
+    pub(crate) fn poll_recv(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Option<Envelope>> {
+        let mut state = self.observer.as_ref().map(|observer| observer.lock());
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(mut env)) => {
+                if let Some(state) = &mut state {
+                    if let Some(progress)=&mut state.snapshot.input_progress{progress.received(&env);}
+                    let stamp = state.stamps.pop_front().expect("queued observation");
+                    state.snapshot.residence.record(stamp.at.elapsed());
+                    if state.snapshot.queued.remove(env.depth) {
+                        state.snapshot.accounting_errors_total = state.snapshot.accounting_errors_total.saturating_add(1);
+                    }
+                    state.snapshot.consumer_held.add(env.depth);
+                    state.snapshot.received_items_total = state.snapshot.received_items_total.saturating_add(1);
+                    env.held = true;
+                }
+                Poll::Ready(Some(env))
+            }
+            other => other,
+        }
+    }
     pub async fn recv(&mut self) -> Result<Option<Envelope>> {
         tokio::select! {
             biased;
@@ -294,6 +337,7 @@ impl MailboxRx {
                 match result {
                     Poll::Ready(Some(mut env)) => {
                         if let Some(state) = &mut state {
+                            if let Some(progress)=&mut state.snapshot.input_progress{progress.received(&env);}
                             let stamp=state.stamps.pop_front().expect("queued observation");
                             state.snapshot.residence.record(stamp.at.elapsed());
                             if state.snapshot.queued.remove(env.depth) {
@@ -317,6 +361,7 @@ impl Drop for MailboxRx {
         if let Some(observer) = &self.observer {
             let mut state = observer.lock();
             state.snapshot.receiver_open = false;
+            if let Some(progress)=&mut state.snapshot.input_progress{progress.barrier_blocked=false;}
             state.snapshot.discarded_on_close_total = state
                 .snapshot
                 .discarded_on_close_total

@@ -456,6 +456,18 @@ impl CheckpointStore {
         Self::open_profile_exclusive(dir,max_keys,retention,4)
     }
 
+    /// A graph cut is not a linear File cursor. A distinct outer version also
+    /// makes pre-K3 writers reject this entire directory before fallback/GC.
+    pub fn open_graph_exclusive(dir: impl Into<PathBuf>, max_keys: usize, retention: CheckpointRetention) -> Result<Self> {
+        Self::open_profile_exclusive(dir,max_keys,retention,5)
+    }
+
+    /// IoT state has a distinct codec family. Never mix its generations with
+    /// legacy File, JetStream or pre-IoT DAG history, including fresh starts.
+    pub fn open_iot_exclusive(dir: impl Into<PathBuf>, max_keys: usize, retention: CheckpointRetention) -> Result<Self> {
+        Self::open_profile_exclusive(dir,max_keys,retention,6)
+    }
+
     fn open_profile_exclusive(dir: impl Into<PathBuf>, max_keys: usize, retention: CheckpointRetention, version:u16) -> Result<Self> {
         let mut store = Self::open_exclusive(dir, max_keys, retention)?;
         for id in list_generation_ids(&store.dir)? {
@@ -464,13 +476,21 @@ impl CheckpointStore {
                 let path = chk.join(file);
                 if !path.exists() { continue; }
                 let bytes = read_bounded(&path, CHUNK_SIZE as u64).map_err(|e|e.context("checkpoint_guard_generation",id.to_string()).context("checkpoint_guard","unreadable_history_cannot_be_classified; preserve_directory_and_inspect_backup"))?;
+                if bytes.len() < MAGIC.len() + 2 || !bytes.starts_with(MAGIC) {
+                    return Err(SparrowError::new(
+                        ErrorCode::UnsupportedRestore,
+                        "checkpoint history first chunk cannot be classified; retain original history and inspect backup",
+                    )
+                    .context("checkpoint_guard_generation", id.to_string())
+                    .context("checkpoint_guard", "unreadable_history_cannot_be_classified"));
+                }
                 if bytes.starts_with(MAGIC) && matches!(bytes.get(4..6), Some([1 | 2, 0])) {
                     return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
                         "legacy single-window checkpoint history: refusing K1 writes in this directory; retain the original backup/binary and explicitly choose a new checkpoint directory"));
                 }
                 if bytes.starts_with(MAGIC) && bytes.len()>=6 && bytes[4..6]!=version.to_le_bytes() {
                     return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-                        "checkpoint source profile mismatch: File/v3 and JetStream/v4 require separate directories; retain original history"));
+                        "checkpoint source profile mismatch: File/v3, JetStream/v4, DAG/v5 and IoT/v6 require separate directories; retain original history"));
                 }
             }
         }
@@ -498,7 +518,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if matches!(version,3|4) {
+        if matches!(version,3|4|5|6) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {
@@ -2538,6 +2558,41 @@ mod tests {
         buf.extend_from_slice(&1_000_000u32.to_le_bytes());
         let err = super::decode_freeze(&mut buf.as_slice(), MAX_FREEZE_ENTRIES).unwrap_err();
         assert_eq!(err.code, ErrorCode::BoundExceeded);
+    }
+
+    #[test]
+    fn k4_profile_guard_rejects_unclassifiable_first_chunks_without_mutating_history() {
+        let fixtures: [(&str, &[u8]); 3] = [
+            ("0000.bin", b"SPV1"),
+            ("0000.bin.part", &[]),
+            ("0000.bin", b"not-a-snapshot"),
+        ];
+        for (file, bytes) in fixtures {
+            let dir = tmp();
+            let generation = dir.join("chk-00000001");
+            fs::create_dir(&generation).unwrap();
+            fs::write(dir.join("CURRENT"), b"chk-00000001\n").unwrap();
+            let path = generation.join(file);
+            fs::write(&path, bytes).unwrap();
+            let before_chunk = fs::read(&path).unwrap();
+            let before_current = fs::read(dir.join("CURRENT")).unwrap();
+
+            let error = match CheckpointStore::open_iot_exclusive(
+                &dir,
+                1024,
+                CheckpointRetention::default(),
+            ) {
+                Ok(_) => panic!("unclassifiable checkpoint history was accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, ErrorCode::UnsupportedRestore);
+            assert!(error
+                .message
+                .contains("first chunk cannot be classified"));
+            assert_eq!(fs::read(&path).unwrap(), before_chunk);
+            assert_eq!(fs::read(dir.join("CURRENT")).unwrap(), before_current);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     fn count_schema() -> Schema {

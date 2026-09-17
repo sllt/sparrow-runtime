@@ -17,8 +17,8 @@ use serde_json::{json, Value};
 use sparrow_control::DemoHarness;
 use sparrow_control::{
     bind_plan, binder_catalog, capabilities_json, explain_plan_with, honesty_json,
-    replay_label_for_source, request_start_at, request_stop, stream_schema, validate_aligned_plan,
-    validate_io, DemoIo, PipelineSpec, RestoreSpec, Store, StreamSpec, Supervisor, HONESTY,
+    request_start_at, request_stop, stream_schema, validate_aligned_plan, DemoIo, PipelineSpec,
+    RestoreSpec, Store, StreamSpec, Supervisor, HONESTY,
 };
 use sparrow_model::{ErrorCode, SparrowError};
 use sparrow_runtime::Kernel;
@@ -152,16 +152,48 @@ impl From<SparrowError> for ApiError {
     }
 }
 
+fn public_error_context(error: &SparrowError) -> Vec<Value> {
+    const ALLOWED: &[&str] = &[
+        "operator",
+        "field",
+        "pipeline",
+        "job_attempt",
+        "checkpoint_outcome",
+        "admission",
+        "phase",
+        "scope",
+        "snapshot_id",
+        "max_keys",
+        "max_bytes",
+        "max_rows",
+        "max_timers",
+    ];
+    error
+        .context
+        .iter()
+        .filter(|(key, _)| ALLOWED.contains(&key.as_str()))
+        .take(8)
+        .map(|(key, value)| {
+            json!({
+                "key": key,
+                "value": value.chars().take(128).collect::<String>(),
+            })
+        })
+        .collect()
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut body = honesty_json();
         if let Value::Object(map) = &mut body {
+            let context = public_error_context(&self.err);
             map.insert(
                 "error".into(),
                 json!({
                     "code": self.err.code.as_str(),
                     "message": self.err.message,
                     "retryable": self.err.retryable,
+                    "context": context,
                 }),
             );
         }
@@ -349,7 +381,15 @@ fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
     let policy = sparrow_control::validate::store_policy(&state.store, demo.as_ref())
         .map_err(ApiError::from)?;
     let secrets = sparrow_control::validate::StoreSecrets::new(Arc::clone(&state.store));
-    validate_io(spec, &schema, &secrets, &policy, demo.as_ref()).map_err(ApiError::from)?;
+    sparrow_control::validate::validate_io_with_plan(
+        spec,
+        &schema,
+        &plan,
+        &secrets,
+        &policy,
+        demo.as_ref(),
+    )
+    .map_err(ApiError::from)?;
     let mut body = honesty_json();
     if let Value::Object(map) = &mut body {
         map.insert("accepted".into(), json!(true));
@@ -370,7 +410,7 @@ fn run_explain(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
         .check_delivery()
         .map(|(_, r)| r)
         .unwrap_or(sparrow_model::RecoveryPolicy::RestartFresh);
-    let replay = replay_label_for_source(&spec.source.kind);
+    let replay = sparrow_control::validate::replay_label_for_spec(spec);
     let mut e = explain_plan_with(&plan, recovery, replay);
     if spec.source.kind=="jetstream" {
         e.delivery="checkpointed_at_least_once";
@@ -628,7 +668,7 @@ fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
         })),
         "delivery": effective["delivery"],
         "recovery": row.spec.recovery.clone(),
-        "replay": replay_label_for_source(&row.spec.source.kind),
+        "replay": sparrow_control::validate::replay_label_for_spec(&row.spec),
         "honesty": HONESTY,
         "effective": effective,
         "mailboxes": mailboxes,
@@ -680,7 +720,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
     };
     let source_queue = boundary_queue_json(diag.source_queue.get());
     let sink_queue = boundary_queue_json(diag.sink_queue.get());
-    let io = diag.snapshot();
+    let io = s.graph_ports.as_ref().map_or_else(||diag.snapshot(),|ports|ports.snapshot());
     let delivery = diag.observation.delivery().unwrap_or_default();
     let mut reasons = Vec::new();
     if s.cancel_requested {
@@ -729,7 +769,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
         .into_iter()
         .map(|(n, h)| (n.into(), histogram_json(&h)))
         .collect();
-    json!({"available":true,"running_revision":s.running_revision,"runtime_attempt_id":s.runtime_attempt_id,
+    let mut value=json!({"available":true,"running_revision":s.running_revision,"runtime_attempt_id":s.runtime_attempt_id,
         "scope":"active_runtime_attempt","retention":"active_handles_only","clock":"process_monotonic",
         "snapshot_consistency":"per_component_not_cross_pipeline_atomic",
         "source_kind":s.source_kind,"sink_kind":s.sink_kind,"source":endpoint_json(&source),"sink":endpoint_json(&sink),
@@ -762,7 +802,27 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "local_origin":if s.source_kind=="file"{"decoded_file_batch_ready"}else{"complete_local_request_or_publish_before_decode"},
             "origin_propagation":"conservative_input_batch_bounds; window_aggregate_outputs_unknown",
             "device_event_age_available":false,"broker_wait_available":false,"business_ack_available":false,
-            "restored_monotonic_age_available":false,"payload_semantics_changed":false}})
+            "restored_monotonic_age_available":false,"payload_semantics_changed":false}});
+    if let Some(ports)=&s.graph_ports {
+        value["graph_ports"]=json!({"sources":ports.sources.iter().map(|(id,diag)|graph_port_json(*id,true,diag)).collect::<Vec<_>>(),"sinks":ports.sinks.iter().map(|(id,diag)|graph_port_json(*id,false,diag)).collect::<Vec<_>>()});
+        value["source"]=json!({"available":false,"reason":"multiple_ports_see_graph_ports"});
+        value["sink"]=json!({"available":false,"reason":"multiple_ports_see_graph_ports"});
+        value["delivery"]=json!({"available":false,"reason":"per_sink_see_graph_ports"});
+        value["latency_contract"]["local_origin"]=json!("graph_port_specific; no_single_source_origin");
+        value["diagnosis_reasons"]=json!(["graph_inspect_each_port_and_physical_input_progress"]);
+    }
+    value
+}
+
+fn graph_port_json(id:u32,source:bool,diag:&sparrow_connectors::IoDiagnostics)->Value {
+    let endpoints=diag.observation.endpoints();
+    let endpoint=endpoints.as_ref().map(|(input,output)|endpoint_json(if source{input}else{output}));
+    let queue=boundary_queue_json(if source{diag.source_queue.get()}else{diag.sink_queue.get()});
+    let delivery=diag.observation.delivery().unwrap_or_default();let io=diag.snapshot();
+    json!({"operator_id":id,"role":if source{"source"}else{"sink"},"endpoint":endpoint,"queue":queue,
+        "decode_errors":io.decode_errors,"http_failed":io.http_failed,"http_posted":io.http_posted,
+        "delivery":{"active_input_batches":delivery.active_groups,"active_rows":delivery.active_rows,"failed_or_cancelled_rows":delivery.failed_rows,"completed_rows":delivery.completed_rows},
+        "latency":diag.observation.histograms().into_iter().map(|(name,h)|(name.to_string(),histogram_json(&h))).collect::<serde_json::Map<_,_>>()})
 }
 
 fn mailbox_snapshot_json(s: &sparrow_control::supervisor::PipelineMailboxSnapshot) -> Value {
@@ -799,10 +859,15 @@ fn mailbox_snapshot_json(s: &sparrow_control::supervisor::PipelineMailboxSnapsho
                 "completed_wait_us_total": q.completed_wait_us_total, "max_completed_wait_us": q.max_completed_wait_us,
             });
             value["accounting_valid"] = json!(q.accounting_errors_total == 0);
+            value["input_progress"] = json!(q.input_progress.as_ref().map(input_progress_json));
             value["accounting_errors_total"] = json!(q.accounting_errors_total);
             value
         }).collect::<Vec<_>>(),
     })
+}
+
+fn input_progress_json(p:&sparrow_runtime::mailbox_observe::InputProgress)->Value {
+    json!({"scope":"physical_edge_received_not_committed","rows_received":p.rows_received,"watermark_micros":p.watermark_micros,"idle":p.idle,"eof":p.eof,"barrier_received":p.barrier_received,"barrier_blocked":p.barrier_blocked})
 }
 
 async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -841,7 +906,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "log_written": io.log_written,
             "decode_errors": io.decode_errors,
     });
-    Ok(Json(json!({
+    let mut value=json!({
         "jobs_started": snap.jobs_started,
         "state_accounting_errors_total": state.supervisor.kernel().process_owner().accounting_errors_total(),
         "histogram_contract": histogram_contract_json(),
@@ -872,7 +937,21 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         "log": snap.log_line(),
         "label_budget": "job_and_connector_only; no per-event labels",
         "honesty": HONESTY,
-    })))
+    });
+    value["graph_dropped_rows"]=json!(snap.graph_dropped_rows);
+    value["graph_side_rows"]=json!(snap.graph_side_rows);
+    value["graph_detached_branches"]=json!(snap.graph_detached_branches);
+    value["graph_branch_failures"]=json!(snap.graph_branch_failures);
+    value["iot_input_rows"] = json!(snap.iot_input_rows);
+    value["iot_emitted_rows"] = json!(snap.iot_emitted_rows);
+    value["iot_filtered_rows"] = json!(snap.iot_filtered_rows);
+    value["iot_invalid_rows"] = json!(snap.iot_invalid_rows);
+    value["iot_expired_keys"] = json!(snap.iot_expired_keys);
+    value["iot_state_keys"] = json!(snap.iot_state_keys);
+    value["iot_state_bytes"] = json!(snap.iot_state_bytes);
+    value["iot_metrics_scope"] = json!("all_iot_operator_instances; one input may be counted by multiple IoT nodes");
+    value["iot_filtered_contract"] = json!("includes_invalid_and_suppressed; invalid_is_subset");
+    Ok(Json(value))
 }
 
 async fn list_pipelines(
@@ -1370,5 +1449,21 @@ mod tests {
         assert_eq!(r.status(), StatusCode::CONFLICT);
         let r = ApiError::from(SparrowError::new(ErrorCode::Internal, "boom")).into_response();
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn k4_api_error_context_exposes_bounded_operator_identity_only() {
+        let error = SparrowError::new(ErrorCode::TypeMismatch, "IoT value type")
+            .at_operator(42.into())
+            .context("path", "/sensitive/fixture")
+            .context("field", "temperature");
+        let context = public_error_context(&error);
+        assert!(context.iter().any(|entry| {
+            entry["key"] == "operator" && entry["value"] == "OperatorId(42)"
+        }));
+        assert!(context.iter().any(|entry| {
+            entry["key"] == "field" && entry["value"] == "temperature"
+        }));
+        assert!(!context.iter().any(|entry| entry["key"] == "path"));
     }
 }

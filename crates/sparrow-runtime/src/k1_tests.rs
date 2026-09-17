@@ -67,6 +67,9 @@ fn plan(windows: usize, keep: bool) -> PhysicalPlan {
         schema: input,
     });
     PhysicalPlan {
+        edges: None,
+        side_outputs: vec![],
+        source_times: vec![],
         pipeline: 1.into(),
         revision: 1.into(),
         stages,
@@ -201,7 +204,7 @@ fn k2_reliable_sink_cursor_is_cut_local_and_snapshot_v4_is_not_legacy() {
             let count=counter.clone();
             let handle=kernel.submit(JobRequest::new(physical,vec![],SharedCapture::disabled())
                 .with_live_events(rx).with_live_out(out).with_aligned(AlignedJob{restore:None,
-                    pipeline:Some(PipelineRestore{plan:manifest.clone(),generation:[3;16],restore:None}),acks:acks.clone(),outbox:counter})).unwrap();
+                    pipeline:Some(PipelineRestore{plan:manifest.clone(),generation:[3;16],restore:None,iot:vec![]}),acks:acks.clone(),outbox:counter})).unwrap();
             let sink=tokio::spawn(async move {
                 let mut result=Vec::new();
                 while let Some(batch)=received.recv().await {
@@ -352,6 +355,7 @@ fn r11_restore_rejects_wrong_keys_accumulators_and_bounds_before_input() {
             JobRequest::new(physical, vec![row(99)], capture.clone()).with_aligned(AlignedJob {
                 restore: None,
                 pipeline: Some(PipelineRestore {
+                    iot: Vec::new(),
                     plan: manifest,
                     generation: [1; 16],
                     restore: Some(vec![bad]),
@@ -530,6 +534,7 @@ fn r11_restore_duplicate_unknown_legacy_combination_and_generation_zero_reject()
                         None
                     },
                     pipeline: Some(PipelineRestore {
+                        iot: Vec::new(),
                         plan: manifest,
                         generation: if case == 3 { [0; 16] } else { [1; 16] },
                         restore: Some(states),
@@ -840,6 +845,7 @@ fn k1_real_kernel_zero_single_double_windows_recover_every_cut_against_raw_input
                                 .with_aligned(AlignedJob {
                                     restore: None,
                                     pipeline: Some(PipelineRestore {
+                                        iot: Vec::new(),
                                         plan: manifest.clone(),
                                         generation: [42; 16],
                                         restore: None,
@@ -959,6 +965,7 @@ fn k1_real_kernel_zero_single_double_windows_recover_every_cut_against_raw_input
                             .with_aligned(AlignedJob {
                                 restore: None,
                                 pipeline: Some(PipelineRestore {
+                                    iot: Vec::new(),
                                     plan: manifest,
                                     generation: snapshot.generation,
                                     restore: Some(snapshot.windows),
@@ -1282,6 +1289,7 @@ fn k1_partial_restore_rejected_before_input_and_failed_preparation_refunds_all()
             .with_aligned(AlignedJob {
                 restore: None,
                 pipeline: Some(PipelineRestore {
+                    iot: Vec::new(),
                     plan: manifest.clone(),
                     generation: [42; 16],
                     restore: Some(bad),
@@ -1361,6 +1369,7 @@ fn k1_single_et_tumble_hop_restore_watermark_and_state_against_raw_buckets() {
                         .with_aligned(AlignedJob {
                             restore: None,
                             pipeline: Some(PipelineRestore {
+                                iot: Vec::new(),
                                 plan: manifest.clone(),
                                 generation: [42; 16],
                                 restore: None,
@@ -1419,6 +1428,7 @@ fn k1_single_et_tumble_hop_restore_watermark_and_state_against_raw_buckets() {
                         .with_aligned(AlignedJob {
                             restore: None,
                             pipeline: Some(PipelineRestore {
+                                iot: Vec::new(),
                                 plan: manifest,
                                 generation: snapshot.generation,
                                 restore: Some(snapshot.windows),
@@ -1462,6 +1472,7 @@ fn k1_two_windows_checkpoint_waits_for_real_slow_sink_and_cancellation_releases_
                         .with_aligned(AlignedJob {
                             restore: None,
                             pipeline: Some(PipelineRestore {
+                                iot: Vec::new(),
                                 plan: manifest,
                                 generation: [42; 16],
                                 restore: None,
@@ -1526,6 +1537,7 @@ fn k1_partial_freeze_budget_failure_is_retryable_without_job_loss_or_leases() {
                     .with_aligned(AlignedJob {
                         restore: None,
                         pipeline: Some(PipelineRestore {
+                            iot: Vec::new(),
                             plan: manifest,
                             generation: [42; 16],
                             restore: None,
@@ -1612,6 +1624,7 @@ fn k1_two_full_keyspaces_share_bytes_without_halving_per_operator_cardinality() 
                     .with_aligned(AlignedJob {
                         restore: None,
                         pipeline: Some(PipelineRestore {
+                            iot: Vec::new(),
                             plan: manifest.clone(),
                             generation: [42; 16],
                             restore: None,
@@ -1682,6 +1695,7 @@ fn k1_two_full_keyspaces_share_bytes_without_halving_per_operator_cardinality() 
                 JobRequest::new(physical, rows, capture.clone()).with_aligned(AlignedJob {
                     restore: None,
                     pipeline: Some(PipelineRestore {
+                        iot: Vec::new(),
                         plan: manifest,
                         generation: snapshot.generation,
                         restore: Some(snapshot.windows),

@@ -49,6 +49,8 @@ impl QueueDepth {
 
 #[derive(Clone, Debug)]
 pub struct MailboxSnapshot {
+    /// Graph-only physical input progress, not durable source positions.
+    pub input_progress: Option<InputProgress>,
     /// Nonzero means the observation is invalid, not a trustworthy zero gauge.
     pub accounting_errors_total: u64,
     pub residence: sparrow_model::observation::HistogramSnapshot,
@@ -78,6 +80,29 @@ pub struct MailboxSnapshot {
     pub completed_waits_total: u64,
     pub completed_wait_us_total: u64,
     pub max_completed_wait_us: u64,
+}
+
+#[derive(Clone,Debug,Default)]
+pub struct InputProgress {
+    pub rows_received: u64,
+    pub watermark_micros: Option<i64>,
+    pub idle: bool,
+    pub eof: bool,
+    pub barrier_received: Option<u64>,
+    pub barrier_blocked: bool,
+}
+impl InputProgress {
+    pub(crate) fn received(&mut self,envelope:&crate::mailbox::Envelope) {
+        if let Some(batch)=&envelope.batch{self.rows_received=self.rows_received.saturating_add(batch.num_rows() as u64);self.idle=false;}
+        match &envelope.control {
+            Some(crate::mailbox::StreamControl::EndOfInput)=>self.eof=true,
+            Some(crate::mailbox::StreamControl::Watermark {wm_micros,..})=>self.watermark_micros=Some(self.watermark_micros.map_or(*wm_micros,|w|w.max(*wm_micros))),
+            Some(crate::mailbox::StreamControl::Idle {..})=>self.idle=true,
+            Some(crate::mailbox::StreamControl::Active {..})=>self.idle=false,
+            Some(crate::mailbox::StreamControl::CheckpointBarrier {checkpoint_id})=>self.barrier_received=Some(*checkpoint_id),
+            _=>{},
+        }
+    }
 }
 
 pub(crate) struct QueuedStamp {
@@ -134,6 +159,7 @@ impl MailboxObserver {
         Ok(Arc::new(Self {
             state: Mutex::new(QueueState {
                 snapshot: MailboxSnapshot {
+                    input_progress: None,
                     accounting_errors_total: 0,
                     residence: sparrow_model::observation::HistogramSnapshot::default(),
                     max_items: cfg.max_items,
@@ -208,6 +234,8 @@ pub struct JobMailboxSnapshot {
 }
 
 struct EdgeObserver {
+    from_stage: usize,
+    to_stage: usize,
     from_kind: &'static str,
     to_kind: &'static str,
     observer: Arc<MailboxObserver>,
@@ -242,11 +270,15 @@ impl JobMailboxObserver {
         // pool, never a batch. Snapshot VALUES contain no owner references.
         let lease = owner.acquire(CreditKind::Queue, bytes)?;
         let mut edges = Vec::with_capacity(plan.mailbox_count());
-        for pair in plan.stages.windows(2) {
+        for (from, to) in plan.edge_pairs() {
+            let observer=MailboxObserver::with_lease(cfg,lease.share())?;
+            if plan.edges.is_some(){observer.lock().snapshot.input_progress=Some(InputProgress::default());}
             edges.push(EdgeObserver {
-                from_kind: stage_kind(&pair[0]),
-                to_kind: stage_kind(&pair[1]),
-                observer: MailboxObserver::with_lease(cfg, lease.share())?,
+                from_stage: from,
+                to_stage: to,
+                from_kind: stage_kind(&plan.stages[from]),
+                to_kind: stage_kind(&plan.stages[to]),
+                observer,
             });
         }
         Ok(Arc::new(Self {
@@ -279,8 +311,8 @@ impl JobMailboxObserver {
                 .enumerate()
                 .map(|(i, edge)| EdgeMailboxSnapshot {
                     edge_index: i,
-                    from_stage: i,
-                    to_stage: i + 1,
+                    from_stage: edge.from_stage,
+                    to_stage: edge.to_stage,
                     from_kind: edge.from_kind,
                     to_kind: edge.to_kind,
                     queue: edge.observer.snapshot_at(now),
@@ -293,10 +325,15 @@ impl JobMailboxObserver {
 fn stage_kind(stage: &sparrow_plan::PhysicalStage) -> &'static str {
     use sparrow_plan::PhysicalStage;
     match stage {
+        PhysicalStage::Branch { .. } => "branch",
+        PhysicalStage::Route { .. } => "route",
+        PhysicalStage::UnionAll { .. } => "union_all",
+        PhysicalStage::BestEffortSink { .. } => "best_effort_sink",
         PhysicalStage::MemorySource { .. } => "source",
         PhysicalStage::Transform { .. } => "transform",
         PhysicalStage::CaptureSink { .. } => "sink",
         PhysicalStage::WindowAgg { .. } => "window",
+        PhysicalStage::Iot { spec, .. } => if spec.deadband.is_some() { "deadband" } else { "change_detect" },
         PhysicalStage::Deduplicate { .. } => "deduplicate",
         PhysicalStage::Lookup { .. } => "lookup",
     }

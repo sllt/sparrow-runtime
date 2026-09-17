@@ -1,0 +1,6 @@
+{
+  "fields": [
+    {"name": "device_id", "type": "utf8", "nullable": false},
+    {"name": "temperature", "type": "float64", "nullable": true}
+  ]
+}

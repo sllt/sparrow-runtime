@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::expr_spec::ExprSpec;
+use crate::stateful::IotSpec;
 use sparrow_model::error::{ErrorCode, Result, SparrowError};
 
 pub const GRAPH_SPEC_VERSION: u32 = 1;
@@ -77,6 +78,58 @@ pub struct NodeSpec {
     pub temporal: Option<bool>,
     #[serde(default)]
     pub as_of_field: Option<String>,
+    /// Parameters for the first bounded IoT state operators.  Keeping this
+    /// as an optional nested object preserves old linear GraphSpec JSON when
+    /// no IoT node is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iot: Option<IotSpec>,
+    /// Explicit ordered routing cases; destinations must occur in `out`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<Vec<RouteSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_mode: Option<RouteMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_out: Option<u32>,
+    /// Loss is an edge contract, not an inference from a slow consumer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub best_effort: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_output: Option<SideOutputSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_of_orderness_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_future_skew_micros: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideOutputKind { DecodeError, Late, RuleReject }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SideOutputSpec {
+    pub kind: SideOutputKind,
+    pub to: u32,
+    /// Explicit finite-queue policy: required backpressure, or lossy drop.
+    pub full: SideOutputFull,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideOutputFull { Backpressure, Drop }
+
+pub fn decode_error_schema() -> sparrow_model::Schema {
+    use sparrow_model::{DataType,Field,Schema};
+    Schema::new(0x44454345, vec![Field::new(1,"source_operator",DataType::UInt64,false),Field::new(2,"error_code",DataType::Utf8,false)]).expect("static decode error schema")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteMode { FirstMatch, AllMatch }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSpec {
+    pub predicate: ExprSpec,
+    pub to: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -125,6 +178,7 @@ pub struct NamedExprSpec {
 
 impl GraphSpec {
     pub fn from_json(text: &str) -> Result<Self> {
+        if text.len()>64*1024 {return Err(SparrowError::new(ErrorCode::MaxRecordSize,"GraphSpec exceeds 64 KiB"));}
         let spec: Self = serde_json::from_str(text).map_err(|e| {
             SparrowError::new(ErrorCode::InvalidArgument, format!("GraphSpec JSON: {e}"))
         })?;

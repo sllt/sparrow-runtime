@@ -32,6 +32,8 @@ SDK `read_buffer_capacity` 只是初始容量；不能把它或订阅条数当�
 
 ## R12 执行形态
 
+已观察到的积压、资源及空闲时效取舍统一维护在 [项目优化清单 OPT-001～004](OPTIMIZATION_BACKLOG.md#opt-001)；生产验证缺口与按需扩展仍在 [DEVELOPMENT_TODO §8.4](DEVELOPMENT_TODO.md#k2-followups)。K2/R12 Preview 已提交为 `d52b15c`；这些待办不因本轮功能代码完成而自动关闭。
+
 - Source 合并同一 pull 中已经就绪的记录，受 Kernel rows/bytes 限制；不为凑批等待新消息。整批发布后才推进连续 published cut，尚未入队的预取/延后记录不进入 checkpoint。
 - 非空批次结束立即继续；仅真正空拉取使用 5→10→…→250 ms 退避，有数据即复位。空闲稳定状态约不超过 4 pull/s，代价是最长约 250 ms 的空闲唤醒等待；控制/ACK/取消不被该等待阻塞。旧 v13 每 8 条还会额外等 5 ms，不能沿用其 NATS 容量假设。
 - 保留 **Explicit** ACK：独立 worker 最多 16 个确认请求，共享有界队列/工作区，每条最多 3 次尝试；负响应不算确认。提交后仅调度 ACK，不在 source select 分支串行等待 N 个 RTT，停止时取消并 join worker；ACK 失败耗尽重试才结束 attempt。broker 断线仍 fail-closed，不承诺透明重连。

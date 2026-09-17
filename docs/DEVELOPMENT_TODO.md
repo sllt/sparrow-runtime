@@ -1,6 +1,6 @@
 # Sparrow Post-V1 完整开发 TODO
 
-更新日期：2026-09-16。
+更新日期：2026-09-17。
 
 设计依据：根目录 `Sparrow_Post_V1_Roadmap_Arrow_JIT_Final.md`，包含 2026-09-12 实施补充；同时追踪原始蓝图、计划评审与历史 ADR，文档范围、取舍及章节对应见 [§18 覆盖矩阵](#design-coverage)。运行合同与已验证证据以 [RUNTIME.md](RUNTIME.md) 为准，并核对其对应源码/构建。本文件负责把设计转成执行任务，不替代设计文档，也不把设计接口当成已存在的 API。
 
@@ -10,9 +10,13 @@
 
 **K2 实施进展（2026-09-15）：K1/R11 已提交 `6fb20c2`，未 push；后续工作在 `feat/k2-jetstream-reliability`，没有混入该提交。JetStream 首批 Preview 已贯通真实 Source→Kernel→HTTP→checkpoint→ACK/恢复，完成自查修复及限定矩阵测试，见 [JETSTREAM.md](JETSTREAM.md)。默认关闭；选择 fail/held、broker 保留/重放，不实现独立 outbox 或 DLQ。固定历史 replay、语义 fork、TLS/真实 RTT/容量与长稳等剩余门禁不假报完成，REL 父任务保持未勾选；当前仍收尾 K2，不自动转入 K3 或平台。**
 
-R12 收尾（2026-09-16）已完成本批实现、自查及匹配复验：checkpoint 仲裁/超时分流、真实空闲退避、输入合批、有界并发 Explicit ACK、broker 侧提交失败 oracle 和验证入口已落实。556 核心、35 no-demo、32×20 专项及进程故障通过；NATS 预装排空相对 v13 为零状态 17.99×/单 Count 10.98×，但持续写入 10k 档仍有积压，不承诺低延迟 20k/s。默认 File 原性能门槛通过；详见 [R12 证据](JETSTREAM.md#r12-validation)。随本次 K2/R12 提交归档，未 push/tag/部署；仍是 Preview，TLS/WAN/长稳与完整 REL 未完成。
+R12 收尾（2026-09-16）已完成本批实现、自查及匹配复验，提交为 `d52b15c`：checkpoint 仲裁/超时分流、真实空闲退避、输入合批、有界并发 Explicit ACK、broker 侧提交失败 oracle 和验证入口已落实。556 核心、35 no-demo、32×20 专项及进程故障通过；NATS 预装排空相对 v13 为零状态 17.99×/单 Count 10.98×，但持续写入 10k 档仍有积压，不承诺低延迟 20k/s。默认 File 原性能门槛通过；详见 [R12 证据](JETSTREAM.md#r12-validation)。未 push/tag/部署；仍是 Preview，TLS/WAN/长稳与完整 REL 未完成。已知限制、生产验证缺口和按需扩展分开登记在 [§8.4 后续优化台账](#k2-followups)，不把“本轮代码完成”理解为完整 K2 只剩长测。
+
+**最新进展（2026-09-16，替代上方历史记录中的“当前批次”）：K3 的 DAG-01～07 已在声明矩阵内完成实现、自查和匹配复验，尚未 commit/push/tag。最终 `package-v14-*`：580 核心、35 no-demo、24×20 专项、零/双状态多输入真实进程故障通过；三组完整 File ABBA 单组/全样本合并均通过原门槛；32 项 K2 与其真实进程回归通过。自查补正 EOF、嵌套可选支路取消、通知注册竞态和旧 JSON 兼容；此前失败样本保留。详见 [K3 合同与证据](DAG.md#k3-validation)。这是 Preview，不是任意 DAG aligned 或生产认证。下一建议核心模块为 K4，尚未启动；K2 长稳/真实网络/容量门禁仍保留，K5 平台继续后置。**
 
 ## 导航
+
+**当前执行更新（2026-09-17，替代上方历史排期）：K4 首批已完成实现、全局 Review 修复和限定矩阵复验。** 变化检测、Deadband、状态/key/timer/bytes 预算、v6 恢复、配置/诊断及两个实际运行模板已闭环；630 核心、36 no-demo、50×20 K4、24×20 K3、32 项 K2、真实进程故障和三组 File ABBA 均通过，见 [K4 验收](IOT.md#k4-validation)。不另开 R13 批次，不自动转入 K5；K3/K4 工作尚未 commit/push/tag，原始评审文档保留。生产长稳/目标网络门禁与高级 IoT 仍未关闭。
 
 - [维护规则与完成标准](#rules)
 - [当前基线与未完成边界](#baseline)
@@ -23,6 +27,8 @@ R12 收尾（2026-09-16）已完成本批实现、自查及匹配复验：checkp
 - [过载与业务时效](#freshness)
 - [V1.1 工作台、CLI 与首批 IoT](#v11)
 - [共享状态参与者与可靠输入](#recovery)
+- [K2 已知限制与后续优化](#k2-followups)
+- [项目非阻断问题与优化清单](OPTIMIZATION_BACKLOG.md)
 - [V1.3 DAG](#dag)
 - [V1.4 高级 IoT 与参考表](#iot)
 - [Connector 与格式](#connectors)
@@ -77,11 +83,11 @@ R12 收尾（2026-09-16）已完成本批实现、自查及匹配复验：checkp
 
 ### 2.1 已知工作区状态
 
-历史验证基线：`3619676b4636dfce4bbd477ea79b028e6a6a4efb`。当前代码基线为 **`4f70407`**，已包含 BASE、连接器生产修复、OBS 与 R9 跟进的代码、构建配置和验证脚本。历史补丁/二进制证据继续按原指纹解释，不把旧 HEAD 当成最新实现。README、正式 docs 和根目录文档按用户要求未随该 commit 加入；尚未 push/tag/发版，发行文档和证据的版本化仍属 PUB 收尾。
+历史验证基线：`3619676b4636dfce4bbd477ea79b028e6a6a4efb`；`4f70407` 为 BASE/OBS/R9 阶段，后续 K1/R11 与 K2/R12 已提交。当前 HEAD 为 **`d52b15c`**，工作区另有本轮尚未提交的 K3 及正式文档；匹配构建与源码指纹见 [K3 验证](DAG.md#k3-validation)。历史补丁/二进制证据继续按原指纹解释，不把旧 HEAD 当成最新实现，也不把工作区测试当作已经发行。未在本轮 commit/push/tag/部署，发行文档和证据的版本化仍属 PUB 收尾。
 
 | 项目 | 当前状态 | 下一步如何处理 |
 |---|---|---|
-| SQL/Graph、prepared Row、现有窗口/参考表 | 已有基础，Graph 仍为线性形状 | 复用；只补真实缺项，不重复实现 bind-once/fusion |
+| SQL/Graph、prepared Row、现有窗口/参考表 | 旧线性基础保留；K3 新增显式 DAG Preview，SQL 未新增通用 UNION 语法 | 复用 bind-once/fusion；以 [DAG 合同](DAG.md) 区分图执行与受测恢复矩阵 |
 | BASE-01/02 | 本轮限定修复已验证 | 进入持续回归，不冒充已支持多参与者 |
 | BASE-03 | owner handle、detach 顺序等局部已修复 | 受控路径审计与完整 arena 边界仍待补齐 |
 | BASE-04 | 保持现有 eager/首错语义 | 独立 golden 与候选后端语义合同仍待补齐 |
@@ -261,14 +267,14 @@ B/C/E 编号只用于追踪旧计划；当前优先级以 K0～K5 为准：**当
 <a id="core-first-batches"></a>
 ### 3.4 核心优先：整批开发、依赖与验收
 
-K0～K5 是执行批次别名，不增加或替换原任务 ID，不预留真实版本号。**每次交付一个完整、可运行且有失败反例的核心增量，不以新增 trait、codec 或几个 helper 作为整批完成。** K1 功能和有限范围复验完成，保留明确的高频压力点性能限制；K2～K5 尚未实现。
+K0～K5 是执行批次别名，不增加或替换原任务 ID，不预留真实版本号。**每次交付一个完整、可运行且有失败反例的核心增量，不以新增 trait、codec 或几个 helper 作为整批完成。** K1/R11 已提交并通过原高频压力点门槛；K2/R12 的选定 Preview 闭环已提交，但完整 K2 与生产验收未关闭，剩余项见 §8.4；K3 的限定矩阵已实现并复验，见 §9；K4/K5 尚未实现。下方历史工作包描述不替代最新受测支持矩阵。
 
 #### 3.4.1 大模块顺序与交付效果
 
 | 优先批次 | 模块 / 原任务 | 必须交付的闭环 | 做完后新增的实际能力 |
 |---|---|---|---|
 | K0：当前收尾，持续最高优先 | 当前 review、PUB/OPS-04/QA 适用范围 | 修复 review 阻断问题；冻结可追溯候选；按平台/负载做网络、设备、长稳与恢复验收 | 为现有受限支持范围取得发行证据；不宣称新核心已实现 |
-| **K1：已实现，待 review** | **通用 checkpoint / 状态参与者**；STATE-01～05、REL-14 的 File 子集、所用 MEM/SEM/CFG/QA | 协议、零/单/双 Count 保存恢复、generation、API/CLI/codec 拒绝矩阵与匹配服务器证据已闭合；100 ms 压力点不按性能门槛放行 | 恢复不再硬编码为“必须恰好一个 Window”；不等于任意图可恢复 |
+| **K1：已实现、review 修复及提交** | **通用 checkpoint / 状态参与者**；STATE-01～05、REL-14 的 File 子集、所用 MEM/SEM/CFG/QA | 协议、零/单/双 Count 保存恢复、generation、API/CLI/codec 拒绝矩阵与匹配服务器证据已闭合；R11 已通过原 100 ms 压力点门槛，完整生产门禁仍保留 | 恢复不再硬编码为“必须恰好一个 Window”；不等于任意图可恢复 |
 | K2a：可靠入口 | REL-00～06/08～14、AGE-01 来源身份子集 | 只选一条来源路线；拉取/预取/未确认预算、checkpoint-aware ACK、运行中/重启后去重、保留范围、独占/旧 attempt 隔离、毒消息与有限 retry/DLQ | 对选定来源解释哪些数据可以重放、何时确认、历史何时失效；不是只增加一个 broker 连接器 |
 | K2b：可靠输出，与 K2a 对齐 | REL-07/08、STATE-04、HTTP-06/07 | 稳定输出 ID、required 确认层级、未知 HTTP 结果、重试/重放与重复语义；按下游断网自治需求决定是否交付独立持久 outbox | 明确已接纳/已持久化/远端已确认的差异；选用 outbox 后才可承诺其持久接纳范围内的重启续送 |
 | K3：真实 DAG 内核 | DAG-01～07、STATE/AGE/MEM 适用部分 | 单源 Branch/Route/多 Sink → 多源 UnionAll/时间进度 → 多输入 aligned；分别通过预算、慢/失败支路、取消与恢复矩阵 | 真正执行分支和合流，而不只是画图；按已通过的阶段开放 capability，DAG-08 页面不在本批 |
@@ -466,11 +472,11 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
 
 新节点共同前置：MEM-02 对所用类型闭合；显式 key/state/timer 上限、TTL、首次值/异常值语义、输出 schema 与重置行为。首批不依赖完整 UI、DAG 或 JetStream；未参与 snapshot 的新节点拒绝 aligned。
 
-- [ ] **IOT-01 — 变化检测。** 每 key 前值和比较规则；首值是否输出、NULL/Missing、NaN/非有限值、TTL 到期、重复输入与 reset 的行为可配置或明确固定。受预算更新，失败不半更新状态。
-- [ ] **IOT-02 — Deadband。** 绝对/相对阈值、基准取上次输入或上次输出、零基准、初值和异常值明确；阈值边界与逐步漂移有手算 golden，不因样例简单省略状态资源测试。
+- [x] **IOT-01 — 变化检测（K4 Preview）。** 每 key 前值和比较规则；首值、NULL/非有限值、TTL、重复与 reset 已有明确合同。预算失败不半更新基准；File→HTTP、TTL=0 的 v6 恢复已验证，其他组合不自动降级。
+- [x] **IOT-02 — Deadband（K4 Preview）。** 绝对/相对阈值、last_input/last_output、零基准、初值和异常值已实现；阈值边界、逐步漂移、整数极值、资源与恢复反例通过。
 - [ ] **IOT-03 — Hysteresis。** enter/exit 双阈值、等号边界、Normal/Unknown/Active 与恢复行为；坏数据不把 Active 清零。可作为第三个场景，若业务更需要告警可替换首批中的一项。
-- [ ] **TPL-01 — 至少两个完整可运行模板。** 为首批节点各交付 schema、输入 fixture、精确输出/错误预期、配置与状态预算、首次值/reset/过载样例、命令和失败测试。不仅提供 SQL 字符串。
-- [ ] **TPL-02 — 现有能力模板化。** 遥测阈值通知、窗口统计、设备信息补全复用现有算子；为 Source/Sink/recovery/time 的支持边界和故障行为补说明。多支路模板等相应 DAG 能力，不伪装已支持。
+- [x] **TPL-01 — 至少两个完整可运行模板。** change/deadband 均交付 schema、NDJSON、精确 golden、配置/预算、reset/过载说明与命令；测试实际加载模板经 File→Kernel→HTTP 验证，不只检查字符串或输出行数。
+- [x] **TPL-02 — 现有能力模板化（现有入口范围）。** File/v3 阈值与双 Count Server 模板、静态/版本化 Lookup embedding 示例的效果、命令与故障/恢复/time 边界统一写入 [IOT.md](IOT.md)。不将 embedding 表能力冒充 Server 表发布/绑定；该运营流程仍属 TAB 后续项。
 
 首批如果输出被当作稳定告警事件，必须落实 STATE-04/REL-07 的最小身份子集；单纯值过滤也必须暴露 fresh reset/连续性丢失，不能复用旧 episode 身份。
 
@@ -553,26 +559,61 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
   - GC 同时受活跃消费者、保留 checkpoint、合法重放任务约束；永久停止的慢消费者不能无限 pin 磁盘。
   - 仅对 durable receipt 后的范围声明可靠；MQTT 接收前/同步前的丢失不能被本地日志补成历史重放。
 
+<a id="k2-followups"></a>
+### 8.4 K2 已知限制、验证缺口与后续优化台账
+
+登记日期：2026-09-16；基线：`d52b15c`（K2/R12 Preview）。依据为 [R12 匹配证据](JETSTREAM.md#r12-validation)，原始产物根目录为 `/workspace/bench-compare/r12-artifacts-20260916/`。本节编号是原 REL/HTTP/MEM/QA 等任务的跟踪子项，不另造平行路线；负责人均待认领，排期在开工时确认。**全部保留未完成状态，本次只登记，不自动开工或放行。**
+
+#### A. 优化项索引（明细单独维护）
+
+性能、资源和时效取舍已迁入项目级 [非阻断问题与优化清单](OPTIMIZATION_BACKLOG.md)，这里只保留关联，不重复维护状态或验收条款：
+
+| 原跟踪号 | 统一条目 |
+|---|---|
+| K2-OPT-01 | [OPT-001：10k 档积压与尾延迟](OPTIMIZATION_BACKLOG.md#opt-001) |
+| K2-OPT-02 | [OPT-002：默认预算下的消息容量](OPTIMIZATION_BACKLOG.md#opt-002) |
+| K2-OPT-03 | [OPT-003：空闲首消息等待](OPTIMIZATION_BACKLOG.md#opt-003) |
+| K2-OPT-04 | [OPT-004：远端控制查询与 ACK 成本](OPTIMIZATION_BACKLOG.md#opt-004) |
+
+该清单也收录其他模块的优化候选。生产验证与未实现功能继续保留在下面 B/C，不能统称为“不影响使用的小问题”。
+
+#### B. 尚未完成的生产验证（不是已确认的代码 BUG）
+
+- [ ] **K2-VAL-01 — TLS 与真实网络（生产门禁；关联 HTTP-05、REL-12、QA-04/10）。** 在明确授权的隔离环境测试正常 TLS、无效证书/鉴权失败、延迟/抖动、断连和慢响应；核对 fail-closed、有限恢复/held、ACK/重放、资源和取消。区分实际网络与应用层 sleep；未跑的环境标 NOT RUN，不从 loopback 推导认证。
+- [ ] **K2-VAL-02 — 目标设备与多管线容量（生产门禁；关联 QA-07/10、MEM、REL-02）。** 测单/多 Job、零/单/双 Count、消息/schema/状态大小和慢下游组合；验证准入、共享进程预算、公平性和过载恢复。发布所测设备/介质/负载的支持上限，不借一次单管线排空结果承诺通用容量。
+- [ ] **K2-VAL-03 — 24 h 无人值守恢复及 72 h 长稳（生产门禁；关联 OPS-04、QA-08）。** 安排独立测试窗口，交替空闲/突发/持续/慢 Sink/断连；记录 RSS、fd、任务、队列、consumer/KV/checkpoint 存储增长和失败计数。24 h 后恢复核对切点/状态/输出，72 h 核对无无界增长、失控重启或静默丢重；短程 640 次重复不替代本项。
+- [ ] **K2-VAL-04 — 存储与故障矩阵补齐（生产门禁；关联 REL-10/12、QA-09/10）。** 优先补 ownership KV 容量满不淘汰他人、broker/checkpoint 盘满、写入/同步失败和损坏/修复流程；对声明的介质另验 OS 崩溃/断电模型。使用 broker 与 CURRENT 双侧 oracle，确认不提前 ACK、不静默 fresh/跳过、不损坏其他 owner；SIGKILL 证据不得等同掉电认证。
+
+#### C. 未实现的按需扩展（不是性能 BUG，也不因补测而自动具备）
+
+- [ ] **K2-EXT-01 — 历史 replay、语义 fork 与迁移工作流（条件；关联 REL-06/07/09、STATE-04）。** 有真实回放/变更需求再立项；先定义合法历史范围、持久 lineage/输出 epoch、依赖/版本、授权审计、重复风险与回退。验收覆盖操作中断/重启与 ID 冲突，未交付前继续明确拒绝，不通过删除 owner/checkpoint 绕过。
+- [ ] **K2-EXT-02 — 独立持久 outbox（条件；关联 HTTP-07、REL-07/08）。** 只有需要下游断网时仍本地持久接纳才启动；容量/同步点、重启续送、checkpoint/输入 ACK/远端确认/GC 的联合切点须一起验收。本轮 broker 保留/重放方案不冒充已实现 outbox。
+- [ ] **K2-EXT-03 — 持久 DLQ 与受控重放（条件；关联 REL-08/13）。** 只有需要隔离毒消息并继续处理后续输入才启动；定义持久点、容量/TTL/满时策略、授权审计和输出身份。DLQ 未持久不能确认来源，重放不能无限循环；现有 fail/held 是已选策略，不是漏做了静默跳过。
+
+**后续处理顺序：** 按独立优化清单先定位 OPT-001 的持续负载瓶颈，其他优化按消息/时效需求推进；在相应环境补 K2-VAL-01/02，生产放行前补齐所声明范围的 K2-VAL-03/04。K2-EXT 项由需求触发，不为勾完 K2 强行同时建设多套持久化。以上不要求所有项目清零后才能开发 K3，但未完成的生产门禁不能因切换开发阶段而消失；新发现的正确性/数据安全问题优先修复，不能按普通性能优化无限延期。
+
 <a id="dag"></a>
 ## 9. V1.3：分阶段真实 DAG
+
+**K3 本批完成（2026-09-16，尚未提交）：** DAG-01～07 的运行/控制面/Connector/故障闭环已实现并自查，限定能力矩阵通过 `package-v14-*` 匹配复验，详见 [DAG.md](DAG.md#k3-validation)。下方勾选表示这些声明组合的开发验收完成，不表示任意图、所有 codec 或生产认证。aligned 仅开放 required File→HTTP 的零状态/Count 图；time/side-output/有损/JetStream 图 aligned 明确拒绝。K2 的生产验证/优化剩余项继续保留，DAG-08/K5 不在本批。
 
 优先级：核心批 **K3**，按单源分支、多源合流、多输入恢复依次交付；不等工作台，也不强制依赖已选可靠 broker。共同前置：图级预算/owner、稳定 edge/input 身份；恢复还依赖 STATE 和所选可重放来源/输出合同。DAG-08 Designer 单独后置为 K5。负责人：待认领。
 
 ### 9.1 V1.3a：单源分支与多输出
 
-- [ ] **DAG-01 — Branch。** 一次输入广播所有分支；有限 pending-branches bitmap/continuation；不持全局锁无限等待，不默认为分支复制 payload。required 慢支路反压相关上游，取消可终止。
-- [ ] **DAG-02 — Route/Switch。** first-match/all-match 与默认分支显式；输出膨胀受限，条件错误定位原节点。未定义路由不得随机挑边。
-- [ ] **DAG-05 — 多 Sink 与分支保证。** required/best-effort 是完整支路合同；loss/replay/time 属性沿边传播。首版可禁止有损支路重新汇入 required 链，不允许汇流后“恢复无损”。外部 A 成功、B 失败不承诺回滚 A。
-- [ ] **DAG-06 — 有限 Side Output。** decode error、late、rule reject 各有显式 schema、预算、满时处置和可观测值；control 不作为普通可丢消息。
+- [x] **DAG-01 — Branch。** 共享 payload 广播；有限 continuation；required 背压相关上游；广播中取消和额度释放已测，不持全局锁等待。
+- [x] **DAG-02 — Route/Switch。** 显式 first-match/all-match/default；有界 masks/scratch/builder；路由条件错误归因原节点；不随机挑边。
+- [x] **DAG-05 — 多 Sink 与分支保证。** 显式有损子树不准重新合流/接 required；数据满时丢弃并计数，控制满时取消该可选子树及嵌套子支路，不静默丢控制继续健康或遗留 stalled leaf；A 已成功/B 失败不回滚 A。
+- [x] **DAG-06 — 有限 Side Output（已声明来源/节点）。** File decode-error、ET late、Filter rule-reject 具有独立 schema、预算和显式 backpressure/drop 策略；MQTT/HTTP decode side port 尚不开放，side-output aligned 明确拒绝。
 
 ### 9.2 V1.3b：多源与时间进度
 
-- [ ] **DAG-03 — UnionAll。** 检查兼容 schema，保留来源和每源顺序；不承诺跨源全局排序。调度公平、慢源、空源和关闭可解释。
-- [ ] **DAG-04 — 多 Source。** 每个物理输入维护 position、watermark、idle、EOF、失败和 Barrier 进度；全部 idle 不等于 MAX watermark，永久 EOF 的退出有协议依据。
+- [x] **DAG-03 — UnionAll。** 结构 schema/time 校验、来源 metadata、每物理输入顺序与轮转调度；不保证跨输入全局排序，同源经不同支路合流也不恢复原总序。
+- [x] **DAG-04 — 多 Source。** 独立 Connector actor/位置切点、每物理边 watermark/idle/EOF/barrier 进度与每端口诊断；Source 时间在 Filter 前生成，窗口不自行抢跑快源；全部 idle 不推进 MAX，append-only EOF/异常 channel close 不冒充永久结束；显式 EOF 后仍参与 checkpoint，PT 等定时输出完成再结束。
 
 ### 9.3 V1.3c 与按能力演进的 Designer
 
-- [ ] **DAG-07 — 多输入 aligned checkpoint。** 对齐所有 required 输入/分支/状态/Sink；控制不能越过未完成广播或切点前数据。用 Replayable File 即可先验收，不指定 JetStream 为唯一前置。恢复缺输入/依赖时拒绝。
+- [x] **DAG-07 — 多输入 aligned checkpoint（v5 File/Count 矩阵）。** 对齐 required 输入/分支/Count 状态/HTTP Sink，暂停快输入切点后数据，超时解除阻塞；全部 source cursor 和完整图严格校验。真实零/双状态进程恢复、提交失败与部分外部输出失败通过。v5 不混写 v3/v4；其他状态/time/side/lossy/JetStream 图继续拒绝。
 - [ ] **DAG-08 — Graph Designer（K5 后置）。** typed ports、节点/边限制、预算、Explain、diff 与错误位置；保存未优化 GraphSpec，展示实际计划。不是 K3 内核交付前置；页面只暴露已通过 a/b/c 验收的形状，不要求任意图逆转为一条 SQL。
 
 **每个子阶段单独放行**：禁止数据环；测试慢/失败分支、广播中取消、队列满、重复/旧 Barrier、idle/EOF、部分输出成功及恢复。未认证图显式拒绝 aligned，不静默降级。
@@ -883,7 +924,7 @@ commit / build / raw evidence：
 下一动作 / 阻塞条件：
 ```
 
-**当前执行队列（2026-09-15）：** K1/R11 通过独立自查、恢复/回滚/资源反例和原高频性能门槛；最终证据为 `r11-artifacts-20260915/package-v8` 及匹配验证，详见 [R11 记录](PRODUCTION.md#r11-validation)。下一整批为 **K2 可靠输入/输出**，用户已批准 NATS JetStream 路线；先做 SDK/服务配置 conformance，随后完成来源身份、ACK/去重/独占、输出身份/确认、poison 与恢复故障闭环。独立磁盘 outbox 仍按部署需求选择，不因选择 broker 就声称本地断网续送。随后 K3 DAG → K4 IoT，K5 平台后置；OBS-03、完整 AGE-01、OPS-04 和 QA-08 仍未关闭，不自动 push/tag/发行。
+**当前执行队列（2026-09-17）：** K1/R11 与 K2/R12 的选定 Preview 已提交；K3 DAG-01～07 和 K4 首批 IoT 已完成限定矩阵，K4 后的全局 Review 修复与跨阶段回归已通过，见 [IOT.md](IOT.md#k4-validation)。等待用户 review/提交决定，不另开 R13，不自动转入 K5 平台。独立 outbox/DLQ 仍按需求选择，K2 生产门禁与 OBS-03、完整 AGE-01、OPS-04、QA-08 未因此关闭；不自动 commit/push/tag/发行。
 
 ### 16.4 后续维护步骤
 
@@ -919,7 +960,7 @@ commit / build / raw evidence：
 ```
 
 - **阶段 0～3 仍是现有受限范围的发行主线；新增核心不被说成已完成，也不要求全部做完才能发行现有范围。** RC 必须基于干净、可定位的提交；新核心实现可与旧候选验收隔离推进，但性能/长稳证据不得跨源码拼接。
-- **下一开发模块确定为 K1，随后默认 K2 → K3 → K4，平台 K5 后置。** 可靠路线的部署决定尚未具备时，只推前置已满足的其他核心切片，不擅自新增 broker。DAG a/b 不必等待可靠 broker，IoT 值过滤不必等待完整 DAG；调整顺序须登记原因，不虚构技术依赖。
+- **默认核心顺序为 K1 → K2 → K3 → K4，平台 K5 后置。** K1/K2 的选定 Preview 已提交，K3/K4 已完成限定矩阵且待用户 review/提交；后续批次另行确认。可靠路线的部署决定尚未具备时，只推前置已满足的其他核心切片，不擅自新增 broker。DAG a/b 不必等待可靠 broker，IoT 值过滤不必等待完整 DAG；调整顺序须登记原因，不虚构技术依赖。
 - MEM、SEM、CFG、QA、Connector/格式任务随所用路径进入各阶段，不单独排成“先全量重写，再交付功能”。已知影响本次支持范围的正确性缺陷必须关闭，不能用缩减文案掩盖仍启用路径中的缺陷。
 - P0/Arrow/JIT 是有投入上限的证据线，不是主线必经站。可另行安排实验；收益不成立就停止，不能为了技术选型推迟已满足门槛的产品发行。
 
@@ -1066,7 +1107,7 @@ commit / build / raw evidence：
 | 05.4：共享参与者 | STATE-01～05、REL-14、OPS-04 | 2 的现有调度；K1 优先线性恢复，K3c 再扩多输入 | E-BASE 不覆盖零/多状态；E-FEATURE 待 |
 | 06：工作台、运维、嵌入、模板 | UI-01～06、OPS-01～03、EMB-01、SQL-01、CLI-01、IOT-01～03、TPL-01/02 | K4 的原 4b 业务；K5 的原 4a/5 平台；必要 API/CLI 随核心交付 | E-FEATURE 待；至少两个精确场景、权限/诊断同交付 |
 | 07：可靠来源与本地备选 | REL-00～15、STATE-01～05 | K1 先恢复；K2 的原阶段 6 可靠路线，部署选择仍需确认 | E-FEATURE/E-FAIL 待；ACK/切点/去重/身份/毒消息一起闭合 |
-| 08：真实 DAG | DAG-01～08 | K3：7a→7b→7c 内核；DAG-08 Designer 后置 K5 | E-MODEL/E-FEATURE/E-FAIL 待 |
+| 08：真实 DAG | DAG-01～08 | K3：7a→7b→7c 内核；DAG-08 Designer 后置 K5 | DAG-01～07 的限定模型/功能/进程故障证据见 [K3](DAG.md#k3-validation)；Designer、任意 state codec 与生产长稳不在此完成范围 |
 | 09：IoT 与表 | IOT-01～09、TAB-01～03、MEM-02、STATE-04、REL-07 | 首批 K4 / 原 4b；高级 8a 按需求 | E-FEATURE 待；状态/时间、reset/连续性、输出身份 |
 | 10：有界分析 | ANA-01～07 | 8b，条件启动 | E-MODEL/E-FEATURE 待；膨胀、清理、时间与恢复 |
 | 11：WASM/SDK/IPC | EXT-01～06 | 8b，条件启动 | E-HIST 仅 spike；G5 和生产隔离/版本/资源待 |
