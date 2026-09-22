@@ -12,6 +12,8 @@ pub mod clock;
 pub mod coordinator;
 pub mod dedup;
 pub mod iot;
+mod timed_iot;
+pub mod processing_cut;
 pub mod kernel;
 pub mod linear;
 pub mod lookup;
@@ -24,7 +26,7 @@ pub mod transform;
 pub mod watermark;
 pub mod window;
 pub mod pipeline_checkpoint;
-pub use pipeline_checkpoint::PipelineSnapshot;
+pub use pipeline_checkpoint::{snapshot_version_for, PipelineSnapshot};
 pub use iot::{IotFreeze, IotOperator};
 #[cfg(test)]
 mod k1_tests;
@@ -32,6 +34,18 @@ mod k1_tests;
 mod k3_tests;
 #[cfg(test)]
 mod k4_tests;
+#[cfg(test)]
+mod core_a_tests;
+#[cfg(test)]
+mod core_b_tests;
+#[cfg(test)]
+mod core_b2_tests;
+#[cfg(test)]
+mod reference_completion_tests;
+#[cfg(test)]
+mod hysteresis_completion_tests;
+#[cfg(test)]
+mod paused_time_tests;
 
 pub use aligned::{run_until, AlignedSession};
 pub use barrier::{

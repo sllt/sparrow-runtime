@@ -784,7 +784,10 @@ func scenario(root, binary, oldBinary, kind string) {
 		copyTree(input, legacyInput)
 		legacySetupPort := freePort()
 		legacySetupAPI := api{base: fmt.Sprintf("http://127.0.0.1:%d", legacySetupPort), client: http.Client{Timeout: 15 * time.Second}}
-		setupCommand, setupLog := launch(binary, legacyRoot, legacySetupPort, filepath.Join(root, "legacy-setup-server.log"))
+		// Build the reader catalog with the old binary itself.  The new binary
+		// may have a newer catalog schema, which would make the old process fail
+		// at catalog open instead of reaching the intended v6 checkpoint guard.
+		setupCommand, setupLog := launch(oldBinary, legacyRoot, legacySetupPort, filepath.Join(root, "legacy-setup-server.log"))
 		waitHealth(legacySetupAPI, "legacy catalog setup server health")
 		legacySetupAPI.ok("PUT", "/v1/allowlist", map[string]any{"host": "127.0.0.1", "port": first.port()})
 		legacySetupAPI.ok("PUT", "/v1/streams/telemetry", map[string]any{"fields": []any{
@@ -797,6 +800,7 @@ func scenario(root, binary, oldBinary, kind string) {
 		stopProcess(setupCommand, setupLog, syscall.SIGTERM)
 		beforeOldTree := checkpointTreeHash(legacyCheckpoint)
 		beforeOldCurrent := hash(filepath.Join(legacyCheckpoint, "CURRENT"))
+		beforeOldOutputs := len(first.snapshot())
 		oldPort := freePort()
 		oldAPI := api{base: fmt.Sprintf("http://127.0.0.1:%d", oldPort), client: http.Client{Timeout: 500 * time.Millisecond}}
 		oldCommand, oldLog := launch(oldBinary, legacyRoot, oldPort, filepath.Join(root, "old-server.log"))
@@ -838,6 +842,7 @@ func scenario(root, binary, oldBinary, kind string) {
 			"old binary did not reach the v6 checkpoint profile guard")
 		require(checkpointTreeHash(legacyCheckpoint) == beforeOldTree, "old binary changed v6 checkpoint history")
 		require(hash(filepath.Join(legacyCheckpoint, "CURRENT")) == beforeOldCurrent, "old binary changed v6 CURRENT")
+		require(len(first.snapshot()) == beforeOldOutputs, "old binary emitted output before v6 profile rejection")
 		oldEvidence = map[string]any{
 			"checked":           true,
 			"healthy":           healthy,
@@ -848,6 +853,7 @@ func scenario(root, binary, oldBinary, kind string) {
 			"error_response":    guardError,
 			"history_preserved": true,
 			"current_preserved": true,
+			"output_preserved":  true,
 		}
 		save(filepath.Join(root, "old-v6-evidence.json"), oldEvidence)
 	}

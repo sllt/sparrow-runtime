@@ -212,6 +212,10 @@ impl PhysicalPlan {
         self.stages.iter().any(|stage| matches!(stage, PhysicalStage::Iot { .. }))
     }
 
+    pub fn has_timed_iot(&self) -> bool {
+        self.stages.iter().any(|s| matches!(s, PhysicalStage::Iot { spec, .. } if spec.timing.is_some()))
+    }
+
     /// Honesty label for the plan under `recovery`.
     ///
     /// Does not cite a milestone contract (V0.3 etc.). Windowed

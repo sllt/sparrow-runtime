@@ -1,5 +1,7 @@
 # K3：真实 DAG 执行与恢复
 
+**2026-09-17 核心完善增量：** required File→HTTP 图已接入固定 revision/SHA/CRC 的静态参考表，独立 profile11 支持最多16个 Count/IoT(TTL0)状态。真实进程覆盖 Lookup 分支、双来源 Lookup→Union，以及 Lookup→Count→Hysteresis→双 required HTTP 的 pending Count/latch 同切点恢复，见 [本轮证据](PRODUCTION.md#k1-k4-reference-validation)。无引用迟滞图使用独立 profile12；该声明仍是有限 Preview，不开放时间型状态、side/lossy、JetStream DAG 或确定性全局合流。
+
 **K4 扩展（开发候选）：** 图内新增变化检测/Deadband，含 IoT 状态的 File→required HTTP checkpoint 使用独立 **v6**，不是下文历史 K3 验收的 v5；限制和新证据见 [IOT.md](IOT.md)。内嵌 aligned 图必须使用有序 events 输入，不能以有限 rows/raw row 通道代替可接收 barrier 的 Source；逻辑 EOF 不等于 checkpoint ACK，已关闭输入不得满足 Union 对齐。
 
 状态：2026-09-16，K3 的 DAG-01～07 核心功能已完成实现、自查及下方限定矩阵复验；**仍是 Preview，不是全场景生产认证或发版声明**。Graph Designer 属于 K5，不在本批。既有 SQL/线性 File 与默认关闭的 JetStream 路径保留；本批不扩展 SQL 为通用 UNION/DAG 语法。
@@ -16,7 +18,7 @@
 | Side output | File decode error、ET late、Filter rule reject；独立 schema、有限队列与明确的满队列策略 |
 | aligned | 独立 v5 profile：1～16 个 File 输入、1～16 个 required HTTP 输出、零状态或最多 16 个 Count 状态参与者；还受实际 Job 总预算限制 |
 
-aligned 不接受 ET/PT、Lookup、Dedup、有损分支、side output、Source time 或 JetStream 图组合。它们不是静默降级为 `restart_fresh`；validate/start 明确拒绝。逐类型扩展 time/side-output snapshot 是后续能力扩展，不用没有测试的 codec 宣称“任意 DAG 可恢复”。
+上述 legacy v5 aligned 不接受 ET/PT、Lookup、Dedup、有损分支、side output、Source time 或 JetStream 图组合。它们不是静默降级为 `restart_fresh`；validate/start 明确拒绝。逐类型扩展 time/side-output snapshot 是后续能力扩展，不用没有测试的 codec 宣称“任意 DAG 可恢复”。
 
 ## 编写图和绑定 I/O
 

@@ -1,0 +1,3 @@
+# Explicit broker fixtures. They must be ignored by ordinary cargo and run
+# with --include-ignored by production-core-a-validate.sh on the pinned broker.
+sparrow_control|core_a_tests::core_a_jetstream_count_change_v7_checkpoint_restore_and_http_ack_cut

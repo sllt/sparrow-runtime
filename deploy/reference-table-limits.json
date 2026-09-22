@@ -1,0 +1,11 @@
+{
+  "expected_revision": 0,
+  "table": {
+    "fields": [
+      {"name": "device_id", "type": "utf8", "nullable": false},
+      {"name": "threshold", "type": "int64", "nullable": false}
+    ],
+    "keys": ["device_id"],
+    "rows": [["a", 10], ["b", 20]]
+  }
+}

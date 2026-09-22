@@ -15,7 +15,8 @@ pid=
 cleanup() { if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi; }
 trap cleanup EXIT
 start_server() {
-    "$server" --bind "127.0.0.1:$port" --catalog "$run/catalog.db" --safe-mode --max-jobs 1 >> "$run/server.log" 2>&1 & pid=$!
+    local catalog_path=${catalog_path:-"$run/catalog.db"}
+    "$server" --bind "127.0.0.1:$port" --catalog "$catalog_path" --safe-mode --max-jobs 1 >> "$run/server.log" 2>&1 & pid=$!
     for _ in $(seq 1 100); do
         if "$ctl" health > "$run/health.json" 2>/dev/null; then return; fi
         kill -0 "$pid"; sleep .05
@@ -32,6 +33,7 @@ checkpoint() {
 }
 for shape in zero two-count; do
     run="$root/$shape"; mkdir "$run"
+    catalog_path="$run/catalog.db"
     start_server
     printf '%s\n' '{"fields":[{"name":"device_id","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false}]}' > "$run/stream.json"
     "$ctl" put-stream sensors "$run/stream.json" > "$run/put-stream.json"
@@ -98,6 +100,7 @@ if [[ -n "$baseline" ]]; then
         run="$root/$direction"; mkdir "$run"
         server="$baseline"; reader="$package/bin/sparrow-server"
         if [[ "$direction" == new-to-old ]]; then server="$package/bin/sparrow-server"; reader="$baseline"; fi
+        catalog_path="$run/catalog.db"
         start_server
         printf '%s\n' '{"fields":[{"name":"device_id","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false}]}' > "$run/stream.json"
         "$ctl" put-stream sensors "$run/stream.json" > "$run/put-stream.json"
@@ -111,7 +114,20 @@ if [[ -n "$baseline" ]]; then
         checkpoint
         kill -TERM "$pid"; wait "$pid"; pid=
         sha256sum "$run/checkpoint/CURRENT" > "$run/current-before.sha256"
-        server="$reader"; start_server
+        server="$reader"
+        if [[ "$direction" == new-to-old ]]; then
+            # Do not hand the old reader the new binary's v3 catalog.  Let the
+            # old binary create its own v2 catalog with the same stream and
+            # pipeline spec, then point that reader at the new checkpoint.
+            catalog_path="$run/reader-catalog.db"
+            start_server
+            "$ctl" put-stream sensors "$run/stream.json" > "$run/reader-put-stream.json"
+            "$ctl" put-pipeline check "$run/spec.json" > "$run/reader-put.json"
+            "$ctl" start check > "$run/reader-start.json"
+        else
+            catalog_path="$run/catalog.db"
+            start_server
+        fi
         pattern='legacy single-window'; if [[ "$direction" == new-to-old ]]; then pattern='snapshot version 3'; fi
         wait_status ".actual.status==\"failed\" and (.actual.last_error|test(\"$pattern\"))"
         cp "$run/status.json" "$run/incompatible-status.json"
@@ -137,7 +153,7 @@ fi
 prototype_rollback=NOT_RUN
 if [[ -n "$pre_r11" ]]; then
     test -x "$pre_r11"
-    run="$root/k1-upgrade-rollback"; mkdir "$run"; server="$pre_r11"; start_server
+    run="$root/k1-upgrade-rollback"; mkdir "$run"; server="$pre_r11"; catalog_path="$run/catalog.db"; start_server
     printf '%s\n' '{"fields":[{"name":"device_id","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false}]}' > "$run/stream.json"
     "$ctl" put-stream sensors "$run/stream.json" > "$run/put-stream.json"
     printf '%s\n' '{"device_id":"d1","v":1}' '{"device_id":"d1","v":2}' > "$run/events.jsonl"
@@ -147,6 +163,19 @@ if [[ -n "$pre_r11" ]]; then
     wait_status '.actual.status=="running" and .observation.runtime_progress.ingested_rows==2'
     checkpoint; status; old_id=$(jq -r .checkpoint.last_success_id "$run/status.json")
     kill -TERM "$pid"; wait "$pid"; pid=
+    # Preserve the stopped old writer's v2 catalog as the rollback input.
+    # The upgrade intentionally uses the original path and may migrate it to
+    # v3; rollback must never point the old binary at that migrated catalog.
+    cp "$run/catalog.db" "$run/catalog-v2-backup.db"
+    chmod 600 "$run/catalog-v2-backup.db"
+    for suffix in -wal -shm; do
+        if [[ -e "$run/catalog.db$suffix" ]]; then
+            cp "$run/catalog.db$suffix" "$run/catalog-v2-backup.db$suffix"
+            chmod 600 "$run/catalog-v2-backup.db$suffix"
+        fi
+    done
+    sha256sum "$run/catalog-v2-backup.db" > "$run/catalog-v2-backup.sha256"
+    catalog_path="$run/catalog.db"
     server="$package/bin/sparrow-server"; start_server
     wait_status ".actual.status==\"running\" and .checkpoint.restored_from_checkpoint==$old_id"
     printf '%s\n' '{"device_id":"d1","v":3}' >> "$run/events.jsonl"
@@ -155,7 +184,7 @@ if [[ -n "$pre_r11" ]]; then
     kill -TERM "$pid"; wait "$pid"; pid=
     test -f "$run/checkpoint/chk-$(printf '%08d' "$old_id")/PUBLISHED"
     sha256sum "$run/checkpoint/CURRENT" > "$run/current-new.sha256"
-    server="$pre_r11"; start_server
+    server="$pre_r11"; catalog_path="$run/catalog-v2-backup.db"; start_server
     wait_status '.actual.status=="failed" and (.actual.last_error|contains("pipeline semantics changed"))'
     sha256sum -c "$run/current-new.sha256" >/dev/null
     sed -n 's/^sparrow-log //p' "$run/server.log" | jq -se 'length==1 and .[0].s==6' >/dev/null

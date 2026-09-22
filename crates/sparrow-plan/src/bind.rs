@@ -58,10 +58,10 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
 
     for id in order {
         let node = by_id[&id];
-        if node.iot.is_some() && !matches!(node.kind.as_str(), "change_detect" | "deadband") {
+        if node.iot.is_some() && !matches!(node.kind.as_str(), "change_detect" | "deadband" | "hysteresis" | "hold_for" | "debounce") {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
-                format!("node {}: iot configuration is only valid for change_detect/deadband", node.id),
+                format!("node {}: iot configuration is only valid for change_detect/deadband/hysteresis", node.id),
             ));
         }
         let kind = match node.kind.as_str() {
@@ -235,7 +235,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     output,
                 }
             }
-            "change_detect" | "deadband" => {
+            "change_detect" | "deadband" | "hysteresis" | "hold_for" | "debounce" => {
                 let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
                     SparrowError::new(
                         ErrorCode::InvalidArgument,
@@ -249,6 +249,20 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     )
                 })?;
                 match node.kind.as_str() {
+                    "hold_for" | "debounce" if spec.timing.as_ref().map(|t| t.kind_name()) != Some(node.kind.as_str()) => {
+                        return Err(SparrowError::new(ErrorCode::InvalidArgument, "timed node kind/config mismatch"));
+                    }
+                    "change_detect" | "deadband" | "hysteresis" if spec.timing.is_some() => {
+                        return Err(SparrowError::new(ErrorCode::InvalidArgument, "legacy IoT cannot contain timing configuration"));
+                    }
+                    "hysteresis" if spec.hysteresis.is_none() || spec.deadband.is_some() => {
+                        return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                            format!("hysteresis {id} requires only hysteresis configuration")));
+                    }
+                    "change_detect" | "deadband" if spec.hysteresis.is_some() => {
+                        return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                            format!("{} {id} must not contain hysteresis configuration", node.kind)));
+                    }
                     "change_detect" if spec.deadband.is_some() => {
                         return Err(SparrowError::new(
                             ErrorCode::InvalidArgument,

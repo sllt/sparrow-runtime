@@ -8,7 +8,7 @@ use sparrow_model::{ErrorCode, MemoryOwner, OutputSequence, Schema};
 use sparrow_plan::CheckpointPlan;
 use std::path::Path;
 
-fn random<const N: usize>() -> Result<[u8; N]> {
+pub(super) fn random<const N: usize>() -> Result<[u8; N]> {
     use ring::rand::SecureRandom;
     let mut value = [0; N];
     ring::rand::SystemRandom::new()
@@ -31,7 +31,7 @@ fn random<const N: usize>() -> Result<[u8; N]> {
 /// Stable local owner, tied to the canonical checkpoint directory. Creation is
 /// private and durable before any network reader. A partial creation fails
 /// closed rather than regenerating an identity around existing broker state.
-fn binding_owner(dir: &Path) -> Result<[u8; 32]> {
+pub(super) fn binding_owner(dir: &Path) -> Result<[u8; 32]> {
     use std::io::{Read, Write};
     let fail = |_: std::io::Error| {
         SparrowError::new(
@@ -103,12 +103,6 @@ impl Supervisor {
         target_policy: &sparrow_connectors::TargetPolicy,
     ) -> Result<RunningJob> {
         validate_aligned_plan(spec, &plan)?;
-        if plan.has_iot() {
-            return Err(SparrowError::new(
-                ErrorCode::FeatureUnavailable,
-                "JetStream + IoT state operators are not in the K4 aligned profile; use restart_fresh or File/replay",
-            ));
-        }
         let config = spec
             .source
             .jetstream
@@ -122,17 +116,51 @@ impl Supervisor {
             .checkpoint_dir
             .clone()
             .expect("validated checkpoint directory");
-        let manifest = Arc::new(CheckpointPlan::from_physical(&plan)?);
+        // JetStream bootstrap and reference-table materialization must share
+        // one SourceAdmission/MemoryOwner.  Do not let the reference loader
+        // acquire a second slot for the same attempt.
+        let (admission, prepared_references) = if spec.reference_tables.is_empty() {
+            (self.kernel.prepare_source_admission(plan.pipeline)?, None)
+        } else {
+            let admission = self.kernel.prepare_source_admission(plan.pipeline)?;
+            let (admission, prepared) = self
+                .prepare_reference_tables_with_admission(spec, admission)
+                .await?;
+            (admission, Some(prepared))
+        };
+        let manifest = Arc::new(if let Some(prepared) = &prepared_references {
+            crate::validate::checkpoint_plan_with_references(
+                spec,
+                &plan,
+                &prepared.dependencies,
+            )?
+        } else {
+            CheckpointPlan::from_physical(&plan)?
+        });
         let layout = manifest.clone();
         let retention = policy.retention();
         let max_keys = self.kernel.job_budget().max_state_keys;
-        // Reserve capacity before filesystem/network bootstrap. A waiting
-        // ninth source must not steal the unused quotas of eight live jobs.
-        let admission = self.kernel.prepare_source_admission(plan.pipeline)?;
+        let reliable_iot = plan.has_iot();
+        let hysteresis_profile = manifest.has_hysteresis();
         let owner = admission.owner();
+        let reference_profile = prepared_references.is_some();
         let (store,snapshot,generation,output,binding)=self.store.run_blocking(move || {
             sparrow_connectors::check_data_path(Path::new(&dir))?;
-            let store=CheckpointStore::open_reliable_exclusive(&dir,max_keys,retention)?;
+            let store=if reference_profile {
+                CheckpointStore::open_for_plan_exclusive(
+                    &dir,
+                    max_keys,
+                    retention,
+                    layout.as_ref(),
+                    "jetstream-v1",
+                )?
+            } else if hysteresis_profile {
+                CheckpointStore::open_reliable_hysteresis_exclusive(&dir,max_keys,retention)?
+            } else if reliable_iot {
+                CheckpointStore::open_reliable_iot_exclusive(&dir,max_keys,retention)?
+            } else {
+                CheckpointStore::open_reliable_exclusive(&dir,max_keys,retention)?
+            };
             let inventory=store.inventory()?;
             let restore=inventory.current.is_some() || inventory.current_error.is_some();
             if !restore && !inventory.generations.is_empty() {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream checkpoint history exists without CURRENT"));}
@@ -186,24 +214,26 @@ impl Supervisor {
         let diag = IoDiagnostics::new();
         diag.observe_source(&tx);
         diag.observe_sink(&tx_out);
-        let submitted = self.kernel.submit(
-            JobRequest::new(plan, vec![], SharedCapture::disabled())
-                .with_source_admission(admission)
-                .with_live_events(rx)
-                .with_live_out(tx_out)
-                .with_observation(diag.observation.clone())
-                .with_aligned(AlignedJob {
-                    restore: None,
-                    pipeline: Some(PipelineRestore {
-                        plan: manifest.clone(),
-                        generation,
-                        restore,
-                        iot: restore_iot,
-                    }),
-                    acks: acks.clone(),
-                    outbox: outbox.clone(),
+        let mut request = JobRequest::new(plan, vec![], SharedCapture::disabled())
+            .with_source_admission(admission)
+            .with_live_events(rx)
+            .with_live_out(tx_out)
+            .with_observation(diag.observation.clone())
+            .with_aligned(AlignedJob {
+                restore: None,
+                pipeline: Some(PipelineRestore {
+                    plan: manifest.clone(),
+                    generation,
+                    restore,
+                    iot: restore_iot,
                 }),
-        );
+                acks: acks.clone(),
+                outbox: outbox.clone(),
+            });
+        if let Some(prepared) = prepared_references {
+            request = request.with_tables(prepared.tables);
+        }
+        let submitted = self.kernel.submit(request);
         let job = match submitted {
             Ok(job) => job,
             Err(e) => {

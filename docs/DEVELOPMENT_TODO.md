@@ -1,6 +1,10 @@
 # Sparrow Post-V1 完整开发 TODO
 
-更新日期：2026-09-17。
+**先看开发顺序：[简版开发顺序 TODO](DEVELOPMENT_ORDER.md)。** 该文件维护当前执行先后与每批效果；本文件保留详细任务、设计对应和历史证据。
+
+更新日期：2026-09-19。
+
+**当前进展：单个线性 HoldFor / Debounce 的可恢复时间首批已完成验收。** 服务器 `box@100.64.0.18`：747/44、22×20、6+3 进程场景、旧矩阵及三组 ABBA 均通过，[证据与边界](PRODUCTION.md#paused-time-validation)。PT/正 TTL、多状态组合、时间型 DAG 和完整 IoT 生命周期仍未完成；新 v14/v15 是逐决策串行持久化 profile，其容量成本见 OPT-012，不能代替旧高吞吐路径。以 [开发顺序第 1 批](DEVELOPMENT_ORDER.md) 为准，不将子项通过写成 K1～K4 全部完成。
 
 设计依据：根目录 `Sparrow_Post_V1_Roadmap_Arrow_JIT_Final.md`，包含 2026-09-12 实施补充；同时追踪原始蓝图、计划评审与历史 ADR，文档范围、取舍及章节对应见 [§18 覆盖矩阵](#design-coverage)。运行合同与已验证证据以 [RUNTIME.md](RUNTIME.md) 为准，并核对其对应源码/构建。本文件负责把设计转成执行任务，不替代设计文档，也不把设计接口当成已存在的 API。
 
@@ -16,7 +20,41 @@ R12 收尾（2026-09-16）已完成本批实现、自查及匹配复验，提交
 
 ## 导航
 
-**当前执行更新（2026-09-17，替代上方历史排期）：K4 首批已完成实现、全局 Review 修复和限定矩阵复验。** 变化检测、Deadband、状态/key/timer/bytes 预算、v6 恢复、配置/诊断及两个实际运行模板已闭环；630 核心、36 no-demo、50×20 K4、24×20 K3、32 项 K2、真实进程故障和三组 File ABBA 均通过，见 [K4 验收](IOT.md#k4-validation)。不另开 R13 批次，不自动转入 K5；K3/K4 工作尚未 commit/push/tag，原始评审文档保留。生产长稳/目标网络门禁与高级 IoT 仍未关闭。
+**当前执行更新（2026-09-17，替代上方历史排期）：用户授权补齐 K1～K4 剩余核心，前端 K5 后置，不另开 R13 报告。** K3/K4 首批已随 `1dd17c8` 提交，未 push/tag。上一未提交候选又完成 JetStream＋IoT TTL0、静态参考表管理和 File 无状态 Lookup checkpoint，700/44、专项和三组 ABBA 合并通过；其历史产物仍保留 A/B1/B2-A 名称，失败样本不删除。当前新增代码不能继承这些测试结果；剩余时间状态、其他组合、高级 IoT 及生产验证均按下表单独验收。
+
+### K1～K4 核心完善阶段（2026-09-17 用户确认）
+
+统一采用 K0～K5 大阶段与原 STATE/REL/DAG/IOT/TAB 任务号。此前 A/B/C 是临时工作批次，**不是新的正式阶段**；只在历史构建、源码清单、测试名称及证据链接中保留，不能把首批或某个恢复组合完成写成整个 K1～K4 完成。
+
+| 大阶段 | 已有受测能力 | 本阶段剩余核心工作 |
+|---|---|---|
+| K1 / STATE / TAB | File 零/单/双 Count、受限 ET、IoT TTL0；静态 Lookup v8/v9；不可变表发布/固定绑定/pin/GC；单个 HoldFor/Debounce 的暂停时间 v14 | PT Window/正 TTL、多状态时间恢复；对应 codec/依赖/预算/迁移拒绝矩阵 |
+| K2 / REL | JetStream 受限零/Count/IoT TTL0、静态表 v10/迟滞 v13、稳定输出身份、HTTP确认→checkpoint→ACK；单个 HoldFor/Debounce v15 | 其他时间状态组合；重连/容量/异常处置与发行缺口。独立 outbox/DLQ 仍是需求触发项，不假装已实现 |
+| K3 / DAG | Branch/Route/UnionAll、多来源/required HTTP、受限 File Count/IoT；静态表 v11 的分支/合流/混合状态恢复 | 时间状态和 Source 时间进度恢复；确定性 timer/合流合同及慢/失败支路、预算与控制进展回归 |
+| K4 / IOT | ChangeDetect、Deadband、Hysteresis、TTL0 恢复；线性 processing-time HoldFor/Debounce 与模板 | event-time/多状态/图组合；冷却/通知限频、静默/离线检测、告警生命周期及采样/重采样；对应 schema、身份、恢复与业务模板 |
+| K0 / QA / PUB | 短程/故障/性能证据、冻结二进制与独立清单 | 匹配源码的全局Review、真实网络/目标容量/24～72h/存储失败模型、CI和发行证据；未跑保持NOT RUN |
+| K5 | 后置 | 运维工作台、Graph Designer及前端不进入本次核心完善 |
+
+**当前实施顺序**：静态表＋状态/可靠输入/required DAG 的组合恢复与 K4 迟滞已完成本轮匹配功能验收；接下来补齐可恢复时间与高级 IoT 状态机。每项必须贯通 API→实际执行→失败/取消→恢复和独立预期，不能只补 helper/trait 或放宽准入。本轮冻结 v7 为726/44、26×20专项及9种进程，完整旧矩阵回归通过；性能和来源单列见 [本轮证据](PRODUCTION.md#k1-k4-reference-validation)，不继承上一候选700/44和ABBA成绩。
+
+2026-09-19 补充：上段数字属于静态表/迟滞历史批次；最新时间型子批为 747/44、22×20、6+3 进程及三组 ABBA。下一步仍补齐第 1 批剩余 PT/正 TTL/多状态时间合同，再推进时间型 DAG，不跳到 K5。
+
+**计时决策（用户已确认）**：高级 IoT 采用停机暂停，恢复后继续剩余时长。该选择必须进入显式配置与兼容语义；有未提交输入重放时，还需证明逻辑时间、timer 与 Source cut 的顺序，不得只保存 `remaining_ttl` 就宣称确定性可靠重放。设备事件时间/watermark模式是另一个明确时间域，不与暂停的 processing-time 偷换。
+
+**新增后端排期（2026-09-17）**：时间恢复/高级 IoT 之后安排 [Action/Sink 与常用函数首批](#actions-functions)，先于容量验收和 K5；更丰富的连接器/复杂函数/插件按需推进。当前下一大批仍是可恢复时间＋HoldFor/Debounce，完整顺序见 [简版 TODO](DEVELOPMENT_ORDER.md)。
+
+阶段验收清单：
+
+- [x] K1：限定静态 Lookup＋Count/IoT(TTL0) 状态/依赖恢复与旧版本拒绝，v8不扩写。
+- [x] K2：真实 JetStream 新组合的稳定 ID、HTTP 未知结果、CURRENT失败与重投递；旧 ACK 丢失场景回归通过。
+- [x] K3：required File DAG 的 Lookup 分支/合流、全来源切点，以及 Count pending＋迟滞 latch 恢复。
+- [x] K4：迟滞双阈值、整数精度、坏值、首值、预算、恢复和真实模板，仍为 TTL0 Preview。
+- [ ] K1/K3/K4：暂停时间、timer/state/source/output 同切点及停机/重放反例。
+- [ ] K4：持续条件、防抖、冷却、静默/离线、告警触发/恢复/episode 和采样模板闭环。
+- [x] 本轮静态表/迟滞候选交叉Review与原支持矩阵功能回归；不替代后续时间协议的全局Review。
+- [ ] 适用生产门禁：真实网络/设备容量、24～72h、介质故障及发行包。
+
+本清单未全部完成时，只报告具体完成项，不再笼统宣布“K1～K4 已全部完成”。Arrow/JIT、插件、Kafka、HA 等独立路线不混入。必要 API/CLI、鉴权、审计、诊断仍随核心操作交付；不自动 commit/push/tag 或启动未确认时段的长稳。
 
 - [维护规则与完成标准](#rules)
 - [当前基线与未完成边界](#baseline)
@@ -83,7 +121,7 @@ R12 收尾（2026-09-16）已完成本批实现、自查及匹配复验，提交
 
 ### 2.1 已知工作区状态
 
-历史验证基线：`3619676b4636dfce4bbd477ea79b028e6a6a4efb`；`4f70407` 为 BASE/OBS/R9 阶段，后续 K1/R11 与 K2/R12 已提交。当前 HEAD 为 **`d52b15c`**，工作区另有本轮尚未提交的 K3 及正式文档；匹配构建与源码指纹见 [K3 验证](DAG.md#k3-validation)。历史补丁/二进制证据继续按原指纹解释，不把旧 HEAD 当成最新实现，也不把工作区测试当作已经发行。未在本轮 commit/push/tag/部署，发行文档和证据的版本化仍属 PUB 收尾。
+历史验证基线：`3619676b4636dfce4bbd477ea79b028e6a6a4efb`；`4f70407` 为 BASE/OBS/R9 阶段，K1/R11、K2/R12 后续提交分别保留独立证据。当前 HEAD 为 **`1dd17c8`**，包含 K3/K4 及正式文档；匹配构建与源码指纹见 [K3 验证](DAG.md#k3-validation) 和 [K4 验证](IOT.md#k4-validation)。工作区包含已验证的核心增强 A/B1/B2-A，不把新补丁混称为已提交构建；各冻结包只覆盖其匹配源码，不自动证明后续代码已测。未 push/tag/部署，发行文档和证据的版本化仍属 PUB 收尾。
 
 | 项目 | 当前状态 | 下一步如何处理 |
 |---|---|---|
@@ -267,7 +305,7 @@ B/C/E 编号只用于追踪旧计划；当前优先级以 K0～K5 为准：**当
 <a id="core-first-batches"></a>
 ### 3.4 核心优先：整批开发、依赖与验收
 
-K0～K5 是执行批次别名，不增加或替换原任务 ID，不预留真实版本号。**每次交付一个完整、可运行且有失败反例的核心增量，不以新增 trait、codec 或几个 helper 作为整批完成。** K1/R11 已提交并通过原高频压力点门槛；K2/R12 的选定 Preview 闭环已提交，但完整 K2 与生产验收未关闭，剩余项见 §8.4；K3 的限定矩阵已实现并复验，见 §9；K4/K5 尚未实现。下方历史工作包描述不替代最新受测支持矩阵。
+K0～K5 是执行批次别名，不增加或替换原任务 ID，不预留真实版本号。**每次交付一个完整、可运行且有失败反例的核心增量，不以新增 trait、codec 或几个 helper 作为整批完成。** K1/R11 已提交并通过原高频压力点门槛；K2/R12 的选定 Preview 闭环已提交，但完整 K2 与生产验收未关闭，剩余项见 §8.4；K3/K4 首批范围已实现并复验，随 `1dd17c8` 提交；K5 前端仍后置。当前按顶部清单继续补齐 K1～K4 核心；历史工作包不替代最新支持矩阵。
 
 #### 3.4.1 大模块顺序与交付效果
 
@@ -487,6 +525,7 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
 - [ ] **OPS-01 — 导入/导出。** 包含配置和依赖版本，不含秘密明文或未经授权机器码；导入先验证 capability/依赖/冲突，不直接覆盖当前运行状态。
 - [ ] **EMB-01 — 宿主 Runtime 接入。** 仅有嵌入需求时推进；显式传入 Handle/执行上下文，区分 borrowed/owned 生命周期，不关闭宿主 runtime，不安装全局信号/日志。文件/SQLite blocking 隔离不重复建设。
 - [ ] **SQL-01 — 场景驱动补充 SQL。** 先 inventory HAVING、CASE、IN/BETWEEN 等实际支持，再按模板补缺项；每项进入 SEM 的类型/NULL/错误/资源测试。函数维护成本成为瓶颈时评审 DF 深接入，不零碎复制通用数据库。
+  - 2026-09-17 用户新增“丰富 Action/函数”的规划要求：常用函数首批和后续函数分类统一见 [§11.4](#actions-functions)，与 SQL/Graph 共用 binder/语义，不另建一套 evaluator。
 
 **V1.1 退出条件**：用户可以通过已有入口部署、解释、停止和诊断；至少两个完整场景可复现；所有未支持恢复组合拒绝；不以完整 IDE/Designer 为门槛。
 
@@ -624,7 +663,11 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
 优先级：按真实场景启动。共同前置：首批 IOT 状态合同、AGE、MEM-02；恢复型节点需 STATE，稳定告警身份需 STATE-04/REL-07。负责人：待认领。
 
 - [ ] **IOT-04 — HoldFor。** 条件开始、缺样本、反转、processing/event-time 选择及停机时间规则；processing-time 按 timer 到点触发，不等下一条消息；event-time 由 watermark 推进。
+  - [x] 单个线性 paused processing-time、File/JetStream 恢复与真实故障验证（v14/v15）；缺样本维持有效条件、false 取消、等 deadline 时 timer-before-input 明确。
+  - [ ] event-time/watermark 和其他状态/图组合；父项不因首批通过而勾选。
 - [ ] **IOT-05 — Debounce。** leading/trailing、最大等待、重复输入是否延长及每 key timer 上限；timer 替换/取消/恢复和连续抖动有确定性测试。
+  - [x] 单个线性 paused processing-time 的上述参数、File/JetStream 恢复、预算和故障测试（v14/v15）。
+  - [ ] 其他时间域和状态/图组合的协议与验证；逐决策提交的容量优化单列 OPT-012。
 - [ ] **IOT-06 — 冷却/通知限频。** 限的是通知而非上游状态观察；冷却期间恢复条件仍生效，等待通知有 bytes/数量/年龄上限。
 - [ ] **IOT-07 — 静默/离线检测。** 设备集合、最近接收、停机宽限与链路健康关联；从未出现且未登记的设备不凭空判离线，来源断连时不把全部设备判故障。
 - [ ] **IOT-08 — 告警生命周期。** Normal/Pending/Active/Recovering、activate/resolve、稳定 episode ID 和重复通知语义；Active/Pending 不默认 TTL 静默淘汰，资源不足时明确 expired/unknown 或失败。
@@ -671,7 +714,29 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
 - [ ] **FMT-01 — JSON bounded codec 与类型提取。** 先 inventory 现有能力，再补深度/字段/单值/总字节限制、Schema 演进、Missing/NULL/错误；热字段直接类型化，避免重复 stringify/parse。
 - [ ] **FMT-02 — Protobuf/CSV（需求驱动）。** 固定 descriptor/schema 版本、字段/行/字节限制、编码错误和兼容策略；实际 fixture 与 round-trip/拒绝测试通过后列 capability。
 - [ ] **FMT-03 — Arrow IPC（可选）。** 用于受限分析/文件/IPC 交换；受预算验证 schema/长度/来源。不用它代替 checkpoint manifest，不把 C Data Interface 指针直接用于跨进程。
-- [ ] **FMT-04 — Parquet/File Sink（可选）。** 不可变文件、临时写入/发布/失败清理协议、磁盘限额、重复输出与恢复；不默认引入完整数据湖体系。
+- [ ] **FMT-04 — File Sink 基础能力与可选 Parquet。** 不可变文件、临时写入/发布/失败清理协议、磁盘限额、重复输出与恢复；不默认引入完整数据湖体系。
+  - 2026-09-17 排期调整：有界 File Sink 基础能力进入下方 Action 首批；Parquet 编码与其他文件格式仍按需，不要求与首批一起交付。
+
+<a id="actions-functions"></a>
+### 11.4 Action/Sink 与函数库扩展（2026-09-17 新增计划）
+
+用户希望参考 eKuiper 丰富规则的输出动作和函数。eKuiper 将规则的 Action 定义为 Sink 实例，一条规则可配置多个动作；计算函数另有独立分类，不能将二者混成一种执行模型。参考其版本化官方文档：[Action/Sink 概念](https://ekuiper.org/docs/en/v2.3/concepts/sinks.html)、[Sink 类型与公共参数](https://ekuiper.org/docs/en/v2.3/guide/sinks/overview.html)、[函数分类](https://ekuiper.org/docs/en/v2.3/sqls/functions/overview.html)。这些仅用于能力对照，不表示 Sparrow 已实现、兼容 eKuiper 配置，或照搬其默认交付保证。
+
+**排期：** 放在时间恢复/高级 IoT 闭环之后、容量验收与 K5 前端之前，作为一个完整的后端首批。先交付现有输出增强＋有界 File Sink＋高频纯函数；数据库/消息系统等更多 Sink、复杂函数与动态插件继续按需求分批，不要求清空整个扩展清单才能发行。不新增 K 阶段或另一套 Action 引擎，复用 CONN/HTTP/FMT、SQL/SEM/ANA、EXT 的既有任务。
+
+- [ ] **能力盘点与对照清单。** 分列 Action/Sink、纯标量函数、聚合/分析/窗口函数和扩展函数，记录已实现/缺失/语义不同/暂缓、优先级与测试入口。当前 Server Sink 为 HTTP/MQTT/Log；当前已有 `abs`、`lower/upper`、`length/char_length`、`coalesce/nullif`、`greatest/least` 及 COUNT/SUM/AVG/MIN/MAX 等，不重复开发。核对真实 binder/evaluator，而非仅按名称判断兼容；例如当前大小写映射为 ASCII、参数采用 eager 求值，不能为对齐名称偷偷改旧规则语义。
+
+- [ ] **Action 公共能力首批（CONN/HTTP/FMT）。** 在已有合批、linger、并发、flush 和 DAG 多输出之上，补输出字段映射/有界数据模板、空结果/单条与批量编码的明确行为、受控动态 MQTT topic/HTTP 参数、配置复用与逐动作诊断。动态目标展开后仍校验 allowlist、SecretRef 和编码大小；重试使用同一已确定 payload/身份，模板版本纳入适用的兼容校验。多动作复用 required/best-effort 合同，一处失败不意味着已成功的外部副作用能回滚。
+
+- [ ] **File Sink 首批（FMT-04）。** 先实现明确格式的有界文件输出，例如 NDJSON；定义路径权限、轮转/容量、写入与发布/flush 确认、部分写入、停止、磁盘满和重放重复行为。普通文件写入成功不冒充 fsync 或可靠 receipt；没有完成对应 checkpoint 协议前拒绝 required aligned 组合。
+
+- [ ] **更多 Action/Sink 候选（CONN/FMT，按需）。** Memory/Local DataBus（复用 CONN-07）、Redis、SQL 数据库（按所需 SQLite/PostgreSQL/MySQL 驱动选择）、InfluxDB、NATS/Kafka 等分别立项；这是 Sparrow 候选清单，不是声称这些都是 eKuiper 内置项。通知平台先用 HTTP/Webhook 或 MQTT 模板，不为每个平台复制一套网络栈。每项有生命周期、共享预算、连接池/并发、错误/重试、停止和 receipt conformance；Source 支持某协议不代表对应 Sink 已实现。数据库 insert/upsert/delete 的幂等、事务与恢复语义独立定义，不因此声称已具备通用 Changelog/Exactly-once。Memory/跨规则输出需有界慢消费者与生命周期合同；调试 Nop/Capture 不可冒充业务送达。
+
+- [ ] **常用计算函数首批（SQL-01 / SEM-01/02）。** 按实际缺口补字符串拼接/截取/替换/匹配，数值舍入与类型转换，JSON 提取/构造，以及日期时间解析/格式化等高频能力。明确类型、Missing/NULL、字符计量、溢出/首错、时区和输出/工作量上限，使用独立 golden；SQL/Graph、融合/未融合共用语义。函数能力同步 capability/Explain/模板；改变已有行为时单列语义版本和恢复兼容性。
+
+- [ ] **复杂/扩展函数后续（SQL / ANA / EXT）。** 数组/对象、编码/哈希按类型和资源边界补充；新增聚合、分析、窗口、多行/多列函数复用 ANA 的 state/timer/展开协议，不塞进无状态标量 evaluator。当前时间/随机等非确定性值不能在恢复时随意重算；外部函数的 I/O、并发、超时、结果身份与可重放性独立设计，未闭合则拒绝对应可靠组合。自定义纯 UDF、函数 Registry/版本固定、有界 Transform 和自定义 Sink 接入既有 EXT-01～06，不要求首批引入完整动态插件系统。
+
+**整批验收：** 真实配置→bind/validate→执行→输出→取消/适用恢复；至少包含字段整形后 MQTT/HTTP 推送、告警 Webhook、文件落地等模板与精确预期，不能只补函数名/trait。覆盖超大展开/模板、无效动态目标、慢/失败 Sink、部分动作成功、资源退款和适用的稳定 ID/ACK/重放。新 Sink 默认不继承 HTTP 的 aligned 支持；测试、能力矩阵和文档必须同时交付。必要 API/CLI 随后端实现，K5 以后再展示这些能力。
 
 <a id="performance"></a>
 ## 12. 性能线：先 P0，再决定 Arrow/JIT

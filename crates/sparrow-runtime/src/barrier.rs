@@ -175,9 +175,20 @@ impl RuntimeAligned {
                 "cannot combine legacy and participant restore",
             ));
         }
-        pipeline
-            .plan
-            .check_compatible(&CheckpointPlan::from_physical(plan)?)?;
+        let live_plan = if pipeline.plan.has_references() {
+            // Kernel admission has already verified the attached table Arc,
+            // including its canonical digest, runtime CRC, owner and concrete
+            // Lookup schema. Rebuild the physical manifest here as a second
+            // guard, carrying the persisted dependencies rather than sending
+            // a CPL3 plan through the legacy from_physical path.
+            CheckpointPlan::from_physical_with_references(
+                plan,
+                pipeline.plan.reference_tables.clone(),
+            )?
+        } else {
+            CheckpointPlan::from_physical(plan)?
+        };
+        pipeline.plan.check_compatible(&live_plan)?;
         let mut restored = BTreeMap::new();
         let mut restored_iot = BTreeMap::new();
         if pipeline.restore.is_none() && !pipeline.iot.is_empty() {
@@ -886,6 +897,7 @@ mod tests {
                     source: 1.into(),
                     sink: 20.into(),
                     states: vec![],
+                    reference_tables: vec![],
                     semantics: b"CP01test".to_vec(),
                     recovery_prefix_len: Some(8),
                 }),

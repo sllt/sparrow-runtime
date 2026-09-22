@@ -12,7 +12,132 @@ pub const PIPELINE_SNAPSHOT_VERSION: u16 = 3;
 pub const RELIABLE_SNAPSHOT_VERSION: u16 = 4;
 pub const GRAPH_SNAPSHOT_VERSION: u16 = 5;
 pub const IOT_SNAPSHOT_VERSION: u16 = 6;
+/// Reliable JetStream output plus the bounded TTL=0 IoT state codec.  This is
+/// intentionally a new envelope/profile: v4 has no IoT participant and v6
+/// has no output cursor, so neither can be extended in place without making a
+/// committed checkpoint ambiguous to older binaries.
+pub const RELIABLE_IOT_SNAPSHOT_VERSION: u16 = 7;
+/// Static immutable reference-table enrichment has a separate File-only
+/// profile. It uses the CPL3 participant manifest and intentionally has no
+/// output cursor or state frames; v3..v7 remain byte-for-byte compatible.
+pub const REFERENCE_SNAPSHOT_VERSION: u16 = 8;
+/// Static reference enrichment combined with bounded linear Count/IoT state.
+pub const REFERENCE_LINEAR_SNAPSHOT_VERSION: u16 = 9;
+/// Static reference enrichment on reliable JetStream input. This profile has
+/// the output cursor in addition to the CPL3 reference/state manifest.
+pub const REFERENCE_RELIABLE_SNAPSHOT_VERSION: u16 = 10;
+/// Static reference enrichment on a required File DAG.
+pub const REFERENCE_GRAPH_SNAPSHOT_VERSION: u16 = 11;
+/// Hysteresis/other new IoT state without references on File (linear or DAG).
+pub const HYSTERESIS_SNAPSHOT_VERSION: u16 = 12;
+/// Hysteresis/other new IoT state without references on reliable JetStream.
+pub const HYSTERESIS_RELIABLE_SNAPSHOT_VERSION: u16 = 13;
+pub const PAUSED_FILE_SNAPSHOT_VERSION: u16 = 14;
+pub const PAUSED_RELIABLE_SNAPSHOT_VERSION: u16 = 15;
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
+
+fn output_profile(kind: &str) -> bool {
+    matches!(kind,"jetstream-v1"|crate::processing_cut::FILE_KIND|crate::processing_cut::JETSTREAM_KIND)
+}
+
+/// Select the outer snapshot profile from the fully validated plan and the
+/// connector-declared source identity.  Existing v3..v8 plans retain their
+/// previous selection; the new profiles are opt-in through references or the
+/// new IoT kind and never silently reinterpret an old directory.
+pub fn snapshot_version_for(
+    plan: &CheckpointPlan,
+    source_kind: &str,
+) -> Result<u16> {
+    plan.validate()?;
+    let graph = plan.is_graph();
+    let references = plan.has_references();
+    let hysteresis = plan.has_hysteresis();
+
+    if plan.has_timed_iot() {
+        return match source_kind {
+            crate::processing_cut::FILE_KIND => Ok(PAUSED_FILE_SNAPSHOT_VERSION),
+            crate::processing_cut::JETSTREAM_KIND => Ok(PAUSED_RELIABLE_SNAPSHOT_VERSION),
+            _ => Err(invalid("timed IoT requires a durable paused-time source profile")),
+        };
+    }
+    if matches!(source_kind,crate::processing_cut::FILE_KIND|crate::processing_cut::JETSTREAM_KIND) {
+        return Err(invalid("paused-time source requires timed IoT semantics"));
+    }
+
+    if references {
+        // Do not let a raw CheckpointPlan literal claim one of the new
+        // reference profiles with an event-time/processing-time participant.
+        // `validate` enforces the same invariant for decoded CPL3 manifests;
+        // keep this selector guard local so callers cannot bypass the profile
+        // matrix by constructing a plan directly.
+        if plan
+            .states
+            .iter()
+            .any(|state| state.codec == sparrow_plan::checkpoint::WINDOW_STATE_CODEC && state.window_kind != 1)
+        {
+            return Err(invalid(
+                "reference checkpoint profiles exclude event/processing-time windows",
+            ));
+        }
+        let version = if graph {
+            if source_kind != "file-dag-v1" {
+                return Err(invalid("reference graph checkpoint requires a File DAG source"));
+            }
+            REFERENCE_GRAPH_SNAPSHOT_VERSION
+        } else if source_kind == "jetstream-v1" {
+            REFERENCE_RELIABLE_SNAPSHOT_VERSION
+        } else if source_kind == "file" {
+            if plan.states.is_empty() {
+                REFERENCE_SNAPSHOT_VERSION
+            } else {
+                REFERENCE_LINEAR_SNAPSHOT_VERSION
+            }
+        } else {
+            return Err(invalid("reference checkpoint requires a File or JetStream source"));
+        };
+        return Ok(version);
+    }
+
+    if hysteresis {
+        if graph {
+            if source_kind != "file-dag-v1" {
+                return Err(invalid("hysteresis graph checkpoint requires a File DAG source"));
+            }
+            return Ok(HYSTERESIS_SNAPSHOT_VERSION);
+        }
+        return match source_kind {
+            "file" => Ok(HYSTERESIS_SNAPSHOT_VERSION),
+            "jetstream-v1" => Ok(HYSTERESIS_RELIABLE_SNAPSHOT_VERSION),
+            _ => Err(invalid("hysteresis checkpoint requires a File or JetStream source")),
+        };
+    }
+
+    // Preserve the pre-reference profile matrix exactly for callers that use
+    // the old public open_* methods or construct embedding plans directly.
+    if graph {
+        return if source_kind == "file-dag-v1" {
+            Ok(if plan.has_iot() {
+                IOT_SNAPSHOT_VERSION
+            } else {
+                GRAPH_SNAPSHOT_VERSION
+            })
+        } else {
+            Err(invalid("graph checkpoint requires a File DAG source"))
+        };
+    }
+    if source_kind == "jetstream-v1" {
+        return Ok(if plan.has_iot() {
+            RELIABLE_IOT_SNAPSHOT_VERSION
+        } else {
+            RELIABLE_SNAPSHOT_VERSION
+        });
+    }
+    Ok(if plan.has_iot() {
+        IOT_SNAPSHOT_VERSION
+    } else {
+        PIPELINE_SNAPSHOT_VERSION
+    })
+}
 
 #[derive(Debug, PartialEq)]
 pub struct PipelineSnapshot {
@@ -87,15 +212,67 @@ impl PipelineSnapshot {
         max_keys: usize,
     ) -> Result<EncodedSnapshot> {
         plan.validate()?;
-        if (plan.has_iot() || plan.is_graph()) && acks.next_output.is_some() {
-            return Err(invalid("IoT/graph checkpoint does not admit the JetStream output profile"));
+        // Keep the established topology rejection ahead of profile selection
+        // so old v5/v6 callers retain the same decisive diagnostic.
+        if (plan.has_iot() || plan.is_graph())
+            && (source.identity.kind == "file-dag-v1") != plan.is_graph()
+        {
+            return Err(invalid("checkpoint source topology mismatch"));
+        }
+        let version = snapshot_version_for(plan, &source.identity.kind)?;
+        if matches!(
+            version,
+            REFERENCE_SNAPSHOT_VERSION
+                | REFERENCE_LINEAR_SNAPSHOT_VERSION
+                | REFERENCE_RELIABLE_SNAPSHOT_VERSION
+                | REFERENCE_GRAPH_SNAPSHOT_VERSION
+        ) && !plan.has_references()
+        {
+            return Err(invalid("reference snapshot profile lacks dependency-bearing plan"));
+        }
+        if version == REFERENCE_SNAPSHOT_VERSION && !plan.states.is_empty() {
+            return Err(invalid("v8 reference checkpoint must remain stateless"));
+        }
+        if version == REFERENCE_LINEAR_SNAPSHOT_VERSION
+            && (plan.is_graph() || plan.states.is_empty() || plan.states.len() > 2)
+        {
+            return Err(invalid("v9 reference checkpoint requires linear Count/IoT state"));
+        }
+        if version == REFERENCE_RELIABLE_SNAPSHOT_VERSION
+            && (plan.is_graph() || plan.states.len() > 2)
+        {
+            return Err(invalid("v10 reference checkpoint requires a linear plan"));
+        }
+        if version == REFERENCE_GRAPH_SNAPSHOT_VERSION && !plan.is_graph() {
+            return Err(invalid("v11 reference checkpoint requires a DAG plan"));
+        }
+        if matches!(version, HYSTERESIS_SNAPSHOT_VERSION | HYSTERESIS_RELIABLE_SNAPSHOT_VERSION)
+            && !plan.has_hysteresis()
+        {
+            return Err(invalid("hysteresis snapshot profile lacks hysteresis state"));
         }
         if (plan.has_iot() || plan.is_graph())
             && (source.identity.kind == "file-dag-v1") != plan.is_graph() {
             return Err(invalid("checkpoint source topology mismatch"));
         }
-        if acks.next_output.is_some() != (source.identity.kind == "jetstream-v1") {
+        if plan.has_timed_iot() { crate::processing_cut::ProcessingCut::unwrap(source)?; }
+        if acks.next_output.is_some() != output_profile(&source.identity.kind) {
             return Err(invalid("reliable output cursor and source profile disagree"));
+        }
+        if matches!(
+            version,
+            RELIABLE_IOT_SNAPSHOT_VERSION
+                | REFERENCE_RELIABLE_SNAPSHOT_VERSION
+                | HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
+                | PAUSED_FILE_SNAPSHOT_VERSION | PAUSED_RELIABLE_SNAPSHOT_VERSION
+        )
+            && acks
+                .next_output
+                .is_some_and(|position| position.epoch() != acks.generation)
+        {
+            return Err(invalid(
+                "reliable IoT output epoch differs from the state generation",
+            ));
         }
         if source.identity.path.len() > MAX_SOURCE_METADATA
             || source.identity.kind.len() > MAX_SOURCE_METADATA
@@ -107,9 +284,26 @@ impl PipelineSnapshot {
                 "pipeline checkpoint source/participant/attempt mismatch",
             ));
         }
+        // The plan descriptor owns the CPL3 dependency names/digests. Keep
+        // their encoded bytes in the temporary workspace reservation as well
+        // as the semantic payload; otherwise the first reference checkpoint
+        // can grow an uncharged manifest while it is being assembled.
+        let reference_metadata = if plan.has_references() {
+            plan.reference_tables.iter().fold(2usize, |bytes, dependency| {
+                bytes
+                    .saturating_add(2)
+                    .saturating_add(dependency.name.len())
+                    .saturating_add(8)
+                    .saturating_add(32)
+                    .saturating_add(4)
+            })
+        } else {
+            0
+        };
         let metadata = plan
             .semantics
             .len()
+            .saturating_add(reference_metadata)
             .saturating_add(source.identity.kind.len())
             .saturating_add(source.identity.path.len())
             .saturating_add(512)
@@ -122,7 +316,7 @@ impl PipelineSnapshot {
             104 + usize::from(acks.next_output.is_some())*24 + source.identity.kind.len() + source.identity.path.len() + manifest.len(),
         );
         prefix.extend_from_slice(crate::checkpoint::MAGIC);
-        prefix.extend_from_slice(&if plan.has_iot(){IOT_SNAPSHOT_VERSION}else if plan.is_graph(){GRAPH_SNAPSHOT_VERSION}else if acks.next_output.is_some(){RELIABLE_SNAPSHOT_VERSION}else{PIPELINE_SNAPSHOT_VERSION}.to_le_bytes());
+        prefix.extend_from_slice(&version.to_le_bytes());
         prefix.extend_from_slice(&checkpoint_id.to_le_bytes());
         prefix.extend_from_slice(&ingested_rows.to_le_bytes());
         crate::checkpoint::encode_position(source, &mut prefix)?;
@@ -207,7 +401,21 @@ impl PipelineSnapshot {
             return Err(invalid("unsupported pipeline snapshot magic/version/size"));
         }
         let version=u16::from_le_bytes(take(&mut bytes,2)?.try_into().unwrap());
-        if !matches!(version,PIPELINE_SNAPSHOT_VERSION|RELIABLE_SNAPSHOT_VERSION|GRAPH_SNAPSHOT_VERSION|IOT_SNAPSHOT_VERSION) {
+        if !matches!(
+            version,
+            PIPELINE_SNAPSHOT_VERSION
+                | RELIABLE_SNAPSHOT_VERSION
+                | GRAPH_SNAPSHOT_VERSION
+                | IOT_SNAPSHOT_VERSION
+                | RELIABLE_IOT_SNAPSHOT_VERSION
+                | REFERENCE_SNAPSHOT_VERSION
+                | REFERENCE_LINEAR_SNAPSHOT_VERSION
+                | REFERENCE_RELIABLE_SNAPSHOT_VERSION
+                | REFERENCE_GRAPH_SNAPSHOT_VERSION
+                | HYSTERESIS_SNAPSHOT_VERSION
+                | HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
+                | PAUSED_FILE_SNAPSHOT_VERSION | PAUSED_RELIABLE_SNAPSHOT_VERSION
+        ) {
             return Err(invalid("unsupported pipeline snapshot version"));
         }
         let checkpoint_id = u64_value(&mut bytes)?;
@@ -237,24 +445,167 @@ impl PipelineSnapshot {
         if attempt == 0 {
             return Err(invalid("pipeline snapshot lacks attempt identity"));
         }
-        let next_output=if version==RELIABLE_SNAPSHOT_VERSION {
+        let next_output=if matches!(
+            version,
+            RELIABLE_SNAPSHOT_VERSION
+                | RELIABLE_IOT_SNAPSHOT_VERSION
+                | REFERENCE_RELIABLE_SNAPSHOT_VERSION
+                | HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
+                | PAUSED_FILE_SNAPSHOT_VERSION | PAUSED_RELIABLE_SNAPSHOT_VERSION
+        ) {
             let epoch=take(&mut bytes,16)?.try_into().unwrap();
             Some(sparrow_model::OutputSequence::new(epoch,u64_value(&mut bytes)?)
                 .map_err(|_|invalid("invalid reliable output position"))?)
         } else {None};
-        if next_output.is_some() != (source.identity.kind=="jetstream-v1") {
+        if next_output.is_some() != output_profile(&source.identity.kind) {
             return Err(invalid("reliable snapshot lacks source/output identity"));
         }
         let length = u32_value(&mut bytes)?;
         let plan = CheckpointPlan::decode(take(&mut bytes, length)?)?;
-        if (version == IOT_SNAPSHOT_VERSION) != plan.has_iot() {
+        let mandatory_iot_version = matches!(
+            version,
+            IOT_SNAPSHOT_VERSION
+                | RELIABLE_IOT_SNAPSHOT_VERSION
+                | HYSTERESIS_SNAPSHOT_VERSION
+                | HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
+                | PAUSED_FILE_SNAPSHOT_VERSION | PAUSED_RELIABLE_SNAPSHOT_VERSION
+        );
+        let reference_stateful_version = matches!(
+            version,
+            REFERENCE_LINEAR_SNAPSHOT_VERSION
+                | REFERENCE_RELIABLE_SNAPSHOT_VERSION
+                | REFERENCE_GRAPH_SNAPSHOT_VERSION
+        ) && plan.has_references();
+        if !reference_stateful_version && mandatory_iot_version != plan.has_iot() {
             return Err(invalid("IoT checkpoint version/manifest mismatch"));
         }
-        if version != IOT_SNAPSHOT_VERSION && (version==GRAPH_SNAPSHOT_VERSION)!=plan.is_graph(){return Err(invalid("graph checkpoint version/manifest mismatch"));}
-        if matches!(version, IOT_SNAPSHOT_VERSION | GRAPH_SNAPSHOT_VERSION)
+        if version == REFERENCE_SNAPSHOT_VERSION
+            && (source.identity.kind != "file"
+                || plan.is_graph()
+                || !plan.has_references()
+                || !plan.states.is_empty()
+                || next_output.is_some())
+        {
+            return Err(invalid(
+                "reference-table checkpoint requires a linear File stateless profile",
+            ));
+        }
+        if version == REFERENCE_LINEAR_SNAPSHOT_VERSION
+            && (source.identity.kind != "file"
+                || plan.is_graph()
+                || plan.states.is_empty()
+                || plan.states.len() > 2
+                || !plan.has_references()
+                || next_output.is_some())
+        {
+            return Err(invalid(
+                "reference-table v9 checkpoint requires a linear File stateful profile",
+            ));
+        }
+        if version == REFERENCE_RELIABLE_SNAPSHOT_VERSION
+            && (source.identity.kind != "jetstream-v1"
+                || plan.is_graph()
+                || plan.states.len() > 2
+                || !plan.has_references()
+                || next_output.is_none()
+                || next_output.is_some_and(|position| position.epoch() != generation))
+        {
+            return Err(invalid(
+                "reference-table v10 checkpoint requires linear JetStream output identity",
+            ));
+        }
+        if version == REFERENCE_GRAPH_SNAPSHOT_VERSION
+            && (source.identity.kind != "file-dag-v1"
+                || !plan.is_graph()
+                || !plan.has_references()
+                || next_output.is_some())
+        {
+            return Err(invalid(
+                "reference-table v11 checkpoint requires a File DAG without output cursor",
+            ));
+        }
+        if version == HYSTERESIS_SNAPSHOT_VERSION
+            && (source.identity.kind != "file"
+                && !(source.identity.kind == "file-dag-v1" && plan.is_graph()))
+        {
+            return Err(invalid(
+                "hysteresis checkpoint requires a File linear or DAG source",
+            ));
+        }
+        if version == HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
+            && (source.identity.kind != "jetstream-v1"
+                || plan.is_graph()
+                || next_output.is_none()
+                || next_output.is_some_and(|position| position.epoch() != generation))
+        {
+            return Err(invalid(
+                "hysteresis reliable checkpoint requires linear JetStream output identity",
+            ));
+        }
+        if version != REFERENCE_SNAPSHOT_VERSION
+            && !matches!(
+                version,
+                REFERENCE_LINEAR_SNAPSHOT_VERSION
+                    | REFERENCE_RELIABLE_SNAPSHOT_VERSION
+                    | REFERENCE_GRAPH_SNAPSHOT_VERSION
+            )
+            && plan.has_references()
+        {
+            return Err(invalid(
+                "reference-table dependencies require a v8-v11 checkpoint profile",
+            ));
+        }
+        if version == RELIABLE_IOT_SNAPSHOT_VERSION && plan.is_graph() {
+            return Err(invalid("reliable IoT checkpoint requires a linear plan"));
+        }
+        if version == RELIABLE_IOT_SNAPSHOT_VERSION && next_output.is_none() {
+            return Err(invalid("reliable IoT checkpoint lacks output identity"));
+        }
+        if version == RELIABLE_IOT_SNAPSHOT_VERSION
+            && next_output.is_some_and(|position| position.epoch() != generation)
+        {
+            return Err(invalid(
+                "reliable IoT output epoch differs from the state generation",
+            ));
+        }
+        if version == RELIABLE_SNAPSHOT_VERSION && next_output.is_none() {
+            return Err(invalid("reliable v4 checkpoint lacks output identity"));
+        }
+        if version == RELIABLE_SNAPSHOT_VERSION && plan.has_iot() {
+            return Err(invalid("reliable v4 checkpoint cannot contain IoT state"));
+        }
+        if !matches!(
+            version,
+            IOT_SNAPSHOT_VERSION
+                | RELIABLE_IOT_SNAPSHOT_VERSION
+                | GRAPH_SNAPSHOT_VERSION
+                | REFERENCE_GRAPH_SNAPSHOT_VERSION
+                | HYSTERESIS_SNAPSHOT_VERSION
+        ) && plan.is_graph()
+        {
+            return Err(invalid("graph checkpoint version/manifest mismatch"));
+        }
+        if matches!(
+            version,
+            IOT_SNAPSHOT_VERSION
+                | RELIABLE_IOT_SNAPSHOT_VERSION
+                | GRAPH_SNAPSHOT_VERSION
+                | REFERENCE_GRAPH_SNAPSHOT_VERSION
+                | HYSTERESIS_SNAPSHOT_VERSION
+        )
             && (source.identity.kind == "file-dag-v1") != plan.is_graph() {
             return Err(invalid("checkpoint source topology mismatch"));
         }
+        let expected_version = snapshot_version_for(&plan, &source.identity.kind)?;
+        if expected_version != version {
+            return Err(invalid("checkpoint source/profile and manifest semantics disagree"));
+        }
+        let processing_time = if plan.has_timed_iot() {
+            if next_output.is_none_or(|output|output.epoch()!=generation) {
+                return Err(invalid("paused-time snapshot lacks stable output generation"));
+            }
+            Some(crate::processing_cut::ProcessingCut::unwrap(&source)?.micros)
+        } else { None };
         let n = u16::from_le_bytes(take(&mut bytes, 2)?.try_into().unwrap()) as usize;
         if n != plan.states.len() {
             return Err(invalid("missing/extra checkpoint state participant"));
@@ -276,7 +627,7 @@ impl PipelineSnapshot {
                 ));
             }
             if participant.codec == sparrow_plan::checkpoint::IOT_STATE_CODEC {
-                let freeze = crate::iot::IotFreeze::decode_mode(&mut frame, per_participant, materialize)?;
+                let freeze = crate::iot::IotFreeze::decode_at_cut(&mut frame, per_participant, materialize, processing_time)?;
                 remaining -= entries;
                 if !frame.is_empty() || participant.id != ParticipantId::iot(freeze.operator)
                     || freeze.kind != participant.freeze_kind() {
@@ -337,7 +688,7 @@ impl StoredSnapshot {
         }
     }
     pub(crate) fn decode(bytes: &[u8], max_keys: usize, materialize: bool) -> Result<Self> {
-        if matches!(bytes.get(4..6),Some([3|4|5|6,0])) {
+        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15,0])) {
             Ok(Self::Pipeline(PipelineSnapshot::decode_mode(
                 bytes,
                 max_keys,

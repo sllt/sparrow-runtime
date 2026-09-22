@@ -333,7 +333,7 @@ fn stage_kind(stage: &sparrow_plan::PhysicalStage) -> &'static str {
         PhysicalStage::Transform { .. } => "transform",
         PhysicalStage::CaptureSink { .. } => "sink",
         PhysicalStage::WindowAgg { .. } => "window",
-        PhysicalStage::Iot { spec, .. } => if spec.deadband.is_some() { "deadband" } else { "change_detect" },
+        PhysicalStage::Iot { spec, .. } => spec.kind_name(),
         PhysicalStage::Deduplicate { .. } => "deduplicate",
         PhysicalStage::Lookup { .. } => "lookup",
     }

@@ -252,6 +252,25 @@ impl FileReplaySource {
         self.codec.decode_frame(frame)
     }
 
+    /// One bounded scan for the serialized time profile. Decoder expansion is
+    /// reserved from the actual frame size before constructing JSON/row state.
+    /// The caller separately owns the bounded File reader/frame buffers.
+    pub fn poll_admitted(&mut self,schema:std::sync::Arc<Schema>,owner:std::sync::Arc<sparrow_model::MemoryOwner>,
+        row_limit:usize)->ModelResult<Option<sparrow_model::RowBatch>> {
+        match self.read_frame(2*MAX_RECORD)? {
+            FramePoll::Frame(frame)=>{
+                let estimate=frame.payload.len().saturating_mul(64)
+                    .saturating_add(schema.fields.len()*std::mem::size_of::<sparrow_model::Scalar>()*2).saturating_add(4096);
+                let _scratch=owner.acquire(sparrow_model::CreditKind::Reservation,estimate)?;
+                let row=self.codec.decode_frame(&frame)?.ok_or_else(||SparrowError::new(ErrorCode::CodecViolation,"File row decode failed"))?;
+                let resident=row.resident_bytes();
+                let mut builder=sparrow_model::RowBatchBuilder::new(schema,owner,sparrow_model::CreditKind::Reservation,1,row_limit)?;
+                builder.push_accounted(row,resident)?;Ok(Some(builder.finish()?))
+            }
+            FramePoll::Pending|FramePoll::Eof=>Ok(None),
+        }
+    }
+
     /// Read one NDJSON record and decode it. Decode failures are
     /// [`FilePoll::DecodeError`] (caller increments `IoDiagnostics`).
     pub fn poll_decoded(&mut self) -> ModelResult<FilePoll> {

@@ -160,12 +160,30 @@ impl Supervisor {
         let aligned = spec.recovery == "aligned";
         let iot_profile = plan.has_iot();
         let admission = self.kernel.prepare_source_admission(plan.pipeline)?;
+        let (admission, prepared_references) = if spec.reference_tables.is_empty() {
+            (admission, None)
+        } else {
+            self.prepare_reference_tables_with_admission(spec, admission)
+                .await
+                .map(|(admission, prepared)| (admission, Some(prepared)))?
+        };
         let owner = admission.owner();
         let manifest = if aligned {
-            Some(Arc::new(CheckpointPlan::from_physical(&plan)?))
+            Some(Arc::new(if let Some(prepared) = &prepared_references {
+                crate::validate::checkpoint_plan_with_references(
+                    spec,
+                    &plan,
+                    &prepared.dependencies,
+                )?
+            } else {
+                CheckpointPlan::from_physical(&plan)?
+            }))
         } else {
             None
         };
+        let hysteresis_profile = manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.has_hysteresis());
         let checkpoint_policy = spec.checkpoint.clone().unwrap_or_default();
         let mut restored_positions = BTreeMap::new();
         let mut restore = None;
@@ -179,10 +197,19 @@ impl Supervisor {
             let selected = spec.restore.clone();
             let layout = manifest.clone();
             let max_keys = self.kernel.job_budget().max_state_keys;
+            let reference_profile = prepared_references.is_some();
             let opened = self
                 .store
                 .run_blocking(move || {
-                    let mut store = if iot_profile {
+                    let mut store = if reference_profile || hysteresis_profile {
+                        CheckpointStore::open_for_plan_exclusive(
+                            std::path::Path::new(&directory),
+                            max_keys,
+                            policy.retention(),
+                            layout.as_ref(),
+                            "file-dag-v1",
+                        )?
+                    } else if iot_profile {
                         CheckpointStore::open_iot_exclusive(
                             std::path::Path::new(&directory),
                             max_keys,
@@ -199,6 +226,19 @@ impl Supervisor {
                     let restore = selected.as_ref().is_some_and(|r| r.kind == "checkpoint")
                         || (policy.resume_latest
                             && (inventory.current.is_some() || inventory.current_error.is_some()));
+                    if (reference_profile || hysteresis_profile)
+                        && !restore
+                        && (inventory.current.is_some()
+                            || inventory.current_error.is_some()
+                            || !inventory.generations.is_empty())
+                    {
+                        let message = if reference_profile {
+                            "reference checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
+                        } else {
+                            "hysteresis checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
+                        };
+                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore, message));
+                    }
                     if policy.resume_latest && !restore && !inventory.generations.is_empty() {
                         return Err(SparrowError::new(
                             ErrorCode::UnsupportedRestore,
@@ -259,6 +299,9 @@ impl Supervisor {
         let mut request = JobRequest::new(plan.clone(), vec![], SharedCapture::disabled())
             .with_source_admission(admission)
             .with_observation(diag.observation.clone());
+        if let Some(prepared) = prepared_references {
+            request = request.with_tables(prepared.tables);
+        }
         let mut inputs = Vec::new();
         let mut ports = GraphPortDiagnostics {
             sources: BTreeMap::new(),

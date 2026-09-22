@@ -45,6 +45,8 @@ impl MailboxConfig {
 /// Watermark / idle punctuation travelling with the dataflow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamControl {
+    /// Durable source-ordered logical time; only admitted by paused-time plans.
+    ProcessingTime { micros: i64 },
     /// Permanent data completion. Channels closing without this mark in a
     /// graph are failures/cancellation, never authorization for final time.
     EndOfInput,

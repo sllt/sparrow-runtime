@@ -2,6 +2,54 @@
 
 状态：实现与验证中，未发布、未部署；不能沿用 R11 的长稳或性能结论。设计决定见 [ADR-004](adr/004-jetstream-reliability.md)。默认构建仍不包含 NATS SDK。
 
+**2026-09-17 核心完善增量：** 独立 v10 profile 已接入精确静态参考表＋0～2 Count/IoT(TTL0)，无引用迟滞使用独立 v13。真实 broker/HTTP 进程已验证 Lookup→Count、Lookup→IoT、迟滞的恢复和稳定输出 ID，CURRENT 失败不推进 ACK；旧 v4/v7 不混写、不升级。完整证据见 [组合验收](PRODUCTION.md#k1-k4-reference-validation)。仍不开放时间状态、JetStream DAG、历史 replay/fork 或生产认证；下方 Core-A/v7 数字保留为历史证据。
+
+## 核心增强 A：IoT 可靠组合
+
+2026-09-17 从 `1dd17c8` 继续开发，已完成实现、交叉 Review、功能与故障恢复验证。**Core-A 独立候选的默认 File 零状态性能门槛未通过**，原记录如下；后续包含 A+B1 的候选已对同一 K4 基线通过三组全样本合并门槛，且重跑本节全部专项/进程，见 [当前 B1 证据](REFERENCE_TABLES.md#2026-09-17-b1-验证证据)。不据此声称已定位单一性能根因。未 commit/push/tag，未生产认证。
+目标是 `JetStream → Count / change_detect / deadband → required HTTP`，
+仅线性、最多两个状态参与者，IoT `ttl_micros=0`。同一 checkpoint 保存
+Source cut、所有状态及下一个输出 ordinal，复用既有 durable publication 后
+Explicit ACK 协议，不另外建立一套 ACK 或 ID 机制。
+
+- 新组合使用独立 **v7 ReliableIoT** profile；旧 JetStream 零/Count 仍为 v4，
+  File IoT 仍为 v6。v7 同时包含 IoT 独立 codec 和可靠输出 cursor，不让旧版
+  将新状态误读成 v4/v6。各 profile 不混写目录，不自动迁移。
+- 抑制行仍然属于 Source cut：不能因“不输出 HTTP”而提前 ACK，也不能等待
+  一定有输出才允许 checkpoint。恢复时保留比较基准，稳定 ID 只为实际输出
+  分配 ordinal；按同一未提交输入重放时输出 ID 不得变化。
+- Count 与 IoT 的两种顺序分别绑定各自 schema；全部状态与 required HTTP
+  receipt 一起进入同一切点，不以 Source 收到数或提交后的 ACK 调度数冒充
+  broker 已确认事实。
+- 不开放正 TTL、ET/PT、Lookup/Dedup、DAG/多来源、固定历史 replay 或语义
+  fork。新 profile 不绕过既有 ownership、保留范围、资源和 fail/held 合同。
+- 更改旧 pipeline 的算子不能自动继承 v4 历史。需要新独立目录及合法的
+  consumer 绑定；新建 pipeline 是新的输出 lineage，不代表原地升级或已实现
+  历史迁移。旧目录/binary 保留用于原支持范围回退。
+
+使用 [JetStream/IoT 模板](../deploy/pipeline-jetstream-iot.json)；其中 Count(3) → change_detect 使用独立 v7 目录。以下 K2/R12 记录继续按原构建解释，不把历史结果当作 v7 的测试证据。
+
+### Core-A 功能证据与未通过门槛
+
+候选 `package-v4-*` 在服务器 `box@100.64.0.16` 验证，证据根目录为 `/workspace/bench-compare/core-a-artifacts-20260917/`：
+
+- reliable/default-members **637 passed、17 ignored**，独立 no-demo 入口 **36 passed**；专项独立清单 **8 × 20 = 160** 通过，包含必跑的真实 broker ignored fixture，不把普通测试中其余 ignored 算为运行。清单门禁的 8 类缺失/重名/多余/ignored 分组反例通过。
+- 5 个真实进程场景：change、deadband、IoT→Count、Count→IoT、首次全部抑制。HTTP 已收到 body 但未返回 2xx 时强杀，恢复的值及 ID 一致；`CURRENT.tmp` 为目录造成真实提交失败时，CURRENT 与 broker ACK floor 不前进；清障后重放通过。检查全部输入（包括抑制行）的最终 ACK floor/pending。旧 K4 JetStream binary 以旧 Count 配置打开复制的 v7 历史，明确 profile 拒绝且历史/输出不变。
+- K4 **50 × 20**、K3 **24 × 20**、K2 **32 项**及各自真实进程回归、default/K1 smoke 均通过。Clippy/Go vet 退出 0；Clippy 保留 **90** 条 warning，不声称 `-D warnings` 通过。
+- 三组完整 File ABBA（冻结 K4 v5 为 fresh 对照；周期仍为同候选 on/off，100 ms checkpoint、20 ms 应用等待）：fresh 零状态合并比值 **0.960633**，低于原 **0.97** 门槛；三个单组为 **0.943589 / 0.982734 / 0.950758**，没有丢弃失败组。fresh 双 Count **0.999804**，周期零/双 Count **1.001285 / 1.000038**，后面三项通过原门槛。RSS 最大差均小于 +2048 KiB，全部输出完整、一致，周期无失败提交。**`regression-v4b.exit=1`，不是完整 PASS。** 性能原因仍待定位，不以本轮证据断言是噪声或设计问题。
+
+冻结测试在 `frozen-v4`，160 次在 `validation-v4/repeat.log`；修正后的进程 oracle 在 `process-v6`。首次 Go 驱动误把 HTTP 请求次数当成返回响应所含行数（`batch_rows=1` 不会拆分已有 batch），导致 `validation-v4` 流程失败；保留该失败记录，修复后独立 Go v6 全部场景通过，Rust binary 未重编译。前面的错误方法名、fixture observer 初始化顺序和 Arc move 编译/测试失败也保留在 v1～v3。后续 B1 工作区更改不属于本次 Core-A 冻结构建。
+
+```text
+base commit       1dd17c8186b5f52f2cea85a5fae1a94d79722b22
+source manifest   f9b2c68ecd0b007f80d178b20975063ee1f2265174f2f363bacee491ffd750e4
+default server    e967b4dc35e4c8694f319e8063c242fc4f85fa9985bd40e776105cde833d194f
+JetStream server  33b0b034619c8a4509f5c815c9ef801a6959b394c7c521884d8a141db09b212f
+Go oracle v6      99aca449bb2fec95d06f97193e36923886628266bf07b8c180e2c84c42f8dd19
+```
+
+源码清单中的 Go 为 v5；v6 仅更正进程测试 oracle，独立源码保留为 `core-a-process-v6.go`。B1 候选继续对同一 K4 基线守原性能门槛，不以较慢的 Core-A 候选重设基线。TLS/WAN、容量、24/72 h、目标介质/掉电门禁仍未执行。
+
 ## 支持合同
 
 - 显式选择 `source.kind=jetstream`、`delivery=checkpointed_at_least_once`、`recovery=aligned`，指定独立 checkpoint 目录及周期 `resume_latest=true`。首次接收用户数据前先提交空 checkpoint，固定来源、state generation 和输出 epoch。

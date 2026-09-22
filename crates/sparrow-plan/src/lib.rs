@@ -22,6 +22,12 @@ pub mod stateful;
 mod k3_tests;
 #[cfg(test)]
 mod k4_tests;
+#[cfg(test)]
+mod core_b2_tests;
+#[cfg(test)]
+mod hysteresis_completion_tests;
+#[cfg(test)]
+mod paused_time_tests;
 
 pub use bind::{
     bind_dedup_linear, bind_graph, bind_linear, bind_lookup_linear, bind_window_linear,
@@ -32,7 +38,7 @@ pub use explain::{
     et_tumble_template, explain_bound, explain_graph, validate_graph, GraphExplain, REPLAY_UNBOUND,
 };
 pub use graph::{GraphSpec, GRAPH_SPEC_VERSION};
-pub use checkpoint::{CheckpointPlan, ParticipantId, StateParticipant};
+pub use checkpoint::{CheckpointPlan, ParticipantId, ReferenceTableDependency, StateParticipant};
 pub use physical::{physicalize, PhysicalPlan, PhysicalStage, PlanOptions, TransformStep};
 pub use compat::{
     decide_state_reuse, expr_fingerprint, where_before_window, where_before_window_physical,
@@ -40,7 +46,7 @@ pub use compat::{
 };
 pub use stateful::{
     agg_result_type, lookup_output_schema, window_output_schema, AggCall, DeadbandBaseline,
-    DeadbandMode, DeadbandSpec, DedupSpec, InvalidValuePolicy, IotSpec, LookupSpec, WindowSpec,
+    DeadbandMode, DeadbandSpec, DedupSpec, HysteresisDirection, HysteresisSpec, InvalidValuePolicy, IotSpec, IotTimingSpec, ProcessingTimePolicy, LookupSpec, WindowSpec,
 };
 
 /// M0 linear stub, still used by the sync `LinearExecutor`.

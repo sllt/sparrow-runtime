@@ -1,8 +1,18 @@
 # Runtime ownership (A3 / A4)
 
+**2026-09-19 时间型 Preview（首批验证完成）**：仅面向单个线性 HoldFor/Debounce，不改变旧 profile 的时钟。Source actor 按 `TIME_PENDING fsync → ProcessingTime → 可选输入行 → barrier → HTTP flush → CURRENT → JetStream ACK` 串行推进；初始 generation/bootstrap 先于任何输出。算子不采样宿主时间，到期队列按 `(deadline, encoded key)` 有界逐项排出；完整行/索引和快照编码归实际 SourceAdmission owner。新 v14/v15 cut 保存逻辑时钟、序号和原连接器位置，并与 next-output、状态和 timer 同时提交。匹配功能 747/44、22×20、6+3 进程场景、完整旧矩阵与三组 ABBA 已通过，[本批证据](PRODUCTION.md#paused-time-validation)，不继承旧候选的通过结论。停机暂停、逻辑时间采样边界、CURRENT-only、每决策 checkpoint 成本和备份范围见 [时间型 IoT](IOT.md#paused-time-preview)。PT/正 TTL/多状态/DAG 时间恢复仍未开放；新模式的吞吐成本见 OPT-012，不等于高吞吐或长稳认证。
+
+2026-09-17 的 K1～K4 核心完善候选新增独立 snapshot profiles9～13：静态参考表与 Count/IoT(TTL0)、JetStream 可靠输出和 required File DAG 的组合，以及 Hysteresis Bool latch。引用沿用 CPL3、无引用迟滞沿用 CPL1 的外层结构，由新 snapshot/profile 与 kind6/新语义 tag 隔离旧 reader；旧3～8不改语义。26×20专项、9种真实进程及旧矩阵回归已通过，精确范围与性能见 [当前证据](PRODUCTION.md#k1-k4-reference-validation)。停机暂停的可恢复时间协议和高级 IoT 尚未实现，不因新增 snapshot version 就开放 PT/正TTL。
+
 K3 开发候选新增真实 DAG：显式物理边、Branch/Route/UnionAll、多 Connector、有限 side output 与 File 多输入/required HTTP checkpoint。图使用独立 v5 profile 与完整图严格兼容，不改变线性 File/v3 或 JetStream/v4 合同；ET 图必须显式声明 Source time，不能由快输入抢跑 watermark。详细范围、预算、best-effort 脱离策略、恢复限制与本轮验收见 [DAG.md](DAG.md)。这不是任意图/全场景生产认证。
 
-K4 Preview 新增 `change_detect` / `deadband`：按 key 保存 detached 前值，显式首值、无效值、绝对/相对阈值与比较基准；正 TTL 为单调 processing-time 空闲过期，受 key、逻辑 timer 和 bytes 预算约束。支持的 File→HTTP aligned 组合要求 TTL=0，并使用独立 v6 profile，完整语义严格恢复；不扩展 JetStream、ET/PT 或告警生命周期。已完成全局 Review 和限定矩阵复验：630 核心、36 no-demo、50×20 K4、24×20 K3、32 项 K2、真实进程故障与三组 File ABBA 均通过。配置、限制与构建证据见 [IOT.md](IOT.md#k4-validation)；未提交或发版，不替代目标设备/真实网络/长稳门禁。
+K4 Preview 新增 `change_detect` / `deadband`：按 key 保存 detached 前值，显式首值、无效值、绝对/相对阈值与比较基准；正 TTL 为单调 processing-time 空闲过期，受 key、逻辑 timer 和 bytes 预算约束。支持的 File→HTTP aligned 组合要求 TTL=0，并使用独立 v6 profile，完整语义严格恢复；K4 批次自身不扩展 JetStream、ET/PT 或告警生命周期。已完成全局 Review 和限定矩阵复验：630 核心、36 no-demo、50×20 K4、24×20 K3、32 项 K2、真实进程故障与三组 File ABBA 均通过。配置、限制与构建证据见 [IOT.md](IOT.md#k4-validation)；已随 `1dd17c8` 提交、未 push/tag，不替代目标设备/真实网络/长稳门禁。
+
+后续 Core-A 将 **JetStream→线性 Count/IoT(TTL=0)→required HTTP** 纳入独立 v7 profile，最多两个状态参与者，保持 v4/v6 不混写。抑制行同样进入持久 Source cut，输出 ordinal 只在实际输出时推进；完整状态、输出 cursor、HTTP receipt 与提交后 Explicit ACK 同切点。功能及真实重放已验证，Core-A 自身候选的 File 零状态性能比值 0.960633 未过原门槛，详见 [JETSTREAM.md](JETSTREAM.md)。不把功能通过当作整批性能/生产放行。
+
+B1 静态参考表 Preview 复用 Lookup：catalog v3 保存不可变 revision/SHA，pipeline 固定绑定，所有持久历史 revision 保守 pin，GC 不读截断预览来决定删除。Server 加载表时先占同一 Job admission/owner；blocking 构造及返回结果持有 slot guard，取消等待不会提前释放容量。表 retention lease 覆盖 resident 与构造峰值；Lookup 的选表 Arc、scratch、复制和输出 builder 有预算，nullable stream key 仍按 miss 输出 NULL。B1 **仅 linear restart_fresh**，未将表依赖塞进旧 aligned codec，PT/TTL/temporal 恢复仍不开放。匹配测试、catalog 回退要求与资源限制见 [REFERENCE_TABLES.md](REFERENCE_TABLES.md)；本批回归/性能放行状态以对应证据为准。
+
+B2-A 独立增加 File → stateless Transform/static Lookup → required HTTP 的 **v8/CPL3** checkpoint profile：精确 revision、canonical SHA-256、runtime CRC32 与完整计算语义共同约束恢复；表不伪装成 mutable state participant。必须先解析确切 catalog 依赖并按当前 Job owner 保留，再开放来源；foreign owner、未 verified 表、动态表或依赖变化拒绝。HTTP 未确认或 CURRENT 提交失败不得推进切点，允许旧点后输出重放，不提供 File exactly-once/稳定业务 ID。旧 v3～v7/CPL1 不混写；实现与验证状态详见 [参考表合同](REFERENCE_TABLES.md#b2-a静态-file-aligned-合同)。
 
 R12/K2 执行更新：JetStream 在 Source 侧合并已就绪记录，只有整批成功入队后才推进 published cut；非空 pull 完成不 sleep，仅真正空闲时按 5～250 ms 退避。durable cut 通过有独立 64 KiB 额度的 worker 做最多 16 路 Explicit ACK、每条最多 3 次确认尝试，stop 取消并 join；默认 File 仍不携带 NATS SDK。checkpoint busy 不是 Job 错误，flush 超时单独标记（不伪造 dropped），JetStream 放弃该次提交但继续背压；真实输出/存储错误仍结束 attempt。具体合同与本批测试证据见 [JETSTREAM.md](JETSTREAM.md)。
 

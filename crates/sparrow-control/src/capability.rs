@@ -17,7 +17,9 @@ pub fn inventory() -> Value {
     json!({"version":1,"combinations":combinations,
         "jetstream":{"enabled_by_build":cfg!(feature="jetstream"),"maturity":"preview","requires_feature":"jetstream",
             "source":"jetstream","sink":"http","delivery":"checkpointed_at_least_once","recovery":"aligned","snapshot_version":4,
-            "state_shapes":["zero_state","single_count_window","two_count_windows"],"consumer_scope":"cooperative_single_node_no_HA",
+            "snapshot_version_scope":"legacy_zero_or_count_only; IoT uses profiles.reliable_iot; Hysteresis uses v13; references use v10",
+            "state_shapes":["zero_state","single_count_window","two_count_windows","single_change_detect_ttl0","single_deadband_ttl0","count_plus_iot_ttl0","two_iot_ttl0"],
+            "profiles":{"legacy_count":"v4","reliable_iot":"v7","reference_jetstream":"v10"},"consumer_scope":"cooperative_single_node_no_HA",
             "poison":"fail_finite_retry_or_held","dlq":false,"durable_outbox":false,"automatic_resume_required":true,
             "source_filtering":false,"semantic_fork_and_fixed_replay":false,"certified":false},
         "function_semantics":{"version":sparrow_expr::semantics::VERSION,"evaluation":sparrow_expr::semantics::EVALUATION,
@@ -34,16 +36,17 @@ pub fn inventory() -> Value {
             "operators":["branch","route_first_match","route_all_match","union_all","multiple_sources","multiple_sinks"],
             "source_binding":"explicit_graph_io_by_operator_id","source_time":"explicit_event_time_field_before_filter",
             "side_outputs":["file_decode_error","event_time_late","filter_rule_reject"],
-            "aligned":"required_File_to_HTTP_stateless_or_Count_v5_or_IoT_v6_ttl0; side_outputs_and_ET_not_admitted",
+            "aligned":"required_File_to_HTTP_stateless_or_Count_v5_or_IoT_v6_ttl0; immutable_reference_profile11_supports_Count_or_IoT_ttl0; side_outputs_and_ET_not_admitted",
             "best_effort":"explicit_data_drop; control_overflow_detaches_branch; no_lossy_rejoin","designer":false},
         "iot":{
             "maturity":"preview","certified":false,
-            "operators":["change_detect","deadband"],
+            "operators":["change_detect","deadband","hysteresis"],
             "input_types":["bool","int64","uint64","float64","utf8","bytes","timestamp_micros_utc"],"key_fields_max":16,
             "state":"task_owned_bounded_key_state",
             "semantics":{
                 "change_detect":"typed equality; emit_first and invalid policy are explicit",
                 "deadband":"absolute_or_relative_threshold; baseline is explicit last_input_or_last_output",
+                "hysteresis":"high/low Schmitt trigger; finite separated enter/exit thresholds; emits only initial/transition rows",
                 "invalid":"error_or_ignore; ignored values do not update state",
                 "ttl":"processing_time_only; aligned requires ttl_micros=0"
             },
@@ -54,14 +57,33 @@ pub fn inventory() -> Value {
             "aligned":{
                 "sources":["file","file_replay","replay"],"required_sinks":["http"],
                 "linear_max_state_participants":2,"graph_max_state_participants":16,
-                "snapshot_version":6,"profile":"iot_v6",
+                "snapshot_version":6,"profile":"iot_v6","profiles":{"legacy":"iot_v6","hysteresis":"hysteresis_v12"},
+                "legacy_scope":"snapshot_version=6 is legacy change_detect/deadband only; Hysteresis uses profile hysteresis_v12",
                 "ttl_micros":0,"source_time":false,"side_outputs":false,"lossy_edges":false,
-                "continuity":"preserved only from a compatible committed v6 snapshot"
+                "continuity":"preserved only from a compatible matching profile checkpoint"
             },
-            "jetstream":{"supported":false,"reason":"IoT state is not admitted on the JetStream v4 profile"},
+            "jetstream":{"supported":cfg!(feature="jetstream"),"reason":if cfg!(feature="jetstream"){"IoT state uses independent reliable profiles; legacy v7 and Hysteresis v13; TTL must be zero"}else{"JetStream support requires the jetstream build feature"},"snapshot_version":7,"profile":"reliable_iot_v7","profiles":{"legacy":"reliable_iot_v7","hysteresis":"hysteresis_reliable_v13"},"legacy_scope":"snapshot_version=7 is legacy reliable change_detect/deadband only; Hysteresis uses profile hysteresis_reliable_v13","ttl_micros":0,"required_sink":"http"},
             "reset":"fresh/reset is explicit; prior state continuity is not implied",
             "resource_contract":"max_keys and state bytes are bounded; quota failure preserves the prior entry"
         },
+        "paused_time_iot":{"maturity":"preview","certified":false,"operators":["hold_for","debounce"],
+            "sources":{"file":"v14","jetstream":if cfg!(feature="jetstream"){"v15"}else{"feature_required"}},
+            "sink":"required_http_with_stable_output_identity","state":"one_timed_operator_linear_no_references",
+            "clock":"source_ordered_processing_time; downtime_paused; due_before_input; no_event_time",
+            "durability":"TIME_PENDING before publication; checkpoint after every decision; CURRENT_only_restore",
+            "performance":"one_input_row_or_idle_tick_per_commit; serialized_fsync_and_HTTP_flush",
+            "not_enabled":["timed_dag","positive_ttl_restore","PT_window_restore","historical_replay","exactly_once"]},
+        "reference_tables":{"maturity":"preview","certified":false,"frontend":false,
+            "managed_lookup":"linear_static_restart_fresh_or_aligned_profiles8_9_10; required_File_HTTP_graph_profile11","selection":"explicit_revision_and_sha256_never_latest_at_start",
+            "publication":"immutable_revision_with_atomic_CAS_head_switch",
+            "running_job":"keeps_its_bound_revision_and_job_owned_snapshot",
+            "gc":"non_latest_unreferenced_only; all_persisted_pipeline_revisions_pin",
+            "checkpoint_dependencies":{"profiles":{"file_stateless":"v8","file_state":"v9","jetstream":"v10","file_graph":"v11"},"source":"File/file_replay/replay or JetStream; graph sources are File only","sink":"required_HTTP","scope":"static Lookup plus Count/IoT ttl0 state; no ET/PT/temporal/Dedup/side/lossy","table_rows_in_checkpoint":false},
+            "hysteresis_without_references":{"file":"v12","jetstream":"v13","scope":"new IoT kind only; ttl_micros=0; no automatic migration from v6/v7"},
+            "temporal_managed_lookup":false,"external_async_lookup":false,
+            "max_bindings_per_pipeline":8,
+            "max_rows_per_revision":crate::reference_table::MAX_REFERENCE_TABLE_ROWS,
+            "max_payload_bytes_per_revision":crate::reference_table::MAX_REFERENCE_TABLE_BYTES},
         "windows":{"implemented":["count","processing_time_tumbling","event_time_tumbling","event_time_hopping"],
             "not_implemented":["session","sliding_count","unbounded_global"],"new_window_policy":"add_only_with_workload_semantics_and_independent_reference"},
         "sql":{"runtime_parser":"sparrow_sql_subset","aggregates":["count","sum","avg","min","max"],
@@ -86,7 +108,8 @@ mod tests {
         assert_eq!(value["dag"]["certified"], false);
         assert_eq!(value["iot"]["aligned"]["snapshot_version"], 6);
         assert_eq!(value["iot"]["aligned"]["ttl_micros"], 0);
-        assert_eq!(value["iot"]["jetstream"]["supported"], false);
+        assert_eq!(value["iot"]["jetstream"]["supported"], cfg!(feature="jetstream"));
+        assert_eq!(value["iot"]["jetstream"]["snapshot_version"], 7);
         assert!(value["dag"]["aligned"]
             .as_str()
             .unwrap()
@@ -117,5 +140,19 @@ mod tests {
             value["iot"]["fresh"]["continuity"],
             "state starts empty; no persisted state_generation"
         );
+    }
+
+    #[test]
+    fn core_a_jetstream_iot_inventory_exposes_independent_v7_profile() {
+        let value = super::inventory();
+        assert_eq!(value["jetstream"]["profiles"]["legacy_count"], "v4");
+        assert_eq!(value["jetstream"]["profiles"]["reliable_iot"], "v7");
+        assert_eq!(value["iot"]["jetstream"]["snapshot_version"], 7);
+        assert_eq!(value["iot"]["jetstream"]["ttl_micros"], 0);
+        assert_eq!(value["iot"]["jetstream"]["required_sink"], "http");
+        assert!(value["jetstream"]["state_shapes"].as_array().unwrap()
+            .contains(&serde_json::json!("two_iot_ttl0")));
+        assert!(value["jetstream"]["snapshot_version_scope"].as_str().unwrap()
+            .contains("legacy_zero_or_count_only"));
     }
 }

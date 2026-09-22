@@ -1007,6 +1007,7 @@ async fn union(ctx: &JobCtx, mut inputs: Vec<MailboxRx>, output: MailboxTx) -> R
             }
             if let Some(control) = control {
                 match control {
+                    StreamControl::ProcessingTime { .. } => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for DAG Union")),
                     StreamControl::EndOfInput => {
                         ended[i] = true;
                         hub.mark_idle(InputId(i as u16))?;

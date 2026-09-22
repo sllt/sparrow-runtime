@@ -237,6 +237,88 @@ impl JobRequest {
     }
 }
 
+/// Derive the exact immutable table identities attached to a request. The map
+/// key is part of the admission contract: accepting a table under a different
+/// map key could make a physical Lookup resolve a different object than the
+/// checkpoint manifest describes.
+fn verified_reference_dependencies(
+    tables: &HashMap<String, Arc<ReferenceTable>>,
+) -> Result<Vec<sparrow_plan::ReferenceTableDependency>> {
+    let mut dependencies = Vec::with_capacity(tables.len());
+    for (map_name, table) in tables {
+        if map_name != &table.name {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "reference table attachment key does not match the table identity",
+            ));
+        }
+        dependencies.push(table.verified_dependency()?);
+    }
+    dependencies.sort_by(|a, b| a.name.cmp(&b.name));
+    if dependencies
+        .windows(2)
+        .any(|pair| pair[0].name == pair[1].name)
+    {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "duplicate reference table dependency identity",
+        ));
+    }
+    Ok(dependencies)
+}
+
+/// Validate each static Lookup against the attached snapshot, rather than
+/// relying solely on dependency names in the checkpoint manifest. The plan
+/// crate validates the dependency set and stage shape; this short-lived
+/// operator additionally proves the table schema, key order, keep/output
+/// schema and table CRC that the runtime will execute.
+fn validate_static_lookup_bindings(
+    plan: &PhysicalPlan,
+    tables: &HashMap<String, Arc<ReferenceTable>>,
+    owner: &Arc<MemoryOwner>,
+) -> Result<()> {
+    for stage in &plan.stages {
+        let PhysicalStage::Lookup {
+            operator,
+            spec,
+            input,
+            output,
+        } = stage
+        else {
+            continue;
+        };
+        if spec.temporal || spec.as_of_field.is_some() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "aligned reference-table profile excludes temporal Lookup",
+            )
+            .at_operator(*operator));
+        }
+        let table = tables.get(&spec.table).ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                format!("static Lookup table '{}' is not attached", spec.table),
+            )
+            .at_operator(*operator)
+        })?;
+        let lookup = LookupOperator::new(
+            spec.clone(),
+            Arc::clone(table),
+            input.clone(),
+            Arc::clone(owner),
+        )
+        .map_err(|error| error.at_operator(*operator))?;
+        if lookup.output_schema() != output {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidSchema,
+                "static Lookup output schema does not match the physical plan",
+            )
+            .at_operator(*operator));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct JobStats {
     pub attempt: JobAttemptId,
@@ -474,6 +556,26 @@ impl Kernel {
 
     pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
         graph::validate_request(&req)?;
+        if req.plan.has_timed_iot() {
+            let manifest = sparrow_plan::CheckpointPlan::from_physical(&req.plan)?;
+            if !req.clock.is_virtual() || req.clock.now_micros()<0 || req.live_events.is_none()
+                || req.live_ctrl.is_some() || req.live_in.is_some() || req.budgeted_in.is_some()
+                || !req.rows.is_empty() || !req.trailing_controls.is_empty()
+                || req.aligned.as_ref().is_none_or(|a| a.pipeline.is_none() || a.acks.output_sequence().is_none()) {
+                return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                    "timed IoT requires ordered ingress, an initial logical clock and complete aligned output identity"));
+            }
+            manifest.validate()?;
+            for freeze in &req.aligned.as_ref().unwrap().pipeline.as_ref().unwrap().iot {
+                for entry in &freeze.entries {
+                    match entry.values.as_slice() {
+                        [sparrow_model::Scalar::Int64(start),sparrow_model::Scalar::Int64(deadline),_,..]
+                            if *start<=req.clock.now_micros() && (*deadline==-1 || *deadline>req.clock.now_micros()) => {},
+                        _ => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"timed IoT restore is inconsistent with logical time")),
+                    }
+                }
+            }
+        }
         for stage in &req.plan.stages {
             if let PhysicalStage::Iot { operator, spec, input } = stage {
                 spec.validate(input).map_err(|e| e.at_operator(*operator))?;
@@ -493,15 +595,101 @@ impl Kernel {
             ));
         }
         if let Some(aligned) = &req.aligned {
-            if req.plan.has_iot() && aligned.acks.output_sequence().is_some() {
-                return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "IoT state is not enabled for JetStream recovery"));
+            if !req.versioned_tables.is_empty() {
+                return Err(SparrowError::new(
+                    ErrorCode::UnsupportedRestore,
+                    "aligned recovery does not support versioned reference tables",
+                ));
+            }
+            if req.plan.edges.is_some() && aligned.acks.output_sequence().is_some() {
+                return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "graph state is not enabled for the JetStream output profile"));
             }
             if aligned.acks.output_sequence().is_some() && (req.live_out.is_none() || aligned.pipeline.is_none()) {
                 return Err(SparrowError::new(ErrorCode::InvalidArgument,"reliable output requires a live required sink and participant checkpoint"));
             }
+            if req.plan.has_iot()
+                && aligned
+                    .acks
+                    .output_sequence()
+                    .zip(aligned.pipeline.as_ref().map(|pipeline| pipeline.generation))
+                    .is_some_and(|(output, generation)| output.epoch() != generation)
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::UnsupportedRestore,
+                    "reliable IoT output epoch differs from the state generation",
+                ));
+            }
             if let Some(pipeline) = &aligned.pipeline {
-                pipeline.plan.check_compatible(&sparrow_plan::CheckpointPlan::from_physical(&req.plan)?)?;
+                // The source connector is not started yet, but the profile is
+                // already unambiguous from the physical topology and whether
+                // a reliable output cursor was provisioned.  Select it before
+                // owner activation so v10/v13 cannot defer an epoch mismatch
+                // until the first checkpoint.
+                let source_kind = if req.plan.has_timed_iot() {
+                    crate::processing_cut::FILE_KIND
+                } else if req.plan.edges.is_some() {
+                    "file-dag-v1"
+                } else if aligned.acks.output_sequence().is_some() {
+                    "jetstream-v1"
+                } else {
+                    "file"
+                };
+                let profile = crate::pipeline_checkpoint::snapshot_version_for(
+                    &pipeline.plan,
+                    source_kind,
+                )?;
+                if matches!(
+                    profile,
+                    crate::pipeline_checkpoint::REFERENCE_RELIABLE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::RELIABLE_IOT_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
+                ) && aligned
+                    .acks
+                    .output_sequence()
+                    .is_some_and(|output| output.epoch() != pipeline.generation)
+                {
+                    return Err(SparrowError::new(
+                        ErrorCode::UnsupportedRestore,
+                        "reliable output epoch differs from the state generation",
+                    ));
+                }
+                if pipeline.plan.has_references() {
+                    let dependencies = verified_reference_dependencies(&req.tables)?;
+                    if dependencies != pipeline.plan.reference_tables {
+                        return Err(SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "attached reference tables do not exactly match the checkpoint dependencies",
+                        ));
+                    }
+                    // Validate the physical Lookup schema/key/output contract
+                    // against the attached table; name/revision alone is not
+                    // a restore proof.
+                    validate_static_lookup_bindings(
+                        &req.plan,
+                        &req.tables,
+                        &self.process_owner,
+                    )?;
+                    let live = sparrow_plan::CheckpointPlan::from_physical_with_references(
+                        &req.plan,
+                        dependencies,
+                    )?;
+                    pipeline.plan.check_compatible(&live)?;
+                } else {
+                    if !req.tables.is_empty() {
+                        return Err(SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "reference tables require a dependency-bearing checkpoint plan",
+                        ));
+                    }
+                    pipeline.plan.check_compatible(&sparrow_plan::CheckpointPlan::from_physical(&req.plan)?)?;
+                }
             } else {
+                if !req.tables.is_empty() {
+                    return Err(SparrowError::new(
+                        ErrorCode::UnsupportedRestore,
+                        "reference tables are not supported by the legacy aligned checkpoint path",
+                    ));
+                }
                 sparrow_plan::PlanLayout::from_physical(&req.plan)?;
             }
         }
@@ -578,6 +766,24 @@ impl Kernel {
         let attempt = admission.attempt;
         let cancel = CancellationToken::new();
         let owner = admission.owner;
+        if req
+            .aligned
+            .as_ref()
+            .and_then(|job| job.pipeline.as_ref())
+            .is_some_and(|pipeline| pipeline.plan.has_references())
+        {
+            for table in req.tables.values() {
+                if !table.is_owned_by(&owner) {
+                    return Err(SparrowError::new(
+                        ErrorCode::UnsupportedRestore,
+                        format!(
+                            "aligned reference table '{}' is not retained by this Job owner",
+                            table.name
+                        ),
+                    ));
+                }
+            }
+        }
         let ingress_memory = if ingress_metadata > 0 {
             Some(Arc::new(
                 owner
@@ -1367,12 +1573,11 @@ async fn stage_loop(
                 if let Some(batch) = batch {
                     consume_work(&ctx, batch.num_rows() as u64).await?;
                     let started = std::time::Instant::now();
-                    let result = op.on_batch(&batch);
+                    let result = op.on_batch_into(&batch);
                     if let Some(obs) = &ctx.observation {
                         obs.record(Latency::Lookup, started.elapsed());
                     }
-                    let rows = result?;
-                    if let Some(out) = op.build_batch(rows)? {
+                    if let Some(out) = result? {
                         if !tx.send(out.with_origin(batch.origin()).with_source_operator(batch.source_operator())).await? {
                             break;
                         }
@@ -1423,6 +1628,7 @@ impl Drop for IotReporter {
 /// TTL is local monotonic idle time, never event time or wall-clock age. The
 /// aligned profile refuses positive TTL until a replayable time policy exists.
 async fn iot_stage(ctx: &JobCtx, op: &mut crate::iot::IotOperator, rx: &mut MailboxRx, tx: &MailboxTx) -> Result<usize> {
+    if op.is_timed() { return timed_iot_stage(ctx,op,rx,tx).await; }
     let started = tokio::time::Instant::now();
     let now = || if ctx.clock.is_virtual() { ctx.clock.now_micros() }
         else { started.elapsed().as_micros().min(i64::MAX as u128) as i64 };
@@ -1478,6 +1684,52 @@ async fn iot_stage(ctx: &JobCtx, op: &mut crate::iot::IotOperator, rx: &mut Mail
     reporter.sample(op);
     op.cleanup();
     Ok(0)
+}
+
+/// Time decisions and data share one FIFO. Timers are completely drained at
+/// each durable decision before the following data or checkpoint barrier.
+async fn timed_iot_stage(ctx:&JobCtx,op:&mut crate::iot::IotOperator,rx:&mut MailboxRx,tx:&MailboxTx) -> Result<usize> {
+    let mut now = ctx.clock.now_micros();
+    op.validate_processing_cut(now)?;
+    let mut reporter=IotReporter {metrics:ctx.metrics.clone(),previous:Default::default(),keys:0,bytes:0};
+    let mut timers=TimerReporter {ctx,live:0,cancelled:0};
+    loop {
+        reporter.sample(op); timers.sample(op.pending_timers(),0);
+        let envelope=tokio::select! { biased; _=ctx.cancel.cancelled()=>break, e=rx.recv()=>e? };
+        let Some(mut envelope)=envelope else {
+            if !ctx.cancel.is_cancelled() { return Err(SparrowError::new(ErrorCode::JobFailed,"ordered processing-time source closed without shutdown")); }
+            break;
+        };
+        let (batch,control)=envelope.take();
+        if let Some(batch)=batch {
+            consume_work(ctx,batch.num_rows() as u64).await?;
+            if let Some(output)=op.on_batch(&batch,now)? {
+                if !tx.send(output).await? {break;}
+            }
+        }
+        if let Some(control)=control {
+            match &control {
+                StreamControl::ProcessingTime {micros}=>{
+                    op.set_processing_time(*micros)?; now=*micros;
+                    while op.next_deadline().is_some_and(|deadline|deadline<=now) {
+                        consume_work(ctx,1).await?;
+                        if let Some(output)=op.take_timed_due(now)? {
+                            if !tx.send(output).await? {op.cleanup();return Ok(0);}
+                        }
+                    }
+                }
+                StreamControl::CheckpointBarrier {checkpoint_id}=>{
+                    let aligned=ctx.aligned.as_ref().expect("timed admission");
+                    if !aligned.acks.is_active(*checkpoint_id) {continue;}
+                    let freeze=crate::barrier::EncodedFreeze::from_iot(op,&ctx.owner,ctx.max_state_keys);
+                    aligned.acks.iot_frozen(*checkpoint_id,op.operator_id(),freeze).await;
+                }
+                _=>return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"timed IoT accepts only ordered time and checkpoint controls")),
+            }
+            if !tx.send_control(control).await? {break;}
+        }
+    }
+    reporter.sample(op); op.cleanup(); Ok(0)
 }
 
 async fn emit_window(
@@ -1629,6 +1881,7 @@ async fn window_stage<const GRAPH:bool>(
                             // A failed checkpoint must abort that request, not
                             // fail the live job while reserving unused output.
                             let emission = match ctrl {
+                                StreamControl::ProcessingTime { .. } => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for windows")),
                                 StreamControl::EndOfInput=>{
                                     if !GRAPH{return Err(SparrowError::new(ErrorCode::InvalidArgument,"explicit EOF belongs to graph ingress"));}
                                     eof_received=true;

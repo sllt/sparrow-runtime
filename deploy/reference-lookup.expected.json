@@ -1,0 +1,5 @@
+[
+  {"device_id":"a","v":7,"threshold":10},
+  {"device_id":"unknown","v":8,"threshold":null},
+  {"device_id":"b","v":9,"threshold":20}
+]

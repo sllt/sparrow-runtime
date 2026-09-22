@@ -14,6 +14,10 @@ pub struct PipelineSpec {
     #[serde(default = "one")]
     pub version: u32,
     pub stream: String,
+    /// Immutable reference revisions. Publishing a newer table never changes
+    /// the data observed by this pipeline revision.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub reference_tables: std::collections::BTreeMap<String, ReferenceBinding>,
     #[serde(default)]
     pub sql: Option<String>,
     #[serde(default)]
@@ -37,6 +41,13 @@ pub struct PipelineSpec {
     /// `IoDiagnostics.decode_errors`. Also enabled by `SPARROW_FAIL_ON_DECODE=1`.
     #[serde(default)]
     pub fail_on_decode: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceBinding {
+    pub revision: u64,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -283,12 +294,61 @@ impl PipelineSpec {
     }
 
     pub fn basic_check(&self) -> Result<()> {
-        let graph_uses_iot = self.graph.as_ref().is_some_and(|graph| {
-            graph
-                .nodes
-                .iter()
-                .any(|node| matches!(node.kind.as_str(), "change_detect" | "deadband"))
-        });
+        if self.reference_tables.len() > 8 {
+            return Err(SparrowError::new(ErrorCode::BoundExceeded,
+                "at most eight immutable reference table bindings are allowed"));
+        }
+        for (name, binding) in &self.reference_tables {
+            crate::store::check_name(name)?;
+            if binding.revision == 0 || binding.revision > i64::MAX as u64
+                || binding.sha256.len() != 64
+                || !binding.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                    "reference table binding requires a positive revision and lowercase SHA-256"));
+            }
+            if name == &self.stream {
+                return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                    "reference table name must not shadow the source stream"));
+            }
+        }
+        if let Some(graph) = &self.graph {
+            for node in &graph.nodes {
+                if node.kind == "memory_source"
+                    && node
+                        .table
+                        .as_ref()
+                        .is_some_and(|table| self.reference_tables.contains_key(table))
+                {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidSchema,
+                        "graph memory_source must not shadow a managed reference table",
+                    ));
+                }
+            }
+        }
+        if !self.reference_tables.is_empty()
+            && RecoveryPolicy::parse(&self.recovery)?.is_aligned()
+        {
+            // Reference-dependent aligned profiles are selected after binding:
+            // v8 is linear stateless File, v9 is linear File with supported
+            // Count/IoT state, v10 is linear JetStream, and v11 is a required
+            // File/HTTP graph.  Keep only the connector/checkpoint envelope at
+            // this spec layer; PhysicalPlan validation owns the state/topology
+            // matrix and prevents a future operator from being opened here by
+            // accident.
+            if !matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay" | "jetstream")
+                || self.sink.kind != "http"
+                || self
+                    .checkpoint_dir
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::UnsupportedRestore,
+                    "reference-table checkpoint profile requires replayable File/JetStream input, explicit checkpoint_dir and a required HTTP sink",
+                ));
+            }
+        }
         if let Some(io) = &self.graph_io {
             if self.graph.is_none() || io.sources.is_empty() || io.sinks.is_empty() || io.sources.len() > 16 || io.sinks.len() > 16 {
                 return Err(SparrowError::new(ErrorCode::InvalidArgument,"graph_io requires graph and 1..16 explicit source/sink bindings"));
@@ -310,12 +370,6 @@ impl PipelineSpec {
             return Err(SparrowError::new(ErrorCode::InvalidArgument,"source.jetstream is required exclusively for kind=jetstream"));
         }
         if self.source.kind=="jetstream" {
-            if graph_uses_iot {
-                return Err(SparrowError::new(
-                    ErrorCode::FeatureUnavailable,
-                    "JetStream + IoT state operators are not in the K4 profile",
-                ));
-            }
             #[cfg(not(feature="jetstream"))]
             return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"JetStream support requires the jetstream build feature"));
             #[cfg(feature="jetstream")]

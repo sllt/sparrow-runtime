@@ -1,8 +1,57 @@
 # 当前生产化候选：安装、恢复与回退
 
-本页说明当前实现合同，不是目标设备认证或正式发行公告。Linux x86_64、Rust 1.98.0、锁定 Cargo.lock；Row/prepared/fusion，线性执行。Arrow/JIT/DAG、HA、可靠 MQTT、持久 HTTP outbox 均未开启。版本号仍为 0.1.0，tag/push 另行授权。
+本页说明当前实现合同，不是目标设备认证或正式发行公告。Linux x86_64、Rust 1.98.0、锁定 Cargo.lock；Row/prepared/fusion，支持线性和显式DAG Preview，恢复按独立profile准入。Arrow/JIT、HA、可靠MQTT、持久HTTP outbox均未开启。版本号仍为0.1.0，tag/push另行授权。最新时间型增量见 [时间 profile 验收](#paused-time-validation)，静态表/迟滞历史批次见 [组合证据](#k1-k4-reference-validation)；后文历史门禁不自动代表新增能力。
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
+
+<a id="paused-time-validation"></a>
+## 可恢复时间首批：2026-09-19 验收
+
+**限定 Preview 已完成本批验证，不是完整 K1～K4 或生产认证。** 仅单个线性 HoldFor / Debounce，File append-only v14 或可选 JetStream v15，required HTTP、暂停的逻辑时间、CURRENT-only 恢复。每个输入行/空闲 tick 先持久决策再执行、每决策 checkpoint；不开放 PT Window、正 TTL、多状态时间组合、时间型 DAG、完整告警生命周期。合同与备份边界见 [IOT.md](IOT.md#paused-time-preview)。未 commit/push/tag/生产部署。
+
+全部 Rust 构建在 `box@100.64.0.18` 集中执行，本机未编译。该节点为 Debian 13.6、Linux 6.12.94+、8 vCPU Intel Xeon；不直接继承原 `.16` 的性能数字。
+
+### 功能、故障与兼容
+
+- `frozen-v6`：747 passed / 18 ignored；独立 no-demo 44 passed。18 个 ignored 不计入普通通过数；本批 NATS 和既有 K2 等由专项明确启用。
+- `paused-repeat-v6`：精确清单 22 项 × 20 轮 = 440 次通过，其中每轮 21 常规 + 1 隔离 NATS。覆盖配置、算子、完整行/NULL、timer/预算、codec、日志完整性、停机暂停、CURRENT 故障、慢 HTTP 重放和缺失日志拒绝。
+- `process-v4` / Go driver-v4：File、JetStream 各执行 HoldFor、Debounce trailing、Debounce leading，共 6 种真实 SIGKILL 场景；核验真实信号退出状态、未提交输出 ID/内容完全一致、已提交后重启不重复、停机不计时及未提交输入不 ACK。上一批 package-v7 二进制（最高支持 snapshot v13）对 v14/v15 的两个拒绝反例保持完整历史、CURRENT 和输出不变。
+- `process-default-v5` / Go driver-v5：默认关闭 JetStream 的生产二进制再跑上述 3 种 File 进程场景，全部通过。
+- 旧矩阵：参考表/迟滞 26×20 + 9 种进程及旧 profile guards；B2 25×20、B1 38×20、Core-A 8×20、K4 50×20、K3 24×20及其进程；K2 专项（含真实 broker）、真实进程与 default/K1 smoke 均通过。
+- 普通 release/all-targets/JetStream Clippy 退出 0，102 条 warning；不声称通过 `-D warnings`。
+
+### 性能：相同节点重新跑原门槛
+
+`performance-v3` 使用原冻结 K1 driver、原 K4 v5 baseline 和新 default package；三组预先声明的完整 ABBA **每组及合并均通过**。fresh 比值门槛仍为 ≥0.97，periodic on/off ≥0.90，RSS 增量 ≤2048 KiB；未降低门槛。
+
+| 场景 | 合并吞吐比 | RSS 增量 | 测量样本 |
+|---|---:|---:|---:|
+| fresh / 0 state | 1.003825 | +820 KiB | 36 |
+| fresh / 2 states | 0.990209 | +1016 KiB | 36 |
+| periodic / 0 state | 1.005042 | +400 KiB | 24 |
+| periodic / 2 states | 0.999532 | +56 KiB | 24 |
+
+全部样本输出校验通过；periodic 提交成功数均为正、失败数为 0。这证明本轮原链路门禁未退化，不代表新时间型串行 profile 有同等吞吐。
+
+新模式另做成本观察：File、单 key、Debounce leading-only、逐行 POST，各 100 行全部提交、100 个连续输出 ID；无人工 HTTP 延迟约 **139 行/s**，20 ms 模拟响应延迟约 **34.1 行/s**。这不是 WAN 或持续容量认证；大状态、多规则、磁盘写入量未外推。后续批处理/group commit 见 [OPT-012](OPTIMIZATION_BACKLOG.md#opt-012)，不能删除持久时间/ACK 保护换吞吐。
+
+### 来源与保留的失败样本
+
+产物根：`/workspace/bench-compare/paused-time-artifacts-20260919`；对应 `package-v7-default` / `package-v7-jetstream`、`frozen-v6`、`paused-repeat-v6`、`process-v4`、`process-default-v5`、旧矩阵 `*-v1` 和 `file-performance-v3-*`。测试源码、日志、原始失败和 checksum 均保留。
+
+```text
+default server  22f8be3f6ccb098da1b4e3ad076e1589b61b4a78be9c4ad956a16c5e1396b74a
+JetStream       fc13de3e162fdb99aa533249a5fd9b3bbf7e04701b48de8a2281beb5ea505a9a
+source manifest 4e49381c2159a7fbf7295635c25baa18c65fccdd3771512b3d38a4df8835e930
+Go driver-v4    a629af3ba052f16b9b5d2a437144031608c9732c911619e36fa1c9961a7ea803
+Go driver-v5    4539f567433c161ac92b20ddc1396208f0810f7d413732e27fb5d6b52ec8c21d
+```
+
+本地逐文件复核中所有 Rust 与生产包 source manifest 一致；两个 Go 文件是构建后独立冻结/验证的 driver 更新，不能称为原 manifest 的同一版本。Go 校验器现在包含 `main.go`、`stateful_dag.go`、`paused_time.go`，必须一起构建。原包保留构建时文档；此处最终记录是后续证据补充，不冒充重新编译。
+
+保留：初始归档遗漏 workspace/打包目录、测试类型标注与不适用的 Cargo 参数失败；SSH 中断后的 `regression-v1.exit=0` **不作为全程通过证据**，K3/K2/smoke 后续阶段按实际完成日志补齐。Go driver-v3 在快提交时把 `CURRENT→PUBLISHED` 发布窗口的 ENOENT 当成失败；v4 仅在固定期限内重试 ENOENT，CRC/格式错误仍立即失败。性能 v1/v2 因新节点缺 Mosquitto/共享库而在测量前失败；在任务目录解包 Mosquitto 2.0.21 及依赖、校验 `ldd` 后运行完整 v3 三组，未安装/启动系统服务。原 driver 仅通过 wrapper 增加隔离 broker 路径；具体依赖 hash 见 `performance-v3-dependencies.sha256`。
+
+**未运行/未覆盖**：真实 TLS/WAN、目标设备、24/72 h 长稳、断电/介质损坏、时间型大状态/多规则容量。上述项目仍是对应部署/发行门禁，不因短程通过变为已认证。
 
 ## 构建与追溯
 
@@ -123,6 +172,8 @@ R10 对数值恢复点采用 **fail-closed**：运行失败或 Server 进程重�
 File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** 的身份，修复“空文件启动后追加的数据没有纳入身份”的缺口；Unix 下拒绝路径已替换而旧 fd 仍活跃的提交。当前身份为有界首/中/尾抽样，不是全文件密码学校验，不能保证发现任意位置的恶意/违规原地修改。可信 append-only producer 合同仍是前提。
 
 ## 升级、备份与回退
+
+**核心增强 B1 的额外 catalog 门禁：** 新候选将 catalog schema 升为 **v3**，加入不可变参考表 revision 与历史 pipeline dependency。即使当前没有 Lookup，首次打开旧 catalog 也会事务升级；旧 v2 binary 将拒绝 v3 catalog。回退必须使用停机一致的升级前 catalog 备份，不能编辑 version 数字或删除 pin 表来绕过。表发布、固定绑定、GC 和验证边界见 [REFERENCE_TABLES.md](REFERENCE_TABLES.md)。Catalog 兼容拒绝与 checkpoint codec 拒绝是两个独立检查，不能把前者当作已经验证后者。
 
 1. 保存配置 revision、capabilities、诊断与二进制/source manifest；先停 desired，再等待实际停止，关闭 Server，确认 writer lease 已释放。
 2. 在服务停止时一起备份 catalog（含存在的 `-wal/-shm`）、原 File 数据、**整个 checkpoint 目录**和对应密钥；校验备份。不要只复制 CURRENT，也不要热复制 SQLite 文件当成一致性备份。
@@ -379,3 +430,69 @@ K1_PERF_STATES=0 K1_PERF_MODES=periodic bash scripts/production-k1-performance.s
 - Server SHA256：`6feffdd99734885bf3777a5c3fd211bf5186284fbefb0ca594fc2b49d7d2abde`；CLI：`9d7df7ca6ce43988f55096a52fa75f7b7fc700046bdaeefa72b9aaa7c7ea2a19`。
 
 保留开发过程反例：CPL1/CPL2 查找 fixture、API If-Match/allowlist/busy polling、直接 Window 测试需消费 pending emission 才推进 holdback，均在 `core-v1..v4` 与 direct API 日志中；没有改预算或放宽原断言来制造通过。R11 的 MIN/MAX 批内 key 缓存、上一代 CRC/GC IO 缓存和 held catalog 读缓存仍为后续低优先级优化，不冒充本轮已实现。真实 WAN/netem、目标设备、24/72 h 长稳和掉电仍未认证；本批不自动 push/tag/部署。
+
+<a id="k1-k4-reference-validation"></a>
+## 2026-09-17：K1～K4 静态表组合恢复与迟滞增量
+
+本轮是用户授权的“补齐 K1～K4 剩余核心”中的完整可验收增量，**不是整个 K1～K4 完成**。停机暂停的确定性时间协议、HoldFor/Debounce、冷却、静默/离线、告警生命周期、Resample 和生产环境门禁仍未完成；K5/前端未启动。
+
+### 实现范围与兼容
+
+- 新 profile9：线性 File＋静态 Lookup＋1～2 Count/IoT(TTL0)。原无状态引用仍为v8，不在旧profile中扩写状态。
+- 新 profile10：线性 JetStream＋静态 Lookup＋0～2 Count/IoT(TTL0)，保存可靠输出cursor，epoch必须等于state generation。
+- 新 profile11：required File→HTTP DAG＋静态 Lookup＋最多16个 Count/IoT(TTL0)，完整图语义、全部来源切点及精确表revision/SHA/runtimeCRC一起验证。
+- 新 Hysteresis 使用 Bool latch/kind6。无引用 File使用v12、JetStream使用v13；有引用时使用9～11。参考表沿用CPL3，其他迟滞沿用CPL1，新外层version/profile保护旧reader；旧3～8的语义和已支持编码不改变，不自动迁移。
+- 正TTL、ET/PT/temporal/Dedup、side/lossy图及JetStream DAG均不因本轮而开放。校验也覆盖手工构造/解码的时间参与者、新旧profile篡改、错误拓扑和外部owner依赖。
+
+### 匹配功能与故障证据
+
+服务器 `box@100.64.0.16`，证据根目录 `/workspace/bench-compare/k1-k4-core-artifacts-20260917/`；冻结 `package-v7-default` / `package-v7-jetstream`、`frozen-v7`，最终功能脚本 **`regression-v7d.exit=0`**。
+
+| 验证 | 结果与边界 |
+|---|---|
+| Rust reliable/default-members | **726 passed、17 ignored**；ignored不当作通过 |
+| 独立无demo | **44 passed**，不同feature组合，不与前者相加声称独立测试数 |
+| 新专项 | 人工清单**26×20=520**，Plan4/Runtime15/Control7；9类fake inventory/summary反例通过 |
+| 新真实进程 | Go v11 oracle，**9种**独立场景，另含旧B2对新9～13及新无引用profile的拒绝检查 |
+| 旧矩阵回归 | B2 **25×20**、B1 **38×20**、A **8×20**、K4 **50×20**、K3 **24×20**及各自进程通过；K2 **32项**含broker与独立进程、default/K1 smoke及旧codec/catalog回退通过 |
+| 静态与构建 | Clippy普通模式退出0，**100条warning**，不是`-D warnings`；Go vet/build、两套生产包及SHA校验通过 |
+
+9种场景为 File Lookup→Count→IoT、File Count→Lookup、JetStream Lookup→Count、JetStream Lookup→IoT、Lookup→Branch→两个required HTTP、双来源Lookup→Union、Lookup→Count→Hysteresis→双required HTTP，以及无引用File/JetStream迟滞。
+
+- table r1在r2/r3发布和GC后保持固定；进程读真实CPL3依赖、state count、Source cut，以及MAN2长度/分块CRC/PUBLISHED证明。
+- HTTP body已接收但响应被hold时，CURRENT和broker ACK不得提前。先SIGKILL再释放夹具，从旧切点重放；Union验证各Source子序列，不假设全局排序。
+- `CURRENT.tmp`目录注入真实I/O失败。File路径验证精确API错误；JetStream可能先向API waiter返回`cancelled: job stopping`，必须从最终actual状态验证`checkpoint io:`和`is a directory`，不能把任意取消算作预期故障。旧CURRENT及其发布payload保持，broker pending未被ACK，恢复后相同业务数据/输出ID重放。
+- Store可在尝试提交前回收不受保护的旧generation以满足retention。本轮检查受保护CURRENT/payload，**不承诺失败提交保留全部可回收历史**；旧reader/profile拒绝路径则检查完整复制历史不变。
+- 迟滞独立golden为57,60,55,60,54；保留Active后重放输出55,60,54。混合DAG在cut=3保存pending Count＋Active latch；输入6,7,1后输出13，后缀7,1,1,6,7输出2,13，强杀恢复两required sink仍精确输出2,13。
+
+```text
+base commit      1dd17c8186b5f52f2cea85a5fae1a94d79722b22
+source manifest  0a53e656817e135de9f727e7b9e877dbaddbf7d926c5bf9f387a89689f9bdc8f
+default server   cd9611457cd4e6fd49ce4f6bc06b0ac8991f58c71a24664b942df1603d4b7843
+JetStream server b6e5712cc44f419a070c2d925f6be16af8f54ca615b6fb53d29e69b66d102750
+Go v11 oracle   e0190687488ce2ef7d70cabae49359680a2f7e78d70c04648610cb8d60c6b914
+```
+
+Rust/生产二进制固定为v7；Go v11源码和binary另在`driver-v11/`、`k1-k4-reference-process-v11`归档。v7原始source manifest没有伪装包含后来的Go夹具修正。失败v1～v6构建、v7a～v7c进程记录保留：包括helper/import/有效ET图fixture、旧拓扑诊断优先级，以及停止后volatile状态已不可用、5秒采样指标不能当作实时ACK事实、可靠commit失败先取消API waiter等。只修正对应原因，未通过放宽运行时恢复规则制造PASS；未在本地运行Cargo。
+
+复用入口（先在服务器独立构建Go oracle；验证脚本不编译）：
+
+```sh
+go build -trimpath -o DRIVER tests/k1-k4-reference-process/*.go
+bash scripts/production-k1-k4-completion-validate.sh NEW_EVIDENCE PACKAGE_JS FROZEN DRIVER OLD_B2_SERVER NATS_SERVER 20
+```
+
+### 本轮性能与生产门禁
+
+原K4 v5为fresh对照；周期仍为同候选on/off（100ms checkpoint、20ms应用响应等待）。预定完整三组ABBA，保持fresh≥0.97、periodic≥0.90、RSS增量≤2048KiB。三组单组及全样本合并均通过，`performance-v7.exit=0`，未删除任何试次：
+
+| 负载 | 合并吞吐比 | RSS增量 KiB | 实测样本 |
+|---|---:|---:|---:|
+| fresh 零状态 | 1.014472 | 844 | 36 |
+| fresh 双Count | 1.002904 | 568 | 36 |
+| periodic 零状态 | 0.999027 | 180 | 24 |
+| periodic 双Count | 1.000047 | 108 | 24 |
+
+全部输出完整、无缺失/重复/非法行且对应hash一致；周期checkpoint每次测量成功数为正、失败0。这是本候选的File回归门槛，不是新增参考表路径的极限容量、WAN/p99或eKuiper新对照；也不改写历史候选的失败样本。
+
+真实TLS/WAN、目标设备容量、24/72h与介质掉电模型仍为NOT RUN。未commit/push/tag或部署；既有Mosquitto PID2657777未被停止，没有修改host qdisc。

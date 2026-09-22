@@ -8,7 +8,10 @@ root=${2:?new evidence directory}
 test ! -e "$root"; mkdir -p "$root"; root=$(cd "$root" && pwd)
 bin="$package/bin/sparrow-server"; ctl="$package/bin/sparrowctl"
 test -x "$bin" && test -x "$ctl"
-port=${SPARROW_SMOKE_PORT:-$((44000 + $$ % 10000))}
+# Keep the server below Linux's usual ephemeral range. Health-poll clients
+# and preceding process fixtures also allocate outbound ports; a checked-free
+# ephemeral port can otherwise be occupied before the listener binds.
+port=${SPARROW_SMOKE_PORT:-$((20000 + $$ % 9000))}
 test -z "$(ss -H -ltn "sport = :$port")"
 export SPARROW_URL="http://127.0.0.1:$port"
 export SPARROW_TOKEN=production-isolated-smoke-not-a-deployment-secret

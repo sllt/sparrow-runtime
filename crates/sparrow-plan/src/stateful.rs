@@ -44,6 +44,75 @@ pub struct DeadbandSpec {
     pub threshold: f64,
 }
 
+/// Direction of a Schmitt trigger. Equality at either threshold transitions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HysteresisDirection {
+    High,
+    Low,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HysteresisSpec {
+    pub direction: HysteresisDirection,
+    pub enter: f64,
+    pub exit: f64,
+}
+
+/// Source-ordered processing time. Host downtime never advances this clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessingTimePolicy { Paused }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IotTimingSpec {
+    /// Missing samples keep the last valid condition; false cancels it.
+    HoldFor { duration_micros: i64, clock: ProcessingTimePolicy },
+    /// A forced max-wait emission ends the current burst, as does quiet expiry.
+    Debounce {
+        quiet_micros: i64,
+        max_wait_micros: i64,
+        leading: bool,
+        trailing: bool,
+        reset_on_repeat: bool,
+        clock: ProcessingTimePolicy,
+    },
+}
+impl IotTimingSpec {
+    pub fn kind_name(&self) -> &'static str {
+        match self { Self::HoldFor { .. } => "hold_for", Self::Debounce { .. } => "debounce" }
+    }
+    pub fn state_kind(&self) -> u8 {
+        match self { Self::HoldFor { .. } => 7, Self::Debounce { .. } => 8 }
+    }
+    pub fn validate(&self) -> Result<()> {
+        let valid = match self {
+            Self::HoldFor { duration_micros, .. } => *duration_micros > 0,
+            Self::Debounce { quiet_micros, max_wait_micros, leading, trailing, .. } =>
+                *quiet_micros > 0 && *max_wait_micros >= *quiet_micros && (*leading || *trailing),
+        };
+        if !valid { return Err(SparrowError::new(ErrorCode::InvalidArgument,
+            "timed IoT requires positive durations; debounce max_wait >= quiet and leading or trailing")); }
+        Ok(())
+    }
+}
+
+impl HysteresisSpec {
+    pub fn validate(&self) -> Result<()> {
+        let separated = match self.direction {
+            HysteresisDirection::High => self.enter > self.exit,
+            HysteresisDirection::Low => self.enter < self.exit,
+        };
+        if !self.enter.is_finite() || !self.exit.is_finite() || !separated {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                "hysteresis requires finite separated thresholds: high enter > exit, low enter < exit"));
+        }
+        Ok(())
+    }
+}
+
 impl DeadbandSpec {
     pub fn validate(&self) -> Result<()> {
         if !self.threshold.is_finite() || self.threshold < 0.0 {
@@ -58,7 +127,7 @@ impl DeadbandSpec {
 
 /// Shared state contract for the first IoT value operators.
 ///
-/// The operator keeps one detached value per key.  `ttl_micros == 0` means
+/// The operator keeps detached comparison values (or a hysteresis latch) per key. `ttl_micros == 0` means
 /// no time-based eviction; it does not remove the mandatory `max_keys` and
 /// memory bounds.  The plan binder validates field types against the input
 /// schema via [`Self::validate`].
@@ -73,6 +142,10 @@ pub struct IotSpec {
     pub invalid: InvalidValuePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadband: Option<DeadbandSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hysteresis: Option<HysteresisSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<IotTimingSpec>,
 }
 
 impl IotSpec {
@@ -91,8 +164,22 @@ impl IotSpec {
                 "IoT max_keys must be > 0",
             ));
         }
+        if let Some(timing) = &self.timing {
+            timing.validate()?;
+            if self.ttl_micros != 0 || self.emit_first || self.deadband.is_some() || self.hysteresis.is_some() {
+                return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                    "timed IoT requires ttl_micros=0 and emit_first=false; leading is explicit; other IoT modes cannot mix"));
+            }
+        }
         if let Some(deadband) = &self.deadband {
             deadband.validate()?;
+        }
+        if let Some(hysteresis) = &self.hysteresis {
+            hysteresis.validate()?;
+            if self.deadband.is_some() || self.ttl_micros != 0 {
+                return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                    "hysteresis cannot mix deadband or silently expire its state; ttl_micros must be 0"));
+            }
         }
         Ok(())
     }
@@ -103,6 +190,16 @@ impl IotSpec {
     /// IoT stage.
     pub fn validate(&self, input: &Schema) -> Result<()> {
         self.validate_params()?;
+        if let Some(timing) = &self.timing {
+            if input.fields.len() > 60 || input.fields.iter().any(|f| !iot_value_type(&f.data_type)) {
+                return Err(SparrowError::new(ErrorCode::FeatureUnavailable,
+                    "timed IoT retains full rows and currently requires at most 60 flat scalar fields"));
+            }
+            if matches!(timing, IotTimingSpec::HoldFor { .. }) && (self.fields.len() != 1
+                || input.field_by_name(&self.fields[0]).is_none_or(|f| f.data_type != DataType::Bool)) {
+                return Err(SparrowError::new(ErrorCode::TypeMismatch, "hold_for requires one Bool condition field"));
+            }
+        }
         for name in &self.keys {
             let field = input.field_by_name(name).ok_or_else(|| {
                 SparrowError::new(
@@ -156,13 +253,25 @@ impl IotSpec {
             }
             deadband.validate()?;
         }
+        if self.hysteresis.is_some() && (self.fields.len() != 1
+            || !matches!(input.field_by_name(&self.fields[0]).expect("validated value field").data_type,
+                DataType::Int64 | DataType::UInt64 | DataType::Float64)) {
+            return Err(SparrowError::new(ErrorCode::TypeMismatch,
+                "hysteresis requires exactly one numeric value field"));
+        }
         Ok(())
     }
 
     /// Stable kind tag used by the checkpoint participant registry.  These
     /// values intentionally do not overlap the WindowKind tags.
     pub fn state_kind_tag(&self) -> u8 {
-        if self.deadband.is_some() { 5 } else { 4 }
+        if let Some(timing) = &self.timing { return timing.state_kind(); }
+        if self.hysteresis.is_some() { 6 } else if self.deadband.is_some() { 5 } else { 4 }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        if let Some(timing) = &self.timing { return timing.kind_name(); }
+        if self.hysteresis.is_some() { "hysteresis" } else if self.deadband.is_some() { "deadband" } else { "change_detect" }
     }
 }
 

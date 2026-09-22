@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "stream": "sensors",
+  "reference_tables": {
+    "limits": {
+      "revision": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "source": {
+    "kind": "file",
+    "path": "/var/lib/sparrow/data/reference-lookup.ndjson",
+    "file_contract": "append_only"
+  },
+  "sink": {
+    "kind": "http",
+    "url": "http://127.0.0.1:43181/telemetry",
+    "batch_rows": 64,
+    "linger_ms": 5,
+    "max_inflight": 1
+  },
+  "delivery": "live_best_effort",
+  "recovery": "restart_fresh",
+  "graph": {
+    "version": 1,
+    "pipeline_id": 1,
+    "revision_id": 1,
+    "nodes": [
+      {"id": 1, "kind": "memory_source", "table": "sensors", "out": [2]},
+      {"id": 2, "kind": "lookup", "table": "limits", "on": [{"stream": "device_id", "table": "device_id"}], "keep": ["threshold"], "out": [3]},
+      {"id": 3, "kind": "capture_sink", "name": "output"}
+    ]
+  }
+}

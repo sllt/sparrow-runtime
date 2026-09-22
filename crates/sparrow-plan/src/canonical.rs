@@ -246,11 +246,25 @@ pub(crate) fn checkpoint_pipeline(plan: &PhysicalPlan) -> Result<(Vec<u8>, usize
                 // legacy plans never take this arm, so their bytes stay
                 // byte-for-byte unchanged.  IoT recovery uses the complete
                 // descriptor (no RCP2 downstream-prefix relaxation).
-                w.tag(6)?; w.raw(&operator.raw().to_le_bytes())?;
+                w.tag(if spec.timing.is_some() { 9 } else if spec.hysteresis.is_some() { 8 } else { 6 })?; w.raw(&operator.raw().to_le_bytes())?;
                 w.iot(spec)?; w.schema(input)?;
             }
             PhysicalStage::CaptureSink { operator, schema, .. } => {
                 w.tag(5)?; w.raw(&operator.raw().to_le_bytes())?; w.schema(schema)?;
+            }
+            PhysicalStage::Lookup { operator, spec, input, output } => {
+                // Only the CPL3/v8 profile admits this new tag. Old plans
+                // retain byte-identical CP01 computation descriptors.
+                w.tag(7)?; w.raw(&operator.raw().to_le_bytes())?;
+                w.bytes(spec.table.as_bytes())?;
+                for names in [&spec.stream_keys, &spec.table_keys, &spec.keep] {
+                    w.len(names.len())?;
+                    for name in names { w.bytes(name.as_bytes())?; }
+                }
+                w.tag(u8::from(spec.temporal))?;
+                w.tag(u8::from(spec.as_of_field.is_some()))?;
+                if let Some(name) = &spec.as_of_field { w.bytes(name.as_bytes())?; }
+                w.schema(input)?; w.schema(output)?;
             }
             _ => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"unsupported checkpoint computation")),
         }
@@ -503,6 +517,18 @@ impl Writer {
     }
 
     fn iot(&mut self, spec: &IotSpec) -> Result<()> {
+        if let Some(timing) = &spec.timing {
+            self.tag(timing.state_kind())?;
+            self.tag(1)?; // paused processing-time, source-ordered, tick before input
+            match timing {
+                crate::IotTimingSpec::HoldFor { duration_micros, .. } => self.raw(&duration_micros.to_le_bytes())?,
+                crate::IotTimingSpec::Debounce { quiet_micros, max_wait_micros, leading, trailing, reset_on_repeat, .. } => {
+                    self.raw(&quiet_micros.to_le_bytes())?;
+                    self.raw(&max_wait_micros.to_le_bytes())?;
+                    self.tag(u8::from(*leading))?; self.tag(u8::from(*trailing))?; self.tag(u8::from(*reset_on_repeat))?;
+                }
+            }
+        }
         self.len(spec.keys.len())?;
         for key in &spec.keys { self.bytes(key.as_bytes())?; }
         self.len(spec.fields.len())?;
@@ -534,6 +560,18 @@ impl Writer {
                 } else {
                     deadband.threshold.to_bits()
                 };
+                self.raw(&bits.to_le_bytes())?;
+            }
+        }
+        // No extra byte for old Change/Deadband plans. Tag 8 distinguishes
+        // this new contract, and the outer profile rejects old readers.
+        if let Some(hysteresis) = &spec.hysteresis {
+            self.tag(match hysteresis.direction {
+                crate::HysteresisDirection::High => 0,
+                crate::HysteresisDirection::Low => 1,
+            })?;
+            for threshold in [hysteresis.enter, hysteresis.exit] {
+                let bits = if threshold == 0.0 { 0.0f64.to_bits() } else { threshold.to_bits() };
                 self.raw(&bits.to_le_bytes())?;
             }
         }

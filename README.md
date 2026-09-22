@@ -15,13 +15,15 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 - Recover only from verified committed checkpoints; missing/corrupt stores are rejected
 - MQTT replay is **unsupported**; MQTT cannot pretend durable restore
 - A default process restart is a **fresh attempt**, not restore
-- Exactly-once / at-least-once configs are **rejected**
+- `exactly_once` and generic `at_least_once` configs are **rejected**; the optional JetStream Preview has an explicit `checkpointed_at_least_once` contract
 
 当前里程碑 / current milestone: **V1**（production aligned recovery + coordinator + observability）。
 
 Runtime contracts and compatibility notes: [`docs/RUNTIME.md`](docs/RUNTIME.md).
 K3 DAG Preview (Branch/Route/UnionAll, multiple I/O, bounded side outputs and a separate File graph checkpoint profile): [`docs/DAG.md`](docs/DAG.md).
-K4 IoT Preview (change detection, deadband, bounded keyed state and a separate v6 recovery profile; scoped review/test evidence): [`docs/IOT.md`](docs/IOT.md).
+K4 IoT Preview (change detection, deadband and hysteresis, bounded keyed state and profile-specific TTL0 recovery): [`docs/IOT.md`](docs/IOT.md). New paused-time profiles v14/v15 cover one linear HoldFor or Debounce on File/JetStream with durable decision replay and required HTTP output IDs. This serialized, per-decision checkpoint profile is not the high-throughput path; PT/positive-TTL recovery, timed DAGs and advanced alarm lifecycle remain unfinished. See the [precise scope and validation status](docs/IOT.md#paused-time-preview).
+
+Managed reference tables Preview: immutable revisions, explicit SHA-256 bindings, bounded static Lookup and conservative dependency-aware GC. Profile v8 covers stateless File; v9/v10 add bounded Count/IoT state on File/JetStream, and v11 covers required File DAGs. No positive TTL, temporal Lookup or implicit profile migration. Catalog schema v3 requires a matching pre-upgrade catalog backup for older binaries. See [`docs/REFERENCE_TABLES.md`](docs/REFERENCE_TABLES.md) for scope and [matching validation evidence](docs/PRODUCTION.md#k1-k4-reference-validation).
 Non-blocking issues and optimization backlog: [`docs/OPTIMIZATION_BACKLOG.md`](docs/OPTIMIZATION_BACKLOG.md).
 MQTT ingress now has decoded-byte accounting and optional Linux QUICKACK;
 HTTP sinks support opt-in batch/linger and bounded concurrency (default serial).

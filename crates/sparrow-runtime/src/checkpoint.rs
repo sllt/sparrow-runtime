@@ -468,6 +468,113 @@ impl CheckpointStore {
         Self::open_profile_exclusive(dir,max_keys,retention,6)
     }
 
+    /// Reliable JetStream plus TTL=0 IoT state has its own profile.  It must
+    /// not share history with either the v4 output-only or v6 IoT-only stores:
+    /// the source cut, output epoch and keyed state are one restore contract.
+    pub fn open_reliable_iot_exclusive(dir: impl Into<PathBuf>, max_keys: usize, retention: CheckpointRetention) -> Result<Self> {
+        Self::open_profile_exclusive(
+            dir,
+            max_keys,
+            retention,
+            crate::pipeline_checkpoint::RELIABLE_IOT_SNAPSHOT_VERSION,
+        )
+    }
+
+    /// Static immutable reference-table enrichment has its own File-only
+    /// history. It must not share a directory with any v3..v7 profile.
+    pub fn open_reference_exclusive(dir: impl Into<PathBuf>, max_keys: usize, retention: CheckpointRetention) -> Result<Self> {
+        Self::open_profile_exclusive(
+            dir,
+            max_keys,
+            retention,
+            crate::pipeline_checkpoint::REFERENCE_SNAPSHOT_VERSION,
+        )
+    }
+
+    /// Reference-table enrichment mixed with bounded linear Count/IoT state.
+    pub fn open_reference_linear_exclusive(
+        dir: impl Into<PathBuf>,
+        max_keys: usize,
+        retention: CheckpointRetention,
+    ) -> Result<Self> {
+        Self::open_profile_exclusive(
+            dir,
+            max_keys,
+            retention,
+            crate::pipeline_checkpoint::REFERENCE_LINEAR_SNAPSHOT_VERSION,
+        )
+    }
+
+    /// Reference-table enrichment on reliable JetStream input.
+    pub fn open_reference_reliable_exclusive(
+        dir: impl Into<PathBuf>,
+        max_keys: usize,
+        retention: CheckpointRetention,
+    ) -> Result<Self> {
+        Self::open_profile_exclusive(
+            dir,
+            max_keys,
+            retention,
+            crate::pipeline_checkpoint::REFERENCE_RELIABLE_SNAPSHOT_VERSION,
+        )
+    }
+
+    /// Reference-table enrichment on a required File DAG.
+    pub fn open_reference_graph_exclusive(
+        dir: impl Into<PathBuf>,
+        max_keys: usize,
+        retention: CheckpointRetention,
+    ) -> Result<Self> {
+        Self::open_profile_exclusive(
+            dir,
+            max_keys,
+            retention,
+            crate::pipeline_checkpoint::REFERENCE_GRAPH_SNAPSHOT_VERSION,
+        )
+    }
+
+    /// Hysteresis/other new IoT state on File, linear or required DAG.
+    pub fn open_hysteresis_exclusive(
+        dir: impl Into<PathBuf>,
+        max_keys: usize,
+        retention: CheckpointRetention,
+    ) -> Result<Self> {
+        Self::open_profile_exclusive(
+            dir,
+            max_keys,
+            retention,
+            crate::pipeline_checkpoint::HYSTERESIS_SNAPSHOT_VERSION,
+        )
+    }
+
+    /// Hysteresis/other new IoT state on reliable JetStream input.
+    pub fn open_reliable_hysteresis_exclusive(
+        dir: impl Into<PathBuf>,
+        max_keys: usize,
+        retention: CheckpointRetention,
+    ) -> Result<Self> {
+        Self::open_profile_exclusive(
+            dir,
+            max_keys,
+            retention,
+            crate::pipeline_checkpoint::HYSTERESIS_RELIABLE_SNAPSHOT_VERSION,
+        )
+    }
+
+    /// Select the exact profile for a validated plan/source pair.  This is
+    /// the shared guard used by control-plane supervisors so a directory can
+    /// never be opened under a guessed reference or hysteresis version.
+    pub fn open_for_plan_exclusive(
+        dir: impl Into<PathBuf>,
+        max_keys: usize,
+        retention: CheckpointRetention,
+        plan: &sparrow_plan::CheckpointPlan,
+        source_kind: &str,
+    ) -> Result<Self> {
+        let version = crate::pipeline_checkpoint::snapshot_version_for(plan, source_kind)?;
+        Self::open_profile_exclusive(dir, max_keys, retention, version)
+    }
+
     fn open_profile_exclusive(dir: impl Into<PathBuf>, max_keys: usize, retention: CheckpointRetention, version:u16) -> Result<Self> {
         let mut store = Self::open_exclusive(dir, max_keys, retention)?;
         for id in list_generation_ids(&store.dir)? {
@@ -490,7 +597,7 @@ impl CheckpointStore {
                 }
                 if bytes.starts_with(MAGIC) && bytes.len()>=6 && bytes[4..6]!=version.to_le_bytes() {
                     return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-                        "checkpoint source profile mismatch: File/v3, JetStream/v4, DAG/v5 and IoT/v6 require separate directories; retain original history"));
+                        "checkpoint source profile mismatch: File/v3, JetStream/v4, DAG/v5, IoT/v6, ReliableIoT/v7, Reference/v8-v11, Hysteresis/v12-v13 and PausedTime/v14-v15 require separate directories; retain original history"));
                 }
             }
         }
@@ -518,7 +625,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if matches!(version,3|4|5|6) {
+        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {

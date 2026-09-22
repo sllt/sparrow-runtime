@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "stream": "sensors",
+  "source": {
+    "kind": "jetstream",
+    "inbox_capacity": 16,
+    "jetstream": {
+      "servers": ["nats://127.0.0.1:4222"],
+      "namespace": "edge_local_account",
+      "stream": "SENSORS",
+      "consumer": "sparrow_sensors_iot",
+      "ownership_bucket": "SPARROW_OWNERS",
+      "max_pending": 128,
+      "pending_bytes": 262144,
+      "pull_messages": 8,
+      "pull_bytes": 73728
+    }
+  },
+  "sink": {
+    "kind": "http",
+    "url": "http://127.0.0.1:8081/events",
+    "batch_rows": 64,
+    "batch_bytes": 262144,
+    "linger_ms": 5,
+    "max_inflight": 1
+  },
+  "delivery": "checkpointed_at_least_once",
+  "recovery": "aligned",
+  "checkpoint_dir": "/var/lib/sparrow/checkpoints/jetstream-sensors-iot",
+  "checkpoint": {
+    "interval_ms": 1000,
+    "timeout_ms": 5000,
+    "retain_generations": 3,
+    "max_store_bytes": 33554432,
+    "resume_latest": true
+  },
+  "graph": {
+    "version": 1,
+    "pipeline_id": 501,
+    "revision_id": 1,
+    "nodes": [
+      {"id": 1, "kind": "memory_source", "table": "sensors", "out": [2]},
+      {
+        "id": 2,
+        "kind": "window_agg",
+        "keys": ["device_id"],
+        "window": {"kind": "count", "size": 3},
+        "aggs": [{"fn": "sum", "expr": {"k": "col", "name": "v"}, "alias": "sum_v"}],
+        "out": [3]
+      },
+      {
+        "id": 3,
+        "kind": "change_detect",
+        "iot": {
+          "keys": ["device_id"],
+          "fields": ["sum_v"],
+          "emit_first": true,
+          "ttl_micros": 0,
+          "max_keys": 1024,
+          "invalid": "error"
+        },
+        "out": [4]
+      },
+      {"id": 4, "kind": "capture_sink", "name": "changed"}
+    ]
+  }
+}

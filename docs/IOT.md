@@ -1,8 +1,99 @@
-# K4：变化检测与 Deadband
+# K4：变化检测、Deadband 与迟滞
 
-状态：2026-09-17，K4 首批功能、全局 Review 修复及下方限定矩阵复验已完成。仍是 **Preview，未 commit/push/tag**；不是任意组合或全场景生产认证。
+> 2026-09-19：可恢复时间 + HoldFor / Debounce 的首批线性 profile 已完成本批功能、故障、旧矩阵与性能验证。不是整个 K1～K4 完成或生产认证；见 [时间型 IoT](#paused-time-preview) 和 [匹配证据](PRODUCTION.md#paused-time-validation)。
 
-## 范围
+<a id="paused-time-preview"></a>
+## 可恢复时间、HoldFor / Debounce（限定 Preview）
+
+以下只描述单个线性时间型算子的合同，未列出的组合不自动获得恢复资格。
+
+### 首批边界
+
+- 单个 HoldFor 或 Debounce，线性 File / JetStream → 可选纯 Filter/Project/Map → required HTTP；不混入其他状态、参考表、side output 或 DAG。
+- File 必须 `append_only`；EOF 只表示等待追加，不能终止 timer。要求 `recovery:"aligned"`、独立 `checkpoint_dir`、`fail_on_decode:true`、`resume_latest:true` 和 `checkpoint.interval_ms:100..1000`。
+- `interval_ms` 在新 profile 中表示空闲时间决策间隔；**每个输入行仍强制 checkpoint**。一个在途决策，一个输入行或空闲 tick，提交之前不开放下一个决策。不是通用高吞吐 WAL，也不是旧链路性能优化；会受 fsync、状态大小、HTTP RTT/重试限制。
+- 不推进停机时间；启动和未提交后缀恢复期间不采样新的逻辑时间。正常运行期间的下游等待属于运行时间，完成提交后的下一次决策会反映该时长。tick 可能被背压推迟，不承诺硬实时。
+- 逻辑时间以持久决策为准，不使用恢复时的墙钟差补算。故障前尚未记录的 elapsed 也不会被推算回去；这是可重放的逻辑时间合同，不是精确累计物理在线时长。
+- 同一决策严格先触发所有到期 timer，再处理该输入，最后 barrier/flush。相同 deadline 按稳定编码 key 排序。输出沿用原行，File 和 JetStream 均使用 `[{"id":"…","data":{…}}]`，下游需要显式适配；不宣称 exactly-once。
+
+### 配置与语义
+
+共同 `iot` 参数仍需 keys/fields/max_keys/invalid；要求 `emit_first:false`、`ttl_micros:0`，不能混用 deadband/hysteresis。完整行最多 60 个扁平 scalar 字段；key 非空且非 nullable，状态和 timer 有明确配额，超限失败而非静默淘汰。
+
+HoldFor 节点 `kind:"hold_for"`，观察一个 Bool 条件字段：
+
+```json
+"timing": {"kind":"hold_for","clock":"paused","duration_micros":1000000}
+```
+
+- true 首次出现开始计时；持续 true 更新保留行但不延长 deadline，到期只输出一次。
+- false 撤销 Pending 或解除已触发的 latch；之后 true 才开始下一轮。无样本维持上次有效条件，不代表设备在线。
+- `invalid:"ignore"` 不刷新或撤销条件；等于 deadline 的 false 输入会在到期输出之后处理。尚不是带 episode/activate/resolve 的完整告警生命周期。
+
+Debounce 节点 `kind:"debounce"`：
+
+```json
+"timing": {"kind":"debounce","clock":"paused","quiet_micros":200000,
+  "max_wait_micros":1000000,"leading":false,"trailing":true,"reset_on_repeat":true}
+```
+
+- quiet/max_wait 必须为正且 max_wait ≥ quiet；leading/trailing 至少开启一项，所有参数显式提供。
+- leading 输出一轮 burst 的首行；trailing 输出最后有效行。两者同时开启且只有一次输入时，不额外重复 trailing。
+- `reset_on_repeat:false` 时，observed fields 未变化的重复输入不延长 quiet，但仍更新保留的完整行，并可使 leading+trailing 的 trailing 生效。
+- quiet 到期或首次输入起算的 max_wait 到期都结束当前 burst；持续来包不能无限推迟输出。
+
+模板：`deploy/stream-iot-timed.json`、`deploy/pipeline-iot-hold-for.json`、`deploy/pipeline-iot-debounce.json`；生产候选包同时携带。修改路径、Schema/stream、allowlist 和 HTTP 地址后使用，不能混用旧 checkpoint 目录。
+
+### 持久化与恢复
+
+- 独立 snapshot v14（File）/v15（JetStream），kind7/8、slot3、codec2；保持旧 v3～v13 路径隔离，无自动迁移。Source cut 包含原连接器位置、逻辑微秒和决策序号；完整状态、timer、generation 与 next-output 一起提交。
+- `TIME_PENDING` 记录一个先持久后发布的决策，带版本、SHA-256、generation/语义摘要、目标 Source cut 和可选输入行摘要。原子 temp 写入/fsync/rename/目录 fsync；仅在前一决策已提交后覆盖。
+- 未提交决策恢复时，先验证原 Source 坐标和输入摘要，再按原时间发布；已被 HTTP 接收但未提交的 timer/输入输出可能重发，但 ID 与内容必须一致。
+- 首次输入前提交 seq0/time0 的 bootstrap。日志丢失、校验失败、序号跳跃、generation/语义不符，或存在无法解释的无 CURRENT 历史，均拒绝恢复，不补采一个“现在”。
+- 只支持 CURRENT 及其一个未提交后继，**不支持选择历史 snapshot**。备份必须在停止并 join 后完整保存 checkpoint 目录（含 `TIME_PENDING` / `STATE_GENERATION` / JetStream owner），不能只复制某个 `chk-*`。
+- `TIME_PENDING` 与其临时文件各自最多 128 KiB，checkpoint 提交的目录配额统计会计入它们。日志先持久化、随后才检查 checkpoint 提交配额，因此磁盘还需预留最多 256 KiB 的瞬时日志空间；不能把 payload 大小当作整个目录的上限。输入保留、状态、编码和 SDK 仍分别受 Job 预算约束。
+
+### 验收状态
+
+服务器 `box@100.64.0.18`：`frozen-v6` 功能 747 passed / 18 ignored、独立 no-demo 44 passed；22 项专项（含显式启用的真实 NATS 用例）×20 轮全部通过。覆盖停机暂停、空闲触发、重复策略、max_wait、NULL、边界/预算、旧 profile 降级拒绝、慢 HTTP 未提交重放、CURRENT 故障、缺失日志。普通 Clippy 通过但有 102 条 warning，不是 `-D warnings`。
+
+`package-v7-default/jetstream` 已构建；独立 Go driver-v4 的 File/JetStream × HoldFor/Debounce trailing/Debounce leading 共 6 种实际 SIGKILL 场景通过，并验证旧二进制对 v14/v15 保持完整历史/输出不变地拒绝。默认 feature-off 包另有 driver-v5 的 3 种 File 进程验证。旧矩阵与三组 ABBA 通过原门槛；新串行模式的 100 行成本观察约为 139 行/s（本机无人工 HTTP 延迟）或 34.1 行/s（20 ms 模拟响应延迟），不能按旧高吞吐链路选型。证据、失败样本及 hash 见 [验收记录](PRODUCTION.md#paused-time-validation)。PT Window/正 TTL、多状态、时间型 DAG、冷却/离线/Resample/完整告警仍未完成。
+
+状态：2026-09-17，K4 首批功能、全局 Review 修复及下方限定矩阵复验已完成，随后随 `1dd17c8` 提交，未 push/tag。仍是 **Preview**，不是任意组合或全场景生产认证。
+
+K2/K4 的 JetStream + IoT TTL0 独立 v7 组合已有匹配验证，见 [JETSTREAM.md](JETSTREAM.md)；下方 v6 矩阵和 K4 验收仍是原首批受测范围。2026-09-17 新迟滞和静态表组合已通过本轮匹配功能/进程回归，证据见 [K1～K4 组合验收](PRODUCTION.md#k1-k4-reference-validation)；性能单列，不将首批或这一增量写成整个 K1～K4 完成。
+
+## K4 后续迟滞实现（Preview）
+
+`kind:"hysteresis"` 复用 IoT 的 key、单个数值 field、`emit_first` 和 `invalid` 参数；新增 `iot.hysteresis`：
+
+```json
+{"direction":"high","enter":60.0,"exit":55.0}
+```
+
+- `high` 必须 enter > exit；Normal 遇到 value ≥ enter 转 Active，Active 遇到 value ≤ exit 转 Normal。`low` 要求 enter < exit，并反转比较方向。阈值有限且严格分离，等号规则固定。
+- key 首次有效观察以 Normal 为初始状态再判断 enter；`emit_first` 仅决定是否输出这次初始化观察。后续只在状态转换时输出，带内抖动不输出。每个 key 独立保存 Bool latch。
+- 输出保留原行/schema，不伪装成完整告警事件；尚无本节点专用 episode 或 activate/resolve schema。无效值按 `error/ignore`，忽略不得清除 Active、初始化 Unknown 或产生恢复通知。
+- Int64/UInt64 输入不先转 f64，因此大于 2^53 的整数、负数和分数阈值不会因输入舍入改变进入/退出判断。
+- 本节点暂要求 TTL=0，不能静默淘汰 Active。持久 latch 使用新 kind=6/slot=3，普通 File（线性/required DAG）使用新 profile12，JetStream 使用13；带静态表则使用9/10/11。旧v6/v7目录不混写，不以旧reader的损坏回退代替明确拒绝。
+- 模板 `deploy/pipeline-k4-hysteresis.json`，输入/独立预期为 `k4-hysteresis.ndjson`、`k4-hysteresis.expected.json`；57,60,59,56,55,56,60,60,54 应输出57,60,55,60,54。
+
+用户已确认时间型 IoT 在停机期间暂停计时，恢复后继续剩余时长。HoldFor/Debounce 已按上方独立 profile 验证；冷却、离线检测和完整告警生命周期仍未实现，不因迟滞或时间型首批而宣称完成。
+
+### 时间状态的实现约束（首批已落实，其他组合继续受限）
+
+原 v3～v13 的 PT Window 读取运行时钟、IoT TTL 使用 stage-local elapsed、UnionAll 按 ready 顺序合流，没有持久时间决策序号。因此仅添加 `remaining_ttl` 不能保证未提交后缀一致。新 v14/v15 已为单个线性时间型算子增加持久决策；并未把旧 PT/TTL/Union 自动迁入该协议。
+
+- 首先建立 Job 级逻辑时间与有界、先持久后发布的输入/tick 顺序，恢复时重放未提交时间决策；同时间采用明确的 timer/input 顺序，不让每个算子各自采样当前时间。
+- Source cut、逻辑时间/决策游标、状态、timer 和适用的输出 cursor 必须在同一个新 profile 中提交；CURRENT 失败或 HTTP 结果未知不得推进可靠 Source ACK。停机不推进逻辑时间；恢复完成之前不开放新输入。
+- 旧 v3～v13 不改语义、不隐式升级；journal 的初始 generation、存储/工作量配额、断尾处理、保留/GC、丢失依赖拒绝和取消需要一起实现，而非只增加 freeze 字段。
+- DAG 的 timer-after-Union 还需可重放的合流选择/进展协议。当前 per-source 有序不等于全局确定性；未实现之前必须继续拒绝该 aligned 组合。
+- HoldFor 与 Debounce 只共享有界 keyed timer，不共用开始/重置语义；Cooldown 作用于通知，不阻止底层告警状态更新；Offline 必须区分设备静默、Source 断连和 pipeline 停止；Resample 的缺样、插值和丢弃有独立合同。
+- 现有 Change/Deadband/Hysteresis 保持原 row schema。高级告警事件、episode 序号/生成代次、activate/resolve、重放身份使用独立 schema/codec；不能通过修改旧迟滞的输出偷偷引入。
+
+每个新组合仍须验证无新输入时 timer 触发、跨 deadline 的 SIGKILL/停机暂停、相同未提交后缀输出与身份、CURRENT/journal I/O 故障、慢 Sink、预算/取消退款，以及原 TTL0 路径不退化。首批证据只授权上面的 v14/v15 矩阵，不授权其余组合。
+
+## 首批 Change/Deadband 范围（历史 v6 合同）
 
 本批实现 IOT-01 变化检测、IOT-02 Deadband，以及相应状态、资源、恢复、配置、诊断和模板。复用现有 GraphSpec → BoundPlan → PhysicalPlan → Kernel → Connector 路径，不另造执行引擎。
 

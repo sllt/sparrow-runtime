@@ -132,7 +132,7 @@ fn describe_state(plan: &PhysicalPlan) -> String {
                 bits.push(format!(
                     "iot op={} kind={} keys={} fields={} emit_first={} ttl_micros={} max_keys={} invalid={:?}",
                     operator.raw(),
-                    if spec.deadband.is_some() { "deadband" } else { "change_detect" },
+                    spec.kind_name(),
                     spec.keys.join(","),
                     spec.fields.join(","),
                     spec.emit_first,
@@ -140,6 +140,16 @@ fn describe_state(plan: &PhysicalPlan) -> String {
                     spec.max_keys,
                     spec.invalid
                 ));
+                if let Some(hysteresis) = &spec.hysteresis {
+                    bits.push(format!("hysteresis direction={} enter={} exit={}",
+                        match hysteresis.direction {
+                            crate::HysteresisDirection::High => "high",
+                            crate::HysteresisDirection::Low => "low",
+                        }, hysteresis.enter, hysteresis.exit));
+                }
+                if let Some(timing)=&spec.timing {
+                    bits.push(format!("timing={timing:?}; clock=paused_source_ordered; due_before_input"));
+                }
             }
             _ => {}
         }
@@ -173,11 +183,7 @@ fn stage_label(s: &PhysicalStage) -> String {
         PhysicalStage::WindowAgg { spec, .. } => format!("window:{:?}", spec.kind),
         PhysicalStage::Deduplicate { .. } => "dedup".into(),
         PhysicalStage::Lookup { spec, .. } => format!("lookup:{}", spec.table),
-        PhysicalStage::Iot { spec, .. } => if spec.deadband.is_some() {
-            "iot:deadband".into()
-        } else {
-            "iot:change_detect".into()
-        },
+        PhysicalStage::Iot { spec, .. } => format!("iot:{}", spec.kind_name()),
     }
 }
 
@@ -247,11 +253,7 @@ pub fn bound_kinds(bound: &BoundLogicalPlan) -> Vec<String> {
             BoundKind::WindowAgg { spec, .. } => format!("window:{:?}", spec.kind),
             BoundKind::Deduplicate { .. } => "dedup".into(),
             BoundKind::Lookup { spec, .. } => format!("lookup:{}", spec.table),
-            BoundKind::Iot { spec, .. } => if spec.deadband.is_some() {
-                "iot:deadband".into()
-            } else {
-                "iot:change_detect".into()
-            },
+            BoundKind::Iot { spec, .. } => format!("iot:{}", spec.kind_name()),
             BoundKind::CaptureSink { name, .. } => format!("sink:{name}"),
         })
         .collect()

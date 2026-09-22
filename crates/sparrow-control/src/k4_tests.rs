@@ -336,7 +336,7 @@ fn k4_file_deadband_fresh_filters_and_resets_state_on_restart() {
 }
 
 #[test]
-fn k4_invalid_ttl_deadband_shape_and_jetstream_are_rejected() {
+fn k4_invalid_ttl_deadband_shape_and_jetstream_feature_boundary() {
     let catalog = {
         let mut catalog = sparrow_plan::Catalog::new();
         catalog.insert(
@@ -400,9 +400,30 @@ fn k4_invalid_ttl_deadband_shape_and_jetstream_are_rejected() {
             "ownership_bucket":"bucket"
         }
     });
-    let error = PipelineSpec::from_json(&serde_json::to_vec(&jetstream).unwrap()).unwrap_err();
-    assert_eq!(error.code, sparrow_model::ErrorCode::FeatureUnavailable);
-    assert!(error.message.contains("IoT"));
+    #[cfg(not(feature = "jetstream"))]
+    {
+        let error = PipelineSpec::from_json(&serde_json::to_vec(&jetstream).unwrap()).unwrap_err();
+        assert_eq!(error.code, sparrow_model::ErrorCode::FeatureUnavailable);
+        assert!(error.message.contains("jetstream build feature"));
+    }
+    #[cfg(feature = "jetstream")]
+    {
+        let checkpoint_dir = sparrow_connectors::ensure_default_data_root().join("k4-jetstream-iot");
+        jetstream["checkpoint_dir"] = json!(checkpoint_dir);
+        jetstream["delivery"] = json!("checkpointed_at_least_once");
+        jetstream["recovery"] = json!("aligned");
+        jetstream["checkpoint"] = json!({"interval_ms":10000,"timeout_ms":2000,"resume_latest":true});
+        let valid = PipelineSpec::from_json(&serde_json::to_vec(&jetstream).unwrap()).unwrap();
+        let plan = crate::bind_plan(&valid, &catalog, "jetstream-iot", 1).unwrap();
+        crate::validate_aligned_plan(&valid, &plan).unwrap();
+
+        jetstream["graph"]["nodes"][1]["iot"]["ttl_micros"] = json!(1);
+        let positive_ttl = PipelineSpec::from_json(&serde_json::to_vec(&jetstream).unwrap()).unwrap();
+        let plan = crate::bind_plan(&positive_ttl, &catalog, "jetstream-iot-ttl", 1).unwrap();
+        let error = crate::validate_aligned_plan(&positive_ttl, &plan).unwrap_err();
+        assert_eq!(error.code, sparrow_model::ErrorCode::UnsupportedRestore);
+        assert!(error.message.contains("ttl_micros=0"));
+    }
 }
 
 #[test]

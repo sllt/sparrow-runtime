@@ -9,10 +9,17 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{params, Connection, OptionalExtension};
 use sparrow_model::{ErrorCode, Result, SparrowError};
 
+use crate::reference_table::{
+    reference_table_sha256, ReferenceTableMetadata, ReferenceTableRow, ReferenceTableSpec,
+    MAX_REFERENCE_TABLE_BYTES_PER_NAME, MAX_REFERENCE_TABLE_CATALOG_BYTES,
+    MAX_REFERENCE_TABLE_VERSIONS, MAX_REFERENCE_TABLE_NAMES,
+    MAX_REFERENCE_TABLE_PREVIEW_PINS,
+    REFERENCE_TABLE_METADATA_BYTES,
+};
 use crate::spec::PipelineSpec;
 use crate::status::PipelineStatus;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 2;
+pub const CATALOG_SCHEMA_VERSION: u32 = 3;
 pub const FORMAT_VERSION: u32 = 1;
 const AUDIT_CAP: usize = 200;
 const ATTEMPT_CAP: usize = 100;
@@ -29,6 +36,7 @@ struct StoreInner {
     conn: Mutex<Connection>,
     fail_before_commit: AtomicBool,
     stream_epoch: AtomicU64,
+    reference_epoch: AtomicU64,
     status_effective: Mutex<StatusEffectiveCache>,
 }
 
@@ -44,7 +52,7 @@ struct StatusEffectiveEntry {
     name: String,
     // SQLite data_version detects writes through OTHER Store/connections;
     // stream_epoch handles this connection's own schema writes.
-    key: (u64, u64, u64),
+    key: (u64, u64, u64, u64),
     value: serde_json::Value,
 }
 
@@ -127,6 +135,7 @@ impl Store {
                 conn: Mutex::new(conn),
                 fail_before_commit: AtomicBool::new(false),
                 stream_epoch: AtomicU64::new(0),
+                reference_epoch: AtomicU64::new(0),
                 status_effective: Mutex::new(StatusEffectiveCache::default()),
             }),
         })
@@ -141,6 +150,7 @@ impl Store {
                 conn: Mutex::new(conn),
                 fail_before_commit: AtomicBool::new(false),
                 stream_epoch: AtomicU64::new(0),
+                reference_epoch: AtomicU64::new(0),
                 status_effective: Mutex::new(StatusEffectiveCache::default()),
             }),
         })
@@ -192,6 +202,568 @@ impl Store {
 
     pub fn list_streams(&self) -> Result<Vec<StreamRow>> {
         self.read(load_streams)
+    }
+
+    /// Publish one immutable reference-table revision and atomically advance
+    /// its latest head.  A revision is never updated in place: a failed CAS,
+    /// validation, quota check, or commit leaves the old head untouched.
+    pub fn publish_reference_table(
+        &self,
+        name: &str,
+        expected_revision: u64,
+        table: &ReferenceTableSpec,
+    ) -> Result<ReferenceTableRow> {
+        check_name(name)?;
+        if expected_revision > i64::MAX as u64 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "reference table expected_revision exceeds SQLite integer range",
+            ));
+        }
+        let payload = table.encoded_bytes()?;
+        let payload_bytes = payload.len() as u64;
+        self.write(|c| {
+            let current: Option<i64> = c
+                .query_row(
+                    "SELECT latest_revision FROM reference_table_heads WHERE name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db)?;
+            let current_u64 = match current {
+                None => 0,
+                Some(value) if value > 0 => value as u64,
+                Some(_) => {
+                    return Err(SparrowError::new(
+                        ErrorCode::CodecViolation,
+                        "reference table head revision is invalid",
+                    ));
+                }
+            };
+            if current_u64 != 0 {
+                // A head is an immutable revision pointer, not merely a CAS
+                // counter.  Refuse to publish over a dangling/corrupt head.
+                load_reference_table_metadata(c, name, current_u64)?;
+            }
+            if current_u64 != expected_revision {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "reference table `{name}` expected revision {expected_revision}, current {current_u64}"
+                    ),
+                )
+                .context("expected_revision", expected_revision.to_string())
+                .context("current_revision", current_u64.to_string()));
+            }
+            let revision = expected_revision.checked_add(1).ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    "reference table revision exhausted",
+                )
+            })?;
+            if revision > i64::MAX as u64 {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    "reference table revision exceeds SQLite integer range",
+                ));
+            }
+            let versions: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM reference_table_revisions WHERE name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .map_err(db)?;
+            if versions as usize >= MAX_REFERENCE_TABLE_VERSIONS {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    format!(
+                        "reference table `{name}` exceeds {MAX_REFERENCE_TABLE_VERSIONS} revisions"
+                    ),
+                ));
+            }
+            if current.is_none() {
+                let names: i64 = c
+                    .query_row(
+                        "SELECT COUNT(*) FROM reference_table_heads",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(db)?;
+                if names as usize >= MAX_REFERENCE_TABLE_NAMES {
+                    return Err(SparrowError::new(
+                        ErrorCode::BoundExceeded,
+                        format!(
+                            "reference table catalog exceeds {MAX_REFERENCE_TABLE_NAMES} names"
+                        ),
+                    ));
+                }
+            }
+            let table_bytes: i64 = c
+                .query_row(
+                    "SELECT COALESCE(SUM(payload_bytes + ?2),0) FROM reference_table_revisions WHERE name=?1",
+                    params![name, REFERENCE_TABLE_METADATA_BYTES as i64],
+                    |r| r.get(0),
+                )
+                .map_err(db)?;
+            if table_bytes < 0 {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "reference table byte metadata is invalid",
+                ));
+            }
+            if (table_bytes.max(0) as u64)
+                .saturating_add(payload_bytes)
+                .saturating_add(REFERENCE_TABLE_METADATA_BYTES)
+                > MAX_REFERENCE_TABLE_BYTES_PER_NAME
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    format!(
+                        "reference table `{name}` exceeds {MAX_REFERENCE_TABLE_BYTES_PER_NAME}B across revisions"
+                    ),
+                ));
+            }
+            let catalog_bytes: i64 = c
+                .query_row(
+                    "SELECT COALESCE(SUM(payload_bytes + ?1),0) FROM reference_table_revisions",
+                    [REFERENCE_TABLE_METADATA_BYTES as i64],
+                    |r| r.get(0),
+                )
+                .map_err(db)?;
+            if catalog_bytes < 0 {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "reference table catalog byte metadata is invalid",
+                ));
+            }
+            if (catalog_bytes.max(0) as u64)
+                .saturating_add(payload_bytes)
+                .saturating_add(REFERENCE_TABLE_METADATA_BYTES)
+                > MAX_REFERENCE_TABLE_CATALOG_BYTES
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    format!(
+                        "reference table catalog exceeds {MAX_REFERENCE_TABLE_CATALOG_BYTES}B"
+                    ),
+                ));
+            }
+            let sha256 = reference_table_sha256(name, revision, table)?;
+            let table_json = String::from_utf8(payload.clone()).map_err(|_| {
+                SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    "reference table JSON is not UTF-8",
+                )
+            })?;
+            let created_at_ms = now_ms();
+            c.execute(
+                "INSERT INTO reference_table_revisions
+                    (name, revision, table_json, sha256, payload_bytes, row_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    name,
+                    revision as i64,
+                    table_json,
+                    sha256,
+                    payload_bytes as i64,
+                    table.rows.len() as i64,
+                    created_at_ms,
+                ],
+            )
+            .map_err(db)?;
+            if current.is_some() {
+                c.execute(
+                    "UPDATE reference_table_heads SET latest_revision=?1 WHERE name=?2",
+                    params![revision as i64, name],
+                )
+                .map_err(db)?;
+            } else {
+                c.execute(
+                    "INSERT INTO reference_table_heads(name, latest_revision) VALUES (?1, ?2)",
+                    params![name, revision as i64],
+                )
+                .map_err(db)?;
+            }
+            // A failed transaction may cause an extra status-cache miss, but
+            // must never leave a stale successful answer after a commit.
+            self.inner.reference_epoch.fetch_add(1, Ordering::Relaxed);
+            Ok(ReferenceTableRow {
+                name: name.to_string(),
+                revision,
+                sha256,
+                table: table.clone(),
+                payload_bytes,
+                row_count: table.rows.len() as u64,
+                created_at_ms,
+            })
+        })
+    }
+
+    /// Load one exact immutable revision.  Stored JSON and its digest are
+    /// revalidated on every read so a corrupt catalog fails closed.
+    pub fn get_reference_table_revision(
+        &self,
+        name: &str,
+        revision: u64,
+    ) -> Result<ReferenceTableRow> {
+        check_name(name)?;
+        if revision == 0 || revision > i64::MAX as u64 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "reference table revision must be 1..=i64::MAX",
+            ));
+        }
+        self.read(|c| load_reference_table_revision(c, name, revision))
+    }
+
+    /// Load the current head only.  Pipeline bindings must use
+    /// `get_reference_table_revision`, never this moving alias.
+    pub fn get_reference_table(&self, name: &str) -> Result<ReferenceTableRow> {
+        check_name(name)?;
+        self.read(|c| {
+            let revision: i64 = c
+                .query_row(
+                    "SELECT latest_revision FROM reference_table_heads WHERE name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db)?
+                .ok_or_else(|| {
+                    SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("unknown reference table `{name}`"),
+                    )
+                })?;
+            if revision <= 0 {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "reference table head revision is invalid",
+                ));
+            }
+            load_reference_table_revision(c, name, revision as u64)
+        })
+    }
+
+    /// List current heads, ordered by table name.  Historical revisions are
+    /// intentionally omitted; use `list_reference_table_revisions` for them.
+    pub fn list_reference_tables(&self) -> Result<Vec<ReferenceTableMetadata>> {
+        self.read(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT name, latest_revision FROM reference_table_heads ORDER BY name",
+                )
+                .map_err(db)?;
+            let heads = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(db)?;
+            let mut out = Vec::new();
+            for head in heads {
+                let (name, revision) = head.map_err(db)?;
+                if revision <= 0 {
+                    return Err(SparrowError::new(
+                        ErrorCode::CodecViolation,
+                        "reference table head revision is invalid",
+                    ));
+                }
+                out.push(load_reference_table_metadata(c, &name, revision as u64)?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// List every immutable revision of one table, ordered by revision.
+    pub fn list_reference_table_revisions(
+        &self,
+        name: &str,
+    ) -> Result<Vec<ReferenceTableMetadata>> {
+        check_name(name)?;
+        self.read(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT revision FROM reference_table_revisions
+                     WHERE name=?1 ORDER BY revision",
+                )
+                .map_err(db)?;
+            let revisions = stmt
+                .query_map([name], |r| r.get::<_, i64>(0))
+                .map_err(db)?;
+            let mut out = Vec::new();
+            for revision in revisions {
+                out.push(load_reference_table_metadata(
+                    c,
+                    name,
+                    revision.map_err(db)? as u64,
+                )?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Resolve and digest-check every table explicitly bound by a pipeline.
+    /// This read API is for validation/startup; `put_pipeline` repeats the
+    /// same check inside its own write transaction to close the TOCTOU gap.
+    pub fn reference_bindings(&self, spec: &PipelineSpec) -> Result<Vec<ReferenceTableRow>> {
+        if spec.reference_tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.read(|c| validate_reference_bindings(c, spec))
+    }
+
+    /// Read-only dependency preview for operations/diagnostics.  All queries
+    /// run inside one SQLite read transaction so the latest head, revision
+    /// metadata and persistent pipeline pins describe one catalog snapshot.
+    /// Pin rows are intentionally capped for response size; `total_count` and
+    /// `truncated` make that loss explicit.  GC never consumes this preview
+    /// and always evaluates the complete dependency relation in its write
+    /// transaction.
+    pub fn reference_table_dependencies(&self, name: &str) -> Result<serde_json::Value> {
+        check_name(name)?;
+        let guard = self
+            .inner
+            .conn
+            .lock()
+            .map_err(|_| SparrowError::new(ErrorCode::Internal, "catalog mutex poisoned"))?;
+        guard.execute_batch("BEGIN DEFERRED").map_err(db)?;
+        let result = (|| {
+            let latest: Option<i64> = guard
+                .query_row(
+                    "SELECT latest_revision FROM reference_table_heads WHERE name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db)?;
+            if latest.is_some_and(|revision| revision <= 0) {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "reference table head revision is invalid",
+                ));
+            }
+            if let Some(revision) = latest {
+                // Keep the preview fail-closed for a dangling head instead
+                // of presenting a plausible dependency report for a table
+                // that a job could not actually bind.
+                load_reference_table_metadata(&guard, name, revision as u64)?;
+            }
+
+            let mut revisions = Vec::new();
+            let mut revision_stmt = guard
+                .prepare(
+                    "SELECT revision FROM reference_table_revisions
+                     WHERE name=?1 ORDER BY revision",
+                )
+                .map_err(db)?;
+            let revision_rows = revision_stmt
+                .query_map([name], |r| r.get::<_, i64>(0))
+                .map_err(db)?;
+            for revision in revision_rows {
+                let revision = revision.map_err(db)?;
+                if revision <= 0 || revision as u64 > i64::MAX as u64 {
+                    return Err(SparrowError::new(
+                        ErrorCode::CodecViolation,
+                        "reference table revision metadata is invalid",
+                    ));
+                }
+                revisions.push(load_reference_table_metadata(
+                    &guard,
+                    name,
+                    revision as u64,
+                )?);
+                if revisions.len() > MAX_REFERENCE_TABLE_VERSIONS {
+                    return Err(SparrowError::new(
+                        ErrorCode::CodecViolation,
+                        format!(
+                            "reference table `{name}` exceeds {MAX_REFERENCE_TABLE_VERSIONS} revisions"
+                        ),
+                    ));
+                }
+            }
+            drop(revision_stmt);
+
+            let total_pins: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM pipeline_reference_tables WHERE table_name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .map_err(db)?;
+            if total_pins < 0 {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "reference table pin count is invalid",
+                ));
+            }
+            let mut pin_stmt = guard
+                .prepare(
+                    "SELECT pipeline_name, pipeline_revision, table_revision, sha256
+                     FROM pipeline_reference_tables
+                     WHERE table_name=?1
+                     ORDER BY table_revision, pipeline_name, pipeline_revision
+                     LIMIT ?2",
+                )
+                .map_err(db)?;
+            let pin_rows = pin_stmt
+                .query_map(
+                    params![name, MAX_REFERENCE_TABLE_PREVIEW_PINS as i64],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .map_err(db)?;
+            let mut pins = Vec::new();
+            for pin in pin_rows {
+                let (pipeline, pipeline_revision, table_revision, sha256) = pin.map_err(db)?;
+                if pipeline_revision <= 0 || table_revision <= 0 || !valid_sha256(&sha256) {
+                    return Err(SparrowError::new(
+                        ErrorCode::CodecViolation,
+                        "reference table dependency pin metadata is invalid",
+                    ));
+                }
+                pins.push(serde_json::json!({
+                    "pipeline": pipeline,
+                    "pipeline_revision": pipeline_revision,
+                    "table_revision": table_revision,
+                    "sha256": sha256,
+                }));
+            }
+            drop(pin_stmt);
+            let total_pins = total_pins as u64;
+            let revision_count = revisions.len();
+            let returned_pin_count = pins.len();
+            Ok(serde_json::json!({
+                "name": name,
+                "latest_revision": latest.map(|revision| revision as u64),
+                "revisions": revisions,
+                "revision_count": revision_count,
+                "pins": {
+                    "items": pins,
+                    "returned_count": returned_pin_count,
+                    "total_count": total_pins,
+                    "max_returned": MAX_REFERENCE_TABLE_PREVIEW_PINS,
+                    "truncated": total_pins > MAX_REFERENCE_TABLE_PREVIEW_PINS as u64,
+                    "kind": "persistent_pipeline_revision_dependency"
+                },
+                "gc": {
+                    "uses_complete_pin_relation": true,
+                    "preview_truncation_does_not_change_gc_roots": true
+                }
+            }))
+        })();
+        match result {
+            Ok(value) => {
+                match guard.execute_batch("COMMIT") {
+                    Ok(()) => Ok(value),
+                    Err(error) => {
+                        let _ = guard.execute_batch("ROLLBACK");
+                        Err(db(error))
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = guard.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Conservative B1 GC for one table.  No active-job/checkpoint deletion
+    /// is claimed here: every persisted pipeline revision is a permanent
+    /// dependency until a future explicit pipeline-retention API exists.
+    pub fn gc_reference_table(&self, name: &str) -> Result<serde_json::Value> {
+        check_name(name)?;
+        self.write(|c| {
+            let latest: Option<i64> = c
+                .query_row(
+                    "SELECT latest_revision FROM reference_table_heads WHERE name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db)?;
+            let Some(latest) = latest else {
+                return Ok(serde_json::json!({
+                    "name": name,
+                    "deleted": 0,
+                    "pinned": false,
+                    "pinned_revisions": [],
+                }));
+            };
+            if latest <= 0 {
+                return Err(SparrowError::new(
+                    ErrorCode::CodecViolation,
+                    "reference table head revision is invalid",
+                ));
+            }
+            // Do not let GC operate on a dangling/corrupt head.  Otherwise a
+            // damaged catalog could advance deletion while its advertised
+            // latest revision is already unavailable to a future job.
+            let _latest_metadata =
+                load_reference_table_metadata(c, name, latest as u64)?;
+            let mut pinned_revisions = Vec::new();
+            {
+                let mut stmt = c
+                    .prepare(
+                    "SELECT DISTINCT table_revision, sha256
+                     FROM pipeline_reference_tables
+                     WHERE table_name=?1
+                     ORDER BY table_revision",
+                )
+                .map_err(db)?;
+                let rows = stmt
+                    .query_map(params![name], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map_err(db)?;
+                for revision in rows {
+                    let (revision, sha256) = revision.map_err(db)?;
+                    if revision <= 0 {
+                        return Err(SparrowError::new(
+                            ErrorCode::CodecViolation,
+                            "reference table pin revision is invalid",
+                        ));
+                    }
+                    if !valid_sha256(&sha256) {
+                        return Err(SparrowError::new(
+                            ErrorCode::CodecViolation,
+                            "reference table pin digest is invalid",
+                        ));
+                    }
+                    if revision != latest {
+                        pinned_revisions.push(revision as u64);
+                    }
+                }
+            }
+            c.execute(
+                "DELETE FROM reference_table_revisions
+                 WHERE name=?1 AND revision != ?2
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pipeline_reference_tables p
+                       WHERE p.table_name=reference_table_revisions.name
+                         AND p.table_revision=reference_table_revisions.revision
+                   )",
+                params![name, latest],
+            )
+            .map_err(db)?;
+            let deleted = c.changes();
+            if deleted > 0 {
+                self.inner.reference_epoch.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(serde_json::json!({
+                "name": name,
+                "deleted": deleted,
+                "pinned": !pinned_revisions.is_empty(),
+                "pinned_revisions": pinned_revisions,
+                "latest_revision": latest as u64,
+            }))
+        })
     }
 
     pub fn put_pipeline(
@@ -270,6 +842,26 @@ impl Store {
                 params![name, next as i64, spec_json, etag, ts],
             )
             .map_err(db)?;
+            // Materialize every immutable table dependency in the same
+            // transaction as the pipeline revision.  GC therefore cannot
+            // observe a committed pipeline whose referenced revision is not
+            // yet pinned.  The helper also rechecks the digest, closing the
+            // validation-then-publish TOCTOU window.
+            for table in validate_reference_bindings(c, spec)? {
+                c.execute(
+                    "INSERT INTO pipeline_reference_tables
+                        (pipeline_name, pipeline_revision, table_name, table_revision, sha256)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        name,
+                        next as i64,
+                        table.name,
+                        table.revision as i64,
+                        table.sha256,
+                    ],
+                )
+                .map_err(db)?;
+            }
             c.execute(
                 "INSERT OR IGNORE INTO desired_state(name, desired_revision, desired_status, updated_at)
                  VALUES (?1, NULL, 'stopped', ?2)",
@@ -303,7 +895,7 @@ impl Store {
         &self,
         name: &str,
     ) -> Result<(PipelineRow, serde_json::Value)> {
-        let (row, key, cached, streams) = self.read(|c| {
+        let (row, key, cached) = self.read(|c| {
             let version: u64 = c
                 .query_row("PRAGMA data_version", [], |r| r.get(0))
                 .map_err(db)?;
@@ -311,6 +903,7 @@ impl Store {
             let key = (
                 row.latest_revision,
                 self.inner.stream_epoch.load(Ordering::Relaxed),
+                self.inner.reference_epoch.load(Ordering::Relaxed),
                 version,
             );
             let mut cache = self
@@ -326,24 +919,23 @@ impl Store {
                 let entry = cache.entries.remove(i).expect("cache index");
                 let value = entry.value.clone();
                 cache.entries.push_back(entry);
-                return Ok((row, key, Some(value), Vec::new()));
+                return Ok((row, key, Some(value)));
             }
             drop(cache);
-            Ok((row, key, None, load_streams(c)?))
+            Ok((row, key, None))
         })?;
         if let Some(value) = cached {
             return Ok((row, value));
         }
-        let plan = (|| {
-            let mut catalog = sparrow_plan::Catalog::new();
-            for stream in streams {
-                catalog.insert(
-                    stream.name.clone(),
-                    crate::validate::stream_to_schema(&stream)?,
-                );
-            }
-            crate::validate::bind_plan(&row.spec, &catalog, name, row.latest_revision)
-        })();
+        // Binding is intentionally outside the SQLite mutex.  The wrapper
+        // resolves immutable table revisions and their digests, then performs
+        // the same managed-table checks as validate/startup.
+        let plan = crate::validate::bind_plan_with_store(
+            self,
+            &row.spec,
+            name,
+            row.latest_revision,
+        );
         let effective = match plan {
             Ok(plan) => crate::validate::effective_guarantees_with_plan(&row.spec, &plan),
             Err(e) => {
@@ -1000,95 +1592,308 @@ fn load_streams(c: &Connection) -> Result<Vec<StreamRow>> {
     rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db)
 }
 
+fn load_reference_table_revision(
+    c: &Connection,
+    name: &str,
+    revision: u64,
+) -> Result<ReferenceTableRow> {
+    if revision == 0 || revision > i64::MAX as u64 {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "reference table revision is outside the storage range",
+        ));
+    }
+    let (stored_name, stored_revision, table_json, stored_sha, payload_bytes, row_count, created_at): (
+        String,
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+    ) = c
+        .query_row(
+            "SELECT name, revision, table_json, sha256, payload_bytes, row_count, created_at
+             FROM reference_table_revisions WHERE name=?1 AND revision=?2",
+            params![name, revision as i64],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db)?
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("reference table `{name}` has no revision {revision}"),
+            )
+        })?;
+    if stored_name != name || stored_revision <= 0 || stored_revision as u64 != revision {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "reference table revision identity is corrupt",
+        ));
+    }
+    if payload_bytes < 0 || row_count < 0 || created_at < 0 {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "reference table metadata contains a negative value",
+        ));
+    }
+    let table = ReferenceTableSpec::from_json(table_json.as_bytes())?;
+    let encoded = table.encoded_bytes()?;
+    if encoded.len() as u64 != payload_bytes as u64
+        || table.rows.len() as u64 != row_count as u64
+    {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "reference table metadata does not match its payload",
+        ));
+    }
+    let computed = reference_table_sha256(name, revision, &table)?;
+    if computed != stored_sha || !valid_sha256(&stored_sha) {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            format!("reference table `{name}` revision {revision} sha256 mismatch"),
+        ));
+    }
+    Ok(ReferenceTableRow {
+        name: stored_name,
+        revision,
+        sha256: stored_sha,
+        table,
+        payload_bytes: payload_bytes as u64,
+        row_count: row_count as u64,
+        created_at_ms: created_at,
+    })
+}
+
+fn load_reference_table_metadata(
+    c: &Connection,
+    name: &str,
+    revision: u64,
+) -> Result<ReferenceTableMetadata> {
+    if revision == 0 || revision > i64::MAX as u64 {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "reference table revision is outside the storage range",
+        ));
+    }
+    let (stored_name, stored_revision, stored_sha, payload_bytes, row_count, created_at): (
+        String,
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+    ) = c
+        .query_row(
+            "SELECT name, revision, sha256, payload_bytes, row_count, created_at
+             FROM reference_table_revisions WHERE name=?1 AND revision=?2",
+            params![name, revision as i64],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db)?
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("reference table `{name}` has no revision {revision}"),
+            )
+        })?;
+    if stored_name != name
+        || stored_revision <= 0
+        || stored_revision as u64 != revision
+        || payload_bytes < 0
+        || row_count < 0
+        || row_count as u64 > crate::reference_table::MAX_REFERENCE_TABLE_ROWS as u64
+        || payload_bytes as u64
+            > crate::reference_table::MAX_REFERENCE_TABLE_BYTES as u64
+        || created_at < 0
+        || !valid_sha256(&stored_sha)
+    {
+        return Err(SparrowError::new(
+            ErrorCode::CodecViolation,
+            "reference table metadata is invalid",
+        ));
+    }
+    Ok(ReferenceTableMetadata {
+        name: stored_name,
+        revision,
+        sha256: stored_sha,
+        payload_bytes: payload_bytes as u64,
+        row_count: row_count as u64,
+        created_at_ms: created_at,
+    })
+}
+
+fn validate_reference_bindings(
+    c: &Connection,
+    spec: &PipelineSpec,
+) -> Result<Vec<ReferenceTableRow>> {
+    let mut out = Vec::with_capacity(spec.reference_tables.len());
+    for (name, binding) in &spec.reference_tables {
+        let row = load_reference_table_revision(c, name, binding.revision)?;
+        if row.sha256 != binding.sha256 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "reference table `{name}` revision {} sha256 does not match the pipeline binding",
+                    binding.revision
+                ),
+            )
+            .context("expected_sha256", binding.sha256.clone())
+            .context("actual_sha256", row.sha256));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn existing_catalog_schema_version(conn: &Connection) -> Result<u32> {
+    let has_meta: i64 = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db)?;
+    if has_meta == 0 {
+        Ok(0)
+    } else {
+        meta_u32(conn, "catalog_schema_version")
+    }
+}
+
 fn init(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        PRAGMA foreign_keys=ON;
-        CREATE TABLE IF NOT EXISTS meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS streams (
-            name TEXT PRIMARY KEY,
-            schema_json TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS pipelines (
-            name TEXT PRIMARY KEY,
-            latest_revision INTEGER NOT NULL,
-            etag TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS pipeline_revisions (
-            name TEXT NOT NULL,
-            revision INTEGER NOT NULL,
-            spec_json TEXT NOT NULL,
-            etag TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (name, revision)
-        );
-        -- Status columns stay TEXT (A8). Rust reads/writes PipelineStatus;
-        -- no CHECK constraint so existing catalogs keep loading.
-        CREATE TABLE IF NOT EXISTS desired_state (
-            name TEXT PRIMARY KEY,
-            desired_revision INTEGER,
-            desired_status TEXT NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS actual_state (
-            name TEXT PRIMARY KEY,
-            actual_revision INTEGER,
-            actual_status TEXT NOT NULL,
-            attempt_id INTEGER NOT NULL DEFAULT 0,
-            consecutive_failures INTEGER NOT NULL DEFAULT 0,
-            restart_blocked INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS deployment_attempts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pipeline TEXT NOT NULL,
-            revision INTEGER NOT NULL,
-            started_at INTEGER NOT NULL,
-            outcome TEXT NOT NULL,
-            detail TEXT,
-            restore_claim TEXT NOT NULL DEFAULT 'none'
-        );
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            at_ms INTEGER NOT NULL,
-            actor TEXT NOT NULL,
-            action TEXT NOT NULL,
-            target TEXT,
-            detail TEXT,
-            outcome TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS secrets (
-            name TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS allowlist (
-            host TEXT NOT NULL,
-            port INTEGER NOT NULL,
-            PRIMARY KEY (host, port)
-        );
-        "#,
-    )
-    .map_err(db)?;
-    let ver = meta_u32(conn, "catalog_schema_version").unwrap_or(0);
-    if ver != 0 && ver != 1 && ver != CATALOG_SCHEMA_VERSION {
+    // Inspect the version before CREATE/ALTER so a future catalog is rejected
+    // without mutating it.  Older binaries (schema v2) consequently reject a
+    // catalog after this module has committed v3, rather than silently
+    // downgrading or ignoring table dependencies.
+    let ver = existing_catalog_schema_version(conn)?;
+    if ver > CATALOG_SCHEMA_VERSION {
         return Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
             format!(
-                "catalog_schema_version {ver} is not supported (want {CATALOG_SCHEMA_VERSION})"
+                "catalog_schema_version {ver} is newer than supported {CATALOG_SCHEMA_VERSION}"
             ),
         ));
     }
-    if ver < CATALOG_SCHEMA_VERSION {
-        conn.execute_batch("BEGIN IMMEDIATE").map_err(db)?;
-        let migrated = (|| -> Result<()> {
+    // Foreign-key enforcement is a connection setting and must be enabled
+    // before the schema transaction.  Every schema object and the version
+    // marker below are then committed (or rolled back) as one unit; an
+    // interrupted migration cannot leave a half-created v3 catalog behind.
+    conn.execute_batch("PRAGMA foreign_keys=ON;")
+        .map_err(db)?;
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(db)?;
+    let initialized = (|| -> Result<()> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS streams (
+                name TEXT PRIMARY KEY,
+                schema_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pipelines (
+                name TEXT PRIMARY KEY,
+                latest_revision INTEGER NOT NULL,
+                etag TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pipeline_revisions (
+                name TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                spec_json TEXT NOT NULL,
+                etag TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (name, revision)
+            );
+            -- Status columns stay TEXT (A8). Rust reads/writes PipelineStatus;
+            -- no CHECK constraint so existing catalogs keep loading.
+            CREATE TABLE IF NOT EXISTS desired_state (
+                name TEXT PRIMARY KEY,
+                desired_revision INTEGER,
+                desired_status TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS actual_state (
+                name TEXT PRIMARY KEY,
+                actual_revision INTEGER,
+                actual_status TEXT NOT NULL,
+                attempt_id INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                restart_blocked INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS deployment_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pipeline TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                started_at INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                detail TEXT,
+                restore_claim TEXT NOT NULL DEFAULT 'none'
+            );
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at_ms INTEGER NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                detail TEXT,
+                outcome TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS secrets (
+                name TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS allowlist (
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                PRIMARY KEY (host, port)
+            );
+            "#,
+        )
+        .map_err(db)?;
+        if ver == CATALOG_SCHEMA_VERSION && !reference_catalog_schema_complete(conn)? {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "catalog schema v3 is missing immutable reference-table dependency tables; refusing to continue or GC",
+            ));
+        }
+        if ver < CATALOG_SCHEMA_VERSION {
             migrate_actual_consecutive_failures(conn)?;
             migrate_restart_blocked(conn)?;
+            migrate_reference_table_catalog(conn)?;
             if ver == 0 {
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES ('catalog_schema_version', ?1), ('format_version', ?2)",
@@ -1101,15 +1906,16 @@ fn init(conn: &Connection) -> Result<()> {
                 )
                 .map_err(db)?;
             }
-            Ok(())
-        })();
-        if let Err(error) = migrated {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(error);
         }
-        conn.execute_batch("COMMIT").map_err(db)?;
+        Ok(())
+    })();
+    match initialized {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(db),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
     }
-    Ok(())
 }
 
 fn migrate_restart_blocked(conn: &Connection) -> Result<()> {
@@ -1140,6 +1946,216 @@ fn migrate_restart_blocked(conn: &Connection) -> Result<()> {
         ).map_err(db)?;
     }
     Ok(())
+}
+
+fn migrate_reference_table_catalog(conn: &Connection) -> Result<()> {
+    // Keep the migration idempotent for v0/v1/v2 catalogs and for a process
+    // interrupted after the schema objects were created but before meta was
+    // advanced.  Data is append-only; there is no destructive backfill.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS reference_table_revisions (
+            name TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            table_json TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            payload_bytes INTEGER NOT NULL,
+            row_count INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (name, revision)
+         );
+         CREATE TABLE IF NOT EXISTS reference_table_heads (
+            name TEXT PRIMARY KEY,
+            latest_revision INTEGER NOT NULL,
+            FOREIGN KEY (name, latest_revision)
+                REFERENCES reference_table_revisions(name, revision)
+         );
+         CREATE TABLE IF NOT EXISTS pipeline_reference_tables (
+            pipeline_name TEXT NOT NULL,
+            pipeline_revision INTEGER NOT NULL,
+            table_name TEXT NOT NULL,
+            table_revision INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            PRIMARY KEY (pipeline_name, pipeline_revision, table_name),
+            FOREIGN KEY (pipeline_name, pipeline_revision)
+                REFERENCES pipeline_revisions(name, revision),
+            FOREIGN KEY (table_name, table_revision)
+                REFERENCES reference_table_revisions(name, revision)
+         );
+         CREATE INDEX IF NOT EXISTS pipeline_reference_tables_by_table
+            ON pipeline_reference_tables(table_name, table_revision);",
+    )
+    .map_err(db)?;
+    if reference_catalog_schema_complete(conn)? {
+        Ok(())
+    } else {
+        Err(SparrowError::new(
+            ErrorCode::InvalidSchema,
+            "reference-table catalog migration did not create the complete v3 schema",
+        ))
+    }
+}
+
+fn reference_catalog_schema_complete(conn: &Connection) -> Result<bool> {
+    const REVISION_COLUMNS: &[&str] = &[
+        "name",
+        "revision",
+        "table_json",
+        "sha256",
+        "payload_bytes",
+        "row_count",
+        "created_at",
+    ];
+    const HEAD_COLUMNS: &[&str] = &["name", "latest_revision"];
+    const PIN_COLUMNS: &[&str] = &[
+        "pipeline_name",
+        "pipeline_revision",
+        "table_name",
+        "table_revision",
+        "sha256",
+    ];
+    for (table, columns, primary_key) in [
+        (
+            "reference_table_revisions",
+            REVISION_COLUMNS,
+            &["name", "revision"][..],
+        ),
+        ("reference_table_heads", HEAD_COLUMNS, &["name"][..]),
+        (
+            "pipeline_reference_tables",
+            PIN_COLUMNS,
+            &["pipeline_name", "pipeline_revision", "table_name"][..],
+        ),
+    ] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |r| r.get(0),
+            )
+            .map_err(db)?;
+        if exists == 0 {
+            return Ok(false);
+        }
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(db)?;
+        let mut found = std::collections::HashSet::new();
+        for row in rows {
+            found.insert(row.map_err(db)?);
+        }
+        if columns.iter().any(|column| !found.contains(*column)) {
+            return Ok(false);
+        }
+        if !primary_key_matches(conn, table, primary_key)? {
+            return Ok(false);
+        }
+    }
+    // These relations are what make a committed pipeline revision a durable
+    // GC root.  Merely having the columns is not enough: a damaged v3
+    // catalog with a missing/mismatched FK must fail closed rather than let
+    // a later DELETE silently orphan a running pipeline's lookup revision.
+    if !primary_key_matches(conn, "pipeline_revisions", &["name", "revision"])? {
+        return Ok(false);
+    }
+    if !foreign_key_matches(
+        conn,
+        "reference_table_heads",
+        "reference_table_revisions",
+        &["name", "latest_revision"],
+        &["name", "revision"],
+    )? || !foreign_key_matches(
+        conn,
+        "pipeline_reference_tables",
+        "pipeline_revisions",
+        &["pipeline_name", "pipeline_revision"],
+        &["name", "revision"],
+    )? || !foreign_key_matches(
+        conn,
+        "pipeline_reference_tables",
+        "reference_table_revisions",
+        &["table_name", "table_revision"],
+        &["name", "revision"],
+    )? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn primary_key_matches(conn: &Connection, table: &str, expected: &[&str]) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(db)?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
+        .map_err(db)?;
+    let mut actual = Vec::new();
+    for row in rows {
+        let (name, position) = row.map_err(db)?;
+        if position > 0 {
+            actual.push((position, name));
+        }
+    }
+    actual.sort_by_key(|(position, _)| *position);
+    Ok(actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|((_, actual), expected)| actual.as_str() == *expected))
+}
+
+fn foreign_key_matches(
+    conn: &Connection,
+    table: &str,
+    target: &str,
+    from: &[&str],
+    to: &[&str],
+) -> Result<bool> {
+    if from.len() != to.len() {
+        return Ok(false);
+    }
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA foreign_key_list({table})"))
+        .map_err(db)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(db)?;
+    let mut groups = std::collections::BTreeMap::<
+        i64,
+        (String, Vec<(i64, String, String)>),
+    >::new();
+    for row in rows {
+        let (id, sequence, target_table, source, destination) = row.map_err(db)?;
+        let entry = groups
+            .entry(id)
+            .or_insert_with(|| (target_table, Vec::new()));
+        entry.1.push((sequence, source, destination));
+    }
+    groups.values_mut().for_each(|(_, pairs)| {
+        pairs.sort_by_key(|(sequence, _, _)| *sequence);
+    });
+    let matches = groups.values().any(|(target_table, pairs)| {
+        target_table.as_str() == target
+            && pairs.len() == from.len()
+            && pairs
+                .iter()
+                .zip(from.iter().zip(to))
+                .all(|((_, actual_from, actual_to), (expected_from, expected_to))| {
+                    actual_from.as_str() == *expected_from
+                        && actual_to.as_str() == *expected_to
+                })
+    });
+    Ok(matches)
 }
 
 fn migrate_actual_consecutive_failures(conn: &Connection) -> Result<()> {
@@ -1543,6 +2559,7 @@ mod tests {
             graph_io: None,
             version: 1,
             stream: "sensors".into(),
+            reference_tables: Default::default(),
             sql: Some("SELECT device_id FROM sensors".into()),
             graph: None,
             source: SourceSpec {
@@ -1942,7 +2959,7 @@ mod tests {
     fn r5_v1_migration_preserves_failures_and_does_not_rearm_unlocked_jobs() {
         let c = legacy_v1_catalog();
         init(&c).unwrap();
-        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 2);
+        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 3);
         assert_eq!(meta_u32(&c, "format_version").unwrap(), 1);
         for (name, expected) in [
             ("a", true),
@@ -2004,7 +3021,7 @@ mod tests {
             .is_err());
         c.execute_batch("DROP TRIGGER fail_migration;").unwrap();
         init(&c).unwrap();
-        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 2);
+        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 3);
     }
 
     #[test]

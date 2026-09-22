@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "stream": "telemetry",
+  "source": {"kind":"file","path":"/var/lib/sparrow/data/k4-hysteresis.ndjson","file_contract":"append_only","inbox_capacity":8},
+  "sink": {"kind":"http","url":"http://127.0.0.1:18082/telemetry","batch_rows":32,"linger_ms":5,"outbox_capacity":8},
+  "recovery": "aligned",
+  "checkpoint_dir": "/var/lib/sparrow/checkpoints/hysteresis-v12",
+  "checkpoint": {"interval_ms":10000,"timeout_ms":5000,"retain_generations":3,"max_store_bytes":33554432,"resume_latest":true},
+  "graph": {
+    "version":1,"pipeline_id":403,"revision_id":1,
+    "nodes":[
+      {"id":1,"kind":"memory_source","table":"telemetry","out":[2]},
+      {"id":2,"kind":"hysteresis","iot":{
+        "keys":["device_id"],"fields":["temperature"],"emit_first":true,"ttl_micros":0,"max_keys":1024,"invalid":"ignore",
+        "hysteresis":{"direction":"high","enter":60.0,"exit":55.0}
+      },"out":[3]},
+      {"id":3,"kind":"capture_sink","name":"hysteresis"}
+    ]
+  }
+}

@@ -1,7 +1,8 @@
 //! Bounded IoT state operators.
 //!
-//! This module deliberately keeps the first IoT slice small: Change and
-//! Deadband are task-owned keyed operators over first-class scalar values.
+//! Change, Deadband and Hysteresis are task-owned keyed operators over
+//! first-class scalar values. Hysteresis stores a typed Bool latch rather
+//! than reusing a numeric deadband baseline.
 //! Values which enter state are detached, and every state/index replacement is
 //! admitted before the old entry is changed.  Processing-time TTL is useful
 //! for a live job, but TTL-bearing state is not part of the aligned snapshot
@@ -25,11 +26,21 @@ pub const IOT_STATE_SLOT: StateSlotId = StateSlotId::new(3);
 pub const IOT_CHANGE_KIND: u8 = 4;
 /// Freeze kind for [`IotSpec`] with a deadband.
 pub const IOT_DEADBAND_KIND: u8 = 5;
+pub const IOT_HYSTERESIS_KIND: u8 = 6;
 /// A freeze is bounded independently of the outer snapshot envelope.
 pub const MAX_IOT_FREEZE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_IOT_FREEZE_ENTRIES: usize = 16 * 1024;
 
 const MAX_IOT_ARITY: usize = 64;
+
+fn validate_timed_metadata(kind:u8,start:i64,deadline:i64,trailing:bool,now:Option<i64>) -> Result<()> {
+    if start<0 || (deadline != -1 && deadline<=start)
+        || (kind==7 && trailing!=(deadline!=-1)) || (kind==8 && deadline==-1)
+        || now.is_some_and(|now| start>now || (deadline!=-1 && deadline<=now)) {
+        return Err(codec("timed IoT state disagrees with its processing-time cut"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 struct StoredIotState {
@@ -63,7 +74,8 @@ pub struct IotEntry {
 /// IoT state frame.  The frame is embedded in the outer snapshot v6 envelope;
 /// it therefore intentionally has no magic prefix of its own.  Its fixed
 /// header is the same 11-byte state frame shape used by the existing runtime:
-/// `u32 operator | u16 slot(3) | u8 kind(4/5) | u32 entry_count`.
+/// `u32 operator | u16 slot(3) | u8 kind(4/5/6) | u32 entry_count`.
+/// Kind 6 requires a newer outer profile; it never upgrades v6/v7 in place.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IotFreeze {
     pub operator: OperatorId,
@@ -147,6 +159,10 @@ impl IotFreeze {
     /// scans every scalar and detects duplicate keys, but does not allocate
     /// decoded `Scalar` values; the caller may use it for bounded admission.
     pub fn decode_mode(src: &mut &[u8], max_keys: usize, materialize: bool) -> Result<Self> {
+        Self::decode_at_cut(src, max_keys, materialize, None)
+    }
+
+    pub(crate) fn decode_at_cut(src: &mut &[u8], max_keys: usize, materialize: bool, now: Option<i64>) -> Result<Self> {
         if src.len() > MAX_IOT_FREEZE_BYTES {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -195,23 +211,53 @@ impl IotFreeze {
                 return Err(codec("duplicate IoT freeze key"));
             }
             let value_len = take_u16(src, "IoT freeze value arity")? as usize;
-            if value_len == 0 || value_len > MAX_IOT_ARITY {
+            if value_len == 0 || value_len > MAX_IOT_ARITY
+                || (header.kind == IOT_HYSTERESIS_KIND && value_len != 1) {
                 return Err(SparrowError::new(
                     ErrorCode::BoundExceeded,
                     "IoT freeze value arity is invalid",
                 ));
             }
+            let timed = matches!(header.kind,7|8);
             let mut values = Vec::with_capacity(if materialize { value_len } else { 0 });
-            for _ in 0..value_len {
+            let mut prefix = 0;
+            if timed {
+                if value_len < 4 || src.len()<20 || src[0]!=2 || src[9]!=2 || src[18]!=1 || src[19]>1 {
+                    return Err(codec("timed IoT freeze metadata encoding"));
+                }
+                let start = i64::from_le_bytes(src[1..9].try_into().unwrap());
+                let deadline = i64::from_le_bytes(src[10..18].try_into().unwrap());
+                let trailing = src[19]!=0;
+                validate_timed_metadata(header.kind,start,deadline,trailing,now)?;
+                if materialize { values.extend([Scalar::Int64(start),Scalar::Int64(deadline),Scalar::Bool(trailing)]); }
+                *src = &src[20..]; prefix = 3;
+            }
+            for _ in prefix..value_len {
+                if header.kind == IOT_HYSTERESIS_KIND {
+                    // Bool tag 1 is a fixed-width scalar. Check before decode
+                    // so header-only validation never allocates another type.
+                    if src.len() < 2 || src[0] != 1 || src[1] > 1 {
+                        return Err(codec("hysteresis freeze requires a Bool latch"));
+                    }
+                    let value = Scalar::Bool(src[1] != 0);
+                    *src = &src[2..];
+                    if materialize { values.push(value); }
+                    ensure_decoded_size(input_len.saturating_sub(src.len()))?;
+                    continue;
+                }
                 if materialize {
                     let value = Scalar::decode_value(src)?;
-                    validate_freeze_scalar(&value, false)?;
+                    if !(matches!(header.kind,7|8) && value.is_null()) {
+                        validate_freeze_scalar(&value, false)?;
+                    }
                     values.push(value);
                 } else {
                     let before = *src;
                     Scalar::skip_encoded_value(src)?;
                     let consumed = before.len().saturating_sub(src.len());
-                    validate_encoded_scalar(&before[..consumed], false)?;
+                    if !(matches!(header.kind,7|8) && before[..consumed]==[0]) {
+                        validate_encoded_scalar(&before[..consumed], false)?;
+                    }
                 }
                 ensure_decoded_size(input_len.saturating_sub(src.len()))?;
             }
@@ -238,7 +284,7 @@ impl IotFreeze {
         if slot != IOT_STATE_SLOT {
             return Err(codec("IoT freeze StateSlotId is not 3"));
         }
-        if !matches!(kind, IOT_CHANGE_KIND | IOT_DEADBAND_KIND) {
+        if !matches!(kind, 4..=8) {
             return Err(codec("unknown IoT freeze kind"));
         }
         Ok(IotFreezeHeader {
@@ -287,7 +333,7 @@ impl IotFreeze {
         if self.slot != IOT_STATE_SLOT {
             return Err(codec("IoT freeze StateSlotId is not 3"));
         }
-        if !matches!(self.kind, IOT_CHANGE_KIND | IOT_DEADBAND_KIND) {
+        if !matches!(self.kind, 4..=8) {
             return Err(codec("unknown IoT freeze kind"));
         }
         if max_keys == 0
@@ -301,6 +347,16 @@ impl IotFreeze {
         }
         let mut seen = BTreeSet::new();
         for entry in &self.entries {
+            if matches!(self.kind,7|8) {
+                match entry.values.as_slice() {
+                    [Scalar::Int64(start),Scalar::Int64(deadline),Scalar::Bool(trailing),_,..] =>
+                        validate_timed_metadata(self.kind,*start,*deadline,*trailing,None)?,
+                    _ => return Err(codec("timed IoT freeze metadata")),
+                }
+            }
+            if self.kind == IOT_HYSTERESIS_KIND && !matches!(entry.values.as_slice(), [Scalar::Bool(_)]) {
+                return Err(codec("hysteresis freeze requires exactly one Bool latch"));
+            }
             if entry.key.is_empty()
                 || entry.key.len() > MAX_IOT_ARITY
                 || entry.values.is_empty()
@@ -318,6 +374,7 @@ impl IotFreeze {
                 return Err(codec("duplicate IoT freeze key"));
             }
             for value in &entry.values {
+                if matches!(self.kind,7|8) && value.is_null() { continue; }
                 validate_freeze_scalar(value, false)?;
             }
         }
@@ -325,7 +382,7 @@ impl IotFreeze {
     }
 }
 
-/// A single-task Change or Deadband state operator.
+/// A single-task Change, Deadband or Hysteresis state operator.
 pub struct IotOperator {
     operator: OperatorId,
     spec: IotSpec,
@@ -339,6 +396,7 @@ pub struct IotOperator {
     owner: Arc<MemoryOwner>,
     expiry: BTreeMap<(i64, Vec<u8>), StateKey>,
     expiry_bytes: usize,
+    timed: Option<crate::timed_iot::TimedIot>,
     _metadata_lease: MemoryLease,
     stats: IotStats,
 }
@@ -366,12 +424,15 @@ impl IotOperator {
         let field_idx = resolve_names(&input, &spec.fields, "value")?;
         validate_iot_types(&spec, &input, &field_idx)?;
         let state = MemoryState::new(Arc::clone(&owner), operator, IOT_STATE_SLOT, spec.max_keys)?;
+        let input = Arc::new(input);
+        let timed = spec.timing.as_ref().map(|_| crate::timed_iot::TimedIot::new(operator, &spec,
+            input.clone(),owner.clone(),key_idx.clone(),field_idx.clone())).transpose()?;
         Ok(Self {
             operator,
             spec,
             key_idx,
             field_idx,
-            input: Arc::new(input),
+            input,
             state,
             table_lease: None,
             owner,
@@ -379,6 +440,7 @@ impl IotOperator {
             expiry_bytes: 0,
             _metadata_lease: metadata_lease,
             stats: IotStats::default(),
+            timed,
         })
     }
 
@@ -484,6 +546,7 @@ impl IotOperator {
             )
             .at_operator(self.operator));
         }
+        if let Some(timed) = &mut self.timed { return timed.on_batch(batch, now); }
         self.expire(now);
         let mut output = sparrow_model::RowBatchBuilder::new(
             self.input.clone(),
@@ -532,6 +595,7 @@ impl IotOperator {
     }
 
     pub fn next_deadline(&self) -> Option<i64> {
+        if let Some(timed) = &self.timed { return timed.next_deadline(); }
         if self.spec.ttl_micros <= 0 {
             return None;
         }
@@ -539,10 +603,12 @@ impl IotOperator {
     }
 
     pub fn pending_timers(&self) -> usize {
+        if let Some(timed) = &self.timed { return timed.pending_timers(); }
         self.expiry.len()
     }
 
     pub fn cleanup(&mut self) {
+        if let Some(timed) = &mut self.timed { timed.cleanup(); }
         self.state.clear_and_release_capacity();
         self.table_lease = None;
         self.expiry.clear();
@@ -554,15 +620,18 @@ impl IotOperator {
     }
 
     pub fn key_count(&self) -> usize {
+        if let Some(timed) = &self.timed { return timed.key_count(); }
         self.state.len()
     }
 
     /// Effective cap after the job budget is applied to the plan's max_keys.
     pub fn max_keys(&self) -> usize {
+        if let Some(timed) = &self.timed { return timed.max_keys(); }
         self.state.max_keys()
     }
 
     pub fn retention_bytes(&self) -> usize {
+        if let Some(timed) = &self.timed { return timed.retention_bytes(); }
         self.state
             .retention_bytes()
             .saturating_add(self.expiry_bytes)
@@ -570,6 +639,7 @@ impl IotOperator {
     }
 
     pub fn stats(&self) -> IotStats {
+        if let Some(timed) = &self.timed { return timed.stats(); }
         self.stats
     }
 
@@ -578,6 +648,7 @@ impl IotOperator {
     }
 
     pub fn estimated_freeze_bytes(&self) -> usize {
+        if let Some(timed) = &self.timed { return timed.estimated_freeze_bytes(); }
         let mut total = 11usize;
         for (key, value) in self.state.iter() {
             total = total
@@ -602,6 +673,7 @@ impl IotOperator {
 
     #[cfg(test)]
     pub fn freeze(&self) -> Result<IotFreeze> {
+        if let Some(timed) = &self.timed { return timed.freeze(); }
         if self.spec.ttl_micros != 0 {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
@@ -641,6 +713,7 @@ impl IotOperator {
     }
 
     pub fn encode_freeze_into(&self, out: &mut Vec<u8>, max_keys: usize) -> Result<()> {
+        if let Some(timed) = &self.timed { return timed.encode(out,max_keys); }
         if self.spec.ttl_micros != 0 {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
@@ -692,6 +765,10 @@ impl IotOperator {
     /// pass schema, key, value and budget checks. A malformed/oversized frame
     /// therefore never clears a currently running operator.
     pub fn restore(&mut self, freeze: &IotFreeze) -> Result<()> {
+        if let Some(timed) = &mut self.timed {
+            freeze.validate_shape(timed.max_keys())?;
+            return timed.restore(freeze);
+        }
         if self.spec.ttl_micros != 0 {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
@@ -772,11 +849,26 @@ impl IotOperator {
     }
 
     fn freeze_kind(&self) -> u8 {
-        if self.spec.deadband.is_some() {
+        if let Some(timing) = &self.spec.timing {
+            timing.state_kind()
+        } else if self.spec.hysteresis.is_some() {
+            IOT_HYSTERESIS_KIND
+        } else if self.spec.deadband.is_some() {
             IOT_DEADBAND_KIND
         } else {
             IOT_CHANGE_KIND
         }
+    }
+
+    pub fn is_timed(&self) -> bool { self.timed.is_some() }
+    pub fn validate_processing_cut(&mut self,now:i64)->Result<()> {
+        self.timed.as_mut().ok_or_else(||codec("operator has no ordered clock"))?.validate_cut(now)
+    }
+    pub fn set_processing_time(&mut self, now: i64) -> Result<()> {
+        self.timed.as_mut().ok_or_else(||codec("operator has no ordered clock"))?.set_time(now)
+    }
+    pub fn take_timed_due(&mut self, now: i64) -> Result<Option<RowBatch>> {
+        self.timed.as_mut().ok_or_else(||codec("operator has no ordered clock"))?.take_due(now)
     }
 
     fn validate_row(&self, row: &Row) -> Result<bool> {
@@ -845,6 +937,25 @@ impl IotOperator {
         previous: Option<&StoredIotState>,
         current: &[Scalar],
     ) -> Result<(bool, Vec<Scalar>)> {
+        if let Some(hysteresis) = &self.spec.hysteresis {
+            let active = match previous {
+                None => false,
+                Some(previous) => match previous.values.as_slice() {
+                    [Scalar::Bool(active)] => *active,
+                    _ => return Err(codec("invalid hysteresis latch in live state")),
+                },
+            };
+            let threshold = if active { hysteresis.exit } else { hysteresis.enter };
+            let comparison = compare_threshold(&current[0], threshold)?;
+            let crossed = match (hysteresis.direction, active) {
+                (sparrow_plan::HysteresisDirection::High, false)
+                | (sparrow_plan::HysteresisDirection::Low, true) => !comparison.is_lt(),
+                _ => !comparison.is_gt(),
+            };
+            let next = if crossed { !active } else { active };
+            let emit = if previous.is_none() { self.spec.emit_first } else { next != active };
+            return Ok((emit, vec![Scalar::Bool(next)]));
+        }
         let Some(previous) = previous else {
             return Ok((
                 self.spec.emit_first,
@@ -972,6 +1083,13 @@ impl IotOperator {
                 ));
             }
         }
+        if self.spec.hysteresis.is_some() {
+            return if matches!(entry.values.as_slice(), [Scalar::Bool(_)]) {
+                Ok(())
+            } else {
+                Err(codec("hysteresis freeze requires a Bool latch"))
+            };
+        }
         for (value, &index) in entry.values.iter().zip(&self.field_idx) {
             let field = &self.input.fields[index];
             if value.is_null()
@@ -1053,7 +1171,7 @@ fn validate_iot_types(spec: &IotSpec, input: &Schema, fields: &[usize]) -> Resul
             ));
         }
     }
-    if spec.deadband.is_some() {
+    if spec.deadband.is_some() || spec.hysteresis.is_some() {
         if fields.len() != 1 {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
@@ -1174,7 +1292,7 @@ fn encode_entry(out: &mut Vec<u8>, entry: &IotEntry, start: usize) -> Result<()>
     encode_entry_parts(out, &entry.key, &entry.values, start)
 }
 
-fn encode_entry_parts(
+pub(crate) fn encode_entry_parts(
     out: &mut Vec<u8>,
     key: &[Scalar],
     values: &[Scalar],
@@ -1233,6 +1351,24 @@ fn validate_encoded_scalar(bytes: &[u8], key: bool) -> Result<()> {
         8 => Err(codec("Dynamic value cannot enter IoT state")),
         _ => Err(codec("invalid encoded IoT scalar tag")),
     }
+}
+
+/// Compare integer inputs without rounding them to f64. The threshold is
+/// the declared finite f64 value, including fractional and >2^53 values.
+fn compare_threshold(value: &Scalar, threshold: f64) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let integer = match value {
+        Scalar::Int64(value) => i128::from(*value),
+        Scalar::UInt64(value) => i128::from(*value),
+        Scalar::Float64(value) => return value.partial_cmp(&threshold)
+            .ok_or_else(|| codec("non-finite hysteresis comparison")),
+        _ => return Err(codec("hysteresis comparison requires a numeric scalar")),
+    };
+    if threshold >= i128::MAX as f64 { return Ok(Ordering::Less); }
+    if threshold <= i128::MIN as f64 { return Ok(Ordering::Greater); }
+    let floor = threshold.floor();
+    let order = integer.cmp(&(floor as i128));
+    Ok(if order.is_eq() && threshold != floor { Ordering::Less } else { order })
 }
 
 fn deadband_exceeds(
@@ -1433,6 +1569,8 @@ mod tests {
             max_keys: 16,
             invalid: InvalidValuePolicy::Error,
             deadband: None,
+            hysteresis: None,
+            timing: None,
         }
     }
 

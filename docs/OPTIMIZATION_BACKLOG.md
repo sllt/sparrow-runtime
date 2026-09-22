@@ -1,8 +1,8 @@
 # Sparrow 非阻断问题与优化清单
 
-更新日期：2026-09-17。已提交核对基线：`d52b15c`（K2/R12 Preview）；K3/K4 未提交候选的新增证据单独标明。
+更新日期：2026-09-19。已提交核对基线：`1dd17c8`（含 K3/K4）；后续 Core-A/B1/B2-A、K1～K4 组合完善与时间型 Preview 的新增证据单独标明，均未提交。
 
-K3 开发候选的新增条目按 [K3 匹配构建](DAG.md#k3-validation) 单独标明，不把未提交的新代码混称为 `d52b15c`。
+K3/K4 历史条目按各自匹配构建解释；后续条目链接对应 Core-A/B1/B2-A 候选证据，不把未提交的新代码混称为已提交基线。
 
 这是项目长期维护的优化清单，不是某一轮 review 报告。集中记录**在当前适用范围内不阻断使用，但有性能、资源、时效或维护成本问题**的项目，后续可以按模块成批处理。
 
@@ -30,6 +30,9 @@ K3 开发候选的新增条目按 [K3 匹配构建](DAG.md#k3-validation) 单独
 | [OPT-007](#opt-007) | Supervisor：held 规则重复读取 catalog | 待量化 | 低，多规则场景时提升 | held 数量较少，控制面时效及 SQLite 压力可接受 |
 | [OPT-008](#opt-008) | DAG：Sink 失败观察的空闲轮询 | 待量化 | 低，多空闲图时提升 | 当前图数量下的空闲 CPU/唤醒量满足部署要求 |
 | [OPT-009](#opt-009) | 工程质量：Clippy 提示分批清理 | 待整理 | 低，维护性 | 不将 lint 告警当作已通过 `-D warnings`，功能/故障门禁独立执行 |
+| [OPT-010](#opt-010) | 参考表：保守构造/Lookup scratch 配额 | 待量化 | 负载需求驱动 | 已用真实表/schema/batch 验证容量，不将 64 KiB wire 上限理解为所有 Job 均可接纳 |
+| [OPT-011](#opt-011) | 可靠 checkpoint：API 取消可能先于根因透传 | 待优化 | 低，诊断体验 | 结合最终actual错误排障；受保护CURRENT与ACK正确性已通过故障验证 |
+| [OPT-012](#opt-012) | 时间型 profile：逐决策 fsync / checkpoint / HTTP 串行成本 | 待优化 | 按目标速率决定 | 低频规则的容量、时效和磁盘写入满足要求；不能拿旧高吞吐路径的指标为 v14/v15 背书 |
 
 ### 2.1 JetStream 接入链路
 
@@ -104,8 +107,34 @@ K3 开发候选的新增条目按 [K3 匹配构建](DAG.md#k3-validation) 单独
 ### OPT-009 — Clippy 提示分批清理
 
 - **证据**：K4 候选在 Rust 1.98.0 下执行 default-members、all-targets、JetStream feature 的 release Clippy，正常命令退出 0，日志有 87 条提示；严格 `-D warnings` 被既有 `unnecessary_map_or` / `manual_div_ceil` 等提示阻断。见 K4 产物的 `clippy-v5.log` / `clippy-v3-preflight.log`。
+- **后续候选**：Core-A v4 为90条、B1 v2为95条、B2-A v4为97条，本轮K1～K4组合候选v7为100条，均是正常Clippy退出0；对应产物各自保存，不将旧的87条当作当前数量。B2-A未调用的`validate_aligned_plan_with_references`包装函数已在本轮移除；实际启动经`checkpoint_plan_with_references`和Kernel校验真实依赖，不是缺少恢复验证。
 - **范围**：这是现工作区 lint 提示数，不是 87 个已确认功能 BUG，也不是完整 release 认证。包含风格/简化建议；本批不顺带重写无关模块，避免扩大 K4 回归面。
+- **时间型 Preview（2026-09-19）**：`paused-time-artifacts-20260919/clippy-v6.log` 普通 Clippy 退出 0，共 102 条 warning。新增时间 cut 的两个迭代/整除写法建议以及 Source 枚举体积提示，不是已确认数据正确性问题；后续等价整理仍需匹配测试，不在本轮为清理样式追加 Rust 重编译。
 - **待办/验收**：按模块分类，优先确认有语义影响的项，其余做等价整理；每批保留原测试/性能门槛，最终再启用零告警门禁，不能靠全局 allow 隐藏问题。若具体提示揭示正确性/安全问题，应立即转修复任务而非继续留在普通优化清单。
+
+<a id="opt-010"></a>
+### OPT-010 — 参考表的保守构造/Lookup scratch 配额
+
+- **现状/证据**：B1 loader 在复制前预留 `payload_bytes × 64 + 64 KiB`，还要保留表的 resident/CRC 构造峰值 lease。默认 4 MiB reservation 因此不能保证装入每一个接近 64 KiB 的表；Lookup scratch 还用已选定表的最大行 resident 上界，遇到大但不常命中的行/未保留字段可能提前报配额不足。代码边界确认，收益和典型场景容量尚未量化；不是结果错误或静默丢弃。
+- **待办**：按实际 schema、字符串/key/keep/batch 组合测容量，再考虑更紧的、仍在复制前准入的 typed estimate；必要时为选定命中行计费。不得恢复按 wire/logical bytes 冒充 resident 的旧计量，也不得绕过共享 Job owner。
+- **验收与可延后前提**：目标表和输入 batch 已经完整通过加载/运行、错误退款与 RSS 检查时可延期。若业务所需表被默认配额拒绝，本项是该部署前置；比较成功边界、拒绝边界和峰值，不通过扩大默认预算制造“优化”。保留 binding SHA、miss/NULL、并发版本选择与取消 guard 的正确性。
+
+<a id="opt-011"></a>
+### OPT-011 — 可靠 checkpoint 失败的 API 根因透传
+
+- **状态/优先级**：待优化，诊断体验；不改变提交或ACK合同。
+- **现象/证据**：本轮profile10的`CURRENT.tmp`真实I/O故障会结束可靠attempt。API waiter可能先返回`cancelled: job stopping`，实际根因随后保留在`actual.last_error`，含`checkpoint io:`与`is a directory`。见`k1-k4-core-artifacts-20260917/completion-v7d/process`；受保护CURRENT/payload、未提交pending及相同ID恢复均通过。
+- **影响/延期前提**：数据正确性路径会fail-closed，不提前ACK；排障需关联API响应和最终pipeline状态，不能把取消本身当作存储错误证明。
+- **改进/验收**：考虑在单飞checkpoint完成对象中保留首个决定性错误，再通知取消waiter；区分用户取消、超时和实际存储失败。覆盖失败/stop同时发生、任务join、已有waiter超时后提交完成等竞态，不延迟资源释放，不覆盖先发生的根因或泄漏敏感路径。关联OBS、REL、OPS；未分配解决commit。
+
+<a id="opt-012"></a>
+### OPT-012 — 时间型 profile 的逐决策提交成本
+
+- **状态/范围**：待优化；仅影响新 v14/v15。为先证明恢复正确性，当前一个输入行/空闲 tick 对应一个持久决策和完整 checkpoint，提交前不开放下一决策。它不是旧 v3～v13 高吞吐链路的退化，也不是通用多记录 WAL。
+- **实测**：`box@100.64.0.18` 的 `paused-time-artifacts-20260919/process-v4/serialized-cost-{0,20}ms`，File、单 key、Debounce leading-only、每行一个 POST、各 100 行全部持久提交且输出 ID 连续：HTTP 无人工延迟约 **139 行/s**，人工响应延迟 20 ms 约 **34.1 行/s**。这是短程成本观察，不是容量认证或 eKuiper 对照；20 ms 是模拟响应延迟，不是真实 WAN RTT。
+- **代码确认/待量化**：每决策 journal fsync、完整 snapshot/目录 fsync、required HTTP flush 均串行；空闲也按配置频率提交 tick。更大状态、多规则、介质写入量和长稳影响还需专项量化，不能仅从本次 100 行推断具体热点占比。
+- **方向/验收**：按需求设计有界多决策 journal、group commit/批处理以及有证据的空闲 tick 合并；持久序号、timer-before-input、输出身份、ACK cut、初始 generation、日志保留/GC 和旧 profile 拒绝必须一起验证。不得删除先持久后发布、缩小恢复范围或放大默认预算换吞吐。保持现有正确性/资源/故障门槛，另建预先声明的容量阶梯和真实介质测量。
+- **延期前提**：目标规则频率低、延迟与磁盘预算满足验证时可以使用限定 Preview；如果业务要求持续数千/上万条每秒，或大量空闲规则下的 I/O 不可接受，本项就是该部署的前置，不应表述为“不影响使用”。关联 STATE/REL/HTTP/MEM/QA；PT/正 TTL、DAG 时间恢复等未实现功能仍留在开发 TODO，不混成优化项。
 
 ## 3. 后续统一处理方式
 

@@ -75,6 +75,8 @@ fn valid_change() -> IotSpec {
         max_keys: 64,
         invalid: InvalidValuePolicy::Ignore,
         deadband: None,
+        hysteresis: None,
+        timing: None,
     }
 }
 
@@ -91,6 +93,8 @@ fn valid_deadband() -> IotSpec {
             baseline: DeadbandBaseline::LastOutput,
             threshold: 0.05,
         }),
+        hysteresis: None,
+        timing: None,
     }
 }
 

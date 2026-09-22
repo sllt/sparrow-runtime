@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 #[cfg(feature = "demo-io")]
 use sparrow_control::DemoHarness;
 use sparrow_control::{
-    bind_plan, binder_catalog, capabilities_json, explain_plan_with, honesty_json,
+    binder_catalog, capabilities_json, explain_plan_with, honesty_json,
     request_start_at, request_stop, stream_schema, validate_aligned_plan, DemoIo, PipelineSpec,
     RestoreSpec, Store, StreamSpec, Supervisor, HONESTY,
 };
@@ -24,6 +24,7 @@ use sparrow_model::{ErrorCode, SparrowError};
 use sparrow_runtime::Kernel;
 use tower_http::limit::RequestBodyLimitLayer;
 mod operations;
+mod reference_tables;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:43180";
 pub const MAX_BODY: usize = 64 * 1024;
@@ -50,6 +51,20 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/test", post(test_plan))
         .route("/v1/streams", get(list_streams))
         .route("/v1/streams/{name}", put(put_stream).get(get_stream))
+        .route("/v1/tables", get(reference_tables::list_tables))
+        .route(
+            "/v1/tables/{name}",
+            put(reference_tables::put_table).get(reference_tables::get_latest_table),
+        )
+        .route(
+            "/v1/tables/{name}/revisions/{revision}",
+            get(reference_tables::get_table_revision),
+        )
+        .route(
+            "/v1/tables/{name}/dependencies",
+            get(reference_tables::table_dependencies),
+        )
+        .route("/v1/tables/{name}/gc", post(reference_tables::gc_table))
         .route("/v1/pipelines", get(list_pipelines))
         .route("/v1/pipelines/{name}", put(put_pipeline).get(get_pipeline))
         .route("/v1/pipelines/{name}/status", get(pipeline_status))
@@ -163,6 +178,12 @@ fn public_error_context(error: &SparrowError) -> Vec<Value> {
         "phase",
         "scope",
         "snapshot_id",
+        "revision",
+        "expected_revision",
+        "current_revision",
+        "latest_revision",
+        "table",
+        "pins",
         "max_keys",
         "max_bytes",
         "max_rows",
@@ -284,6 +305,12 @@ async fn root() -> Json<Value> {
             "POST /v1/graphs/validate",
             "POST /v1/graphs/explain",
             "PUT /v1/streams/{name}",
+            "GET /v1/tables",
+            "PUT /v1/tables/{name}",
+            "GET /v1/tables/{name}",
+            "GET /v1/tables/{name}/revisions/{revision}",
+            "GET /v1/tables/{name}/dependencies",
+            "POST /v1/tables/{name}/gc",
             "PUT /v1/pipelines/{name}",
             "POST /v1/pipelines/{name}/start",
             "POST /v1/pipelines/{name}/stop",
@@ -374,8 +401,13 @@ fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
         })?,
     )
     .map_err(ApiError::from)?;
-    let catalog = binder_catalog(&state.store).map_err(ApiError::from)?;
-    let plan = bind_plan(spec, &catalog, spec.stream.as_str(), 0).map_err(ApiError::from)?;
+    let plan = sparrow_control::validate::bind_plan_with_store(
+        &state.store,
+        spec,
+        spec.stream.as_str(),
+        0,
+    )
+    .map_err(ApiError::from)?;
     validate_aligned_plan(spec, &plan).map_err(ApiError::from)?;
     let demo = state.supervisor.demo_endpoints();
     let policy = sparrow_control::validate::store_policy(&state.store, demo.as_ref())
@@ -403,8 +435,13 @@ fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
 }
 
 fn run_explain(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
-    let catalog = binder_catalog(&state.store).map_err(ApiError::from)?;
-    let plan = bind_plan(spec, &catalog, spec.stream.as_str(), 0).map_err(ApiError::from)?;
+    let plan = sparrow_control::validate::bind_plan_with_store(
+        &state.store,
+        spec,
+        spec.stream.as_str(),
+        0,
+    )
+    .map_err(ApiError::from)?;
     validate_aligned_plan(spec, &plan).map_err(ApiError::from)?;
     let recovery = spec
         .check_delivery()
@@ -626,6 +663,60 @@ async fn pipeline_status(
     blocking_api(move || Ok(Json(status_body(&state, &name)?))).await
 }
 
+fn reference_tables_status(
+    state: &AppState,
+    name: &str,
+    latest: &sparrow_control::PipelineRow,
+    actual: Option<&sparrow_control::ActualState>,
+) -> Value {
+    let latest_bindings = serde_json::to_value(&latest.spec.reference_tables)
+        .unwrap_or_else(|_| json!({}));
+    let running = match actual {
+        Some(value) if value.status == "running" => match value.revision {
+            None => json!({
+                "available": false,
+                "reason": "running_without_revision",
+            }),
+            // Most status polls describe the same immutable revision we have
+            // already loaded above. Avoid another SQLite read/spec decode on
+            // the default non-Lookup path and on ordinary reference Jobs.
+            Some(revision) if revision == latest.latest_revision => json!({
+                "available": true,
+                "revision": revision,
+                "bindings": latest_bindings.clone(),
+            }),
+            Some(revision) => match state.store.get_pipeline_revision(name, revision) {
+                Ok(row) => json!({
+                    "available": true,
+                    "revision": revision,
+                    "bindings": serde_json::to_value(&row.spec.reference_tables)
+                        .unwrap_or_else(|_| json!({})),
+                }),
+                Err(_) => json!({
+                    "available": false,
+                    "revision": revision,
+                    "reason": "running_revision_not_readable",
+                }),
+            },
+        },
+        Some(value) => json!({
+            "available": false,
+            "revision": value.revision,
+            "status": value.status,
+            "reason": "actual_not_running",
+        }),
+        None => json!({"available": false, "reason": "no_actual_state"}),
+    };
+    json!({
+        "stored_latest": {
+            "available": true,
+            "revision": latest.latest_revision,
+            "bindings": latest_bindings,
+        },
+        "running_actual": running,
+    })
+}
+
 fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
     let (row, mut effective) = state
         .store
@@ -633,6 +724,7 @@ fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
         .map_err(ApiError::from)?;
     let desired = state.store.desired(name).ok();
     let actual = state.store.actual(name).ok();
+    let reference_tables = reference_tables_status(state, name, &row, actual.as_ref());
     // Describe the stored latest revision, not a possibly older running attempt.
     // Failed binding must not make status unreadable or claim eligibility.
     effective["scope"] = json!("stored_latest_revision");
@@ -656,6 +748,7 @@ fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
         "revision": row.latest_revision,
         "etag": row.etag,
         "spec": row.spec,
+        "reference_tables": reference_tables,
         "safe_mode": state.safe_mode,
         "desired": desired.map(|d| json!({"revision": d.revision, "status": d.status})),
         "actual": actual.map(|a| json!({
@@ -1078,12 +1171,13 @@ async fn restore_pipeline(
                 client_id: None,
             });
             spec.check_delivery().map_err(ApiError::from)?;
-            let plan = bind_plan(
+            let plan = sparrow_control::validate::bind_plan_with_store(
+                &state.store,
                 &spec,
-                &binder_catalog(&state.store).map_err(ApiError::from)?,
                 &name,
                 row.latest_revision,
-            ).map_err(ApiError::from)?;
+            )
+            .map_err(ApiError::from)?;
             validate_aligned_plan(&spec, &plan).map_err(ApiError::from)?;
             // Reject malformed/unsupported/CAS-conflicting requests before stopping
             // the live attempt. The selected new revision is activated explicitly.

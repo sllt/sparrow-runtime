@@ -20,7 +20,8 @@ use sparrow_plan::{PhysicalPlan, CheckpointPlan};
 use sparrow_plan::PlanLayout;
 use sparrow_runtime::{
     AlignedAcks, AlignedJob, PipelineSnapshot, PipelineRestore, CheckpointStore, IngressEvent, JobHandle,
-    JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, StreamControl,
+    JobRequest, Kernel, KernelOptions, MailboxConfig, SharedCapture, SourceAdmission,
+    StreamControl,
 };
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -29,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use crate::checkpoint::{CheckpointAdmission, CheckpointControl, CheckpointSpec};
 use crate::store::{ActualState, Store};
 use crate::validate::{
-    bind_plan, binder_catalog, http_config, http_push_config, mqtt_config, mqtt_sink_config,
+    bind_plan_with_store, http_config, http_push_config, mqtt_config, mqtt_sink_config,
     store_policy, stream_to_schema, validate_aligned_plan, validate_io_with_plan, DemoEndpoints,
     StoreSecrets,
 };
@@ -41,6 +42,8 @@ pub(crate) const MAX_PIPELINE_ATTEMPTS: u64 = 16;
 #[cfg(feature="jetstream")]
 mod jetstream_source;
 mod graph;
+mod paused_time;
+mod paused_time_log;
 
 /// Per-pipeline backoff, capped at 32 seconds; never sleep in converge.
 /// A successful launch is not a stable recovery: reset after 30s running.
@@ -312,6 +315,16 @@ pub struct GraphPortDiagnostics {
     pub sources: std::collections::BTreeMap<u32, Arc<IoDiagnostics>>,
     pub sinks: std::collections::BTreeMap<u32, Arc<IoDiagnostics>>,
 }
+
+/// One verified, job-owned reference snapshot plus the exact dependency
+/// identities used by the checkpoint participant manifest.  The control
+/// plane keeps this bundle together so an aligned layout can never be built
+/// from a spec-only placeholder CRC and then paired with different tables.
+struct PreparedReferenceTables {
+    tables: HashMap<String, Arc<sparrow_runtime::ReferenceTable>>,
+    dependencies: Vec<sparrow_plan::ReferenceTableDependency>,
+}
+
 impl GraphPortDiagnostics {
     pub fn snapshot(&self)->sparrow_connectors::IoSnapshot {
         let mut snapshot=sparrow_connectors::IoSnapshot::default();
@@ -983,9 +996,8 @@ impl Supervisor {
                     let row = s.get_pipeline_revision(&name, revision)?;
                     let stream = s.get_stream(&row.spec.stream)?;
                     let schema = stream_to_schema(&stream)?;
-                    let catalog = binder_catalog(s)?;
                     let policy = store_policy(s, demo.as_ref())?;
-                    let plan = bind_plan(&row.spec, &catalog, &name, revision)?;
+                    let plan = bind_plan_with_store(s, &row.spec, &name, revision)?;
                     validate_aligned_plan(&row.spec, &plan)?;
                     validate_io_with_plan(
                         &row.spec,
@@ -1034,7 +1046,9 @@ impl Supervisor {
         .await?;
         let recovery = RecoveryPolicy::parse(&spec.recovery)?;
 
-        let job = if spec.graph_io.is_some() {
+        let job = if plan.has_timed_iot() {
+            self.start_paused_time(&spec,schema,plan,&policy).await?
+        } else if spec.graph_io.is_some() {
             self.start_graph(&spec, plan, &policy).await?
         } else { match spec.source.kind.as_str() {
             #[cfg(feature="jetstream")]
@@ -1074,6 +1088,113 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Load fixed catalog revisions before source activation and charge the
+    /// detached table to the very same owner Kernel will use for this attempt.
+    async fn attach_reference_tables(
+        &self,
+        spec: &crate::spec::PipelineSpec,
+        request: JobRequest,
+    ) -> Result<JobRequest> {
+        if spec.reference_tables.is_empty() {
+            return Ok(request);
+        }
+        let (admission, prepared) = self
+            .prepare_reference_tables(spec, request.plan.pipeline)
+            .await?;
+        Ok(request
+            .with_tables(prepared.tables)
+            .with_source_admission(admission))
+    }
+
+    /// Resolve immutable catalog revisions and build verified, job-owned
+    /// snapshots before any connector/source activation.  The blocking
+    /// closure retains the lifecycle guard so a cancelled caller cannot free
+    /// the source-admission slot while decode/snapshot work is still running.
+    async fn prepare_reference_tables(
+        &self,
+        spec: &crate::spec::PipelineSpec,
+        pipeline: sparrow_model::PipelineId,
+    ) -> Result<(SourceAdmission, PreparedReferenceTables)> {
+        let admission = self.kernel.prepare_source_admission(pipeline)?;
+        self.prepare_reference_tables_with_admission(spec, admission)
+            .await
+    }
+
+    /// Resolve references while retaining an already-acquired source
+    /// admission.  Graph and JetStream startup acquire their admission before
+    /// this helper because their source/bootstrap code also needs the same
+    /// owner; acquiring a second token here would double-count one Job.
+    pub(super) async fn prepare_reference_tables_with_admission(
+        &self,
+        spec: &crate::spec::PipelineSpec,
+        admission: SourceAdmission,
+    ) -> Result<(SourceAdmission, PreparedReferenceTables)> {
+        if spec.reference_tables.is_empty() {
+            return Err(SparrowError::new(
+                sparrow_model::ErrorCode::InvalidArgument,
+                "reference table preparation requires at least one binding",
+            ));
+        }
+        let owner = admission.owner();
+        let lifecycle_guard = admission.lifecycle_guard();
+        let store = self.store.clone();
+        let spec = spec.clone();
+        let (prepared, _lifecycle_guard) = self
+            .store
+            .run_blocking(move || {
+                let revisions = store.reference_bindings(&spec)?;
+                let mut tables = HashMap::with_capacity(revisions.len());
+                let mut dependencies = Vec::with_capacity(revisions.len());
+                for revision in revisions {
+                    // Catalog JSON is independently bounded; reserve decoded
+                    // scalar/vector scratch before materializing detached rows.
+                    let scratch_bytes = usize::try_from(revision.payload_bytes)
+                        .ok()
+                        .and_then(|n| n.checked_mul(64))
+                        .and_then(|n| n.checked_add(64 * 1024))
+                        .ok_or_else(|| {
+                            SparrowError::new(
+                                sparrow_model::ErrorCode::BoundExceeded,
+                                "reference table decode scratch overflow",
+                            )
+                        })?;
+                    let _scratch = owner.acquire(
+                        sparrow_model::CreditKind::Reservation,
+                        scratch_bytes,
+                    )?;
+                    let canonical_sha256 =
+                        crate::validate::decode_reference_sha256(&revision.sha256)?;
+                    let table = sparrow_runtime::ReferenceTable::snapshot_owned_verified(
+                        revision.name.clone(),
+                        revision.revision,
+                        revision.table.schema(&revision.name)?,
+                        revision.table.keys.clone(),
+                        revision.table.rows()?,
+                        crate::reference_table::MAX_REFERENCE_TABLE_ROWS,
+                        owner.budget().retention_bytes,
+                        canonical_sha256,
+                        &owner,
+                    )?;
+                    let dependency = table.verified_dependency()?;
+                    tables.insert(revision.name, table);
+                    dependencies.push(dependency);
+                }
+                crate::validate::validate_reference_dependencies(&spec, &dependencies)?;
+                // Cancellation of the waiter does not stop a blocking worker.
+                // Keep its admission slot through construction and through
+                // the returned snapshots until the waiter takes the result.
+                Ok((
+                    PreparedReferenceTables {
+                        tables,
+                        dependencies,
+                    },
+                    lifecycle_guard,
+                ))
+            })
+            .await?;
+        Ok((admission, prepared))
+    }
+
     async fn start_live(
         &self,
         name: &str,
@@ -1103,6 +1224,7 @@ impl Supervisor {
             request = request.with_live_io(rx, tx_out);
             (Some(tx), None)
         };
+        let request = self.attach_reference_tables(spec, request).await?;
         let job = self.kernel.submit(request)?;
         let cancel = job.cancellation();
         let source_result: Result<JoinHandle<Result<()>>> = async {
@@ -1234,12 +1356,13 @@ impl Supervisor {
         diag.observe_source(&tx_ev);
         diag.observe_sink(&tx_out);
         let capture = SharedCapture::disabled();
-        let job = self.kernel.submit(
+        let request = self.attach_reference_tables(spec,
             JobRequest::new(plan, Vec::new(), capture)
                 .with_observation(diag.observation.clone())
                 .with_live_events(rx_ev)
                 .with_live_out(tx_out),
-        )?;
+        ).await?;
+        let job = self.kernel.submit(request)?;
         let cancel = job.cancellation();
         let diag_src = Arc::clone(&diag);
         let source = self.kernel.handle().spawn({
@@ -1306,7 +1429,23 @@ impl Supervisor {
         target_policy: &sparrow_connectors::TargetPolicy,
     ) -> Result<RunningJob> {
         crate::validate::validate_aligned_plan(spec, &plan)?;
-        let layout = Arc::new(CheckpointPlan::from_physical(&plan)?);
+        // Reference-dependent aligned recovery must resolve and materialize
+        // the exact table revisions before touching checkpoint history.  The
+        // no-reference path intentionally retains the old v3 behavior.
+        let prepared_references = if spec.reference_tables.is_empty() {
+            None
+        } else {
+            Some(self.prepare_reference_tables(spec, plan.pipeline).await?)
+        };
+        let layout = Arc::new(if let Some((_, prepared)) = &prepared_references {
+            crate::validate::checkpoint_plan_with_references(
+                spec,
+                &plan,
+                &prepared.dependencies,
+            )?
+        } else {
+            CheckpointPlan::from_physical(&plan)?
+        });
         let checkpoint_revision = plan.revision.raw();
         let chk = spec
             .checkpoint_dir
@@ -1332,12 +1471,22 @@ impl Supervisor {
         let restore_policy = policy.clone();
         let max_keys = self.kernel.job_budget().max_state_keys;
         let iot_profile = plan.has_iot();
+        let reference_profile = prepared_references.is_some();
+        let profile_specific = reference_profile || layout.has_hysteresis();
         // Fingerprinting, bounded snapshot reads and cursor verification are
         // cold filesystem work; never block a Tokio executor worker on them.
         let (source, store, restore_freeze, restore_iot, ingested0, restored_from, inventory, state_generation, downstream_changed) = self
             .store
             .run_blocking(move || {
-                let mut store = if iot_profile {
+                let mut store = if profile_specific {
+                    CheckpointStore::open_for_plan_exclusive(
+                        std::path::Path::new(&chk),
+                        max_keys,
+                        restore_policy.retention(),
+                        restore_layout.as_ref(),
+                        "file",
+                    )?
+                } else if iot_profile {
                     CheckpointStore::open_iot_exclusive(
                         std::path::Path::new(&chk),
                         max_keys,
@@ -1358,6 +1507,20 @@ impl Supervisor {
                     Some("checkpoint")
                 ) || (restore_policy.resume_latest
                     && (inventory.current.is_some() || inventory.current_error.is_some()));
+                if profile_specific && !restore
+                    && (inventory.current.is_some() || inventory.current_error.is_some()
+                        || !inventory.generations.is_empty())
+                {
+                    let message = if reference_profile {
+                        "reference checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
+                    } else {
+                        "hysteresis checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
+                    };
+                    return Err(SparrowError::new(
+                        sparrow_model::ErrorCode::UnsupportedRestore,
+                        message,
+                    ));
+                }
                 if restore_policy.resume_latest && !restore && !inventory.generations.is_empty() {
                     return Err(SparrowError::new(
                         sparrow_model::ErrorCode::UnsupportedRestore,
@@ -1432,18 +1595,22 @@ impl Supervisor {
         diag.observe_sink(&tx_out);
         let diag_src = Arc::clone(&diag);
         let metrics = Arc::clone(&self.kernel.metrics);
-        let job = self.kernel.submit(
-            JobRequest::new(plan, Vec::new(), SharedCapture::disabled())
-                .with_observation(diag.observation.clone())
-                .with_live_events(rx_ev)
-                .with_live_out(tx_out)
-                .with_aligned(AlignedJob {
-                    restore: None,
-                    pipeline: Some(PipelineRestore {plan:layout.clone(),generation:state_generation,restore:restore_freeze,iot:restore_iot}),
-                    acks: acks.clone(),
-                    outbox: Arc::clone(&outbox),
-                }),
-        )?;
+        let mut request = JobRequest::new(plan, Vec::new(), SharedCapture::disabled())
+            .with_observation(diag.observation.clone())
+            .with_live_events(rx_ev)
+            .with_live_out(tx_out)
+            .with_aligned(AlignedJob {
+                restore: None,
+                pipeline: Some(PipelineRestore {plan:layout.clone(),generation:state_generation,restore:restore_freeze,iot:restore_iot}),
+                acks: acks.clone(),
+                outbox: Arc::clone(&outbox),
+            });
+        if let Some((admission, prepared)) = prepared_references {
+            request = request
+                .with_tables(prepared.tables)
+                .with_source_admission(admission);
+        }
+        let job = self.kernel.submit(request)?;
         let cancel = job.cancellation();
         let child = cancel.clone();
         let ingested_r = Arc::clone(&ingested);
@@ -1829,7 +1996,7 @@ impl Supervisor {
                 Some(_) => {
                     return Err(SparrowError::new(
                         sparrow_model::ErrorCode::FeatureUnavailable,
-                        "checkpoint is only available for aligned File/replay jobs",
+                        "checkpoint is only available for aligned File/replay or JetStream jobs",
                     ));
                 }
                 None => {

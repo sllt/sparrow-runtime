@@ -1,5 +1,5 @@
-//! Bounded checkpoint participants for the supported linear execution path.
-//! This is not DAG admission and does not replace the legacy single-window layout.
+//! Bounded checkpoint participants for the supported linear and required File
+//! DAG execution paths. This does not replace the legacy single-window layout.
 use std::collections::BTreeSet;
 
 use crate::{PhysicalPlan, PhysicalStage, TransformStep};
@@ -9,6 +9,9 @@ pub const MAX_CHECKPOINT_STATES: usize = 2;
 pub const MAX_GRAPH_CHECKPOINT_STATES: usize = 16;
 pub const MAX_CHECKPOINT_OPERATORS: usize = 64;
 pub const MAX_CHECKPOINT_STAGES: usize = 64;
+/// Keep public plan admission aligned with the runtime graph mailbox bound.
+pub const MAX_CHECKPOINT_EDGES: usize = 128;
+pub const MAX_CHECKPOINT_REFERENCES: usize = 8;
 pub const WINDOW_STATE_CODEC: u16 = 1;
 /// Versioned keyed IoT state.  It is intentionally distinct from the
 /// WindowFreeze codec; an IoT value is not a window accumulator.
@@ -59,10 +62,20 @@ impl StateParticipant {
     pub fn freeze_kind(&self) -> u8 {
         match self.codec {
             WINDOW_STATE_CODEC => u8::from(self.window_kind == 1),
-            IOT_STATE_CODEC if matches!(self.window_kind, 4 | 5) => self.window_kind,
+            IOT_STATE_CODEC if matches!(self.window_kind, 4..=8) => self.window_kind,
             _ => 0,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceTableDependency {
+    pub name: String,
+    pub revision: u64,
+    /// Digest of the verified canonical catalog record, not the runtime CRC.
+    pub canonical_sha256: [u8; 32],
+    /// Independently verified runtime row/schema/key encoding.
+    pub runtime_crc32: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +83,8 @@ pub struct CheckpointPlan {
     pub source: OperatorId,
     pub sink: OperatorId,
     pub states: Vec<StateParticipant>,
+    /// Immutable read dependencies, never mutable state participants.
+    pub reference_tables: Vec<ReferenceTableDependency>,
     /// Full ordered computation, including downstream transforms. Fusion groups
     /// and catalog revision numbers are not semantic identities.
     pub semantics: Vec<u8>,
@@ -83,7 +98,29 @@ fn rejected(message: &str) -> SparrowError {
 
 impl CheckpointPlan {
     pub fn from_physical(plan: &PhysicalPlan) -> Result<Self> {
-        if plan.edges.is_some() { return Self::from_graph(plan); }
+        Self::from_physical_inner(plan, Vec::new())
+    }
+
+    pub fn from_physical_with_references(
+        plan: &PhysicalPlan,
+        mut deps: Vec<ReferenceTableDependency>,
+    ) -> Result<Self> {
+        if deps.is_empty() {
+            return Err(rejected("reference checkpoint requires immutable dependencies"));
+        }
+        deps.sort_by(|a, b| a.name.cmp(&b.name));
+        validate_references(&deps)?;
+        Self::from_physical_inner(plan, deps)
+    }
+
+    fn from_physical_inner(plan: &PhysicalPlan, reference_tables: Vec<ReferenceTableDependency>) -> Result<Self> {
+        let has_references = !reference_tables.is_empty();
+        if has_references && (!plan.side_outputs.is_empty() || !plan.source_times.is_empty()) {
+            return Err(rejected("reference checkpoint excludes source-time and side-output plans"));
+        }
+        if plan.edges.is_some() {
+            return Self::from_graph(plan, reference_tables);
+        }
         let Some(PhysicalStage::MemorySource {
             operator: source,
             schema,
@@ -111,6 +148,7 @@ impl CheckpointPlan {
         register(*sink)?;
         let mut current = schema;
         let mut states = Vec::new();
+        let mut used_references = BTreeSet::new();
         for stage in &plan.stages[1..plan.stages.len() - 1] {
             match stage {
                 PhysicalStage::Transform { steps } => {
@@ -165,6 +203,11 @@ impl CheckpointPlan {
                     input,
                     output,
                 } => {
+                    if has_references {
+                        if !matches!(spec.kind, WindowKind::Count { .. }) {
+                            return Err(rejected("reference checkpoint requires Count windows; ET/PT state is not recoverable"));
+                        }
+                    }
                     register(*operator)?;
                     spec.validate()?;
                     if matches!(spec.kind, WindowKind::TumblingProcessingTime { .. }) {
@@ -241,12 +284,24 @@ impl CheckpointPlan {
                     }
                     current = input;
                 }
+                PhysicalStage::Lookup { operator, spec, input, output } if has_references => {
+                    validate_static_lookup_stage(spec, input, output)?;
+                    register(*operator)?;
+                    if current.fields != input.fields {
+                        return Err(rejected("reference checkpoint Lookup input schema mismatch"));
+                    }
+                    used_references.insert(spec.table.as_str());
+                    current = output;
+                }
                 _ => {
                     return Err(rejected(
                         "checkpoint excludes additional sources/sinks, Dedup and Lookup",
                     ))
                 }
             }
+        }
+        if used_references != reference_tables.iter().map(|dep| dep.name.as_str()).collect() {
+            return Err(rejected("checkpoint reference dependencies must exactly match static Lookup tables"));
         }
         if let PhysicalStage::CaptureSink { schema, .. } = plan.stages.last().unwrap() {
             if current.fields != schema.fields {
@@ -269,10 +324,11 @@ impl CheckpointPlan {
             source: *source,
             sink: *sink,
             states,
+            reference_tables,
             semantics,
             // IoT state depends on the complete computation descriptor.  Do
             // not apply the linear RCP2 downstream-only relaxation to it.
-            recovery_prefix_len: (!has_iot).then_some(recovery_prefix_len),
+            recovery_prefix_len: (!has_iot && !has_references).then_some(recovery_prefix_len),
         };
         result.validate()?;
         Ok(result)
@@ -301,11 +357,47 @@ impl CheckpointPlan {
     pub fn source_ids(&self) -> Vec<OperatorId> { if self.is_graph() { self.graph_ports().map(|p| p.0).unwrap_or_default() } else { vec![self.source] } }
     pub fn sink_ids(&self) -> Vec<OperatorId> { if self.is_graph() { self.graph_ports().map(|p| p.1).unwrap_or_default() } else { vec![self.sink] } }
     pub fn has_iot(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC) }
+    pub fn has_timed_iot(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC && matches!(s.window_kind, 7 | 8)) }
+    pub fn has_references(&self) -> bool { !self.reference_tables.is_empty() }
+    pub fn has_hysteresis(&self) -> bool {
+        self.states.iter().any(|state| state.codec == IOT_STATE_CODEC && state.window_kind == 6)
+    }
 
-    fn from_graph(plan: &PhysicalPlan) -> Result<Self> {
+    fn from_graph(plan: &PhysicalPlan, reference_tables: Vec<ReferenceTableDependency>) -> Result<Self> {
         if !plan.side_outputs.is_empty() || !plan.source_times.is_empty() {return Err(rejected("side outputs and source-time DAGs currently require restart_fresh"));}
+        if plan.stages.len() < 2 || plan.stages.len() > MAX_CHECKPOINT_STAGES {
+            return Err(rejected("graph checkpoint stage count exceeds bound"));
+        }
+        let has_references = !reference_tables.is_empty();
         let mut sources = Vec::new(); let mut sinks = Vec::new(); let mut states = Vec::new();
+        let mut used_references = BTreeSet::new();
+        let mut stage_operators = Vec::with_capacity(plan.stages.len());
+        let mut operators = BTreeSet::new();
         for stage in &plan.stages {
+            let ids = match stage {
+                PhysicalStage::Transform { steps } => steps
+                    .iter()
+                    .map(|step| match step {
+                        TransformStep::Filter { operator, .. }
+                        | TransformStep::Project { operator, .. }
+                        | TransformStep::Map { operator, .. } => *operator,
+                    })
+                    .collect::<Vec<_>>(),
+                PhysicalStage::Branch { operator, .. }
+                | PhysicalStage::Route { operator, .. }
+                | PhysicalStage::UnionAll { operator, .. }
+                | PhysicalStage::BestEffortSink { operator, .. }
+                | PhysicalStage::MemorySource { operator, .. }
+                | PhysicalStage::CaptureSink { operator, .. }
+                | PhysicalStage::WindowAgg { operator, .. }
+                | PhysicalStage::Deduplicate { operator, .. }
+                | PhysicalStage::Lookup { operator, .. }
+                | PhysicalStage::Iot { operator, .. } => vec![*operator],
+            };
+            if ids.is_empty() || ids.iter().any(|id| !operators.insert(*id)) {
+                return Err(rejected("graph checkpoint has empty or duplicate operator identity"));
+            }
+            stage_operators.push(ids);
             match stage {
                 PhysicalStage::MemorySource { operator, .. } => sources.push(*operator),
                 PhysicalStage::CaptureSink { operator, .. } => sinks.push(*operator),
@@ -329,19 +421,129 @@ impl CheckpointPlan {
                     spec.validate(input)?;
                     states.push(StateParticipant { id: ParticipantId::iot(*operator), codec: IOT_STATE_CODEC, window_kind: spec.state_kind_tag() });
                 }
+                PhysicalStage::Lookup { operator, spec, input, output } if has_references => {
+                    validate_static_lookup_stage(spec, input, output)?;
+                    used_references.insert(spec.table.as_str());
+                    // The Lookup is part of the full graph descriptor; it is
+                    // intentionally not a mutable state participant.
+                    let _ = operator;
+                }
                 PhysicalStage::Branch { .. } | PhysicalStage::Route { .. } | PhysicalStage::UnionAll { .. } | PhysicalStage::Transform { .. } => {},
-                _ => return Err(rejected("graph aligned currently admits required branches with stateless/Count kernels only; ET/PT/Lookup/Dedup/lossy outputs require additional codecs")),
+                _ => return Err(rejected("graph aligned currently admits required branches with stateless/Count/IoT kernels; ET/PT/Dedup/lossy outputs require additional codecs")),
             }
         }
         sources.sort(); sinks.sort();
-        if sources.is_empty() || sinks.is_empty() || sources.len() > 16 || sinks.len() > 16
-            || plan.edges.as_ref().unwrap().iter().any(|e| e.best_effort) { return Err(rejected("graph aligned requires 1..16 sources and required sinks without lossy edges")); }
-        let result = Self { source: sources[0], sink: sinks[0], states,
+        let edges = plan
+            .edges
+            .as_ref()
+            .ok_or_else(|| rejected("graph checkpoint requires explicit physical edges"))?;
+        if edges.len() > MAX_CHECKPOINT_EDGES {
+            return Err(rejected("graph checkpoint edge count exceeds bound"));
+        }
+        let mut edge_pairs = BTreeSet::new();
+        let mut incoming = vec![0usize; plan.stages.len()];
+        let mut outgoing = vec![0usize; plan.stages.len()];
+        for edge in edges {
+            if edge.best_effort
+                || edge.from >= plan.stages.len()
+                || edge.to >= plan.stages.len()
+                || edge.from == edge.to
+                || !edge_pairs.insert((edge.from, edge.to))
+                || !stage_operators[edge.to].contains(&edge.port)
+            {
+                return Err(rejected("graph aligned requires connected required edges without lossy edges"));
+            }
+            if graph_stage_schema(&plan.stages[edge.from], true)?.fields
+                != graph_stage_schema(&plan.stages[edge.to], false)?.fields
+            {
+                return Err(rejected("graph checkpoint edge schema mismatch"));
+            }
+            incoming[edge.to] += 1;
+            outgoing[edge.from] += 1;
+        }
+        if sources.is_empty()
+            || sinks.is_empty()
+            || sources.len() > 16
+            || sinks.len() > 16
+            || edges.is_empty()
+        {
+            return Err(rejected("graph aligned requires connected required edges without lossy edges"));
+        }
+        let sink_indices = plan
+            .stages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, stage)| matches!(stage, PhysicalStage::CaptureSink { .. }).then_some(index))
+            .collect::<BTreeSet<_>>();
+        let invalid_degree = plan
+            .stages
+            .iter()
+            .enumerate()
+            .any(|(index, stage)| match stage {
+                PhysicalStage::MemorySource { .. } => incoming[index] != 0 || outgoing[index] != 1,
+                PhysicalStage::CaptureSink { .. } => incoming[index] != 1 || outgoing[index] != 0,
+                PhysicalStage::Branch { .. } | PhysicalStage::Route { .. } => {
+                    incoming[index] != 1 || !(1..=16).contains(&outgoing[index])
+                }
+                PhysicalStage::UnionAll { .. } => {
+                    !(2..=16).contains(&incoming[index]) || outgoing[index] != 1
+                }
+                PhysicalStage::BestEffortSink { .. } => true,
+                _ => incoming[index] != 1 || outgoing[index] != 1,
+            });
+        if invalid_degree {
+            return Err(rejected("graph checkpoint topology has an invalid source/terminal degree"));
+        }
+        // Kahn's pass rejects cycles independently of source reachability.
+        let mut remaining_incoming = incoming.clone();
+        let mut frontier = remaining_incoming
+            .iter()
+            .enumerate()
+            .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+            .collect::<Vec<_>>();
+        let mut topological_count = 0usize;
+        while let Some(index) = frontier.pop() {
+            topological_count += 1;
+            for edge in edges.iter().filter(|edge| edge.from == index) {
+                remaining_incoming[edge.to] -= 1;
+                if remaining_incoming[edge.to] == 0 {
+                    frontier.push(edge.to);
+                }
+            }
+        }
+        if topological_count != plan.stages.len() {
+            return Err(rejected("graph checkpoint topology contains a cycle"));
+        }
+        // Every physical chain must terminate at a required sink. This also
+        // rejects a detached terminal branch that happens to have a source.
+        let mut to_sink = sink_indices.clone();
+        let mut frontier = sink_indices.iter().copied().collect::<Vec<_>>();
+        while let Some(index) = frontier.pop() {
+            for edge in edges.iter().filter(|edge| edge.to == index) {
+                if to_sink.insert(edge.from) {
+                    frontier.push(edge.from);
+                }
+            }
+        }
+        if to_sink.len() != plan.stages.len() {
+            return Err(rejected("graph checkpoint topology has a non-terminal branch"));
+        }
+        if used_references != reference_tables.iter().map(|dep| dep.name.as_str()).collect() {
+            return Err(rejected("checkpoint reference dependencies must exactly match graph Lookup tables"));
+        }
+        let result = Self { source: sources[0], sink: sinks[0], states, reference_tables,
             semantics: crate::canonical::checkpoint_graph(plan, &sources, &sinks)?, recovery_prefix_len: None };
         result.validate()?; Ok(result)
     }
 
     pub fn validate(&self) -> Result<()> {
+        validate_references(&self.reference_tables)?;
+        if self.has_timed_iot() && (self.is_graph() || self.has_references() || self.states.len()!=1) {
+            return Err(rejected("paused-time profile requires exactly one timed IoT state in a linear plan without reference tables"));
+        }
+        if self.has_references() && self.recovery_prefix_len.is_some() {
+            return Err(rejected("reference checkpoint requires full pipeline semantics"));
+        }
         if self.states.len() > if self.is_graph() { MAX_GRAPH_CHECKPOINT_STATES } else { MAX_CHECKPOINT_STATES }
             || self.source == self.sink
             || (self.has_iot() && self.recovery_prefix_len.is_some())
@@ -386,7 +588,7 @@ impl CheckpointPlan {
                 && matches!(state.window_kind, 1..=3);
             let valid_iot = state.codec == IOT_STATE_CODEC
                 && slot.raw() == 3
-                && matches!(state.window_kind, 4 | 5);
+                && matches!(state.window_kind, 4..=8);
             if shard != 0 || !ids.insert(operator) || !(valid_window || valid_iot) {
                 return Err(rejected(
                     "duplicate/unsupported checkpoint participant, slot, shard or codec",
@@ -396,6 +598,14 @@ impl CheckpointPlan {
         if self.states.len() > 1 && self.states.iter().any(|s| matches!(s.window_kind, 2 | 3)) {
             return Err(rejected("unsupported multi-state time policy"));
         }
+        if self.has_references()
+            && self
+                .states
+                .iter()
+                .any(|state| state.codec == WINDOW_STATE_CODEC && state.window_kind != 1)
+        {
+            return Err(rejected("reference checkpoint requires Count windows; ET/PT state is not recoverable"));
+        }
         Ok(())
     }
 
@@ -404,6 +614,7 @@ impl CheckpointPlan {
         live.validate()?;
         let compatible = self.source == live.source
             && self.states == live.states
+            && self.reference_tables == live.reference_tables
             && match (self.recovery_prefix_len, live.recovery_prefix_len) {
                 (Some(a), Some(b)) => self.semantics[..a] == live.semantics[..b],
                 // Never retroactively loosen a plain CP01 snapshot's contract.
@@ -422,9 +633,16 @@ impl CheckpointPlan {
         } else {
             0
         };
+        let references = if self.has_references() {
+            2 + self.reference_tables.iter().map(|dep| 46 + dep.name.len()).sum::<usize>()
+        } else {
+            0
+        };
         let mut out =
-            Vec::with_capacity(18 + self.states.len() * 11 + self.semantics.len() + extra);
-        out.extend_from_slice(b"CPL1");
+            Vec::with_capacity(18 + self.states.len() * 11 + self.semantics.len() + extra + references);
+        // CPL2 was an abandoned prototype; never reuse its magic. CPL1 bytes
+        // stay unchanged, and v8 Store profile admission guards old readers.
+        out.extend_from_slice(if self.has_references() { b"CPL3" } else { b"CPL1" });
         out.extend_from_slice(&self.source.raw().to_le_bytes());
         out.extend_from_slice(&self.sink.raw().to_le_bytes());
         out.extend_from_slice(&(self.states.len() as u16).to_le_bytes());
@@ -442,6 +660,16 @@ impl CheckpointPlan {
             out.extend_from_slice(&shard.to_le_bytes());
             out.extend_from_slice(&state.codec.to_le_bytes());
             out.push(state.window_kind);
+        }
+        if self.has_references() {
+            out.extend_from_slice(&(self.reference_tables.len() as u16).to_le_bytes());
+            for dep in &self.reference_tables {
+                out.extend_from_slice(&(dep.name.len() as u16).to_le_bytes());
+                out.extend_from_slice(dep.name.as_bytes());
+                out.extend_from_slice(&dep.revision.to_le_bytes());
+                out.extend_from_slice(&dep.canonical_sha256);
+                out.extend_from_slice(&dep.runtime_crc32.to_le_bytes());
+            }
         }
         if let Some(n) = self.recovery_prefix_len {
             out.extend_from_slice(
@@ -466,7 +694,7 @@ impl CheckpointPlan {
             Ok(head)
         }
         let version = take(&mut bytes, 4)?;
-        if version != b"CPL1" {
+        if version != b"CPL1" && version != b"CPL3" {
             return Err(rejected("unsupported checkpoint plan codec"));
         }
         let source = OperatorId::new(u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap()));
@@ -494,6 +722,25 @@ impl CheckpointPlan {
                 window_kind,
             });
         }
+        let mut reference_tables = Vec::new();
+        if version == b"CPL3" {
+            let count = u16::from_le_bytes(take(&mut bytes, 2)?.try_into().unwrap()) as usize;
+            if count == 0 || count > MAX_CHECKPOINT_REFERENCES {
+                return Err(rejected("checkpoint reference dependency count exceeds bound"));
+            }
+            for _ in 0..count {
+                let n = u16::from_le_bytes(take(&mut bytes, 2)?.try_into().unwrap()) as usize;
+                if n == 0 || n > 64 {
+                    return Err(rejected("checkpoint reference name exceeds bound"));
+                }
+                let name = std::str::from_utf8(take(&mut bytes, n)?)
+                    .map_err(|_| rejected("invalid checkpoint reference name encoding"))?.to_owned();
+                let revision = u64::from_le_bytes(take(&mut bytes, 8)?.try_into().unwrap());
+                let canonical_sha256 = take(&mut bytes, 32)?.try_into().unwrap();
+                let runtime_crc32 = u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap());
+                reference_tables.push(ReferenceTableDependency { name, revision, canonical_sha256, runtime_crc32 });
+            }
+        }
         let n = u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap()) as usize;
         if n > crate::canonical::MAX_STATE_SEMANTICS_BYTES {
             return Err(rejected("checkpoint semantics exceeds bound"));
@@ -512,10 +759,118 @@ impl CheckpointPlan {
             source,
             sink,
             states,
+            reference_tables,
             semantics: semantics.to_vec(),
             recovery_prefix_len,
         };
         plan.validate()?;
         Ok(plan)
     }
+}
+
+fn validate_references(deps: &[ReferenceTableDependency]) -> Result<()> {
+    if deps.len() > MAX_CHECKPOINT_REFERENCES {
+        return Err(rejected("checkpoint reference dependency count exceeds bound"));
+    }
+    let mut previous: Option<&str> = None;
+    for dep in deps {
+        if dep.name.is_empty() || dep.name.len() > 64
+            || !dep.name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+            || dep.revision == 0 || dep.revision > i64::MAX as u64
+            || dep.canonical_sha256 == [0; 32]
+            || previous.is_some_and(|name| name >= dep.name.as_str())
+        {
+            return Err(rejected("invalid, duplicate or unsorted checkpoint reference dependency"));
+        }
+        previous = Some(&dep.name);
+    }
+    Ok(())
+}
+
+/// Validate the part of a static Lookup contract that is present in a
+/// physical plan.  The actual table schema, key order, CRC and owner are
+/// checked by the runtime against the attached verified snapshot; keeping the
+/// input/output and key-shape checks here prevents a caller from enabling the
+/// profile by toggling only a reference-present flag.
+fn validate_static_lookup_stage(
+    spec: &crate::LookupSpec,
+    input: &sparrow_model::Schema,
+    output: &sparrow_model::Schema,
+) -> Result<()> {
+    spec.validate()?;
+    if spec.temporal || spec.as_of_field.is_some() {
+        return Err(rejected("reference checkpoint excludes temporal/as-of Lookup"));
+    }
+    let stream_keys = spec.stream_keys.iter().collect::<BTreeSet<_>>();
+    let table_keys = spec.table_keys.iter().collect::<BTreeSet<_>>();
+    let keep = spec.keep.iter().collect::<BTreeSet<_>>();
+    if stream_keys.len() != spec.stream_keys.len()
+        || table_keys.len() != spec.table_keys.len()
+        || keep.len() != spec.keep.len()
+        || spec.stream_keys.iter().any(|name| input.field_by_name(name).is_none())
+        || output.fields.len() != input.fields.len().saturating_add(spec.keep.len())
+        || output.fields[..input.fields.len()] != input.fields
+        || output.fields[input.fields.len()..]
+            .iter()
+            .zip(&spec.keep)
+            .any(|(field, name)| &field.name != name || !field.nullable)
+    {
+        return Err(rejected("reference checkpoint Lookup schema/key contract mismatch"));
+    }
+    Ok(())
+}
+
+fn graph_stage_schema(
+    stage: &PhysicalStage,
+    output: bool,
+) -> Result<&sparrow_model::Schema> {
+    Ok(match stage {
+        PhysicalStage::MemorySource { schema, .. }
+        | PhysicalStage::CaptureSink { schema, .. }
+        | PhysicalStage::BestEffortSink { schema, .. } => schema,
+        PhysicalStage::Branch { input, .. }
+        | PhysicalStage::Route { input, .. }
+        | PhysicalStage::UnionAll { input, .. }
+        | PhysicalStage::Deduplicate { input, .. }
+        | PhysicalStage::Iot { input, .. } => input,
+        PhysicalStage::WindowAgg {
+            input,
+            output: schema,
+            ..
+        }
+        | PhysicalStage::Lookup {
+            input,
+            output: schema,
+            ..
+        } => {
+            if output {
+                schema
+            } else {
+                input
+            }
+        }
+        PhysicalStage::Transform { steps } => {
+            let step = if output { steps.last() } else { steps.first() }
+                .ok_or_else(|| rejected("empty graph transform stage"))?;
+            match step {
+                TransformStep::Filter { input, .. } => input,
+                TransformStep::Project {
+                    input,
+                    output: schema,
+                    ..
+                }
+                | TransformStep::Map {
+                    input,
+                    output: schema,
+                    ..
+                } => {
+                    if output {
+                        schema
+                    } else {
+                        input
+                    }
+                }
+            }
+        }
+    })
 }

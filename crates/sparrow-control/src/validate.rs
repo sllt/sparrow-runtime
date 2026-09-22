@@ -76,6 +76,61 @@ pub fn binder_catalog(store: &Store) -> Result<Catalog> {
     Ok(cat)
 }
 
+/// Resolve immutable dependencies before binding any production pipeline.
+/// Never insert a table's mutable `latest` schema into this catalog.
+pub fn bind_plan_with_store(
+    store: &Store,
+    spec: &PipelineSpec,
+    name: &str,
+    revision: u64,
+) -> Result<PhysicalPlan> {
+    spec.basic_check()?;
+    let references = store.reference_bindings(spec)?;
+    let mut catalog = binder_catalog(store)?;
+    for table in &references {
+        if catalog.get(&table.name).is_ok()
+            || spec.graph.as_ref().is_some_and(|graph| graph.catalog.iter().any(|t| t.name == table.name)) {
+            return Err(SparrowError::new(ErrorCode::InvalidSchema,
+                "managed reference table schema must not shadow a stream or inline graph catalog"));
+        }
+        catalog.insert(table.name.clone(), table.table.schema(&table.name)?);
+    }
+    let plan = bind_plan(spec, &catalog, name, revision)?;
+    let mut used = std::collections::BTreeSet::new();
+    for stage in &plan.stages {
+        let sparrow_plan::PhysicalStage::Lookup { spec: lookup, input, .. } = stage else { continue };
+        let table = references.iter().find(|t| t.name == lookup.table).ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidArgument,
+                format!("Lookup '{}' requires an explicit immutable reference_tables binding", lookup.table))
+        })?;
+        if lookup.temporal || lookup.as_of_field.is_some() {
+            return Err(SparrowError::new(ErrorCode::FeatureUnavailable,
+                "managed temporal Lookup requires a pinned version timeline and is not yet enabled"));
+        }
+        if lookup.table_keys != table.table.keys {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                "Lookup table keys must exactly match the immutable table key order"));
+        }
+        let schema = table.table.schema(&table.name)?;
+        for (stream_key, table_key) in lookup.stream_keys.iter().zip(&lookup.table_keys) {
+            let source = input.field_by_name(stream_key).ok_or_else(||
+                SparrowError::new(ErrorCode::InvalidSchema, "Lookup stream key is absent"))?;
+            let target = schema.field_by_name(table_key).ok_or_else(||
+                SparrowError::new(ErrorCode::InvalidSchema, "Lookup table key is absent"))?;
+            if source.data_type != target.data_type {
+                return Err(SparrowError::new(ErrorCode::TypeMismatch,
+                    "Lookup stream and table key types must match without coercion"));
+            }
+        }
+        used.insert(table.name.as_str());
+    }
+    if used.len() != spec.reference_tables.len() {
+        return Err(SparrowError::new(ErrorCode::InvalidArgument,
+            "reference_tables contains a binding not used by any Lookup"));
+    }
+    Ok(plan)
+}
+
 pub fn bind_plan(
     spec: &PipelineSpec,
     catalog: &Catalog,
@@ -554,24 +609,251 @@ pub fn resolve_file_contract(
     }
 }
 
+/// Decode the canonical table digest stored in a pipeline binding.  The
+/// control plane is the only layer that turns the textual SHA-256 into the
+/// typed checkpoint dependency identity; runtime CRC is deliberately supplied
+/// separately by the verified, detached table snapshot.
+pub(crate) fn decode_reference_sha256(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 {
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "reference table binding requires a 64-character SHA-256",
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16).ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidArgument, "reference table SHA-256 is not hex")
+        })?;
+        let low = (pair[1] as char).to_digit(16).ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidArgument, "reference table SHA-256 is not hex")
+        })?;
+        out[index] = ((high << 4) | low) as u8;
+    }
+    Ok(out)
+}
+
+/// Build only an eligibility/shape dependency list from the persisted spec.
+/// `runtime_crc32=0` is intentional here: no placeholder is ever passed to a
+/// real aligned checkpoint or stored in a manifest; startup replaces it with
+/// `ReferenceTable::verified_dependency()` from the loaded table.
+pub(crate) fn reference_dependency_shape(
+    spec: &PipelineSpec,
+) -> Result<Vec<sparrow_plan::ReferenceTableDependency>> {
+    spec.reference_tables
+        .iter()
+        .map(|(name, binding)| {
+            Ok(sparrow_plan::ReferenceTableDependency {
+                name: name.clone(),
+                revision: binding.revision,
+                canonical_sha256: decode_reference_sha256(&binding.sha256)?,
+                runtime_crc32: 0,
+            })
+        })
+        .collect()
+}
+
+/// Check that actual detached tables and the spec describe exactly the same
+/// immutable dependency set.  This catches a changed revision, digest,
+/// missing table, or duplicate name before constructing the checkpoint layout
+/// used for restore.  Runtime CRC is intentionally allowed to be zero: the
+/// actual value is obtained from the verified table snapshot, not inferred
+/// from this identity-only check.
+pub(crate) fn validate_reference_dependencies(
+    spec: &PipelineSpec,
+    dependencies: &[sparrow_plan::ReferenceTableDependency],
+) -> Result<()> {
+    if dependencies.len() != spec.reference_tables.len() {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "verified reference dependency count differs from the pipeline binding",
+        ));
+    }
+    let mut ordered = dependencies.to_vec();
+    ordered.sort_by(|a, b| a.name.cmp(&b.name));
+    if ordered.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "verified reference dependency names are not unique",
+        ));
+    }
+    for dependency in ordered {
+        let binding = spec.reference_tables.get(&dependency.name).ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                format!("verified reference table '{}' is not bound by the pipeline", dependency.name),
+            )
+        })?;
+        let canonical = decode_reference_sha256(&binding.sha256)?;
+        if dependency.revision != binding.revision || dependency.canonical_sha256 != canonical {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                format!(
+                    "verified reference table '{}' does not match its bound revision/digest",
+                    dependency.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Construct the exact participant plan for an aligned attempt.  For B2-A
+/// this is fed the real runtime CRCs; the eligibility-only caller passes the
+/// spec-derived shape with CRC=0.
+pub(crate) fn checkpoint_plan_with_references(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+    dependencies: &[sparrow_plan::ReferenceTableDependency],
+) -> Result<sparrow_plan::CheckpointPlan> {
+    if spec.reference_tables.is_empty() {
+        if !dependencies.is_empty() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "reference dependencies supplied for a pipeline without bindings",
+            ));
+        }
+        return sparrow_plan::CheckpointPlan::from_physical(plan);
+    }
+    validate_reference_dependencies(spec, dependencies)?;
+    sparrow_plan::CheckpointPlan::from_physical_with_references(plan, dependencies.to_vec())
+}
+
+fn validate_reference_checkpoint_profile(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+) -> Result<()> {
+    if spec.reference_tables.is_empty() {
+        return Ok(());
+    }
+    if spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
+        || spec.sink.kind != "http"
+        || !plan.side_outputs.is_empty()
+        || !plan.source_times.is_empty()
+    {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "reference-table checkpoint profile requires an explicit checkpoint_dir, required HTTP output and no side/time outputs",
+        ));
+    }
+
+    let graph = spec.graph_io.is_some() || plan.edges.is_some();
+    let source_kind = if graph {
+        let io = spec.graph_io.as_ref().ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "reference-table graph checkpoint requires explicit graph_io",
+            )
+        })?;
+        if plan.edges.is_none()
+            || io.sources.is_empty()
+            || io.sources.values().any(|source| {
+                !matches!(source.kind.as_str(), "file" | "file_replay" | "replay")
+            })
+            || io.sinks.is_empty()
+            || io.sinks.values().any(|sink| sink.kind != "http")
+            || plan.stages.iter().any(|stage| {
+                matches!(
+                    stage,
+                    sparrow_plan::PhysicalStage::BestEffortSink { .. }
+                )
+            })
+            || plan
+                .edges
+                .as_ref()
+                .is_some_and(|edges| edges.iter().any(|edge| edge.best_effort))
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "reference-table graph checkpoint requires replayable File sources and required HTTP sinks without lossy edges",
+            ));
+        }
+        "file-dag-v1"
+    } else {
+        if !matches!(
+            spec.source.kind.as_str(),
+            "file" | "file_replay" | "replay" | "jetstream"
+        ) {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "reference-table checkpoint requires a replayable File or JetStream source",
+            ));
+        }
+        if !matches!(
+            plan.stages.first(),
+            Some(sparrow_plan::PhysicalStage::MemorySource { .. })
+        ) || !matches!(
+            plan.stages.last(),
+            Some(sparrow_plan::PhysicalStage::CaptureSink { .. })
+        ) {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "reference-table checkpoint requires one leading source and one trailing required sink",
+            ));
+        }
+        if spec.source.kind == "jetstream" {
+            "jetstream-v1"
+        } else {
+            "file"
+        }
+    };
+
+    // The plan/runtime pair owns the supported state matrix and profile
+    // number.  This keeps control from accidentally opening a new IoT kind
+    // (for example Hysteresis) through the old v8 stateless path.
+    let dependencies = reference_dependency_shape(spec)?;
+    let layout = sparrow_plan::CheckpointPlan::from_physical_with_references(
+        plan,
+        dependencies,
+    )?;
+    let version = sparrow_runtime::pipeline_checkpoint::snapshot_version_for(&layout, source_kind)?;
+    let expected = if graph {
+        11
+    } else if source_kind == "jetstream-v1" {
+        10
+    } else if layout.states.is_empty() {
+        8
+    } else {
+        9
+    };
+    if version != expected {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            format!(
+                "reference checkpoint profile mismatch: source/topology selects v{expected}, runtime selected v{version}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Aligned recovery: honor Filter/Project on the Kernel path; reject
-/// dishonest plans (PT windows, Dedup, Lookup) rather than strip stages (P0-1/P0-2/A1).
+/// dishonest plans rather than strip stages (P0-1/P0-2/A1). B2-A adds a
+/// separate profile for static immutable Lookup dependencies.
 pub fn validate_aligned_plan(
     spec: &PipelineSpec,
     plan: &PhysicalPlan,
 ) -> sparrow_model::Result<()> {
+    let dependencies = if spec.reference_tables.is_empty() {
+        None
+    } else {
+        Some(reference_dependency_shape(spec)?)
+    };
+    validate_aligned_plan_inner(spec, plan, dependencies.as_deref())
+}
+
+fn validate_aligned_plan_inner(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+    dependencies: Option<&[sparrow_plan::ReferenceTableDependency]>,
+) -> sparrow_model::Result<()> {
     let recovery = RecoveryPolicy::parse(&spec.recovery)?;
+    if plan.has_timed_iot() { validate_paused_time_profile(spec,plan)?; }
     if !recovery.is_aligned() {
         return Ok(());
     }
     if plan.has_iot() && spec.graph_io.is_none() {
         validate_linear_iot_profile(spec)?;
-    }
-    if plan.has_iot() && spec.source.kind == "jetstream" {
-        return Err(SparrowError::new(
-            ErrorCode::FeatureUnavailable,
-            "JetStream + IoT state operators are not in the K4 aligned profile",
-        ));
     }
     if plan.has_iot()
         && plan.stages.iter().any(|stage| {
@@ -605,7 +887,12 @@ pub fn validate_aligned_plan(
     if let Some(dir) = &spec.checkpoint_dir {
         check_data_path(std::path::Path::new(dir)).map_err(io)?;
     }
-    sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    if let Some(dependencies) = dependencies {
+        validate_reference_checkpoint_profile(spec, plan)?;
+        checkpoint_plan_with_references(spec, plan, dependencies)?;
+    } else {
+        sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    }
     if spec.source.kind=="jetstream" && plan.stages.iter().any(|stage|
         matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}))) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state or one/two Count windows only; event/processing-time replay context not verified"));
@@ -626,6 +913,26 @@ fn validate_linear_iot_profile(spec: &PipelineSpec) -> Result<()> {
             "linear aligned IoT recovery requires an explicit checkpoint_dir and HTTP sink",
         ));
     }
+    Ok(())
+}
+
+fn validate_paused_time_profile(spec:&PipelineSpec,plan:&PhysicalPlan)->Result<()> {
+    let supported_source=matches!(spec.source.kind.as_str(),"file"|"file_replay"|"replay")
+        || (cfg!(feature="jetstream") && spec.source.kind=="jetstream");
+    if spec.recovery!="aligned" || !supported_source || spec.graph_io.is_some() || plan.edges.is_some()
+        || !spec.reference_tables.is_empty() || !plan.source_times.is_empty() || !plan.side_outputs.is_empty()
+        || spec.sink.kind!="http" || spec.sink.skip_verify
+        || spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
+        || !spec.fail_on_decode
+        || !spec.checkpoint.as_ref().is_some_and(|p|p.resume_latest && p.interval_ms.is_some_and(|n|(100..=1000).contains(&n)))
+        || spec.restore.as_ref().is_some_and(|r| r.kind!="checkpoint" || r.snapshot_id.as_deref().is_some_and(|id|!id.is_empty() && id!="aligned")) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+            "paused-time IoT requires linear File/JetStream, verified HTTP, explicit checkpoint_dir, fail_on_decode=true and resume_latest with interval_ms=100..1000; historical restore, references and side/time inputs are not enabled"));
+    }
+    if spec.source.kind!="jetstream" && resolve_file_contract(spec,RecoveryPolicy::Aligned)?!=sparrow_connectors::FileContract::AppendOnly {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"paused-time File input requires append_only; EOF must not stop timers"));
+    }
+    sparrow_plan::CheckpointPlan::from_physical(plan)?;
     Ok(())
 }
 
@@ -678,6 +985,7 @@ pub fn capabilities_json() -> serde_json::Value {
                 "kind":"jetstream","enabled_by_build":cfg!(feature="jetstream"),"maturity":"preview",
                 "replay":if cfg!(feature="jetstream"){"replayable"}else{"unavailable"},
                 "delivery":"checkpointed_at_least_once","recovery":"aligned","requires_eligible_profile":true,
+                "state_profiles":if cfg!(feature="jetstream"){serde_json::json!({"legacy_count":"v4","iot_ttl0":"v7"})}else{serde_json::json!({})},
                 "certified":false,
             }
         ],
@@ -728,17 +1036,123 @@ fn iot_ttls(plan: &PhysicalPlan) -> Vec<i64> {
         .collect()
 }
 
+fn plan_has_hysteresis(plan: &PhysicalPlan) -> bool {
+    plan.stages.iter().any(|stage| {
+        matches!(
+            stage,
+            sparrow_plan::PhysicalStage::Iot { spec, .. } if spec.hysteresis.is_some()
+        )
+    })
+}
+
+fn reference_source_kind(spec: &PipelineSpec, plan: &PhysicalPlan) -> &'static str {
+    if plan.edges.is_some() {
+        "file-dag-v1"
+    } else if spec.source.kind == "jetstream" {
+        "jetstream-v1"
+    } else {
+        "file"
+    }
+}
+
+fn reference_snapshot_version(spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<u16> {
+    let dependencies = reference_dependency_shape(spec)?;
+    let layout = sparrow_plan::CheckpointPlan::from_physical_with_references(plan, dependencies)?;
+    sparrow_runtime::pipeline_checkpoint::snapshot_version_for(
+        &layout,
+        reference_source_kind(spec, plan),
+    )
+}
+
 /// Eligibility is a property of both the replayable source and the bound plan,
 /// independent of whether the stored spec currently requests aligned recovery.
 pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
+    if plan.has_timed_iot() {
+        let checked=validate_paused_time_profile(spec,plan);
+        value["aligned_eligible"]=serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"]=serde_json::json!(checked.err().map(|e|e.message));
+        value["recovery_risk"]=serde_json::json!("required_HTTP_may_repeat_before_commit; deduplicate_by_output_identity; no_exactly_once");
+        value["iot"]=serde_json::json!({"operators":["hold_for","debounce"],"clock":"paused_source_ordered",
+            "snapshot_version":if spec.source.kind=="jetstream"{15}else{14},"maturity":"preview","certified":false,
+            "profile":"one_timed_state_linear_no_references","recovery":"CURRENT_only; TIME_PENDING_required",
+            "checkpoint":"one_input_or_idle_tick_per_durable_decision; commit_before_next_decision",
+            "idle_tick_ms":spec.checkpoint.as_ref().and_then(|p|p.interval_ms),
+            "downtime":"paused; startup_and_pending_replay_do_not_advance_time",
+            "throughput":"serialized_per_decision_fsync_and_required_HTTP_flush; not_the_high_throughput_profile"});
+        return value;
+    }
+    let reference_version = if spec.reference_tables.is_empty() {
+        None
+    } else {
+        reference_snapshot_version(spec, plan).ok()
+    };
+    if !spec.reference_tables.is_empty() {
+        value["reference_tables"] = serde_json::json!({
+            "bindings":spec.reference_tables,
+            "selection":"immutable_revision_and_sha256; never_latest",
+            "validation":"requires_exact_resolution_at_bind_and_start",
+            "running_update":"new_table_publication_does_not_replace_bound_revision",
+            "recovery":"restart_fresh_by_default; aligned profiles v8(stateless File), v9(File state), v10(JetStream), v11(File DAG)",
+            "gc_pin":"all_retained_pipeline_revisions",
+            "checkpoint_dependencies":"profile-specific snapshots store exact revision, canonical SHA-256 and runtime table CRC; table rows are not copied into the checkpoint",
+            "checkpoint_profile":reference_version.map(|version| format!("v{version}")),
+            "certified":false
+        });
+    }
     let recovery = RecoveryPolicy::parse(&spec.recovery).unwrap_or(RecoveryPolicy::RestartFresh);
+    let reliable_iot = cfg!(feature = "jetstream") && spec.source.kind == "jetstream";
+    let unreferenced_iot_version = if plan_has_hysteresis(plan) {
+        if reliable_iot { 13 } else { 12 }
+    } else if reliable_iot {
+        7
+    } else {
+        6
+    };
+    let iot_snapshot_version = reference_version.unwrap_or(unreferenced_iot_version);
+    let iot_restore_compatibility = if reference_version.is_some() {
+        "source_all_state_and_full_plan_semantics; exact reference revision/SHA/CRC; separate profile-specific directory"
+    } else if plan_has_hysteresis(plan) {
+        "source_all_state_and_full_plan_semantics; separate Hysteresis profile directory"
+    } else if reliable_iot {
+        "source_all_state_and_full_plan_semantics; separate directories from v3/v4/v5/v6"
+    } else {
+        "source_all_state_and_full_plan_semantics; separate directories from v3/v4/v5"
+    };
+    let iot_downstream_changes = if reference_version.is_some() {
+        "any table revision/schema/CRC or computation change requires explicit fresh or compatible reference restore; external outputs are not rolled back"
+    } else if plan_has_hysteresis(plan) {
+        "full_plan_change_requires_explicit_fresh_or_compatible_hysteresis_restore; external_outputs_are_not_rolled_back"
+    } else if reliable_iot {
+        "full_plan_change_requires_explicit_fresh_or_compatible_v7_restore; external_outputs_are_not_rolled_back"
+    } else {
+        "full_plan_change_requires_explicit_fresh_or_compatible_v6_restore; external_outputs_are_not_rolled_back"
+    };
     if plan.has_iot() {
+        let iot_recovery = if recovery.is_aligned() {
+            if reference_version.is_some() {
+                format!("aligned_v{iot_snapshot_version}_ttl_disabled")
+            } else if plan_has_hysteresis(plan) {
+                format!("aligned_v{iot_snapshot_version}_hysteresis_ttl_disabled")
+            } else if reliable_iot {
+                "aligned_v7_ttl_disabled".to_string()
+            } else {
+                "aligned_v6_ttl_disabled".to_string()
+            }
+        } else {
+            "restart_fresh_empty_state_no_persisted_generation".to_string()
+        };
+        let iot_continuity = if recovery.is_aligned() {
+            format!("preserved_from_compatible_v{iot_snapshot_version}_checkpoint")
+        } else {
+            "not_preserved_on_restart_or_reset".to_string()
+        };
         value["iot"] = serde_json::json!({
-            "operators":["change_detect","deadband"],
+            "operators":if plan_has_hysteresis(plan) { vec!["change_detect","deadband","hysteresis"] } else { vec!["change_detect","deadband"] },
             "state":"bounded_task_owned_key_state",
-            "recovery":if recovery.is_aligned() {"aligned_v6_ttl_disabled"} else {"restart_fresh_empty_state_no_persisted_generation"},
-            "continuity":if recovery.is_aligned() {"preserved_from_compatible_v6_checkpoint"} else {"not_preserved_on_restart_or_reset"},
+            "snapshot_version":iot_snapshot_version,
+            "recovery":iot_recovery,
+            "continuity":iot_continuity,
             "ttl_micros":iot_ttls(plan)
         });
     }
@@ -750,19 +1164,27 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
         value["aligned_eligibility_reason"]=serde_json::json!(eligibility.err().map_or_else(||"graph_required_file_count_participants".into(),|e|e.message));
         let iot = plan.has_iot();
         let iot_ttl = iot_ttls(plan);
+        let snapshot_version = reference_version.unwrap_or(if iot {
+            iot_snapshot_version
+        } else {
+            5
+        });
+        let manifest = if reference_version.is_some() { "CPL3" } else { "CPL1/CP01DAG1" };
         value["checkpoint_participants"]=serde_json::json!({
-            "scope":if iot {"graph_File_required_HTTP_stateless_Count_or_IoT"} else {"graph_File_required_HTTP_stateless_or_Count"},
-            "snapshot_version":if iot {6} else {5},
-            "manifest":"CPL1/CP01DAG1",
-            "restore_compatibility":if iot {"strict_full_graph_all_source_cursors_and_IoT_state; separate_directory_from_v3_v4_v5"} else {"strict_full_graph_and_all_source_cursors; separate_directory_from_v3_v4"},
+            "scope":if reference_version.is_some() {"graph_File_required_HTTP_static_Lookup_Count_or_IoT"} else if iot {"graph_File_required_HTTP_stateless_Count_or_IoT"} else {"graph_File_required_HTTP_stateless_or_Count"},
+            "snapshot_version":snapshot_version,
+            "manifest":manifest,
+            "manifest_version":if reference_version.is_some() {"CPL3"} else {"CPL1"},
+            "restore_compatibility":if iot {iot_restore_compatibility} else {"strict_full_graph_and_all_source_cursors; separate_directory_from_v3_v4"},
             "certified":false
         });
         if iot {
             value["iot"] = serde_json::json!({
-                "operators":["change_detect","deadband"],
+                "operators":if plan_has_hysteresis(plan) { vec!["change_detect","deadband","hysteresis"] } else { vec!["change_detect","deadband"] },
                 "state":"bounded_task_owned_key_state",
-                "recovery":if spec.recovery=="aligned" {"aligned_v6_ttl_disabled"} else {"restart_fresh_empty_state_no_persisted_generation"},
-                "continuity":if spec.recovery=="aligned" {"preserved_from_compatible_v6_checkpoint"} else {"not_preserved_on_restart_or_reset"},
+                "snapshot_version":iot_snapshot_version,
+                "recovery":if spec.recovery=="aligned" {format!("aligned_v{iot_snapshot_version}_ttl_disabled")} else {"restart_fresh_empty_state_no_persisted_generation".to_string()},
+                "continuity":if spec.recovery=="aligned" {format!("preserved_from_compatible_v{iot_snapshot_version}_checkpoint")} else {"not_preserved_on_restart_or_reset".to_string()},
                 "ttl_micros":iot_ttl
             });
         }
@@ -772,15 +1194,57 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
     }
     if spec.source.kind=="jetstream" {
         let accepted=spec.basic_check().and_then(|_|spec.check_delivery()).and_then(|_|validate_aligned_plan(spec,plan));
+        let iot = plan.has_iot();
+        let accepted_ok = accepted.is_ok();
+        let eligibility_reason = accepted
+            .as_ref()
+            .err()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| {
+                if let Some(version) = reference_version {
+                    format!("jetstream_static_reference_dependencies_profile{version}")
+                } else if iot {
+                    format!("jetstream_reliable_iot_v{iot_snapshot_version}_ttl0_count_or_iot_state")
+                } else {
+                    "jetstream_zero_or_one_two_count_windows".into()
+                }
+            });
         value["requested_delivery"]=serde_json::json!(spec.delivery);
-        if accepted.is_err() {value["delivery"]=serde_json::json!("unavailable");}
-        value["aligned_eligible"]=serde_json::json!(accepted.is_ok());
-        value["aligned_eligibility_reason"]=serde_json::json!(accepted.err().map_or_else(||"jetstream_zero_or_one_two_count_windows".into(),|e|e.message));
-        value["checkpoint_participants"]=serde_json::json!({"snapshot_version":4,"scope":"single_jetstream_single_required_http_sink",
-            "restore_compatibility":"full_computation_and_source_reader_binding","downstream_changes":"rejected_until_explicit_lineage_fork",
+        if !accepted_ok {value["delivery"]=serde_json::json!("unavailable");}
+        value["aligned_eligible"]=serde_json::json!(accepted_ok);
+        value["aligned_eligibility_reason"]=serde_json::json!(eligibility_reason);
+        let snapshot_version = reference_version.unwrap_or(if iot {
+            iot_snapshot_version
+        } else {
+            4
+        });
+        let profile = reference_version.map_or_else(
+            || {
+                if plan_has_hysteresis(plan) {
+                    "hysteresis_reliable_v13".to_string()
+                } else if iot {
+                    "reliable_iot_v7".to_string()
+                } else {
+                    "jetstream_v4".to_string()
+                }
+            },
+            |version| format!("reference_jetstream_v{version}"),
+        );
+        value["checkpoint_participants"]=serde_json::json!({"snapshot_version":snapshot_version,"profile":profile,"manifest_version":if reference_version.is_some() {"CPL3"} else {"CPL1"},"scope":if reference_version.is_some() {"single_jetstream_static_reference_required_http"} else if iot {"single_jetstream_single_required_http_sink_iot"} else {"single_jetstream_single_required_http_sink"},
+            "restore_compatibility":if iot {iot_restore_compatibility} else {"full_computation_and_source_reader_binding"},"downstream_changes":if iot {iot_downstream_changes} else {"rejected_until_explicit_lineage_fork"},
             "confirmation":"HTTP_2xx_acceptance_not_business_commit","source_ack":"after_durable_checkpoint","output_ids":"128bit_epoch_64bit_ordinal",
             "certified":false,"maturity":"preview","poison":"fail_then_finite_retry_or_held","durable_outbox":false,"dlq":false});
         value["recovery_risk"]=serde_json::json!("uncommitted_outputs_may_repeat_with_stable_ids; retention_expiry_refuses_restore; no_HA");
+        if iot {
+            value["iot"] = serde_json::json!({
+                "operators":if plan_has_hysteresis(plan) { vec!["change_detect","deadband","hysteresis"] } else { vec!["change_detect","deadband"] },
+                "state":"bounded_task_owned_key_state",
+                "snapshot_version":iot_snapshot_version,
+                "recovery":if accepted_ok {format!("aligned_v{iot_snapshot_version}_ttl_disabled")} else {"unavailable".to_string()},
+                "continuity":if accepted_ok {format!("preserved_from_compatible_v{iot_snapshot_version}_checkpoint")} else {"unavailable_until_validation_passes".to_string()},
+                "ttl_micros":iot_ttls(plan)
+            });
+        }
         if let Some(config)=&spec.source.jetstream {
             value["jetstream_execution"]=serde_json::json!({
                 "input_batching":"already_ready_rows_bounded_by_kernel_and_pull",
@@ -795,7 +1259,14 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
         return value;
     }
     if matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
-        let checkpoint_plan = if plan.has_iot() {
+        let checkpoint_plan = if !spec.reference_tables.is_empty() {
+            let mut aligned = spec.clone();
+            aligned.recovery = "aligned".into();
+            validate_aligned_plan(&aligned, plan).and_then(|_| {
+                let dependencies = reference_dependency_shape(&aligned)?;
+                checkpoint_plan_with_references(&aligned, plan, &dependencies)
+            })
+        } else if plan.has_iot() {
             validate_linear_iot_profile(spec)
                 .and_then(|_| sparrow_plan::CheckpointPlan::from_physical(plan))
         } else {
@@ -806,29 +1277,38 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
                 value["aligned_eligible"] = serde_json::json!(true);
                 let iot = plan.has_iot();
                 let iot_ttl = iot_ttls(plan);
-                value["aligned_eligibility_reason"] = serde_json::json!(if iot {
-                    "IoT_state_participants_v6"
+                value["aligned_eligibility_reason"] = serde_json::json!(if let Some(version) = reference_version {
+                    format!("static_reference_dependencies_profile{version}")
+                } else if iot {
+                    format!("IoT_state_participants_v{iot_snapshot_version}")
                 } else {
                     match manifest.states.len() {
                         0=>"zero_state_file_cut",
                         1=>"single_supported_window",
                         _=>"two_count_window_participants",
-                    }
+                    }.to_string()
                 });
+                let snapshot_version = reference_version.unwrap_or(if iot {
+                    iot_snapshot_version
+                } else {
+                    sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION
+                });
+                let manifest_version = if reference_version.is_some() { "CPL3" } else { "CPL1" };
                 value["checkpoint_participants"] = serde_json::json!({"source":manifest.source.raw(),"required_sink":manifest.sink.raw(),
-                    "snapshot_version":if iot {6} else {sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION},
-                    "manifest_version":"CPL1","semantics_version":if iot {"CP01_full_plan_IoT_state"} else {"CP01+RCP2"},"restore_compatibility":if iot {"source_all_state_and_full_plan_semantics; separate_directory_from_v3_v4_v5"} else {"source_and_all_state_upstream_prefixes; plain_CP01_full_plan_strict"},
-                    "downstream_changes":if iot {"full_plan_change_requires_explicit_fresh_or_compatible_v6_restore; external_outputs_are_not_rolled_back"} else {"allowed_after_last_state; plain_CP01_snapshots_remain_full_plan_strict; external_outputs_are_not_rolled_back"},
+                    "snapshot_version":snapshot_version,
+                    "manifest_version":manifest_version,"semantics_version":if iot {"CP01_full_plan_IoT_state"} else if reference_version.is_some() {"CP01_full_plan_static_reference_dependencies"} else {"CP01+RCP2"},"restore_compatibility":if iot {iot_restore_compatibility} else if reference_version.is_some() {"source_and_exact_static_reference_revision_sha256_runtime_crc; separate profile-specific directory"} else {"source_and_all_state_upstream_prefixes; plain_CP01_full_plan_strict"},
+                    "downstream_changes":if reference_version.is_some() {"any table revision/schema/CRC or computation change requires explicit fresh or compatible reference restore; external outputs are not rolled back"} else if iot {iot_downstream_changes} else {"allowed_after_last_state; plain_CP01_snapshots_remain_full_plan_strict; external_outputs_are_not_rolled_back"},
                     "states":manifest.states.iter().map(|state|match state.id {
                         sparrow_plan::ParticipantId::State {operator,slot,shard}=>serde_json::json!({"operator":operator.raw(),"slot":slot.raw(),"shard":shard,"codec":state.codec,"window_kind":state.window_kind}),
                         _=>unreachable!(),
-                    }).collect::<Vec<_>>(),"scope":"single_file_single_required_sink_tested_linear_shapes","certified":false});
+                    }).collect::<Vec<_>>(),"profile":reference_version.map_or_else(|| format!("v{snapshot_version}"), |version| format!("reference_v{version}")),"scope":if reference_version.is_some() {"single_file_static_reference_required_http_linear_shapes"} else {"single_file_single_required_sink_tested_linear_shapes"},"certified":false});
                 if iot {
                     value["iot"] = serde_json::json!({
-                        "operators":["change_detect","deadband"],
+                        "operators":if plan_has_hysteresis(plan) { vec!["change_detect","deadband","hysteresis"] } else { vec!["change_detect","deadband"] },
                         "state":"bounded_task_owned_key_state",
-                        "recovery":if spec.recovery=="aligned" {"aligned_v6_ttl_disabled"} else {"restart_fresh_empty_state_no_persisted_generation"},
-                        "continuity":if spec.recovery=="aligned" {"preserved_from_compatible_v6_checkpoint"} else {"not_preserved_on_restart_or_reset"},
+                        "snapshot_version":iot_snapshot_version,
+                        "recovery":if spec.recovery=="aligned" {format!("aligned_v{iot_snapshot_version}_ttl_disabled")} else {"restart_fresh_empty_state_no_persisted_generation".to_string()},
+                        "continuity":if spec.recovery=="aligned" {format!("preserved_from_compatible_v{iot_snapshot_version}_checkpoint")} else {"not_preserved_on_restart_or_reset".to_string()},
                         "ttl_micros":iot_ttl
                     });
                 }
@@ -842,14 +1322,16 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
                 if plan.has_iot() {
                     value["checkpoint_participants"] = serde_json::json!({
                         "scope":"single_file_single_required_sink_iot",
-                        "snapshot_version":6,
-                        "profile":"iot_v6",
+                        "snapshot_version":iot_snapshot_version,
+                        "profile":format!("iot_v{iot_snapshot_version}"),
+                        "manifest_version":if reference_version.is_some() {"CPL3"} else {"CPL1"},
                         "eligible":false,
                         "certified":false
                     });
                     value["iot"] = serde_json::json!({
-                        "operators":["change_detect","deadband"],
+                        "operators":if plan_has_hysteresis(plan) { vec!["change_detect","deadband","hysteresis"] } else { vec!["change_detect","deadband"] },
                         "state":"bounded_task_owned_key_state",
+                        "snapshot_version":iot_snapshot_version,
                         "recovery":"restart_fresh_empty_state_no_persisted_generation",
                         "continuity":"not_preserved_on_restart_or_reset",
                         "ttl_micros":iot_ttls(plan)
@@ -925,6 +1407,7 @@ mod tests {
     #[test]
     fn rejects_checkpoint_and_at_least_once() {
         let mut spec = PipelineSpec {
+            reference_tables: Default::default(),
             graph_io: None,
             version: 1,
             stream: "sensors".into(),

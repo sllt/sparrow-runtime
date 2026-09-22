@@ -4,31 +4,375 @@
 //! V0.3: [`VersionedReferenceTable`] — as-of-event-time lookup; new versions
 //! can be published with `valid_from` without replacing the job handle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use sparrow_model::{
-    CreditKind, DataType, ErrorCode, Field, FieldId, MemoryOwner, Result, Row, RowBatch,
-    RowBatchBuilder, Scalar, Schema, SchemaId, SparrowError,
+    CreditKind, DataType, ErrorCode, Field, FieldId, MemoryLease, MemoryOwner, Result, Row,
+    RowBatch, RowBatchBuilder, Scalar, Schema, SchemaId, SparrowError,
 };
 use sparrow_plan::LookupSpec;
 
-use crate::window::{finish_rows, resolve_keys};
+use crate::window::{finish_rows_metered, resolve_keys};
+
+const REFERENCE_TABLE_HASH_NODE_BYTES: usize = 64;
+const REFERENCE_TABLE_METADATA_BYTES: usize = 256;
+
+fn invalid_table(message: impl Into<String>) -> SparrowError {
+    SparrowError::new(ErrorCode::InvalidSchema, message)
+}
+
+fn unsupported_key(message: impl Into<String>) -> SparrowError {
+    SparrowError::new(ErrorCode::FeatureUnavailable, message)
+}
+
+fn deterministic_key_type(ty: &DataType) -> bool {
+    matches!(
+        ty,
+        DataType::Bool
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Bytes
+            | DataType::TimestampMicrosUTC
+    )
+}
+
+fn deterministic_key_scalar(value: &Scalar) -> bool {
+    match value {
+        Scalar::Bool(_)
+        | Scalar::Int64(_)
+        | Scalar::UInt64(_)
+        | Scalar::Utf8(_)
+        | Scalar::Bytes(_)
+        | Scalar::TimestampMicrosUTC(_) => true,
+        Scalar::Float64(value) => value.is_finite(),
+        Scalar::Null | Scalar::Dynamic(_) => false,
+    }
+}
+
+fn validate_row(schema: &Schema, row: &Row, row_number: usize) -> Result<()> {
+    if row.values.len() != schema.fields.len() {
+        return Err(invalid_table(format!(
+            "reference row {row_number} has {} values, schema has {} fields",
+            row.values.len(),
+            schema.fields.len()
+        )));
+    }
+    for (value, field) in row.values.iter().zip(&schema.fields) {
+        if value.is_null() {
+            if !field.nullable {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    format!(
+                        "reference field '{}' is non-nullable but row {row_number} has Null",
+                        field.name
+                    ),
+                ));
+            }
+        } else if !value.matches_type(&field.data_type) {
+            return Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                format!(
+                    "reference field '{}' expected {}, got {} in row {row_number}",
+                    field.name,
+                    field.data_type,
+                    value.data_type()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_key_schema(schema: &Schema, key_fields: &[String], key_idx: &[usize]) -> Result<()> {
+    if key_fields.is_empty() || key_idx.len() != key_fields.len() {
+        return Err(invalid_table(
+            "reference table requires at least one key field",
+        ));
+    }
+    let mut seen = HashSet::with_capacity(key_idx.len());
+    for (name, &index) in key_fields.iter().zip(key_idx) {
+        if !seen.insert(index) {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!("reference table has duplicate key field '{name}'"),
+            ));
+        }
+        let field = schema
+            .fields
+            .get(index)
+            .ok_or_else(|| invalid_table("reference table key index is outside schema"))?;
+        if field.nullable {
+            return Err(invalid_table(format!(
+                "reference table key field '{}' must be non-nullable",
+                field.name
+            )));
+        }
+        if !deterministic_key_type(&field.data_type) {
+            return Err(unsupported_key(format!(
+                "reference table key field '{}' has unsupported type {}",
+                field.name, field.data_type
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_key_values(
+    schema: &Schema,
+    key_idx: &[usize],
+    row: &Row,
+    row_number: usize,
+    allow_null: bool,
+) -> Result<()> {
+    for &index in key_idx {
+        let field = &schema.fields[index];
+        let value = &row.values[index];
+        if value.is_null() {
+            if allow_null {
+                // A nullable stream key is a normal lookup miss. The table
+                // contract still rejects nullable/null keys at snapshot time.
+                continue;
+            }
+            return Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                format!(
+                    "reference key field '{}' is null in row {row_number}",
+                    field.name
+                ),
+            ));
+        }
+        if !deterministic_key_scalar(value) {
+            return Err(unsupported_key(format!(
+                "reference key field '{}' is not a deterministic scalar",
+                field.name
+            )));
+        }
+        if !value.matches_type(&field.data_type) {
+            return Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                format!(
+                    "reference key field '{}' expected {}, got {} in row {row_number}",
+                    field.name,
+                    field.data_type,
+                    value.data_type()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn encode_string(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn encode_data_type(out: &mut Vec<u8>, ty: &DataType) {
+    match ty {
+        DataType::Null => out.push(0),
+        DataType::Bool => out.push(1),
+        DataType::Int64 => out.push(2),
+        DataType::UInt64 => out.push(3),
+        DataType::Float64 => out.push(4),
+        DataType::Utf8 => out.push(5),
+        DataType::Bytes => out.push(6),
+        DataType::TimestampMicrosUTC => out.push(7),
+        DataType::Dynamic => out.push(8),
+        DataType::Array(inner) => {
+            out.push(9);
+            encode_data_type(out, inner);
+        }
+        DataType::Struct(fields) => {
+            out.push(10);
+            out.extend_from_slice(&(fields.len() as u64).to_le_bytes());
+            for field in fields {
+                out.extend_from_slice(&field.id.raw().to_le_bytes());
+                encode_string(out, &field.name);
+                encode_data_type(out, &field.data_type);
+                out.push(u8::from(field.nullable));
+            }
+        }
+        DataType::Map { key, value } => {
+            out.push(11);
+            encode_data_type(out, key);
+            encode_data_type(out, value);
+        }
+    }
+}
+
+fn encode_schema(out: &mut Vec<u8>, schema: &Schema) {
+    out.extend_from_slice(&schema.id.raw().to_le_bytes());
+    out.extend_from_slice(&(schema.fields.len() as u64).to_le_bytes());
+    for field in &schema.fields {
+        out.extend_from_slice(&field.id.raw().to_le_bytes());
+        encode_string(out, &field.name);
+        encode_data_type(out, &field.data_type);
+        out.push(u8::from(field.nullable));
+    }
+}
+
+fn scalar_key_len(value: &Scalar) -> usize {
+    match value {
+        Scalar::Null => 1,
+        Scalar::Bool(_) => 2,
+        Scalar::Int64(_)
+        | Scalar::UInt64(_)
+        | Scalar::Float64(_)
+        | Scalar::TimestampMicrosUTC(_) => 1 + 8,
+        Scalar::Utf8(value) => 1usize.saturating_add(4).saturating_add(value.len()),
+        Scalar::Bytes(value) => 1usize.saturating_add(4).saturating_add(value.len()),
+        // Dynamic keys are rejected before this estimator. Keep a conservative
+        // fallback so a malformed caller cannot make the estimate wrap.
+        Scalar::Dynamic(value) => Scalar::Dynamic(value.clone())
+            .resident_bytes()
+            .saturating_mul(2)
+            .saturating_add(64),
+    }
+}
+
+fn data_type_resident_bytes(ty: &DataType) -> usize {
+    std::mem::size_of::<DataType>().saturating_add(match ty {
+        DataType::Array(inner) => data_type_resident_bytes(inner),
+        DataType::Struct(fields) => fields
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Field>())
+            .saturating_add(fields.iter().map(field_resident_bytes).sum::<usize>()),
+        DataType::Map { key, value } => {
+            data_type_resident_bytes(key).saturating_add(data_type_resident_bytes(value))
+        }
+        _ => 0,
+    })
+}
+
+fn field_resident_bytes(field: &Field) -> usize {
+    std::mem::size_of::<Field>()
+        .saturating_add(field.name.capacity())
+        .saturating_add(data_type_resident_bytes(&field.data_type))
+}
+
+fn schema_resident_bytes(schema: &Schema) -> usize {
+    std::mem::size_of::<Schema>()
+        .saturating_add(
+            schema
+                .fields
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Field>()),
+        )
+        .saturating_add(
+            schema
+                .fields
+                .iter()
+                .map(field_resident_bytes)
+                .sum::<usize>(),
+        )
+}
+
+fn snapshot_resident_bytes(
+    name: &String,
+    schema: &Schema,
+    key_fields: &Vec<String>,
+    rows: &Vec<Row>,
+    key_idx: &[usize],
+) -> usize {
+    let metadata = REFERENCE_TABLE_METADATA_BYTES
+        .saturating_add(std::mem::size_of::<ReferenceTable>())
+        .saturating_add(name.capacity())
+        .saturating_add(
+            key_fields
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+        )
+        .saturating_add(key_fields.iter().map(String::capacity).sum::<usize>())
+        .saturating_add(schema_resident_bytes(schema))
+        // The source Vec and its rows coexist with the detached index while
+        // construction is in progress.
+        .saturating_add(rows.capacity().saturating_mul(std::mem::size_of::<Row>()));
+    let mut total = metadata;
+    let mut checksum_scratch = REFERENCE_TABLE_METADATA_BYTES
+        .saturating_add(name.capacity())
+        .saturating_add(schema_resident_bytes(schema))
+        .saturating_add(
+            key_fields
+                .iter()
+                .map(|field| 8usize.saturating_add(field.capacity()))
+                .sum::<usize>(),
+        );
+    for row in rows {
+        let row_bytes = row.resident_bytes();
+        let key_bytes = key_idx.iter().fold(0usize, |n, &index| {
+            n.saturating_add(row.values[index].resident_bytes())
+                .saturating_add(scalar_key_len(&row.values[index]))
+                .saturating_add(1)
+        });
+        let encoded_index_key = key_idx.iter().fold(0usize, |n, &index| {
+            n.saturating_add(scalar_key_len(&row.values[index]))
+                .saturating_add(1)
+        });
+        checksum_scratch = checksum_scratch.saturating_add(
+            8usize.saturating_add(
+                row.values
+                    .iter()
+                    .map(|value| scalar_key_len(value).saturating_add(1))
+                    .sum::<usize>(),
+            ),
+        );
+        // `table_crc` appends a length-prefixed encoded index key and holds a
+        // sorted reference Vec for the whole table. Include both and leave
+        // room for Vec growth while the CRC buffer expands.
+        checksum_scratch = checksum_scratch
+            .saturating_add(encoded_index_key)
+            .saturating_add(4)
+            .saturating_add(std::mem::size_of::<&Vec<u8>>());
+        // Count both the source row and its detached copy, plus the temporary
+        // detached key and encoded key retained until insertion completes.
+        total = total
+            .saturating_add(row_bytes.saturating_mul(2))
+            .saturating_add(key_bytes);
+    }
+    total
+        .saturating_add(rows.len().saturating_mul(
+            std::mem::size_of::<(Vec<u8>, Row)>().saturating_add(REFERENCE_TABLE_HASH_NODE_BYTES),
+        ))
+        .saturating_add(checksum_scratch.saturating_mul(2))
+}
 
 /// Finite, detached snapshot. Not an async lookup.
-#[derive(Clone, Debug)]
+///
+/// `snapshot` keeps the historical bounded constructor for embedded callers:
+/// its caller owns the external lifetime/budget. Job-attached tables should
+/// use [`Self::snapshot_owned`], which holds a retention lease for the full
+/// table lifetime.
+#[derive(Debug)]
 pub struct ReferenceTable {
     pub name: String,
     pub version: u64,
     pub schema: Schema,
     pub key_fields: Vec<String>,
     index: HashMap<Vec<u8>, Row>,
-    /// CRC-32 of the frozen snapshot (name, version, keys, rows). Fail closed
-    /// on mismatch (P2-36).
+    /// CRC-32 of the frozen snapshot, including the complete schema. Fail
+    /// closed on mismatch (P2-36).
     checksum: u32,
+    /// Present only for the job-owned constructor. The historical embedding
+    /// constructor intentionally leaves this absent and documents that the
+    /// caller owns its external budget/lifetime.
+    owned_lease: Option<MemoryLease>,
+    /// SHA-256 of the control-plane canonical JSON envelope. Control has
+    /// already verified this digest; runtime's typed CRC is a separate
+    /// integrity contract and must not be compared as the same hash.
+    /// Historical constructors leave this absent and cannot be used as a
+    /// verified aligned reference-table dependency.
+    canonical_sha256: Option<[u8; 32]>,
+    /// Cached after construction so batch processing never scans the complete
+    /// table to calculate a scratch bound.
+    max_row_resident: usize,
 }
 
 impl ReferenceTable {
+    /// Historical bounded embedding constructor. The caller must externally
+    /// own the table's memory/lifetime; no job credit is acquired here.
     pub fn snapshot(
         name: impl Into<String>,
         version: u64,
@@ -37,6 +381,84 @@ impl ReferenceTable {
         rows: Vec<Row>,
         max_rows: usize,
         max_bytes: usize,
+    ) -> Result<Arc<Self>> {
+        Self::snapshot_inner(
+            name, version, schema, key_fields, rows, max_rows, max_bytes, None, None,
+        )
+    }
+
+    /// Build a finite table under the supplied job owner. A retention lease is
+    /// acquired before any detached key/row copy and retained until the table
+    /// is dropped. The estimate deliberately includes temporary key copies,
+    /// encoded index keys, hash nodes, vectors and schema metadata.
+    pub fn snapshot_owned(
+        name: impl Into<String>,
+        version: u64,
+        schema: Schema,
+        key_fields: Vec<String>,
+        rows: Vec<Row>,
+        max_rows: usize,
+        max_bytes: usize,
+        owner: &Arc<MemoryOwner>,
+    ) -> Result<Arc<Self>> {
+        Self::snapshot_inner(
+            name,
+            version,
+            schema,
+            key_fields,
+            rows,
+            max_rows,
+            max_bytes,
+            None,
+            Some(owner),
+        )
+    }
+
+    /// Build a job-owned snapshot from a control-plane verified canonical
+    /// table digest. The digest is supplied, not recomputed: control hashes
+    /// canonical JSON while this crate's CRC protects the detached typed
+    /// representation. The caller must obtain it from an exact-revision
+    /// `Store::reference_bindings` read.
+    pub fn snapshot_owned_verified(
+        name: impl Into<String>,
+        version: u64,
+        schema: Schema,
+        key_fields: Vec<String>,
+        rows: Vec<Row>,
+        max_rows: usize,
+        max_bytes: usize,
+        canonical_sha256: [u8; 32],
+        owner: &Arc<MemoryOwner>,
+    ) -> Result<Arc<Self>> {
+        if canonical_sha256 == [0; 32] {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "reference table canonical SHA-256 is empty",
+            ));
+        }
+        Self::snapshot_inner(
+            name,
+            version,
+            schema,
+            key_fields,
+            rows,
+            max_rows,
+            max_bytes,
+            Some(canonical_sha256),
+            Some(owner),
+        )
+    }
+
+    fn snapshot_inner(
+        name: impl Into<String>,
+        version: u64,
+        schema: Schema,
+        key_fields: Vec<String>,
+        rows: Vec<Row>,
+        max_rows: usize,
+        max_bytes: usize,
+        canonical_sha256: Option<[u8; 32]>,
+        owner: Option<&Arc<MemoryOwner>>,
     ) -> Result<Arc<Self>> {
         if rows.len() > max_rows {
             return Err(SparrowError::new(
@@ -47,9 +469,27 @@ impl ReferenceTable {
                 ),
             ));
         }
+        schema.validate()?;
         let key_idx = resolve_keys(&schema, &key_fields)?;
-        let mut index = HashMap::new();
-        let mut bytes = 0usize;
+        validate_key_schema(&schema, &key_fields, &key_idx)?;
+        for (row_number, row) in rows.iter().enumerate() {
+            validate_row(&schema, row, row_number)?;
+            validate_key_values(&schema, &key_idx, row, row_number, false)?;
+        }
+        let name = name.into();
+        let estimated = snapshot_resident_bytes(&name, &schema, &key_fields, &rows, &key_idx);
+        if estimated > max_bytes {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "reference table exceeds max_bytes {max_bytes} (estimated resident bytes {estimated})"
+                ),
+            ));
+        }
+        let owned_lease = owner
+            .map(|owner| owner.acquire(CreditKind::Retention, estimated.max(1)))
+            .transpose()?;
+        let mut index = HashMap::with_capacity(rows.len());
         for row in rows {
             let key: Vec<Scalar> = key_idx
                 .iter()
@@ -58,17 +498,17 @@ impl ReferenceTable {
             let detached = Row {
                 values: row.values.iter().map(Scalar::detach_copy).collect(),
             };
-            bytes = bytes.saturating_add(detached.tracked_bytes());
-            if bytes > max_bytes {
+            let encoded = encode_scalars(&key);
+            if index.contains_key(&encoded) {
                 return Err(SparrowError::new(
-                    ErrorCode::BoundExceeded,
-                    format!("reference table exceeds max_bytes {max_bytes}"),
+                    ErrorCode::InvalidArgument,
+                    "reference table contains duplicate key",
                 ));
             }
-            index.insert(encode_scalars(&key), detached);
+            index.insert(encoded, detached);
         }
-        let name = name.into();
-        let checksum = table_crc(&name, version, &key_fields, &index);
+        let max_row_resident = index.values().map(Row::resident_bytes).max().unwrap_or(0);
+        let checksum = table_crc(&name, version, &schema, &key_fields, &index);
         Ok(Arc::new(Self {
             name,
             version,
@@ -76,6 +516,9 @@ impl ReferenceTable {
             key_fields,
             index,
             checksum,
+            owned_lease,
+            canonical_sha256,
+            max_row_resident,
         }))
     }
 
@@ -83,9 +526,57 @@ impl ReferenceTable {
         self.checksum
     }
 
+    /// B2 aligned recovery requires the retention lease to belong to the
+    /// admitting Job owner. The historical unowned constructor deliberately
+    /// returns false here so it remains usable for restart-fresh embedding but
+    /// cannot bypass the aligned Job quota.
+    pub fn is_owned_by(&self, owner: &Arc<MemoryOwner>) -> bool {
+        self.owned_lease
+            .as_ref()
+            .is_some_and(|lease| Arc::ptr_eq(lease.owner(), owner))
+    }
+
+    /// Return the dependency identity only for snapshots created by
+    /// `snapshot_owned_verified`. Calling `verify` first prevents a corrupted
+    /// table from becoming valid merely by attaching an old digest.
+    pub fn verified_dependency(&self) -> Result<sparrow_plan::ReferenceTableDependency> {
+        self.verify()?;
+        self.schema.validate()?;
+        let key_idx = resolve_keys(&self.schema, &self.key_fields)?;
+        validate_key_schema(&self.schema, &self.key_fields, &key_idx)?;
+        for (row_number, row) in self.index.values().enumerate() {
+            validate_row(&self.schema, row, row_number)?;
+            validate_key_values(&self.schema, &key_idx, row, row_number, false)?;
+        }
+        let canonical_sha256 = self.canonical_sha256.ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "reference table was not created from a verified canonical digest",
+            )
+        })?;
+        if canonical_sha256 == [0; 32] || self.name.is_empty() || self.version == 0 {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "reference table has an invalid verified dependency identity",
+            ));
+        }
+        Ok(sparrow_plan::ReferenceTableDependency {
+            name: self.name.clone(),
+            revision: self.version,
+            canonical_sha256,
+            runtime_crc32: self.checksum,
+        })
+    }
+
     /// Recompute CRC-32 from live rows and compare to the stored value.
     pub fn verify(&self) -> Result<()> {
-        let got = table_crc(&self.name, self.version, &self.key_fields, &self.index);
+        let got = table_crc(
+            &self.name,
+            self.version,
+            &self.schema,
+            &self.key_fields,
+            &self.index,
+        );
         if got != self.checksum {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
@@ -99,15 +590,17 @@ impl ReferenceTable {
     }
 
     /// Test helper: keep live rows, replace the stored checksum.
+    #[cfg(test)]
     pub fn with_stored_checksum(&self, checksum: u32) -> Self {
-        let mut t = self.clone();
+        let mut t = self.test_clone();
         t.checksum = checksum;
         t
     }
 
     /// Test helper: flip the first cell of one row, keep the stored checksum.
+    #[cfg(test)]
     pub fn with_corrupted_first_row(&self) -> Self {
-        let mut t = self.clone();
+        let mut t = self.test_clone();
         if let Some(row) = t.index.values_mut().next() {
             if let Some(first) = row.values.first_mut() {
                 *first = match first {
@@ -122,11 +615,33 @@ impl ReferenceTable {
         t
     }
 
+    #[cfg(test)]
+    fn test_clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            version: self.version,
+            schema: self.schema.clone(),
+            key_fields: self.key_fields.clone(),
+            index: self
+                .index
+                .iter()
+                .map(|(key, row)| (key.clone(), row.detach_copy()))
+                .collect(),
+            checksum: self.checksum,
+            owned_lease: self.owned_lease.as_ref().map(MemoryLease::share),
+            canonical_sha256: self.canonical_sha256,
+            max_row_resident: self.max_row_resident,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.index.len()
     }
 
     pub fn get(&self, key: &[Scalar]) -> Option<&Row> {
+        if key.len() != self.key_fields.len() {
+            return None;
+        }
         self.index.get(&encode_scalars(key))
     }
 }
@@ -134,6 +649,7 @@ impl ReferenceTable {
 fn table_crc(
     name: &str,
     version: u64,
+    schema: &Schema,
     key_fields: &[String],
     index: &HashMap<Vec<u8>, Row>,
 ) -> u32 {
@@ -142,6 +658,7 @@ fn table_crc(
     buf.extend_from_slice(&(nb.len() as u32).to_le_bytes());
     buf.extend_from_slice(nb);
     buf.extend_from_slice(&version.to_le_bytes());
+    encode_schema(&mut buf, schema);
     buf.extend_from_slice(&(key_fields.len() as u32).to_le_bytes());
     for k in key_fields {
         let b = k.as_bytes();
@@ -223,16 +740,31 @@ impl VersionedReferenceTable {
         if table.name != self.name {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
-                format!("versioned table '{}' != snapshot '{}'", self.name, table.name),
+                format!(
+                    "versioned table '{}' != snapshot '{}'",
+                    self.name, table.name
+                ),
             ));
         }
         table.verify()?;
         let mut g = self.inner.write().expect("versioned table");
         if let Some(last) = g.last() {
-            if valid_from < last.valid_from {
+            if version <= last.version {
                 return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
-                    "versioned table valid_from must not go backward",
+                    "versioned table version must strictly increase",
+                ));
+            }
+            if valid_from <= last.valid_from {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "versioned table valid_from must strictly increase",
+                ));
+            }
+            if table.schema != last.table.schema || table.key_fields != last.table.key_fields {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    "versioned table revisions must keep the same schema and key fields",
                 ));
             }
         }
@@ -267,9 +799,7 @@ impl VersionedReferenceTable {
         let g = self.inner.read().expect("versioned table");
         g.iter()
             .rev()
-            .find(|v| {
-                as_of >= v.valid_from && v.valid_to.map(|to| as_of < to).unwrap_or(true)
-            })
+            .find(|v| as_of >= v.valid_from && v.valid_to.map(|to| as_of < to).unwrap_or(true))
             .map(|v| Arc::clone(&v.table))
     }
 
@@ -304,7 +834,6 @@ pub struct LookupOperator {
     stream_idx: Vec<usize>,
     keep_idx: Vec<usize>,
     as_of_idx: Option<usize>,
-    #[allow(dead_code)]
     input: Schema,
     output: Schema,
     owner: Arc<MemoryOwner>,
@@ -340,6 +869,7 @@ impl LookupOperator {
         owner: Arc<MemoryOwner>,
     ) -> Result<Self> {
         spec.validate()?;
+        input.validate()?;
         let (name, schema, key_fields) = match &source {
             LookupSource::Static(t) => (t.name.clone(), t.schema.clone(), t.key_fields.clone()),
             LookupSource::Versioned(t) => {
@@ -349,7 +879,11 @@ impl LookupOperator {
                         format!("versioned table '{}' has no versions", t.name()),
                     )
                 })?;
-                (t.name().to_string(), latest.schema.clone(), latest.key_fields.clone())
+                (
+                    t.name().to_string(),
+                    latest.schema.clone(),
+                    latest.key_fields.clone(),
+                )
             }
         };
         if spec.table != name {
@@ -361,12 +895,37 @@ impl LookupOperator {
         match &source {
             LookupSource::Static(t) => t.verify()?,
             LookupSource::Versioned(t) => {
-                if let Some(latest) = t.latest() {
-                    latest.verify()?;
+                let versions = t.inner.read().expect("versioned table");
+                for version in versions.iter() {
+                    version.table.verify()?;
                 }
             }
         }
         let stream_idx = resolve_keys(&input, &spec.stream_keys)?;
+        if spec.table_keys != key_fields {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "lookup table_keys must match the snapshot key_fields in order",
+            ));
+        }
+        let table_idx = resolve_keys(&schema, &spec.table_keys)?;
+        validate_key_schema(&schema, &spec.table_keys, &table_idx)?;
+        for (&stream, &table) in stream_idx.iter().zip(&table_idx) {
+            let stream_type = &input.fields[stream].data_type;
+            let table_type = &schema.fields[table].data_type;
+            if stream_type != table_type {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    format!(
+                        "lookup key type mismatch: stream '{}' is {}, table '{}' is {}",
+                        input.fields[stream].name,
+                        stream_type,
+                        schema.fields[table].name,
+                        table_type
+                    ),
+                ));
+            }
+        }
         let keep = if spec.keep.is_empty() {
             schema
                 .fields
@@ -380,12 +939,22 @@ impl LookupOperator {
         let keep_idx = resolve_keys(&schema, &keep)?;
         let as_of_idx = if spec.temporal {
             let field = spec.as_of_field.as_deref().unwrap_or("");
-            Some(input.index_of_name(field).ok_or_else(|| {
+            let index = input.index_of_name(field).ok_or_else(|| {
                 SparrowError::new(
                     ErrorCode::InvalidArgument,
                     format!("unknown as-of event-time field '{field}'"),
                 )
-            })?)
+            })?;
+            if !matches!(
+                &input.fields[index].data_type,
+                DataType::Int64 | DataType::UInt64 | DataType::TimestampMicrosUTC
+            ) {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    format!("versioned lookup as-of field '{field}' must be event-time"),
+                ));
+            }
+            Some(index)
         } else {
             None
         };
@@ -405,10 +974,7 @@ impl LookupOperator {
     pub fn table_version(&self) -> u64 {
         match &self.source {
             LookupSource::Static(t) => t.version,
-            LookupSource::Versioned(t) => t
-                .latest()
-                .map(|x| x.version)
-                .unwrap_or(0),
+            LookupSource::Versioned(t) => t.latest().map(|x| x.version).unwrap_or(0),
         }
     }
 
@@ -416,53 +982,182 @@ impl LookupOperator {
         &self.output
     }
 
-    pub fn on_batch(&self, batch: &RowBatch) -> Result<Vec<Row>> {
-        let mut out = Vec::with_capacity(batch.num_rows());
-        for row in batch.rows() {
-            let key: Vec<Scalar> = self
-                .stream_idx
-                .iter()
-                .map(|&i| row.values[i].detach_copy())
-                .collect();
-            let table = match &self.source {
-                LookupSource::Static(t) => Some(Arc::clone(t)),
-                LookupSource::Versioned(t) => {
-                    let as_of = if let Some(i) = self.as_of_idx {
-                        row.values
-                            .get(i)
-                            .and_then(Scalar::as_event_time_micros)
-                            .ok_or_else(|| {
-                                SparrowError::new(
-                                    ErrorCode::TypeMismatch,
-                                    "versioned lookup as-of field must be event-time",
-                                )
-                            })?
-                    } else {
-                        i64::MAX
-                    };
-                    t.table_as_of(as_of)
-                }
-            };
-            let mut values: Vec<Scalar> = row.values.iter().map(Scalar::detach_copy).collect();
-            match table.as_ref().and_then(|t| t.get(&key)) {
-                Some(hit) => {
-                    for &i in &self.keep_idx {
-                        values.push(hit.values[i].detach_copy());
-                    }
-                }
-                None => {
-                    for _ in &self.keep_idx {
-                        values.push(Scalar::Null);
-                    }
+    fn validate_input_batch(&self, batch: &RowBatch) -> Result<()> {
+        if batch.schema() != &self.input {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidSchema,
+                "lookup input batch schema does not match the bound input schema",
+            ));
+        }
+        if !Arc::ptr_eq(batch.lease().owner(), &self.owner) {
+            return Err(SparrowError::new(
+                ErrorCode::PolicyDenied,
+                "lookup input batch belongs to a different memory owner",
+            ));
+        }
+        for (row_number, row) in batch.rows().iter().enumerate() {
+            validate_row(&self.input, row, row_number)?;
+            validate_key_values(&self.input, &self.stream_idx, row, row_number, true)?;
+            if let Some(index) = self.as_of_idx {
+                if row.values[index].as_event_time_micros().is_none() {
+                    return Err(SparrowError::new(
+                        ErrorCode::TypeMismatch,
+                        format!(
+                            "versioned lookup as-of field '{}' must be event-time",
+                            self.input.fields[index].name
+                        ),
+                    ));
                 }
             }
-            out.push(Row { values });
         }
-        Ok(out)
+        Ok(())
+    }
+
+    fn select_table(&self, row: &Row) -> Result<Option<Arc<ReferenceTable>>> {
+        match &self.source {
+            LookupSource::Static(table) => Ok(Some(Arc::clone(table))),
+            LookupSource::Versioned(table) => {
+                let as_of = if let Some(index) = self.as_of_idx {
+                    row.values[index].as_event_time_micros().ok_or_else(|| {
+                        SparrowError::new(
+                            ErrorCode::TypeMismatch,
+                            "versioned lookup as-of field must be event-time",
+                        )
+                    })?
+                } else {
+                    i64::MAX
+                };
+                Ok(table.table_as_of(as_of))
+            }
+        }
+    }
+
+    fn select_tables(&self, batch: &RowBatch) -> Result<Vec<Option<Arc<ReferenceTable>>>> {
+        batch
+            .rows()
+            .iter()
+            .map(|row| self.select_table(row))
+            .collect()
+    }
+
+    fn output_scratch_bytes(
+        &self,
+        batch: &RowBatch,
+        selected: &Vec<Option<Arc<ReferenceTable>>>,
+    ) -> usize {
+        let selections = selected
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<Arc<ReferenceTable>>>());
+        let rows = batch
+            .rows()
+            .iter()
+            .zip(selected)
+            .fold(64usize, |total, (row, table)| {
+                let key_bytes = self.stream_idx.iter().fold(0usize, |n, &index| {
+                    n.saturating_add(row.values[index].resident_bytes())
+                        .saturating_add(scalar_key_len(&row.values[index]))
+                        .saturating_add(1)
+                });
+                let table_row = table.as_ref().map_or(0, |table| table.max_row_resident);
+                total
+                    .saturating_add(row.resident_bytes())
+                    .saturating_add(key_bytes)
+                    .saturating_add(table_row)
+                    .saturating_add(
+                        row.values
+                            .len()
+                            .saturating_add(self.keep_idx.len())
+                            .saturating_mul(std::mem::size_of::<Scalar>()),
+                    )
+                    .saturating_add(64)
+            });
+        selections.saturating_add(rows)
+    }
+
+    fn output_row(&self, row: &Row, table: Option<&ReferenceTable>) -> Result<Row> {
+        let key: Vec<Scalar> = self
+            .stream_idx
+            .iter()
+            .map(|&i| row.values[i].detach_copy())
+            .collect();
+        let mut values = Vec::with_capacity(row.values.len() + self.keep_idx.len());
+        values.extend(row.values.iter().map(Scalar::detach_copy));
+        match table.and_then(|table| table.get(&key)) {
+            Some(hit) => {
+                for &i in &self.keep_idx {
+                    let value = hit.values.get(i).ok_or_else(|| {
+                        SparrowError::new(
+                            ErrorCode::InvalidSchema,
+                            "reference table row does not match its schema width",
+                        )
+                    })?;
+                    values.push(value.detach_copy());
+                }
+            }
+            None => {
+                // Preserve the existing miss contract: one NULL per kept
+                // table field, with no change to output row cardinality.
+                values.extend(std::iter::repeat(Scalar::Null).take(self.keep_idx.len()));
+            }
+        }
+        Ok(Row { values })
+    }
+
+    /// Validate and enrich a batch directly into an owner-metered output
+    /// builder. The scratch lease is acquired before any detached output copy;
+    /// it is released only after the builder owns the finished rows.
+    pub fn on_batch_into(&self, batch: &RowBatch) -> Result<Option<RowBatch>> {
+        self.validate_input_batch(batch)?;
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        // Resolve temporal revisions once and keep the selected Arcs alive
+        // through both sizing and copy. A concurrent publish therefore cannot
+        // change the payload after the scratch reservation was admitted.
+        let _selection_lease = self.owner.acquire(
+            CreditKind::Reservation,
+            batch.num_rows().saturating_mul(std::mem::size_of::<Option<Arc<ReferenceTable>>>())
+                .saturating_add(64),
+        )?;
+        let selected = self.select_tables(batch)?;
+        let scratch = self.owner.acquire(
+            CreditKind::Reservation,
+            self.output_scratch_bytes(batch, &selected).max(1),
+        )?;
+        let result = (|| {
+            let mut builder = RowBatchBuilder::new(
+                Arc::new(self.output.clone()),
+                Arc::clone(&self.owner),
+                CreditKind::Reservation,
+                batch.num_rows(),
+                self.owner.budget().reservation_bytes,
+            )?;
+            for (row, table) in batch.rows().iter().zip(&selected) {
+                let output = self.output_row(row, table.as_deref())?;
+                let minimum = output.resident_bytes().saturating_add(64);
+                builder.push_accounted(output, minimum)?;
+            }
+            Ok(Some(builder.finish()?))
+        })();
+        drop(scratch);
+        result
+    }
+
+    /// Compatibility API for embedded callers. Kernel execution uses
+    /// [`Self::on_batch_into`] so output copies are metered before publication.
+    pub fn on_batch(&self, batch: &RowBatch) -> Result<Vec<Row>> {
+        self.validate_input_batch(batch)?;
+        let selected = self.select_tables(batch)?;
+        batch
+            .rows()
+            .iter()
+            .zip(&selected)
+            .map(|(row, table)| self.output_row(row, table.as_deref()))
+            .collect()
     }
 
     pub fn build_batch(&self, rows: Vec<Row>) -> Result<Option<RowBatch>> {
-        finish_rows(&self.output, rows, &self.owner)
+        finish_rows_metered(&self.output, rows, &self.owner)
     }
 }
 
@@ -476,6 +1171,15 @@ pub fn lookup_output_schema(stream: &Schema, table: &Schema, keep: &[String]) ->
                 format!("lookup keep column '{name}' missing on table"),
             )
         })?;
+        if fields.iter().any(|existing| existing.name == f.name) {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidSchema,
+                format!(
+                    "lookup output column '{}' duplicates an existing field",
+                    f.name
+                ),
+            ));
+        }
         id += 1;
         fields.push(Field::new(
             FieldId::new(id),
@@ -488,6 +1192,11 @@ pub fn lookup_output_schema(stream: &Schema, table: &Schema, keep: &[String]) ->
 }
 
 /// Helper used by demos to build a one-column-key table.
+///
+/// The supplied owner accounts for the temporary input batch only. The
+/// returned table intentionally uses the historical unowned `snapshot`
+/// constructor; callers that need job-lifetime accounting should call
+/// `ReferenceTable::snapshot_owned` directly.
 pub fn table_from_pairs(
     name: &str,
     version: u64,
@@ -513,9 +1222,7 @@ pub fn table_from_pairs(
         owner.budget().reservation_bytes.min(64 * 1024).max(64),
     )?;
     for (k, v) in pairs {
-        b.push(Row {
-            values: vec![k, v],
-        })?;
+        b.push(Row { values: vec![k, v] })?;
     }
     let batch = b.finish()?;
     rows.extend(batch.rows().iter().map(|r| Row {
