@@ -44,6 +44,8 @@ mod jetstream_source;
 mod graph;
 mod paused_time;
 mod paused_time_log;
+mod graph_time;
+mod graph_time_log;
 
 /// Per-pipeline backoff, capped at 32 seconds; never sleep in converge.
 /// A successful launch is not a stable recovery: reset after 30s running.
@@ -1046,7 +1048,9 @@ impl Supervisor {
         .await?;
         let recovery = RecoveryPolicy::parse(&spec.recovery)?;
 
-        let job = if plan.has_timed_iot() {
+        let job = if spec.recovery=="aligned" && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
+            self.start_time_graph(&spec,plan,&policy).await?
+        } else if plan.has_timed_iot() || (spec.recovery == "aligned" && plan.has_processing_time_state()) {
             self.start_paused_time(&spec,schema,plan,&policy).await?
         } else if spec.graph_io.is_some() {
             self.start_graph(&spec, plan, &policy).await?

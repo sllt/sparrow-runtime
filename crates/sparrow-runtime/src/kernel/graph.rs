@@ -6,6 +6,7 @@ use sparrow_plan::graph::RouteMode;
 use sparrow_plan::physical::PhysicalEdge;
 use std::collections::BTreeSet;
 use std::task::Poll;
+mod time_union;
 
 #[derive(Default)]
 pub struct GraphInput {
@@ -464,8 +465,8 @@ fn stage_schema(stage: &PhysicalStage, output: bool) -> Result<&sparrow_model::S
         PhysicalStage::Branch { input, .. }
         | PhysicalStage::Route { input, .. }
         | PhysicalStage::UnionAll { input, .. }
-        | PhysicalStage::Iot { input, .. }
         | PhysicalStage::Deduplicate { input, .. } => input,
+        PhysicalStage::Iot { input, output: schema, .. } => if output { schema } else { input },
         PhysicalStage::WindowAgg {
             input,
             output: schema,
@@ -574,7 +575,8 @@ pub(super) async fn run(ctx: JobCtx, mut req: JobRequest) -> Result<JobStats> {
                         panic!("injected graph stage panic");
                     }
                     let result = if matches!(stage, PhysicalStage::UnionAll { .. }) {
-                        union(&child, input, output.remove(0).1).await
+                        if child.graph_time.is_some() {time_union::run(&child,operator.raw(),input,output.remove(0).1).await}
+                        else {union(&child, input, output.remove(0).1).await}
                     } else {
                         router(&child, stage, input.remove(0), output).await
                     };
@@ -611,7 +613,7 @@ pub(super) async fn run(ctx: JobCtx, mut req: JobRequest) -> Result<JobStats> {
                     _ => None,
                 };
                 child.source_operator = source_id;
-                child.source_time = source_id
+                child.source_time = source_id.filter(|_|child.graph_time.is_none())
                     .and_then(|id| {
                         req.plan
                             .source_times
@@ -1007,7 +1009,7 @@ async fn union(ctx: &JobCtx, mut inputs: Vec<MailboxRx>, output: MailboxTx) -> R
             }
             if let Some(control) = control {
                 match control {
-                    StreamControl::ProcessingTime { .. } => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for DAG Union")),
+                    StreamControl::ProcessingTime { .. } | StreamControl::GraphProgress {..} | StreamControl::GraphRoundEnd {..} => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for legacy DAG Union")),
                     StreamControl::EndOfInput => {
                         ended[i] = true;
                         hub.mark_idle(InputId(i as u16))?;

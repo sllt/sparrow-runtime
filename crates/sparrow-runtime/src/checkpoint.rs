@@ -625,7 +625,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15) {
+        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {
@@ -1840,6 +1840,10 @@ pub(crate) fn decode_freeze_mode(
     max_entries: usize,
     materialize: bool,
 ) -> Result<WindowFreeze> {
+    decode_freeze_at_cut(src,max_entries,materialize,None)
+}
+
+pub(crate) fn decode_freeze_at_cut(src: &mut &[u8], max_entries: usize, materialize: bool, pt_cut: Option<i64>) -> Result<WindowFreeze> {
     let FreezeHeader {operator,slot,kind,entries:n} = FreezeHeader::parse(src)?;
     *src = &src[11..];
     const MIN_FREEZE_ENTRY: usize = 2 + 8 + 8 + 8 + 2;
@@ -1891,6 +1895,9 @@ pub(crate) fn decode_freeze_mode(
         *src = &src[8..];
         let count = u64::from_le_bytes(src[..8].try_into().unwrap());
         *src = &src[8..];
+        if pt_cut.is_some_and(|now| kind != 0 || window_start < 0 || window_start > now || window_end <= now || count != 0) {
+            return Err(SparrowError::new(ErrorCode::CodecViolation,"PT window state disagrees with the processing-time cut"));
+        }
         let na = u16::from_le_bytes(src[..2].try_into().unwrap()) as usize;
         *src = &src[2..];
         if na > 64 {
@@ -1917,7 +1924,7 @@ pub(crate) fn decode_freeze_mode(
             });
         }
     }
-    Ok(WindowFreeze {
+    let freeze = WindowFreeze {
         operator,
         slot,
         kind,
@@ -1925,7 +1932,11 @@ pub(crate) fn decode_freeze_mode(
         wm_in: decode_opt_i64(src)?,
         wm_out: decode_opt_i64(src)?,
         last_effective: decode_opt_i64(src)?,
-    })
+    };
+    if pt_cut.is_some() && (freeze.wm_in.is_some() || freeze.wm_out.is_some() || freeze.last_effective.is_some()) {
+        return Err(SparrowError::new(ErrorCode::CodecViolation,"PT freeze contains event-time watermarks"));
+    }
+    Ok(freeze)
 }
 
 #[cfg(test)]

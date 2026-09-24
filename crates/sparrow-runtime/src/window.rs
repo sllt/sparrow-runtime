@@ -118,6 +118,12 @@ fn fixed_size_column_estimate(
 
 impl WindowOperator {
     pub(crate) fn is_processing_time(&self)->bool {matches!(self.spec.kind,WindowKind::TumblingProcessingTime {..})}
+    pub(crate) fn is_event_time(&self)->bool {self.spec.kind.uses_event_time()}
+    /// A logged permanent EOF closes all windows, including positive holdback.
+    /// Used only by the durable ET graph, never by an ordinary watermark.
+    pub(crate) fn advance_graph_final(&mut self) {
+        if let Some(holdback)=&mut self.holdback {holdback.restore(Some(i64::MAX),Some(i64::MAX));}
+    }
     pub(crate) fn finish_input(&mut self)->Result<WindowEmission> {
         self.hub.mark_active(self.default_input)?;
         self.hub.set_watermark(self.default_input,i64::MAX)?;
@@ -143,12 +149,14 @@ impl WindowOperator {
                 if entry.count==0 || entry.count>=size { return Err(invalid()); }
             } else {
                 let (size,slide)=match self.spec.kind {
+                    WindowKind::TumblingProcessingTime {size_micros}=>(size_micros,size_micros),
                     WindowKind::TumblingEventTime {size_micros}=>(size_micros,size_micros),
                     WindowKind::HoppingEventTime {size_micros,slide_micros}=>(size_micros,slide_micros),
                     _=>return Err(invalid()),
                 };
                 if entry.window_start.checked_add(size)!=Some(entry.window_end) || entry.window_start.rem_euclid(slide)!=0
-                    || entry.key.last()!=Some(&Scalar::Int64(entry.window_start)) { return Err(invalid()); }
+                    || (self.spec.kind.uses_event_time() && entry.key.last()!=Some(&Scalar::Int64(entry.window_start))) { return Err(invalid()); }
+                if self.is_processing_time() && entry.count != 0 { return Err(invalid()); }
             }
             for ((actual,prototype),call) in entry.accs.iter().zip(&expected).zip(&self.spec.aggs) {
                 if std::mem::discriminant(actual)!=std::mem::discriminant(prototype) { return Err(invalid()); }
@@ -167,6 +175,21 @@ impl WindowOperator {
                 };
                 if count && n>entry.count {return Err(invalid());}
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_processing_cut(&self, now: i64) -> Result<()> {
+        if now < 0 || self.spec.kind.uses_event_time() {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"invalid ordered window time policy"));
+        }
+        if let WindowStore::Tumble(store) = &self.store {
+            if store.iter().any(|(_,e)| e.window_start < 0 || e.window_start > now || e.window_end <= now) {
+                return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"PT restore has a future window or overdue timer"));
+            }
+        }
+        if self.wm_in().is_some() || self.wm_out().is_some() || self.hub.last_effective().is_some() {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered window cannot restore event-time watermarks"));
         }
         Ok(())
     }

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "stream": "graph_signals",
+  "source": {"kind":"file","path":"/tmp/sparrow/graph-a.ndjson","file_contract":"append_only","inbox_capacity":4},
+  "sink": {"kind":"http","url":"http://127.0.0.1:9081/ingest","batch_rows":32,"linger_ms":10,"outbox_capacity":4},
+  "recovery": "aligned",
+  "fail_on_decode": true,
+  "checkpoint_dir": "/tmp/sparrow/checkpoints-time-graph-pt",
+  "checkpoint": {"interval_ms":100,"timeout_ms":5000,"resume_latest":true},
+  "graph_io": {
+    "sources": {
+      "1": {"kind":"file","path":"/tmp/sparrow/graph-a.ndjson","file_contract":"append_only","inbox_capacity":4},
+      "2": {"kind":"file","path":"/tmp/sparrow/graph-b.ndjson","file_contract":"append_only","inbox_capacity":4}
+    },
+    "sinks": {"5":{"kind":"http","url":"http://127.0.0.1:9081/ingest","batch_rows":32,"linger_ms":10,"outbox_capacity":4}}
+  },
+  "graph": {"version":1,"pipeline_id":818,"revision_id":1,"nodes":[
+    {"id":1,"kind":"memory_source","table":"graph_signals","out":[3]},
+    {"id":2,"kind":"memory_source","table":"graph_signals","out":[3]},
+    {"id":3,"kind":"union_all","out":[4]},
+    {"id":4,"kind":"window_agg","window":{"kind":"processing_time","size_micros":1000000},"keys":[],"aggs":[{"fn":"sum","expr":{"k":"col","name":"v"},"alias":"total"}],"out":[5]},
+    {"id":5,"kind":"capture_sink","name":"http"}
+  ]}
+}

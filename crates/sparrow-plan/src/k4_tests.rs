@@ -223,7 +223,10 @@ fn k4_aligned_recovery_requires_zero_ttl_and_accepts_iot_codec() {
         &bind_graph(&spec, &Catalog::new()).unwrap(),
         &PlanOptions::default(),
     );
-    assert!(CheckpointPlan::from_physical(&plan).is_err());
+    let timed = CheckpointPlan::from_physical(&plan).unwrap();
+    assert!(timed.requires_paused_time());
+    assert_eq!(timed.states[0].freeze_kind(), 9);
+    assert!(checkpoint.check_compatible(&timed).is_err());
 }
 
 #[test]

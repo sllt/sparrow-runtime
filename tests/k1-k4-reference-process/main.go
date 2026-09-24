@@ -2644,6 +2644,11 @@ func main() {
 	out := flag.String("out", "", "new isolated artifact directory")
 	pausedOnly := flag.Bool("paused-time-only", false, "run independent v14/v15 time/process oracles instead of the reference matrix")
 	pausedFileOnly := flag.Bool("paused-file-only", false, "run the three timed File scenarios on a feature-off production binary")
+	completionOnly := flag.Bool("time-completion-only", false, "run v16/v17 PT, TTL and multi-state crash oracles")
+	completionFileOnly := flag.Bool("time-completion-file-only", false, "run v16 crash oracles on the default feature-off binary")
+	graphOnly := flag.Bool("time-graph-only", false, "run File time DAG v18/v19 multi-source/multi-Sink SIGKILL oracles")
+	alarmOnly := flag.Bool("alarm-only", false, "run v20/v21 alarm activate/resolve and episode SIGKILL oracles")
+	alarmFileOnly := flag.Bool("alarm-file-only", false, "run v20 alarm oracles on the default feature-off binary")
 	flag.Parse()
 	require(*serverBin != "" && *oldServerBin != "" && *natsBin != "" && *out != "",
 		"server-bin, old-server-bin, nats-server, and out are required")
@@ -2661,6 +2666,18 @@ func main() {
 		"server_sha256": hash(*serverBin), "old_server_sha256": hash(*oldServerBin),
 		"nats_sha256": hash(*natsBin), "driver_sha256": hash(self),
 	})
+	if *graphOnly {
+		runTimeGraphMatrix(root, *serverBin, *oldServerBin)
+		return
+	}
+	if *alarmOnly || *alarmFileOnly {
+		runAlarmMatrix(root, *serverBin, *oldServerBin, *natsBin, *alarmFileOnly)
+		return
+	}
+	if *completionOnly || *completionFileOnly {
+		runTimeCompletionMatrix(root, *serverBin, *oldServerBin, *natsBin, *completionFileOnly)
+		return
+	}
 	if *pausedFileOnly {
 		for _, kind := range []string{"hold_for", "debounce", "debounce_leading"} {
 			runTimedProcess(filepath.Join(root, "file-"+kind), *serverBin, *natsBin, kind, false)

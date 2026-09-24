@@ -71,7 +71,7 @@ pub enum BoundKind {
     },
     /// Bounded keyed IoT value state. This is deliberately separate from
     /// WindowAgg: it has no window timestamps or aggregate accumulator.
-    Iot { spec: IotSpec, input: Schema },
+    Iot { spec: IotSpec, input: Schema, output: Schema },
 }
 
 impl BoundKind {
@@ -85,7 +85,7 @@ impl BoundKind {
             Self::CaptureSink { schema, .. } => schema,
             Self::WindowAgg { output, .. } | Self::Lookup { output, .. } => output,
             Self::Deduplicate { input, .. } => input,
-            Self::Iot { input, .. } => input,
+            Self::Iot { output, .. } => output,
         }
     }
 }

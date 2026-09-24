@@ -62,7 +62,7 @@ impl StateParticipant {
     pub fn freeze_kind(&self) -> u8 {
         match self.codec {
             WINDOW_STATE_CODEC => u8::from(self.window_kind == 1),
-            IOT_STATE_CODEC if matches!(self.window_kind, 4..=8) => self.window_kind,
+            IOT_STATE_CODEC if matches!(self.window_kind, 4..=11) => self.window_kind,
             _ => 0,
         }
     }
@@ -96,6 +96,16 @@ fn rejected(message: &str) -> SparrowError {
     SparrowError::new(ErrorCode::UnsupportedRestore, message)
 }
 
+/// Time journals fingerprint the complete decoded input with the scalar value
+/// codec, before Filter/Project. Reject unsupported columns at admission even
+/// when a downstream projection would discard them (or their first value is NULL).
+fn validate_time_input_schema(schema:&sparrow_model::Schema)->Result<()> {
+    if schema.fields.iter().any(|f|f.data_type.is_nested() || f.data_type==sparrow_model::DataType::Dynamic) {
+        return Err(rejected("durable time input fingerprint requires scalar source fields; nested/Dynamic source columns are not supported"));
+    }
+    Ok(())
+}
+
 impl CheckpointPlan {
     pub fn from_physical(plan: &PhysicalPlan) -> Result<Self> {
         Self::from_physical_inner(plan, Vec::new())
@@ -115,6 +125,9 @@ impl CheckpointPlan {
 
     fn from_physical_inner(plan: &PhysicalPlan, reference_tables: Vec<ReferenceTableDependency>) -> Result<Self> {
         let has_references = !reference_tables.is_empty();
+        if plan.edges.is_none() && plan.has_processing_time_state() && (!plan.side_outputs.is_empty() || !plan.source_times.is_empty()) {
+            return Err(rejected("paused-time checkpoint excludes source-time and side-output plans"));
+        }
         if has_references && (!plan.side_outputs.is_empty() || !plan.source_times.is_empty()) {
             return Err(rejected("reference checkpoint excludes source-time and side-output plans"));
         }
@@ -129,6 +142,7 @@ impl CheckpointPlan {
         else {
             return Err(rejected("checkpoint requires one leading source"));
         };
+        if plan.has_processing_time_state() { validate_time_input_schema(schema)?; }
         let Some(PhysicalStage::CaptureSink { operator: sink, .. }) = plan.stages.last() else {
             return Err(rejected("checkpoint requires one trailing required sink"));
         };
@@ -210,11 +224,6 @@ impl CheckpointPlan {
                     }
                     register(*operator)?;
                     spec.validate()?;
-                    if matches!(spec.kind, WindowKind::TumblingProcessingTime { .. }) {
-                        return Err(rejected(
-                            "processing-time window checkpoint is not supported",
-                        ));
-                    }
                     for key in &spec.keys {
                         let index = input
                             .index_of_name(key)
@@ -256,17 +265,7 @@ impl CheckpointPlan {
                     }
                     current = output;
                 }
-                PhysicalStage::Iot { operator, spec, input } => {
-                    // K4 currently supports aligned IoT state only when no
-                    // wall-clock eviction has to be reconstructed.  The
-                    // runtime v6 codec may then persist the value map using
-                    // its own participant identity (slot 3), never as a
-                    // WindowFreeze.
-                    if spec.ttl_micros != 0 {
-                        return Err(rejected(
-                            "aligned IoT recovery currently requires ttl_micros=0",
-                        ));
-                    }
+                PhysicalStage::Iot { operator, spec, input, output } => {
                     spec.validate(input)?;
                     register(*operator)?;
                     states.push(StateParticipant {
@@ -279,10 +278,10 @@ impl CheckpointPlan {
                             "checkpoint supports at most two state participants",
                         ));
                     }
-                    if current.fields != input.fields {
+                    if current.fields != input.fields || spec.output_schema(input)?.fields != output.fields {
                         return Err(rejected("checkpoint IoT input schema mismatch"));
                     }
-                    current = input;
+                    current = output;
                 }
                 PhysicalStage::Lookup { operator, spec, input, output } if has_references => {
                     validate_static_lookup_stage(spec, input, output)?;
@@ -308,14 +307,13 @@ impl CheckpointPlan {
                 return Err(rejected("checkpoint sink schema mismatch"));
             }
         }
-        // Open only Count/IoT combinations.  ET/PT states remain governed by
-        // the existing single-window/two-Count matrix and cannot be mixed with
-        // an IoT participant until their timer/time semantics are extended.
+        // Processing time is shared by the durable ordered profile. Event time
+        // remains a separate clock domain and cannot be mixed with IoT state.
         if states.iter().any(|s| matches!(s.window_kind, 2 | 3))
             && states.iter().any(|s| s.codec == IOT_STATE_CODEC)
         {
             return Err(rejected(
-                "IoT checkpoint cannot be combined with event/processing-time windows",
+                "IoT checkpoint cannot be combined with event-time windows",
             ));
         }
         let (semantics, recovery_prefix_len) = crate::canonical::checkpoint_pipeline(plan)?;
@@ -328,7 +326,7 @@ impl CheckpointPlan {
             semantics,
             // IoT state depends on the complete computation descriptor.  Do
             // not apply the linear RCP2 downstream-only relaxation to it.
-            recovery_prefix_len: (!has_iot && !has_references).then_some(recovery_prefix_len),
+            recovery_prefix_len: (!has_iot && !has_references && !plan.has_processing_time_state()).then_some(recovery_prefix_len),
         };
         result.validate()?;
         Ok(result)
@@ -341,7 +339,9 @@ impl CheckpointPlan {
             .collect()
     }
 
-    pub fn is_graph(&self) -> bool { self.semantics.starts_with(b"CP01DAG1") }
+    pub fn is_graph(&self) -> bool { self.semantics.starts_with(b"CP01DAG1") || self.is_time_graph() }
+    pub fn is_time_graph(&self) -> bool { self.semantics.starts_with(b"CP01DAG2") }
+    pub fn has_event_time_state(&self) -> bool { self.states.iter().any(|s|s.codec==WINDOW_STATE_CODEC && matches!(s.window_kind,2|3)) }
     fn graph_ports(&self) -> Result<(Vec<OperatorId>, Vec<OperatorId>)> {
         let mut bytes = self.semantics.get(8..).ok_or_else(|| rejected("truncated graph identity"))?;
         let mut read = || -> Result<Vec<OperatorId>> {
@@ -357,14 +357,25 @@ impl CheckpointPlan {
     pub fn source_ids(&self) -> Vec<OperatorId> { if self.is_graph() { self.graph_ports().map(|p| p.0).unwrap_or_default() } else { vec![self.source] } }
     pub fn sink_ids(&self) -> Vec<OperatorId> { if self.is_graph() { self.graph_ports().map(|p| p.1).unwrap_or_default() } else { vec![self.sink] } }
     pub fn has_iot(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC) }
-    pub fn has_timed_iot(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC && matches!(s.window_kind, 7 | 8)) }
+    pub fn has_timed_iot(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC && matches!(s.window_kind, 7 | 8 | 11)) }
+    pub fn has_alarm(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC && s.window_kind == 11) }
+    pub fn requires_paused_time(&self) -> bool {
+        self.is_time_graph() || self.states.iter().any(|s| (s.codec == WINDOW_STATE_CODEC && s.window_kind == 0)
+            || (s.codec == IOT_STATE_CODEC && matches!(s.window_kind, 7..=11)))
+    }
+    pub fn is_single_timed_iot(&self) -> bool { self.states.len() == 1 && self.has_timed_iot() }
     pub fn has_references(&self) -> bool { !self.reference_tables.is_empty() }
     pub fn has_hysteresis(&self) -> bool {
         self.states.iter().any(|state| state.codec == IOT_STATE_CODEC && state.window_kind == 6)
     }
 
     fn from_graph(plan: &PhysicalPlan, reference_tables: Vec<ReferenceTableDependency>) -> Result<Self> {
-        if !plan.side_outputs.is_empty() || !plan.source_times.is_empty() {return Err(rejected("side outputs and source-time DAGs currently require restart_fresh"));}
+        let time_graph=plan.has_processing_time_state() || plan.has_event_time_window();
+        if !plan.side_outputs.is_empty() || (!time_graph && !plan.source_times.is_empty()) {return Err(rejected("side outputs and legacy source-time DAGs require restart_fresh"));}
+        if time_graph && (!reference_tables.is_empty() || (plan.has_event_time_window() && plan.has_processing_time_state())
+            || (!plan.has_event_time_window() && !plan.source_times.is_empty())) {
+            return Err(rejected("durable time DAG excludes references and mixed processing/event-time domains"));
+        }
         if plan.stages.len() < 2 || plan.stages.len() > MAX_CHECKPOINT_STAGES {
             return Err(rejected("graph checkpoint stage count exceeds bound"));
         }
@@ -399,9 +410,12 @@ impl CheckpointPlan {
             }
             stage_operators.push(ids);
             match stage {
-                PhysicalStage::MemorySource { operator, .. } => sources.push(*operator),
+                PhysicalStage::MemorySource { operator, schema, .. } => {
+                    if time_graph { validate_time_input_schema(schema)?; }
+                    sources.push(*operator);
+                },
                 PhysicalStage::CaptureSink { operator, .. } => sinks.push(*operator),
-                PhysicalStage::WindowAgg { operator, spec, input, output } if matches!(spec.kind, WindowKind::Count { .. }) => {
+                PhysicalStage::WindowAgg { operator, spec, input, output } if time_graph || matches!(spec.kind, WindowKind::Count { .. }) => {
                     spec.validate()?;
                     if crate::window_output_schema(input,spec)?.fields!=output.fields {return Err(rejected("graph checkpoint window schema mismatch"));}
                     for key in &spec.keys {
@@ -412,13 +426,14 @@ impl CheckpointPlan {
                     for agg in &spec.aggs {
                         if matches!(agg.func,sparrow_model::AggFn::Min|sparrow_model::AggFn::Max){let ty=agg.input_type(input)?;if ty.is_nested()||ty==sparrow_model::DataType::Dynamic{return Err(rejected("graph checkpoint MIN/MAX codec excludes nested/Dynamic"));}}
                     }
-                    states.push(StateParticipant { id: ParticipantId::window(*operator), codec: WINDOW_STATE_CODEC, window_kind: 1 });
+                    states.push(StateParticipant { id: ParticipantId::window(*operator), codec: WINDOW_STATE_CODEC, window_kind: crate::compat::window_kind_tag(spec.kind) });
                 }
-                PhysicalStage::Iot { operator, spec, input } => {
-                    if spec.ttl_micros != 0 {
+                PhysicalStage::Iot { operator, spec, input, output } => {
+                    if !time_graph && spec.ttl_micros != 0 {
                         return Err(rejected("graph aligned IoT recovery currently requires ttl_micros=0"));
                     }
                     spec.validate(input)?;
+                    if spec.output_schema(input)?.fields != output.fields {return Err(rejected("graph IoT output schema mismatch"));}
                     states.push(StateParticipant { id: ParticipantId::iot(*operator), codec: IOT_STATE_CODEC, window_kind: spec.state_kind_tag() });
                 }
                 PhysicalStage::Lookup { operator, spec, input, output } if has_references => {
@@ -538,8 +553,14 @@ impl CheckpointPlan {
 
     pub fn validate(&self) -> Result<()> {
         validate_references(&self.reference_tables)?;
-        if self.has_timed_iot() && (self.is_graph() || self.has_references() || self.states.len()!=1) {
-            return Err(rejected("paused-time profile requires exactly one timed IoT state in a linear plan without reference tables"));
+        if !self.is_time_graph() && self.requires_paused_time() && (self.is_graph() || self.has_references() || self.recovery_prefix_len.is_some()
+            || self.states.iter().any(|s| s.codec == WINDOW_STATE_CODEC && matches!(s.window_kind, 2 | 3))) {
+            return Err(rejected("paused-time recovery requires a linear plan without references, event time or relaxed semantics"));
+        }
+        if self.is_time_graph() && (self.has_references() || self.recovery_prefix_len.is_some()
+            || (self.has_event_time_state() && self.states.iter().any(|s|s.window_kind==0 || matches!(s.window_kind,7..=11)))
+            || !self.states.iter().any(|s|matches!(s.window_kind,0|2|3|7..=11))) {
+            return Err(rejected("invalid durable time graph participant/domain contract"));
         }
         if self.has_references() && self.recovery_prefix_len.is_some() {
             return Err(rejected("reference checkpoint requires full pipeline semantics"));
@@ -585,17 +606,17 @@ impl CheckpointPlan {
             };
             let valid_window = state.codec == WINDOW_STATE_CODEC
                 && slot.raw() == 1
-                && matches!(state.window_kind, 1..=3);
+                && matches!(state.window_kind, 0..=3);
             let valid_iot = state.codec == IOT_STATE_CODEC
                 && slot.raw() == 3
-                && matches!(state.window_kind, 4..=8);
+                && matches!(state.window_kind, 4..=11);
             if shard != 0 || !ids.insert(operator) || !(valid_window || valid_iot) {
                 return Err(rejected(
                     "duplicate/unsupported checkpoint participant, slot, shard or codec",
                 ));
             }
         }
-        if self.states.len() > 1 && self.states.iter().any(|s| matches!(s.window_kind, 2 | 3)) {
+        if !self.is_time_graph() && self.states.len() > 1 && self.states.iter().any(|s| matches!(s.window_kind, 2 | 3)) {
             return Err(rejected("unsupported multi-state time policy"));
         }
         if self.has_references()
@@ -831,8 +852,8 @@ fn graph_stage_schema(
         PhysicalStage::Branch { input, .. }
         | PhysicalStage::Route { input, .. }
         | PhysicalStage::UnionAll { input, .. }
-        | PhysicalStage::Deduplicate { input, .. }
-        | PhysicalStage::Iot { input, .. } => input,
+        | PhysicalStage::Deduplicate { input, .. } => input,
+        PhysicalStage::Iot { input, output: schema, .. } => if output { schema } else { input },
         PhysicalStage::WindowAgg {
             input,
             output: schema,

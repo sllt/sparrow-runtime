@@ -84,6 +84,7 @@ pub enum PhysicalStage {
         operator: OperatorId,
         spec: IotSpec,
         input: Schema,
+        output: Schema,
     },
 }
 
@@ -214,6 +215,13 @@ impl PhysicalPlan {
 
     pub fn has_timed_iot(&self) -> bool {
         self.stages.iter().any(|s| matches!(s, PhysicalStage::Iot { spec, .. } if spec.timing.is_some()))
+    }
+
+    /// These states need source-ordered, durable time when recovery is aligned.
+    /// Live PT/TTL jobs retain their existing restart-fresh clock contract.
+    pub fn has_processing_time_state(&self) -> bool {
+        self.has_processing_time_window() || self.stages.iter().any(|s|
+            matches!(s, PhysicalStage::Iot { spec, .. } if spec.timing.is_some() || spec.ttl_micros > 0))
     }
 
     /// Honesty label for the plan under `recovery`.
@@ -389,12 +397,13 @@ fn physicalize_linear(plan: &BoundLogicalPlan, opts: &PlanOptions) -> PhysicalPl
                     output: output.clone(),
                 });
             }
-            BoundKind::Iot { spec, input } => {
+            BoundKind::Iot { spec, input, output } => {
                 flush(&mut pending, &mut stages);
                 stages.push(PhysicalStage::Iot {
                     operator: node.id,
                     spec: spec.clone(),
                     input: input.clone(),
+                    output: output.clone(),
                 });
             }
         }

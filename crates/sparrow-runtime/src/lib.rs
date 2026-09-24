@@ -13,7 +13,11 @@ pub mod coordinator;
 pub mod dedup;
 pub mod iot;
 mod timed_iot;
+mod timed_state;
+mod alarm;
+mod alarm_iot;
 pub mod processing_cut;
+pub mod graph_cut;
 pub mod kernel;
 pub mod linear;
 pub mod lookup;
@@ -46,6 +50,12 @@ mod reference_completion_tests;
 mod hysteresis_completion_tests;
 #[cfg(test)]
 mod paused_time_tests;
+#[cfg(test)]
+mod time_completion_tests;
+#[cfg(test)]
+mod time_graph_tests;
+#[cfg(test)]
+mod alarm_tests;
 
 pub use aligned::{run_until, AlignedSession};
 pub use barrier::{

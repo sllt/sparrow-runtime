@@ -848,25 +848,18 @@ fn validate_aligned_plan_inner(
     dependencies: Option<&[sparrow_plan::ReferenceTableDependency]>,
 ) -> sparrow_model::Result<()> {
     let recovery = RecoveryPolicy::parse(&spec.recovery)?;
-    if plan.has_timed_iot() { validate_paused_time_profile(spec,plan)?; }
+    if spec.graph_io.as_ref().is_some_and(|io|io.idle_after_ms.is_some())
+        && !(recovery.is_aligned() && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window())) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"idle_after_ms is only supported by durable time graphs"));
+    }
+    if recovery.is_aligned() && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
+        validate_time_graph_profile(spec,plan)?;
+    } else if plan.has_timed_iot() || (recovery.is_aligned() && plan.has_processing_time_state()) { validate_paused_time_profile(spec,plan)?; }
     if !recovery.is_aligned() {
         return Ok(());
     }
     if plan.has_iot() && spec.graph_io.is_none() {
         validate_linear_iot_profile(spec)?;
-    }
-    if plan.has_iot()
-        && plan.stages.iter().any(|stage| {
-            matches!(
-                stage,
-                sparrow_plan::PhysicalStage::Iot { spec, .. } if spec.ttl_micros != 0
-            )
-        })
-    {
-        return Err(SparrowError::new(
-            ErrorCode::UnsupportedRestore,
-            "aligned IoT state requires ttl_micros=0; processing-time TTL is restart_fresh only",
-        ));
     }
     if let Some(io) = &spec.graph_io {
         if spec.checkpoint_dir.as_deref().is_none_or(str::is_empty) || io.sources.values().any(|s| !matches!(s.kind.as_str(),"file"|"file_replay"|"replay"))
@@ -893,7 +886,7 @@ fn validate_aligned_plan_inner(
     } else {
         sparrow_plan::CheckpointPlan::from_physical(plan)?;
     }
-    if spec.source.kind=="jetstream" && plan.stages.iter().any(|stage|
+    if spec.source.kind=="jetstream" && !plan.has_processing_time_state() && plan.stages.iter().any(|stage|
         matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}))) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state or one/two Count windows only; event/processing-time replay context not verified"));
     }
@@ -927,12 +920,29 @@ fn validate_paused_time_profile(spec:&PipelineSpec,plan:&PhysicalPlan)->Result<(
         || !spec.checkpoint.as_ref().is_some_and(|p|p.resume_latest && p.interval_ms.is_some_and(|n|(100..=1000).contains(&n)))
         || spec.restore.as_ref().is_some_and(|r| r.kind!="checkpoint" || r.snapshot_id.as_deref().is_some_and(|id|!id.is_empty() && id!="aligned")) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-            "paused-time IoT requires linear File/JetStream, verified HTTP, explicit checkpoint_dir, fail_on_decode=true and resume_latest with interval_ms=100..1000; historical restore, references and side/time inputs are not enabled"));
+            "paused processing-time recovery requires linear File/JetStream, verified HTTP, explicit checkpoint_dir, fail_on_decode=true and resume_latest with interval_ms=100..1000; historical restore, references and side/time inputs are not enabled"));
     }
     if spec.source.kind!="jetstream" && resolve_file_contract(spec,RecoveryPolicy::Aligned)?!=sparrow_connectors::FileContract::AppendOnly {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"paused-time File input requires append_only; EOF must not stop timers"));
     }
     sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    Ok(())
+}
+
+pub(crate) fn validate_time_graph_profile(spec:&PipelineSpec,plan:&PhysicalPlan)->Result<()> {
+    let Some(io)=&spec.graph_io else {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"durable time graph requires graph_io"));};
+    if spec.recovery!="aligned" || plan.edges.is_none() || !spec.reference_tables.is_empty() || !plan.side_outputs.is_empty()
+        || !spec.fail_on_decode || spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
+        || !spec.checkpoint.as_ref().is_some_and(|p|p.resume_latest && p.interval_ms.is_some_and(|n|(100..=1000).contains(&n)))
+        || spec.restore.as_ref().is_some_and(|r|r.kind!="checkpoint" || r.snapshot_id.as_deref().is_some_and(|s|!s.is_empty()&&s!="aligned"))
+        || io.sources.values().any(|s|!matches!(s.kind.as_str(),"file"|"file_replay"|"replay"))
+        || io.sinks.values().any(|s|s.kind!="http"||s.skip_verify)
+        || io.idle_after_ms.is_some_and(|n|!(100..=86400000).contains(&n)) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"durable time graph requires File inputs, verified required HTTP, independent directory, fail_on_decode, resume_latest and 100..1000 ms decisions; optional idle_after_ms=100..86400000; no historical replay/references/side outputs"));
+    }
+    let manifest=sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    if !manifest.is_time_graph() {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"graph has no supported durable time state"));}
+    for source in io.sources.values() {let mut single=spec.clone();single.graph_io=None;single.source=source.clone();resolve_file_contract(&single,RecoveryPolicy::Aligned)?;}
     Ok(())
 }
 
@@ -1068,14 +1078,61 @@ fn reference_snapshot_version(spec: &PipelineSpec, plan: &PhysicalPlan) -> Resul
 /// independent of whether the stored spec currently requests aligned recovery.
 pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
-    if plan.has_timed_iot() {
+    if plan.stages.iter().any(|s| matches!(s,sparrow_plan::PhysicalStage::Iot {spec,..} if spec.is_alarm())) {
+        value["alarm"] = serde_json::json!({"maturity":"development_preview","certified":false,
+            "phases":["normal","pending","active","recovering"],"events":["activate","resolve","notify"],
+            "episode_identity":["state_generation","operator","configured_key_values","per_key_episode"],
+            "notification_policy":"state_events_always_emitted; resolve_bypasses_cooldown; one_latest_activation_pending_per_key",
+            "notification_age":"expired_pending_notification_is_counted_not_sent; equal_age_expires",
+            "state_eviction":"none; Normal_retains_episode_counter; key_or_byte_exhaustion_fails",
+            "timers":"two_logical_slots_per_key; due_before_input; condition_wins_equal_notification_deadline"});
+    }
+    if plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
+        let mut candidate=spec.clone();candidate.recovery="aligned".into();
+        let checked = validate_time_graph_profile(&candidate, plan);
+        let version = sparrow_plan::CheckpointPlan::from_physical(plan).ok().and_then(|p|
+            sparrow_runtime::snapshot_version_for(&p, sparrow_runtime::graph_cut::KIND).ok());
+        value["graph"] = serde_json::json!("dag");
+        value["aligned_eligible"] = serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
+        if spec.recovery!="aligned" {
+            // Eligibility is not activation: ordinary live graphs still use
+            // host time/ready-order and have no durable output identity.
+            value["checkpoint_participants"]=serde_json::json!({"active":false,"snapshot_version":null,
+                "candidate_snapshot_version":version,"certified":false});
+            value["graph_time"]=serde_json::json!({"mode":"live_restart_fresh","durable_rounds":false,
+                "stable_output_ids":false,"ordering":"legacy_ready_order"});
+            value["recovery_risk"]=serde_json::json!("restart_fresh_loses_graph_state");
+            if plan.has_iot() {value["iot"]=serde_json::json!({"recovery":"restart_fresh_empty_state_no_persisted_generation","ttl_micros":iot_ttls(plan)});}
+            return value;
+        }
+        value["checkpoint_participants"] = serde_json::json!({
+            "snapshot_version":version,"manifest":"CPL1/CP01DAG2","certified":false,
+            "scope":"required_File_HTTP_time_graph; PT_or_ET_not_mixed","max_states":16,
+            "recovery":"CURRENT_only; TIME_PENDING_required; full_graph_semantics",
+            "ordering":"logged_global_decisions; bounded_fixed_edge_order_Union",
+            "clock":"paused_processing_time; separately_recorded_ET_wall_observation",
+            "idle_after_ms":spec.graph_io.as_ref().and_then(|io|io.idle_after_ms),
+            "eof":"permanent_only_for_sealed_or_immutable; append_only_remains_active_without_explicit_idle",
+            "output_ids":"generation_and_sink_scoped_epoch; persisted_per_sink_ordinal",
+            "throughput":"serialized_per_decision_fsync_and_all_required_HTTP_flush; not_high_throughput"
+        });
+        value["recovery_risk"] = serde_json::json!("HTTP_may_repeat_before_CURRENT; deduplicate_by_output_identity; no_exactly_once_or_cross_sink_rollback");
+        return value;
+    }
+    if plan.has_timed_iot() || (spec.recovery == "aligned" && plan.has_processing_time_state()) {
         let checked=validate_paused_time_profile(spec,plan);
+        let manifest = sparrow_plan::CheckpointPlan::from_physical(plan).ok();
+        let version = manifest.as_ref().and_then(|p| sparrow_runtime::snapshot_version_for(p,
+            if spec.source.kind=="jetstream" { sparrow_runtime::processing_cut::JETSTREAM_KIND } else { sparrow_runtime::processing_cut::FILE_KIND }).ok());
         value["aligned_eligible"]=serde_json::json!(checked.is_ok());
         value["aligned_eligibility_reason"]=serde_json::json!(checked.err().map(|e|e.message));
         value["recovery_risk"]=serde_json::json!("required_HTTP_may_repeat_before_commit; deduplicate_by_output_identity; no_exactly_once");
-        value["iot"]=serde_json::json!({"operators":["hold_for","debounce"],"clock":"paused_source_ordered",
-            "snapshot_version":if spec.source.kind=="jetstream"{15}else{14},"maturity":"preview","certified":false,
-            "profile":"one_timed_state_linear_no_references","recovery":"CURRENT_only; TIME_PENDING_required",
+        value["iot"]=serde_json::json!({"operators":["hold_for","debounce","change_detect","deadband","hysteresis"],"clock":"paused_source_ordered",
+            "snapshot_version":version,"maturity":"preview","certified":false,
+            "profile":if manifest.as_ref().is_some_and(|p|p.is_single_timed_iot()) {"one_timed_state_linear_no_references"} else {"bounded_linear_time_states"},"recovery":"CURRENT_only; TIME_PENDING_required",
+            "max_states":2,"windows":["processing_time_tumbling","count"],"ttl":"last_valid_input; expire_before_input_at_equal_cut",
+            "ordering":"forward_time_before_timer_output; downstream_due_before_upstream_derived_rows",
             "checkpoint":"one_input_or_idle_tick_per_durable_decision; commit_before_next_decision",
             "idle_tick_ms":spec.checkpoint.as_ref().and_then(|p|p.interval_ms),
             "downtime":"paused; startup_and_pending_replay_do_not_advance_time",

@@ -1,4 +1,4 @@
-//! Serialized, crash-replayable time decisions for one linear timed operator.
+//! Serialized, crash-replayable time decisions for bounded linear time states.
 //! Publication order: persist decision -> time -> optional input -> barrier ->
 //! required output flush -> CURRENT -> broker ACK. No next decision before it.
 use super::paused_time_log::{self as log, fail, Decision};

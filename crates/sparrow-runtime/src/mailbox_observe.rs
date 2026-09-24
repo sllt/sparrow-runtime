@@ -99,6 +99,11 @@ impl InputProgress {
             Some(crate::mailbox::StreamControl::Watermark {wm_micros,..})=>self.watermark_micros=Some(self.watermark_micros.map_or(*wm_micros,|w|w.max(*wm_micros))),
             Some(crate::mailbox::StreamControl::Idle {..})=>self.idle=true,
             Some(crate::mailbox::StreamControl::Active {..})=>self.idle=false,
+            Some(crate::mailbox::StreamControl::GraphProgress {watermark_micros,flags})=>{
+                if *watermark_micros >= 0 { self.watermark_micros=Some(self.watermark_micros.map_or(*watermark_micros,|w|w.max(*watermark_micros))); }
+                self.idle=flags & 1 != 0;
+                self.eof=flags & 2 != 0;
+            },
             Some(crate::mailbox::StreamControl::CheckpointBarrier {checkpoint_id})=>self.barrier_received=Some(*checkpoint_id),
             _=>{},
         }

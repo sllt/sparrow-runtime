@@ -27,7 +27,7 @@ type timeCut struct {
 	NextOutput uint64 `json:"next_output"`
 }
 
-func currentTimeCut(checkpoint string) timeCut {
+func currentTimeCut(checkpoint string, requiredVersion ...uint16) timeCut {
 	current, err := os.ReadFile(filepath.Join(checkpoint, "CURRENT"))
 	must(err)
 	id, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(string(current)), "chk-"), 10, 64)
@@ -35,7 +35,11 @@ func currentTimeCut(checkpoint string) timeCut {
 	payload := snapshotPayload(checkpoint, id)
 	require(len(payload) >= 38, "truncated timed snapshot")
 	version := binary.LittleEndian.Uint16(payload[4:6])
-	require(version == 14 || version == 15, "wrong timed snapshot version")
+	if len(requiredVersion) == 0 {
+		require(version >= 14 && version <= 17, "wrong legacy timed snapshot version")
+	} else {
+		require(len(requiredVersion) == 1 && (requiredVersion[0] == 20 || requiredVersion[0] == 21) && version == requiredVersion[0], "wrong alarm snapshot version")
+	}
 	offset := 38
 	readString := func() string {
 		n, ok := readU32(payload, &offset)
@@ -45,7 +49,7 @@ func currentTimeCut(checkpoint string) timeCut {
 		return string(b)
 	}
 	kind, path := readString(), readString()
-	require((version == 14 && kind == "paused-file-v1") || (version == 15 && kind == "paused-jetstream-v1"), "timed source/profile mismatch")
+	require(((version == 14 || version == 16 || version == 20) && kind == "paused-file-v1") || ((version == 15 || version == 17 || version == 21) && kind == "paused-jetstream-v1"), "timed source/profile mismatch")
 	decoded, err := hex.DecodeString(path)
 	must(err)
 	require(len(decoded) >= 20 && string(decoded[:4]) == "PTC1", "time cut encoding")
@@ -60,7 +64,7 @@ func currentTimeCut(checkpoint string) timeCut {
 	plan, ok := readBytes(payload, &offset, int(n))
 	require(ok && len(plan) >= 4 && string(plan[:4]) == "CPL1", "timed manifest version")
 	states, ok := readU16(payload, &offset)
-	require(ok && states == 1, "timed profile must have one state")
+	require(ok && states >= 1 && states <= 2 && (version >= 16 || states == 1), "timed profile state count")
 	return timeCut{ID: id, Version: version, Ingested: binary.LittleEndian.Uint64(payload[14:22]),
 		Sequence: binary.LittleEndian.Uint64(decoded[4:12]), Micros: int64(binary.LittleEndian.Uint64(decoded[12:20])), NextOutput: next}
 }
@@ -74,14 +78,14 @@ func pendingTime(checkpoint string) map[string]any {
 	must(json.Unmarshal(raw[36:], &result))
 	return result
 }
-func waitTimeCut(checkpoint string, rows, ordinal uint64) timeCut {
+func waitTimeCut(checkpoint string, rows, ordinal uint64, requiredVersion ...uint16) timeCut {
 	var result timeCut
 	wait("committed time cut", func() bool {
 		if _, err := os.Stat(filepath.Join(checkpoint, "CURRENT")); err != nil {
 			return false
 		}
 		var ready bool
-		result, ready = sampleTimeCut(checkpoint)
+		result, ready = sampleTimeCut(checkpoint, requiredVersion...)
 		return ready && result.Ingested >= rows && result.NextOutput >= ordinal
 	})
 	return result
@@ -91,7 +95,7 @@ func waitTimeCut(checkpoint string, rows, ordinal uint64) timeCut {
 // An unlocked observer can also lose an older generation to GC while reading.
 // Retry ONLY ENOENT within wait's fixed deadline, never CRC/format mismatches;
 // persistent missing/corrupt publication still cannot pass the oracle.
-func sampleTimeCut(checkpoint string) (cut timeCut, ready bool) {
+func sampleTimeCut(checkpoint string, requiredVersion ...uint16) (cut timeCut, ready bool) {
 	defer func() {
 		if problem := recover(); problem != nil {
 			if err, ok := problem.(error); ok && os.IsNotExist(err) {
@@ -101,9 +105,61 @@ func sampleTimeCut(checkpoint string) (cut timeCut, ready bool) {
 			panic(problem)
 		}
 	}()
-	return currentTimeCut(checkpoint), true
+	return currentTimeCut(checkpoint, requiredVersion...), true
 }
 func timedSpec(file, sink, checkpoint, kind string, brokerPort int) map[string]any {
+	if kind == "alarm" || kind == "alarm_immediate" {
+		spec := timedSpec(file, sink, checkpoint, "hold_for", brokerPort)
+		nodes := spec["graph"].(map[string]any)["nodes"].([]any)
+		nodes[0].(map[string]any)["out"] = []int{4}
+		node := nodes[1].(map[string]any)
+		node["kind"] = "alarm"
+		iot := node["iot"].(map[string]any)
+		iot["fields"] = []string{"active", "clear"}
+		activate := 1000000
+		if kind == "alarm_immediate" {
+			activate = 0
+		}
+		iot["timing"] = map[string]any{"kind": "alarm", "clock": "paused", "activate_micros": activate, "resolve_micros": 200000, "cooldown_micros": 1000000, "notification_max_age_micros": 2000000}
+		project := map[string]any{"id": 4, "kind": "project", "out": []int{2}, "exprs": []any{
+			map[string]any{"alias": "device_id", "expr": map[string]any{"k": "col", "name": "device_id"}},
+			map[string]any{"alias": "active", "expr": map[string]any{"k": "col", "name": "active"}},
+			map[string]any{"alias": "clear", "expr": map[string]any{"k": "not", "expr": map[string]any{"k": "col", "name": "active"}}},
+		}}
+		spec["graph"].(map[string]any)["nodes"] = append(nodes, project)
+		return spec
+	}
+	if kinds, ok := completionKinds[kind]; ok {
+		spec := timedSpec(file, sink, checkpoint, "debounce", brokerPort)
+		nodes := []any{map[string]any{"id": 1, "kind": "memory_source", "table": "telemetry", "out": []int{2}}}
+		for index, state := range kinds {
+			id := index + 2
+			var node map[string]any
+			if state == "pt" {
+				node = map[string]any{"kind": "window_agg", "window": map[string]any{"kind": "processing_time", "size_micros": 1000000},
+					"keys": []string{"device_id"}, "aggs": []any{map[string]any{"fn": "count", "alias": "active"}}}
+			} else {
+				baseKind := "debounce"
+				if state == "hold" {
+					baseKind = "hold_for"
+				}
+				node = timedSpec(file, sink, checkpoint, baseKind, brokerPort)["graph"].(map[string]any)["nodes"].([]any)[1].(map[string]any)
+				if state == "ttl" {
+					node["kind"] = "change_detect"
+					iot := node["iot"].(map[string]any)
+					delete(iot, "timing")
+					iot["ttl_micros"] = 1000000
+					iot["emit_first"] = true
+				}
+			}
+			node["id"] = id
+			node["out"] = []int{id + 1}
+			nodes = append(nodes, node)
+		}
+		nodes = append(nodes, map[string]any{"id": len(kinds) + 2, "kind": "capture_sink", "name": "http"})
+		spec["graph"].(map[string]any)["nodes"] = nodes
+		return spec
+	}
 	spec := hysteresisFileSpec(file, sink, checkpoint)
 	if brokerPort != 0 {
 		spec = hysteresisJSSpec(brokerPort, sink, checkpoint, "paused")
@@ -133,6 +189,15 @@ func configureTimed(a api, c *capture, brokerPort int) {
 		map[string]any{"name": "active", "type": "bool", "nullable": true}}})
 }
 func runTimedProcess(root, serverBin, natsBin, kind string, jetstream bool) string {
+	alarm := kind == "alarm" || kind == "alarm_immediate"
+	var requiredVersion []uint16
+	if alarm {
+		version := uint16(20)
+		if jetstream {
+			version = 21
+		}
+		requiredVersion = []uint16{version}
+	}
 	must(os.Mkdir(root, 0700))
 	c := newCapture()
 	defer c.close()
@@ -172,7 +237,7 @@ func runTimedProcess(root, serverBin, natsBin, kind string, jetstream bool) stri
 	spec := timedSpec(file, c.url(), checkpoint, kind, brokerPort)
 	save(filepath.Join(root, "spec.json"), spec)
 	startPipeline(a, "timed", spec)
-	bootstrap := waitTimeCut(checkpoint, 0, 1)
+	bootstrap := waitTimeCut(checkpoint, 0, 1, requiredVersion...)
 	require(bootstrap.Ingested == 0, "bootstrap consumed input")
 	body := data(map[string]any{"device_id": "a", "active": true})
 	c.setHold()
@@ -188,10 +253,11 @@ func runTimedProcess(root, serverBin, natsBin, kind string, jetstream bool) stri
 	}
 	// A committed HoldFor pending latch must survive a process outage longer
 	// than its duration without spending its remaining logical time.
-	if kind == "hold_for" {
-		waitTimeCut(checkpoint, 1, 1)
+	downtime := kind == "hold_for" || kind == "pt" || kind == "pt_pt" || kind == "alarm"
+	if downtime {
+		waitTimeCut(checkpoint, 1, 1, requiredVersion...)
 		stop(syscall.SIGKILL)
-		stopped := currentTimeCut(checkpoint)
+		stopped := currentTimeCut(checkpoint, requiredVersion...)
 		require(c.receivedRows() == 0, "HoldFor fired before fixture stopped")
 		save(filepath.Join(root, "stopped-cut.json"), stopped)
 		time.Sleep(1100 * time.Millisecond)
@@ -206,9 +272,16 @@ func runTimedProcess(root, serverBin, natsBin, kind string, jetstream bool) stri
 	require(len(received) == 1, "unexpected pre-crash output count")
 	first := received[0]
 	verifyOutputIDs([]map[string]any{first}, "", 1)
-	require(rowData(first)["active"] == true, "wrong timer payload")
+	if kind == "pt" || kind == "pt_pt" {
+		require(number(rowData(first)["active"]) == 1, "wrong PT aggregate")
+	} else {
+		require(rowData(first)["active"] == true, "wrong timer payload")
+	}
 	require(first["id"] != nil, "timed File/JetStream output lacks ID")
-	before := currentTimeCut(checkpoint)
+	if alarm {
+		require(rowData(first)["sparrow_alarm_event"] == "activate" && number(rowData(first)["sparrow_alarm_episode"]) == 1 && rowData(first)["sparrow_alarm_notify"] == true, "alarm activation/episode oracle")
+	}
+	before := currentTimeCut(checkpoint, requiredVersion...)
 	currentHash := hash(filepath.Join(checkpoint, "CURRENT"))
 	logHash := hash(filepath.Join(checkpoint, "TIME_PENDING"))
 	pending := pendingTime(checkpoint)
@@ -219,7 +292,7 @@ func runTimedProcess(root, serverBin, natsBin, kind string, jetstream bool) stri
 	if jetstream {
 		info := consumerInfo(producer)
 		save(filepath.Join(root, "held-broker.json"), info)
-		if kind == "debounce_leading" {
+		if kind == "debounce_leading" || kind == "ttl" || kind == "alarm_immediate" {
 			require(number(nested(info, "ack_floor", "stream_seq")) == 0 && number(info["num_ack_pending"]) == 1, "uncommitted input was ACKed")
 		}
 	}
@@ -234,7 +307,14 @@ func runTimedProcess(root, serverBin, natsBin, kind string, jetstream bool) stri
 	wait("time suffix replay", func() bool { return c.rowCount() == 1 })
 	replay := c.snapshot().Rows[0]
 	require(bytes.Equal(data(first), data(replay)), "uncommitted output ID/payload changed after SIGKILL")
-	committed := waitTimeCut(checkpoint, 1, 2)
+	committed := waitTimeCut(checkpoint, 1, 2, requiredVersion...)
+	if _, combined := completionKinds[kind]; combined {
+		wanted := uint16(16)
+		if jetstream {
+			wanted = 17
+		}
+		require(committed.Version == wanted, "combined profile selection")
+	}
 	if jetstream {
 		wait("timed input ACK", func() bool {
 			info := consumerInfo(producer)
@@ -248,14 +328,81 @@ func runTimedProcess(root, serverBin, natsBin, kind string, jetstream bool) stri
 	waitRunning(a, "timed")
 	time.Sleep(400 * time.Millisecond)
 	require(c.rowCount() == 1 && c.receivedRows() == 2, "committed timer output was repeated")
+	if alarm {
+		c.setHold()
+		body := data(map[string]any{"device_id": "a", "active": false})
+		if jetstream {
+			producer.request("input.rows", body)
+		} else {
+			f, err := os.OpenFile(file, os.O_APPEND|os.O_WRONLY, 0600)
+			must(err)
+			_, err = f.Write(append(body, '\n'))
+			must(err)
+			must(f.Sync())
+			must(f.Close())
+		}
+		c.waitHeld()
+		resolve := c.snapshot().Received[2]
+		require(rowData(resolve)["sparrow_alarm_event"] == "resolve" && number(rowData(resolve)["sparrow_alarm_episode"]) == 1 && rowData(resolve)["sparrow_alarm_notify"] == true, "alarm resolve oracle")
+		require(rowData(resolve)["sparrow_alarm_generation"] == rowData(first)["sparrow_alarm_generation"], "alarm episode generation changed")
+		currentHash := hash(filepath.Join(checkpoint, "CURRENT"))
+		pendingHash := hash(filepath.Join(checkpoint, "TIME_PENDING"))
+		stop(syscall.SIGKILL)
+		c.releaseHold(true)
+		require(hash(filepath.Join(checkpoint, "CURRENT")) == currentHash && hash(filepath.Join(checkpoint, "TIME_PENDING")) == pendingHash, "resolve crash changed cut")
+		start()
+		a.ok(http.MethodPost, "/v1/pipelines/timed/start", map[string]any{})
+		waitRunning(a, "timed")
+		wait("alarm resolve suffix replay", func() bool { return c.rowCount() == 2 })
+		require(bytes.Equal(data(resolve), data(c.snapshot().Rows[1])), "resolve replay changed payload/episode/ID")
+		committed = waitTimeCut(checkpoint, 2, 3, requiredVersion...)
+		if jetstream {
+			wait("alarm resolve input ACK", func() bool { return number(nested(consumerInfo(producer), "ack_floor", "stream_seq")) == 2 })
+		}
+		stop(syscall.SIGKILL)
+		start()
+		a.ok(http.MethodPost, "/v1/pipelines/timed/start", map[string]any{})
+		waitRunning(a, "timed")
+		time.Sleep(300 * time.Millisecond)
+		require(c.rowCount() == 2 && c.receivedRows() == 4, "committed resolve repeated")
+	}
 	stop(syscall.SIGTERM)
 	save(filepath.Join(root, "capture.json"), c.snapshot())
 	save(filepath.Join(root, "committed-cut.json"), committed)
 	save(filepath.Join(root, "summary.json"), map[string]any{"valid": true, "kind": kind, "jetstream": jetstream,
 		"real_sigkill": true, "pending_replay_identical": true, "committed_restart_no_repeat": true,
-		"downtime_checked": kind == "hold_for", "broker_uncommitted_input_checked": jetstream && kind == "debounce_leading",
+		"downtime_checked": downtime, "broker_uncommitted_input_checked": jetstream && (kind == "debounce_leading" || kind == "ttl" || kind == "alarm_immediate"), "alarm_activate_and_resolve_checked": alarm,
 		"profile": committed.Version, "certified": false})
 	return checkpoint
+}
+
+var completionKinds = map[string][]string{
+	"pt": {"pt"}, "ttl": {"ttl"}, "pt_pt": {"pt", "pt"}, "ttl_debounce": {"ttl", "debounce"},
+	"debounce_ttl": {"debounce", "ttl"}, "debounce_debounce": {"debounce", "debounce"},
+	"hold_debounce": {"hold", "debounce"}, "debounce_hold": {"debounce", "hold"},
+}
+
+func runTimeCompletionMatrix(root, serverBin, oldServerBin, natsBin string, fileOnly bool) {
+	transports := []string{"file"}
+	if !fileOnly {
+		transports = append(transports, "jetstream")
+	}
+	count := 0
+	for _, transport := range transports {
+		for _, kind := range []string{"pt", "ttl", "pt_pt", "ttl_debounce", "debounce_ttl", "debounce_debounce", "hold_debounce", "debounce_hold"} {
+			runTimedProcess(filepath.Join(root, transport+"-"+kind), serverBin, natsBin, kind, transport == "jetstream")
+			count++
+		}
+	}
+	guards := map[string]any{}
+	for _, transport := range transports {
+		source := filepath.Join(root, transport+"-pt")
+		guards[transport] = runProfileGuard(filepath.Join(root, "old-"+transport+"-guard"), oldServerBin,
+			filepath.Join(source, "checkpoint"), filepath.Join(source, "signals.ndjson"), "checkpoint source profile mismatch", "old v16/v17 guard")
+	}
+	save(filepath.Join(root, "summary.json"), map[string]any{"valid": true, "process_scenarios": count, "file_only": fileOnly,
+		"old_profile_guards": guards, "snapshot_versions": []int{16, 17}, "exactly_once_claimed": false, "certified": false})
+	fmt.Println("TIME_COMPLETION_PROCESS_OK")
 }
 func runPausedTimeMatrix(root, serverBin, oldServerBin, natsBin string) {
 	checkpoints := map[string]string{}

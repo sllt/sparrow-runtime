@@ -1,5 +1,47 @@
 # K3：真实 DAG 执行与恢复
 
+<a id="time-graph-recovery"></a>
+## 时间型 File DAG：v18 / v19（2026-09-23，限定 Preview 已验收）
+
+本节是独立新 profile，不修改下方历史 v5/v6/v11/v12 的合流和恢复合同。**本批实现、自查和匹配功能/故障/性能门禁已完成，不是生产长稳认证或正式发行。** [验收证据](PRODUCTION.md#time-graph-validation)。
+
+- **v18：** 暂停的 processing-time，支持 PT tumbling、Count、Change/Deadband 正 TTL、TTL0 IoT、HoldFor/Debounce 的 required 分支/合流。
+- **v19：** event-time tumbling/hopping、Count 和 TTL0 IoT；所有来源显式绑定时间列。PT/正 TTL/计时 IoT 与 ET 不混用。
+- 仅 File（append-only、sealed、immutable）→全部 required、校验证书的 HTTP。最多 16 个源/汇/状态参与者，64 节点/128 边，仍受原 Job 总预算约束。不接受 JetStream 图、参考表、Dedup、side/lossy 分支或历史 checkpoint replay。
+- 必须 `recovery:"aligned"`、独立 `checkpoint_dir`、`fail_on_decode:true`、`resume_latest:true`，决策空闲间隔 `checkpoint.interval_ms` 为 100～1000 ms。不是增大默认预算后放开任意拓扑。
+- 时间决策对 Filter/Project 之前的**完整输入行**取指纹，当前只支持一等标量源字段；nested/Dynamic 源列在准入时拒绝，即使下游会丢弃该列或初始值是 NULL。旧无时间 journal 的 profile 和 live 图不因此收窄。
+
+### 持久决策与确定性合流
+
+一个协调 actor 按持久轮转位置选择**一条输入、一条永久 EOF 或一次空闲 tick**。先写入有大小限制、SHA-256 校验且 fsync 的 `TIME_PENDING`（GTD1），再向每个 Source 的同一 FIFO 发布：逻辑时间、前置 progress、可选数据、目标 progress、round-end。所有来源无论 active/idle/EOF 都参与之后的 barrier。
+
+Union 不在新 profile 中沿用旧 ready-order。它有界收集该轮的所有端口，避免 fan-out→rejoin 因只等待一个端口而死锁；到齐后按**物理边顺序**重放，保留边内顺序。这是“同一已记录决策的重放稳定”，不是原始设备总序、事件时间全排序或跨源并发原序。缓冲受 Job `max_rows`、working reservation 的一半及元数据 credit 限制；超限明确失败，不无限增长。
+
+Compact 当前 `max_rows=256`，这是每个 Union **整轮累计**上限，不仅是单个 batch 的上限；多分支 timer 同时到期也计入。大基数/大展开量必须先验证轮缓冲和字节预算，不能由每算子 1024 keys 的格式上限推导“1024 个 timer 可在同轮合流”。
+
+Union progress、所有状态 freeze、各 HTTP Sink 的真实 flush/next-output ordinal 与全部 Source cursor/idle/EOF/逻辑时间，共同进入 `CPL1/CP01DAG2` 快照，再提交 `CURRENT`；完成前不读取下一决策。所有等待可取消，已启动的文件/fsync worker 必须 join。超时/失败保留 pending 并结束 attempt，不在丢失 round 上继续执行。
+
+Rust embedding 必须遵守同一持久化/FIFO/round 协议；`GraphRuntime::complete` 只收集 ACK/control cut，并不代替落盘 `CURRENT`。调用方完成实际提交前不得启动下一轮，失败后必须结束 attempt。
+
+### 时间、EOF 与重放身份
+
+- PT/TTL 停机暂停；恢复及 pending 重放不消耗停机时间。计时控制先于 timer 派生行，下游先处理同一时刻已有的到期状态。
+- ET 另行记录墙钟观察值，仅用于 future-skew 检查；pending 重放使用原观察值，不能因重启后的当前时间变化把旧拒绝行变成有效行。
+- 可选 `graph_io.idle_after_ms` 为 100～86400000；按已记录逻辑时间、最近输入判空闲。未配置时，空 append-only 文件保持 active/未初始化，不能猜测为 idle/EOF。重新 active 不回退已经输出的 watermark。
+- sealed/immutable 的永久 EOF 是持久 progress，不是异常 channel close。全部上游永久 EOF 会关闭 ET 的 positive-lateness 尾窗；PT 的来源 EOF **不停止分支 timer**。这些 Source 仍接收后续 round/barrier，Job 由显式 stop 结束。
+- 每个 Sink 使用由 generation 和 Sink ID 派生的独立 epoch、持久 ordinal。A 已接受而 B 未接受时，恢复可能再次发送给 A，但同一输出的 ID/数据保持；下游需要按 ID 去重。**不承诺 exactly-once、跨 Sink 事务或业务落库 ACK。**
+- 仅支持 `CURRENT` 与其唯一直接后继 `TIME_PENDING`；缺日志、校验失败、文件合同/idle 策略/图语义改变、缺参与者或源身份不符均拒绝。旧目录不自动升级，新目录也不能交给旧 binary 改写。
+
+### 模板与验收入口
+
+注册 `deploy/stream-time-graph.json` 为 `graph_signals`；按 `deploy/pipeline-time-graph-pt.json` 或 `deploy/pipeline-time-graph-et.json` 配置输入文件、目标 allowlist 和独立目录。ET 模板使用 sealed，必须先准备完整输入；持续追加时同时修改对应 `graph_io.sources` 与顶层最小 Source 镜像为 append-only，必要时明确 idle 策略。
+
+测试：`time_graph_` 精确清单见 `tests/time-graph/expected-tests.txt`；冻结重复/进程入口为 `scripts/production-time-graph-validate.sh`，独立 Go 驱动 `--time-graph-only` 解码 GTC1/GTD1、执行真实 SIGKILL 和部分 Sink 接受切点。长稳、TLS/WAN、掉电和容量认证不能由这些短程测试代替。
+
+该 profile 每条输入都支付决策 fsync、所有 required HTTP flush 和 snapshot/CURRENT 的成本，**不是高吞吐默认路径**。旧线性 hot path 与旧 DAG profile 不自动采用这套协议；批决策/日志摊销留在 OPT-012。
+
+**默认 Server 图预算的实际边界：** 目前每条内部边配置 256 KiB，单 Job queue 上限为 2 MiB，另计观察/通道元数据；因此 64 节点/16 状态是格式上限，不是默认 Server 可启动规模。此次 12 边测试需要 3,220,480 B，明确被默认 2,097,152 B 配额拒绝，未发布输入/输出或 CURRENT。大图的低容量 mailbox embedding 测试与默认 Server 的可接纳进程形状分开记录；不通过扩大预算或删掉拒绝证据宣称大图已获默认支持。
+
 **2026-09-17 核心完善增量：** required File→HTTP 图已接入固定 revision/SHA/CRC 的静态参考表，独立 profile11 支持最多16个 Count/IoT(TTL0)状态。真实进程覆盖 Lookup 分支、双来源 Lookup→Union，以及 Lookup→Count→Hysteresis→双 required HTTP 的 pending Count/latch 同切点恢复，见 [本轮证据](PRODUCTION.md#k1-k4-reference-validation)。无引用迟滞图使用独立 profile12；该声明仍是有限 Preview，不开放时间型状态、side/lossy、JetStream DAG 或确定性全局合流。
 
 **K4 扩展（开发候选）：** 图内新增变化检测/Deadband，含 IoT 状态的 File→required HTTP checkpoint 使用独立 **v6**，不是下文历史 K3 验收的 v5；限制和新证据见 [IOT.md](IOT.md)。内嵌 aligned 图必须使用有序 events 输入，不能以有限 rows/raw row 通道代替可接收 barrier 的 Source；逻辑 EOF 不等于 checkpoint ACK，已关闭输入不得满足 Union 对齐。

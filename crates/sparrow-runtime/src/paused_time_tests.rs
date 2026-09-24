@@ -329,5 +329,6 @@ fn paused_time_snapshot_profiles_and_downgrade_rejection() {
         codec: 2,
         window_kind: 4,
     });
-    assert!(mixed.validate().is_err());
+    assert!(mixed.validate().is_ok());
+    assert_eq!(crate::snapshot_version_for(&mixed, FILE_KIND).unwrap(), 16);
 }

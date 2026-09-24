@@ -2,9 +2,11 @@
 
 **先看开发顺序：[简版开发顺序 TODO](DEVELOPMENT_ORDER.md)。** 该文件维护当前执行先后与每批效果；本文件保留详细任务、设计对应和历史证据。
 
-更新日期：2026-09-19。
+更新日期：2026-09-22。
 
-**当前进展：单个线性 HoldFor / Debounce 的可恢复时间首批已完成验收。** 服务器 `box@100.64.0.18`：747/44、22×20、6+3 进程场景、旧矩阵及三组 ABBA 均通过，[证据与边界](PRODUCTION.md#paused-time-validation)。PT/正 TTL、多状态组合、时间型 DAG 和完整 IoT 生命周期仍未完成；新 v14/v15 是逐决策串行持久化 profile，其容量成本见 OPT-012，不能代替旧高吞吐路径。以 [开发顺序第 1 批](DEVELOPMENT_ORDER.md) 为准，不将子项通过写成 K1～K4 全部完成。
+**当前进展（2026-09-23）：开发顺序第 1、2 批的限定时间恢复已完成验收。** v14～v17 线性能力之外，required File→HTTP 时间图 PT v18 / ET v19 已通过 774/44、专项重复、真实进程故障、旧矩阵和原三组 ABBA，[证据与边界](PRODUCTION.md#time-graph-validation)。未声明来源/依赖/时间域组合和完整 IoT 生命周期仍未完成；逐决策串行提交的容量成本仍见 OPT-012。当前按 [开发顺序第 3 批](DEVELOPMENT_ORDER.md) 推进 K4 业务闭环，不将限定图恢复写成 K1～K4 全部完成。
+
+以下带日期的早期“当前/最新”记录保留为历史证据；实际当前状态以上段及 `DEVELOPMENT_ORDER.md` 为准。工作分支现为 `feat/core-completion`，本批基线为 `bce8f8b`，本批新增代码尚未提交或推送。
 
 设计依据：根目录 `Sparrow_Post_V1_Roadmap_Arrow_JIT_Final.md`，包含 2026-09-12 实施补充；同时追踪原始蓝图、计划评审与历史 ADR，文档范围、取舍及章节对应见 [§18 覆盖矩阵](#design-coverage)。运行合同与已验证证据以 [RUNTIME.md](RUNTIME.md) 为准，并核对其对应源码/构建。本文件负责把设计转成执行任务，不替代设计文档，也不把设计接口当成已存在的 API。
 
@@ -28,16 +30,16 @@ R12 收尾（2026-09-16）已完成本批实现、自查及匹配复验，提交
 
 | 大阶段 | 已有受测能力 | 本阶段剩余核心工作 |
 |---|---|---|
-| K1 / STATE / TAB | File 零/单/双 Count、受限 ET、IoT TTL0；静态 Lookup v8/v9；不可变表发布/固定绑定/pin/GC；单个 HoldFor/Debounce 的暂停时间 v14 | PT Window/正 TTL、多状态时间恢复；对应 codec/依赖/预算/迁移拒绝矩阵 |
-| K2 / REL | JetStream 受限零/Count/IoT TTL0、静态表 v10/迟滞 v13、稳定输出身份、HTTP确认→checkpoint→ACK；单个 HoldFor/Debounce v15 | 其他时间状态组合；重连/容量/异常处置与发行缺口。独立 outbox/DLQ 仍是需求触发项，不假装已实现 |
+| K1 / STATE / TAB | File 零/单/双 Count、受限 ET、IoT TTL0；静态 Lookup v8/v9；不可变表发布/固定绑定/pin/GC；单个 HoldFor/Debounce v14；PT tumbling、Change/Deadband 正 TTL 和最多两个线性状态的暂停时间 v16 | 时间型 DAG、时间与 Lookup 等未声明组合仍需独立准入；目标预算、迁移/发行矩阵随新组合扩展 |
+| K2 / REL | JetStream 受限零/Count/IoT TTL0、静态表 v10/迟滞 v13、稳定输出身份、HTTP确认→checkpoint→ACK；单个 HoldFor/Debounce v15；线性 PT/正 TTL/双状态时间 v17 | 未声明拓扑/依赖组合；重连/容量/异常处置与发行缺口。独立 outbox/DLQ 仍是需求触发项，不假装已实现 |
 | K3 / DAG | Branch/Route/UnionAll、多来源/required HTTP、受限 File Count/IoT；静态表 v11 的分支/合流/混合状态恢复 | 时间状态和 Source 时间进度恢复；确定性 timer/合流合同及慢/失败支路、预算与控制进展回归 |
-| K4 / IOT | ChangeDetect、Deadband、Hysteresis、TTL0 恢复；线性 processing-time HoldFor/Debounce 与模板 | event-time/多状态/图组合；冷却/通知限频、静默/离线检测、告警生命周期及采样/重采样；对应 schema、身份、恢复与业务模板 |
+| K4 / IOT | ChangeDetect、Deadband、Hysteresis、TTL0 恢复；线性 processing-time HoldFor/Debounce、Change/Deadband 正 TTL、限定双状态组合与模板 | event-time/图/未声明依赖组合；冷却/通知限频、静默/离线检测、告警生命周期及采样/重采样；对应 schema、身份、恢复与业务模板 |
 | K0 / QA / PUB | 短程/故障/性能证据、冻结二进制与独立清单 | 匹配源码的全局Review、真实网络/目标容量/24～72h/存储失败模型、CI和发行证据；未跑保持NOT RUN |
 | K5 | 后置 | 运维工作台、Graph Designer及前端不进入本次核心完善 |
 
 **当前实施顺序**：静态表＋状态/可靠输入/required DAG 的组合恢复与 K4 迟滞已完成本轮匹配功能验收；接下来补齐可恢复时间与高级 IoT 状态机。每项必须贯通 API→实际执行→失败/取消→恢复和独立预期，不能只补 helper/trait 或放宽准入。本轮冻结 v7 为726/44、26×20专项及9种进程，完整旧矩阵回归通过；性能和来源单列见 [本轮证据](PRODUCTION.md#k1-k4-reference-validation)，不继承上一候选700/44和ABBA成绩。
 
-2026-09-19 补充：上段数字属于静态表/迟滞历史批次；最新时间型子批为 747/44、22×20、6+3 进程及三组 ABBA。下一步仍补齐第 1 批剩余 PT/正 TTL/多状态时间合同，再推进时间型 DAG，不跳到 K5。
+2026-09-22 补充：历史 v14/v15 为 747/44、22×20、6+3 进程。本批 v16/v17 已完成限定线性 PT/正 TTL/最多两个状态：759/44、25×20 与 38×20（清单存在交集）、24 种新增真实进程场景、旧矩阵及三组 ABBA 通过，[匹配证据](PRODUCTION.md#linear-time-validation)。**下一批是时间型 DAG（K3）**，不跳到 K5；第 1 批完成不表示任意时间/Lookup/DAG 组合或生产长稳已完成。
 
 **计时决策（用户已确认）**：高级 IoT 采用停机暂停，恢复后继续剩余时长。该选择必须进入显式配置与兼容语义；有未提交输入重放时，还需证明逻辑时间、timer 与 Source cut 的顺序，不得只保存 `remaining_ttl` 就宣称确定性可靠重放。设备事件时间/watermark模式是另一个明确时间域，不与暂停的 processing-time 偷换。
 
@@ -634,6 +636,8 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
 <a id="dag"></a>
 ## 9. V1.3：分阶段真实 DAG
 
+**2026-09-23 时间图增量已验收：** required File→HTTP 的独立 v18/PT、v19/ET，持久决策、来源 progress、Union 确定性轮合流和每 Sink 输出身份已完成。774/44、14×20、默认/JS 包各 6 个真实故障场景与预算拒绝、完整旧矩阵及三组原性能门禁通过，见 [合同](DAG.md#time-graph-recovery)、[匹配证据](PRODUCTION.md#time-graph-validation)。主线第 2 项按限定组合完成；大图实际准入、每轮 256 行上限及未开放的依赖/时间域仍按合同拒绝，不等于整个 K1～K4 或生产认证。
+
 **K3 本批完成（2026-09-16，尚未提交）：** DAG-01～07 的运行/控制面/Connector/故障闭环已实现并自查，限定能力矩阵通过 `package-v14-*` 匹配复验，详见 [DAG.md](DAG.md#k3-validation)。下方勾选表示这些声明组合的开发验收完成，不表示任意图、所有 codec 或生产认证。aligned 仅开放 required File→HTTP 的零状态/Count 图；time/side-output/有损/JetStream 图 aligned 明确拒绝。K2 的生产验证/优化剩余项继续保留，DAG-08/K5 不在本批。
 
 优先级：核心批 **K3**，按单源分支、多源合流、多输入恢复依次交付；不等工作台，也不强制依赖已选可靠 broker。共同前置：图级预算/owner、稳定 edge/input 身份；恢复还依赖 STATE 和所选可重放来源/输出合同。DAG-08 Designer 单独后置为 K5。负责人：待认领。
@@ -664,10 +668,14 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
 
 - [ ] **IOT-04 — HoldFor。** 条件开始、缺样本、反转、processing/event-time 选择及停机时间规则；processing-time 按 timer 到点触发，不等下一条消息；event-time 由 watermark 推进。
   - [x] 单个线性 paused processing-time、File/JetStream 恢复与真实故障验证（v14/v15）；缺样本维持有效条件、false 取消、等 deadline 时 timer-before-input 明确。
-  - [ ] event-time/watermark 和其他状态/图组合；父项不因首批通过而勾选。
+  - [x] v16/v17 的最多两个线性状态组合，统一有序时间、下游等时到期优先、完整状态/输出 cut 恢复；已完成本批故障与重复回归。
+  - [x] required File 时间图中的 paused-time 组合（v18）；确定性合流与分支 timer 共切点。
+  - [ ] HoldFor 自身的 event-time/watermark 模式与未声明依赖组合；父项不因限定组合通过而勾选。
 - [ ] **IOT-05 — Debounce。** leading/trailing、最大等待、重复输入是否延长及每 key timer 上限；timer 替换/取消/恢复和连续抖动有确定性测试。
   - [x] 单个线性 paused processing-time 的上述参数、File/JetStream 恢复、预算和故障测试（v14/v15）。
-  - [ ] 其他时间域和状态/图组合的协议与验证；逐决策提交的容量优化单列 OPT-012。
+  - [x] v16/v17 的最多两个线性状态组合及 PT/TTL 边界、重放验证。
+  - [x] required File 时间图中的 paused-time 组合（v18）及恢复验证。
+  - [ ] Debounce 自身的其他时间域与未声明依赖组合；逐决策提交的容量优化单列 OPT-012。
 - [ ] **IOT-06 — 冷却/通知限频。** 限的是通知而非上游状态观察；冷却期间恢复条件仍生效，等待通知有 bytes/数量/年龄上限。
 - [ ] **IOT-07 — 静默/离线检测。** 设备集合、最近接收、停机宽限与链路健康关联；从未出现且未登记的设备不凭空判离线，来源断连时不把全部设备判故障。
 - [ ] **IOT-08 — 告警生命周期。** Normal/Pending/Active/Recovering、activate/resolve、稳定 episode ID 和重复通知语义；Active/Pending 不默认 TTL 静默淘汰，资源不足时明确 expired/unknown 或失败。

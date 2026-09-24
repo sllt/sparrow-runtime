@@ -13,6 +13,9 @@ pub struct RuntimeMetrics {
     pub iot_filtered_rows: AtomicU64,
     pub iot_invalid_rows: AtomicU64,
     pub iot_expired_keys: AtomicU64,
+    pub alarm_notifications_expired: AtomicU64,
+    pub alarm_notifications_cancelled: AtomicU64,
+    pub alarm_notifications_deferred: AtomicU64,
     pub iot_state_keys: AtomicU64,
     pub iot_state_bytes: AtomicU64,
     /// Explicitly lossy graph edges only; never counts required output.
@@ -102,6 +105,9 @@ impl RuntimeMetrics {
             iot_filtered_rows: self.iot_filtered_rows.load(Ordering::Relaxed),
             iot_invalid_rows: self.iot_invalid_rows.load(Ordering::Relaxed),
             iot_expired_keys: self.iot_expired_keys.load(Ordering::Relaxed),
+            alarm_notifications_expired: self.alarm_notifications_expired.load(Ordering::Relaxed),
+            alarm_notifications_cancelled: self.alarm_notifications_cancelled.load(Ordering::Relaxed),
+            alarm_notifications_deferred: self.alarm_notifications_deferred.load(Ordering::Relaxed),
             iot_state_keys: self.iot_state_keys.load(Ordering::Relaxed),
             iot_state_bytes: self.iot_state_bytes.load(Ordering::Relaxed),
             graph_dropped_rows: self.graph_dropped_rows.load(Ordering::Relaxed),
@@ -137,6 +143,9 @@ pub struct MetricsSnapshot {
     pub iot_filtered_rows: u64,
     pub iot_invalid_rows: u64,
     pub iot_expired_keys: u64,
+    pub alarm_notifications_expired: u64,
+    pub alarm_notifications_cancelled: u64,
+    pub alarm_notifications_deferred: u64,
     pub iot_state_keys: u64,
     pub iot_state_bytes: u64,
     pub graph_dropped_rows: u64,
@@ -167,7 +176,7 @@ impl MetricsSnapshot {
     /// Structured log line (budgeted labels only).
     pub fn log_line(&self) -> String {
         format!(
-            "{{\"event\":\"sparrow_metrics\",\"jobs_started\":{},\"jobs_stopped\":{},\"jobs_failed\":{},\"ingested_rows\":{},\"emitted_rows\":{},\"iot_input_rows\":{},\"iot_emitted_rows\":{},\"iot_filtered_rows\":{},\"iot_invalid_rows\":{},\"iot_expired_keys\":{},\"iot_state_keys\":{},\"iot_state_bytes\":{},\"queue_items\":{},\"queue_bytes\":{},\"watermark_lag_micros\":{},\"checkpoint_duration_micros\":{},\"checkpoint_bytes\":{},\"checkpoint_commits\":{},\"checkpoint_aborts\":{},\"state_keys\":{},\"state_bytes\":{},\"live_samples\":{},\"future_dropped\":{},\"timers_live\":{},\"timers_cancelled\":{}}}",
+            "{{\"event\":\"sparrow_metrics\",\"jobs_started\":{},\"jobs_stopped\":{},\"jobs_failed\":{},\"ingested_rows\":{},\"emitted_rows\":{},\"iot_input_rows\":{},\"iot_emitted_rows\":{},\"iot_filtered_rows\":{},\"iot_invalid_rows\":{},\"iot_expired_keys\":{},\"iot_state_keys\":{},\"iot_state_bytes\":{},\"queue_items\":{},\"queue_bytes\":{},\"watermark_lag_micros\":{},\"checkpoint_duration_micros\":{},\"checkpoint_bytes\":{},\"checkpoint_commits\":{},\"checkpoint_aborts\":{},\"state_keys\":{},\"state_bytes\":{},\"live_samples\":{},\"future_dropped\":{},\"timers_live\":{},\"timers_cancelled\":{},\"alarm_notifications_expired\":{},\"alarm_notifications_cancelled\":{},\"alarm_notifications_deferred\":{}}}",
             self.jobs_started,
             self.jobs_stopped,
             self.jobs_failed,
@@ -192,7 +201,10 @@ impl MetricsSnapshot {
             self.live_samples,
             self.future_dropped,
             self.timers_live,
-            self.timers_cancelled
+            self.timers_cancelled,
+            self.alarm_notifications_expired,
+            self.alarm_notifications_cancelled,
+            self.alarm_notifications_deferred
         )
     }
 }

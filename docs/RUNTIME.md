@@ -1,5 +1,11 @@
 # Runtime ownership (A3 / A4)
 
+**2026-09-23 时间型 DAG（限定 Preview 已验收）**：独立 v18/PT、v19/ET 使用 GTD1 决策日志和 GTC1 聚合 cut，持久化来源时间/idle/EOF、固定边序 Union progress 与各 Sink 输出 cursor。File actor 先记录再发布一轮，所有状态/barrier/真实 HTTP flush 到齐后提交 CURRENT；ET future-skew 使用已记录墙钟，PT 使用停机暂停时钟。新协议不改变旧 Union ready-order 或扩大默认预算。完整范围、内存边界、EOF 和重复输出合同见 [DAG](DAG.md#time-graph-recovery)；774/44、专项/真实故障/旧矩阵及原三组 ABBA 通过，见 [匹配证据](PRODUCTION.md#time-graph-validation)。仍非目标容量、长稳或生产认证。
+
+本批性能 Review 将新增有序 Window future 放到计费的冷构造路径，Box 内存先释放再退 credit，避免旧窗口热路径携带新协议内联 future。严格 JSON 对象最多 8 个键时使用有界线性去重，第 9 个唯一键开始晋升随机 HashSet；重复键/转义/嵌套/深度等拒绝合同不变。两项随最终 v13 全量及原门槛验证，不改 checkpoint 正确性或资源配额。
+
+**2026-09-22 线性时间扩展（限定 Preview 已验收）**：独立 v16/v17 承载 PT window、Change/Deadband 正 TTL 和最多两个状态的组合恢复。沿用 TIME_PENDING→时间→数据→barrier→HTTP→CURRENT→ACK；每一级先向下游传播时间，再输出到期行，保证下游的等时到期先于上游衍生行，防止串联窗口落回旧窗或 TTL 被旧时间刷新。所有参与者在输入激活前校验 cut/schema/预算并重建 timer；原 v3～v15 的选择与旧目录拒绝保留。759/44、重复/实际 SIGKILL/旧矩阵及三组 ABBA 已通过；精确范围见 [线性时间合同](IOT.md#linear-time-completion)，来源见 [本批证据](PRODUCTION.md#linear-time-validation)。下面的 PT/TTL 未开放描述是对应历史版本的边界，不代表新 v16/v17；该批不包含时间型 DAG、目标容量和生产长稳。
+
 **2026-09-19 时间型 Preview（首批验证完成）**：仅面向单个线性 HoldFor/Debounce，不改变旧 profile 的时钟。Source actor 按 `TIME_PENDING fsync → ProcessingTime → 可选输入行 → barrier → HTTP flush → CURRENT → JetStream ACK` 串行推进；初始 generation/bootstrap 先于任何输出。算子不采样宿主时间，到期队列按 `(deadline, encoded key)` 有界逐项排出；完整行/索引和快照编码归实际 SourceAdmission owner。新 v14/v15 cut 保存逻辑时钟、序号和原连接器位置，并与 next-output、状态和 timer 同时提交。匹配功能 747/44、22×20、6+3 进程场景、完整旧矩阵与三组 ABBA 已通过，[本批证据](PRODUCTION.md#paused-time-validation)，不继承旧候选的通过结论。停机暂停、逻辑时间采样边界、CURRENT-only、每决策 checkpoint 成本和备份范围见 [时间型 IoT](IOT.md#paused-time-preview)。PT/正 TTL/多状态/DAG 时间恢复仍未开放；新模式的吞吐成本见 OPT-012，不等于高吞吐或长稳认证。
 
 2026-09-17 的 K1～K4 核心完善候选新增独立 snapshot profiles9～13：静态参考表与 Count/IoT(TTL0)、JetStream 可靠输出和 required File DAG 的组合，以及 Hysteresis Bool latch。引用沿用 CPL3、无引用迟滞沿用 CPL1 的外层结构，由新 snapshot/profile 与 kind6/新语义 tag 隔离旧 reader；旧3～8不改语义。26×20专项、9种真实进程及旧矩阵回归已通过，精确范围与性能见 [当前证据](PRODUCTION.md#k1-k4-reference-validation)。停机暂停的可恢复时间协议和高级 IoT 尚未实现，不因新增 snapshot version 就开放 PT/正TTL。

@@ -63,7 +63,9 @@ impl GraphExplain {
         } else {
             "no transform fusion".into()
         };
-        let time = if plan.has_event_time_window() {
+        let time = if recovery.is_aligned() && plan.has_processing_time_state() {
+            "processing-time / paused_source_ordered; downstream_due_before_upstream_timer_rows".into()
+        } else if plan.has_event_time_window() {
             format!(
                 "event-time ({})",
                 plan.event_time_binding()

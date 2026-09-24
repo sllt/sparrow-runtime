@@ -86,6 +86,9 @@ cp deploy/pipeline-k4-change.json deploy/pipeline-k4-deadband.json deploy/k4-cha
 cp deploy/stream-k4-telemetry.json "$out/deploy/"
 cp deploy/pipeline-k4-hysteresis.json deploy/k4-hysteresis.ndjson deploy/k4-hysteresis.expected.json "$out/deploy/"
 cp deploy/stream-iot-timed.json deploy/pipeline-iot-hold-for.json deploy/pipeline-iot-debounce.json "$out/deploy/"
+cp deploy/pipeline-pt-recovery.json deploy/pipeline-iot-ttl.json deploy/pipeline-time-combined.json "$out/deploy/"
+cp deploy/stream-time-graph.json deploy/pipeline-time-graph-{pt,et}.json "$out/deploy/"
+cp deploy/pipeline-iot-alarm.json "$out/deploy/"
 if [[ "$jetstream" == 1 ]]; then
     cp deploy/pipeline-jetstream.json deploy/pipeline-jetstream-iot.json deploy/nats-jetstream-local.conf.example "$out/deploy/"
     cp docs/JETSTREAM.md "$out/docs/"

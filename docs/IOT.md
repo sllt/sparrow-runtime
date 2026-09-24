@@ -1,5 +1,77 @@
 # K4：变化检测、Deadband 与迟滞
 
+**2026-09-23 时间型 DAG 已按限定 Preview 验收：** v18 将下方暂停时间算子组合扩展到 required File→HTTP 图；v19 单独承载 ET 窗口和 TTL0 IoT，不把 HoldFor/Debounce 解释为 event-time 模式。[合同](DAG.md#time-graph-recovery)、[匹配证据](PRODUCTION.md#time-graph-validation)。以下 v14～v17 的线性边界保持不变；新图支持不代表冷却、离线检测、告警生命周期或重采样已实现。
+
+本次自查将 v14～v19 的输入指纹限制前移到准入：时间 journal 当前只编码一等标量源字段，不能让 nested/Dynamic 源列先通过检查、到第一条非 NULL 输入才失败；下游 Project 丢弃该列也不绕过完整输入指纹。live 模式及未使用时间 journal 的旧 profile 不受这项新增校验影响。
+
+<a id="business-loop-plan"></a>
+## 当前批：完整 IoT 业务闭环（IOT-06～09，开发中）
+
+下面是下一批执行合同，**不是已开放 capability**。沿用同一 Runtime、持久暂停时间和预算/恢复协议，不做前端，不把旧 Hysteresis 的原行输出偷偷改成告警事件。
+
+1. **IOT-08 告警生命周期先行**：明确 Normal/Pending/Active/Recovering 和 enter/clear 条件、持续触发/恢复时长、等时到期先于输入；无样本保持最后有效条件。activate/resolve 带稳定 episode，使用独立输出 schema 与 codec。Active/Pending 不默认 TTL 淘汰；状态满明确失败，不能静默丢失告警。
+2. **IOT-06 冷却/通知限频**：在状态转换之后控制通知，不冻结底层观察；明确恢复通知、等待通知的合并/丢弃策略、数量/字节/年龄上限。完整 episode、待通知、计时和输出身份同切点持久化，重放不产生新业务身份。
+3. **IOT-07 静默/离线**：关联可重放的来源健康事实，区分设备静默、Source 断连和 pipeline 停止；仅对已观察或显式登记的设备判定，停机时间不推进。不能用 Graph idle 或缺失输入直接冒充连接断开/全体设备故障。
+4. **IOT-09 Sampling/Resample**：逐个定义 last/mean/interpolate 的半开区间、缺样、输出时间、未来点需求和延迟上限；输入舍弃与缺值分别计数。key、展开、窗口/timer/保留点均有界，恢复后的剩余时间和输出身份可重现。
+5. **整批交付门禁**：API/Graph bind→执行→恢复→诊断→可运行业务模板贯通，再自查和集中服务器测试；覆盖无输入到期、等时边界、异常输入、取消/退款、慢 Sink、journal/CURRENT 故障和真实 SIGKILL。新 schema/profile 与旧目录明确隔离；尚未接通/未测的组合继续拒绝。最后复跑旧功能和性能门槛，不借用 v18/v19 的成绩。
+
+### Alarm + 通知冷却：开发候选合同（尚未整批验收）
+
+新增 `kind:"alarm"`，`iot.fields` 的两个 Bool 字段依次是 **enter、clear**。共同参数要求 `emit_first:false`、`ttl_micros:0`、非 nullable keys、最多 48 个扁平 scalar 输入字段。`timing.kind:"alarm"`、`clock:"paused"`，显式设置 `activate_micros`、`resolve_micros`、`cooldown_micros`（均 ≥0，0 表示立即）和 `notification_max_age_micros`（>0）。NULL 或同时 enter/clear 按 `invalid` 处理；ignore 不更新 retained row、状态或 deadline。
+
+- Normal + enter→Pending，连续 enter 满 activate 时长→Active；Active + clear→Recovering，连续 clear 满 resolve 时长→Normal。带内 `enter=false,clear=false` 取消 Pending 或 Recovering；无样本保持最后有效条件。等时先处理到期，再处理输入；跨多个期限只使用实际持久决策时间，不伪造中间观测。
+- **生命周期不被冷却抑制**：activate/resolve 总是输出。首次 activation 可立即通知；上一通知的冷却未结束时，activate 输出 `sparrow_alarm_notify:false`，每 key 仅留一个待 activation 通知。冷却结束输出 `event:"notify"`，使用该 episode 的最新有效整行。重复样本不产生周期提醒，也不延长等待年龄。
+- resolve 永远立即通知、取消该 key 等待的 activation 通知，并重新开始冷却；不会冻结底层状态或发出已恢复告警的迟到通知。等待年龄达到上限（含等号）先过期，计数而不补发；长 tick 不能把过期通知补成新通知。条件与通知 deadline 相同，条件转换先执行。
+- 输出在原行后新增七列：`sparrow_alarm_event`、`sparrow_alarm_phase`、`sparrow_alarm_generation`（32 hex）、`sparrow_alarm_operator`、`sparrow_alarm_episode`、`sparrow_alarm_time`（逻辑微秒）、`sparrow_alarm_notify`。保留名称碰撞拒绝。完整 episode 身份是 **generation + operator + 配置的全部 key 值 + per-key episode**，不能只用序号跨设备去重；传输层仍另有 required HTTP 输出 ID。
+- episode 只在真正 activate 时递增，resolve 沿用同一个 episode；Normal 也保留 counter，不做 TTL 淘汰。每 key 最多两个逻辑 timer，待通知不另存无界队列；整行/key/index 同 Job 计费。达到 key/timer/字节上限明确失败，不静默丢弃 Active/Pending。嵌入调用者必须在恢复/输入前绑定持久 generation；reset 后必须使用新的身份，不能复用旧 episode 命名空间。
+- 独立状态 kind11，候选 outer profiles **File20 / JetStream21 / File图22**。继续要求暂停时间、required HTTP、独立 checkpoint 目录、CURRENT/TIME_PENDING；不混 ET、参考表或侧路，不自动升级旧目录。公共 Bound/Physical IoT 节点新增显式 output schema，手工构造嵌入计划也必须提供并校验。
+
+模板 `deploy/pipeline-iot-alarm.json` 共用 `stream-k4-telemetry.json`：温度 ≥60 持续 1s 激活，≤55 持续 0.5s 恢复，通知冷却 5s、最大等待年龄 10s。模板先 Project 产生 enter/clear，**不要在 Alarm 前 Filter 掉正常值**，否则它无法看到恢复条件。需要仅发通知时在 Alarm 后 Filter `sparrow_alarm_notify`；保留完整生命周期则接收全部事件。
+
+诊断新增 `alarm_notifications_deferred/expired/cancelled`，进程计数不作为持久业务账本。上述是本批开发合同和模板，仍待匹配全量/故障/性能验收；离线/重采样尚未因此完成。
+
+开发验证记录：服务器 `iot-business-artifacts-20260923` 的 `frozen-v5` 为 788 passed / 18 ignored、no-demo 44 passed；`alarm-v6` 精确 14 项×20 轮、默认包 2 个及 JetStream 包 4 个真实进程场景通过，覆盖 activate/resolve 的 SIGKILL 重放、episode/输出 ID、停机暂停与旧版本拒绝。包 v6 仅补 runner/精确清单，与 v5 的 server/CLI 二进制逐字节相同；旧矩阵只完成部分。**随后 Review 修正了 AlarmIot 析构顺序：timer 索引必须先于为其计费的 entry leases 释放。此修复尚待最终匹配复验，不能把 v5/v6 结果冒充最终源码的通过证据。** v6 的剩余回归已停止并留 `.interrupted`，性能为 NOT RUN；源码另存 `iot-business-source-v5-archived-20260923`，不删除此前通过或失败证据。
+
+**后续 v7 / final1：功能与完整旧矩阵已通过，性能未通过，因此整批未放行。** 析构修正已纳入 `frozen-v7`（788/18 ignored、no-demo 44）、14×20 Alarm 专项及 6 个真实进程场景，`validate-final1.complete` / exit0 证明完整旧矩阵完成；新 Alarm 图 v22 只有进程内恢复测试，独立二进制 SIGKILL 专项仍未做。普通 Clippy 退出0、有105条 warning。完整三组原门槛中，第三组 fresh 双 Count 比值 **0.908434**、合并 **0.964801**，未过 ≥0.97；其他场景通过，全部正确性/输出 hash 一致，失败样本保留，不能只挑前两组宣布通过。
+
+定位记录：同一 v7 的另三组预先固定短程 AA/AB 均通过，但 8×输入的固定长程对照仍有一组候选比值 0.922794 未过；不能直接断言只是短测噪声。只调整新 metrics 字段位置的 `layout1` 尝试仍有 0.954049 的失败，已从工作区撤回，不作为修复保留。该实验包/源码、三组原样本、长短对照和 CPU profile 均在上述产物根保留。软件 CPU profile 的共同热点仍在分配/释放、预算操作、JSON 与窗口路径；尚未证明具体回退根因，不将单次 profile 吞吐/RSS 当门禁。当前编译源码恢复为匹配 v7，下一步先定位性能，不叠加 Offline/Resample，也不发布生产认证结论。
+
+### 下一步静默检测的前置边界
+
+当前 `paused_time` actor 的“没有读到行”同时可能来自空输入、pull 等待或 tick 唤醒，不等于健康观测；JetStream 的连接检查在 reader 路径，不能从某个旧的 Ready 指标反推整段时间都可观察。IOT-07 必须先增加**随时间决策持久化的来源健康观测合同**：来源失败/不可判断时不作新的设备静默判断，停机不计时，未提交后继使用原健康观测重放而不是重新采样指标。Pipeline stopped 与 Source unavailable 保留独立诊断；静默事件不是已证明的硬件故障。未见且未登记的设备不建立离线状态。该前置尚未实现，不用现有 Graph idle/EOF 或 Alarm 的无样本保持条件替代。
+
+<a id="linear-time-completion"></a>
+## 线性时间组合 v16/v17（2026-09-22，限定 Preview 已验收）
+
+在下方已验收的 v14/v15 单个 HoldFor/Debounce 之外，新增独立 **File v16 / JetStream v17**：
+
+- PT tumbling window；ChangeDetect/Deadband 的正 TTL；最多两个状态的线性组合，允许 Count/PT、TTL0/正 TTL 值过滤、TTL0 Hysteresis、HoldFor/Debounce，在 schema 合法时串联。
+- 至少包含一个 PT、正 TTL 或 HoldFor/Debounce 状态。只有旧 Count/TTL0 的计划仍选择旧 profile；只有一个 HoldFor/Debounce 仍选择 v14/v15。**不迁移、不混写旧目录**。
+- 沿用独立 checkpoint 目录、File append-only、required HTTP、fail_on_decode、resume_latest、100～1000 ms tick、每决策提交和 CURRENT/TIME_PENDING 合同。File/JetStream 都输出稳定 ID 包装；它们仍可能在未提交时重发，不是 exactly-once。
+- 不包含 ET、DAG、reference Lookup、side output、Dedup 或超过两个状态。Hysteresis 仍要求 TTL=0，避免静默遗忘 Active；HoldFor/Debounce 自己的 `ttl_micros` 也仍为 0。正 TTL 不自动代表完整告警生命周期。
+
+### 时间边界与顺序
+
+每个状态实例持有自己的同序逻辑时间，**仅消费源端已持久化的 ProcessingTime 控制，不采样宿主时钟**。算子先把新时间控制向下游传递，再排出本次到期产生的行，最后处理随后的输入及 barrier。这样下游先处理本次时间点已有的到期状态，再接收上游定时器的衍生行；输出行归当前决策时间，不携带未采样的中间墙钟时间。
+
+- PT 窗口按逻辑零点对齐，使用 `[start,end)`；边界时先关旧窗，再将新行放入新窗。只为有数据的窗口输出聚合，不补空窗口；长 tick/背压跨越多个边界时，不伪造中间观测。
+- `PT(1s) → PT(1s)`：第一级在 t=1s 输出的行进入第二级 `[1s,2s)`，不是已经到期的 `[0,1s)`。
+- 同一算子到期项按 `(deadline, encoded key)` 稳定排出；各算子遵循上述 FIFO 边界，**不宣称跨算子全局 deadline 排序**。
+- TTL=最后有效输入时间+TTL；有效但被抑制的输入也刷新 TTL，ignored NULL/无效输入不刷新。等于 expiry 时先淘汰，再按首次值策略处理输入。过期只删除基线，不生成 resolve/offline 事件。
+- 停机、启动及未提交后继重放不推进时间。重放使用原有时间和完整状态/输出 cut，不能根据当前墙钟重新推算 TTL/窗口。
+
+### 编码、预算与操作
+
+PT 沿用 Window slot1/codec1、manifest kind0；正 TTL 使用 IoT slot3/codec2 的新 kind9/10，值前缀保存 `last_seen:Int64`。新 outer profile 与完整计划语义、Source cut、generation、next-output 联合校验。恢复前重建有界 timer/index，拒绝未来 last_seen、过期状态、窗口区间/聚合类型错误和预算越界；全部参与者准备成功后才发布输入。
+
+状态、索引、工作区归同一 Job owner；timer/keys 仍受每实例上限及共享字节预算限制，扩大组合不扩大默认预算。到期输出按有界批次/单项让出执行预算。每决策 fsync/full checkpoint 的成本仍在 [OPT-012](OPTIMIZATION_BACKLOG.md#opt-012)，不是高吞吐优化。
+
+模板：`deploy/pipeline-pt-recovery.json`（SQL）、`deploy/pipeline-iot-ttl.json`、`deploy/pipeline-time-combined.json`，共用 `deploy/stream-iot-timed.json`。JetStream 替换 Source、配置 `checkpointed_at_least_once` 及独立新目录；必须启用对应 build feature。
+
+本批 759 常规、44 no-demo、25×20 与 38×20 专项（部分重叠）、24 种新增真实 SIGKILL、旧矩阵和三组 ABBA 已通过。对应源码、失败样本与性能证据见 [本批验收](PRODUCTION.md#linear-time-validation)，不继承下面的 747/44 或历史 ABBA 结论。未跑真实 WAN/TLS、目标设备、24/72 h 长稳和断电；新串行 profile 的大状态/多规则容量仍需部署前核定。
+
+静态 capability 的 `iot.aligned` / `iot.jetstream` 节点保留旧 TTL0 profile 的范围；新 PT/TTL/双状态能力在 `paused_time_iot.linear_time_extension`。具体配置仍以 bind/validate、effective guarantees 和实际 snapshot profile 为准，不能把旧条目的 TTL0 约束套到 v16/v17，也不能绕过新 profile 的强制条件。
+
 > 2026-09-19：可恢复时间 + HoldFor / Debounce 的首批线性 profile 已完成本批功能、故障、旧矩阵与性能验证。不是整个 K1～K4 完成或生产认证；见 [时间型 IoT](#paused-time-preview) 和 [匹配证据](PRODUCTION.md#paused-time-validation)。
 
 <a id="paused-time-preview"></a>

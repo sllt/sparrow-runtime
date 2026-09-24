@@ -1,0 +1,9 @@
+{
+  "version":1,"stream":"timed_signals",
+  "source":{"kind":"file","path":"/var/lib/sparrow/data/timed-signals.ndjson","file_contract":"append_only","inbox_capacity":8},
+  "sink":{"kind":"http","url":"http://127.0.0.1:18082/signals","batch_rows":1,"linger_ms":0,"outbox_capacity":8},
+  "fail_on_decode":true,"recovery":"aligned",
+  "checkpoint_dir":"/var/lib/sparrow/checkpoints/pt-v16",
+  "checkpoint":{"interval_ms":100,"timeout_ms":5000,"retain_generations":3,"max_store_bytes":33554432,"resume_latest":true},
+  "sql":"SELECT device_id, COUNT(*) AS n FROM timed_signals GROUP BY device_id, TUMBLE(PROCESSING_TIME, INTERVAL '1' SECOND)"
+}

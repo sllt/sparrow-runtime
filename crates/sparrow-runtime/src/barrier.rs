@@ -165,6 +165,7 @@ impl RuntimeAligned {
         attempt: u64,
         max_keys: usize,
         max_timers: usize,
+        processing_time: Option<i64>,
     ) -> Result<Arc<Self>> {
         let Some(pipeline) = job.pipeline else {
             return Self::adopt(job, owner);
@@ -264,16 +265,19 @@ impl RuntimeAligned {
                     window.validate_participant_restore(&restored.freeze)?;
                     window.restore_freeze(&restored.freeze)?;
                 }
+                if let Some(now) = processing_time { window.validate_processing_cut(now)?; }
                 windows.insert(*operator, window);
             }
-            if let sparrow_plan::PhysicalStage::Iot { operator, spec, input } = stage {
+            if let sparrow_plan::PhysicalStage::Iot { operator, spec, input, .. } = stage {
                 let mut op = crate::iot::IotOperator::new(*operator, spec.clone(), input.clone(), owner.clone())
                     .map_err(|error| error.at_operator(*operator))?;
+                op.bind_generation(pipeline.generation)?;
                 if let Some((freeze, lease)) = restored_iot.remove(operator) {
                     op.restore(&freeze).map_err(|error| error.at_operator(*operator))?;
                     drop(freeze);
                     drop(lease);
                 }
+                if let Some(now) = processing_time { op.validate_processing_cut(now)?; }
                 iot.insert(*operator, op);
             }
         }
@@ -390,6 +394,7 @@ pub struct AlignedAcks {
     active: Arc<Mutex<Option<ActiveCheckpoint>>>,
     participants: Arc<OnceLock<ParticipantAttempt>>,
     output: Arc<OnceLock<sparrow_model::OutputSequence>>,
+    graph: Arc<OnceLock<Arc<crate::graph_cut::GraphRuntime>>>,
 }
 
 struct ActiveCheckpoint {
@@ -406,10 +411,17 @@ pub struct CheckpointAcks {
 }
 
 impl AlignedAcks {
+    pub fn with_graph_time(self,graph:Arc<crate::graph_cut::GraphRuntime>)->Result<Self> {
+        if self.participants.get().is_some() || self.output.get().is_some() || self.graph.set(graph).is_err() {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,"graph time must be initialized before input"));
+        }
+        Ok(self)
+    }
+    pub(crate) fn graph_time(&self)->Option<&Arc<crate::graph_cut::GraphRuntime>> {self.graph.get()}
     /// Configure before Kernel admission. The CaptureSink owns advancement;
     /// checkpointing receives the cursor in its actual Sink barrier ACK.
     pub fn with_output_sequence(self, sequence: sparrow_model::OutputSequence) -> Result<Self> {
-        if self.participants.get().is_some() || self.output.set(sequence).is_err() {
+        if self.participants.get().is_some() || self.graph.get().is_some() || self.output.set(sequence).is_err() {
             return Err(SparrowError::new(ErrorCode::InvalidArgument,"output cursor must be initialized exactly once before input"));
         }
         Ok(self)
@@ -671,10 +683,13 @@ impl CheckpointAcks {
                         dropped: 0,
                         timed_out: false,
                     }),
-                ) if initial_output.is_none() => {
+                ) if initial_output.is_none() && self.registry.graph_time().is_none() => {
                     seen.insert(participant);
                 }
-                (ParticipantId::Sink(_),ParticipantOutcome::ReliableSink{flush:FlushOutcome{ok:true,dropped:0,timed_out:false},next_output:position}) => {
+                (ParticipantId::Sink(sink),ParticipantOutcome::ReliableSink{flush:FlushOutcome{ok:true,dropped:0,timed_out:false},next_output:position}) => {
+                    if let Some(graph)=self.registry.graph_time() {
+                        graph.record_sink(sink.raw(),self.id,position)?;seen.insert(participant);continue;
+                    }
                     if !initial_output.is_some_and(|start|start.epoch()==position.epoch() && start.first()<=position.first())
                         || next_output.is_some_and(|previous|previous!=position) {
                         return Err(SparrowError::new(ErrorCode::CodecViolation,"invalid/conflicting reliable Sink output cursor"));

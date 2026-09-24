@@ -34,6 +34,15 @@ pub const HYSTERESIS_SNAPSHOT_VERSION: u16 = 12;
 pub const HYSTERESIS_RELIABLE_SNAPSHOT_VERSION: u16 = 13;
 pub const PAUSED_FILE_SNAPSHOT_VERSION: u16 = 14;
 pub const PAUSED_RELIABLE_SNAPSHOT_VERSION: u16 = 15;
+/// PT windows, positive TTL and up to two ordered linear state participants.
+/// v14/v15 remain the original single HoldFor/Debounce profile.
+pub const PAUSED_COMBINED_FILE_SNAPSHOT_VERSION: u16 = 16;
+pub const PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION: u16 = 17;
+pub const TIME_GRAPH_PT_SNAPSHOT_VERSION: u16 = 18;
+pub const TIME_GRAPH_ET_SNAPSHOT_VERSION: u16 = 19;
+pub const ALARM_FILE_SNAPSHOT_VERSION: u16 = 20;
+pub const ALARM_RELIABLE_SNAPSHOT_VERSION: u16 = 21;
+pub const ALARM_GRAPH_SNAPSHOT_VERSION: u16 = 22;
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
 
 fn output_profile(kind: &str) -> bool {
@@ -53,15 +62,32 @@ pub fn snapshot_version_for(
     let references = plan.has_references();
     let hysteresis = plan.has_hysteresis();
 
-    if plan.has_timed_iot() {
+    if plan.has_alarm() {
+        if references || !plan.requires_paused_time() || plan.has_event_time_state() {
+            return Err(invalid("alarm profile requires paused time without references/event time"));
+        }
+        return match (graph, source_kind) {
+            (false, crate::processing_cut::FILE_KIND) => Ok(ALARM_FILE_SNAPSHOT_VERSION),
+            (false, crate::processing_cut::JETSTREAM_KIND) => Ok(ALARM_RELIABLE_SNAPSHOT_VERSION),
+            (true, crate::graph_cut::KIND) if plan.is_time_graph() => Ok(ALARM_GRAPH_SNAPSHOT_VERSION),
+            _ => Err(invalid("alarm state requires its own durable time source/profile")),
+        };
+    }
+
+    if plan.is_time_graph() {
+        return if source_kind==crate::graph_cut::KIND {Ok(if plan.has_event_time_state() {TIME_GRAPH_ET_SNAPSHOT_VERSION} else {TIME_GRAPH_PT_SNAPSHOT_VERSION})}
+            else {Err(invalid("durable time DAG requires a graph time source cut"))};
+    }
+    if source_kind==crate::graph_cut::KIND {return Err(invalid("graph time source requires durable graph semantics"));}
+    if plan.requires_paused_time() {
         return match source_kind {
-            crate::processing_cut::FILE_KIND => Ok(PAUSED_FILE_SNAPSHOT_VERSION),
-            crate::processing_cut::JETSTREAM_KIND => Ok(PAUSED_RELIABLE_SNAPSHOT_VERSION),
-            _ => Err(invalid("timed IoT requires a durable paused-time source profile")),
+            crate::processing_cut::FILE_KIND => Ok(if plan.is_single_timed_iot() { PAUSED_FILE_SNAPSHOT_VERSION } else { PAUSED_COMBINED_FILE_SNAPSHOT_VERSION }),
+            crate::processing_cut::JETSTREAM_KIND => Ok(if plan.is_single_timed_iot() { PAUSED_RELIABLE_SNAPSHOT_VERSION } else { PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION }),
+            _ => Err(invalid("time state requires a durable paused-time source profile")),
         };
     }
     if matches!(source_kind,crate::processing_cut::FILE_KIND|crate::processing_cut::JETSTREAM_KIND) {
-        return Err(invalid("paused-time source requires timed IoT semantics"));
+        return Err(invalid("paused-time source requires processing-time semantics"));
     }
 
     if references {
@@ -215,7 +241,7 @@ impl PipelineSnapshot {
         // Keep the established topology rejection ahead of profile selection
         // so old v5/v6 callers retain the same decisive diagnostic.
         if (plan.has_iot() || plan.is_graph())
-            && (source.identity.kind == "file-dag-v1") != plan.is_graph()
+            && matches!(source.identity.kind.as_str(), "file-dag-v1" | crate::graph_cut::KIND) != plan.is_graph()
         {
             return Err(invalid("checkpoint source topology mismatch"));
         }
@@ -252,10 +278,12 @@ impl PipelineSnapshot {
             return Err(invalid("hysteresis snapshot profile lacks hysteresis state"));
         }
         if (plan.has_iot() || plan.is_graph())
-            && (source.identity.kind == "file-dag-v1") != plan.is_graph() {
+            && matches!(source.identity.kind.as_str(), "file-dag-v1" | crate::graph_cut::KIND) != plan.is_graph() {
             return Err(invalid("checkpoint source topology mismatch"));
         }
-        if plan.has_timed_iot() { crate::processing_cut::ProcessingCut::unwrap(source)?; }
+        if plan.is_time_graph() {
+            if crate::graph_cut::GraphCut::unwrap(source)?.ingested!=ingested_rows {return Err(invalid("graph cut ingested count mismatch"));}
+        } else if plan.requires_paused_time() { crate::processing_cut::ProcessingCut::unwrap(source)?; }
         if acks.next_output.is_some() != output_profile(&source.identity.kind) {
             return Err(invalid("reliable output cursor and source profile disagree"));
         }
@@ -265,6 +293,8 @@ impl PipelineSnapshot {
                 | REFERENCE_RELIABLE_SNAPSHOT_VERSION
                 | HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
                 | PAUSED_FILE_SNAPSHOT_VERSION | PAUSED_RELIABLE_SNAPSHOT_VERSION
+                | PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION
+                | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION
         )
             && acks
                 .next_output
@@ -415,6 +445,9 @@ impl PipelineSnapshot {
                 | HYSTERESIS_SNAPSHOT_VERSION
                 | HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
                 | PAUSED_FILE_SNAPSHOT_VERSION | PAUSED_RELIABLE_SNAPSHOT_VERSION
+                | PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION
+                | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION
+                | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION | ALARM_GRAPH_SNAPSHOT_VERSION
         ) {
             return Err(invalid("unsupported pipeline snapshot version"));
         }
@@ -452,6 +485,8 @@ impl PipelineSnapshot {
                 | REFERENCE_RELIABLE_SNAPSHOT_VERSION
                 | HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
                 | PAUSED_FILE_SNAPSHOT_VERSION | PAUSED_RELIABLE_SNAPSHOT_VERSION
+                | PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION
+                | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION
         ) {
             let epoch=take(&mut bytes,16)?.try_into().unwrap();
             Some(sparrow_model::OutputSequence::new(epoch,u64_value(&mut bytes)?)
@@ -476,7 +511,8 @@ impl PipelineSnapshot {
                 | REFERENCE_RELIABLE_SNAPSHOT_VERSION
                 | REFERENCE_GRAPH_SNAPSHOT_VERSION
         ) && plan.has_references();
-        if !reference_stateful_version && mandatory_iot_version != plan.has_iot() {
+        let combined_time_version = matches!(version, PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION | ALARM_GRAPH_SNAPSHOT_VERSION);
+        if !reference_stateful_version && !combined_time_version && mandatory_iot_version != plan.has_iot() {
             return Err(invalid("IoT checkpoint version/manifest mismatch"));
         }
         if version == REFERENCE_SNAPSHOT_VERSION
@@ -581,6 +617,8 @@ impl PipelineSnapshot {
                 | GRAPH_SNAPSHOT_VERSION
                 | REFERENCE_GRAPH_SNAPSHOT_VERSION
                 | HYSTERESIS_SNAPSHOT_VERSION
+                | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION
+                | ALARM_GRAPH_SNAPSHOT_VERSION
         ) && plan.is_graph()
         {
             return Err(invalid("graph checkpoint version/manifest mismatch"));
@@ -600,7 +638,11 @@ impl PipelineSnapshot {
         if expected_version != version {
             return Err(invalid("checkpoint source/profile and manifest semantics disagree"));
         }
-        let processing_time = if plan.has_timed_iot() {
+        let processing_time = if plan.is_time_graph() {
+            let cut=crate::graph_cut::GraphCut::unwrap(&source)?;
+            if cut.ingested!=ingested_rows || next_output.is_some() {return Err(invalid("graph cut count/output mismatch"));}
+            (!plan.has_event_time_state()).then_some(cut.micros)
+        } else if plan.requires_paused_time() {
             if next_output.is_none_or(|output|output.epoch()!=generation) {
                 return Err(invalid("paused-time snapshot lacks stable output generation"));
             }
@@ -637,7 +679,8 @@ impl PipelineSnapshot {
                 continue;
             }
             let freeze =
-                crate::checkpoint::decode_freeze_mode(&mut frame, per_participant, materialize)?;
+                crate::checkpoint::decode_freeze_at_cut(&mut frame, per_participant, materialize,
+                    processing_time.filter(|_|participant.window_kind == 0))?;
             remaining -= entries;
             if !frame.is_empty()
                 || participant.id
@@ -688,7 +731,7 @@ impl StoredSnapshot {
         }
     }
     pub(crate) fn decode(bytes: &[u8], max_keys: usize, materialize: bool) -> Result<Self> {
-        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15,0])) {
+        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22,0])) {
             Ok(Self::Pipeline(PipelineSnapshot::decode_mode(
                 bytes,
                 max_keys,

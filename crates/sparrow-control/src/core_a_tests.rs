@@ -157,7 +157,7 @@ fn core_a_jetstream_iot_admission_reports_v7_and_rejects_positive_ttl() {
     let plan = crate::bind_plan(&positive_ttl, &catalog, "core-a-admission-ttl", 1).unwrap();
     let error = validate_aligned_plan(&positive_ttl, &plan).unwrap_err();
     assert_eq!(error.code, sparrow_model::ErrorCode::UnsupportedRestore);
-    assert!(error.message.contains("ttl_micros=0"));
+    assert!(error.message.contains("paused processing-time"));
 
     let mut template = PipelineSpec::from_json(include_bytes!(
         "../../../deploy/pipeline-jetstream-iot.json"

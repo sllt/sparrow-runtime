@@ -1040,6 +1040,9 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
     value["iot_filtered_rows"] = json!(snap.iot_filtered_rows);
     value["iot_invalid_rows"] = json!(snap.iot_invalid_rows);
     value["iot_expired_keys"] = json!(snap.iot_expired_keys);
+    value["alarm_notifications_expired"] = json!(snap.alarm_notifications_expired);
+    value["alarm_notifications_cancelled"] = json!(snap.alarm_notifications_cancelled);
+    value["alarm_notifications_deferred"] = json!(snap.alarm_notifications_deferred);
     value["iot_state_keys"] = json!(snap.iot_state_keys);
     value["iot_state_bytes"] = json!(snap.iot_state_bytes);
     value["iot_metrics_scope"] = json!("all_iot_operator_instances; one input may be counted by multiple IoT nodes");

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "stream": "telemetry",
+  "source": {"kind":"file","path":"/var/lib/sparrow/data/temperature.ndjson","file_contract":"append_only","inbox_capacity":8},
+  "sink": {"kind":"http","url":"http://127.0.0.1:18082/alarms","batch_rows":1,"linger_ms":0,"outbox_capacity":8},
+  "fail_on_decode": true,
+  "recovery": "aligned",
+  "checkpoint_dir": "/var/lib/sparrow/checkpoints/alarm-v20",
+  "checkpoint": {"interval_ms":100,"timeout_ms":5000,"retain_generations":3,"max_store_bytes":33554432,"resume_latest":true},
+  "graph": {
+    "version":1,"pipeline_id":920,"revision_id":1,
+    "nodes":[
+      {"id":1,"kind":"memory_source","table":"telemetry","out":[2]},
+      {"id":2,"kind":"project","exprs":[
+        {"alias":"device_id","expr":{"k":"col","name":"device_id"}},
+        {"alias":"temperature","expr":{"k":"col","name":"temperature"}},
+        {"alias":"enter","expr":{"k":"bin","op":">=","left":{"k":"col","name":"temperature"},"right":{"k":"lit","value":{"t":"float64","v":60.0}}}},
+        {"alias":"clear","expr":{"k":"bin","op":"<=","left":{"k":"col","name":"temperature"},"right":{"k":"lit","value":{"t":"float64","v":55.0}}}}
+      ],"out":[3]},
+      {"id":3,"kind":"alarm","iot":{
+        "keys":["device_id"],"fields":["enter","clear"],"emit_first":false,"ttl_micros":0,"max_keys":256,"invalid":"ignore",
+        "timing":{"kind":"alarm","clock":"paused","activate_micros":1000000,"resolve_micros":500000,"cooldown_micros":5000000,"notification_max_age_micros":10000000}
+      },"out":[4]},
+      {"id":4,"kind":"capture_sink","name":"alarms"}
+    ]
+  }
+}

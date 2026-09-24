@@ -618,6 +618,10 @@ struct JsonVisitor {
     max_depth: usize,
 }
 
+// Telemetry objects are usually small. Avoid a second owned copy of every
+// key and a hash-table allocation there, but bound linear duplicate checks.
+const SMALL_OBJECT_KEYS: usize = 8;
+
 impl JsonVisitor {
     fn child(&self) -> Option<JsonSeed> {
         let next = self.depth.saturating_add(1);
@@ -709,10 +713,22 @@ impl<'de> serde::de::Visitor<'de> for JsonVisitor {
             Some(s) => s,
             None => return Err(self.depth_err()),
         };
-        let mut pairs = Vec::new();
-        let mut keys = std::collections::HashSet::new();
+        let mut pairs: Vec<(String, JsonVal)> = Vec::new();
+        let mut keys: Option<std::collections::HashSet<String>> = None;
         while let Some(key) = map.next_key::<String>()? {
-            if !keys.insert(key.clone()) {
+            let duplicate = if let Some(keys) = &mut keys {
+                !keys.insert(key.clone())
+            } else {
+                let duplicate = pairs.iter().any(|(seen, _)| seen == &key);
+                if !duplicate && pairs.len() == SMALL_OBJECT_KEYS {
+                    let mut promoted = std::collections::HashSet::with_capacity(SMALL_OBJECT_KEYS * 2);
+                    promoted.extend(pairs.iter().map(|(seen, _)| seen.clone()));
+                    promoted.insert(key.clone());
+                    keys = Some(promoted);
+                }
+                duplicate
+            };
+            if duplicate {
                 return Err(serde::de::Error::custom("JSON object has duplicate keys"));
             }
             let val = map.next_value_seed(JsonSeed {
@@ -758,6 +774,35 @@ fn map_json_de_error(err: serde_json::Error, max_depth: usize) -> SparrowError {
 mod tests {
     use super::*;
     use sparrow_model::{Field, FieldId, SchemaId};
+
+    #[test]
+    fn json_small_object_and_hash_fallback_preserve_strict_contract() {
+        for n in [0, 1, SMALL_OBJECT_KEYS-1, SMALL_OBJECT_KEYS, SMALL_OBJECT_KEYS+1, 16, 32, 256] {
+            let fields=(0..n).map(|i|format!("\"k{i}\":{i}")).collect::<Vec<_>>().join(",");
+            let body=format!("{{{fields}}}");
+            let JsonVal::Object(pairs)=parse_strict_json(body.as_bytes(),8).unwrap() else {panic!()};
+            assert_eq!(pairs.len(),n);
+            for (i,(key,value)) in pairs.iter().enumerate() {
+                assert_eq!(key,&format!("k{i}"));assert_eq!(*value,JsonVal::U64(i as u64));
+            }
+            if n>0 {
+                for key in ["k0".to_string(),format!("k{}",n-1),"\\u006b0".to_string()] {
+                    let duplicate=format!("{{{fields},\"{key}\":null}}");
+                    for input in [duplicate.clone(),format!("{{\"unknown\":{duplicate}}}")] {
+                        let error=parse_strict_json(input.as_bytes(),8).unwrap_err();
+                        assert_eq!(error.code,ErrorCode::InvalidArgument);
+                        assert_eq!(error.message,"JSON object has duplicate keys");
+                    }
+                }
+            }
+            assert!(parse_strict_json(format!("{body} true").as_bytes(),8).is_err());
+        }
+        for body in [r#"{"k0":1,"k0":2}"#,r#"{"\u00e9":1,"é":2}"#,r#"{"x":{"k0":1,"k0":2}}"#] {
+            assert_eq!(parse_strict_json(body.as_bytes(),8).unwrap_err().code,ErrorCode::InvalidArgument);
+        }
+        assert_eq!(parse_strict_json(br#"{"x":{"y":1}}"#,1).unwrap_err().code,ErrorCode::BoundExceeded);
+        assert_eq!(decode_json_row(&schema(),br#"{"device_id":"a","ignored":1,"ignored":2}"#,&JsonLimits::default()).unwrap_err().code,ErrorCode::InvalidArgument);
+    }
 
     #[test]
     fn k2_output_envelope_is_batch_independent_collision_safe_and_bounded() {

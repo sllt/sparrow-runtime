@@ -422,7 +422,7 @@ fn k4_invalid_ttl_deadband_shape_and_jetstream_feature_boundary() {
         let plan = crate::bind_plan(&positive_ttl, &catalog, "jetstream-iot-ttl", 1).unwrap();
         let error = crate::validate_aligned_plan(&positive_ttl, &plan).unwrap_err();
         assert_eq!(error.code, sparrow_model::ErrorCode::UnsupportedRestore);
-        assert!(error.message.contains("ttl_micros=0"));
+        assert!(error.message.contains("paused processing-time"));
     }
 }
 

@@ -1,8 +1,105 @@
 # 当前生产化候选：安装、恢复与回退
 
-本页说明当前实现合同，不是目标设备认证或正式发行公告。Linux x86_64、Rust 1.98.0、锁定 Cargo.lock；Row/prepared/fusion，支持线性和显式DAG Preview，恢复按独立profile准入。Arrow/JIT、HA、可靠MQTT、持久HTTP outbox均未开启。版本号仍为0.1.0，tag/push另行授权。最新时间型增量见 [时间 profile 验收](#paused-time-validation)，静态表/迟滞历史批次见 [组合证据](#k1-k4-reference-validation)；后文历史门禁不自动代表新增能力。
+本页说明当前实现合同，不是目标设备认证或正式发行公告。Linux x86_64、Rust 1.98.0、锁定 Cargo.lock；Row/prepared/fusion，支持线性和显式DAG Preview，恢复按独立profile准入。Arrow/JIT、HA、可靠MQTT、持久HTTP outbox均未开启。版本号仍为0.1.0，tag/push另行授权。最新时间图见 [v18/v19 验收](#time-graph-validation)，线性时间组合见 [v16/v17 验收](#linear-time-validation)，单个时间算子历史批次见 [v14/v15 验收](#paused-time-validation)，静态表/迟滞见 [组合证据](#k1-k4-reference-validation)；历史门禁不自动代表新增能力。
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
+
+<a id="time-graph-validation"></a>
+## 时间型 DAG：2026-09-23 验收
+
+**限定 Preview 的实现、自查和匹配验证已完成，未 commit/push/tag/生产部署。** 新增 required File→HTTP 图的 PT v18 / ET v19，支持持久时间轮、固定物理边序 Union、来源 watermark/idle/EOF 和各 Sink 的稳定输出游标。范围、默认队列/每轮行数限制及嵌入调用者责任见 [DAG 合同](DAG.md#time-graph-recovery)。不包含混合 PT/ET、JetStream 图、参考表、有损支路、历史 replay 或任意图容量。
+
+### 功能、故障与自查
+
+- 最终 `v13`：**774 passed / 18 ignored**，独立 no-demo **44 passed / 0 ignored**；普通 release/all-targets/JetStream Clippy 退出 0，**105 条 warning**，不是 `-D warnings`。
+- `final2`：时间图精确清单 **14×20=280**、JSON 严格解码 **15×20=300** 次通过；重复清单与普通套件有交集，不相加宣称独立用例数。
+- default / JetStream 两个包分别执行 **6 个真实 SIGKILL 场景 + 1 个默认队列配额拒绝场景**。场景覆盖 PT 双源双 Sink、分支 timer/rejoin、ET 慢源与水位、sealed EOF 正 lateness、hopping EOF，以及明确 idle 后的未提交后继。核验真实信号退出状态、未提交输出内容/ID 一致、提交后重启不重复；多 Sink 场景包含一端已接受、另一端未 ACK。每包另验证旧最高 v17 二进制拒绝 v18/v19，历史、CURRENT 和输出保持不变。
+- 旧矩阵全部通过：v16/v17 的 16 个 File/JS 进程场景和 8 个默认 File 场景；paused 25×20 及 6 个进程场景；completion 38×20 与参考表/迟滞进程、兼容 guards；B2 25×20、B1 38×20、Core-A 8×20、K4 50×20、K3 24×20及各自进程；default/K1 smoke、K2 显式 broker 专项及旧进程。
+- 自查修复包括：完整 cut 的大小/拓扑/水位一致性、来源完整行指纹的 scalar-only 准入、sealed EOF 后 timer/尾窗存活、Union 整轮 256 行上限及有界固定序重放、每 Sink 独立输出 cut、启动前参与者一致校验。12 边示例超过默认 2 MiB Job 队列预算，保留为拒绝反例，未放宽默认配额。
+
+### 性能：原门槛三组完整 ABBA
+
+在 `box@100.64.0.18` 集中构建和测试，本机未 Cargo 编译。fresh baseline 为上一批 `time-completion-artifacts-20260922/package-v4-default`，使用冻结 K1 driver 与隔离 Mosquitto wrapper；periodic 为候选自身 checkpoint on/off。最终 **三组各自及合并全部通过**，fresh ≥0.97、periodic ≥0.90、RSS 增量 ≤2048 KiB，门槛未变。
+
+| 场景 | 合并吞吐比 | RSS 增量 | 测量样本 |
+|---|---:|---:|---:|
+| fresh / 0 state | 1.021462 | +336 KiB | 36 |
+| fresh / 2 states | 1.068264 | +280 KiB | 36 |
+| periodic / 0 state | 1.004164 | +504 KiB | 24 |
+| periodic / 2 states | 1.002602 | +460 KiB | 24 |
+
+warmup/measured 全部正确性与输出 hash 一致；periodic 提交成功数为正、失败数为 0。**这是旧高吞吐路径的回归门禁，不是新逐决策 fsync 时间图的容量证明，也不是与 eKuiper 的最新排名。**
+
+性能自查将新增有序 Window future 移到计费的冷构造路径，避免旧路径携带其内联状态；Linux release 的旧窗口 future 从 4328 缩至 3192 bytes。独立 profiling 指向 JSON/分配公共热路径后，将小对象重复键检查改为最多 8 项线性检查，较大对象一次晋升随机 HashSet；保留转义/嵌套/未知字段重复键、深度、尾随内容和类型的严格拒绝语义，未扩大预算或绕过正确性检查。
+
+### 匹配证据与复现
+
+源码：`/workspace/bench-compare/time-graph-source-20260923`；产物：`/workspace/bench-compare/time-graph-artifacts-20260923`。匹配 `package-v13-default/jetstream`、`frozen-v13`、`time-process-v13`，完成标记为 `validate-final2.complete`、`performance-final2.complete`、`finish-final2.complete`。最终逐包/源码/冻结二进制核验记录在 `final-validation.json`、`final-binaries.sha256` 和 `FINAL_MATCHED_VALIDATION_OK`；退出码 0 不能替代这些阶段证据。
+
+```text
+default server  49fd529c2ad97e7dfe3de783bc12770f286d63e3f947a40172e14462b81ee9f5
+JetStream       3162362789735c86b66cc26491bda40cfddc2f4b3ce2ce6f79e81674a00b7116
+Go driver       72b91968490b75b9bd25a42836af50eda0e996272fb2f892ab7cd6b84ddfa204
+source manifest 141aab19e995c5e148b6331016e64041ff3f04dbcbefa56b864b9bbe1445c550
+build input tgz 5c6ea933591fcb61356cc5f3ae7d898199a775837420430fdc626e5cec99b516
+```
+
+本地代码/测试/模板/脚本已与两个包的 source manifest 逐文件核对。包内文档保留构建时快照；此处是后续验收记录，不冒充重新编译。最终文档随 `final-inputs.tgz` 独立归档，不覆盖原始构建输入或失败样本。
+
+复现使用 `scripts/production-time-graph-validate.sh` 及 `tests/time-graph/expected-tests.txt`；Go driver 需共同构建 `tests/k1-k4-reference-process/*.go`，分别传入 default/JetStream 包及旧最高 v17 包，使用 `--time-graph-only`、全新输出目录。完整编排脚本和原始性能 JSON 随产物保留；三组结果分别审核，不能只选合并值。
+
+早期失败保留：测试 fixture 的 schema/If-Match/队列预算/receiver 初始化顺序、idle 场景等待次序以及复用输出路径冲突均有原始记录。被主动中止的旧批次有 `.interrupted`，即使外层退出码是 0 也不计完成。`final1` 的第三组 fresh 双 Count 为 0.962173，虽合并 0.983103 仍不通过；仅隔离 future 的探测及加长采样也未消除失败。JSON 优化后的 `probe2` 和最终 `final2` 才通过，旧失败未删除。CPU profile 中未正常封口/不完整的采样单独标记，不用它们声称性能或 RSS 通过。
+
+**NOT RUN**：真实 TLS/WAN、目标设备、断电/介质损坏、24/72 h 长稳，以及新时间图大状态/多规则持续容量；仍是相应部署/发行门禁。下一批 K4 业务闭环另行验证，不继承本批通过结论。
+
+<a id="linear-time-validation"></a>
+## 线性时间组合：2026-09-22 验收
+
+本批新增独立 File v16 / JetStream v17，覆盖 PT tumbling、Change/Deadband 正 TTL 和最多两个状态的线性恢复组合；保留 v14/v15。实现范围与排序合同见 [IOT](IOT.md#linear-time-completion)。构建/测试集中在 `box@100.64.0.18`，本机只做读取、编辑、格式/语法检查，不进行 Cargo 编译。
+
+**限定 Preview 的本批实现、自查与匹配验证已完成，未 commit/push/tag/生产部署。** 工作分支 `feat/core-completion`，基线 `bce8f8b`。不包含时间型 DAG、ET、reference Lookup、side output、Dedup 或任意数量状态；Hysteresis 和 HoldFor/Debounce 自身仍不开放正 TTL。
+
+### 功能、故障与 Review
+
+- `frozen-v4`：**759 passed / 18 ignored**；独立 no-demo **44 passed**。专项按清单显式启用隔离 NATS，ignored 不计入普通通过数。
+- `paused-repeat-v1`：**25×20=500**，每轮 24 常规+1真实 broker；`completion-v1`：**38×20=760**。两个清单有交集，不能相加宣称 63 个独立用例。新虚拟时钟 oracle 覆盖 PT/Count/TTL/Debounce 的 15 种有时间状态的两两组合、分段恢复后逐行 payload/ID 等价、下游等时到期先于上游 timer 行、TTL 有效/ignored 输入、Deadband 基线、codec 损坏与额度失败后的原子性/内存归还。
+- `time-process-v1-evidence`：File/JetStream × PT、TTL、PT→PT、TTL→Debounce、Debounce→TTL、双 Debounce、HoldFor→Debounce、Debounce→HoldFor，共 **16 种真实 SIGKILL 场景**；`time-default-v1-evidence` 在关闭 JetStream feature 的默认包再跑 **8 种 File 场景**。核验真实信号状态、HTTP 未确认时 CURRENT 不推进、未提交输出内容/ID 相同、提交后重启不重复、停机暂停及适用的 broker ACK cut。旧最高 v15 二进制对 v16/v17 的拒绝保持历史、CURRENT 和输出不变。
+- 旧时间 profile：`paused-process-v1` 六种 File/JS 进程场景及 `paused-default-v1` 三种默认 File 场景通过；旧参考表/迟滞九种进程及兼容 guards 通过。B2 25×20、B1 38×20、Core-A 8×20、K4 50×20、K3 24×20及对应进程通过；K2 32 项（含显式 broker）与两个真实进程、default/K1 smoke 通过。
+- 普通 release/all-targets/JetStream Clippy 退出 0，**103 条 warning**；不声称 `-D warnings` 通过。提交前级别的 whitespace、脚本语法、新测试格式检查完成。
+- 自查重点：有序时间先于下游衍生行、每个实例独立恢复、PT 半开窗口边界、TTL timer/index 的预算和重建、激活前的 cut/schema 验证、旧 profile 保持及 live restart_fresh 不变。回归发现并修复了 live TTL effective metadata 被错误标成持久恢复的诊断回归；没有把旧 fresh 语义改成 paused。
+
+### 性能：三组预先声明的完整 ABBA
+
+沿用冻结 K1 driver 和隔离 Mosquitto fixture，fresh 对照为 **9 月 19 日已验收的 `package-v7-default`**；periodic 比较候选自身的 checkpoint on/off。三组每组及合并均通过原门槛：fresh ≥0.97、periodic ≥0.90、RSS 增量 ≤2048 KiB，未降低门槛。
+
+| 场景 | 合并吞吐比 | RSS 增量 | 测量样本 |
+|---|---:|---:|---:|
+| fresh / 0 state | 1.009588 | +36 KiB | 36 |
+| fresh / 2 states | 1.006952 | +24 KiB | 36 |
+| periodic / 0 state | 1.004455 | +328 KiB | 24 |
+| periodic / 2 states | 0.996858 | +240 KiB | 24 |
+
+全部输出 hash/数量校验一致；periodic 提交成功数为正、失败数为 0。**这是旧高吞吐链路的回归门禁，不是 v16/v17 容量认证。** 旧 v14 的单 key/leading-only/100 行串行成本复测约为 152.7 行/s（无人工 HTTP 延迟）、37.9 行/s（20 ms 模拟响应延迟）；这既不是真实 WAN，也不能外推至新双状态、大状态或多规则。新 profile 仍受 [OPT-012](OPTIMIZATION_BACKLOG.md#opt-012) 约束。
+
+### 证据与复现
+
+源码：`/workspace/bench-compare/time-completion-source-20260922`；产物根：`/workspace/bench-compare/time-completion-artifacts-20260922`。`package-v4-default/jetstream`、`frozen-v4`、`validate-v1`、`performance-v1` 与逐阶段日志互相匹配，最终核验为 `final-validation.json` / `FINAL_MATCHED_VALIDATION_OK`；不只凭 SSH/外层脚本退出码判断完成。
+
+```text
+default server  b846921e62d7c4ebfdeb381fcb77c4fee91af050665cc1a01c0f0adea730d5b1
+JetStream       096b6c87afd0c4070c42e5ea082dbcb3e8fdff4e280b24145b36c56a1c4d0989
+Go driver      04000545b16c1e1b20a4ce6ffe60bf78b9f1e8c79e90549387590c6e69636207
+source manifest 9f2fc68b1fe3b8e50a5a731336bb3e9329b0327886d7ba4e8e043628b09c89f6
+build input tgz 12c865a8e78c0e881b70ab8b0c3b52c52b753ebc0e21b17a705fd149cb58a67e
+```
+
+本地受指纹覆盖的源码、测试、模板和脚本已全部与两个生产包 manifest 核对一致。包内文档保留构建时状态；本仓库最终文档是后续验收补充，不冒充二进制重编译。最终输入归档另保存为 `final-inputs.tgz`，不覆盖早期输入/失败记录。
+
+复现时在 Linux 构建 `tests/k1-k4-reference-process/*.go` 的三个文件，使用 `--time-completion-only` 或 `--time-completion-file-only`，传入 `--server-bin`、`--old-server-bin`、`--nats-server`、全新 `--out`。冻结重复使用 `production-paused-time-validate.sh` 和 `production-k1-k4-completion-validate.sh`；性能用原 `production-k1-performance.sh`，三个完整 ABBA 组分别保留，禁止只挑合并通过的样本。
+
+保留失败：v1 新测试引用了未从 crate root 导出的 WindowOperator；v2 修正上述 live TTL metadata 及两处旧拒绝文案断言；v3 更新仍然不合法的 Log/no-directory PT 配置之 API 错误断言。v4 全部通过，不删除此前失败，也不把 v2 的九项局部成功冒充全量成功。
+
+**NOT RUN**：真实 TLS/WAN、目标设备、24/72 h 长稳、断电/介质损坏、新时间 profile 的大状态/多规则持续容量。它们仍是相应部署/发行门禁；三项开发完成不等于全场景生产认证。
 
 <a id="paused-time-validation"></a>
 ## 可恢复时间首批：2026-09-19 验收

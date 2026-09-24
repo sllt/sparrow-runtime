@@ -332,8 +332,9 @@ fn k4_mixed_count_and_iot_participants_restore_both_orderings() {
             if iot_first {
                 physical.stages.insert(2, window);
             } else {
-                if let PhysicalStage::Iot { input, .. } = &mut physical.stages[1] {
+                if let PhysicalStage::Iot { input, output: iot_output, .. } = &mut physical.stages[1] {
                     *input = output.clone();
+                    *iot_output = output.clone();
                 }
                 physical.stages.insert(1, window);
             }

@@ -241,13 +241,14 @@ pub(crate) fn checkpoint_pipeline(plan: &PhysicalPlan) -> Result<(Vec<u8>, usize
                 w.schema(input)?; w.schema(output)?;
                 recovery_prefix_len = w.0.len();
             }
-            PhysicalStage::Iot { operator, spec, input } => {
+            PhysicalStage::Iot { operator, spec, input, output } => {
                 // Tag 6 is new and is only emitted for an IoT state stage;
                 // legacy plans never take this arm, so their bytes stay
                 // byte-for-byte unchanged.  IoT recovery uses the complete
                 // descriptor (no RCP2 downstream-prefix relaxation).
                 w.tag(if spec.timing.is_some() { 9 } else if spec.hysteresis.is_some() { 8 } else { 6 })?; w.raw(&operator.raw().to_le_bytes())?;
                 w.iot(spec)?; w.schema(input)?;
+                if spec.is_alarm() { w.schema(output)?; }
             }
             PhysicalStage::CaptureSink { operator, schema, .. } => {
                 w.tag(5)?; w.raw(&operator.raw().to_le_bytes())?; w.schema(schema)?;
@@ -276,7 +277,8 @@ pub(crate) fn checkpoint_pipeline(plan: &PhysicalPlan) -> Result<(Vec<u8>, usize
 /// graphs: topology, routes, input schemas and every required sink are dependencies.
 pub(crate) fn checkpoint_graph(plan: &PhysicalPlan, sources: &[sparrow_model::OperatorId], sinks: &[sparrow_model::OperatorId]) -> Result<Vec<u8>> {
     let mut w = Writer::default();
-    w.raw(b"CP01DAG1")?;
+    let time_graph=plan.has_processing_time_state() || plan.has_event_time_window();
+    w.raw(if time_graph {b"CP01DAG2"} else {b"CP01DAG1"})?;
     for ids in [sources, sinks] {
         w.raw(&(ids.len() as u16).to_le_bytes())?;
         for id in ids { w.raw(&id.raw().to_le_bytes())?; }
@@ -305,6 +307,15 @@ pub(crate) fn checkpoint_graph(plan: &PhysicalPlan, sources: &[sparrow_model::Op
     for edge in plan.edges.as_ref().expect("graph topology") {
         w.raw(&(edge.from as u32).to_le_bytes())?; w.raw(&(edge.to as u32).to_le_bytes())?;
         w.raw(&edge.port.raw().to_le_bytes())?; w.tag(u8::from(edge.best_effort))?;
+    }
+    if time_graph {
+        w.bytes(b"durable-round-v1; fixed-edge-order; time-before-derived; observation-clock-recorded")?;
+        w.len(plan.source_times.len())?;
+        for (id,binding) in &plan.source_times {
+            w.raw(&id.raw().to_le_bytes())?;w.bytes(binding.field.as_bytes())?;
+            w.raw(&binding.out_of_orderness_micros.to_le_bytes())?;
+            w.raw(&binding.max_future_skew_micros.unwrap_or(-1).to_le_bytes())?;
+        }
     }
     Ok(w.0)
 }
@@ -521,6 +532,11 @@ impl Writer {
             self.tag(timing.state_kind())?;
             self.tag(1)?; // paused processing-time, source-ordered, tick before input
             match timing {
+                crate::IotTimingSpec::Alarm { activate_micros, resolve_micros, cooldown_micros, notification_max_age_micros, .. } => {
+                    for duration in [activate_micros, resolve_micros, cooldown_micros, notification_max_age_micros] {
+                        self.raw(&duration.to_le_bytes())?;
+                    }
+                }
                 crate::IotTimingSpec::HoldFor { duration_micros, .. } => self.raw(&duration_micros.to_le_bytes())?,
                 crate::IotTimingSpec::Debounce { quiet_micros, max_wait_micros, leading, trailing, reset_on_repeat, .. } => {
                     self.raw(&quiet_micros.to_le_bytes())?;

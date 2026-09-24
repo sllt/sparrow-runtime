@@ -257,6 +257,12 @@ impl FileReplaySource {
     /// The caller separately owns the bounded File reader/frame buffers.
     pub fn poll_admitted(&mut self,schema:std::sync::Arc<Schema>,owner:std::sync::Arc<sparrow_model::MemoryOwner>,
         row_limit:usize)->ModelResult<Option<sparrow_model::RowBatch>> {
+        self.poll_admitted_with_eof(schema,owner,row_limit).map(|(batch,_)|batch)
+    }
+    /// EOF is distinct from a bounded scan yielding Pending. Required by the
+    /// durable graph decision log; Pending must never finalize an ET source.
+    pub fn poll_admitted_with_eof(&mut self,schema:std::sync::Arc<Schema>,owner:std::sync::Arc<sparrow_model::MemoryOwner>,
+        row_limit:usize)->ModelResult<(Option<sparrow_model::RowBatch>,bool)> {
         match self.read_frame(2*MAX_RECORD)? {
             FramePoll::Frame(frame)=>{
                 let estimate=frame.payload.len().saturating_mul(64)
@@ -265,9 +271,10 @@ impl FileReplaySource {
                 let row=self.codec.decode_frame(&frame)?.ok_or_else(||SparrowError::new(ErrorCode::CodecViolation,"File row decode failed"))?;
                 let resident=row.resident_bytes();
                 let mut builder=sparrow_model::RowBatchBuilder::new(schema,owner,sparrow_model::CreditKind::Reservation,1,row_limit)?;
-                builder.push_accounted(row,resident)?;Ok(Some(builder.finish()?))
+                builder.push_accounted(row,resident)?;Ok((Some(builder.finish()?),false))
             }
-            FramePoll::Pending|FramePoll::Eof=>Ok(None),
+            FramePoll::Pending=>Ok((None,false)),
+            FramePoll::Eof=>Ok((None,true)),
         }
     }
 

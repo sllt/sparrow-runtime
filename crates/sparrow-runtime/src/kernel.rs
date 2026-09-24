@@ -556,29 +556,34 @@ impl Kernel {
 
     pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
         graph::validate_request(&req)?;
-        if req.plan.has_timed_iot() {
+        let graph_time=req.aligned.as_ref().and_then(|a|a.acks.graph_time()).cloned();
+        let durable_graph=req.aligned.is_some() && req.plan.edges.is_some() && (req.plan.has_processing_time_state() || req.plan.has_event_time_window());
+        let ordered_time = durable_graph || req.plan.has_timed_iot() || (req.aligned.is_some() && req.plan.has_processing_time_state());
+        if ordered_time {
             let manifest = sparrow_plan::CheckpointPlan::from_physical(&req.plan)?;
-            if !req.clock.is_virtual() || req.clock.now_micros()<0 || req.live_events.is_none()
+            let ingress=if durable_graph {
+                graph_time.as_ref().is_some_and(|g|g.check_plan(&req.plan).is_ok() && g.initial.micros==req.clock.now_micros())
+                    && req.live_events.is_none() && req.graph_inputs.len()==manifest.source_ids().len()
+                    && req.graph_inputs.values().all(|s|s.events.is_some() && s.rows.is_empty() && s.live.is_none() && s.budgeted.is_none() && s.trailing_controls.is_empty())
+                    && req.graph_outputs.len()==manifest.sink_ids().len()
+                    && req.graph_outputs.values().all(|s|s.live.is_some() && s.outbox.is_some())
+            } else {req.live_events.is_some() && graph_time.is_none()};
+            if !req.clock.is_virtual() || req.clock.now_micros()<0 || !ingress
                 || req.live_ctrl.is_some() || req.live_in.is_some() || req.budgeted_in.is_some()
                 || !req.rows.is_empty() || !req.trailing_controls.is_empty()
-                || req.aligned.as_ref().is_none_or(|a| a.pipeline.is_none() || a.acks.output_sequence().is_none()) {
+                || req.aligned.as_ref().is_none_or(|a| a.pipeline.is_none() || (!durable_graph && a.acks.output_sequence().is_none())) {
                 return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-                    "timed IoT requires ordered ingress, an initial logical clock and complete aligned output identity"));
+                    "time recovery requires ordered ingress, an initial logical clock and complete aligned output identity"));
             }
             manifest.validate()?;
-            for freeze in &req.aligned.as_ref().unwrap().pipeline.as_ref().unwrap().iot {
-                for entry in &freeze.entries {
-                    match entry.values.as_slice() {
-                        [sparrow_model::Scalar::Int64(start),sparrow_model::Scalar::Int64(deadline),_,..]
-                            if *start<=req.clock.now_micros() && (*deadline==-1 || *deadline>req.clock.now_micros()) => {},
-                        _ => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"timed IoT restore is inconsistent with logical time")),
-                    }
-                }
-            }
         }
+        if graph_time.is_some() && !durable_graph {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"graph time context requires a durable time graph"));}
         for stage in &req.plan.stages {
-            if let PhysicalStage::Iot { operator, spec, input } = stage {
+            if let PhysicalStage::Iot { operator, spec, input, output } = stage {
                 spec.validate(input).map_err(|e| e.at_operator(*operator))?;
+                if spec.output_schema(input)?.fields != output.fields {
+                    return Err(SparrowError::new(ErrorCode::InvalidSchema, "IoT output schema mismatch").at_operator(*operator));
+                }
                 if spec.ttl_micros > 0 && self.job_budget.max_timers == 0 {
                     return Err(SparrowError::new(ErrorCode::ResourceExhausted, "IoT TTL requires a bounded timer slot").at_operator(*operator));
                 }
@@ -625,7 +630,9 @@ impl Kernel {
                 // a reliable output cursor was provisioned.  Select it before
                 // owner activation so v10/v13 cannot defer an epoch mismatch
                 // until the first checkpoint.
-                let source_kind = if req.plan.has_timed_iot() {
+                let source_kind = if durable_graph {
+                    crate::graph_cut::KIND
+                } else if ordered_time {
                     crate::processing_cut::FILE_KIND
                 } else if req.plan.edges.is_some() {
                     "file-dag-v1"
@@ -643,6 +650,8 @@ impl Kernel {
                     crate::pipeline_checkpoint::REFERENCE_RELIABLE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::RELIABLE_IOT_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::PAUSED_FILE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::PAUSED_COMBINED_FILE_SNAPSHOT_VERSION
                 ) && aligned
                     .acks
                     .output_sequence()
@@ -804,6 +813,8 @@ impl Kernel {
                 .map_err(|e| e.retryable(true).context("admission", "capacity"))?;
         let work = Arc::new(WorkBudget::new(self.job_budget.work_units));
         let ctx = JobCtx {
+            ordered_time,
+            graph_time: graph_time.clone(),
             graph_memory: if req.plan.edges.is_some() {Some(Arc::new(owner.acquire(sparrow_model::CreditKind::Reservation,graph::metadata_bytes(&req.plan))?))}else{None},
             side_port: None,
             graph_mode: false,
@@ -833,7 +844,13 @@ impl Kernel {
             aligned: req
                 .aligned
                 .take()
-                .map(|job| crate::barrier::RuntimeAligned::prepare(job, &req.plan, &owner, attempt.raw(), self.job_budget.max_state_keys, self.job_budget.max_timers))
+                .map(|job| {
+                    if graph_time.as_ref().is_some_and(|g|!g.belongs_to(&owner) || job.pipeline.as_ref().is_none_or(|p|p.generation!=g.generation)) {
+                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"graph control state belongs to another owner or generation"));
+                    }
+                    crate::barrier::RuntimeAligned::prepare(job, &req.plan, &owner, attempt.raw(), self.job_budget.max_state_keys, self.job_budget.max_timers,
+                        (ordered_time && !req.plan.has_event_time_window()).then(||req.clock.now_micros()))
+                })
                 .transpose()?,
             observation: req.observation.clone(),
         };
@@ -927,6 +944,8 @@ fn admit_process(
 }
 
 struct JobCtx {
+    ordered_time: bool,
+    graph_time: Option<Arc<crate::graph_cut::GraphRuntime>>,
     graph_memory: Option<Arc<sparrow_model::MemoryLease>>,
     side_port: Option<u32>,
     graph_mode: bool,
@@ -1144,6 +1163,8 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
 
 fn clone_ctx(ctx: &JobCtx) -> JobCtx {
     JobCtx {
+        ordered_time: ctx.ordered_time,
+        graph_time: ctx.graph_time.clone(),
         graph_memory: ctx.graph_memory.clone(),
         side_port: ctx.side_port,
         graph_mode: ctx.graph_mode,
@@ -1347,7 +1368,7 @@ async fn stage_loop(
         PhysicalStage::CaptureSink { schema, operator, .. } | PhysicalStage::BestEffortSink { schema, operator, .. } => {
             let mut ended=false;
             let sink_outbox = ctx.sink_outbox.as_ref().or_else(||ctx.aligned.as_ref().map(|a|&a.outbox));
-            let mut next_output=ctx.aligned.as_ref().and_then(|a|a.acks.output_sequence());
+            let mut next_output=if let Some(graph)=&ctx.graph_time {Some(graph.sink_sequence(operator.raw())?)} else {ctx.aligned.as_ref().and_then(|a|a.acks.output_sequence())};
             let rx = rx
                 .as_mut()
                 .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "sink missing rx"))?;
@@ -1476,7 +1497,7 @@ async fn stage_loop(
             if ctx.graph_mode {window_stage::<true>(&ctx, &mut op, rx, &tx, &capture).await}
             else{window_stage::<false>(&ctx, &mut op, rx, &tx, &capture).await}
         }
-        PhysicalStage::Iot { operator, spec, input } => {
+        PhysicalStage::Iot { operator, spec, input, .. } => {
             let tx = tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "IoT missing tx"))?;
             let rx = rx.as_mut().ok_or_else(|| SparrowError::new(ErrorCode::Internal, "IoT missing rx"))?;
             let prepared = ctx.aligned.as_ref().and_then(|a| a.iot.lock().expect("prepared IoT state").remove(&operator));
@@ -1605,6 +1626,9 @@ impl IotReporter {
             (&self.metrics.iot_filtered_rows, current.filtered_rows, self.previous.filtered_rows),
             (&self.metrics.iot_invalid_rows, current.invalid_rows, self.previous.invalid_rows),
             (&self.metrics.iot_expired_keys, current.expired_keys, self.previous.expired_keys),
+            (&self.metrics.alarm_notifications_expired, current.notifications_expired, self.previous.notifications_expired),
+            (&self.metrics.alarm_notifications_cancelled, current.notifications_cancelled, self.previous.notifications_cancelled),
+            (&self.metrics.alarm_notifications_deferred, current.notifications_deferred, self.previous.notifications_deferred),
         ] { counter.fetch_add(value.saturating_sub(previous), Ordering::Relaxed); }
         for (counter, previous, value) in [
             (&self.metrics.iot_state_keys, &mut self.keys, op.key_count() as u64),
@@ -1625,10 +1649,10 @@ impl Drop for IotReporter {
     }
 }
 
-/// TTL is local monotonic idle time, never event time or wall-clock age. The
-/// aligned profile refuses positive TTL until a replayable time policy exists.
+/// Live TTL uses local monotonic idle time. Aligned time profiles instead use
+/// only persisted, FIFO time controls and never wake on this local timer path.
 async fn iot_stage(ctx: &JobCtx, op: &mut crate::iot::IotOperator, rx: &mut MailboxRx, tx: &MailboxTx) -> Result<usize> {
-    if op.is_timed() { return timed_iot_stage(ctx,op,rx,tx).await; }
+    if ctx.ordered_time { return timed_iot_stage(ctx,op,rx,tx).await; }
     let started = tokio::time::Instant::now();
     let now = || if ctx.clock.is_virtual() { ctx.clock.now_micros() }
         else { started.elapsed().as_micros().min(i64::MAX as u128) as i64 };
@@ -1711,12 +1735,17 @@ async fn timed_iot_stage(ctx:&JobCtx,op:&mut crate::iot::IotOperator,rx:&mut Mai
             match &control {
                 StreamControl::ProcessingTime {micros}=>{
                     op.set_processing_time(*micros)?; now=*micros;
+                    // Publish the cut before timer-derived rows. Every downstream
+                    // stage expires its old state at this cut before accepting
+                    // upstream timer output at the same cut (half-open boundary).
+                    if !tx.send_control(control.clone()).await? { break; }
                     while op.next_deadline().is_some_and(|deadline|deadline<=now) {
                         consume_work(ctx,1).await?;
                         if let Some(output)=op.take_timed_due(now)? {
                             if !tx.send(output).await? {op.cleanup();return Ok(0);}
                         }
                     }
+                    continue;
                 }
                 StreamControl::CheckpointBarrier {checkpoint_id}=>{
                     let aligned=ctx.aligned.as_ref().expect("timed admission");
@@ -1724,6 +1753,8 @@ async fn timed_iot_stage(ctx:&JobCtx,op:&mut crate::iot::IotOperator,rx:&mut Mai
                     let freeze=crate::barrier::EncodedFreeze::from_iot(op,&ctx.owner,ctx.max_state_keys);
                     aligned.acks.iot_frozen(*checkpoint_id,op.operator_id(),freeze).await;
                 }
+                StreamControl::GraphProgress {watermark_micros,flags} if ctx.graph_time.is_some()=>{crate::graph_cut::Progress::from_control(*watermark_micros,*flags)?;}
+                StreamControl::GraphRoundEnd {..} if ctx.graph_time.is_some()=>{},
                 _=>return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"timed IoT accepts only ordered time and checkpoint controls")),
             }
             if !tx.send_control(control).await? {break;}
@@ -1763,12 +1794,13 @@ async fn emit_window(
             else {
                 break;
             };
+            if ctx.graph_time.is_some() {consume_work(ctx,out.num_rows() as u64).await?;}
             if !tx.send(out).await? {
                 return Ok(false);
             }
         }
-        op.advance_holdback(wm)?;
-        if !tx
+        if ctx.graph_time.is_some() && wm==i64::MAX {op.advance_graph_final();} else {op.advance_holdback(wm)?;}
+        if ctx.graph_time.is_none() && !tx
             .send_control(StreamControl::Watermark {
                 input: sparrow_model::InputId::SINGLE.raw(),
                 wm_micros: wm,
@@ -1838,6 +1870,9 @@ async fn window_stage<const GRAPH:bool>(
     tx: &MailboxTx,
     capture: &SharedCapture,
 ) -> Result<usize> {
+    if ctx.ordered_time {
+        return ordered_window_task(ctx,op,rx,tx,capture)?.await;
+    }
     let mut timer_reporter = TimerReporter {
         ctx,
         live: 0,
@@ -1881,7 +1916,7 @@ async fn window_stage<const GRAPH:bool>(
                             // A failed checkpoint must abort that request, not
                             // fail the live job while reserving unused output.
                             let emission = match ctrl {
-                                StreamControl::ProcessingTime { .. } => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for windows")),
+                                StreamControl::ProcessingTime { .. } | StreamControl::GraphProgress {..} | StreamControl::GraphRoundEnd {..} => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for windows")),
                                 StreamControl::EndOfInput=>{
                                     if !GRAPH{return Err(SparrowError::new(ErrorCode::InvalidArgument,"explicit EOF belongs to graph ingress"));}
                                     eof_received=true;
@@ -1955,6 +1990,110 @@ async fn window_stage<const GRAPH:bool>(
     if deferred_eof&&!ctx.cancel.is_cancelled(){tx.send_control(StreamControl::EndOfInput).await?;}
     op.cleanup();
     timer_reporter.sample(op.live_timers(), op.cancelled_timers());
+    Ok(n)
+}
+
+/// The durable branch is cold for ordinary Count/live windows. Do not embed
+/// its complete async state in every legacy window task. Field drop order
+/// keeps the reservation until the boxed future (including cancellation) drops.
+struct ChargedWindowFuture<F> {
+    future:std::pin::Pin<Box<F>>,
+    _credit:sparrow_model::MemoryLease,
+}
+impl<F:std::future::Future> std::future::Future for ChargedWindowFuture<F> {
+    type Output=F::Output;
+    fn poll(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(cx)
+    }
+}
+
+#[cold]
+fn ordered_window_task<'a>(ctx:&'a JobCtx,op:&'a mut WindowOperator,rx:&'a mut MailboxRx,
+    tx:&'a MailboxTx,capture:&'a SharedCapture)
+    ->Result<ChargedWindowFuture<impl std::future::Future<Output=Result<usize>>+'a>> {
+    // Keep construction outside the parent async body: otherwise even a
+    // subsequently boxed local can retain its large generator storage there.
+    let future=ordered_window_stage(ctx,op,rx,tx,capture);
+    let credit=ctx.owner.acquire(sparrow_model::CreditKind::Reservation,std::mem::size_of_val(&future).saturating_add(64))?;
+    Ok(ChargedWindowFuture {future:Box::pin(future),_credit:credit})
+}
+
+#[cfg(test)]
+pub(crate) fn time_graph_window_future_sizes() -> (usize,usize) {
+    fn bytes<F>(_:impl FnOnce(&'static JobCtx,&'static mut WindowOperator,&'static mut MailboxRx,
+        &'static MailboxTx,&'static SharedCapture)->F)->usize {std::mem::size_of::<F>()}
+    // Type inspection only: no references are constructed and neither async
+    // function is called. Keep cold durable futures off the legacy task layout.
+    (bytes(window_stage::<false>),bytes(ordered_window_stage))
+}
+
+/// PT/Count stages in a durable clock pipeline never sample or wake on a host
+/// clock. A time control is forwarded before derived rows, just as for IoT.
+async fn ordered_window_stage(ctx: &JobCtx, op: &mut WindowOperator, rx: &mut MailboxRx,
+    tx: &MailboxTx, capture: &SharedCapture) -> Result<usize> {
+    let mut now = ctx.clock.now_micros();
+    if !op.is_event_time() {op.validate_processing_cut(now)?;}
+    let mut n = 0;
+    let mut timers = TimerReporter { ctx, live: 0, cancelled: 0 };
+    loop {
+        timers.sample(op.live_timers(),op.cancelled_timers());
+        let envelope = tokio::select! { biased; _=ctx.cancel.cancelled()=>break, e=rx.recv()=>e? };
+        let Some(mut envelope) = envelope else {
+            if !ctx.cancel.is_cancelled() { return Err(SparrowError::new(ErrorCode::JobFailed,"ordered time window input closed without shutdown")); }
+            break;
+        };
+        let (batch, control) = envelope.take();
+        if let Some(batch) = batch {
+            consume_work(ctx,batch.num_rows() as u64).await?;
+            let scratch = op.working_credit(Some(&batch))?;
+            let observation=ctx.graph_time.as_ref().filter(|g|g.event_time).map_or(now,|g|g.observed_micros());
+            let emission = op.on_batch_without_timers(&batch,observation)?;
+            n += emission.finals.len();
+            if !emit_window(ctx,op,tx,capture,emission,Some(scratch)).await? { break; }
+        }
+        if let Some(control) = control {
+            match control {
+                StreamControl::ProcessingTime {micros} => {
+                    if micros < now { return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"processing time cannot move backwards")); }
+                    now = micros;
+                    if !tx.send_control(StreamControl::ProcessingTime {micros}).await? {break;}
+                    if op.is_event_time() {continue;}
+                    op.begin_due(now);
+                    while let Some(out) = op.take_closed_batch(now,ctx.mailbox.max_items,ctx.mailbox.max_bytes)? {
+                        consume_work(ctx,out.num_rows() as u64).await?;
+                        n += out.num_rows();
+                        if !tx.send(out).await? {op.cleanup();return Ok(n);}
+                    }
+                    ctx.metrics.record_state(op.key_count() as u64,op.retention_bytes() as u64);
+                }
+                StreamControl::CheckpointBarrier {checkpoint_id} => {
+                    let aligned = ctx.aligned.as_ref().expect("ordered admission");
+                    if !aligned.acks.is_active(checkpoint_id) {continue;}
+                    let freeze = crate::barrier::EncodedFreeze::from_operator(op,&ctx.owner,ctx.max_state_keys);
+                    aligned.acks.state_frozen(checkpoint_id,op.operator_id(),freeze).await;
+                    if !tx.send_control(StreamControl::CheckpointBarrier {checkpoint_id}).await? {break;}
+                }
+                StreamControl::GraphProgress {watermark_micros,flags} if ctx.graph_time.is_some() => {
+                    let mut p=crate::graph_cut::Progress::from_control(watermark_micros,flags)?;
+                    if op.is_event_time() {
+                        let emission=if p.eof {
+                            let mut emission=op.finish_input()?;emission.pending_close=Some(i64::MAX);emission
+                        } else if p.idle {op.mark_idle(sparrow_model::InputId::SINGLE)?}
+                        else {op.mark_active(sparrow_model::InputId::SINGLE)?;match p.watermark {Some(wm)=>op.observe_watermark(sparrow_model::InputId::SINGLE,wm)?,None=>Default::default()}};
+                        n+=emission.finals.len();
+                        if !emit_window(ctx,op,tx,capture,emission,None).await? {break;}
+                        p.watermark=op.wm_out();
+                    }
+                    if !tx.send_control(p.control()).await? {break;}
+                }
+                StreamControl::GraphRoundEnd {sequence} if ctx.graph_time.is_some() => {
+                    if !tx.send_control(StreamControl::GraphRoundEnd {sequence}).await? {break;}
+                }
+                _ => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered windows accept only time and checkpoint controls")),
+            }
+        }
+    }
+    op.cleanup();
     Ok(n)
 }
 

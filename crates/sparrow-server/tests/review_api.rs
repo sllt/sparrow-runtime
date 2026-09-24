@@ -1277,6 +1277,8 @@ fn r23_start_desired_revision_not_latest() {
 
 #[test]
 fn r24_processing_time_aligned_is_refused_at_put() {
+    // PT recovery is now admitted only with the durable time profile. This
+    // legacy Log/no-directory/no-resume configuration must still fail closed.
     let kernel = compact_kernel().unwrap();
     kernel.block_on(async {
         let state = setup().await;
@@ -1301,7 +1303,7 @@ fn r24_processing_time_aligned_is_refused_at_put() {
             body["error"]["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("window"),
+                .contains("paused processing-time"),
             "{body}"
         );
         let _ = std::fs::remove_file(&path);

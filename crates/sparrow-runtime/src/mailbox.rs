@@ -47,6 +47,11 @@ impl MailboxConfig {
 pub enum StreamControl {
     /// Durable source-ordered logical time; only admitted by paused-time plans.
     ProcessingTime { micros: i64 },
+    /// Full per-edge progress in a durable graph decision (watermark -1 means
+    /// uninitialized; flags bit0=idle, bit1=permanent source EOF).
+    GraphProgress { watermark_micros: i64, flags: u8 },
+    /// End of one globally persisted graph decision, before its barrier.
+    GraphRoundEnd { sequence: u64 },
     /// Permanent data completion. Channels closing without this mark in a
     /// graph are failures/cancellation, never authorization for final time.
     EndOfInput,

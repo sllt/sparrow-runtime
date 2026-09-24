@@ -68,6 +68,15 @@ pub enum ProcessingTimePolicy { Paused }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum IotTimingSpec {
+    /// Lifecycle events are never suppressed. Cooldown applies only to the
+    /// notification flag; at most one activation notification waits per key.
+    Alarm {
+        activate_micros: i64,
+        resolve_micros: i64,
+        cooldown_micros: i64,
+        notification_max_age_micros: i64,
+        clock: ProcessingTimePolicy,
+    },
     /// Missing samples keep the last valid condition; false cancels it.
     HoldFor { duration_micros: i64, clock: ProcessingTimePolicy },
     /// A forced max-wait emission ends the current burst, as does quiet expiry.
@@ -82,13 +91,15 @@ pub enum IotTimingSpec {
 }
 impl IotTimingSpec {
     pub fn kind_name(&self) -> &'static str {
-        match self { Self::HoldFor { .. } => "hold_for", Self::Debounce { .. } => "debounce" }
+        match self { Self::HoldFor { .. } => "hold_for", Self::Debounce { .. } => "debounce", Self::Alarm { .. } => "alarm" }
     }
     pub fn state_kind(&self) -> u8 {
-        match self { Self::HoldFor { .. } => 7, Self::Debounce { .. } => 8 }
+        match self { Self::HoldFor { .. } => 7, Self::Debounce { .. } => 8, Self::Alarm { .. } => 11 }
     }
     pub fn validate(&self) -> Result<()> {
         let valid = match self {
+            Self::Alarm { activate_micros, resolve_micros, cooldown_micros, notification_max_age_micros, .. } =>
+                *activate_micros >= 0 && *resolve_micros >= 0 && *cooldown_micros >= 0 && *notification_max_age_micros > 0,
             Self::HoldFor { duration_micros, .. } => *duration_micros > 0,
             Self::Debounce { quiet_micros, max_wait_micros, leading, trailing, .. } =>
                 *quiet_micros > 0 && *max_wait_micros >= *quiet_micros && (*leading || *trailing),
@@ -149,6 +160,35 @@ pub struct IotSpec {
 }
 
 impl IotSpec {
+    pub fn is_alarm(&self) -> bool { matches!(self.timing, Some(IotTimingSpec::Alarm { .. })) }
+
+    /// Alarm has an independently typed event schema. Legacy IoT stages keep
+    /// their original row schema; callers must not silently append fields.
+    pub fn output_schema(&self, input: &Schema) -> Result<Schema> {
+        if !self.is_alarm() { return Ok(input.clone()); }
+        let extra = [
+            ("sparrow_alarm_event", DataType::Utf8),
+            ("sparrow_alarm_phase", DataType::Utf8),
+            ("sparrow_alarm_generation", DataType::Utf8),
+            ("sparrow_alarm_operator", DataType::UInt64),
+            ("sparrow_alarm_episode", DataType::UInt64),
+            ("sparrow_alarm_time", DataType::Int64),
+            ("sparrow_alarm_notify", DataType::Bool),
+        ];
+        let mut id = input.fields.iter().map(|f| f.id.raw()).max().unwrap_or(0);
+        let mut fields = input.fields.clone();
+        for (name, ty) in extra {
+            if input.field_by_name(name).is_some() {
+                return Err(SparrowError::new(ErrorCode::InvalidSchema, "alarm output field collides with input"));
+            }
+            id = id.checked_add(1).ok_or_else(|| SparrowError::new(ErrorCode::InvalidSchema, "alarm field ID overflow"))?;
+            fields.push(Field::new(FieldId::new(id), name, ty, false));
+        }
+        let schema_id = input.id.raw().checked_add(90)
+            .ok_or_else(|| SparrowError::new(ErrorCode::InvalidSchema, "alarm schema ID overflow"))?;
+        Schema::new(SchemaId::new(schema_id), fields)
+    }
+
     fn validate_params(&self) -> Result<()> {
         validate_names(&self.keys, "keys", 16)?;
         validate_names(&self.fields, "fields", 16)?;
@@ -190,6 +230,14 @@ impl IotSpec {
     /// IoT stage.
     pub fn validate(&self, input: &Schema) -> Result<()> {
         self.validate_params()?;
+        if self.is_alarm() {
+            if input.fields.len() > 48 || self.fields.len() != 2
+                || self.fields.iter().any(|name| input.field_by_name(name).is_none_or(|f| f.data_type != DataType::Bool)) {
+                return Err(SparrowError::new(ErrorCode::TypeMismatch,
+                    "alarm requires enter/clear Bool fields and at most 48 scalar input fields"));
+            }
+            self.output_schema(input)?;
+        }
         if let Some(timing) = &self.timing {
             if input.fields.len() > 60 || input.fields.iter().any(|f| !iot_value_type(&f.data_type)) {
                 return Err(SparrowError::new(ErrorCode::FeatureUnavailable,
@@ -266,7 +314,8 @@ impl IotSpec {
     /// values intentionally do not overlap the WindowKind tags.
     pub fn state_kind_tag(&self) -> u8 {
         if let Some(timing) = &self.timing { return timing.state_kind(); }
-        if self.hysteresis.is_some() { 6 } else if self.deadband.is_some() { 5 } else { 4 }
+        let base = if self.hysteresis.is_some() { 6 } else if self.deadband.is_some() { 5 } else { 4 };
+        if self.ttl_micros > 0 { base + 5 } else { base }
     }
 
     pub fn kind_name(&self) -> &'static str {

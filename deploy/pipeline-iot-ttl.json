@@ -1,0 +1,13 @@
+{
+  "version":1,"stream":"timed_signals",
+  "source":{"kind":"file","path":"/var/lib/sparrow/data/timed-signals.ndjson","file_contract":"append_only","inbox_capacity":8},
+  "sink":{"kind":"http","url":"http://127.0.0.1:18082/signals","batch_rows":1,"linger_ms":0,"outbox_capacity":8},
+  "fail_on_decode":true,"recovery":"aligned",
+  "checkpoint_dir":"/var/lib/sparrow/checkpoints/ttl-v16",
+  "checkpoint":{"interval_ms":100,"timeout_ms":5000,"retain_generations":3,"max_store_bytes":33554432,"resume_latest":true},
+  "graph":{"version":1,"pipeline_id":716,"revision_id":1,"nodes":[
+    {"id":1,"kind":"memory_source","table":"timed_signals","out":[2]},
+    {"id":2,"kind":"change_detect","iot":{"keys":["device_id"],"fields":["active"],"emit_first":true,"ttl_micros":10000000,"max_keys":1024,"invalid":"ignore"},"out":[3]},
+    {"id":3,"kind":"capture_sink","name":"signals"}
+  ]}
+}

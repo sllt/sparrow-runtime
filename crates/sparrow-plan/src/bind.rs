@@ -58,7 +58,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
 
     for id in order {
         let node = by_id[&id];
-        if node.iot.is_some() && !matches!(node.kind.as_str(), "change_detect" | "deadband" | "hysteresis" | "hold_for" | "debounce") {
+        if node.iot.is_some() && !matches!(node.kind.as_str(), "change_detect" | "deadband" | "hysteresis" | "hold_for" | "debounce" | "alarm") {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
                 format!("node {}: iot configuration is only valid for change_detect/deadband/hysteresis", node.id),
@@ -235,7 +235,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     output,
                 }
             }
-            "change_detect" | "deadband" | "hysteresis" | "hold_for" | "debounce" => {
+            "change_detect" | "deadband" | "hysteresis" | "hold_for" | "debounce" | "alarm" => {
                 let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
                     SparrowError::new(
                         ErrorCode::InvalidArgument,
@@ -249,7 +249,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     )
                 })?;
                 match node.kind.as_str() {
-                    "hold_for" | "debounce" if spec.timing.as_ref().map(|t| t.kind_name()) != Some(node.kind.as_str()) => {
+                    "hold_for" | "debounce" | "alarm" if spec.timing.as_ref().map(|t| t.kind_name()) != Some(node.kind.as_str()) => {
                         return Err(SparrowError::new(ErrorCode::InvalidArgument, "timed node kind/config mismatch"));
                     }
                     "change_detect" | "deadband" | "hysteresis" if spec.timing.is_some() => {
@@ -279,8 +279,9 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                 }
                 spec.validate(&input)
                     .map_err(|e| e.at_operator(OperatorId::new(id)))?;
-                incoming_schema.insert(id, input.clone());
-                BoundKind::Iot { spec, input }
+                let output = spec.output_schema(&input)?;
+                incoming_schema.insert(id, output.clone());
+                BoundKind::Iot { spec, input, output }
             }
             "hop" | "tumble_et" | "event_time_window" => {
                 let input = incoming_schema.get(&id).cloned().ok_or_else(|| {

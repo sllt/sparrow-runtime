@@ -55,6 +55,10 @@ pub struct ReferenceBinding {
 pub struct GraphIoSpec {
     pub sources: std::collections::BTreeMap<u32, SourceSpec>,
     pub sinks: std::collections::BTreeMap<u32, SinkSpec>,
+    /// Explicit paused-time inactivity policy for durable File time graphs.
+    /// None never infers idle from an empty append-only file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_after_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

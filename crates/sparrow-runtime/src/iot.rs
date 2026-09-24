@@ -5,8 +5,8 @@
 //! than reusing a numeric deadband baseline.
 //! Values which enter state are detached, and every state/index replacement is
 //! admitted before the old entry is changed.  Processing-time TTL is useful
-//! for a live job, but TTL-bearing state is not part of the aligned snapshot
-//! contract yet; aligned callers must use `ttl_micros == 0`.
+//! for a live job; aligned Change/Deadband TTL uses kind 9/10 in the paused
+//! time profile, preserving its last-valid-input cut rather than host time.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
@@ -62,6 +62,9 @@ pub struct IotStats {
     pub filtered_rows: u64,
     pub invalid_rows: u64,
     pub expired_keys: u64,
+    pub notifications_expired: u64,
+    pub notifications_cancelled: u64,
+    pub notifications_deferred: u64,
 }
 
 /// A detached, schema-independent state entry used by the IoT freeze codec.
@@ -219,8 +222,35 @@ impl IotFreeze {
                 ));
             }
             let timed = matches!(header.kind,7|8);
+            let ttl = matches!(header.kind,9|10);
             let mut values = Vec::with_capacity(if materialize { value_len } else { 0 });
             let mut prefix = 0;
+            if header.kind == crate::alarm_iot::KIND {
+                if value_len <= crate::alarm_iot::PREFIX || src.len() < 54 {
+                    return Err(codec("alarm state metadata encoding"));
+                }
+                let mut metadata = std::array::from_fn::<_, 7, _>(|_| Scalar::Null);
+                for i in 0..6 {
+                    let expected = if i == 0 || i == 3 { 3 } else { 2 };
+                    if src[i * 9] != expected { return Err(codec("alarm metadata scalar tag")); }
+                    let bytes: [u8; 8] = src[i * 9 + 1..i * 9 + 9].try_into().unwrap();
+                    metadata[i] = if expected == 3 { Scalar::UInt64(u64::from_le_bytes(bytes)) } else { Scalar::Int64(i64::from_le_bytes(bytes)) };
+                }
+                crate::alarm_iot::metadata(&metadata, now)?;
+                if materialize { values.extend(metadata.into_iter().take(6)); }
+                *src = &src[54..]; prefix = 6;
+            }
+            if ttl {
+                if value_len < 2 || src.len() < 9 || src[0] != 2 {
+                    return Err(codec("TTL IoT freeze requires last_seen followed by values"));
+                }
+                let last_seen = i64::from_le_bytes(src[1..9].try_into().unwrap());
+                if last_seen < 0 || now.is_some_and(|now| last_seen > now) {
+                    return Err(codec("TTL last_seen exceeds its processing-time cut"));
+                }
+                if materialize { values.push(Scalar::Int64(last_seen)); }
+                *src = &src[9..]; prefix = 1;
+            }
             if timed {
                 if value_len < 4 || src.len()<20 || src[0]!=2 || src[9]!=2 || src[18]!=1 || src[19]>1 {
                     return Err(codec("timed IoT freeze metadata encoding"));
@@ -247,7 +277,7 @@ impl IotFreeze {
                 }
                 if materialize {
                     let value = Scalar::decode_value(src)?;
-                    if !(matches!(header.kind,7|8) && value.is_null()) {
+                    if !(matches!(header.kind,7|8|11) && value.is_null()) {
                         validate_freeze_scalar(&value, false)?;
                     }
                     values.push(value);
@@ -255,7 +285,7 @@ impl IotFreeze {
                     let before = *src;
                     Scalar::skip_encoded_value(src)?;
                     let consumed = before.len().saturating_sub(src.len());
-                    if !(matches!(header.kind,7|8) && before[..consumed]==[0]) {
+                    if !(matches!(header.kind,7|8|11) && before[..consumed]==[0]) {
                         validate_encoded_scalar(&before[..consumed], false)?;
                     }
                 }
@@ -284,7 +314,7 @@ impl IotFreeze {
         if slot != IOT_STATE_SLOT {
             return Err(codec("IoT freeze StateSlotId is not 3"));
         }
-        if !matches!(kind, 4..=8) {
+        if !matches!(kind, 4..=11) {
             return Err(codec("unknown IoT freeze kind"));
         }
         Ok(IotFreezeHeader {
@@ -333,7 +363,7 @@ impl IotFreeze {
         if self.slot != IOT_STATE_SLOT {
             return Err(codec("IoT freeze StateSlotId is not 3"));
         }
-        if !matches!(self.kind, 4..=8) {
+        if !matches!(self.kind, 4..=11) {
             return Err(codec("unknown IoT freeze kind"));
         }
         if max_keys == 0
@@ -347,6 +377,12 @@ impl IotFreeze {
         }
         let mut seen = BTreeSet::new();
         for entry in &self.entries {
+            if self.kind == crate::alarm_iot::KIND { crate::alarm_iot::metadata(&entry.values, None)?; }
+            if matches!(self.kind,9|10) {
+                if !matches!(entry.values.as_slice(), [Scalar::Int64(last_seen),_,..] if *last_seen >= 0) {
+                    return Err(codec("TTL IoT freeze metadata or latch is invalid"));
+                }
+            }
             if matches!(self.kind,7|8) {
                 match entry.values.as_slice() {
                     [Scalar::Int64(start),Scalar::Int64(deadline),Scalar::Bool(trailing),_,..] =>
@@ -374,7 +410,7 @@ impl IotFreeze {
                 return Err(codec("duplicate IoT freeze key"));
             }
             for value in &entry.values {
-                if matches!(self.kind,7|8) && value.is_null() { continue; }
+                if matches!(self.kind,7|8|11) && value.is_null() { continue; }
                 validate_freeze_scalar(value, false)?;
             }
         }
@@ -396,7 +432,8 @@ pub struct IotOperator {
     owner: Arc<MemoryOwner>,
     expiry: BTreeMap<(i64, Vec<u8>), StateKey>,
     expiry_bytes: usize,
-    timed: Option<crate::timed_iot::TimedIot>,
+    timed: Option<crate::timed_state::TimedState>,
+    ordered_now: Option<i64>,
     _metadata_lease: MemoryLease,
     stats: IotStats,
 }
@@ -425,7 +462,7 @@ impl IotOperator {
         validate_iot_types(&spec, &input, &field_idx)?;
         let state = MemoryState::new(Arc::clone(&owner), operator, IOT_STATE_SLOT, spec.max_keys)?;
         let input = Arc::new(input);
-        let timed = spec.timing.as_ref().map(|_| crate::timed_iot::TimedIot::new(operator, &spec,
+        let timed = spec.timing.as_ref().map(|_| crate::timed_state::TimedState::new(operator, &spec,
             input.clone(),owner.clone(),key_idx.clone(),field_idx.clone())).transpose()?;
         Ok(Self {
             operator,
@@ -441,6 +478,7 @@ impl IotOperator {
             _metadata_lease: metadata_lease,
             stats: IotStats::default(),
             timed,
+            ordered_now: None,
         })
     }
 
@@ -547,6 +585,9 @@ impl IotOperator {
             .at_operator(self.operator));
         }
         if let Some(timed) = &mut self.timed { return timed.on_batch(batch, now); }
+        if self.ordered_now.is_some_and(|cut| cut != now) {
+            return Err(codec("IoT input must use its last ordered time decision"));
+        }
         self.expire(now);
         let mut output = sparrow_model::RowBatchBuilder::new(
             self.input.clone(),
@@ -574,24 +615,21 @@ impl IotOperator {
         if self.spec.ttl_micros <= 0 {
             return;
         }
-        while let Some((&(at, _), _)) = self.expiry.first_key_value() {
-            if at > now {
-                break;
-            }
-            let Some((_, key)) = self.expiry.pop_first() else {
-                break;
-            };
-            self.expiry_bytes =
-                self.owner
-                    .replace_accounted_bytes(self.expiry_bytes, key.index_bytes(), 0);
-            if self.state.remove(&key).is_some() {
-                self.stats.expired_keys = self.stats.expired_keys.saturating_add(1);
-            }
+        while self.expire_one(now) {}
+    }
+
+    fn expire_one(&mut self, now: i64) -> bool {
+        if !self.expiry.first_key_value().is_some_and(|((at,_),_)| *at <= now) { return false; }
+        let (_, key) = self.expiry.pop_first().expect("due TTL");
+        self.expiry_bytes = self.owner.replace_accounted_bytes(self.expiry_bytes, key.index_bytes(), 0);
+        if self.state.remove(&key).is_some() {
+            self.stats.expired_keys = self.stats.expired_keys.saturating_add(1);
         }
         if self.state.is_empty() {
             self.state.clear_and_release_capacity();
             self.table_lease = None;
         }
+        true
     }
 
     pub fn next_deadline(&self) -> Option<i64> {
@@ -660,6 +698,7 @@ impl IotOperator {
                         .sum::<usize>(),
                 )
                 .saturating_add(2)
+                .saturating_add(if self.spec.ttl_micros > 0 { 9 } else { 0 })
                 .saturating_add(
                     value
                         .values
@@ -674,13 +713,6 @@ impl IotOperator {
     #[cfg(test)]
     pub fn freeze(&self) -> Result<IotFreeze> {
         if let Some(timed) = &self.timed { return timed.freeze(); }
-        if self.spec.ttl_micros != 0 {
-            return Err(SparrowError::new(
-                ErrorCode::UnsupportedRestore,
-                "aligned IoT freeze requires ttl_micros == 0",
-            )
-            .at_operator(self.operator));
-        }
         let estimate = self.estimated_freeze_bytes();
         if estimate > MAX_IOT_FREEZE_BYTES {
             return Err(SparrowError::new(
@@ -696,7 +728,8 @@ impl IotOperator {
             .iter()
             .map(|(key, value)| IotEntry {
                 key: key.key.iter().map(Scalar::detach_copy).collect(),
-                values: value.values.iter().map(Scalar::detach_copy).collect(),
+                values: (self.spec.ttl_micros > 0).then_some(Scalar::Int64(value.last_seen))
+                    .into_iter().chain(value.values.iter().map(Scalar::detach_copy)).collect(),
             })
             .collect::<Vec<_>>();
         entries.sort_by(|a, b| {
@@ -714,13 +747,6 @@ impl IotOperator {
 
     pub fn encode_freeze_into(&self, out: &mut Vec<u8>, max_keys: usize) -> Result<()> {
         if let Some(timed) = &self.timed { return timed.encode(out,max_keys); }
-        if self.spec.ttl_micros != 0 {
-            return Err(SparrowError::new(
-                ErrorCode::UnsupportedRestore,
-                "aligned IoT freeze requires ttl_micros == 0",
-            )
-            .at_operator(self.operator));
-        }
         if max_keys == 0 || self.state.len() > max_keys.min(MAX_IOT_FREEZE_ENTRIES) {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -750,7 +776,8 @@ impl IotOperator {
             }
         }
         for (key, value) in keyed {
-            encode_entry_parts(out, &key.key, &value.values, start)?;
+            encode_entry_with_prefix(out, &key.key, &value.values, start,
+                (self.spec.ttl_micros > 0).then_some(value.last_seen))?;
         }
         if out.len().saturating_sub(start) > MAX_IOT_FREEZE_BYTES {
             return Err(SparrowError::new(
@@ -768,13 +795,6 @@ impl IotOperator {
         if let Some(timed) = &mut self.timed {
             freeze.validate_shape(timed.max_keys())?;
             return timed.restore(freeze);
-        }
-        if self.spec.ttl_micros != 0 {
-            return Err(SparrowError::new(
-                ErrorCode::UnsupportedRestore,
-                "aligned IoT restore requires ttl_micros == 0",
-            )
-            .at_operator(self.operator));
         }
         if freeze.operator != self.operator
             || freeze.slot != IOT_STATE_SLOT
@@ -806,8 +826,19 @@ impl IotOperator {
             IOT_STATE_SLOT,
             self.spec.max_keys,
         )?;
+        let mut expiry = BTreeMap::new();
+        let mut expiry_bytes = 0usize;
         for entry in &freeze.entries {
             self.validate_freeze_entry(entry)?;
+            let (last_seen, values) = self.entry_values(entry)?;
+            let deadline = if self.spec.ttl_micros > 0 {
+                let at = last_seen.checked_add(self.spec.ttl_micros).ok_or_else(||codec("TTL deadline overflow"))?;
+                if self.ordered_now.is_some_and(|now| last_seen > now || at <= now) {
+                    return Err(codec("TTL state disagrees with its processing-time cut"));
+                }
+                if expiry.len() >= self.owner.budget().max_timers { return Err(codec("TTL restore timer bound")); }
+                Some(at)
+            } else { None };
             let candidate_bound = 2048usize.saturating_add(
                 entry
                     .key
@@ -827,48 +858,59 @@ impl IotOperator {
             if replacement.get(&key).is_some() {
                 return Err(codec("duplicate IoT restore key"));
             }
-            let values = entry
-                .values
+            let values = values
                 .iter()
                 .map(Scalar::detach_copy)
                 .collect::<Vec<_>>();
+            if let Some(at) = deadline {
+                let indexed = key.indexed(&self.owner)?;
+                expiry_bytes = expiry_bytes.saturating_add(indexed.index_bytes());
+                expiry.insert((at,indexed.encoded_bytes().to_vec()),indexed);
+            }
             replacement.put(
                 key,
                 StoredIotState {
                     values: values.clone(),
-                    last_seen: 0,
+                    last_seen,
                 },
                 state_value_bytes(&values),
             )?;
         }
+        self.expiry.clear();
         self.state = replacement;
         self.table_lease = replacement_table;
-        self.expiry.clear();
-        self.expiry_bytes = 0;
+        self.expiry = expiry;
+        self.expiry_bytes = expiry_bytes;
         Ok(())
     }
 
     fn freeze_kind(&self) -> u8 {
-        if let Some(timing) = &self.spec.timing {
-            timing.state_kind()
-        } else if self.spec.hysteresis.is_some() {
-            IOT_HYSTERESIS_KIND
-        } else if self.spec.deadband.is_some() {
-            IOT_DEADBAND_KIND
-        } else {
-            IOT_CHANGE_KIND
-        }
+        self.spec.state_kind_tag()
     }
 
     pub fn is_timed(&self) -> bool { self.timed.is_some() }
+    pub fn bind_generation(&mut self, generation: [u8; 16]) -> Result<()> {
+        if let Some(timed) = &mut self.timed { timed.bind_generation(generation)?; }
+        Ok(())
+    }
     pub fn validate_processing_cut(&mut self,now:i64)->Result<()> {
-        self.timed.as_mut().ok_or_else(||codec("operator has no ordered clock"))?.validate_cut(now)
+        if let Some(timed) = &mut self.timed { return timed.validate_cut(now); }
+        if self.spec.ttl_micros > 0 && self.state.iter().any(|(_,value)| value.last_seen < 0 || value.last_seen > now
+            || value.last_seen.checked_add(self.spec.ttl_micros).is_none_or(|at| at <= now)) {
+            return Err(codec("TTL restore has future input or overdue expiry"));
+        }
+        self.set_processing_time(now)
     }
     pub fn set_processing_time(&mut self, now: i64) -> Result<()> {
-        self.timed.as_mut().ok_or_else(||codec("operator has no ordered clock"))?.set_time(now)
+        if let Some(timed) = &mut self.timed { return timed.set_time(now); }
+        if now < 0 || self.ordered_now.is_some_and(|old| now < old) { return Err(codec("processing time cannot move backwards")); }
+        self.ordered_now = Some(now);
+        Ok(())
     }
     pub fn take_timed_due(&mut self, now: i64) -> Result<Option<RowBatch>> {
-        self.timed.as_mut().ok_or_else(||codec("operator has no ordered clock"))?.take_due(now)
+        if let Some(timed) = &mut self.timed { return timed.take_due(now); }
+        self.expire_one(now);
+        Ok(None)
     }
 
     fn validate_row(&self, row: &Row) -> Result<bool> {
@@ -989,6 +1031,9 @@ impl IotOperator {
     }
 
     fn commit_state(&mut self, key: StateKey, values: Vec<Scalar>, now: i64) -> Result<()> {
+        if self.spec.ttl_micros > 0 && (now < 0 || now.checked_add(self.spec.ttl_micros).is_none()) {
+            return Err(codec("TTL deadline overflow or negative time"));
+        }
         let old_last_seen = self.state.get(&key).map(|value| value.last_seen);
         let previous_table_bytes = self.table_lease.as_ref().map_or(0, MemoryLease::bytes);
         if old_last_seen.is_none() {
@@ -1068,7 +1113,8 @@ impl IotOperator {
     }
 
     fn validate_freeze_entry(&self, entry: &IotEntry) -> Result<()> {
-        if entry.key.len() != self.key_idx.len() || entry.values.len() != self.field_idx.len() {
+        let (_, values) = self.entry_values(entry)?;
+        if entry.key.len() != self.key_idx.len() || values.len() != self.field_idx.len() {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
                 "IoT freeze key/value arity differs from the live operator",
@@ -1084,13 +1130,13 @@ impl IotOperator {
             }
         }
         if self.spec.hysteresis.is_some() {
-            return if matches!(entry.values.as_slice(), [Scalar::Bool(_)]) {
+            return if matches!(values, [Scalar::Bool(_)]) {
                 Ok(())
             } else {
                 Err(codec("hysteresis freeze requires a Bool latch"))
             };
         }
-        for (value, &index) in entry.values.iter().zip(&self.field_idx) {
+        for (value, &index) in values.iter().zip(&self.field_idx) {
             let field = &self.input.fields[index];
             if value.is_null()
                 || matches!(value, Scalar::Float64(v) if !v.is_finite())
@@ -1103,6 +1149,14 @@ impl IotOperator {
             }
         }
         Ok(())
+    }
+
+    fn entry_values<'a>(&self, entry: &'a IotEntry) -> Result<(i64, &'a [Scalar])> {
+        if self.spec.ttl_micros == 0 { return Ok((0, &entry.values)); }
+        match entry.values.split_first() {
+            Some((Scalar::Int64(last_seen), values)) if *last_seen >= 0 => Ok((*last_seen, values)),
+            _ => Err(codec("TTL freeze lacks valid last_seen")),
+        }
     }
 }
 
@@ -1298,6 +1352,10 @@ pub(crate) fn encode_entry_parts(
     values: &[Scalar],
     start: usize,
 ) -> Result<()> {
+    encode_entry_with_prefix(out,key,values,start,None)
+}
+
+fn encode_entry_with_prefix(out: &mut Vec<u8>, key: &[Scalar], values: &[Scalar], start: usize, last_seen: Option<i64>) -> Result<()> {
     ensure_frame_bytes(start, out.len(), 2)?;
     out.extend_from_slice(&(key.len() as u16).to_le_bytes());
     for value in key {
@@ -1306,7 +1364,11 @@ pub(crate) fn encode_entry_parts(
         value.encode_value(out)?;
     }
     ensure_frame_bytes(start, out.len(), 2)?;
-    out.extend_from_slice(&(values.len() as u16).to_le_bytes());
+    out.extend_from_slice(&((values.len() + usize::from(last_seen.is_some())) as u16).to_le_bytes());
+    if let Some(last_seen) = last_seen {
+        ensure_frame_bytes(start,out.len(),9)?;
+        Scalar::Int64(last_seen).encode_value(out)?;
+    }
     for value in values {
         let len = value.encoded_value_len()?;
         ensure_frame_bytes(start, out.len(), len)?;

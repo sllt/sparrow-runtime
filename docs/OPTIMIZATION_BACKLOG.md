@@ -108,8 +108,10 @@ K3/K4 历史条目按各自匹配构建解释；后续条目链接对应 Core-A/
 
 - **证据**：K4 候选在 Rust 1.98.0 下执行 default-members、all-targets、JetStream feature 的 release Clippy，正常命令退出 0，日志有 87 条提示；严格 `-D warnings` 被既有 `unnecessary_map_or` / `manual_div_ceil` 等提示阻断。见 K4 产物的 `clippy-v5.log` / `clippy-v3-preflight.log`。
 - **后续候选**：Core-A v4 为90条、B1 v2为95条、B2-A v4为97条，本轮K1～K4组合候选v7为100条，均是正常Clippy退出0；对应产物各自保存，不将旧的87条当作当前数量。B2-A未调用的`validate_aligned_plan_with_references`包装函数已在本轮移除；实际启动经`checkpoint_plan_with_references`和Kernel校验真实依赖，不是缺少恢复验证。
-- **范围**：这是现工作区 lint 提示数，不是 87 个已确认功能 BUG，也不是完整 release 认证。包含风格/简化建议；本批不顺带重写无关模块，避免扩大 K4 回归面。
+- **2026-09-23 后续**：时间图最终 v13 普通 Clippy 退出 0、105 条 warning，包含 GraphCut 的风格简化建议；不是 `-D warnings` 通过，不为消除风格提示顺带重写已冻结逻辑。
+- **范围**：这是各自匹配工作区的 lint 提示数，不是对应数量的已确认功能 BUG，也不是完整 release 认证。包含风格/简化建议；本批不顺带重写无关模块，避免扩大 K4 回归面。
 - **时间型 Preview（2026-09-19）**：`paused-time-artifacts-20260919/clippy-v6.log` 普通 Clippy 退出 0，共 102 条 warning。新增时间 cut 的两个迭代/整除写法建议以及 Source 枚举体积提示，不是已确认数据正确性问题；后续等价整理仍需匹配测试，不在本轮为清理样式追加 Rust 重编译。
+- **线性时间扩展（2026-09-22）**：`time-completion-artifacts-20260922/clippy-v4.log` 普通 Clippy 退出 0，103 条 warning；没有通过 `-D warnings` 的声明，也未用批量 allow 屏蔽提示。功能/故障/性能证据独立验收。
 - **待办/验收**：按模块分类，优先确认有语义影响的项，其余做等价整理；每批保留原测试/性能门槛，最终再启用零告警门禁，不能靠全局 allow 隐藏问题。若具体提示揭示正确性/安全问题，应立即转修复任务而非继续留在普通优化清单。
 
 <a id="opt-010"></a>
@@ -130,11 +132,12 @@ K3/K4 历史条目按各自匹配构建解释；后续条目链接对应 Core-A/
 <a id="opt-012"></a>
 ### OPT-012 — 时间型 profile 的逐决策提交成本
 
-- **状态/范围**：待优化；仅影响新 v14/v15。为先证明恢复正确性，当前一个输入行/空闲 tick 对应一个持久决策和完整 checkpoint，提交前不开放下一决策。它不是旧 v3～v13 高吞吐链路的退化，也不是通用多记录 WAL。
+- **状态/范围**：待优化；影响时间型 v14～v19。为先证明恢复正确性，当前一个输入行/EOF/空闲 tick 对应一个持久决策和完整 checkpoint，提交前不开放下一决策。它不是旧 v3～v13 高吞吐链路的退化，也不是通用多记录 WAL。功能验收通过不代表该成本已解决。
+  - 2026-09-23 v18/v19 已完成限定功能验收，增加所有来源控制、确定性 Union 轮缓冲和全部 required Sink 的等待；下方 v14 数字不外推为图容量。全部来源 EOF 后仍保留逻辑 tick/barrier 服务，后续可在不损害 PT timer、取消和手动 checkpoint 的前提下减少空闲 fsync；当前不作此优化。默认 Union 整轮 256 行与半 reservation 字节上限、大图队列准入也必须计入容量选型，不能外推每算子的 key 上限。
 - **实测**：`box@100.64.0.18` 的 `paused-time-artifacts-20260919/process-v4/serialized-cost-{0,20}ms`，File、单 key、Debounce leading-only、每行一个 POST、各 100 行全部持久提交且输出 ID 连续：HTTP 无人工延迟约 **139 行/s**，人工响应延迟 20 ms 约 **34.1 行/s**。这是短程成本观察，不是容量认证或 eKuiper 对照；20 ms 是模拟响应延迟，不是真实 WAN RTT。
 - **代码确认/待量化**：每决策 journal fsync、完整 snapshot/目录 fsync、required HTTP flush 均串行；空闲也按配置频率提交 tick。更大状态、多规则、介质写入量和长稳影响还需专项量化，不能仅从本次 100 行推断具体热点占比。
 - **方向/验收**：按需求设计有界多决策 journal、group commit/批处理以及有证据的空闲 tick 合并；持久序号、timer-before-input、输出身份、ACK cut、初始 generation、日志保留/GC 和旧 profile 拒绝必须一起验证。不得删除先持久后发布、缩小恢复范围或放大默认预算换吞吐。保持现有正确性/资源/故障门槛，另建预先声明的容量阶梯和真实介质测量。
-- **延期前提**：目标规则频率低、延迟与磁盘预算满足验证时可以使用限定 Preview；如果业务要求持续数千/上万条每秒，或大量空闲规则下的 I/O 不可接受，本项就是该部署的前置，不应表述为“不影响使用”。关联 STATE/REL/HTTP/MEM/QA；PT/正 TTL、DAG 时间恢复等未实现功能仍留在开发 TODO，不混成优化项。
+- **延期前提**：目标规则频率低、状态/展开量、延迟与磁盘预算满足验证时可以使用限定 Preview；如果业务要求持续数千/上万条每秒，或大量空闲规则下的 I/O 不可接受，本项就是该部署的前置，不应表述为“不影响使用”。关联 STATE/REL/HTTP/MEM/QA；未声明时间域/依赖/拓扑等新功能仍留在开发 TODO。v14 的历史数字不能替代 v16～v19 大状态、多规则或真实目标设备容量测量。
 
 ## 3. 后续统一处理方式
 

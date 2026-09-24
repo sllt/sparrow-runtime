@@ -193,6 +193,7 @@ impl TimedIot {
             let encoded = key_bytes(&key);
             let previous = self.entries.get(&encoded);
             let (start, deadline, trailing, emit) = match self.timing {
+                IotTimingSpec::Alarm { .. } => return Err(invalid("alarm requires its independent state machine")),
                 IotTimingSpec::HoldFor {
                     duration_micros, ..
                 } => {
@@ -474,6 +475,7 @@ impl TimedIot {
                 return Err(invalid("timed IoT freeze row/key mismatch"));
             }
             match self.timing {
+                IotTimingSpec::Alarm { .. } => return Err(invalid("alarm cannot restore a legacy timed state")),
                 IotTimingSpec::HoldFor {
                     duration_micros, ..
                 } => {
