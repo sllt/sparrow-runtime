@@ -37,6 +37,13 @@ pub(super) fn checkpoint_status(state: &AppState, name: &str) -> Value {
             .last_success_at
             .map(|at| at.elapsed().as_millis().min(u64::MAX as u128) as u64));
     value["storage"] = s.storage.as_ref().map(storage_json).unwrap_or(Value::Null);
+    value["observed_source"]=s.observed_source.as_ref().map(|r|json!({
+        "scope":"historical_committed_cut_not_live_connection_or_device_health",
+        "checkpoint_id":r.checkpoint_id,"decision_sequence":r.sequence,"logical_micros":r.logical_micros,
+        "source_offset":r.source_offset,"coverage_since_micros":r.coverage_since,
+        "last_fresh_observation_micros":r.last_fresh,
+        "view_age_ms":r.recorded_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        "view_age_is_observation_age":false,"device_online_claimed":false})).unwrap_or(Value::Null);
     value["reliable_source"]=s.reliable_source.as_ref().map(|r|json!({
         "redeliveries_total":r.redeliveries,"pull_requests_total":r.pull_requests,"ack_retries_total":r.ack_retries,
         "retention_available_bytes":r.retention_available,

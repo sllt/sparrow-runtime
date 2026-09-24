@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "stream": "telemetry",
+  "source": {"kind": "file", "path": "/tmp/sparrow/silence.ndjson", "file_contract": "append_only"},
+  "sink": {"kind": "http", "url": "http://127.0.0.1:9080/events", "batch_rows": 1, "linger_ms": 0},
+  "fail_on_decode": true,
+  "recovery": "aligned",
+  "checkpoint_dir": "/tmp/sparrow/silence-checkpoints",
+  "checkpoint": {"interval_ms": 100, "timeout_ms": 5000, "resume_latest": true},
+  "graph": {
+    "version": 1,
+    "pipeline_id": 724,
+    "revision_id": 1,
+    "nodes": [
+      {"id": 1, "kind": "memory_source", "table": "telemetry", "out": [2]},
+      {
+        "id": 2,
+        "kind": "silence",
+        "iot": {
+          "keys": ["device_id"],
+          "fields": [],
+          "emit_first": false,
+          "ttl_micros": 0,
+          "max_keys": 128,
+          "invalid": "error",
+          "timing": {
+            "kind": "silence",
+            "clock": "paused",
+            "duration_micros": 5000000,
+            "max_observation_gap_micros": 1000000,
+            "registered_keys": [["device-registered"]]
+          }
+        },
+        "out": [3]
+      },
+      {"id": 3, "kind": "capture_sink", "name": "http"}
+    ]
+  }
+}

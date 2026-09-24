@@ -44,6 +44,8 @@ mod jetstream_source;
 mod graph;
 mod paused_time;
 mod paused_time_log;
+mod observed_time;
+mod observed_time_log;
 mod graph_time;
 mod graph_time_log;
 
@@ -1048,7 +1050,9 @@ impl Supervisor {
         .await?;
         let recovery = RecoveryPolicy::parse(&spec.recovery)?;
 
-        let job = if spec.recovery=="aligned" && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
+        let job = if plan.has_silence() {
+            self.start_observed_time(&spec,schema,plan,&policy).await?
+        } else if spec.recovery=="aligned" && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
             self.start_time_graph(&spec,plan,&policy).await?
         } else if plan.has_timed_iot() || (spec.recovery == "aligned" && plan.has_processing_time_state()) {
             self.start_paused_time(&spec,schema,plan,&policy).await?

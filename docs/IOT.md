@@ -40,11 +40,11 @@
 
 2026-09-24 收尾候选 `alarm-closure-artifacts-20260924` / v1 已通过 795/18 ignored、独立 no-demo 44、Alarm 14×20、线性 6 个进程场景及完整旧矩阵。新增 v22 **双 Alarm→Union**、**单 Alarm→双 required Sink** 两种图，在 default/JetStream 两个包分别执行真实 SIGKILL；核验两端独立 ID/完整内容重放、activate/resolve 同 episode、停机暂停、提交后不重复及旧 v19 二进制拒绝。两个包测试的来源都是 File，不代表 JetStream 来源图已开放。验收脚本另通过 1 个合法 stub 与 8 个拒绝反例，stub 不作为真实进程证据。完整原三组 ABBA 的双 Count 已通过，但零状态第 2/3 组及合并未过，合并 0.885299；失败保留，**整批仍未放行**，不能用短程双 Count 探测代替。见 [本次证据](PRODUCTION.md#alarm-closure-validation)。
 
-当前 `paused_time` actor 的“没有读到行”同时可能来自空输入、pull 等待或 tick 唤醒，不等于健康观测；JetStream 的连接检查在 reader 路径，不能从某个旧的 Ready 指标反推整段时间都可观察。IOT-07 必须先增加**随时间决策持久化的来源健康观测合同**：来源失败/不可判断时不作新的设备静默判断，停机不计时，未提交后继使用原健康观测重放而不是重新采样指标。Pipeline stopped 与 Source unavailable 保留独立诊断；静默事件不是已证明的硬件故障。未见且未登记的设备不建立离线状态。该前置尚未实现，不用现有 Graph idle/EOF 或 Alarm 的无样本保持条件替代。
+原 `paused_time` actor 的“没有读到行”同时可能来自空输入、pull 等待或 tick 唤醒，不等于健康观测；JetStream 的连接检查在 reader 路径，不能从某个旧的 Ready 指标反推整段时间都可观察。本批新增独立 `observed_time` actor 和**随时间决策持久化的来源观测合同**：来源失败/不可判断时不作新的设备静默判断，停机不计时，未提交后继使用原健康事实重放而不是重新采样指标。Pipeline stopped 与 Source unavailable 保留独立诊断；静默事件不是已证明的硬件故障。未见且未登记的设备不建立离线状态。不用现有 Graph idle/EOF 或 Alarm 的无样本保持条件替代；实现范围与验证状态见下文。
 
-### IOT-07 实施边界（设计，尚未开放）
+### IOT-07 实施边界（限定开发 Preview，功能验证通过）
 
-**当前仅准备 Connector 观测接口与测试，不是已实现的静默功能。** 冻结 v2 已通过功能回归，但原性能门禁仍有一个单组失败，状态见 [收尾记录](PRODUCTION.md#alarm-closure-validation)。下面的决策协议、节点配置、恢复与模板必须连通并通过测试后，才开放 capability。
+**File/JetStream 的限定静默链路已通过功能、故障和旧矩阵验证，不代表 IOT-07 全范围或生产认证。** Connector 前置已提交 `cb097a4`；独立 OFC1/OFD1、File23/JetStream24、静默/恢复事件和模板已实现。静态 inventory 保持 `development_preview`，具体配置仍须通过 bind/admission，不能据此推导 MQTT、任意 DAG 或生产容量。本批 s8 的原性能门禁仍有一个单组失败，没有整批放行，见 [匹配证据](PRODUCTION.md#silence-validation)。
 
 #### 来源事实与新鲜度
 
@@ -69,6 +69,14 @@
 - MQTT live 是后续同项的独立接入：需新鲜 PINGRESP/响应期限、健康控制与输入同一有界 FIFO、断连和 ingress 丢弃/积压的保守语义；不能从 cached Ready 推导静默，更不能伪装为可持久恢复来源。在这条链路定义并测试前，不宣称 MQTT 静默已支持或 IOT-07 全范围完成。
 - key、索引、timer、登记集合、观测/journal 和输出均受预算；覆盖重建不得无界遍历并重排全部设备。保持旧热路径布局与额度，不因新节点扩大所有旧任务的 future/control。
 - 必测：从未登记、登记未出现、等时心跳、partial/Pending/backlog、慢观测/慢 Sink、路径替换/截短、broker/ownership 故障、断连不全体静默、重新覆盖宽限、静默与恢复的真实 SIGKILL/完整内容和 ID 重放、提交后不重复、旧版本拒绝、取消退款及原性能门禁。尚未执行的项不以 Connector 单测代替。
+
+#### 配置与运维
+
+模板 `deploy/pipeline-iot-silence.json` 共用 `deploy/stream-k4-telemetry.json`，将 `device_id` 用作 key，静默阈值 5 秒、最大观测间隔 1 秒、checkpoint tick 100 ms，额外登记 `device-registered`。`timing.kind:"silence"`、`clock:"paused"`；阈值至少是观测间隔的两倍，观测间隔至少容纳两个 tick。要求 `fields:[]`、`emit_first:false`、`ttl_micros:0`、`invalid:"error"`。
+
+输出仅含 key 与 `sparrow_silence_event/generation/operator/episode/time/last_seen/never_seen` 七列，HTTP 仍为带稳定 `id` 的 `data` 包装。从未出现的登记 key 的 `last_seen` 为 NULL；首次实际记录无恢复事件，只有 Silent 状态收到自己的记录才 `resumed`。状态不 TTL 遗忘，达到 `max_keys`/字节/timer 上限明确失败。
+
+`checkpoint.observed_source` 是最后成功提交（或恢复验证）的历史 cut；`view_age` 不是来源采样年龄，更不是连接当前健康。实时 Source 错误仍在原诊断中。File23/JetStream24 使用新的独立目录，不自动迁移旧时间 profile；恢复只读 CURRENT 及其一个未提交后继，旧版本拒绝该历史。仍是逐行/逐观测串行提交，受 fsync 和 required HTTP 等待限制。
 
 <a id="linear-time-completion"></a>
 ## 线性时间组合 v16/v17（2026-09-22，限定 Preview 已验收）

@@ -16,6 +16,8 @@ mod timed_iot;
 mod timed_state;
 mod alarm;
 mod alarm_iot;
+mod silence_iot;
+pub mod observed_cut;
 pub mod processing_cut;
 pub mod graph_cut;
 pub mod kernel;
@@ -56,6 +58,8 @@ mod time_completion_tests;
 mod time_graph_tests;
 #[cfg(test)]
 mod alarm_tests;
+#[cfg(test)]
+mod silence_tests;
 
 pub use aligned::{run_until, AlignedSession};
 pub use barrier::{

@@ -24,26 +24,33 @@ while IFS='|' read -r crate name mode extra || [[ -n "$crate" ]]; do
 done < "$art/expected-tests.txt"
 test "$count" -gt 0; test "$broker" -gt 0
 bins=(); i=0
+paused_names() {
+    # The new OFD1 tests share private File fixtures through this submodule,
+    # but belong to the separate exact Silence inventory, not legacy TPD1.
+    sed -n 's/^\([^[:space:]]*paused_time_[^[:space:]]*\): test$/\1/p' "$1" |
+        sed '/^paused_time_tests::observed_time_tests::/d'
+}
 while IFS=$'\t' read -r target source; do
     crate=${target//-/_}; binary="$frozen/reliable-test-binaries/$(basename "$source")"; test -x "$binary"
     "$binary" --list paused_time_ > "$art/list-$i.txt"
     "$binary" --list --ignored paused_time_ > "$art/ignored-$i.txt"
-    while IFS= read -r name; do ignored["$crate|$name"]=1; done < <(sed -n 's/^\([^[:space:]]*paused_time_[^[:space:]]*\): test$/\1/p' "$art/ignored-$i.txt")
+    while IFS= read -r name; do ignored["$crate|$name"]=1; done < <(paused_names "$art/ignored-$i.txt")
     selected=0
     while IFS= read -r name; do
         key="$crate|$name"; [[ -z ${discovered[$key]+x} ]]; discovered[$key]=1; executable[$key]=$binary; selected=1
         [[ -n ${expected[$key]+x} ]] || { printf 'unexpected test: %s\n' "$key" >&2; exit 1; }
         if [[ ${expected[$key]} == ignored ]]; then [[ -n ${ignored[$key]+x} ]]; else [[ -z ${ignored[$key]+x} ]]; fi
-    done < <(sed -n 's/^\([^[:space:]]*paused_time_[^[:space:]]*\): test$/\1/p' "$art/list-$i.txt")
+    done < <(paused_names "$art/list-$i.txt")
     if [[ "$selected" == 1 ]]; then bins+=("$binary"); fi
     i=$((i+1))
 done < <(jq -r '.[]|[.name,.exe]|@tsv' "$frozen/reliable-test-binaries.json")
 [[ ${#discovered[@]} == "$count" && ${#ignored[@]} == "$broker" ]]
 for key in "${!expected[@]}"; do [[ -n ${discovered[$key]+x} ]]; printf '%s|%s\n' "$key" "${expected[$key]}"; done | LC_ALL=C sort > "$art/verified-inventory.txt"
 for ((round=1; round<=rounds; round++)); do
-    for binary in "${bins[@]}"; do
-        printf 'ROUND=%s BINARY=%s\n' "$round" "$binary" >> "$art/regular.log"
-        "$binary" paused_time_ --test-threads=1 >> "$art/regular.log" 2>&1
+    for key in "${!expected[@]}"; do
+        if [[ ${expected[$key]} != regular ]]; then continue; fi
+        printf 'ROUND=%s TEST=%s\n' "$round" "$key" >> "$art/regular.log"
+        "${executable[$key]}" "${key#*|}" --exact --test-threads=1 >> "$art/regular.log" 2>&1
     done
     for key in "${!ignored[@]}"; do
         printf 'ROUND=%s TEST=%s\n' "$round" "$key" >> "$art/broker.log"

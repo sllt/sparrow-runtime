@@ -2,6 +2,9 @@ use crate::{request_start, PipelineSpec, Store, Supervisor};
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 
+#[path = "observed_time_tests.rs"]
+mod observed_time_tests;
+
 struct Scratch(std::path::PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -247,7 +250,8 @@ async fn wait_cut(sup: &Arc<Supervisor>, store: &Store, dir: &std::path::Path, r
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             sup.converge_once().await.unwrap();
-            assert_ne!(store.actual("time").unwrap().status, "failed");
+            let actual=store.actual("time").unwrap();
+            assert_ne!(actual.status, "failed", "{actual:?}");
             if dir.join("checkpoints/CURRENT").is_file() && snapshot(dir).ingested_rows >= rows {
                 return;
             }
@@ -266,7 +270,8 @@ async fn wait_output(
     tokio::time::timeout(Duration::from_secs(8), async {
         while outputs(http).len() < n {
             sup.converge_once().await.unwrap();
-            assert_ne!(store.actual("time").unwrap().status, "failed");
+            let actual=store.actual("time").unwrap();
+            assert_ne!(actual.status, "failed", "{actual:?}");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })

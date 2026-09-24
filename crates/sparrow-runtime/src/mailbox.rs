@@ -47,6 +47,10 @@ impl MailboxConfig {
 pub enum StreamControl {
     /// Durable source-ordered logical time; only admitted by paused-time plans.
     ProcessingTime { micros: i64 },
+    /// End of a source-observed decision, after its optional input. -1 means
+    /// no qualifying observation; otherwise this is the validated coverage
+    /// start in paused logical microseconds. Only the silence profile admits it.
+    FeedObservation { coverage_since: i64 },
     /// Full per-edge progress in a durable graph decision (watermark -1 means
     /// uninitialized; flags bit0=idle, bit1=permanent source EOF).
     GraphProgress { watermark_micros: i64, flags: u8 },

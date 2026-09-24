@@ -632,6 +632,11 @@ impl Kernel {
                 // until the first checkpoint.
                 let source_kind = if durable_graph {
                     crate::graph_cut::KIND
+                } else if req.plan.has_silence() {
+                    // Select the observed-clock family, not legacy PTC1.
+                    // The actor/store validates the concrete File/JetStream
+                    // member; both require the same epoch/shape at this point.
+                    crate::observed_cut::FILE_KIND
                 } else if ordered_time {
                     crate::processing_cut::FILE_KIND
                 } else if req.plan.edges.is_some() {
@@ -652,6 +657,7 @@ impl Kernel {
                         | crate::pipeline_checkpoint::HYSTERESIS_RELIABLE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::PAUSED_FILE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::PAUSED_COMBINED_FILE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::OBSERVED_FILE_SNAPSHOT_VERSION
                 ) && aligned
                     .acks
                     .output_sequence()
@@ -1712,6 +1718,8 @@ async fn iot_stage(ctx: &JobCtx, op: &mut crate::iot::IotOperator, rx: &mut Mail
 
 /// Time decisions and data share one FIFO. Timers are completely drained at
 /// each durable decision before the following data or checkpoint barrier.
+/// Silence is the explicit exception: time only opens its decision, input
+/// updates last-seen, and the following source fact authorizes timer draining.
 async fn timed_iot_stage(ctx:&JobCtx,op:&mut crate::iot::IotOperator,rx:&mut MailboxRx,tx:&MailboxTx) -> Result<usize> {
     let mut now = ctx.clock.now_micros();
     op.validate_processing_cut(now)?;
@@ -1746,6 +1754,16 @@ async fn timed_iot_stage(ctx:&JobCtx,op:&mut crate::iot::IotOperator,rx:&mut Mai
                         }
                     }
                     continue;
+                }
+                StreamControl::FeedObservation {coverage_since} if op.is_silence()=>{
+                    if *coverage_since < -1 {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"invalid feed coverage sentinel"));}
+                    op.observe_feed((*coverage_since!=-1).then_some(*coverage_since))?;
+                    while op.next_deadline().is_some_and(|deadline|deadline<=now) {
+                        consume_work(ctx,1).await?;
+                        if let Some(output)=op.take_timed_due(now)? {
+                            if !tx.send(output).await? {op.cleanup();return Ok(0);}
+                        }
+                    }
                 }
                 StreamControl::CheckpointBarrier {checkpoint_id}=>{
                     let aligned=ctx.aligned.as_ref().expect("timed admission");
@@ -1916,7 +1934,7 @@ async fn window_stage<const GRAPH:bool>(
                             // A failed checkpoint must abort that request, not
                             // fail the live job while reserving unused output.
                             let emission = match ctrl {
-                                StreamControl::ProcessingTime { .. } | StreamControl::GraphProgress {..} | StreamControl::GraphRoundEnd {..} => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for windows")),
+                                StreamControl::ProcessingTime { .. } | StreamControl::FeedObservation {..} | StreamControl::GraphProgress {..} | StreamControl::GraphRoundEnd {..} => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for windows")),
                                 StreamControl::EndOfInput=>{
                                     if !GRAPH{return Err(SparrowError::new(ErrorCode::InvalidArgument,"explicit EOF belongs to graph ingress"));}
                                     eof_received=true;

@@ -85,6 +85,18 @@ pub fn inventory() -> Value {
             "identity":"generation+operator+key_values+episode; reset_requires_new_namespace",
             "bounds":"48_scalar_input_fields; max_keys_and_bytes; two_timer_slots_per_key; positive_notification_max_age",
             "not_enabled":["event_time","references","lossy_or_side_outputs","periodic_reminders","offline_detection","resample","exactly_once"]},
+        "silence":{"maturity":"development_preview","certified":false,"operator":"silence",
+            "profiles":{"file":23,"jetstream":if cfg!(feature="jetstream"){json!(24)}else{json!("feature_required")}},
+            "topology":"append_only_File_or_JetStream -> silence_as_first_state -> optional_pure_transforms -> required_HTTP",
+            "clock":"paused_source_observed; input_before_current_feed_fact; downtime_paused",
+            "coverage":"fresh_caught_up_prefix_only; unknown_backlog_partial_inflight_slow_probe_or_restart_breaks_coverage; full_new_grace",
+            "device_scope":"observed_keys_union_bounded_static_registry; silence_is_not_hardware_failure",
+            "events":["silent","resumed"],"output":"keys_plus_seven_event_columns; never_seen_last_seen_is_null; stable_HTTP_output_ID",
+            "identity":"generation+operator+key_values+episode; only_an_actual_record_resumes_the_episode",
+            "durability":"OFC1_cut_and_OFD1_TIME_PENDING; persist_before_publish; required_flush_before_CURRENT_before_source_ACK",
+            "diagnostics":"observed_source_is_a_historical_committed_cut_not_current_source_health",
+            "bounds":"48_scalar_input_fields; max_keys_and_bytes; one_timer_per_key; registry_at_most_1024_keys_and_64KiB_canonical",
+            "not_enabled":["mqtt_live","http_push","upstream_transforms","other_state_nodes","dag","event_time","references","historical_replay","exactly_once"]},
         "paused_time_iot":{"maturity":"preview","certified":false,"operators":["hold_for","debounce"],
             "source_schema":"scalar_fields_only; full_input_fingerprint_before_projection",
             "sources":{"file":"v14","jetstream":if cfg!(feature="jetstream"){"v15"}else{"feature_required"}},
@@ -181,5 +193,23 @@ mod tests {
             .contains(&serde_json::json!("two_iot_ttl0")));
         assert!(value["jetstream"]["snapshot_version_scope"].as_str().unwrap()
             .contains("legacy_zero_or_count_only"));
+    }
+
+    #[test]
+    fn silence_inventory_keeps_observed_profiles_and_exclusions_explicit() {
+        let value = super::inventory();
+        let silence = &value["silence"];
+        assert_eq!(silence["certified"], false);
+        assert_eq!(silence["profiles"]["file"], 23);
+        assert_eq!(silence["profiles"]["jetstream"],
+            if cfg!(feature = "jetstream") { serde_json::json!(24) }
+            else { serde_json::json!("feature_required") });
+        assert_eq!(silence["events"], serde_json::json!(["silent", "resumed"]));
+        for excluded in ["mqtt_live", "http_push", "dag", "event_time", "references", "upstream_transforms", "other_state_nodes"] {
+            assert!(silence["not_enabled"].as_array().unwrap().contains(&serde_json::json!(excluded)));
+        }
+        assert!(silence["diagnostics"].as_str().unwrap().contains("not_current_source_health"));
+        assert_eq!(value["alarm"]["profiles"]["file"], 20);
+        assert_eq!(value["paused_time_iot"]["sources"]["file"], "v14");
     }
 }

@@ -109,6 +109,7 @@ K3/K4 历史条目按各自匹配构建解释；后续条目链接对应 Core-A/
 - **证据**：K4 候选在 Rust 1.98.0 下执行 default-members、all-targets、JetStream feature 的 release Clippy，正常命令退出 0，日志有 87 条提示；严格 `-D warnings` 被既有 `unnecessary_map_or` / `manual_div_ceil` 等提示阻断。见 K4 产物的 `clippy-v5.log` / `clippy-v3-preflight.log`。
 - **后续候选**：Core-A v4 为90条、B1 v2为95条、B2-A v4为97条，本轮K1～K4组合候选v7为100条，均是正常Clippy退出0；对应产物各自保存，不将旧的87条当作当前数量。B2-A未调用的`validate_aligned_plan_with_references`包装函数已在本轮移除；实际启动经`checkpoint_plan_with_references`和Kernel校验真实依赖，不是缺少恢复验证。
 - **2026-09-23 后续**：时间图最终 v13 普通 Clippy 退出 0、105 条 warning，包含 GraphCut 的风格简化建议；不是 `-D warnings` 通过，不为消除风格提示顺带重写已冻结逻辑。
+- **2026-09-24 静默候选**：`silence-artifacts-20260924/clippy-s7.log` 普通 Clippy 退出 0、110 条 warning；不是零告警门禁通过。新增项与既有项分别按模块处理，不以全局 allow 消除。
 - **范围**：这是各自匹配工作区的 lint 提示数，不是对应数量的已确认功能 BUG，也不是完整 release 认证。包含风格/简化建议；本批不顺带重写无关模块，避免扩大 K4 回归面。
 - **时间型 Preview（2026-09-19）**：`paused-time-artifacts-20260919/clippy-v6.log` 普通 Clippy 退出 0，共 102 条 warning。新增时间 cut 的两个迭代/整除写法建议以及 Source 枚举体积提示，不是已确认数据正确性问题；后续等价整理仍需匹配测试，不在本轮为清理样式追加 Rust 重编译。
 - **线性时间扩展（2026-09-22）**：`time-completion-artifacts-20260922/clippy-v4.log` 普通 Clippy 退出 0，103 条 warning；没有通过 `-D warnings` 的声明，也未用批量 allow 屏蔽提示。功能/故障/性能证据独立验收。
@@ -133,6 +134,7 @@ K3/K4 历史条目按各自匹配构建解释；后续条目链接对应 Core-A/
 ### OPT-012 — 时间型 profile 的逐决策提交成本
 
 - **状态/范围**：待优化；影响时间型 v14～v19。为先证明恢复正确性，当前一个输入行/EOF/空闲 tick 对应一个持久决策和完整 checkpoint，提交前不开放下一决策。它不是旧 v3～v13 高吞吐链路的退化，也不是通用多记录 WAL。功能验收通过不代表该成本已解决。
+  - 后续 Alarm v20～22、Silence v23/24 同样采用串行提交，不能继承下方 v14 的容量数字。Silence 没有输出的决策不会等待一个不存在的 HTTP 请求；实际事件的慢 ACK/重试仍阻塞提交，超出观测间隔后下一次观测必须重新建立完整宽限。保持各 profile 已声明的 time/input/fact 顺序，不能为合并提交改变已持久化事实的重放语义。
   - 2026-09-23 v18/v19 已完成限定功能验收，增加所有来源控制、确定性 Union 轮缓冲和全部 required Sink 的等待；下方 v14 数字不外推为图容量。全部来源 EOF 后仍保留逻辑 tick/barrier 服务，后续可在不损害 PT timer、取消和手动 checkpoint 的前提下减少空闲 fsync；当前不作此优化。默认 Union 整轮 256 行与半 reservation 字节上限、大图队列准入也必须计入容量选型，不能外推每算子的 key 上限。
 - **实测**：`box@100.64.0.18` 的 `paused-time-artifacts-20260919/process-v4/serialized-cost-{0,20}ms`，File、单 key、Debounce leading-only、每行一个 POST、各 100 行全部持久提交且输出 ID 连续：HTTP 无人工延迟约 **139 行/s**，人工响应延迟 20 ms 约 **34.1 行/s**。这是短程成本观察，不是容量认证或 eKuiper 对照；20 ms 是模拟响应延迟，不是真实 WAN RTT。
 - **代码确认/待量化**：每决策 journal fsync、完整 snapshot/目录 fsync、required HTTP flush 均串行；空闲也按配置频率提交 tick。更大状态、多规则、介质写入量和长稳影响还需专项量化，不能仅从本次 100 行推断具体热点占比。

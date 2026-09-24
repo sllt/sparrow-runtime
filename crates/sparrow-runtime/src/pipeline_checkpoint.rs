@@ -43,10 +43,13 @@ pub const TIME_GRAPH_ET_SNAPSHOT_VERSION: u16 = 19;
 pub const ALARM_FILE_SNAPSHOT_VERSION: u16 = 20;
 pub const ALARM_RELIABLE_SNAPSHOT_VERSION: u16 = 21;
 pub const ALARM_GRAPH_SNAPSHOT_VERSION: u16 = 22;
+pub const OBSERVED_FILE_SNAPSHOT_VERSION: u16 = 23;
+pub const OBSERVED_RELIABLE_SNAPSHOT_VERSION: u16 = 24;
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
 
 fn output_profile(kind: &str) -> bool {
-    matches!(kind,"jetstream-v1"|crate::processing_cut::FILE_KIND|crate::processing_cut::JETSTREAM_KIND)
+    matches!(kind,"jetstream-v1"|crate::processing_cut::FILE_KIND|crate::processing_cut::JETSTREAM_KIND
+        |crate::observed_cut::FILE_KIND|crate::observed_cut::JETSTREAM_KIND)
 }
 
 /// Select the outer snapshot profile from the fully validated plan and the
@@ -61,6 +64,20 @@ pub fn snapshot_version_for(
     let graph = plan.is_graph();
     let references = plan.has_references();
     let hysteresis = plan.has_hysteresis();
+
+    if plan.has_silence() {
+        if graph || references || plan.states.len() != 1 || !plan.requires_paused_time() {
+            return Err(invalid("silence requires one linear source-observed state without references"));
+        }
+        return match source_kind {
+            crate::observed_cut::FILE_KIND => Ok(OBSERVED_FILE_SNAPSHOT_VERSION),
+            crate::observed_cut::JETSTREAM_KIND => Ok(OBSERVED_RELIABLE_SNAPSHOT_VERSION),
+            _ => Err(invalid("silence requires its independent observed-time source profile")),
+        };
+    }
+    if matches!(source_kind,crate::observed_cut::FILE_KIND|crate::observed_cut::JETSTREAM_KIND) {
+        return Err(invalid("observed-time source requires silence semantics"));
+    }
 
     if plan.has_alarm() {
         if references || !plan.requires_paused_time() || plan.has_event_time_state() {
@@ -283,6 +300,7 @@ impl PipelineSnapshot {
         }
         if plan.is_time_graph() {
             if crate::graph_cut::GraphCut::unwrap(source)?.ingested!=ingested_rows {return Err(invalid("graph cut ingested count mismatch"));}
+        } else if plan.has_silence() { crate::observed_cut::ObservedCut::unwrap(source)?;
         } else if plan.requires_paused_time() { crate::processing_cut::ProcessingCut::unwrap(source)?; }
         if acks.next_output.is_some() != output_profile(&source.identity.kind) {
             return Err(invalid("reliable output cursor and source profile disagree"));
@@ -295,6 +313,7 @@ impl PipelineSnapshot {
                 | PAUSED_FILE_SNAPSHOT_VERSION | PAUSED_RELIABLE_SNAPSHOT_VERSION
                 | PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION
                 | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION
+                | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION
         )
             && acks
                 .next_output
@@ -448,6 +467,7 @@ impl PipelineSnapshot {
                 | PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION
                 | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION
                 | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION | ALARM_GRAPH_SNAPSHOT_VERSION
+                | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION
         ) {
             return Err(invalid("unsupported pipeline snapshot version"));
         }
@@ -487,6 +507,7 @@ impl PipelineSnapshot {
                 | PAUSED_FILE_SNAPSHOT_VERSION | PAUSED_RELIABLE_SNAPSHOT_VERSION
                 | PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION
                 | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION
+                | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION
         ) {
             let epoch=take(&mut bytes,16)?.try_into().unwrap();
             Some(sparrow_model::OutputSequence::new(epoch,u64_value(&mut bytes)?)
@@ -511,7 +532,7 @@ impl PipelineSnapshot {
                 | REFERENCE_RELIABLE_SNAPSHOT_VERSION
                 | REFERENCE_GRAPH_SNAPSHOT_VERSION
         ) && plan.has_references();
-        let combined_time_version = matches!(version, PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION | ALARM_GRAPH_SNAPSHOT_VERSION);
+        let combined_time_version = matches!(version, PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION | ALARM_GRAPH_SNAPSHOT_VERSION | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION);
         if !reference_stateful_version && !combined_time_version && mandatory_iot_version != plan.has_iot() {
             return Err(invalid("IoT checkpoint version/manifest mismatch"));
         }
@@ -646,7 +667,14 @@ impl PipelineSnapshot {
             if next_output.is_none_or(|output|output.epoch()!=generation) {
                 return Err(invalid("paused-time snapshot lacks stable output generation"));
             }
-            Some(crate::processing_cut::ProcessingCut::unwrap(&source)?.micros)
+            Some(if plan.has_silence() {
+                let cut = crate::observed_cut::ObservedCut::unwrap(&source)?;
+                if cut.source.record_index < ingested_rows
+                    || (cut.source.identity.kind=="jetstream-v1" && cut.source.record_index!=ingested_rows) {
+                    return Err(invalid("observed source cut/input count mismatch"));
+                }
+                cut.micros
+            } else { crate::processing_cut::ProcessingCut::unwrap(&source)?.micros })
         } else { None };
         let n = u16::from_le_bytes(take(&mut bytes, 2)?.try_into().unwrap()) as usize;
         if n != plan.states.len() {
@@ -731,7 +759,7 @@ impl StoredSnapshot {
         }
     }
     pub(crate) fn decode(bytes: &[u8], max_keys: usize, materialize: bool) -> Result<Self> {
-        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22,0])) {
+        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24,0])) {
             Ok(Self::Pipeline(PipelineSnapshot::decode_mode(
                 bytes,
                 max_keys,

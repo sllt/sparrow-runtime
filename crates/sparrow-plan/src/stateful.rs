@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sparrow_expr::Expr;
 use sparrow_model::{
     check_hop_overlap_bound, AggFn, DataType, ErrorCode, EventTimeBinding, Field, FieldId, Result,
-    Schema, SchemaId, SparrowError, WindowKind, DEFAULT_MAX_HOP_OVERLAP,
+    Scalar, Schema, SchemaId, SparrowError, WindowKind, DEFAULT_MAX_HOP_OVERLAP,
 };
 
 /// How an IoT state operator handles a row whose configured value fields are
@@ -88,13 +88,24 @@ pub enum IotTimingSpec {
         reset_on_repeat: bool,
         clock: ProcessingTimePolicy,
     },
+    /// Device silence: the state is judged from fresh source observations, not
+    /// from the presence of telemetry rows. `registered_keys` holds the static
+    /// extra key set, one row per entry in the declared `keys` order; it is
+    /// boxed only so the largest variant (Alarm) still decides the enum layout.
+    Silence {
+        duration_micros: i64,
+        max_observation_gap_micros: i64,
+        #[serde(default)]
+        registered_keys: Box<Vec<Vec<serde_json::Value>>>,
+        clock: ProcessingTimePolicy,
+    },
 }
 impl IotTimingSpec {
     pub fn kind_name(&self) -> &'static str {
-        match self { Self::HoldFor { .. } => "hold_for", Self::Debounce { .. } => "debounce", Self::Alarm { .. } => "alarm" }
+        match self { Self::HoldFor { .. } => "hold_for", Self::Debounce { .. } => "debounce", Self::Alarm { .. } => "alarm", Self::Silence { .. } => "silence" }
     }
     pub fn state_kind(&self) -> u8 {
-        match self { Self::HoldFor { .. } => 7, Self::Debounce { .. } => 8, Self::Alarm { .. } => 11 }
+        match self { Self::HoldFor { .. } => 7, Self::Debounce { .. } => 8, Self::Alarm { .. } => 11, Self::Silence { .. } => 12 }
     }
     pub fn validate(&self) -> Result<()> {
         let valid = match self {
@@ -103,9 +114,14 @@ impl IotTimingSpec {
             Self::HoldFor { duration_micros, .. } => *duration_micros > 0,
             Self::Debounce { quiet_micros, max_wait_micros, leading, trailing, .. } =>
                 *quiet_micros > 0 && *max_wait_micros >= *quiet_micros && (*leading || *trailing),
+            // A silence window must cover at least two observation gaps
+            // (`checked_mul` keeps an extreme gap from wrapping into a pass).
+            Self::Silence { duration_micros, max_observation_gap_micros, .. } =>
+                *duration_micros > 0 && *max_observation_gap_micros > 0
+                    && max_observation_gap_micros.checked_mul(2).is_some_and(|gap| gap <= *duration_micros),
         };
         if !valid { return Err(SparrowError::new(ErrorCode::InvalidArgument,
-            "timed IoT requires positive durations; debounce max_wait >= quiet and leading or trailing")); }
+            "timed IoT requires positive durations; debounce max_wait >= quiet and leading or trailing; silence duration >= 2 * max_observation_gap")); }
         Ok(())
     }
 }
@@ -162,9 +178,16 @@ pub struct IotSpec {
 impl IotSpec {
     pub fn is_alarm(&self) -> bool { matches!(self.timing, Some(IotTimingSpec::Alarm { .. })) }
 
+    pub fn is_silence(&self) -> bool { matches!(self.timing, Some(IotTimingSpec::Silence { .. })) }
+
     /// Alarm has an independently typed event schema. Legacy IoT stages keep
     /// their original row schema; callers must not silently append fields.
+    /// Silence reports the lifecycle of a *missing* telemetry record, so it
+    /// keeps only the configured keys and never fabricates the original values.
     pub fn output_schema(&self, input: &Schema) -> Result<Schema> {
+        if self.is_silence() {
+            return self.silence_output_schema(input);
+        }
         if !self.is_alarm() { return Ok(input.clone()); }
         let extra = [
             ("sparrow_alarm_event", DataType::Utf8),
@@ -189,9 +212,66 @@ impl IotSpec {
         Schema::new(SchemaId::new(schema_id), fields)
     }
 
+    /// Silenced/never-seen devices have no telemetry row to forward, so the
+    /// output keeps only the configured keys (same type, still non-nullable)
+    /// plus the lifecycle columns.
+    fn silence_output_schema(&self, input: &Schema) -> Result<Schema> {
+        let mut fields = Vec::with_capacity(self.keys.len() + silence_event_fields().len());
+        for name in &self.keys {
+            let field = input.field_by_name(name).ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("silence key field '{name}' is missing from input schema"),
+                )
+            })?;
+            if field.nullable {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    format!("silence key field '{name}' must be non-nullable"),
+                ));
+            }
+            fields.push(field.clone());
+        }
+        let mut id = input.fields.iter().map(|f| f.id.raw()).max().unwrap_or(0);
+        for (name, ty, nullable) in silence_event_fields() {
+            if input.field_by_name(name).is_some() {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    "silence output field collides with input",
+                ));
+            }
+            id = id.checked_add(1).ok_or_else(|| {
+                SparrowError::new(ErrorCode::InvalidSchema, "silence field ID overflow")
+            })?;
+            fields.push(Field::new(FieldId::new(id), name, ty, nullable));
+        }
+        let schema_id = input.id.raw().checked_add(91).ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidSchema, "silence schema ID overflow")
+        })?;
+        Schema::new(SchemaId::new(schema_id), fields)
+    }
+
     fn validate_params(&self) -> Result<()> {
         validate_names(&self.keys, "keys", 16)?;
-        validate_names(&self.fields, "fields", 16)?;
+        if self.is_silence() {
+            // Silence reports a missing record: it keeps no telemetry value and
+            // cannot silently drop an unusable one, because a dropped row would
+            // replay as silence.
+            if !self.fields.is_empty() {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "silence requires empty fields; it retains keys only",
+                ));
+            }
+            if self.invalid != InvalidValuePolicy::Error {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "silence requires invalid=error",
+                ));
+            }
+        } else {
+            validate_names(&self.fields, "fields", 16)?;
+        }
         if self.ttl_micros < 0 {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
@@ -236,6 +316,20 @@ impl IotSpec {
                 return Err(SparrowError::new(ErrorCode::TypeMismatch,
                     "alarm requires enter/clear Bool fields and at most 48 scalar input fields"));
             }
+            self.output_schema(input)?;
+        }
+        if self.is_silence() {
+            // The source fingerprint/journal keeps a conservative flat bound for
+            // the new profile; the registry is schema-typed and bounded.
+            if input.fields.len() > MAX_SILENCE_INPUT_FIELDS
+                || input.fields.iter().any(|f| !iot_value_type(&f.data_type))
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "silence requires at most 48 flat scalar input fields",
+                ));
+            }
+            self.silence_registered_keys(input)?;
             self.output_schema(input)?;
         }
         if let Some(timing) = &self.timing {
@@ -310,6 +404,121 @@ impl IotSpec {
         Ok(())
     }
 
+    /// Canonical registered key set of a silence configuration, typed by the
+    /// declared key order and the input schema.
+    ///
+    /// Values are interpreted strictly: a JSON float never stands in for an
+    /// integer key, NULL and nested/Dynamic keys are refused, `Bytes` is a byte
+    /// array, and rows are de-duplicated on the canonical key encoding (not on
+    /// their JSON spelling). The row count is bounded by
+    /// `min(max_keys, 1024)` and the complete canonical encoding by 64 KiB;
+    /// these bounds are independent of the overall computation descriptor
+    /// bound, so a registry near its own limit can still be refused at plan
+    /// admission rather than being shortened or hashed into another identity.
+    ///
+    /// This is a pure planner helper that performs its own bounds checks and
+    /// allocates only its result; a runtime caller must account the returned
+    /// rows in its bounded control workspace before publishing them.
+    pub fn silence_registered_keys(&self, input: &Schema) -> Result<Vec<Vec<Scalar>>> {
+        let Some(IotTimingSpec::Silence { registered_keys, .. }) = &self.timing else {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "silence registered keys require a silence timing configuration",
+            ));
+        };
+        let limit = self.max_keys.min(MAX_SILENCE_REGISTERED_KEYS);
+        if registered_keys.len() > limit {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!("silence registered keys exceed min(max_keys, {MAX_SILENCE_REGISTERED_KEYS})"),
+            ));
+        }
+        let mut key_types = Vec::with_capacity(self.keys.len());
+        for name in &self.keys {
+            let field = input.field_by_name(name).ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("silence key field '{name}' is missing from input schema"),
+                )
+            })?;
+            if field.nullable || !iot_key_type(&field.data_type) {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    format!("silence key field '{name}' must be a non-nullable scalar key"),
+                ));
+            }
+            key_types.push(field.data_type.clone());
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut encoded_bytes = 0usize;
+        let mut rows = Vec::with_capacity(registered_keys.len());
+        for row in registered_keys.iter() {
+            if row.len() != self.keys.len() {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "each silence registered key row must follow the declared key order and arity",
+                ));
+            }
+            // Bound the complete row BEFORE copying strings/byte arrays. A
+            // later post-encoding check would allow a huge invalid row to be
+            // materialised outside the caller's bounded workspace.
+            let mut projected = encoded_bytes;
+            for (value, ty) in row.iter().zip(&key_types) {
+                projected = projected.checked_add(silence_key_wire_len(value, ty)?).ok_or_else(|| {
+                    SparrowError::new(ErrorCode::BoundExceeded, "silence registry encoding overflow")
+                })?;
+                if projected > MAX_SILENCE_REGISTRY_BYTES {
+                    return Err(SparrowError::new(ErrorCode::BoundExceeded, "silence registered keys exceed the canonical byte bound"));
+                }
+            }
+            let mut values = Vec::with_capacity(row.len());
+            for (value, ty) in row.iter().zip(&key_types) {
+                values.push(silence_key_scalar(value, ty)?);
+            }
+            let mut encoded = Vec::new();
+            for value in &values {
+                value.encode_key(&mut encoded);
+            }
+            encoded_bytes = encoded_bytes.checked_add(encoded.len()).ok_or_else(|| {
+                SparrowError::new(ErrorCode::BoundExceeded, "silence registry encoding overflow")
+            })?;
+            if encoded_bytes > MAX_SILENCE_REGISTRY_BYTES {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    format!("silence registered keys exceed {MAX_SILENCE_REGISTRY_BYTES} canonical bytes"),
+                ));
+            }
+            if !seen.insert(encoded) {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "silence registered keys repeat one canonical key",
+                ));
+            }
+            rows.push(values);
+        }
+        Ok(rows)
+    }
+
+    /// Resident JSON configuration retained by an operator. Legal registry
+    /// values are scalar or flat byte arrays; invalid nested shapes are rejected
+    /// by validation and are never recursively walked here.
+    pub fn silence_registry_resident_bytes(&self) -> usize {
+        use serde_json::Value;
+        let Some(IotTimingSpec::Silence { registered_keys, .. }) = &self.timing else { return 0; };
+        let mut bytes = 64usize.saturating_add(registered_keys.capacity().saturating_mul(std::mem::size_of::<Vec<Value>>()));
+        for row in registered_keys.iter() {
+            bytes = bytes.saturating_add(48).saturating_add(row.capacity().saturating_mul(std::mem::size_of::<Value>()));
+            for value in row {
+                bytes = bytes.saturating_add(match value {
+                    Value::String(text) => text.capacity().saturating_add(48),
+                    Value::Array(values) => values.capacity().saturating_mul(std::mem::size_of::<Value>()).saturating_add(48),
+                    _ => 0,
+                });
+            }
+        }
+        bytes
+    }
+
     /// Stable kind tag used by the checkpoint participant registry.  These
     /// values intentionally do not overlap the WindowKind tags.
     pub fn state_kind_tag(&self) -> u8 {
@@ -321,6 +530,80 @@ impl IotSpec {
     pub fn kind_name(&self) -> &'static str {
         if let Some(timing) = &self.timing { return timing.kind_name(); }
         if self.hysteresis.is_some() { "hysteresis" } else if self.deadband.is_some() { "deadband" } else { "change_detect" }
+    }
+}
+
+/// Registered silence keys are bounded per Job even when `max_keys` is larger.
+const MAX_SILENCE_REGISTERED_KEYS: usize = 1024;
+/// Canonical encoding of one silence state's registered key set.
+const MAX_SILENCE_REGISTRY_BYTES: usize = 64 * 1024;
+/// The new profile keeps the conservative time-journal input bound.
+const MAX_SILENCE_INPUT_FIELDS: usize = 48;
+/// Lifecycle columns of a silence event, in output order.
+fn silence_event_fields() -> [(&'static str, DataType, bool); 7] {
+    [
+        ("sparrow_silence_event", DataType::Utf8, false),
+        ("sparrow_silence_generation", DataType::Utf8, false),
+        ("sparrow_silence_operator", DataType::UInt64, false),
+        ("sparrow_silence_episode", DataType::UInt64, false),
+        ("sparrow_silence_time", DataType::Int64, false),
+        ("sparrow_silence_last_seen", DataType::Int64, true),
+        ("sparrow_silence_never_seen", DataType::Bool, false),
+    ]
+}
+
+/// One registered silence key value, typed by the declared key field.
+///
+/// The conversion is deliberately strict: no NULL, no JSON float for an
+/// integer key, no string/array where a scalar was declared, and `Bytes` is an
+/// array of u8 values.
+fn silence_key_wire_len(value: &serde_json::Value, ty: &DataType) -> Result<usize> {
+    use serde_json::Value;
+    match (ty, value) {
+        (DataType::Bool, Value::Bool(_)) => Ok(2),
+        (DataType::Int64 | DataType::TimestampMicrosUTC, Value::Number(n)) if n.is_i64() => Ok(9),
+        (DataType::UInt64, Value::Number(n)) if n.is_u64() => Ok(9),
+        (DataType::Utf8, Value::String(s)) => Ok(s.len().saturating_add(5)),
+        (DataType::Bytes, Value::Array(bytes)) => {
+            if bytes.len() > MAX_SILENCE_REGISTRY_BYTES {
+                return Err(SparrowError::new(ErrorCode::BoundExceeded, "silence registered byte key exceeds bound"));
+            }
+            if bytes.iter().any(|b| b.as_u64().is_none_or(|v|v>255)) {
+                return Err(SparrowError::new(ErrorCode::TypeMismatch, "silence registered byte key requires u8 values"));
+            }
+            Ok(bytes.len().saturating_add(5))
+        }
+        _ => Err(SparrowError::new(ErrorCode::TypeMismatch, "silence registered key type mismatch")),
+    }
+}
+
+fn silence_key_scalar(value: &serde_json::Value, ty: &DataType) -> Result<Scalar> {
+    use serde_json::Value;
+    let expected = || {
+        SparrowError::new(
+            ErrorCode::TypeMismatch,
+            format!("silence registered key value is not a valid {ty} key"),
+        )
+    };
+    match (ty, value) {
+        (DataType::Bool, Value::Bool(v)) => Ok(Scalar::Bool(*v)),
+        (DataType::Int64, Value::Number(n)) if n.is_i64() => Ok(Scalar::Int64(n.as_i64().unwrap_or_default())),
+        (DataType::UInt64, Value::Number(n)) if n.is_u64() => Ok(Scalar::UInt64(n.as_u64().unwrap_or_default())),
+        (DataType::TimestampMicrosUTC, Value::Number(n)) if n.is_i64() => {
+            Ok(Scalar::TimestampMicrosUTC(n.as_i64().unwrap_or_default()))
+        }
+        (DataType::Utf8, Value::String(v)) => Ok(Scalar::utf8(v)),
+        (DataType::Bytes, Value::Array(items)) => {
+            let mut bytes = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_u64().filter(|byte| *byte <= u8::MAX as u64) {
+                    Some(byte) => bytes.push(byte as u8),
+                    None => return Err(expected()),
+                }
+            }
+            Ok(Scalar::bytes(bytes))
+        }
+        _ => Err(expected()),
     }
 }
 

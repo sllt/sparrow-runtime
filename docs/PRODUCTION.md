@@ -4,6 +4,32 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="silence-validation"></a>
+## 来源观测与静默：2026-09-24（功能通过，性能门禁未整体放行）
+
+服务器 `box@100.64.0.18`，源码与产物分别在 `/workspace/bench-compare/silence-source-20260924`、`/workspace/bench-compare/silence-artifacts-20260924`。本机不 Cargo/Go 编译；源码、测试可执行文件及每次失败证据分别保留。
+
+- `s6` 全量 **852 passed / 21 ignored**；随后补 capability 合同、在健康决策入口拒绝宽限时间溢出、拒绝空来源身份，`s7` 全量 **853 passed / 21 ignored**。忽略项不视为通过，显式 broker/旧矩阵另跑。
+- 首试 `package-p1-default/jetstream` 与独立 Go `process-g2`：默认包 2 场景、feature 包 4 场景，共 **30 次真实 SIGKILL** 通过；覆盖 File/JetStream、已观察/登记未见设备、完整输出 ID/内容重放、停机暂停与新宽限、已提交输出不重复、旧 v22 二进制拒绝且历史/CURRENT/输出不变。**p1 是 s6 代码首试，不冒充 s7 最终包证据**。
+- 首轮发现并修复 Kernel 把新静默形状按旧 paused profile 预准入的接线错误；另修旧 MQTT→HTTP 演示测试的请求数/记录数混淆（独立提交 `7f41c8d`）。测试自身的类型/时间预期、仍持有输出批次时就断言退款，以及 Go 要求恢复输入前必须额外空闲提交等错误均有原失败日志，未以改生产语义迎合错误预期。
+- `frozen-s7` 独立 no-demo **44 passed / 0 ignored**，普通 Clippy exit0、**110 条 warning**；精确脚本的合法 stub 与 19 个拒绝反例通过。脚本拒绝空 guard、丢场景、错误 profile/kind、缺强杀/重放证明、非零退出、0 项测试却 exit0、错误 hash 和重用证据目录；stub 不是实际强杀证据。
+- `package-s7-default/jetstream` + 独立 `process-g4` 来源故障验证通过：默认包 5 个独立 fixture，feature 包 7 个，共 12 个，覆盖半行及补全、新完整宽限、删除/替换/截短、慢 required HTTP、自己的 broker 真 SIGKILL/原存储恢复、删除自己的 consumer。broker 断开不会全体静默，重新连接不伪造 resumed。慢 HTTP 的 2 秒 hold 触发合法请求超时重试，完整 ID/内容一致；两个唯一事件最终接受，CURRENT 在等待 ACK 时不前进。`final1` 的原测试把重试请求误当成新事件而失败，日志保留；修正了测试 oracle，未修改生产重试语义。
+- 最终候选 `package-s8-default/jetstream`、`process-s8` 与 `final2`：两个 server 与 s7 **逐字节相同**，复用冻结 s7 的 Rust 测试，不重编译测试套件；新包纳入修正后的 Go/脚本。静默精确 **33×20=660**、来源观测 **17×20=340**（每轮含 3 个真实 broker 用例）、**30 次真实 SIGKILL**、上述 **12 个来源故障 fixture** 全部通过。重复与普通套件有交集，不累计为独立用例数。
+- Alarm **14×20**、原线性 6 场景和图 4 场景通过；完整旧矩阵通过 JSON、时间图、线性时间组合、暂停时间、参考表/迟滞、A/B1/B2、K3/K4、default/K1、K2。本批完整 K2 清单 **35 passed / 0 failed / 0 ignored**，未使用会漏选的 `--list | grep -q` 管道。旧 paused-time runner 明确排除共享 fixture 的新 observed 子模块，按旧精确清单运行，未把旧合同改成新合同。`validate-final2.exit=0`。
+
+三组原 ABBA 全部完成、样本全保留；全部正确性和输出 hash 一致，RSS 门槛通过，但第一组 fresh/0-state **0.967551 < 0.97**，所以不能宣称性能整体通过。后两组该项为 **1.067795 / 0.992523**。
+
+| 场景 | 三组合并吞吐比 | RSS 增量 | 原门禁结果 |
+|---|---:|---:|---|
+| fresh / 0 state | 0.998815 | +224 KiB | 合并通过，第一组未通过 |
+| fresh / 2 states | 1.008772 | +448 KiB | 每组及合并通过 |
+| periodic / 0 state | 1.003277 | +376 KiB | 每组及合并通过 |
+| periodic / 2 states | 0.996588 | +56 KiB | 每组及合并通过 |
+
+`performance-final2.exit=3`、`finish-final2.exit=3`，**没有整批 PASS/发行放行**；不改门槛，不用合并值覆盖失败，也未证明失败仅是测量噪声。本批作为功能已验证的限定开发 Preview 保存，性能门禁继续保留为发行阻断项。MQTT live 静默、Sampling/Resample、TLS/WAN、目标设备、24/72 h 和掉电均未因此完成。
+
+匹配证据：源码逐文件清单已在测试前后及本地工作区核对；server SHA-256 为 default `0b475da1d291bc20863e87c0da1155098af80d4c7f4bb235684871776064e2b6`、JetStream `cf846eb0ce0099335c4f8d9c812b0a05fec81bc9e2ebce25e14313c4d6102886`；driver `44c7198e5e01bb22f9fee6f14d235794684b326ebc44b7277117f77a02b1c8cd`。未 push/tag/生产部署。
+
 <a id="alarm-closure-validation"></a>
 ## 告警子批收尾：2026-09-24（功能通过，性能未放行）
 
@@ -39,7 +65,7 @@
 
 投影优化已提交为 `7eb57d7`，366 个暂存构建输入与冻结 v2 清单匹配，未夹带下一批来源观测。其后 `zero-long-v2` 按预定三组 A/A、A/B、每次 1,048,576 输入/3 正式轮、CPU affinity 4～7（非独占）完成：A/A 比值 1.011597 / 0.974333 / 1.011627，A/B 1.026605 / 1.132636 / 1.037943；正确性、hash、RSS 均通过。这支持继续调查短程测量敏感性，但不证明先前失败只有噪声，也不替代原 32k 场景门禁。
 
-并行准备的 File/JetStream 来源观测代码不属于冻结 v2，不能继承上述结果；静默算子、新持久决策与对应故障测试均尚未完成。
+File/JetStream 来源观测代码不属于冻结 v2，不能继承上述结果。后续静默算子、新持久决策与故障验证的独立状态见 [本批记录](#silence-validation)。
 
 <a id="time-graph-validation"></a>
 ## 时间型 DAG：2026-09-23 验收

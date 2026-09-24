@@ -247,8 +247,8 @@ pub(crate) fn checkpoint_pipeline(plan: &PhysicalPlan) -> Result<(Vec<u8>, usize
                 // byte-for-byte unchanged.  IoT recovery uses the complete
                 // descriptor (no RCP2 downstream-prefix relaxation).
                 w.tag(if spec.timing.is_some() { 9 } else if spec.hysteresis.is_some() { 8 } else { 6 })?; w.raw(&operator.raw().to_le_bytes())?;
-                w.iot(spec)?; w.schema(input)?;
-                if spec.is_alarm() { w.schema(output)?; }
+                w.iot(spec, input)?; w.schema(input)?;
+                if spec.is_alarm() || spec.is_silence() { w.schema(output)?; }
             }
             PhysicalStage::CaptureSink { operator, schema, .. } => {
                 w.tag(5)?; w.raw(&operator.raw().to_le_bytes())?; w.schema(schema)?;
@@ -527,10 +527,21 @@ impl Writer {
         }
     }
 
-    fn iot(&mut self, spec: &IotSpec) -> Result<()> {
+    fn iot(&mut self, spec: &IotSpec, input: &Schema) -> Result<()> {
         if let Some(timing) = &spec.timing {
             self.tag(timing.state_kind())?;
-            self.tag(1)?; // paused processing-time, source-ordered, tick before input
+            // Source-ordered paused processing time, hashed from the
+            // configuration instead of assumed, so a future clock policy cannot
+            // silently reuse these bytes. `Paused` keeps emitting 1.
+            let clock = match timing {
+                crate::IotTimingSpec::Alarm { clock, .. }
+                | crate::IotTimingSpec::HoldFor { clock, .. }
+                | crate::IotTimingSpec::Debounce { clock, .. }
+                | crate::IotTimingSpec::Silence { clock, .. } => match clock {
+                    crate::ProcessingTimePolicy::Paused => 1u8,
+                },
+            };
+            self.tag(clock)?;
             match timing {
                 crate::IotTimingSpec::Alarm { activate_micros, resolve_micros, cooldown_micros, notification_max_age_micros, .. } => {
                     for duration in [activate_micros, resolve_micros, cooldown_micros, notification_max_age_micros] {
@@ -542,6 +553,31 @@ impl Writer {
                     self.raw(&quiet_micros.to_le_bytes())?;
                     self.raw(&max_wait_micros.to_le_bytes())?;
                     self.tag(u8::from(*leading))?; self.tag(u8::from(*trailing))?; self.tag(u8::from(*reset_on_repeat))?;
+                }
+                crate::IotTimingSpec::Silence { duration_micros, max_observation_gap_micros, .. } => {
+                    self.raw(&duration_micros.to_le_bytes())?;
+                    self.raw(&max_observation_gap_micros.to_le_bytes())?;
+                    // The registry is a set: sort the canonical key encodings so
+                    // JSON row order cannot manufacture a false state mismatch,
+                    // then write every key in full. Distinct registered device
+                    // sets must never share one recovery identity, so this is
+                    // not reduced to a hash. The overall state-semantics bound
+                    // (64 KiB) applies: a registry that fills its own 64 KiB
+                    // budget and leaves no room for the surrounding schema
+                    // metadata is rejected explicitly, never shortened.
+                    let mut rows = Vec::new();
+                    for keys in spec.silence_registered_keys(input)? {
+                        let mut encoded = Vec::new();
+                        for key in &keys {
+                            key.encode_key(&mut encoded);
+                        }
+                        rows.push(encoded);
+                    }
+                    rows.sort();
+                    self.len(rows.len())?;
+                    for row in &rows {
+                        self.bytes(row)?;
+                    }
                 }
             }
         }

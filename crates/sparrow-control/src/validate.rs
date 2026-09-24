@@ -852,7 +852,9 @@ fn validate_aligned_plan_inner(
         && !(recovery.is_aligned() && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window())) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"idle_after_ms is only supported by durable time graphs"));
     }
-    if recovery.is_aligned() && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
+    if plan.has_silence() {
+        validate_observed_time_profile(spec,plan)?;
+    } else if recovery.is_aligned() && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
         validate_time_graph_profile(spec,plan)?;
     } else if plan.has_timed_iot() || (recovery.is_aligned() && plan.has_processing_time_state()) { validate_paused_time_profile(spec,plan)?; }
     if !recovery.is_aligned() {
@@ -905,6 +907,23 @@ fn validate_linear_iot_profile(spec: &PipelineSpec) -> Result<()> {
             ErrorCode::UnsupportedRestore,
             "linear aligned IoT recovery requires an explicit checkpoint_dir and HTTP sink",
         ));
+    }
+    Ok(())
+}
+
+fn validate_observed_time_profile(spec:&PipelineSpec,plan:&PhysicalPlan)->Result<()> {
+    // Transport/storage prerequisites are shared, but not the time codec or
+    // timer/input ordering. CheckpointPlan enforces Source -> Silence first.
+    validate_paused_time_profile(spec,plan)?;
+    let gap = plan.stages.iter().find_map(|stage| match stage {
+        sparrow_plan::PhysicalStage::Iot {spec,..} => match &spec.timing {
+            Some(sparrow_plan::IotTimingSpec::Silence {max_observation_gap_micros,..}) => Some(*max_observation_gap_micros),
+            _=>None,
+        }, _=>None,
+    }).ok_or_else(||SparrowError::new(ErrorCode::UnsupportedRestore,"observed time requires silence"))?;
+    let interval=spec.checkpoint.as_ref().and_then(|p|p.interval_ms).expect("validated interval");
+    if u64::try_from(gap).is_err() || interval.checked_mul(2000).is_none_or(|twice|twice>gap as u64) {
+        return Err(SparrowError::new(ErrorCode::InvalidArgument,"silence observation gap must allow at least two checkpoint intervals"));
     }
     Ok(())
 }
@@ -1078,6 +1097,28 @@ fn reference_snapshot_version(spec: &PipelineSpec, plan: &PhysicalPlan) -> Resul
 /// independent of whether the stored spec currently requests aligned recovery.
 pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
+    if plan.has_silence() {
+        let checked=validate_observed_time_profile(spec,plan);
+        let version=sparrow_plan::CheckpointPlan::from_physical(plan).ok().and_then(|p|
+            sparrow_runtime::snapshot_version_for(&p,if spec.source.kind=="jetstream" {
+                sparrow_runtime::observed_cut::JETSTREAM_KIND
+            } else { sparrow_runtime::observed_cut::FILE_KIND }).ok());
+        value["aligned_eligible"]=serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"]=serde_json::json!(checked.err().map(|e|e.message));
+        value["silence"]=serde_json::json!({"maturity":"development_preview","certified":false,
+            "snapshot_version":version,"clock":"paused_source_observed","cut_codec":"OFC1","decision_codec":"OFD1",
+            "scope":"linear_File_append_only_or_JetStream; Source_then_Silence_then_optional_Transform_then_required_HTTP",
+            "devices":"observed_keys_union_bounded_static_registry","events":["silent","resumed"],
+            "meaning":"observed_feed_silence_not_proof_of_hardware_failure",
+            "ordering":"decision_time_then_input_then_fresh_feed_fact_then_silence_then_barrier",
+            "coverage":"unknown_backlog_disconnect_or_excessive_gap_requires_full_new_grace; restart_breaks_coverage",
+            "identity":"generation+operator+configured_key_values+per_key_episode",
+            "replay":"CURRENT_plus_one_TIME_PENDING; replay_original_time_and_feed_fact",
+            "state_eviction":"none; full_state_and_timer_and_byte_bounds; no_silent_key_drop",
+            "not_enabled":["MQTT","HTTP_push","DAG","references","other_state_combinations","event_time","historical_replay"]});
+        value["recovery_risk"]=serde_json::json!("required_HTTP_may_repeat_before_CURRENT; deduplicate_by_output_identity; no_exactly_once");
+        return value;
+    }
     if plan.stages.iter().any(|s| matches!(s,sparrow_plan::PhysicalStage::Iot {spec,..} if spec.is_alarm())) {
         value["alarm"] = serde_json::json!({"maturity":"development_preview","certified":false,
             "phases":["normal","pending","active","recovering"],"events":["activate","resolve","notify"],

@@ -678,6 +678,8 @@ K2a/K2b 是同一可靠数据链路的两个工作包，确认层级、身份和
   - [ ] Debounce 自身的其他时间域与未声明依赖组合；逐决策提交的容量优化单列 OPT-012。
 - [ ] **IOT-06 — 冷却/通知限频。** 限的是通知而非上游状态观察；冷却期间恢复条件仍生效，等待通知有 bytes/数量/年龄上限。
 - [ ] **IOT-07 — 静默/离线检测。** 设备集合、最近接收、停机宽限与链路健康关联；从未出现且未登记的设备不凭空判离线，来源断连时不把全部设备判故障。
+  - Connector 瞬时前缀事实已实现（`cb097a4`）；线性 File23/JetStream24、OFC1/OFD1、已观察/登记集合和稳定 silent/resumed 的功能、故障、重复及旧矩阵验证已通过。原性能门禁仍有单组失败，保持开发 Preview/发行未放行，见 [验证记录](PRODUCTION.md#silence-validation)。不是任意 Source 或 IOT-07 全范围完成。
+  - MQTT live 静默仍待独立健康控制、输入 FIFO、PINGRESP 新鲜度、断连/丢弃/积压合同，不继承可靠来源的持久恢复保证。
 - [ ] **IOT-08 — 告警生命周期。** Normal/Pending/Active/Recovering、activate/resolve、稳定 episode ID 和重复通知语义；Active/Pending 不默认 TTL 静默淘汰，资源不足时明确 expired/unknown 或失败。
 - [ ] **IOT-09 — Sampling/Resample。** last/mean/interpolate、缺值、区间边界、输出时间和未来点需求明确；输入丢弃与输出缺值分开计数，展开与 timer 有界。
 - [ ] **TAB-01 — 参考表发布。** 不可变 revision、原子切换、依赖预览/兼容校验；运行 Job 与 checkpoint pin 所需版本，GC 不删除仍可恢复的依赖。不重做已有 as-of lookup。

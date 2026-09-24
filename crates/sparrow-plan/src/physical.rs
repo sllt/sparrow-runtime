@@ -217,6 +217,12 @@ impl PhysicalPlan {
         self.stages.iter().any(|s| matches!(s, PhysicalStage::Iot { spec, .. } if spec.timing.is_some()))
     }
 
+    /// Silence states are judged from fresh source observations, so the plan
+    /// must not hide them behind an upstream transform or another state.
+    pub fn has_silence(&self) -> bool {
+        self.stages.iter().any(|s| matches!(s, PhysicalStage::Iot { spec, .. } if spec.is_silence()))
+    }
+
     /// These states need source-ordered, durable time when recovery is aligned.
     /// Live PT/TTL jobs retain their existing restart-fresh clock contract.
     pub fn has_processing_time_state(&self) -> bool {

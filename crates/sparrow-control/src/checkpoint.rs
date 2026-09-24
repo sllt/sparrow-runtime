@@ -67,6 +67,9 @@ pub struct CheckpointStatus {
     pub state_generation: Option<[u8;16]>,
     pub downstream_semantics_changed: bool,
     pub reliable_source: Option<ReliableSourceStatus>,
+    /// Historical, successfully committed source observation; never a claim
+    /// that the live connection or any device is currently healthy.
+    pub observed_source: Option<ObservedSourceStatus>,
     pub last_success_at: Option<tokio::time::Instant>,
     pub storage: Option<sparrow_runtime::checkpoint::CheckpointInventory>,
 }
@@ -85,6 +88,16 @@ pub struct ReliableSourceStatus {
     pub ack_retries:u64,
     pub retention_available:usize,
 }
+#[derive(Clone, Debug)]
+pub struct ObservedSourceStatus {
+    pub checkpoint_id: Option<u64>,
+    pub sequence: u64,
+    pub logical_micros: i64,
+    pub source_offset: u64,
+    pub coverage_since: Option<i64>,
+    pub last_fresh: Option<i64>,
+    pub recorded_at: tokio::time::Instant,
+}
 pub struct CheckpointControl {
     pub policy: CheckpointSpec,
     pub attempt: u64,
@@ -92,6 +105,15 @@ pub struct CheckpointControl {
     gate: Arc<Semaphore>,
 }
 impl CheckpointControl {
+    pub fn observe_committed_source(&self, cut: &sparrow_runtime::observed_cut::ObservedCut) {
+        let mut state=self.state.lock().unwrap_or_else(|e|e.into_inner());
+        state.observed_source=Some(ObservedSourceStatus {
+            checkpoint_id:state.last_success_id,
+            sequence:cut.sequence,logical_micros:cut.micros,source_offset:cut.source.offset_bytes,
+            coverage_since:cut.coverage.since,last_fresh:cut.coverage.last_fresh,
+            recorded_at:tokio::time::Instant::now(),
+        });
+    }
     pub fn observe_reliable_source(&self,status:ReliableSourceStatus) {
         self.state.lock().unwrap_or_else(|e|e.into_inner()).reliable_source=Some(status);
     }

@@ -1069,3 +1069,12 @@ with `event_time > now + skew` is dropped, counted as
 - 数值恢复点在失败/进程重启后 held，需要显式 start（包括非 safe-mode）；仍恢复原 pin，不静默切 CURRENT。停机先 draining/停止 accept，再排空已准入请求与 join；新变更拒绝 503，鉴权先于 draining。
 
 这些是现有路径的修复，不新增通用多状态恢复、DAG 或可靠 outbox。`max_state_keys` 不是任意宽状态必定可运行的保证；raw helper、第三方分配及全进程 RSS 硬限制仍按原边界声明。匹配代码的 R10 测试/多 key 性能证据见 [PRODUCTION.md](PRODUCTION.md)，不沿用历史 v7 或自审数字作为本轮通过证明。
+
+## 来源观测与静默 profile（验证候选）
+
+- File23 / JetStream24 是独立线性 profile：Source → 首个 Silence 状态 → 可选纯 Transform → required HTTP；不混旧 PTC1/TPD1、ET、参考表或 DAG。旧版本和其他 profile 不得改写其历史。
+- 顺序为 **持久 OFD1 decision → ProcessingTime → 可选输入 → FeedObservation → Barrier → required flush → CURRENT → 来源 ACK**。新 Silence 先更新当前输入的最近接收，再用当前健康事实判断；不改变旧 Alarm/Window 的 timer-before-input。
+- `CaughtUp` 只是新鲜检查的来源前缀事实。积压、半行、在途、不可验证、慢观测、超出间隔的提交/背压或重启均打断覆盖，之后必须重新积累完整宽限。data-only decision 可保留未过期覆盖，但不能授权新静默事件。停机不计时，未提交后继按原时间/事实/输入摘要/输出身份重放，不重采一次 Ready。
+- 静态登记与已观察 key 共同构成设备集合；从未见且未登记的设备不存在。`silent` 每 episode 一次，只有真实输入才 `resumed`；连接恢复不是设备恢复。输出为 key 加独立事件列，登记未见时 `last_seen=NULL`，不伪造原遥测行。
+- kind12 状态、timer/key、副本、登记 JSON、工作区和输出同 Job 计费；覆盖重建是全局常数更新，不逐 key 重排；输出准入失败不能消费当前 episode。静默状态不 TTL 遗忘。宽限/时间溢出明确拒绝，不把溢出当成没有 timer。
+- `checkpoint.observed_source` 只报告已成功提交的历史 cut，不表示实时健康；状态失败仍沿用原 Source 诊断。本 profile 每决策完整持久化，受 fsync/HTTP RTT 限制，不是高吞吐链路。匹配验证与未测范围见 [本批记录](PRODUCTION.md#silence-validation)。

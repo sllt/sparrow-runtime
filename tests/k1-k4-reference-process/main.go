@@ -2648,11 +2648,21 @@ func main() {
 	completionFileOnly := flag.Bool("time-completion-file-only", false, "run v16 crash oracles on the default feature-off binary")
 	graphOnly := flag.Bool("time-graph-only", false, "run File time DAG v18/v19 multi-source/multi-Sink SIGKILL oracles")
 	alarmGraphOnly := flag.Bool("alarm-graph-only", false, "run v22 alarm graph branch/union and partial-Sink SIGKILL oracles")
+	silenceOnly := flag.Bool("silence-only", false, "run the File v23 and JetStream v24 source-observed silence SIGKILL oracles")
+	silenceFileOnly := flag.Bool("silence-file-only", false, "run the File v23 silence oracles only, without JetStream")
+	silenceFaultsOnly := flag.Bool("silence-faults-only", false, "run isolated File, required HTTP and JetStream source-observed fault oracles")
+	silenceFaultsFileOnly := flag.Bool("silence-faults-file-only", false, "run isolated File and required HTTP source-observed fault oracles")
 	alarmOnly := flag.Bool("alarm-only", false, "run v20/v21 alarm activate/resolve and episode SIGKILL oracles")
 	alarmFileOnly := flag.Bool("alarm-file-only", false, "run v20 alarm oracles on the default feature-off binary")
 	flag.Parse()
-	require(!*alarmGraphOnly || !(*pausedOnly || *pausedFileOnly || *completionOnly || *completionFileOnly || *graphOnly || *alarmOnly || *alarmFileOnly),
+	require(!(*silenceFaultsOnly || *silenceFaultsFileOnly) || !(*pausedOnly || *pausedFileOnly || *completionOnly || *completionFileOnly || *graphOnly || *alarmOnly || *alarmFileOnly || *alarmGraphOnly || *silenceOnly || *silenceFileOnly),
+		"silence fault modes cannot be combined with another scenario mode")
+	require(!*silenceFaultsOnly || !*silenceFaultsFileOnly, "silence fault modes are mutually exclusive")
+	require(!*alarmGraphOnly || !(*pausedOnly || *pausedFileOnly || *completionOnly || *completionFileOnly || *graphOnly || *alarmOnly || *alarmFileOnly || *silenceOnly || *silenceFileOnly),
 		"alarm-graph-only cannot be combined with another scenario mode")
+	require(!(*silenceOnly || *silenceFileOnly) || !(*pausedOnly || *pausedFileOnly || *completionOnly || *completionFileOnly || *graphOnly || *alarmOnly || *alarmFileOnly || *alarmGraphOnly),
+		"silence-only/silence-file-only cannot be combined with another scenario mode")
+	require(!*silenceOnly || !*silenceFileOnly, "silence-only and silence-file-only are mutually exclusive")
 	require(*serverBin != "" && *oldServerBin != "" && *natsBin != "" && *out != "",
 		"server-bin, old-server-bin, nats-server, and out are required")
 	root, err := filepath.Abs(*out)
@@ -2669,12 +2679,20 @@ func main() {
 		"server_sha256": hash(*serverBin), "old_server_sha256": hash(*oldServerBin),
 		"nats_sha256": hash(*natsBin), "driver_sha256": hash(self),
 	})
+	if *silenceFaultsOnly || *silenceFaultsFileOnly {
+		runSilenceFaultMatrix(root, *serverBin, *natsBin, *silenceFaultsFileOnly)
+		return
+	}
 	if *graphOnly {
 		runTimeGraphMatrix(root, *serverBin, *oldServerBin)
 		return
 	}
 	if *alarmGraphOnly {
 		runAlarmGraphMatrix(root, *serverBin, *oldServerBin)
+		return
+	}
+	if *silenceOnly || *silenceFileOnly {
+		runSilenceMatrix(root, *serverBin, *oldServerBin, *natsBin, *silenceFileOnly)
 		return
 	}
 	if *alarmOnly || *alarmFileOnly {

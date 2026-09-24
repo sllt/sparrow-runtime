@@ -215,7 +215,8 @@ impl IotFreeze {
             }
             let value_len = take_u16(src, "IoT freeze value arity")? as usize;
             if value_len == 0 || value_len > MAX_IOT_ARITY
-                || (header.kind == IOT_HYSTERESIS_KIND && value_len != 1) {
+                || (header.kind == IOT_HYSTERESIS_KIND && value_len != 1)
+                || (header.kind == crate::silence_iot::KIND && value_len != 3) {
                 return Err(SparrowError::new(
                     ErrorCode::BoundExceeded,
                     "IoT freeze value arity is invalid",
@@ -225,6 +226,26 @@ impl IotFreeze {
             let ttl = matches!(header.kind,9|10);
             let mut values = Vec::with_capacity(if materialize { value_len } else { 0 });
             let mut prefix = 0;
+            if header.kind == crate::silence_iot::KIND {
+                // Fixed 20-byte metadata, checked before any allocation:
+                // Bool silent | UInt64 episode | Int64 last_seen.
+                if src.len() < 20 || src[0] != 1 || src[1] > 1 || src[2] != 3 || src[11] != 2 {
+                    return Err(codec("silence state metadata encoding"));
+                }
+                let silent = src[1] != 0;
+                let episode = u64::from_le_bytes(src[3..11].try_into().unwrap());
+                let last_seen = i64::from_le_bytes(src[12..20].try_into().unwrap());
+                crate::silence_iot::validate_state(silent, episode, last_seen, now)?;
+                if materialize {
+                    values.extend([
+                        Scalar::Bool(silent),
+                        Scalar::UInt64(episode),
+                        Scalar::Int64(last_seen),
+                    ]);
+                }
+                *src = &src[20..];
+                prefix = 3;
+            }
             if header.kind == crate::alarm_iot::KIND {
                 if value_len <= crate::alarm_iot::PREFIX || src.len() < 54 {
                     return Err(codec("alarm state metadata encoding"));
@@ -314,7 +335,7 @@ impl IotFreeze {
         if slot != IOT_STATE_SLOT {
             return Err(codec("IoT freeze StateSlotId is not 3"));
         }
-        if !matches!(kind, 4..=11) {
+        if !matches!(kind, 4..=12) {
             return Err(codec("unknown IoT freeze kind"));
         }
         Ok(IotFreezeHeader {
@@ -363,7 +384,7 @@ impl IotFreeze {
         if self.slot != IOT_STATE_SLOT {
             return Err(codec("IoT freeze StateSlotId is not 3"));
         }
-        if !matches!(self.kind, 4..=11) {
+        if !matches!(self.kind, 4..=12) {
             return Err(codec("unknown IoT freeze kind"));
         }
         if max_keys == 0
@@ -377,6 +398,14 @@ impl IotFreeze {
         }
         let mut seen = BTreeSet::new();
         for entry in &self.entries {
+            if self.kind == crate::silence_iot::KIND {
+                if entry.values.len() != 3 {
+                    return Err(codec(
+                        "silence freeze requires exactly three metadata values",
+                    ));
+                }
+                crate::silence_iot::metadata(&entry.values, None)?;
+            }
             if self.kind == crate::alarm_iot::KIND { crate::alarm_iot::metadata(&entry.values, None)?; }
             if matches!(self.kind,9|10) {
                 if !matches!(entry.values.as_slice(), [Scalar::Int64(last_seen),_,..] if *last_seen >= 0) {
@@ -445,6 +474,18 @@ impl IotOperator {
         input: Schema,
         owner: Arc<MemoryOwner>,
     ) -> Result<Self> {
+        // Silence validation materialises the configured registry, so its
+        // bounded workspace is charged before `spec.validate` runs and is held
+        // across the metadata lease and the timed-state construction. Legacy
+        // shapes keep their original allocation profile.
+        let _silence_workspace = if spec.is_silence() {
+            Some(owner.acquire(
+                CreditKind::Reservation,
+                crate::silence_iot::registry_workspace(&spec, spec.keys.len()),
+            )?)
+        } else {
+            None
+        };
         spec.validate(&input)?;
         if spec.ttl_micros > 0 && owner.budget().max_timers == 0 {
             return Err(SparrowError::new(ErrorCode::ResourceExhausted, "IoT TTL requires a bounded timer slot")
@@ -889,6 +930,9 @@ impl IotOperator {
     }
 
     pub fn is_timed(&self) -> bool { self.timed.is_some() }
+    /// True when this operator is the silence state machine, so the kernel can
+    /// decide whether it owes a feed observation this round.
+    pub fn is_silence(&self) -> bool { self.spec.is_silence() }
     pub fn bind_generation(&mut self, generation: [u8; 16]) -> Result<()> {
         if let Some(timed) = &mut self.timed { timed.bind_generation(generation)?; }
         Ok(())
@@ -911,6 +955,20 @@ impl IotOperator {
         if let Some(timed) = &mut self.timed { return timed.take_due(now); }
         self.expire_one(now);
         Ok(None)
+    }
+
+    /// Accept this round's verified source coverage. Only the silence state
+    /// machine is judged from source observations, so every other IoT shape
+    /// rejects the decision instead of silently ignoring it.
+    pub fn observe_feed(&mut self, coverage_since: Option<i64>) -> Result<()> {
+        if let Some(timed) = &mut self.timed {
+            return timed.observe_feed(coverage_since);
+        }
+        Err(SparrowError::new(
+            ErrorCode::FeatureUnavailable,
+            "IoT feed coverage requires the silence state machine",
+        )
+        .at_operator(self.operator))
     }
 
     fn validate_row(&self, row: &Row) -> Result<bool> {
@@ -1310,6 +1368,10 @@ fn metadata_bytes(
         .saturating_add(key_capacity.saturating_mul(size_of::<usize>()))
         .saturating_add(field_capacity.saturating_mul(size_of::<usize>()))
         .saturating_add(size_of::<IotSpec>())
+        // The operator retains the spec's JSON registry for silence; it
+        // coexists with the converted Scalar registry inside the state machine,
+        // so both are charged. Zero for every other shape.
+        .saturating_add(crate::silence_iot::registry_json_bytes(spec))
 }
 
 // Capacity is part of retained memory, so a slice is insufficient here.
@@ -1321,7 +1383,7 @@ fn state_value_bytes(values: &Vec<Scalar>) -> usize {
         .saturating_add(values.iter().map(Scalar::resident_bytes).sum::<usize>())
 }
 
-fn encoded_key(values: &[Scalar]) -> Result<Vec<u8>> {
+pub(crate) fn encoded_key(values: &[Scalar]) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     for value in values {
         let encoded_len = value.encoded_value_len()?;

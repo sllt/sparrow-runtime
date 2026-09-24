@@ -2,15 +2,21 @@
 use crate::{
     alarm_iot::AlarmIot,
     iot::{IotFreeze, IotStats},
+    silence_iot::SilenceIot,
     timed_iot::TimedIot,
 };
-use sparrow_model::{CreditKind, MemoryLease, MemoryOwner, OperatorId, Result, RowBatch, Schema};
+use sparrow_model::{
+    CreditKind, ErrorCode, MemoryLease, MemoryOwner, OperatorId, Result, RowBatch, Schema,
+    SparrowError,
+};
 use sparrow_plan::IotSpec;
 use std::sync::Arc;
 
 enum State {
     Basic(TimedIot),
     Alarm(AlarmIot),
+    /// Boxed so the new machine does not enlarge the legacy enum layout.
+    Silence(Box<SilenceIot>),
 }
 pub(crate) struct TimedState {
     // The allocation drops before its accounting credit.
@@ -19,12 +25,20 @@ pub(crate) struct TimedState {
 }
 macro_rules! read {
     ($this:expr, $method:ident $(, $arg:expr)*) => {
-        match $this.state.as_ref() { State::Basic(s) => s.$method($($arg),*), State::Alarm(s) => s.$method($($arg),*) }
+        match $this.state.as_ref() {
+            State::Basic(s) => s.$method($($arg),*),
+            State::Alarm(s) => s.$method($($arg),*),
+            State::Silence(s) => s.$method($($arg),*),
+        }
     };
 }
 macro_rules! write {
     ($this:expr, $method:ident $(, $arg:expr)*) => {
-        match $this.state.as_mut() { State::Basic(s) => s.$method($($arg),*), State::Alarm(s) => s.$method($($arg),*) }
+        match $this.state.as_mut() {
+            State::Basic(s) => s.$method($($arg),*),
+            State::Alarm(s) => s.$method($($arg),*),
+            State::Silence(s) => s.$method($($arg),*),
+        }
     };
 }
 impl TimedState {
@@ -39,7 +53,11 @@ impl TimedState {
     ) -> Result<Self> {
         let allocation =
             owner.acquire(CreditKind::Reservation, std::mem::size_of::<State>() + 64)?;
-        let state = if spec.is_alarm() {
+        let state = if spec.is_silence() {
+            State::Silence(Box::new(SilenceIot::new(
+                operator, spec, input, owner, keys, fields,
+            )?))
+        } else if spec.is_alarm() {
             State::Alarm(AlarmIot::new(operator, spec, input, owner, keys, fields)?)
         } else {
             State::Basic(TimedIot::new(operator, spec, input, owner, keys, fields)?)
@@ -53,6 +71,17 @@ impl TimedState {
         match self.state.as_mut() {
             State::Basic(_) => Ok(()),
             State::Alarm(s) => s.bind_generation(generation),
+            State::Silence(s) => s.bind_generation(generation),
+        }
+    }
+    /// This round's verified source coverage. Only silence decisions use it.
+    pub fn observe_feed(&mut self, coverage_since: Option<i64>) -> Result<()> {
+        match self.state.as_mut() {
+            State::Basic(_) | State::Alarm(_) => Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "feed coverage requires the silence state machine",
+            )),
+            State::Silence(s) => s.observe_feed(coverage_since),
         }
     }
     pub fn set_time(&mut self, now: i64) -> Result<()> {

@@ -30,6 +30,8 @@ mod hysteresis_completion_tests;
 mod paused_time_tests;
 #[cfg(test)]
 mod alarm_tests;
+#[cfg(test)]
+mod silence_tests;
 
 pub use bind::{
     bind_dedup_linear, bind_graph, bind_linear, bind_lookup_linear, bind_window_linear,

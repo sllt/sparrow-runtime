@@ -62,7 +62,7 @@ impl StateParticipant {
     pub fn freeze_kind(&self) -> u8 {
         match self.codec {
             WINDOW_STATE_CODEC => u8::from(self.window_kind == 1),
-            IOT_STATE_CODEC if matches!(self.window_kind, 4..=11) => self.window_kind,
+            IOT_STATE_CODEC if matches!(self.window_kind, 4..=12) => self.window_kind,
             _ => 0,
         }
     }
@@ -316,6 +316,34 @@ impl CheckpointPlan {
                 "IoT checkpoint cannot be combined with event-time windows",
             ));
         }
+        // First-release silence admission: exactly one silence state directly
+        // after the source, followed only by pure transforms. An upstream
+        // filter, projection or window could hide an observation, and a second
+        // state would make the decision depend on more than the observed
+        // prefix. References, event time and side outputs are excluded too.
+        if plan.has_silence() {
+            let silence_states = plan
+                .stages
+                .iter()
+                .filter(|stage| matches!(stage, PhysicalStage::Iot { spec, .. } if spec.is_silence()))
+                .count();
+            let first_state = matches!(plan.stages.get(1), Some(PhysicalStage::Iot { spec, .. }) if spec.is_silence());
+            let trailing = plan.stages.len().saturating_sub(1);
+            let trailing_pure = (2..trailing).all(|index| matches!(plan.stages[index], PhysicalStage::Transform { .. }));
+            if !reference_tables.is_empty()
+                || !plan.side_outputs.is_empty()
+                || !plan.source_times.is_empty()
+                || plan.has_event_time_window()
+                || silence_states != 1
+                || states.len() != 1
+                || !first_state
+                || !trailing_pure
+            {
+                return Err(rejected(
+                    "silence requires a linear Source->Silence->[Transform]->Sink plan with one state, no references, no event time and no side outputs",
+                ));
+            }
+        }
         let (semantics, recovery_prefix_len) = crate::canonical::checkpoint_pipeline(plan)?;
         let has_iot = states.iter().any(|s| s.codec == IOT_STATE_CODEC);
         let result = Self {
@@ -357,11 +385,12 @@ impl CheckpointPlan {
     pub fn source_ids(&self) -> Vec<OperatorId> { if self.is_graph() { self.graph_ports().map(|p| p.0).unwrap_or_default() } else { vec![self.source] } }
     pub fn sink_ids(&self) -> Vec<OperatorId> { if self.is_graph() { self.graph_ports().map(|p| p.1).unwrap_or_default() } else { vec![self.sink] } }
     pub fn has_iot(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC) }
-    pub fn has_timed_iot(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC && matches!(s.window_kind, 7 | 8 | 11)) }
+    pub fn has_timed_iot(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC && matches!(s.window_kind, 7 | 8 | 11 | 12)) }
     pub fn has_alarm(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC && s.window_kind == 11) }
+    pub fn has_silence(&self) -> bool { self.states.iter().any(|s| s.codec == IOT_STATE_CODEC && s.window_kind == 12) }
     pub fn requires_paused_time(&self) -> bool {
         self.is_time_graph() || self.states.iter().any(|s| (s.codec == WINDOW_STATE_CODEC && s.window_kind == 0)
-            || (s.codec == IOT_STATE_CODEC && matches!(s.window_kind, 7..=11)))
+            || (s.codec == IOT_STATE_CODEC && matches!(s.window_kind, 7..=12)))
     }
     pub fn is_single_timed_iot(&self) -> bool { self.states.len() == 1 && self.has_timed_iot() }
     pub fn has_references(&self) -> bool { !self.reference_tables.is_empty() }
@@ -371,6 +400,11 @@ impl CheckpointPlan {
 
     fn from_graph(plan: &PhysicalPlan, reference_tables: Vec<ReferenceTableDependency>) -> Result<Self> {
         let time_graph=plan.has_processing_time_state() || plan.has_event_time_window();
+        if plan.has_silence() {
+            return Err(rejected(
+                "silence requires a linear Source->Silence->[Transform]->Sink plan, not a required DAG",
+            ));
+        }
         if !plan.side_outputs.is_empty() || (!time_graph && !plan.source_times.is_empty()) {return Err(rejected("side outputs and legacy source-time DAGs require restart_fresh"));}
         if time_graph && (!reference_tables.is_empty() || (plan.has_event_time_window() && plan.has_processing_time_state())
             || (!plan.has_event_time_window() && !plan.source_times.is_empty())) {
@@ -558,8 +592,8 @@ impl CheckpointPlan {
             return Err(rejected("paused-time recovery requires a linear plan without references, event time or relaxed semantics"));
         }
         if self.is_time_graph() && (self.has_references() || self.recovery_prefix_len.is_some()
-            || (self.has_event_time_state() && self.states.iter().any(|s|s.window_kind==0 || matches!(s.window_kind,7..=11)))
-            || !self.states.iter().any(|s|matches!(s.window_kind,0|2|3|7..=11))) {
+            || (self.has_event_time_state() && self.states.iter().any(|s|s.window_kind==0 || matches!(s.window_kind,7..=12)))
+            || !self.states.iter().any(|s|matches!(s.window_kind,0|2|3|7..=12))) {
             return Err(rejected("invalid durable time graph participant/domain contract"));
         }
         if self.has_references() && self.recovery_prefix_len.is_some() {
@@ -609,7 +643,7 @@ impl CheckpointPlan {
                 && matches!(state.window_kind, 0..=3);
             let valid_iot = state.codec == IOT_STATE_CODEC
                 && slot.raw() == 3
-                && matches!(state.window_kind, 4..=11);
+                && matches!(state.window_kind, 4..=12);
             if shard != 0 || !ids.insert(operator) || !(valid_window || valid_iot) {
                 return Err(rejected(
                     "duplicate/unsupported checkpoint participant, slot, shard or codec",
