@@ -107,6 +107,49 @@ impl RowBatch {
         }
     }
 
+    /// Complete positional projection fast path: this batch already holds
+    /// exactly the rows the caller's output schema describes, so it can be
+    /// re-labelled instead of re-encoded.
+    ///
+    /// Returns `None` unless the output keeps the input width with the same
+    /// `DataType` in every position and its nullability is no stricter than the
+    /// input's, the caller passes the *same* owner as this batch's lease owner
+    /// (a parent and its child are distinct, so isolation is not bypassed), the
+    /// lease is a `Reservation`, and the row count fits
+    /// `owner.budget().max_rows`.
+    ///
+    /// This does not transfer owner or credit-ledger ownership: the result
+    /// shares the original handle and the same `Arc<Vec<Row>>`, acquires no new
+    /// credit and copies no `Scalar`, while the source batch stays fully valid.
+    /// Only a caller that has proven every output position is the input position
+    /// may use it; expression identity is not verifiable here.
+    pub fn try_identity_projection(
+        &self,
+        output: Arc<Schema>,
+        owner: &Arc<MemoryOwner>,
+    ) -> Option<Self> {
+        if !Arc::ptr_eq(self.lease.owner(), owner)
+            || self.lease.kind() != CreditKind::Reservation
+            || self.num_rows() > owner.budget().max_rows
+            || self.schema.fields.len() != output.fields.len()
+        {
+            return None;
+        }
+        for (input, out) in self.schema.fields.iter().zip(&output.fields) {
+            if input.data_type != out.data_type || (input.nullable && !out.nullable) {
+                return None;
+            }
+        }
+        Some(Self {
+            schema: output,
+            rows: Arc::clone(&self.rows),
+            lease: self.lease.share(),
+            origin: self.origin,
+            output_sequence: None,
+            source_operator: None,
+        })
+    }
+
     /// Copy rows for long-lived state. Acquire destination credit BEFORE any
     /// copy. Keep a conservative 2x resident estimate to cover Vec -> Arc copy
     /// temporaries; this API deliberately overcharges until the copy is dropped.
@@ -508,3 +551,7 @@ mod tests {
         assert_eq!(owner.usage().physical_bytes, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "identity_projection_tests.rs"]
+mod identity_projection_tests;

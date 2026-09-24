@@ -25,6 +25,20 @@
 
 `performance-final1.exit=3`、`finish-final1.exit=3`，没有最终匹配 PASS 标记。此前三组短程双 Count 探测均通过，不能据此覆盖零状态失败；`zero-profile1` 是独立 CPU 诊断，不替代门禁。继续定位公共热路径，不改预算/交付保证、不删除失败样本。静默检测、重采样及目标设备、TLS/WAN、24/72h、掉电等验证仍未完成，不能把本节当作生产认证。
 
+### 后续投影候选 v2：功能通过，仍有单组性能失败
+
+验收代码已提交为 `a5997dd`；其后仅增加完整同位置 Project/Map 的共享批次快路径与回归测试。只允许相同 owner、Reservation、相同列类型/宽度和不收紧 nullable 的重命名；保持原逐行逐步 work 扣减、来源时间，并同原路径清除输出 sequence/operator。计算、重排、截列、Filter、跨 owner 等仍走原路径，未扩大预算。
+
+- 服务器窄验证：Model 57、Runtime 320；新增 10 项各重复 20 轮通过。
+- 预先固定的 `probe-p2` 三组 A/A、A/B 全部保留。候选 fresh0 三组为 1.029511 / 1.011308 / 1.006990；fresh2 为 1.018988 / 0.991342 / **0.932071**。A/A fresh0 第三组也有 0.966348 的失败，但不能据此消除候选失败；探测 exit3，不是通过。
+- 随后执行一次完整 `v2/final2` 验收：**805 passed / 18 ignored、no-demo 44 passed**，普通 Clippy exit0、104 条 warning；默认包与 p2 字节一致。Alarm 14×20、线性 6 组和图 4 组真实故障通过，旧矩阵 `validate-final2.exit=0`。
+- 节点曾短暂离线、SSH exit255；重连后取回原产物，没有将断连当测试失败或重新挑样本。Review 发现临时编排的 `binary --list | grep -q` 在 `pipefail` 下出现 BrokenPipe，可能跳过一个 K2 binary。已用先落完整清单、再选择的方式，对**同一冻结 v2** 补跑完整 K2 32 项（含显式 broker 用例），全部通过，证据为 `k2-inventory-recheck-v2`；旧记录不覆盖。
+- 原三组 ABBA 的合并比值为 fresh0 **0.999876**、fresh2 **1.073465**、periodic0 **1.001448**、periodic2 **0.995641**；RSS 增量分别 −28 / +28 / +784 / +184 KiB，全部正确性和 hash 一致。但是 fresh0 第一组 **0.892583** 未过 ≥0.97（后两组 1.006587 / 1.020496），所以 `performance-final2.exit=3`、`finish-final2.exit=3`，**没有最终整体 PASS**。合并改善不能代替每组门禁。
+
+冻结 server SHA-256：default `54647003e6688d2da5df1c42ce79e5ff10565eb71cf8b2eb6b3eb15853b73ea6`，JetStream `39432d46ec0b76699cbe4fb2bb51a5e6d7d09421b9b06259712aeab81283eca1`。仍需定位单组波动；后续固定长样本/同二进制对照仅用于诊断，不覆盖原失败或修改性能门槛。
+
+并行准备的 File/JetStream 来源观测代码不属于冻结 v2，不能继承上述结果；静默算子、新持久决策与对应故障测试均尚未完成。
+
 <a id="time-graph-validation"></a>
 ## 时间型 DAG：2026-09-23 验收
 

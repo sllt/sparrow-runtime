@@ -23,6 +23,33 @@ enum CompiledStep {
     Project(Vec<BoundExpr>),
 }
 
+/// Width of a whole-chain positional identity projection, if any.
+///
+/// Every step must be a Project of the same non-zero width, and every
+/// expression must read the column at its own output position, so applying the
+/// chain is exactly a re-labelling of the row values. Filters, computed
+/// expressions, dropped/reordered columns and mixed widths are not identity.
+/// This is a static property of the compiled chain; the batch helper only
+/// re-checks shape and ownership.
+fn identity_projection_width(steps: &[CompiledStep]) -> Option<usize> {
+    let mut width = None;
+    for step in steps {
+        let CompiledStep::Project(exprs) = step else {
+            return None;
+        };
+        if exprs.is_empty() || *width.get_or_insert(exprs.len()) != exprs.len() {
+            return None;
+        }
+        for (position, expr) in exprs.iter().enumerate() {
+            match expr {
+                BoundExpr::Column { index } if *index == position => {}
+                _ => return None,
+            }
+        }
+    }
+    width
+}
+
 #[cfg(test)]
 mod r3_tests {
     use super::*;
@@ -202,6 +229,9 @@ pub struct CompiledTransform {
     output: Option<Arc<Schema>>,
     scratch: Vec<Vec<sparrow_expr::allocation::AllocationBound>>,
     max_width: usize,
+    /// Set only when the whole chain is a positional identity projection, i.e.
+    /// the shared-batch path may re-label the rows instead of re-encoding them.
+    identity_width: Option<usize>,
 }
 
 impl CompiledTransform {
@@ -270,11 +300,25 @@ impl CompiledTransform {
             })
             .max()
             .unwrap_or(0);
+        // The compiled chain proves every expression reads its own position;
+        // the declared step schemas must also agree that no column is dropped,
+        // reordered or added at any step, so a narrow Project over a wider input
+        // is not a complete positional projection. Cold construction only.
+        let identity_width = identity_projection_width(&compiled).filter(|width| {
+            steps.iter().all(|step| match step {
+                TransformStep::Filter { .. } => false,
+                TransformStep::Project { input, output, .. }
+                | TransformStep::Map { input, output, .. } => {
+                    input.fields.len() == *width && output.fields.len() == *width
+                }
+            })
+        });
         Ok(Self {
             steps: compiled,
             output,
             scratch,
             max_width,
+            identity_width,
         })
     }
 
@@ -287,6 +331,26 @@ impl CompiledTransform {
         let Some(schema) = &self.output else {
             return Ok(None);
         };
+        // A whole-chain positional identity projection of a non-empty batch only
+        // re-labels the rows: values, layout and the input lease are reused
+        // instead of re-encoded. The helper re-checks shape/owner only, and the
+        // work quantum below is exactly the generic path's per-row/per-step
+        // quantum, so previews, remaining and failure semantics do not change.
+        if let Some(width) = self.identity_width {
+            if batch.num_rows() > 0
+                && width == batch.schema().fields.len()
+                && width == schema.fields.len()
+            {
+                if let Some(shared) = batch.try_identity_projection(Arc::clone(schema), owner) {
+                    for _row in batch.rows() {
+                        for _step in &self.steps {
+                            work.consume(width.max(1) as u64)?;
+                        }
+                    }
+                    return Ok(Some(shared));
+                }
+            }
+        }
         // One row of intermediates at a time, but admit before evaluator Vec,
         // CAST/case-mapping allocations. Credit survives builder adoption.
         let width = self.max_width.max(batch.schema().fields.len());
@@ -417,3 +481,7 @@ pub(crate) fn build_source_batches_shared(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "identity_projection_tests.rs"]
+mod identity_projection_tests;

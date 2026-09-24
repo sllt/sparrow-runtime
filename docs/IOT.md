@@ -42,6 +42,34 @@
 
 当前 `paused_time` actor 的“没有读到行”同时可能来自空输入、pull 等待或 tick 唤醒，不等于健康观测；JetStream 的连接检查在 reader 路径，不能从某个旧的 Ready 指标反推整段时间都可观察。IOT-07 必须先增加**随时间决策持久化的来源健康观测合同**：来源失败/不可判断时不作新的设备静默判断，停机不计时，未提交后继使用原健康观测重放而不是重新采样指标。Pipeline stopped 与 Source unavailable 保留独立诊断；静默事件不是已证明的硬件故障。未见且未登记的设备不建立离线状态。该前置尚未实现，不用现有 Graph idle/EOF 或 Alarm 的无样本保持条件替代。
 
+### IOT-07 实施边界（设计，尚未开放）
+
+**当前仅准备 Connector 观测接口与测试，不是已实现的静默功能。** 冻结 v2 已通过功能回归，但原性能门禁仍有一个单组失败，状态见 [收尾记录](PRODUCTION.md#alarm-closure-validation)。下面的决策协议、节点配置、恢复与模板必须连通并通过测试后，才开放 capability。
+
+#### 来源事实与新鲜度
+
+- 将**瞬时流前缀观测**与现有 `HealthState::Ready` 运维状态分开。记录来源位置、已观测尾部、观测种类；`CaughtUp` 只表示一次新鲜检查时无已知未消费输入，不证明硬件健康或整个历史区间没有短暂故障。冷 I/O 的开始/完成时间由 actor 的单调时钟测量，过慢观测不授予新鲜度。
+- File 必须新鲜校验路径与已打开句柄、常规文件、截短和既有 append-only 身份约束；未读字节、BufReader 预读、未完成行、scan-budget `Pending` 均不能伪装排空。仅持续 append-only 来源可形成排空观测；sealed/immutable 结束不代表后续仍可收心跳。有限采样 fingerprint 不是全量内容认证。
+- JetStream 保留所有 ownership、policy、range 检查；新鲜查询 stream 和本次 consumer，并与创建身份/配置比较。必须同时核对 stream 尾部、broker pending/delivered、已收到/已发布位置和未完成 pull，不能只看 `num_pending==0` 或 SDK connection state。控制面查询失败保持失败，不为了记录“不可用”而放宽 ACK 或所有权。
+- 点观测没有自动计时权。后续 actor 必须在有界最大观测间隔内建立覆盖；来源积压、未完成记录、不可验证、断连、过长提交/背压及重启都会使覆盖中断或失效。重新建立覆盖后给予**完整静默宽限**，不把未知区间两侧的时长直接相加。定时器只有当前决策带有效排空事实才可产生新的 `silent`。
+
+#### 设备状态与输出
+
+- 设备集合由已接收的合法 key 与有界静态登记集合组成；登记沿用严格类型的 canonical key 编码，重复登记拒绝，登记数量/字节计入计划和 Job 上限。动态注册管理不隐式纳入首批。
+- 首次输入建立最近接收时间，不凭空输出恢复。静默期达到阈值才输出一次 `silent` 并递增 episode；之后真正接收到该 key 的记录才输出一次 `resumed`，沿用该 episode。来源重新连接/排空自身不产生设备恢复；已 Silent 的设备在覆盖中断后仍保留原 episode，不批量重复告警。
+- 登记但从未见过的 key 需等首次有效覆盖及完整宽限，才能发 `silent`；事件保留 `last_seen=NULL`，不得伪造原 telemetry 的 non-null 温度等字段。因此采用 **key + 独立静默事件字段**，不沿用 Alarm 的完整原行输出。时间字段明确是暂停的逻辑微秒，不是设备事件时间或 UTC。
+- 完整身份包含 generation、operator、全部 key、episode，required HTTP 仍另有输出 ID。静默表示**所观测流缺少记录**；积压后收到旧遥测也只能证明收到一条流记录，不能据此声称设备此刻物理在线。
+- 新 profile 明确采用**本决策输入先更新最近接收，再按本决策健康事实判断静默**；等时心跳不先制造一次 silent/resumed。这是新静默合同，不改变现有 Alarm/HoldFor/Window 的到期先于输入顺序。任何可能隐藏心跳的上游 Filter、采样或状态节点均不在首批准入范围。
+
+#### 持久化、范围与验收
+
+- 独立 cut、decision log 和 outer profile，不能给旧 PTC1/TPD1 或 v20～22 加一个缺省健康字段就改变旧语义。决策包含逻辑时间、输入摘要、完整来源观测及覆盖边界；先持久化，再发布输入/健康控制、required 输出、CURRENT，最后才允许来源 ACK。
+- 未提交决策必须按原事实/时间/身份重放；不补采一次新的 Ready。恢复完未提交后继后，首个新决策显式打断观测覆盖，停机不计时，也不把重启当恢复通信。CURRENT 与 journal 缺失、版本/身份/序列矛盾必须拒绝。
+- 首批可靠范围是 **线性 File append-only / JetStream → 首个静默状态 → required HTTP**，默认包和 feature 包分别验收；与 ET、参考表、其他时间状态及 DAG 的组合继续拒绝。这只是 IOT-07 的一个受限交付，不自动代表所有 Source 支持。
+- MQTT live 是后续同项的独立接入：需新鲜 PINGRESP/响应期限、健康控制与输入同一有界 FIFO、断连和 ingress 丢弃/积压的保守语义；不能从 cached Ready 推导静默，更不能伪装为可持久恢复来源。在这条链路定义并测试前，不宣称 MQTT 静默已支持或 IOT-07 全范围完成。
+- key、索引、timer、登记集合、观测/journal 和输出均受预算；覆盖重建不得无界遍历并重排全部设备。保持旧热路径布局与额度，不因新节点扩大所有旧任务的 future/control。
+- 必测：从未登记、登记未出现、等时心跳、partial/Pending/backlog、慢观测/慢 Sink、路径替换/截短、broker/ownership 故障、断连不全体静默、重新覆盖宽限、静默与恢复的真实 SIGKILL/完整内容和 ID 重放、提交后不重复、旧版本拒绝、取消退款及原性能门禁。尚未执行的项不以 Connector 单测代替。
+
 <a id="linear-time-completion"></a>
 ## 线性时间组合 v16/v17（2026-09-22，限定 Preview 已验收）
 
