@@ -15,7 +15,7 @@ fn mqtt_json_kernel_http_receives_filtered_rows() {
     let live = LiveLoop::start(&kernel, 16, 16).unwrap();
     live.publish_fixture(&kernel).unwrap();
     let bodies = live
-        .wait_http_at_least(&kernel, 3, Duration::from_secs(8))
+        .wait_http_rows_at_least(&kernel, 3, Duration::from_secs(8))
         .unwrap();
     assert!(
         bodies.iter().any(|b| b.contains("\"device_id\":\"edge-a\"") && b.contains("26.2")),
@@ -23,6 +23,9 @@ fn mqtt_json_kernel_http_receives_filtered_rows() {
     );
     assert!(bodies.iter().any(|b| b.contains("edge-b") && b.contains("31")));
     assert!(bodies.iter().any(|b| b.contains("edge-c") && b.contains("29.4")));
+    let rows: Vec<serde_json::Value> = bodies.iter().flat_map(|body|
+        serde_json::from_str::<Vec<serde_json::Value>>(body).unwrap()).collect();
+    assert_eq!(rows.len(),3,"request batching must not hide missing/extra rows");
     live.stop(&kernel).unwrap();
     assert_eq!(kernel.live_tasks(), 0);
 }

@@ -53,7 +53,7 @@ fn run() -> sparrow_model::Result<()> {
 
     println!("\n[3] publish 6 JSON sensor events; filter temperature > 25");
     live.publish_fixture(&kernel)?;
-    let bodies = live.wait_http_at_least(&kernel, 3, Duration::from_secs(5))?;
+    let bodies = live.wait_http_rows_at_least(&kernel, 3, Duration::from_secs(5))?;
     println!("    HTTP received {} bodies (expect 3 hot rows first)", bodies.len());
     for (i, body) in bodies.iter().take(3).enumerate() {
         println!("    {i}: {body}");

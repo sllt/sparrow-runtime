@@ -88,6 +88,29 @@ pub struct LiveLoop {
 }
 
 #[cfg(feature = "demo-io")]
+fn captured_row_count(bodies: &[String]) -> Result<usize> {
+    bodies.iter().try_fold(0usize, |count, body| {
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(body)
+            .map_err(|_|SparrowError::new(sparrow_model::ErrorCode::CodecViolation, "HTTP capture must contain JSON object rows"))?;
+        count.checked_add(rows.len()).ok_or_else(||SparrowError::new(
+            sparrow_model::ErrorCode::BoundExceeded, "HTTP capture row count overflow"))
+    })
+}
+
+#[cfg(all(test, feature = "demo-io"))]
+mod capture_row_tests {
+    #[test]
+    fn captured_rows_do_not_depend_on_http_batch_boundaries() {
+        for bodies in [vec!["[{\"v\":1},{\"v\":2},{\"v\":3}]"],
+            vec!["[{\"v\":1}]", "[{\"v\":2},{\"v\":3}]"]] {
+            assert_eq!(super::captured_row_count(&bodies.into_iter().map(str::to_owned).collect::<Vec<_>>()).unwrap(),3);
+        }
+        assert!(super::captured_row_count(&["{\"v\":1}".into()]).is_err());
+        assert!(super::captured_row_count(&["[1]".into()]).is_err());
+    }
+}
+
+#[cfg(feature = "demo-io")]
 impl LiveLoop {
     pub fn start(kernel: &Kernel, inbox: usize, outbox: usize) -> Result<Self> {
         kernel.block_on(Self::start_async(kernel, inbox, outbox))
@@ -195,19 +218,30 @@ impl LiveLoop {
         n: usize,
         timeout: Duration,
     ) -> Result<Vec<String>> {
+        self.wait_http_count(kernel, n, timeout, false)
+    }
+
+    /// Wait for logical rows, not requests: one kernel batch may contain more
+    /// than one row even when HTTP coalescing is disabled.
+    pub fn wait_http_rows_at_least(&self, kernel: &Kernel, n: usize, timeout: Duration) -> Result<Vec<String>> {
+        self.wait_http_count(kernel, n, timeout, true)
+    }
+
+    fn wait_http_count(&self, kernel: &Kernel, n: usize, timeout: Duration, rows: bool) -> Result<Vec<String>> {
         kernel.block_on(async {
             let start = std::time::Instant::now();
             loop {
                 let bodies = self.http.body_strings();
-                if bodies.len() >= n {
+                let count = if rows { captured_row_count(&bodies)? } else { bodies.len() };
+                if count >= n {
                     return Ok(bodies);
                 }
                 if start.elapsed() > timeout {
                     return Err(SparrowError::new(
                         sparrow_model::ErrorCode::Internal,
                         format!(
-                            "HTTP capture has {} bodies, expected >= {n} ({})",
-                            bodies.len(),
+                            "HTTP capture has {count} {}, expected >= {n} ({})",
+                            if rows { "rows" } else { "bodies" },
                             self.diag.snapshot()
                         ),
                     ));
