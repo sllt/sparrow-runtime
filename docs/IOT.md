@@ -38,6 +38,8 @@
 
 ### 下一步静默检测的前置边界
 
+2026-09-24 收尾候选 `alarm-closure-artifacts-20260924` / v1 已通过 795/18 ignored、独立 no-demo 44、Alarm 14×20、线性 6 个进程场景及完整旧矩阵。新增 v22 **双 Alarm→Union**、**单 Alarm→双 required Sink** 两种图，在 default/JetStream 两个包分别执行真实 SIGKILL；核验两端独立 ID/完整内容重放、activate/resolve 同 episode、停机暂停、提交后不重复及旧 v19 二进制拒绝。两个包测试的来源都是 File，不代表 JetStream 来源图已开放。验收脚本另通过 1 个合法 stub 与 8 个拒绝反例，stub 不作为真实进程证据。完整原三组 ABBA 的双 Count 已通过，但零状态第 2/3 组及合并未过，合并 0.885299；失败保留，**整批仍未放行**，不能用短程双 Count 探测代替。见 [本次证据](PRODUCTION.md#alarm-closure-validation)。
+
 当前 `paused_time` actor 的“没有读到行”同时可能来自空输入、pull 等待或 tick 唤醒，不等于健康观测；JetStream 的连接检查在 reader 路径，不能从某个旧的 Ready 指标反推整段时间都可观察。IOT-07 必须先增加**随时间决策持久化的来源健康观测合同**：来源失败/不可判断时不作新的设备静默判断，停机不计时，未提交后继使用原健康观测重放而不是重新采样指标。Pipeline stopped 与 Source unavailable 保留独立诊断；静默事件不是已证明的硬件故障。未见且未登记的设备不建立离线状态。该前置尚未实现，不用现有 Graph idle/EOF 或 Alarm 的无样本保持条件替代。
 
 <a id="linear-time-completion"></a>

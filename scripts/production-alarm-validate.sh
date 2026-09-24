@@ -49,6 +49,22 @@ for variant in default jetstream; do
         and all(.old_profile_guards[];.checked and .history_preserved and .current_preserved and .output_preserved)' \
         "$art/$variant-process/summary.json" >/dev/null
 done
+# v22 File alarm-graph SIGKILL acceptance runs in its own fail-closed script.
+# There is no fallback and no skip: a missing marker, a non-zero child exit or a
+# summary that drifts from the reviewed schema aborts this run before the
+# summary claims graph coverage.
+graph="$art/graph-process"
+if ! bash "$root/scripts/production-alarm-graph-validate.sh" "$graph" "$default" "$js" "$driver" "$old" "$nats" \
+        > "$art/alarm-graph.log" 2>&1; then
+    tail -n 80 "$art/alarm-graph.log" >&2
+    exit 1
+fi
+test "$(sed -n '1p' "$graph/exit")" -eq 0
+grep -q '^ALARM_GRAPH_PROCESS_OK$' "$art/alarm-graph.log"
+jq -e '.valid and .process_scenarios==4 and .crash_scenarios==4 and .per_package_scenarios==2
+    and .snapshot_versions==[22] and (.graph_process_sigkill==true) and .source_scope=="file"
+    and (.exactly_once_claimed==false) and (.soak==false) and (.certified==false)' \
+    "$graph/summary.json" >/dev/null
 jq -n --argjson rounds "$rounds" --argjson count "$count" \
-    '{valid:true,rounds:$rounds,tests_per_round:$count,process_scenarios:6,graph_process_sigkill:false,soak:false,certified:false}' > "$art/summary.json"
+    '{valid:true,rounds:$rounds,tests_per_round:$count,process_scenarios:10,linear_process_scenarios:6,graph_process_scenarios:4,graph_process_sigkill:true,soak:false,certified:false}' > "$art/summary.json"
 printf 'ALARM_FROZEN_AND_PROCESS_OK\n'

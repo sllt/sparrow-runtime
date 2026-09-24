@@ -4,6 +4,27 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="alarm-closure-validation"></a>
+## 告警子批收尾：2026-09-24（功能通过，性能未放行）
+
+代码基线 `06243b3`（包含 `53e06d2` 的固定大小 Window 单次额度预留），新增验收代码另行提交。服务器 `box@100.64.0.18`，证据根为 `/workspace/bench-compare/alarm-closure-artifacts-20260924`；候选 `package-v1-default/jetstream`、`frozen-v1`、`process-v1`。本机未 Cargo/Go 编译。Rust 与 Go/脚本分阶段构建，Rust/Cargo/deploy/fixture 输入在前后逐文件核对；最终两包拥有同一 source manifest。
+
+- Rust **795 passed / 18 ignored**，独立 no-demo **44 passed / 0 ignored**；普通 Clippy 退出 0、105 条 warning，不宣称零告警。
+- Alarm 精确 **14×20**、原线性进程 **6 组**通过；新增 **2 类告警图×2 个生产包=4 组**通过。覆盖双 Alarm 分支合流和双 required HTTP 的部分成功，实际检查 SIGKILL 信号、停机暂停、每 Sink 的独立输出命名空间/连续序号、完整 ID/内容重放、activate/resolve 同 episode、提交后不重复、旧 v19 reader 拒绝且历史/CURRENT/输出不变。两个包均使用 File 来源图，不宣称 JetStream 来源图可恢复。
+- 脚本 `scripts/production-alarm-graph-validate.sh` 纳入主 Alarm 验收；`tests/alarm-graph/runner-contract.sh` 的合法 stub 和 8 个拒绝反例通过，仅证明脚本不误报，不代替真实进程测试。
+- 完整旧矩阵通过：JSON、时间图、线性时间组合、暂停时间、静态表/迟滞、A/B1/B2、K3/K4、default/K1、K2 broker 与进程。`validate-final1.exit=0`。
+
+原三组 ABBA 未改参数/门槛，全部输出正确且 hash 一致，但**性能整体失败**：
+
+| 场景 | 三组合并吞吐比 | RSS 增量 | 结果 |
+|---|---:|---:|---|
+| fresh / 0 state | 0.885299 | −64 KiB | 未通过；第 2/3 组为 0.872214 / 0.908143 |
+| fresh / 2 states | 1.029827 | +224 KiB | 每组及合并通过 |
+| periodic / 0 state | 1.005985 | +396 KiB | 每组及合并通过 |
+| periodic / 2 states | 0.998225 | +432 KiB | 每组及合并通过 |
+
+`performance-final1.exit=3`、`finish-final1.exit=3`，没有最终匹配 PASS 标记。此前三组短程双 Count 探测均通过，不能据此覆盖零状态失败；`zero-profile1` 是独立 CPU 诊断，不替代门禁。继续定位公共热路径，不改预算/交付保证、不删除失败样本。静默检测、重采样及目标设备、TLS/WAN、24/72h、掉电等验证仍未完成，不能把本节当作生产认证。
+
 <a id="time-graph-validation"></a>
 ## 时间型 DAG：2026-09-23 验收
 

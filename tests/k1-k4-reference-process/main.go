@@ -2647,9 +2647,12 @@ func main() {
 	completionOnly := flag.Bool("time-completion-only", false, "run v16/v17 PT, TTL and multi-state crash oracles")
 	completionFileOnly := flag.Bool("time-completion-file-only", false, "run v16 crash oracles on the default feature-off binary")
 	graphOnly := flag.Bool("time-graph-only", false, "run File time DAG v18/v19 multi-source/multi-Sink SIGKILL oracles")
+	alarmGraphOnly := flag.Bool("alarm-graph-only", false, "run v22 alarm graph branch/union and partial-Sink SIGKILL oracles")
 	alarmOnly := flag.Bool("alarm-only", false, "run v20/v21 alarm activate/resolve and episode SIGKILL oracles")
 	alarmFileOnly := flag.Bool("alarm-file-only", false, "run v20 alarm oracles on the default feature-off binary")
 	flag.Parse()
+	require(!*alarmGraphOnly || !(*pausedOnly || *pausedFileOnly || *completionOnly || *completionFileOnly || *graphOnly || *alarmOnly || *alarmFileOnly),
+		"alarm-graph-only cannot be combined with another scenario mode")
 	require(*serverBin != "" && *oldServerBin != "" && *natsBin != "" && *out != "",
 		"server-bin, old-server-bin, nats-server, and out are required")
 	root, err := filepath.Abs(*out)
@@ -2668,6 +2671,10 @@ func main() {
 	})
 	if *graphOnly {
 		runTimeGraphMatrix(root, *serverBin, *oldServerBin)
+		return
+	}
+	if *alarmGraphOnly {
+		runAlarmGraphMatrix(root, *serverBin, *oldServerBin)
 		return
 	}
 	if *alarmOnly || *alarmFileOnly {

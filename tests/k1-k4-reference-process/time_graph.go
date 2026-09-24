@@ -90,7 +90,7 @@ func decodeGraphCut(path string) graphCut {
 	require(r.offset == len(raw), "trailing graph cut")
 	return cut
 }
-func currentGraphCut(dir string) graphCut {
+func currentGraphCut(dir string, requiredVersion ...uint16) graphCut {
 	current, err := os.ReadFile(filepath.Join(dir, "CURRENT"))
 	must(err)
 	id, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(string(current)), "chk-"), 10, 64)
@@ -98,7 +98,14 @@ func currentGraphCut(dir string) graphCut {
 	raw := snapshotPayload(dir, id)
 	require(len(raw) >= 38, "graph snapshot header")
 	version := binary.LittleEndian.Uint16(raw[4:6])
-	require(version == 18 || version == 19, "graph snapshot version")
+	if len(requiredVersion) == 0 {
+		require(version == 18 || version == 19, "graph snapshot version")
+	} else {
+		// Only an explicit alarm-graph caller may widen the accepted profile;
+		// the v18/v19 call sites stay exactly as strict as before.
+		require(len(requiredVersion) == 1 && requiredVersion[0] == 22 && version == 22,
+			"alarm graph snapshot version")
+	}
 	r := graphReader{raw: raw, offset: 38}
 	require(r.text() == "time-file-dag-v1", "graph source profile")
 	cut := decodeGraphCut(r.text())
@@ -107,7 +114,7 @@ func currentGraphCut(dir string) graphCut {
 	require(cut.Ingested == binary.LittleEndian.Uint64(raw[14:22]), "graph ingested mirror")
 	return cut
 }
-func waitGraphCut(dir string, condition func(graphCut) bool) graphCut {
+func waitGraphCut(dir string, condition func(graphCut) bool, requiredVersion ...uint16) graphCut {
 	var cut graphCut
 	wait("committed graph cut", func() (ready bool) {
 		defer func() {
@@ -119,7 +126,7 @@ func waitGraphCut(dir string, condition func(graphCut) bool) graphCut {
 				panic(problem)
 			}
 		}()
-		cut = currentGraphCut(dir)
+		cut = currentGraphCut(dir, requiredVersion...)
 		return condition(cut)
 	})
 	return cut
