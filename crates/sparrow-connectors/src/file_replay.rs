@@ -24,6 +24,9 @@ const PREFIX: usize = 4096;
 const MAX_RECORD: usize = 64 * 1024;
 const MAX_PENDING: usize = MAX_RECORD;
 
+#[path = "file_feed.rs"]
+mod feed;
+
 /// How the file may change after a checkpoint cut (R28), and what EOF
 /// means for event-time watermarks (N5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

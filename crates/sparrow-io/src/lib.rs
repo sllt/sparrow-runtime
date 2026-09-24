@@ -10,6 +10,7 @@ use sparrow_model::{
 use sparrow_model::error::ErrorCode;
 
 pub mod replay;
+pub mod feed;
 #[cfg(feature = "observation")]
 pub mod observed;
 

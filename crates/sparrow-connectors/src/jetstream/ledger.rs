@@ -75,6 +75,14 @@ impl<T> DeliveryLedger<T> {
     pub fn published(&self) -> u64 {
         self.published
     }
+    /// Highest new source sequence admitted, initially the restored cut.
+    pub fn received(&self) -> u64 {
+        self.received
+    }
+    /// Highest consumer delivery sequence observed by this attempt.
+    pub fn delivered(&self) -> u64 {
+        self.delivered
+    }
     pub fn committed(&self) -> u64 {
         self.committed
     }

@@ -161,7 +161,11 @@ impl Connection {
             .client_capacity(COMMAND_CAPACITY)
             .read_buffer_capacity(u16::MAX)
             .ignore_discovered_servers()
-            .max_reconnects(0)
+            // async-nats 0.50 maps zero to None (= unlimited), not "off".
+            // Bound SDK attempts to one pass over the configured endpoints.
+            // Any discontinuity still makes this reader sticky-unhealthy;
+            // a successful SDK reconnect never authorizes source continuation.
+            .max_reconnects(config.servers.len())
             .ping_interval(Duration::from_secs(1))
             .request_timeout(Some(REQUEST_TIMEOUT))
             .connection_timeout(REQUEST_TIMEOUT)

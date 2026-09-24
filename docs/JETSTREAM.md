@@ -2,6 +2,10 @@
 
 状态：实现与验证中，未发布、未部署；不能沿用 R11 的长稳或性能结论。设计决定见 [ADR-004](adr/004-jetstream-reliability.md)。默认构建仍不包含 NATS SDK。
 
+**2026-09-24 连接退出修复与来源观测前置：** 实际锁定的 `async-nats 0.50.0` 将 `max_reconnects(0)` 转为无限尝试，原配置并未禁用重连。真实 broker 停止测试复现了关闭等待超时、SDK 额度仍持有的问题。现改为最多与已配置端点数量相同的 SDK 尝试（1～4）；协议连续性丢失仍使本 reader 永久 unhealthy，即使 SDK 重连成功也不授权继续应用输入。关闭仍等待真实 SDK 退出，不以提前退款绕过 guard/目录独占。单节点 broker 停止后的退出与退款已重复验证；不把这项修复解释为透明恢复或 WAN 认证。
+
+新增 `Reader::observe_feed` 是显式调用的**瞬时前缀观测**：fresh ownership/policy、consumer 创建身份/完整配置、stream head、broker pending/delivered/waiting 和本地 received/published/pull 联合校验；不靠 cached Ready，不改变 ACK、Source cut 或自动触发静默。`get_info()` 只读取新事实，不覆盖用于身份比较的创建期 cache。对应 File 观测检查活跃句柄、路径/截短、预读和未完成行。服务器 `feed-observation-artifacts-20260924/f3`：Connector 99 passed / 10 ignored、IO 17 passed，新增 17 项×20 轮（每轮含 3 项显式真实 broker 测试）、该 Connector binary 内全部 16 项 K2 和 no-default 编译检查通过，源码 hash 匹配。旧 f1 编译失败、f2 断连失败保留。这里仅验证 Connector 前置；持久健康决策、静默节点及其端到端恢复仍在后续实现，不宣称 IOT-07 完成。
+
 **2026-09-17 核心完善增量：** 独立 v10 profile 已接入精确静态参考表＋0～2 Count/IoT(TTL0)，无引用迟滞使用独立 v13。真实 broker/HTTP 进程已验证 Lookup→Count、Lookup→IoT、迟滞的恢复和稳定输出 ID，CURRENT 失败不推进 ACK；旧 v4/v7 不混写、不升级。完整证据见 [组合验收](PRODUCTION.md#k1-k4-reference-validation)。仍不开放时间状态、JetStream DAG、历史 replay/fork 或生产认证；下方 Core-A/v7 数字保留为历史证据。
 
 ## 核心增强 A：IoT 可靠组合

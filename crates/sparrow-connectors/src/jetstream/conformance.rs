@@ -15,6 +15,8 @@ use std::{
     time::Duration,
 };
 
+#[path = "feed_conformance.rs"] mod feed_conformance;
+
 static NEXT: AtomicUsize = AtomicUsize::new(1);
 struct Broker {
     process: Option<Child>,

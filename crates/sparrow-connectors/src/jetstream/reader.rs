@@ -15,6 +15,9 @@ use sparrow_model::{
 };
 use std::{sync::Arc, time::Duration};
 
+#[path = "feed.rs"]
+mod feed;
+
 #[derive(Clone, Debug)]
 pub struct ReaderConfig {
     pub namespace: String,
