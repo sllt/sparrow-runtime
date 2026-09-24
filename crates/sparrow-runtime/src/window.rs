@@ -81,6 +81,41 @@ pub struct WindowOperator {
     accumulator_scratch_lease: Option<sparrow_model::MemoryLease>,
 }
 
+/// Widest input schema the fixed-size-accumulator credit fast path handles on
+/// the stack. Above this the generic path keeps its heap `Vec<usize>`.
+const WORKING_CREDIT_MAX_FIELDS: usize = 64;
+
+/// Fixed-size accumulator fast path: max resident bytes per column in a stack
+/// array, folded once over the aggregate `allocation` bound.
+///
+/// `#[inline(never)]` keeps the bounded `[usize; 64]` column array (512 bytes on
+/// 64-bit targets) out of `working_credit`'s frame (and out of any async state
+/// machine inlining the caller). No heap allocation;
+/// `AllocationBound::estimate` only reads the prebuilt bound tree.
+#[inline(never)]
+fn fixed_size_column_estimate(
+    allocation: &[sparrow_expr::allocation::AllocationBound],
+    batch: &RowBatch,
+    fields: usize,
+) -> (usize, usize) {
+    debug_assert!(fields <= WORKING_CREDIT_MAX_FIELDS);
+    let mut columns = [0usize; WORKING_CREDIT_MAX_FIELDS];
+    let columns = &mut columns[..fields];
+    for row in batch.rows() {
+        for (size, value) in columns.iter_mut().zip(&row.values) {
+            *size = (*size).max(value.resident_bytes());
+        }
+    }
+    let mut allocated = 0usize;
+    let mut values = 0usize;
+    for bound in allocation {
+        let e = bound.estimate(columns);
+        allocated = allocated.saturating_add(e.allocated);
+        values = values.saturating_add(e.value);
+    }
+    (allocated, values)
+}
+
 impl WindowOperator {
     pub(crate) fn is_processing_time(&self)->bool {matches!(self.spec.kind,WindowKind::TumblingProcessingTime {..})}
     pub(crate) fn finish_input(&mut self)->Result<WindowEmission> {
@@ -272,6 +307,23 @@ impl WindowOperator {
             )
             .saturating_add((self.spec.max_overlap as usize).saturating_mul(32))
             .saturating_add(256);
+        // Fixed-size accumulators need no retained variable-value scratch
+        // (`touched` stays zero; only Min/Max carry variable-value bytes), so
+        // the whole reservation is known before touching the owner: scan the
+        // columns on the stack, fold the bound once, then take a single
+        // reservation. `base` and the final saturating formula are unchanged,
+        // including the `columns` term in `base`, even though the scan no
+        // longer heap-allocates.
+        if !self.variable_accs && self.input.fields.len() <= WORKING_CREDIT_MAX_FIELDS {
+            if let Some(batch) = batch {
+                let (allocation, values) =
+                    fixed_size_column_estimate(&self.allocation, batch, self.input.fields.len());
+                let total = base
+                    .saturating_add(allocation.saturating_mul(2))
+                    .saturating_add(values.saturating_mul(rows).saturating_mul(4));
+                return self.owner.acquire(CreditKind::Reservation, total);
+            }
+        }
         let mut lease = self.owner.acquire(CreditKind::Reservation, base)?;
         if let Some(batch) = batch {
             let mut columns = vec![0usize; self.input.fields.len()];
@@ -2136,3 +2188,7 @@ mod review_tests {
         assert_eq!(w.key_count(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "window_credit_tests.rs"]
+mod credit_tests;
