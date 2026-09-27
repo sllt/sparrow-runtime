@@ -17,6 +17,7 @@ pub mod explain;
 pub mod expr_spec;
 pub mod graph;
 pub mod physical;
+pub mod resample;
 pub mod stateful;
 #[cfg(test)]
 mod k3_tests;
@@ -44,13 +45,14 @@ pub use explain::{
 pub use graph::{GraphSpec, GRAPH_SPEC_VERSION};
 pub use checkpoint::{CheckpointPlan, ParticipantId, ReferenceTableDependency, StateParticipant};
 pub use physical::{physicalize, PhysicalPlan, PhysicalStage, PlanOptions, TransformStep};
+pub use resample::{ResampleMode, ResampleSpec};
 pub use compat::{
     decide_state_reuse, expr_fingerprint, where_before_window, where_before_window_physical,
     PlanLayout, StateReuse,
 };
 pub use stateful::{
     agg_result_type, lookup_output_schema, window_output_schema, AggCall, DeadbandBaseline,
-    DeadbandMode, DeadbandSpec, DedupSpec, HysteresisDirection, HysteresisSpec, InvalidValuePolicy, IotSpec, IotTimingSpec, ProcessingTimePolicy, LookupSpec, WindowSpec,
+    DeadbandMode, DeadbandSpec, DedupSpec, HysteresisDirection, HysteresisSpec, InvalidValuePolicy, IotSpec, IotTimingSpec, ProcessingTimePolicy, SilenceClockPolicy, LookupSpec, WindowSpec,
 };
 
 /// M0 linear stub, still used by the sync `LinearExecutor`.

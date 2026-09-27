@@ -133,6 +133,23 @@ mod r3_tests {
     }
 
     #[test]
+    fn actions_builtin_fusion_equivalence_and_allocation_refund() {
+        let schema=Schema::new(1,vec![Field::new(1,"text",DataType::Utf8,false)]).unwrap();
+        let call=|name:&str,args:Vec<Expr>|Expr::Call{name:name.into(),args};
+        let col=||Expr::Column{name:"text".into()};let literal=|s:&str|Expr::Literal(Scalar::utf8(s));
+        let first=TransformStep::Project{operator:1.into(),input:schema.clone(),output:schema.clone(),exprs:vec![call("replace",vec![col(),literal("x"),literal("测试")])]};
+        let second=TransformStep::Project{operator:2.into(),input:schema.clone(),output:schema.clone(),exprs:vec![call("concat",vec![col(),literal("!")])]};
+        let owner=MemoryOwner::new(ResourceBudget::compact());let input=build_source_batches(schema.clone(),vec![Row{values:vec![Scalar::utf8("x🙂x")]}],&owner,1).unwrap();
+        let fused=CompiledTransform::new(&[first.clone(),second.clone()]).unwrap().apply(&input[0],&owner,&WorkBudget::new(1000)).unwrap().unwrap();
+        let middle=CompiledTransform::new(&[first]).unwrap().apply(&input[0],&owner,&WorkBudget::new(1000)).unwrap().unwrap();
+        let separate=CompiledTransform::new(&[second]).unwrap().apply(&middle,&owner,&WorkBudget::new(1000)).unwrap().unwrap();
+        assert_eq!(fused.rows(),separate.rows());assert_eq!(fused.rows()[0].values,vec![Scalar::utf8("测试🙂测试!")]);drop((fused,middle,separate,input));assert_eq!(owner.usage().physical_bytes,0);
+        let owner=MemoryOwner::new(ResourceBudget{reservation_bytes:4096,..ResourceBudget::compact()});let input=build_source_batches(schema.clone(),vec![Row{values:vec![Scalar::utf8("xxx")]}],&owner,1).unwrap();
+        let project=TransformStep::Project{operator:1.into(),input:schema.clone(),output:schema,exprs:vec![call("replace",vec![col(),literal("x"),literal(&"y".repeat(10000))])]};
+        let before=owner.usage().physical_bytes;let error=CompiledTransform::new(&[project]).unwrap().apply(&input[0],&owner,&WorkBudget::new(1000)).unwrap_err();assert_eq!(error.code,ErrorCode::ResourceExhausted);assert_eq!(owner.usage().physical_bytes,before);drop(input);assert_eq!(owner.usage().physical_bytes,0);
+    }
+
+    #[test]
     fn source_batches_move_rows_share_schema_and_release_failed_leases() {
         let owner = MemoryOwner::new(ResourceBudget::compact());
         let schema = Arc::new(

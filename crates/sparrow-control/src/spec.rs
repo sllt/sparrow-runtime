@@ -133,6 +133,10 @@ pub struct JetStreamSpec {
     pub pull_messages: usize,
     #[serde(default="js_pull_bytes")]
     pub pull_bytes: usize,
+    /// Operational tuning for the regular reliable actor only; not a new
+    /// delivery/restore policy. None preserves the existing 250ms idle cap.
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub idle_backoff_max_ms: Option<u64>,
 }
 fn js_pending()->usize {128}
 fn js_pending_bytes()->usize {256*1024}
@@ -159,6 +163,10 @@ impl JetStreamSpec {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SinkSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<Box<FileSinkSpec>>,
     pub kind: String,
     #[serde(default)]
     pub url: Option<String>,
@@ -192,6 +200,18 @@ pub struct SinkSpec {
     pub clean_session: bool,
     #[serde(default)]
     pub tls: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileSinkSpec {
+    pub directory: String,
+    pub segment_bytes: u64,
+    pub max_bytes: u64,
+    pub max_files: usize,
+    pub row_bytes: usize,
+    #[serde(default)]
+    pub sync_data: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -372,6 +392,9 @@ impl PipelineSpec {
         }
         if self.source.jetstream.is_some() != (self.source.kind=="jetstream") {
             return Err(SparrowError::new(ErrorCode::InvalidArgument,"source.jetstream is required exclusively for kind=jetstream"));
+        }
+        if self.source.jetstream.as_ref().and_then(|js|js.idle_backoff_max_ms).is_some_and(|ms|!(5..=250).contains(&ms)) {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,"JetStream idle_backoff_max_ms must be 5..250; default 250"));
         }
         if self.source.kind=="jetstream" {
             #[cfg(not(feature="jetstream"))]

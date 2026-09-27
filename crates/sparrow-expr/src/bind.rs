@@ -69,6 +69,10 @@ pub fn bind(expr: &Expr, schema: &Schema) -> Result<BoundExpr> {
         Expr::Call { name, args } => {
             let name = name.to_ascii_lowercase();
             check_call_arity(&name, args.len())?;
+            if crate::builtin::contains(&name) {
+                let types = args.iter().map(|arg| crate::infer_type(arg, schema)).collect::<Result<Vec<_>>>()?;
+                crate::builtin::signature(&name, &types)?;
+            }
             let args = args
                 .iter()
                 .map(|a| bind(a, schema))

@@ -45,6 +45,8 @@ pub const ALARM_RELIABLE_SNAPSHOT_VERSION: u16 = 21;
 pub const ALARM_GRAPH_SNAPSHOT_VERSION: u16 = 22;
 pub const OBSERVED_FILE_SNAPSHOT_VERSION: u16 = 23;
 pub const OBSERVED_RELIABLE_SNAPSHOT_VERSION: u16 = 24;
+pub const RESAMPLE_FILE_SNAPSHOT_VERSION: u16 = 25;
+pub const RESAMPLE_RELIABLE_SNAPSHOT_VERSION: u16 = 26;
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
 
 fn output_profile(kind: &str) -> bool {
@@ -64,6 +66,17 @@ pub fn snapshot_version_for(
     let graph = plan.is_graph();
     let references = plan.has_references();
     let hysteresis = plan.has_hysteresis();
+
+    if plan.has_resample() {
+        if graph || references || plan.states.len() != 1 || !plan.requires_paused_time() {
+            return Err(invalid("resample requires one linear paused-time state without references"));
+        }
+        return match source_kind {
+            crate::processing_cut::FILE_KIND => Ok(RESAMPLE_FILE_SNAPSHOT_VERSION),
+            crate::processing_cut::JETSTREAM_KIND => Ok(RESAMPLE_RELIABLE_SNAPSHOT_VERSION),
+            _ => Err(invalid("resample requires a durable paused-time source")),
+        };
+    }
 
     if plan.has_silence() {
         if graph || references || plan.states.len() != 1 || !plan.requires_paused_time() {
@@ -314,6 +327,7 @@ impl PipelineSnapshot {
                 | PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION
                 | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION
                 | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION
+                | RESAMPLE_FILE_SNAPSHOT_VERSION | RESAMPLE_RELIABLE_SNAPSHOT_VERSION
         )
             && acks
                 .next_output
@@ -468,6 +482,7 @@ impl PipelineSnapshot {
                 | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION
                 | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION | ALARM_GRAPH_SNAPSHOT_VERSION
                 | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION
+                | RESAMPLE_FILE_SNAPSHOT_VERSION | RESAMPLE_RELIABLE_SNAPSHOT_VERSION
         ) {
             return Err(invalid("unsupported pipeline snapshot version"));
         }
@@ -508,6 +523,7 @@ impl PipelineSnapshot {
                 | PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION
                 | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION
                 | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION
+                | RESAMPLE_FILE_SNAPSHOT_VERSION | RESAMPLE_RELIABLE_SNAPSHOT_VERSION
         ) {
             let epoch=take(&mut bytes,16)?.try_into().unwrap();
             Some(sparrow_model::OutputSequence::new(epoch,u64_value(&mut bytes)?)
@@ -532,7 +548,7 @@ impl PipelineSnapshot {
                 | REFERENCE_RELIABLE_SNAPSHOT_VERSION
                 | REFERENCE_GRAPH_SNAPSHOT_VERSION
         ) && plan.has_references();
-        let combined_time_version = matches!(version, PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION | ALARM_GRAPH_SNAPSHOT_VERSION | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION);
+        let combined_time_version = matches!(version, PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION | ALARM_GRAPH_SNAPSHOT_VERSION | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION | RESAMPLE_FILE_SNAPSHOT_VERSION | RESAMPLE_RELIABLE_SNAPSHOT_VERSION);
         if !reference_stateful_version && !combined_time_version && mandatory_iot_version != plan.has_iot() {
             return Err(invalid("IoT checkpoint version/manifest mismatch"));
         }
@@ -759,7 +775,7 @@ impl StoredSnapshot {
         }
     }
     pub(crate) fn decode(bytes: &[u8], max_keys: usize, materialize: bool) -> Result<Self> {
-        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24,0])) {
+        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26,0])) {
             Ok(Self::Pipeline(PipelineSnapshot::decode_mode(
                 bytes,
                 max_keys,

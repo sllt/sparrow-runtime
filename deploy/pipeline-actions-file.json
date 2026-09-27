@@ -1,0 +1,11 @@
+{
+  "version":1,"stream":"actions",
+  "sql":"SELECT concat(device, '-out') AS label, n FROM actions",
+  "source":{"kind":"file","path":"/var/lib/sparrow/data/actions.ndjson","file_contract":"append_only"},
+  "sink":{
+    "kind":"file",
+    "file":{"directory":"/var/lib/sparrow/data/actions-output","segment_bytes":1048576,"max_bytes":16777216,"max_files":32,"row_bytes":65536,"sync_data":true},
+    "action":{"version":1,"body":{"device":{"$field":"label"},"value":{"$field":"n"}}}
+  },
+  "recovery":"restart_fresh","fail_on_decode":true
+}

@@ -175,6 +175,9 @@ impl PlanLayout {
 ///
 /// Default reset/replay: WHERE before the window changes.
 pub fn decide_state_reuse(saved: &PlanLayout, live: &PlanLayout) -> StateReuse {
+    if saved.window_kind > 3 || live.window_kind > 3 {
+        return StateReuse::Reject { reason: "no published restore codec/profile for this window family".into() };
+    }
     let complete = |l: &PlanLayout| {
         l.semantic_descriptor
             .as_ref()
@@ -259,6 +262,12 @@ pub fn window_params_fingerprint(kind: &WindowKind) -> u64 {
             size_micros,
             slide_micros,
         } => format!("hop:{size_micros}:{slide_micros}"),
+        WindowKind::HoppingProcessingTime {size_micros,slide_micros} => format!("hop_pt:{size_micros}:{slide_micros}"),
+        WindowKind::SlidingCount {size,step} => format!("sliding_count:{size}:{step}"),
+        WindowKind::SlidingProcessingTime {size_micros,delay_micros} => format!("sliding_pt:{size_micros}:{delay_micros}"),
+        WindowKind::SlidingEventTime {size_micros,delay_micros} => format!("sliding_et:{size_micros}:{delay_micros}"),
+        WindowKind::SessionProcessingTime {gap_micros,max_duration_micros} => format!("session_pt:{gap_micros}:{max_duration_micros}"),
+        WindowKind::SessionEventTime {gap_micros,max_duration_micros} => format!("session_et:{gap_micros}:{max_duration_micros}"),
     };
     fnv1a64(s.as_bytes())
 }
@@ -269,6 +278,12 @@ pub fn window_kind_tag(kind: WindowKind) -> u8 {
         WindowKind::Count { .. } => 1,
         WindowKind::HoppingEventTime { .. } => 2,
         WindowKind::TumblingEventTime { .. } => 3,
+        WindowKind::HoppingProcessingTime {..} => 4,
+        WindowKind::SlidingCount {..} => 5,
+        WindowKind::SlidingProcessingTime {..} => 6,
+        WindowKind::SlidingEventTime {..} => 7,
+        WindowKind::SessionProcessingTime {..} => 8,
+        WindowKind::SessionEventTime {..} => 9,
     }
 }
 

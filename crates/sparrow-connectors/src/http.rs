@@ -142,6 +142,8 @@ pub struct HttpSink {
     pub diag: Arc<IoDiagnostics>,
     client: reqwest::Client,
     auth: Option<String>,
+    action: Option<Box<sparrow_formats::action::ActionSpec>>,
+    action_policy: Option<TargetPolicy>,
 }
 
 struct Receipts {
@@ -262,6 +264,75 @@ impl Drop for HttpInflight {
 }
 
 impl HttpSink {
+    pub fn validate_action(config:&HttpSinkConfig, action:&sparrow_formats::action::ActionSpec)->Result<()> {
+        let url=url::Url::parse(&config.url).map_err(|_|ConnectorError::new(ErrorCode::InvalidArgument,"invalid action URL"))?;
+        if url.as_str().len()>4096 || !url.username().is_empty() || url.password().is_some() || url.fragment().is_some()
+            || action.query.keys().any(|key|url.query_pairs().any(|(fixed,_)|fixed==key.as_str())) {
+            return Err(ConnectorError::new(ErrorCode::InvalidArgument,"action URL requires <=4096 bytes, no userinfo/fragment or duplicate fixed query keys"));
+        }
+        if action.topic.is_some() || (action.per_row_http() && (config.max_inflight!=1 || config.batch_rows!=1 || !config.linger.is_zero())) {
+            return Err(ConnectorError::new(ErrorCode::InvalidArgument,"HTTP action options: no topic; per-row requires serial/no linger/no coalescing"));
+        }
+        Ok(())
+    }
+    pub fn with_action(mut self,action:Option<Box<sparrow_formats::action::ActionSpec>>,policy:&TargetPolicy)->Result<Self> {
+        if let Some(action)=&action {
+            Self::validate_action(&self.config,action)?;
+        }
+        self.action_policy=action.as_ref().map(|_|policy.clone());self.action=action;Ok(self)
+    }
+
+    async fn run_row_actions(self,mut rx:ObservedReceiver<RowBatch>,cancel:CancellationToken,outbox:Option<Arc<InflightCounter>>) {
+        let _lifecycle=self.diag.observation.lifecycle(false);
+        self.diag.observation.health(false,HealthState::Ready,"http_action_ready_not_connected",None);
+        let action=self.action.as_ref().expect("row action");
+        loop {
+            let batch=tokio::select!{biased;_=cancel.cancelled()=>break,batch=rx.recv()=>batch};
+            let Some(batch)=batch else {break};
+            let mut receipts=Receipts{observation:Some(self.diag.observation.delivery_guard(batch.num_rows(),batch.tracked_bytes(),batch.origin())),
+                batches:1,outbox:outbox.clone(),diag:self.diag.clone()};
+            if batch.output_sequence().is_some(){
+                self.diag.http_encode_errors.fetch_add(1,Ordering::Relaxed);
+                self.diag.observation.health(false,HealthState::Failed,"http_action_reliable_rejected",Some(ErrorCode::UnsupportedRestore));
+                continue;
+            }
+            let mut succeeded=true;
+            for row in batch.rows() {
+                let encoded=(||->sparrow_model::Result<_>{
+                    if batch.output_sequence().is_some(){return Err(sparrow_model::SparrowError::new(ErrorCode::UnsupportedRestore,"HTTP actions are live-only"));}
+                    let mut lease=batch.lease().owner().acquire(CreditKind::Reservation,32*1024)?;
+                    let bytes=action.encode(batch.schema(),std::slice::from_ref(row),!action.single,self.config.batch_bytes,|cap|lease.grow_to(cap+32*1024))?;
+                    let mut url=url::Url::parse(&self.config.url).map_err(|_|sparrow_model::SparrowError::new(ErrorCode::InvalidArgument,"invalid action base URL"))?;
+                    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+                        return Err(sparrow_model::SparrowError::new(ErrorCode::PolicyDenied,"action URL forbids userinfo and fragments"));
+                    }
+                    for (key,text) in &action.query {
+                        if url.query_pairs().any(|(old,_)|old==key.as_str()){return Err(sparrow_model::SparrowError::new(ErrorCode::InvalidArgument,"dynamic query duplicates a fixed parameter"));}
+                        let value=action.text(text,batch.schema(),row,1024)?;
+                        url.query_pairs_mut().append_pair(key,&value);
+                        if url.as_str().len()>4096{return Err(sparrow_model::SparrowError::new(ErrorCode::BoundExceeded,"expanded HTTP URL exceeds 4096 bytes"));}
+                    }
+                    self.action_policy.as_ref().expect("action policy").check_http_url(url.as_str()).map_err(sparrow_model::SparrowError::from)?;
+                    Ok((lease,bytes,url))
+                })();
+                let (lease,bytes,url)=match encoded {Ok(v)=>v,Err(e)=>{
+                    self.diag.http_encode_errors.fetch_add(1,Ordering::Relaxed);
+                    if e.code==ErrorCode::ResourceExhausted{self.diag.http_budget_drops.fetch_add(1,Ordering::Relaxed);}
+                    self.diag.observation.health(false,HealthState::Failed,"http_action_encode_failed",Some(e.code));succeeded=false;break;
+                }};
+                let _encoded=self.diag.observation.encoded_credit(lease.bytes());
+                self.diag.http_inflight.fetch_add(1,Ordering::Relaxed);let _inflight=HttpInflight(self.diag.clone());
+                // Both target and body are fixed ONCE per row, before retries.
+                let ok=tokio::select!{biased;_=cancel.cancelled()=>false,
+                    ok=self.post_body_to(url.as_str(),reqwest::Body::from(bytes))=>ok};
+                if !ok{succeeded=false;break;}
+                self.diag.http_posted.fetch_add(1,Ordering::Relaxed);
+            }
+            if succeeded{receipts.ack();}
+        }
+        rx.close();while let Ok(_batch)=rx.discard_next(){drop(Receipts{observation:None,batches:1,outbox:outbox.clone(),diag:self.diag.clone()});}
+    }
+
     pub fn bind(
         config: HttpSinkConfig,
         secrets: &dyn SecretResolver,
@@ -279,6 +350,8 @@ impl HttpSink {
             diag,
             client,
             auth,
+            action: None,
+            action_policy: None,
         })
     }
 
@@ -289,6 +362,9 @@ impl HttpSink {
         outbox: Option<Arc<InflightCounter>>,
     ) {
         let mut rx=rx.into();
+        if self.action.as_ref().is_some_and(|a|a.per_row_http()) {
+            return Box::pin(self.run_row_actions(rx,cancel,outbox)).await;
+        }
         let _lifecycle=self.diag.observation.lifecycle(false);
         self.diag.observation.health(false,HealthState::Ready,"http_request_ready_not_connected",None);
         let sink = Arc::new(self);
@@ -419,13 +495,18 @@ impl HttpSink {
             })
             .ok()?;
         let mut encoded_credit=self.diag.observation.encoded_credit(lease.bytes());
-        let bytes = encode_json_output_bounded_with_capacity(
+        let encoded = if let Some(action)=&self.action {
+            if batch.output_sequence().is_some() {Err(sparrow_model::SparrowError::new(ErrorCode::UnsupportedRestore,"action payloads cannot inherit reliable output identity"))}
+            else {action.encode(batch.schema(),batch.rows(),true,self.config.batch_bytes,
+                |capacity|{lease.grow_to(capacity+DELIVERY_OVERHEAD)?;encoded_credit.resize(lease.bytes());Ok(())})}
+        } else {encode_json_output_bounded_with_capacity(
             batch.schema(),
             batch.rows(),
             batch.output_sequence(),
             self.config.batch_bytes,
             |capacity| {lease.grow_to(capacity+DELIVERY_OVERHEAD)?;encoded_credit.resize(lease.bytes());Ok(())},
-        )
+        )};
+        let bytes = encoded
         .map_err(|error| {
             self.diag.observation.health(false,HealthState::Failed,"http_encode_failed",Some(error.code));
             if error.code == ErrorCode::ResourceExhausted {
@@ -455,9 +536,13 @@ impl HttpSink {
     // Body owns the encoded Vec once. Retrying clones its shared byte handle,
     // not the payload; callers construct only replayable in-memory bodies.
     async fn post_body(&self, body: reqwest::Body) -> bool {
+        self.post_body_to(&self.config.url,body).await
+    }
+
+    async fn post_body_to(&self, url:&str, body:reqwest::Body)->bool {
         let mut template = self
             .client
-            .post(&self.config.url)
+            .post(url)
             .header("content-type", "application/json")
             .body(body);
         if let Some(token) = &self.auth {
@@ -804,6 +889,81 @@ mod tests {
         })
         .unwrap();
         b.finish().unwrap()
+    }
+
+    async fn action_request(stream:&mut tokio::net::TcpStream,buffer:&mut Vec<u8>)->(String,Vec<u8>) {
+        loop {
+            if let Some(end)=buffer.windows(4).position(|w|w==b"\r\n\r\n") {
+                let head=std::str::from_utf8(&buffer[..end]).unwrap();
+                let len=head.lines().find_map(|line|line.to_ascii_lowercase().strip_prefix("content-length:").map(|n|n.trim().parse::<usize>().unwrap())).unwrap();
+                if buffer.len()>=end+4+len {
+                    let target=head.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_owned();
+                    let body=buffer[end+4..end+4+len].to_vec();buffer.drain(..end+4+len);return(target,body);
+                }
+            }
+            let mut bytes=[0;2048];let n=stream.read(&mut bytes).await.unwrap();assert_ne!(n,0);buffer.extend_from_slice(&bytes[..n]);assert!(buffer.len()<65536);
+        }
+    }
+    #[tokio::test]
+    async fn actions_http_retry_stable_query_body_connection_and_one_batch_receipt() {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+        let server=tokio::spawn(async move{
+            let(mut stream,_)=listener.accept().await.unwrap();let mut buffer=Vec::new();let mut requests=Vec::new();
+            for index in 0..3 {
+                requests.push(action_request(&mut stream,&mut buffer).await);
+                let reply=if index==0 {b"HTTP/1.1 503 Retry\r\ncontent-length: 2\r\n\r\nno".as_slice()} else {b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".as_slice()};
+                stream.write_all(reply).await.unwrap();
+            }requests
+        });
+        let policy=TargetPolicy::allow("127.0.0.1",port);let diag=IoDiagnostics::new();let owner=MemoryOwner::new(ResourceBudget::compact());
+        let mut cfg=HttpSinkConfig::demo(format!("http://127.0.0.1:{port}/fixed?base=1"));cfg.retry_backoff=Duration::from_millis(1);
+        let action=serde_json::from_value(serde_json::json!({"single":true,"body":{"value":{"$field":"text"}},"query":{"key":[{"$field":"text"}]}})).unwrap();
+        let sink=HttpSink::bind(cfg,&MapSecretResolver::empty(),&policy,diag.clone()).unwrap().with_action(Some(Box::new(action)),&policy).unwrap();
+        let first=text_batch(&owner,"x&host=http://evil/#測");let schema=first.schema().clone();drop(first);
+        let mut builder=RowBatchBuilder::new(Arc::new(schema),owner.clone(),CreditKind::Reservation,2,65536).unwrap();
+        for value in ["x&host=http://evil/#測","second"] {builder.push(Row{values:vec![Scalar::utf8(value)]}).unwrap();}
+        let counter=Arc::new(InflightCounter::new());counter.enqueue();let(tx,rx)=mpsc::channel(1);tx.send(builder.finish().unwrap()).await.unwrap();drop(tx);
+        tokio::time::timeout(Duration::from_secs(5),sink.run(rx,CancellationToken::new(),Some(counter.clone()))).await.unwrap();
+        let requests=server.await.unwrap();assert_eq!(requests[0],requests[1]);assert_eq!(requests.len(),3);
+        let parsed=url::Url::parse(&format!("http://127.0.0.1:{port}{}",requests[0].0)).unwrap();assert_eq!(parsed.path(),"/fixed");
+        assert_eq!(parsed.query_pairs().find(|(key,_)|key=="key").unwrap().1,"x&host=http://evil/#測");
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&requests[0].1).unwrap(),serde_json::json!({"value":"x&host=http://evil/#測"}));
+        assert_eq!((counter.acked(),counter.failed(),counter.pending()),(1,0,0));assert_eq!(diag.snapshot().http_posted,2);assert_eq!(owner.usage().physical_bytes,0);
+    }
+    #[tokio::test]
+    async fn actions_http_cancel_refunds_and_fails_original_receipt() {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+        let (ready_tx,ready_rx)=tokio::sync::oneshot::channel();let server=tokio::spawn(async move{
+            let(mut stream,_)=listener.accept().await.unwrap();let _=action_request(&mut stream,&mut Vec::new()).await;ready_tx.send(()).unwrap();
+            let mut byte=[0];let _=stream.read(&mut byte).await;
+        });
+        let policy=TargetPolicy::allow("127.0.0.1",port);let owner=MemoryOwner::new(ResourceBudget::compact());let diag=IoDiagnostics::new();
+        let action=sparrow_formats::action::ActionSpec{single:true,..Default::default()};
+        let sink=HttpSink::bind(HttpSinkConfig::demo(format!("http://127.0.0.1:{port}/")),&MapSecretResolver::empty(),&policy,diag.clone()).unwrap().with_action(Some(Box::new(action)),&policy).unwrap();
+        let counter=Arc::new(InflightCounter::new());counter.enqueue();let(tx,rx)=mpsc::channel(1);tx.send(number_batch(&owner,1)).await.unwrap();drop(tx);
+        let cancel=CancellationToken::new();let runner=tokio::spawn(sink.run(rx,cancel.clone(),Some(counter.clone())));
+        tokio::time::timeout(Duration::from_secs(3),ready_rx).await.unwrap().unwrap();cancel.cancel();runner.await.unwrap();server.abort();let _=server.await;
+        assert_eq!((counter.failed(),counter.pending()),(1,0));assert_eq!(diag.snapshot().http_inflight,0);assert_eq!(owner.usage().physical_bytes,0);
+        let owner=MemoryOwner::new(ResourceBudget{reservation_bytes:4096,..ResourceBudget::compact()});
+        let diag=IoDiagnostics::new();let policy=TargetPolicy::allow("127.0.0.1",12345);
+        let sink=HttpSink::bind(HttpSinkConfig::demo("http://127.0.0.1:12345/"),&MapSecretResolver::empty(),&policy,diag.clone()).unwrap()
+            .with_action(Some(Box::new(sparrow_formats::action::ActionSpec{single:true,..Default::default()})),&policy).unwrap();
+        let(tx,rx)=mpsc::channel(1);tx.send(number_batch(&owner,1)).await.unwrap();drop(tx);counter.enqueue();
+        sink.run(rx,CancellationToken::new(),Some(counter.clone())).await;
+        assert_eq!(diag.snapshot().http_budget_drops,1);assert_eq!(diag.snapshot().http_posted,0);assert_eq!(counter.failed(),2);assert_eq!(owner.usage().physical_bytes,0);
+    }
+    #[test]
+    fn actions_http_preflight_and_batched_body_mapping() {
+        let owner=MemoryOwner::new(ResourceBudget::compact());let diag=IoDiagnostics::new();
+        let policy=TargetPolicy::allow("127.0.0.1",12345);
+        let action=sparrow_formats::action::ActionSpec{body:Some(serde_json::json!({"v":{"$field":"n"}})),..Default::default()};
+        let sink=accounting_sink(diag).with_action(Some(Box::new(action)),&policy).unwrap();
+        let delivery=sink.encode_delivery(number_batch(&owner,9),None).unwrap();assert_eq!(delivery.bytes,b"[{\"v\":9}]");drop(delivery);assert_eq!(owner.usage().physical_bytes,0);
+        let action=sparrow_formats::action::ActionSpec{single:true,..Default::default()};
+        for url in ["http://user@127.0.0.1:12345/","http://127.0.0.1:12345/#fragment"] {
+            assert!(HttpSink::validate_action(&HttpSinkConfig::demo(url),&action).is_err());
+        }
+        let mut cfg=HttpSinkConfig::demo("http://127.0.0.1:12345/");cfg.max_inflight=2;assert!(HttpSink::validate_action(&cfg,&action).is_err());
     }
 
     fn text_batch(owner: &Arc<MemoryOwner>, text: &str) -> RowBatch {

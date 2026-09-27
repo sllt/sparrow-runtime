@@ -9,6 +9,7 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 
 - Event-time tumbling + hopping windows, watermarks, holdback, late side output
 - Processing-time tumbling windows and count windows (arrival-order; they do **not** impersonate event-time)
+- Window completion Preview: PT hopping, sliding count, per-event PT/ET sliding and bounded PT/ET sessions; **restart_fresh only**, see [`docs/WINDOWS.md`](docs/WINDOWS.md) for semantics and validation status
 - Incremental COUNT/SUM/AVG/MIN/MAX (checked integer overflow)
 - Versioned as-of-event-time lookup in embedded plans (not eligible for current Server aligned restore)
 - Aligned single-job checkpoint (`aligned`) for Replayable **File**: zero state, one Count/ET window, or two Count windows in a linear chain — **not** default exactly-once
@@ -25,6 +26,7 @@ K4 IoT Preview (change detection, deadband and hysteresis, bounded keyed state a
 
 Managed reference tables Preview: immutable revisions, explicit SHA-256 bindings, bounded static Lookup and conservative dependency-aware GC. Profile v8 covers stateless File; v9/v10 add bounded Count/IoT state on File/JetStream, and v11 covers required File DAGs. No positive TTL, temporal Lookup or implicit profile migration. Catalog schema v3 requires a matching pre-upgrade catalog backup for older binaries. See [`docs/REFERENCE_TABLES.md`](docs/REFERENCE_TABLES.md) for scope and [matching validation evidence](docs/PRODUCTION.md#k1-k4-reference-validation).
 Non-blocking issues and optimization backlog: [`docs/OPTIMIZATION_BACKLOG.md`](docs/OPTIMIZATION_BACKLOG.md).
+Action/File/function Preview: typed JSON output mapping, restricted HTTP query/MQTT topic templates, bounded Linux NDJSON File Sink, and 18 additional pure functions shared by SQL/Graph. These actions are **restart_fresh only**, not aligned output or cross-Sink transactions. See [`docs/ACTIONS.md`](docs/ACTIONS.md) and the [matching validation evidence](docs/PRODUCTION.md#actions-validation).
 MQTT ingress now has decoded-byte accounting and optional Linux QUICKACK;
 HTTP sinks support opt-in batch/linger and bounded concurrency (default serial).
 See the runtime contracts before changing queue, body or ordering settings.
@@ -80,6 +82,8 @@ still rejected.
 
 See [`docs/PRODUCTION.md`](docs/PRODUCTION.md) for fixed no-demo builds,
 deployment templates, authentication, backup/upgrade/rollback and fault handling.
+See [`docs/CAPACITY.md`](docs/CAPACITY.md) for reproducible capacity observations,
+idle-latency tuning and the distinction between finite drain and sustained load.
 
 ```bash
 bash scripts/production-build.sh /absolute/new/package

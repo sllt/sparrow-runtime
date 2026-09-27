@@ -2,6 +2,7 @@
 use crate::{
     alarm_iot::AlarmIot,
     iot::{IotFreeze, IotStats},
+    resample_iot::{ResampleIot, ResampleStats},
     silence_iot::SilenceIot,
     timed_iot::TimedIot,
 };
@@ -17,6 +18,7 @@ enum State {
     Alarm(AlarmIot),
     /// Boxed so the new machine does not enlarge the legacy enum layout.
     Silence(Box<SilenceIot>),
+    Resample(Box<ResampleIot>),
 }
 pub(crate) struct TimedState {
     // The allocation drops before its accounting credit.
@@ -29,6 +31,7 @@ macro_rules! read {
             State::Basic(s) => s.$method($($arg),*),
             State::Alarm(s) => s.$method($($arg),*),
             State::Silence(s) => s.$method($($arg),*),
+            State::Resample(s) => s.$method($($arg),*),
         }
     };
 }
@@ -38,6 +41,7 @@ macro_rules! write {
             State::Basic(s) => s.$method($($arg),*),
             State::Alarm(s) => s.$method($($arg),*),
             State::Silence(s) => s.$method($($arg),*),
+            State::Resample(s) => s.$method($($arg),*),
         }
     };
 }
@@ -53,7 +57,11 @@ impl TimedState {
     ) -> Result<Self> {
         let allocation =
             owner.acquire(CreditKind::Reservation, std::mem::size_of::<State>() + 64)?;
-        let state = if spec.is_silence() {
+        let state = if spec.is_resample() {
+            State::Resample(Box::new(ResampleIot::new(
+                operator, spec, input, owner, keys, fields,
+            )?))
+        } else if spec.is_silence() {
             State::Silence(Box::new(SilenceIot::new(
                 operator, spec, input, owner, keys, fields,
             )?))
@@ -72,12 +80,13 @@ impl TimedState {
             State::Basic(_) => Ok(()),
             State::Alarm(s) => s.bind_generation(generation),
             State::Silence(s) => s.bind_generation(generation),
+            State::Resample(s) => s.bind_generation(generation),
         }
     }
     /// This round's verified source coverage. Only silence decisions use it.
     pub fn observe_feed(&mut self, coverage_since: Option<i64>) -> Result<()> {
         match self.state.as_mut() {
-            State::Basic(_) | State::Alarm(_) => Err(SparrowError::new(
+            State::Basic(_) | State::Alarm(_) | State::Resample(_) => Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
                 "feed coverage requires the silence state machine",
             )),
@@ -107,6 +116,17 @@ impl TimedState {
     }
     pub fn stats(&self) -> IotStats {
         read!(self, stats)
+    }
+    pub fn resample_stats(&self) -> ResampleStats {
+        match self.state.as_ref() {
+            State::Resample(s) => s.resample_stats(),
+            _ => ResampleStats::default(),
+        }
+    }
+    pub fn report_resample_metrics(&mut self, metrics: &crate::metrics::RuntimeMetrics) {
+        if let State::Resample(s) = self.state.as_mut() {
+            s.report_metrics(metrics);
+        }
     }
     pub fn pending_timers(&self) -> usize {
         read!(self, pending_timers)

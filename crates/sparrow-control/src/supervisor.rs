@@ -45,6 +45,7 @@ mod graph;
 mod paused_time;
 mod paused_time_log;
 mod observed_time;
+mod live_silence;
 mod observed_time_log;
 mod graph_time;
 mod graph_time_log;
@@ -347,6 +348,7 @@ fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
     match spec.sink.kind.as_str() {
         "log" => "log",
         "mqtt" => "mqtt",
+        "file" => "file",
         _ => "http",
     }
 }
@@ -1050,7 +1052,9 @@ impl Supervisor {
         .await?;
         let recovery = RecoveryPolicy::parse(&spec.recovery)?;
 
-        let job = if plan.has_silence() {
+        let job = if plan.has_silence() && spec.source.kind == "mqtt" {
+            self.start_live_silence(name, &spec, schema, plan, demo.as_ref(), &policy).await?
+        } else if plan.has_silence() {
             self.start_observed_time(&spec,schema,plan,&policy).await?
         } else if spec.recovery=="aligned" && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
             self.start_time_graph(&spec,plan,&policy).await?
@@ -1868,19 +1872,25 @@ impl Supervisor {
         outbox: Option<Arc<InflightCounter>>,
     ) -> Result<JoinHandle<()>> {
         Ok(match spec.sink.kind.as_str() {
+            "file" => {
+                let config=crate::validate::file_sink_config(&spec.sink)?;
+                config.validate().map_err(SparrowError::from)?;
+                let sink=sparrow_connectors::file_sink::FileSink {config,diag,action:spec.sink.action.as_deref().cloned().unwrap_or_default()};
+                self.kernel.handle().spawn(sink.run(rx_out,cancel,outbox))
+            }
             "log" => {
-                let log = LogSink::new(diag, 64);
+                let log = LogSink::unbuffered(diag).with_action(spec.sink.action.clone());
                 self.kernel.handle().spawn(log.run(rx_out, cancel, outbox))
             }
             "mqtt" => {
                 let cfg = mqtt_sink_config(&spec.sink, demo)?;
                 let sink =
-                    MqttSink::bind(cfg, &self.secrets, policy, diag).map_err(SparrowError::from)?;
+                    MqttSink::bind(cfg, &self.secrets, policy, diag).and_then(|sink|sink.with_action(spec.sink.action.clone())).map_err(SparrowError::from)?;
                 self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
             _ => {
                 let http_cfg = http_config(&spec.sink, demo)?;
-                let sink = HttpSink::bind(http_cfg, &self.secrets, policy, diag)
+                let sink = HttpSink::bind(http_cfg, &self.secrets, policy, diag).and_then(|sink|sink.with_action(spec.sink.action.clone(),policy))
                     .map_err(SparrowError::from)?;
                 self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
@@ -1918,6 +1928,7 @@ impl Supervisor {
     }
 
     async fn join_job(&self, job: RunningJob) -> Result<()> {
+        let file_diag=(job.graph_ports.is_none() && job.sink_kind=="file").then(||job.diag.clone());
         match job.kind {
             RunningKind::Live {
                 handle,
@@ -1934,6 +1945,9 @@ impl Supervisor {
                     )),
                 };
                 let _ = sink.await;
+                if file_diag.as_ref().is_some_and(|d|d.file_failed.load(std::sync::atomic::Ordering::Relaxed)>0) {
+                    return Err(SparrowError::new(sparrow_model::ErrorCode::JobFailed,"File Sink failed; inspect sink health and file_failed; no automatic rollback or replay"));
+                }
                 match (r, src) {
                     (_, Err(e)) => Err(e),
                     (Err(e), _) => Err(e),

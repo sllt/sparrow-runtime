@@ -87,6 +87,15 @@ pub fn decode_json_row(schema: &Schema, bytes: &[u8], limits: &JsonLimits) -> Re
     decode_json_row_on(schema, bytes, limits, None)
 }
 
+/// Strict scalar/array/object JSON for pure expression functions. Reuses the
+/// same pre-parse byte/depth bound and duplicate-key rejection as input codecs.
+pub fn decode_dynamic_json(bytes:&[u8],limits:&JsonLimits)->Result<DynamicValue> {
+    if bytes.len()>limits.max_bytes || json_byte_depth(bytes)>limits.max_depth {
+        return Err(SparrowError::new(ErrorCode::BoundExceeded,"JSON expression byte/depth limit exceeded"));
+    }
+    json_val_to_dynamic(&parse_strict_json(bytes,limits.max_depth)?)
+}
+
 pub fn decode_json_row_on(
     schema: &Schema,
     bytes: &[u8],
@@ -280,12 +289,75 @@ fn encode_json_row_into(schema: &Schema, row: &Row, out: &mut impl std::io::Writ
             "row/schema arity mismatch",
         ));
     }
+    // Common telemetry rows need no temporary JSON object, cloned keys or
+    // cloned UTF8 values. Keep the exact legacy lexicographic key order and
+    // serde_json scalar semantics (including nonfinite -> null). A fixed stack
+    // index array avoids adding uncharged variable scratch to bounded HTTP.
+    // Structured/wide rows keep the original path below, not a new codec.
+    const SMALL_FIELDS: usize = 16;
+    if schema.fields.len() <= SMALL_FIELDS
+        && row.values.iter().all(|value| !matches!(value, Scalar::Bytes(_) | Scalar::Dynamic(_)))
+        && legacy_json_map_is_sorted()
+    {
+        let mut order = [0usize; SMALL_FIELDS];
+        let order = &mut order[..schema.fields.len()];
+        for (index, slot) in order.iter_mut().enumerate() { *slot = index; }
+        // Insertion sort is allocation-free even for empty/tiny schemas.
+        for index in 1..order.len() {
+            let mut at = index;
+            while at > 0 && schema.fields[order[at]].name < schema.fields[order[at-1]].name {
+                order.swap(at, at-1); at -= 1;
+            }
+        }
+        // Schema fields are public at the embedding boundary. Preserve the
+        // legacy last-wins behavior for a manually corrupted duplicate schema.
+        if !order.windows(2).any(|pair| schema.fields[pair[0]].name == schema.fields[pair[1]].name) {
+            struct Primitive<'a>(&'a Scalar);
+            impl serde::Serialize for Primitive<'_> {
+                fn serialize<S: serde::Serializer>(&self, serializer:S)->std::result::Result<S::Ok,S::Error> {
+                    match self.0 {
+                        Scalar::Null=>serializer.serialize_unit(),
+                        Scalar::Bool(v)=>serializer.serialize_bool(*v),
+                        Scalar::Int64(v)|Scalar::TimestampMicrosUTC(v)=>serializer.serialize_i64(*v),
+                        Scalar::UInt64(v)=>serializer.serialize_u64(*v),
+                        Scalar::Float64(v)=>serializer.serialize_f64(*v),
+                        Scalar::Utf8(v)=>serializer.serialize_str(v),
+                        _=>Err(serde::ser::Error::custom("not a primitive JSON fast path value")),
+                    }
+                }
+            }
+            struct BorrowedRow<'a>{schema:&'a Schema,row:&'a Row,order:&'a[usize]}
+            impl serde::Serialize for BorrowedRow<'_> {
+                fn serialize<S:serde::Serializer>(&self,serializer:S)->std::result::Result<S::Ok,S::Error> {
+                    use serde::ser::SerializeMap;
+                    let mut map=serializer.serialize_map(Some(self.order.len()))?;
+                    for index in self.order {
+                        map.serialize_entry(&self.schema.fields[*index].name,&Primitive(&self.row.values[*index]))?;
+                    }
+                    map.end()
+                }
+            }
+            return serde_json::to_writer(out,&BorrowedRow{schema,row,order}).map_err(|e|
+                SparrowError::new(ErrorCode::CodecViolation,format!("JSON encode: {e}")));
+        }
+    }
     let mut map = serde_json::Map::new();
     for (field, value) in schema.fields.iter().zip(row.values.iter()) {
         map.insert(field.name.clone(), scalar_to_json(value));
     }
     serde_json::to_writer(out, &serde_json::Value::Object(map)).map_err(|e| {
         SparrowError::new(ErrorCode::CodecViolation, format!("JSON encode: {e}"))
+    })
+}
+
+fn legacy_json_map_is_sorted()->bool {
+    // A host can feature-unify serde_json/preserve_order. In that build keep
+    // its original object path rather than silently change output bytes. This
+    // probe has fixed tiny metadata, runs once, and never retains user values.
+    static SORTED:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
+    *SORTED.get_or_init(||{
+        let mut map=serde_json::Map::new();map.insert("z".into(),serde_json::Value::Null);map.insert("a".into(),serde_json::Value::Null);
+        map.keys().next().is_some_and(|key|key=="a")
     })
 }
 
@@ -861,6 +933,36 @@ mod tests {
         drop(bytes);
         drop(lease);
         assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    #[test]
+    fn capacity_primitive_encoder_is_byte_identical_to_legacy_value_path() {
+        let values=vec![Scalar::Null,Scalar::Bool(true),Scalar::Int64(i64::MIN),Scalar::UInt64(u64::MAX),
+            Scalar::TimestampMicrosUTC(-1),Scalar::utf8("测\"\\\n\0"),Scalar::Float64(-0.0),Scalar::Float64(f64::from_bits(1)),
+            Scalar::Float64(f64::MAX),Scalar::Float64(f64::NAN),Scalar::Float64(f64::INFINITY),Scalar::Float64(f64::NEG_INFINITY)];
+        for width in [0,1,2,12,16,17] {
+            let mut fields=Vec::new();let mut row=Row{values:Vec::new()};let mut expected=serde_json::Map::new();
+            for index in 0..width {
+                let key=format!("{}\"{index}",if index%2==0{"中"}else{"a"});let value=values[index%values.len()].clone();
+                fields.push(Field::new((index+1)as u16,key.clone(),value.data_type(),true));expected.insert(key,scalar_to_json(&value));row.values.push(value);
+            }
+            let schema=Schema::new(SchemaId::new(1),fields).unwrap();
+            let expected=serde_json::to_vec(&serde_json::Value::Object(expected)).unwrap();
+            assert_eq!(encode_json_row(&schema,&row).unwrap(),expected,"width {width}");
+            let mut array=vec![b'['];array.extend_from_slice(&expected);array.push(b']');
+            assert_eq!(encode_json_batch_bounded(&schema,std::slice::from_ref(&row),array.len()).unwrap(),array);
+            assert!(encode_json_batch_bounded(&schema,std::slice::from_ref(&row),array.len()-1).is_err());
+        }
+    }
+
+    #[test]
+    fn capacity_encoder_fallback_preserves_bytes_dynamic_and_duplicate_fields() {
+        let mut schema=Schema::new(SchemaId::new(1),vec![Field::new(FieldId::new(1),"z",DataType::Bytes,false),Field::new(FieldId::new(2),"a",DataType::Dynamic,true)]).unwrap();
+        let row=Row{values:vec![Scalar::bytes(vec![0,255,128]),Scalar::Dynamic(DynamicValue::Array(vec![DynamicValue::UInt64(u64::MAX),DynamicValue::Float64(f64::NAN)].into()))]};
+        let mut expected=serde_json::Map::new();for (field,value) in schema.fields.iter().zip(&row.values){expected.insert(field.name.clone(),scalar_to_json(value));}
+        assert_eq!(encode_json_row(&schema,&row).unwrap(),serde_json::to_vec(&serde_json::Value::Object(expected)).unwrap());
+        schema.fields[1].name="z".into();let row=Row{values:vec![Scalar::Int64(1),Scalar::Int64(2)]};
+        assert_eq!(encode_json_row(&schema,&row).unwrap(),b"{\"z\":2}");
     }
 
     #[test]

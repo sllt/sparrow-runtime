@@ -12,6 +12,8 @@ use sparrow_model::error::ErrorCode;
 pub mod replay;
 pub mod feed;
 #[cfg(feature = "observation")]
+pub mod live_feed;
+#[cfg(feature = "observation")]
 pub mod observed;
 
 pub mod fs_lock;

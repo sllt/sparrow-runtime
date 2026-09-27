@@ -1,4 +1,4 @@
-# K4：变化检测、Deadband 与迟滞
+# K4：变化检测、告警、静默与重采样
 
 **2026-09-23 时间型 DAG 已按限定 Preview 验收：** v18 将下方暂停时间算子组合扩展到 required File→HTTP 图；v19 单独承载 ET 窗口和 TTL0 IoT，不把 HoldFor/Debounce 解释为 event-time 模式。[合同](DAG.md#time-graph-recovery)、[匹配证据](PRODUCTION.md#time-graph-validation)。以下 v14～v17 的线性边界保持不变；新图支持不代表冷却、离线检测、告警生命周期或重采样已实现。
 
@@ -7,7 +7,7 @@
 <a id="business-loop-plan"></a>
 ## 当前批：完整 IoT 业务闭环（IOT-06～09，开发中）
 
-下面是下一批执行合同，**不是已开放 capability**。沿用同一 Runtime、持久暂停时间和预算/恢复协议，不做前端，不把旧 Hysteresis 的原行输出偷偷改成告警事件。
+下面是本批范围；已实现范围以各 profile 的合同、capability 和匹配验证为准，不能把未覆盖组合当作已支持。沿用同一 Runtime、持久暂停时间和预算/恢复协议，不做前端，不把旧 Hysteresis 的原行输出偷偷改成告警事件。
 
 1. **IOT-08 告警生命周期先行**：明确 Normal/Pending/Active/Recovering 和 enter/clear 条件、持续触发/恢复时长、等时到期先于输入；无样本保持最后有效条件。activate/resolve 带稳定 episode，使用独立输出 schema 与 codec。Active/Pending 不默认 TTL 淘汰；状态满明确失败，不能静默丢失告警。
 2. **IOT-06 冷却/通知限频**：在状态转换之后控制通知，不冻结底层观察；明确恢复通知、等待通知的合并/丢弃策略、数量/字节/年龄上限。完整 episode、待通知、计时和输出身份同切点持久化，重放不产生新业务身份。
@@ -66,7 +66,7 @@
 - 独立 cut、decision log 和 outer profile，不能给旧 PTC1/TPD1 或 v20～22 加一个缺省健康字段就改变旧语义。决策包含逻辑时间、输入摘要、完整来源观测及覆盖边界；先持久化，再发布输入/健康控制、required 输出、CURRENT，最后才允许来源 ACK。
 - 未提交决策必须按原事实/时间/身份重放；不补采一次新的 Ready。恢复完未提交后继后，首个新决策显式打断观测覆盖，停机不计时，也不把重启当恢复通信。CURRENT 与 journal 缺失、版本/身份/序列矛盾必须拒绝。
 - 首批可靠范围是 **线性 File append-only / JetStream → 首个静默状态 → required HTTP**，默认包和 feature 包分别验收；与 ET、参考表、其他时间状态及 DAG 的组合继续拒绝。这只是 IOT-07 的一个受限交付，不自动代表所有 Source 支持。
-- MQTT live 是后续同项的独立接入：需新鲜 PINGRESP/响应期限、健康控制与输入同一有界 FIFO、断连和 ingress 丢弃/积压的保守语义；不能从 cached Ready 推导静默，更不能伪装为可持久恢复来源。在这条链路定义并测试前，不宣称 MQTT 静默已支持或 IOT-07 全范围完成。
+- MQTT live 使用下述独立接入，不继承本节的可持久恢复来源、排空前缀或输出重放保证。不能从 cached Ready 推导静默，也不能由 File/JetStream 的验证结果推导其通过。
 - key、索引、timer、登记集合、观测/journal 和输出均受预算；覆盖重建不得无界遍历并重排全部设备。保持旧热路径布局与额度，不因新节点扩大所有旧任务的 future/control。
 - 必测：从未登记、登记未出现、等时心跳、partial/Pending/backlog、慢观测/慢 Sink、路径替换/截短、broker/ownership 故障、断连不全体静默、重新覆盖宽限、静默与恢复的真实 SIGKILL/完整内容和 ID 重放、提交后不重复、旧版本拒绝、取消退款及原性能门禁。尚未执行的项不以 Connector 单测代替。
 
@@ -77,6 +77,46 @@
 输出仅含 key 与 `sparrow_silence_event/generation/operator/episode/time/last_seen/never_seen` 七列，HTTP 仍为带稳定 `id` 的 `data` 包装。从未出现的登记 key 的 `last_seen` 为 NULL；首次实际记录无恢复事件，只有 Silent 状态收到自己的记录才 `resumed`。状态不 TTL 遗忘，达到 `max_keys`/字节/timer 上限明确失败。
 
 `checkpoint.observed_source` 是最后成功提交（或恢复验证）的历史 cut；`view_age` 不是来源采样年龄，更不是连接当前健康。实时 Source 错误仍在原诊断中。File23/JetStream24 使用新的独立目录，不自动迁移旧时间 profile；恢复只读 CURRENT 及其一个未提交后继，旧版本拒绝该历史。仍是逐行/逐观测串行提交，受 fsync 和 required HTTP 等待限制。
+
+<a id="mqtt-live-silence"></a>
+### MQTT live 静默（独立开发 Preview）
+
+模板 `deploy/pipeline-iot-mqtt-silence.json`；**MQTT QoS0 + clean_session → Silence → 可选纯 Transform → verified HTTP**。`timing.clock:"live"`、`recovery:"restart_fresh"`；拒绝 checkpoint、restore、上游 Transform、其他状态、DAG、参考表与 ET。普通不带 Silence 的 MQTT 接收路径保持独立。
+
+- `max_observation_gap_micros` 为 100 ms～120 s；静默阈值至少为 gap 的两倍。探测周期为 `min(gap/4, keepalive/2)`，一次最多一个 PINGREQ；PUBLISH 不推迟探测，响应期限为 gap/4，迟到等号失效，超时重连。无请求的 PINGRESP 不授权覆盖。
+- PINGRESP **不是 broker 排空证明，也不是 QoS0 送达证明**。它只验证响应连接；接收端另检查已知本地队列和 framed-reader 预读字节。MQTT 规范只把响应定义为 Server 存活指示，见 [MQTT 3.1.1 §3.13](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html)。事件含义始终是“此接收链路未观察到该 key 的新记录”，不是物理设备离线。
+- 数据、探测与不可用事实共用一个有界 FIFO；每个事件带单调接收时间和 sticky discontinuity epoch。断连、队列积压/等待/丢弃、字节不足、坏 JSON 和 `RETAIN=1` 都中断覆盖；即使不可用控制本身塞不进队列，下个事件仍携带新的 epoch，不会误接旧宽限。记录只保留一个队列外工作事件，不预取整批健康事实。
+- 消费端在所有上游排队之后再次校验：响应耗时 < gap/4，消费时间距请求开始 < gap/2。过期控制不给 timer 授权；长间隔和慢下游中断覆盖，必须重新积累完整宽限。timer 排空期间也重新检查期限。已发布到下游的事件仍可能因 HTTP 排队而迟到；事件时间是观测 cut，不是接收 HTTP 时的实时在线证明。
+- 只有收到该 key 的合法、非 retained 记录才能 `resumed`；重连自身不会恢复设备。保留消息不登记 key、不更新 last_seen、不恢复 episode。收到过的 key 和静态登记 key 受原状态/字节/timer 预算约束，不 TTL 遗忘。
+- 连接重建保留当前尝试的设备/episode，但中断覆盖；管线重启/进程强杀则清空已观察 key，重新加载登记集合、生成新 generation、重新等待完整宽限。输出仍为 key + 七个静默事件字段；live HTTP **没有可持久重放的输出 ID**。时间是当前尝试的单调微秒，不是暂停恢复时间、UTC 或设备事件时间。
+- `fail_on_decode:false` 的丢弃有诊断且打断覆盖；`true` 直接失败/取消尝试。`mqtt_feed_probes/feed_breaks/ping_timeouts/retained_ignored` 与原丢弃/队列指标一起观察；probe 计数只是 connector 提供的候选事实，不保证消费端仍把它认定为新鲜，旧 `Ready` 仍不是计时授权。
+
+验证入口：`scripts/production-mqtt-live-validate.sh`，精确测试清单及隔离 Mosquitto、真实 server SIGKILL、75 s 来包场景。当前结果与未测范围见 [匹配验证](PRODUCTION.md#mqtt-live-silence-validation)；不把短试次当成 24/72 h soak、TLS/WAN 或生产认证。
+
+<a id="resample-preview"></a>
+### IOT-09 Sampling/Resample（限定开发 Preview，功能/故障/回归通过）
+
+三种模式已经接入 Plan、Runtime、检查点、控制面和 HTTP 输出；独立 v25/v26 的最终 s3 已通过本批功能、真实故障、旧矩阵和原三组性能回归门禁，仍不代表生产认证。下面是实际实现合同，证据见 [本批记录](PRODUCTION.md#resample-validation)。
+
+- 首批是独立 File25 / JetStream26：线性 Source → 可选纯 Transform → 单个 Resample → 可选纯 Transform → required HTTP。复用暂停的有序 processing-time/TPD1 决策语义，完整计划与独立目录校验；不与其他状态、ET、参考表、DAG 或 MQTT live 混合。不是设备 event-time 对齐。
+- 以逻辑零点为固定网格，`period_micros>0`。Last/Mean 使用半开区间 `[start,end)`，等边界先关闭旧区间再处理输入；Last 是**本区间**最后有效样本，保留整数类型/精度，不隐式无限前向填充；Mean 输出 Float64。已观察 key 的空区间明确输出 NULL/missing，未见 key 不生成数据。
+- Interpolate 在网格点取值：精确命中的样本可直接使用，否则只用最近左点与首个后到右点做线性插值，不外推。`0<max_wait_micros<=period_micros` 限制每 key 最多一个等待网格；`max_gap_micros>0` 限制左右点跨度。等待期限等号处先过期，再处理同刻输入，已发出的结果不回写。重复同刻样本仅对尚未产出的网格按输入顺序取最后值。
+- keys 与 value fields 分离；首批选择 1～16 个 numeric 字段，按完整向量处理：其中任一字段 NULL/非有限/类型不符时按 `invalid` 整行拒绝或忽略，不把不同时间的字段拼成一个点。Last 保持各数值字段原类型，Mean/Interpolate 明确转为 Float64；输入丢弃与输出缺值分别计数，聚合缩减不冒充丢失。
+- 输出是 keys + nullable 采样值 + `sparrow_resample_mode/time/emitted_at/missing/samples/generation/operator`；`time` 是区间右边界或插值网格，`emitted_at` 是真正产出该结果的持久决策时间，不能混为一谈。Last/Mean 的 `samples` 为区间有效行数，插值为 0（缺值）、1（精确点）或 2（左右点）。稳定业务身份包含 generation/operator/全部 key/网格时间，HTTP 输出仍另有稳定 ID。
+- keys、点/累加器、timer、字节和每决策展开量有界。`max_emissions_per_decision` 默认 256、最多 4096；须覆盖 `max_keys`，插值另预留一个输入决策产出的名额。长运行间隔造成过多补网格时明确拒绝，不静默截断，也不先物化无限空窗口；时间/计数/非有限运算溢出不得回绕。状态不 TTL 遗忘。
+- 冻结包含剩余区间、等待点、使用标记与规范化状态；未提交决策重放原时间、输入和输出身份，停机不推进网格。恢复拒绝过期 pending、未来采样点、类型/模式/网格不一致及配额越界。验证覆盖三模式的独立黄金值、边界/缺样/插值超期与跨度、批量补格拒绝、OOM/取消退款、真实 SIGKILL/旧版本拒绝及原路径回归。
+
+#### 配置与操作
+
+模板 `deploy/pipeline-iot-resample.json` 复用 `deploy/stream-k4-telemetry.json`：每 1 秒取该区间最后一个有效温度，tick 为 100 ms。要求 `recovery:"aligned"`、File `append_only` 或启用 feature 的 JetStream、verified required HTTP、独立目录、`fail_on_decode:true` 和 `resume_latest:true`。周期必须不小于 checkpoint tick；这不保证慢 HTTP/磁盘下不会超出补格上限，超限会失败并保留恢复切点，不悄悄丢格。
+
+- `timing.kind:"resample"`，`mode:"last"|"mean"|"interpolate"`，`clock:"paused"`。Last/Mean 必须省略或置零 `max_wait_micros/max_gap_micros`。Interpolate 例如周期 1 秒、等待 500 ms、左右跨度最多 2 秒；这三个配置都必须显式给出合法值。
+- `keys` 与 `fields` 分离，`emit_first:false`、`ttl_micros:0`，不可混入 deadband/hysteresis。NULL 或非有限值按 `invalid:"error"|"ignore"` 处理整行，而非逐列拼接。来源格式解码失败仍由 `fail_on_decode` 独立控制。
+- key 在收到第一个完整有效采样向量时才登记；`invalid:"ignore"` 不创建 key、不刷新已有点，也不消耗插值等待。所谓首个右点是首个后到的完整有效点。
+- 已知 key 永久保留并在空网格输出 missing；这不是“设备离线”事件。需要停止空采样时应停止/重置规则，不应依赖隐式 TTL。
+- 指标 `resample_discarded_inputs`、`resample_missing_outputs`、`resample_interpolated_outputs` 分别统计被忽略/替换的输入、空格输出、真正双点插值。Mean 多对一不算丢弃，exact 插值不算双点插值；指标是 attempt 内累计，不伪装为持久交付计数。
+- `iot_input_rows` 与 `iot_emitted_rows` 是算子输入/输出的不同计量：聚合会缩减，空格补发又可使输出多于输入，不能用两者相减推断来源丢包，也不能套用一进一出的守恒公式。
+- 运行验证入口为 `scripts/production-resample-validate.sh`，只使用冻结二进制，严格比较 24 项清单、逐项重复和两包真实 SIGKILL；不编译，不宣称长稳或性能认证。当前结果以 [验证记录](PRODUCTION.md#resample-validation) 为准。
 
 <a id="linear-time-completion"></a>
 ## 线性时间组合 v16/v17（2026-09-22，限定 Preview 已验收）

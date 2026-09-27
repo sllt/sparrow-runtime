@@ -11,6 +11,7 @@ pub mod bind;
 pub mod infer;
 pub mod kernels;
 pub mod semantics;
+mod builtin;
 pub use bind::{bind, eval_bound, BoundExpr};
 pub use infer::{infer_nullable, infer_type};
 pub use kernels::{filter_mask, SimplePred};
@@ -89,6 +90,7 @@ pub fn eval(expr: &Expr, schema: &Schema, row: &[Scalar]) -> Result<Scalar> {
 }
 
 pub(crate) fn eval_call_values(name: &str, vals: Vec<Scalar>) -> Result<Scalar> {
+    if builtin::contains(name) { return builtin::eval(name, vals); }
     // BoundExpr stores canonical lowercase function names.
     match name {
         "abs" => match vals.first() {

@@ -290,6 +290,7 @@ impl Supervisor {
                 restored_cut,
                 max_pending: config.max_pending,
                 max_pending_bytes: config.pending_bytes,
+                idle_backoff_max_ms: config.idle_backoff_max_ms.unwrap_or(250),
             }
             .run(),
         );
@@ -344,6 +345,7 @@ struct Actor {
     restored_cut: u64,
     max_pending: usize,
     max_pending_bytes: usize,
+    idle_backoff_max_ms: u64,
 }
 impl Actor {
     fn observe(&self) {
@@ -465,14 +467,7 @@ impl Actor {
                         self.diag
                             .decode_errors
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        SparrowError::new(
-                            e.code,
-                            format!(
-                                "JetStream decode failed at source_sequence={sequence} ({})",
-                                e.code
-                            ),
-                        )
-                        .context("source_sequence", sequence.to_string())
+                        decode_failure(sequence,e)
                     })?;
                 if !added {
                     self.deferred = Some(next);
@@ -522,7 +517,7 @@ impl Actor {
         let mut progress = tokio::time::interval(Duration::from_secs(5));
         progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let ack_signal = self.reader.ack_signal();
-        let mut idle = IdlePull::default();
+        let mut idle = IdlePull::new(self.idle_backoff_max_ms);
         let mut retry_after = tokio::time::Instant::now();
         let result:Result<()>=async {
             loop {
@@ -616,24 +611,45 @@ fn checkpoint_timeout(message: &str) -> SparrowError {
 }
 struct IdlePull {
     delay_ms: u64,
+    max_ms: u64,
     until: tokio::time::Instant,
 }
 impl Default for IdlePull {
     fn default() -> Self {
-        Self {
-            delay_ms: 5,
-            until: tokio::time::Instant::now(),
-        }
+        Self::new(250)
     }
 }
 impl IdlePull {
+    fn new(max_ms:u64)->Self {Self{delay_ms:5,max_ms,until:tokio::time::Instant::now()}}
     fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self::new(self.max_ms);
     }
     fn empty(&mut self) {
         self.until = tokio::time::Instant::now() + Duration::from_millis(self.delay_ms);
-        self.delay_ms = (self.delay_ms * 2).min(250);
+        self.delay_ms = (self.delay_ms * 2).min(self.max_ms);
     }
+}
+
+/// Preserve useful quota diagnostics without exposing decoded payloads,
+/// subjects, credentials or arbitrary connector error text to the API/log.
+fn decode_failure(sequence:u64,cause:SparrowError)->SparrowError {
+    let mut error=SparrowError::new(cause.code,format!("JetStream decode failed at source_sequence={sequence} ({})",cause.code))
+        .context("source_sequence",sequence.to_string());
+    if cause.code==ErrorCode::ResourceExhausted {
+        for key in ["credit","used","request","cap"] {
+            if let Some((_,value))=cause.context.iter().find(|(name,_)|name==key) {
+                let safe=if key=="credit" {matches!(value.as_str(),"reservation"|"retention"|"queue")}
+                    else {value.parse::<u64>().is_ok() && value.len()<=20};
+                if safe {
+                    // Attempt status persists message, not structured context.
+                    // Include only this bounded whitelist in both surfaces.
+                    error.message.push_str(&format!(" {key}={value}"));
+                    error=error.context(key,value.clone());
+                }
+            }
+        }
+    }
+    error
 }
 
 #[cfg(test)]
@@ -650,5 +666,25 @@ mod tests {
         idle.reset();
         assert_eq!(idle.delay_ms, 5);
         assert!(idle.until <= tokio::time::Instant::now());
+    }
+
+    #[tokio::test]
+    async fn capacity_idle_tuning_preserves_cap_across_resets() {
+        for cap in [5,20,250] {
+            let mut idle=IdlePull::new(cap);
+            for _ in 0..16 {idle.empty();assert!(idle.delay_ms<=cap);assert!(idle.until<=tokio::time::Instant::now()+Duration::from_millis(cap));}
+            idle.reset();assert_eq!(idle.max_ms,cap);assert_eq!(idle.delay_ms,5);
+            assert!(idle.until<=tokio::time::Instant::now());
+        }
+    }
+    #[test]
+    fn capacity_decode_diagnostics_only_expose_numeric_quota_context() {
+        let cause=SparrowError::new(ErrorCode::ResourceExhausted,"secret payload")
+            .context("credit","reservation").context("used","12").context("request","64").context("cap","32").context("token","private");
+        let error=decode_failure(9,cause);let display=error.to_string();
+        for term in ["source_sequence=9","credit=reservation","used=12","request=64","cap=32"] {assert!(display.contains(term),"{display}");assert!(error.message.contains(term),"status persists message only");}
+        assert!(!display.contains("secret")&&!display.contains("private"));
+        let error=decode_failure(3,SparrowError::new(ErrorCode::ResourceExhausted,"hidden").context("credit","secret").context("used","not_a_number"));
+        assert_eq!(error.context,vec![("source_sequence".into(),"3".into())]);
     }
 }

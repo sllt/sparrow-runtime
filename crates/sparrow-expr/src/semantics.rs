@@ -7,6 +7,12 @@ pub enum OutputAllocation {
     Scalar,
     AsciiUtf8,
     Forward,
+    BoundedText,
+    Replace,
+    JsonParse,
+    JsonObject,
+    JsonStringify,
+    FixedText,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct FunctionSemantics {
@@ -20,6 +26,150 @@ pub struct FunctionSemantics {
     pub allocation: OutputAllocation,
 }
 pub const FUNCTIONS: &[FunctionSemantics] = &[
+    bounded(
+        "concat",
+        2,
+        16,
+        "utf8",
+        "propagate",
+        OutputAllocation::BoundedText,
+    ),
+    bounded(
+        "substring",
+        3,
+        3,
+        "utf8_positive_1_based_start_nonnegative_count_unicode_scalars",
+        "propagate",
+        OutputAllocation::BoundedText,
+    ),
+    bounded(
+        "replace",
+        3,
+        3,
+        "utf8_nonempty_literal_search",
+        "propagate",
+        OutputAllocation::Replace,
+    ),
+    bounded(
+        "contains",
+        2,
+        2,
+        "utf8_literal",
+        "propagate",
+        OutputAllocation::Scalar,
+    ),
+    bounded(
+        "starts_with",
+        2,
+        2,
+        "utf8_literal",
+        "propagate",
+        OutputAllocation::Scalar,
+    ),
+    bounded(
+        "ends_with",
+        2,
+        2,
+        "utf8_literal",
+        "propagate",
+        OutputAllocation::Scalar,
+    ),
+    bounded(
+        "trim",
+        1,
+        1,
+        "utf8_unicode_whitespace",
+        "propagate",
+        OutputAllocation::BoundedText,
+    ),
+    bounded(
+        "round",
+        1,
+        1,
+        "finite_numeric_ties_away_from_zero",
+        "propagate",
+        OutputAllocation::Scalar,
+    ),
+    bounded(
+        "floor",
+        1,
+        1,
+        "finite_numeric",
+        "propagate",
+        OutputAllocation::Scalar,
+    ),
+    bounded(
+        "ceil",
+        1,
+        1,
+        "finite_numeric",
+        "propagate",
+        OutputAllocation::Scalar,
+    ),
+    bounded(
+        "to_int64",
+        1,
+        1,
+        "numeric_or_text_strict_range_truncate_toward_zero",
+        "propagate_including_dynamic_null",
+        OutputAllocation::Scalar,
+    ),
+    bounded(
+        "to_float64",
+        1,
+        1,
+        "numeric_or_text_finite_lossy_integer_conversion",
+        "propagate_including_dynamic_null",
+        OutputAllocation::Scalar,
+    ),
+    bounded(
+        "to_string",
+        1,
+        1,
+        "finite_primitive",
+        "propagate_including_dynamic_null",
+        OutputAllocation::BoundedText,
+    ),
+    bounded(
+        "json_get",
+        2,
+        2,
+        "strict_json_utf8_rfc6901_pointer",
+        "missing_or_json_null_is_sql_null",
+        OutputAllocation::JsonParse,
+    ),
+    bounded(
+        "json_object",
+        2,
+        16,
+        "alternating_utf8_keys_values_unique_keys",
+        "null_key_propagates_null_value_preserved",
+        OutputAllocation::JsonObject,
+    ),
+    bounded(
+        "json_stringify",
+        1,
+        1,
+        "scalar_json_bytes_base64_nonfinite_rejected",
+        "sql_null_becomes_json_null_text",
+        OutputAllocation::JsonStringify,
+    ),
+    bounded(
+        "parse_timestamp",
+        1,
+        1,
+        "rfc3339_known_offset_years_1_9999_no_leap_no_submicrosecond",
+        "propagate",
+        OutputAllocation::Scalar,
+    ),
+    bounded(
+        "format_timestamp",
+        1,
+        1,
+        "utc_timestamp_or_int64_micros_years_1_9999",
+        "propagate",
+        OutputAllocation::FixedText,
+    ),
     FunctionSemantics {
         name: "abs",
         min_args: 1,
@@ -111,6 +261,27 @@ pub const FUNCTIONS: &[FunctionSemantics] = &[
         work_bound: "linear_comparisons_plus_child_evaluation",
     },
 ];
+const fn bounded(
+    name: &'static str,
+    min_args: usize,
+    max_args: usize,
+    input: &'static str,
+    null_policy: &'static str,
+    allocation: OutputAllocation,
+) -> FunctionSemantics {
+    FunctionSemantics {
+        name,
+        min_args,
+        max_args: Some(max_args),
+        input,
+        null_policy,
+        allocation,
+        output_bound:
+            "scalar_or_max_65536_bytes_text_or_dynamic_resident; reservation_may_be_stricter",
+        work_bound:
+            "max_16_arguments_65536_bytes_each; json_depth_8; pointer_1024_bytes; no_regex_or_io",
+    }
+}
 pub fn function(name: &str) -> Option<&'static FunctionSemantics> {
     FUNCTIONS.iter().find(|f| f.name.eq_ignore_ascii_case(name))
 }
@@ -121,7 +292,11 @@ mod tests {
     fn r10_every_registered_function_has_an_evaluator_and_allocation_rule() {
         for f in super::FUNCTIONS {
             if matches!(f.allocation, super::OutputAllocation::AsciiUtf8) {
-                assert_eq!((f.min_args, f.max_args), (1, Some(1)), "ASCII allocation bound only covers unary functions");
+                assert_eq!(
+                    (f.min_args, f.max_args),
+                    (1, Some(1)),
+                    "ASCII allocation bound only covers unary functions"
+                );
             }
             let values = vec![sparrow_model::Scalar::Null; f.min_args];
             crate::check_call_arity(f.name, values.len()).unwrap();

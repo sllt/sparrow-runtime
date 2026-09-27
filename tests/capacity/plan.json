@@ -1,0 +1,20 @@
+{
+  "version":1,
+  "cases":[
+    {"name":"js-zero-r1k","source":"jetstream","sink":"http","rows":10000,"rate":1000,"jobs":1,"window":1,"p99_target_ms":100},
+    {"name":"js-zero-r5k","source":"jetstream","sink":"http","rows":50000,"rate":5000,"jobs":1,"window":1,"p99_target_ms":100},
+    {"name":"js-zero-r10k","source":"jetstream","sink":"http","rows":100000,"rate":10000,"jobs":1,"window":1,"p99_target_ms":100},
+    {"name":"js-zero-r20k","source":"jetstream","sink":"http","rows":200000,"rate":20000,"jobs":1,"window":1,"p99_target_ms":100},
+    {"name":"js-count-r10k","source":"jetstream","sink":"http","rows":99999,"rate":10000,"jobs":1,"window":3,"p99_target_ms":100},
+    {"name":"js-multi-r5k","source":"jetstream","sink":"http","rows":50000,"rate":5000,"jobs":2,"window":1,"p99_target_ms":100},
+    {"name":"js-slow20-r1k","source":"jetstream","sink":"http","rows":10000,"rate":1000,"jobs":1,"window":1,"delay_ms":20,"p99_target_ms":150},
+    {"name":"js-overload-recover","source":"jetstream","sink":"http","rows":30000,"rate":10000,"jobs":1,"window":1,"delay_ms":20,"recovery_ms":2000,"p99_target_ms":1000},
+    {"name":"js-idle-default","source":"jetstream","sink":"http","rows":12,"rate":0,"jobs":1,"window":1,"idle_ms":600,"p99_target_ms":100},
+    {"name":"js-idle-fast20","source":"jetstream","sink":"http","rows":12,"rate":0,"jobs":1,"window":1,"idle_ms":600,"idle_cap_ms":20,"p99_target_ms":100},
+    {"name":"js-payload-8k","source":"jetstream","sink":"http","rows":96,"rate":100,"jobs":1,"window":1,"padding":8192,"p99_target_ms":150},
+    {"name":"js-payload-reject16k","source":"jetstream","sink":"http","rows":1,"rate":0,"jobs":1,"window":1,"padding":16384,"expect_rejection":true,"p99_target_ms":100},
+    {"name":"file-multi-http","source":"file","sink":"http","rows":32768,"rate":0,"jobs":2,"window":1,"p99_target_ms":100},
+    {"name":"file-ndjson","source":"file","sink":"file","rows":32768,"rate":0,"jobs":1,"window":1,"p99_target_ms":100},
+    {"name":"push-r500","source":"http_push","sink":"http","rows":5000,"rate":500,"jobs":1,"window":1,"p99_target_ms":100}
+  ]
+}

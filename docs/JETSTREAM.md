@@ -88,6 +88,7 @@ SDK `read_buffer_capacity` 只是初始容量；不能把它或订阅条数当�
 
 - Source 合并同一 pull 中已经就绪的记录，受 Kernel rows/bytes 限制；不为凑批等待新消息。整批发布后才推进连续 published cut，尚未入队的预取/延后记录不进入 checkpoint。
 - 非空批次结束立即继续；仅真正空拉取使用 5→10→…→250 ms 退避，有数据即复位。空闲稳定状态约不超过 4 pull/s，代价是最长约 250 ms 的空闲唤醒等待；控制/ACK/取消不被该等待阻塞。旧 v13 每 8 条还会额外等 5 ms，不能沿用其 NATS 容量假设。
+  - 容量批新增可选 `source.jetstream.idle_backoff_max_ms`（5～250ms），缺省仍250。只用于普通可靠Actor；持久时间/来源观测profile拒绝。调低后空闲请求率会增加，status的effective上限随配置变化；不是端到端SLA，也没有改SDK拉取期限、ACK或恢复规则。配置和复验口径见 [CAPACITY](CAPACITY.md)。
 - 保留 **Explicit** ACK：独立 worker 最多 16 个确认请求，共享有界队列/工作区，每条最多 3 次尝试；负响应不算确认。提交后仅调度 ACK，不在 source select 分支串行等待 N 个 RTT，停止时取消并 join worker；ACK 失败耗尽重试才结束 attempt。broker 断线仍 fail-closed，不承诺透明重连。
 - `AckAll` 未采用。不能忽略重投递后的 consumer sequence 与旧 reply token，直接替换确认策略；以后改变需独立 conformance/恢复测试。
 - `timeout_ms` 应覆盖目标负载下的正常 HTTP 排空时间。过小不会通过 ACK 丢弃输入，但会增加 checkpoint 失败与积压；持续慢端点仍需限流/容量规划。HTTP waiter 超时不取消已开始的 durable commit。

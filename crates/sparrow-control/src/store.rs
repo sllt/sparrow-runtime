@@ -2585,6 +2585,8 @@ mod tests {
                 file_contract: None,
             },
             sink: SinkSpec {
+                action: None,
+                file: None,
                 kind: "http".into(),
                 url: Some("http://127.0.0.1:9/ingest".into()),
                 skip_verify: false,

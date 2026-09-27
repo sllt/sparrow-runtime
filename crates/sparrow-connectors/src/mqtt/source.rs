@@ -189,7 +189,7 @@ impl MqttSourceConfig {
 pub struct MqttSource {
     pub config: MqttSourceConfig,
     pub diag: Arc<IoDiagnostics>,
-    codec: JsonCodec,
+    pub(super) codec: JsonCodec,
     username: Option<String>,
     password: Option<Vec<u8>>,
 }
@@ -204,9 +204,9 @@ enum Ingress {
     },
 }
 
-struct PendingIngress {
-    diag: Arc<IoDiagnostics>,
-    bytes: u64,
+pub(super) struct PendingIngress {
+    pub(super) diag: Arc<IoDiagnostics>,
+    pub(super) bytes: u64,
 }
 impl Drop for PendingIngress {
     fn drop(&mut self) {
@@ -331,7 +331,7 @@ impl MqttSource {
         }
     }
 
-    async fn session(&self, tx: &Ingress, cancel: &CancellationToken) -> Result<()> {
+    pub(super) async fn open_session(&self, cancel: &CancellationToken) -> Result<Option<(super::io::MqttStream, MqttFramedReader)>> {
         self.diag.observation.health(true,HealthState::Connecting,"mqtt_handshake",None);
         let mut stream = connect_with_quickack(
             &self.config.host,
@@ -394,10 +394,10 @@ impl MqttSource {
             Ok::<_, ConnectorError>(reader)
         };
 
-        let mut reader = tokio::select! {
+        let reader = tokio::select! {
             _ = cancel.cancelled() => {
                 close_mqtt(&mut stream).await;
-                return Ok(());
+                return Ok(None);
             }
             r = tokio::time::timeout(self.config.connect_timeout, handshake) => {
                 match r {
@@ -418,6 +418,11 @@ impl MqttSource {
         };
 
         self.diag.observation.health(true,HealthState::Ready,"mqtt_subscribed",None);
+        Ok(Some((stream, reader)))
+    }
+
+    async fn session(&self, tx: &Ingress, cancel: &CancellationToken) -> Result<()> {
+        let Some((mut stream, mut reader)) = self.open_session(cancel).await? else { return Ok(()) };
         let ping = self.config.keepalive / 2;
         let ping = if ping.is_zero() {
             Duration::from_secs(15)

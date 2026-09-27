@@ -41,7 +41,18 @@ impl StateSemantics {
                 w.raw(&size_micros.to_le_bytes())?;
                 w.raw(&slide_micros.to_le_bytes())?;
             }
+            WindowKind::HoppingProcessingTime {size_micros,slide_micros} => {
+                w.tag(4)?;w.raw(&size_micros.to_le_bytes())?;w.raw(&slide_micros.to_le_bytes())?;
+            }
+            WindowKind::SlidingCount {size,step} => {w.tag(5)?;w.raw(&size.to_le_bytes())?;w.raw(&step.to_le_bytes())?;}
+            WindowKind::SlidingProcessingTime {size_micros,delay_micros}|WindowKind::SlidingEventTime {size_micros,delay_micros} => {
+                w.tag(if spec.kind.uses_event_time(){7}else{6})?;w.raw(&size_micros.to_le_bytes())?;w.raw(&delay_micros.to_le_bytes())?;
+            }
+            WindowKind::SessionProcessingTime {gap_micros,max_duration_micros}|WindowKind::SessionEventTime {gap_micros,max_duration_micros} => {
+                w.tag(if spec.kind.uses_event_time(){9}else{8})?;w.raw(&gap_micros.to_le_bytes())?;w.raw(&max_duration_micros.to_le_bytes())?;
+            }
         }
+        if spec.kind.is_buffered() {w.raw(&(spec.max_buffered_rows as u64).to_le_bytes())?;}
         w.len(spec.keys.len())?;
         for key in &spec.keys {
             w.bytes(key.as_bytes())?;
@@ -534,15 +545,27 @@ impl Writer {
             // configuration instead of assumed, so a future clock policy cannot
             // silently reuse these bytes. `Paused` keeps emitting 1.
             let clock = match timing {
+                crate::IotTimingSpec::Resample(config) => match config.clock {
+                    crate::ProcessingTimePolicy::Paused => 1u8,
+                },
                 crate::IotTimingSpec::Alarm { clock, .. }
                 | crate::IotTimingSpec::HoldFor { clock, .. }
-                | crate::IotTimingSpec::Debounce { clock, .. }
-                | crate::IotTimingSpec::Silence { clock, .. } => match clock {
+                | crate::IotTimingSpec::Debounce { clock, .. } => match clock {
                     crate::ProcessingTimePolicy::Paused => 1u8,
+                },
+                crate::IotTimingSpec::Silence { clock, .. } => match clock {
+                    crate::SilenceClockPolicy::Paused => 1u8,
+                    crate::SilenceClockPolicy::Live => 2u8,
                 },
             };
             self.tag(clock)?;
             match timing {
+                crate::IotTimingSpec::Resample(config) => {
+                    self.raw(&config.period_micros.to_le_bytes())?;
+                    self.raw(&config.max_wait_micros.to_le_bytes())?;
+                    self.raw(&config.max_gap_micros.to_le_bytes())?;
+                    self.raw(&(config.max_emissions_per_decision as u64).to_le_bytes())?;
+                }
                 crate::IotTimingSpec::Alarm { activate_micros, resolve_micros, cooldown_micros, notification_max_age_micros, .. } => {
                     for duration in [activate_micros, resolve_micros, cooldown_micros, notification_max_age_micros] {
                         self.raw(&duration.to_le_bytes())?;

@@ -45,6 +45,11 @@ impl MailboxConfig {
 /// Watermark / idle punctuation travelling with the dataflow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamControl {
+    /// Live-only FIFO round. No durable identity or wall-clock interpretation.
+    LiveFeedStart { micros: i64, epoch: u64 },
+    /// Probe start time, -1 for data-only, -2 for unavailable. The receiving
+    /// silence stage checks freshness AFTER all preceding ingress/mailboxes.
+    LiveFeedEnd { probe_started: i64 },
     /// Durable source-ordered logical time; only admitted by paused-time plans.
     ProcessingTime { micros: i64 },
     /// End of a source-observed decision, after its optional input. -1 means

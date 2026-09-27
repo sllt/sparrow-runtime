@@ -218,6 +218,7 @@ impl<T> Sender<T> {
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
+    pub async fn closed(&self) { self.tx.closed().await; }
     pub async fn reserve(&self) -> std::result::Result<Permit<'_, T>, mpsc::error::SendError<()>> {
         if let Some(o) = &self.observer {
             o.active_state();

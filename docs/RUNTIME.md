@@ -1,5 +1,7 @@
 # Runtime ownership (A3 / A4)
 
+2026-09-27 窗口补齐Preview已完成本批自查与验证：PT hopping、SlidingCount、PT/ET逐事件Sliding、PT/ET Session；匹配候选937项回归、44项no-demo及19×5专项通过。新窗口仅 `restart_fresh`，Control、CheckpointPlan、PlanLayout复用判定、Kernel及新窗口旧codec恢复入口均明确拒绝aligned/restore。PT hopping复用增量store；其他新族使用独立冷路径，保存有界、detached聚合输入，以支持MIN/MAX和乱序Session重分段；key/event/deadline索引、候选、输出分别计费，按key/rows/bytes/timers上限失败，不静默丢弃。旧窗口快照编码不变，匹配旧恢复回归通过。详见 [窗口合同、初次失败及最终证据](WINDOWS.md)；没有新族容量/长稳或整体生产认证。
+
 **2026-09-23 时间型 DAG（限定 Preview 已验收）**：独立 v18/PT、v19/ET 使用 GTD1 决策日志和 GTC1 聚合 cut，持久化来源时间/idle/EOF、固定边序 Union progress 与各 Sink 输出 cursor。File actor 先记录再发布一轮，所有状态/barrier/真实 HTTP flush 到齐后提交 CURRENT；ET future-skew 使用已记录墙钟，PT 使用停机暂停时钟。新协议不改变旧 Union ready-order 或扩大默认预算。完整范围、内存边界、EOF 和重复输出合同见 [DAG](DAG.md#time-graph-recovery)；774/44、专项/真实故障/旧矩阵及原三组 ABBA 通过，见 [匹配证据](PRODUCTION.md#time-graph-validation)。仍非目标容量、长稳或生产认证。
 
 本批性能 Review 将新增有序 Window future 放到计费的冷构造路径，Box 内存先释放再退 credit，避免旧窗口热路径携带新协议内联 future。严格 JSON 对象最多 8 个键时使用有界线性去重，第 9 个唯一键开始晋升随机 HashSet；重复键/转义/嵌套/深度等拒绝合同不变。两项随最终 v13 全量及原门槛验证，不改 checkpoint 正确性或资源配额。
@@ -1070,6 +1072,15 @@ with `event_time > now + skew` is dropped, counted as
 
 这些是现有路径的修复，不新增通用多状态恢复、DAG 或可靠 outbox。`max_state_keys` 不是任意宽状态必定可运行的保证；raw helper、第三方分配及全进程 RSS 硬限制仍按原边界声明。匹配代码的 R10 测试/多 key 性能证据见 [PRODUCTION.md](PRODUCTION.md)，不沿用历史 v7 或自审数字作为本轮通过证明。
 
+## 重采样 profile v25/v26（开发 Preview）
+
+- 单个线性 Resample，前后仅纯 Transform；File25 / JetStream26，使用已有 PTC1/TPD1 的持久暂停时间与 timer-before-input 顺序。旧 v14～24 目录不升级、不混写；输出 epoch 必须等于 state generation，完整计划身份包含模式、周期、wait/gap 与展开上限。
+- IoT slot3/codec2 新增 kind13/14/15（Last/Mean/Interpolate）。每条状态是 key + `next_grid:Int64,pending_grid:Int64,sample_time:Int64,samples:UInt64,used:Bool` + 完整数值向量；缺失时间用 -1。前缀固定 38 字节，非物化扫描同样验证类型、数值完整性和 source cut，随后恢复再按绑定 schema/周期/等待期限检查并构造有界 timer。
+- Last/Mean 只保留当前半开区间的一个向量/在线均值，空区间全 NULL；Last 不把 UInt64 绕经 Float64。Interpolate 只保留最近一个完整点及至多一个等待格，不预分配无限时间轴、不外推、不回写已发结果。过期等号先输出 missing，之后同刻输入只能影响仍未产出的格。
+- 每次时间推进先算补格数量、时间溢出和 cap，再改变逻辑时钟。插值始终为随后可能产生的一个输入输出预留名额；不能先发满 timer 输出，再在输入处才发现超额。时间跳跃超过上限明确失败，不截断。
+- 新机器放在冷 Box 内，不扩大原有 TimedState 的最大内联变体；条目、索引副本、工作区、输出和恢复候选由同一 Job owner 计费。恢复采用完整候选替换，输出入账后才消费 timer/改状态；取消时先释放分配、后归还额度。
+- 诊断独立使用 `resample_*` 三类计数，不借用 Alarm 通知计数。每决策 fsync/full checkpoint 与 required HTTP 串行等待的限制不变，v25/v26 不是高吞吐批提交优化。
+
 ## 来源观测与静默 profile（验证候选）
 
 - File23 / JetStream24 是独立线性 profile：Source → 首个 Silence 状态 → 可选纯 Transform → required HTTP；不混旧 PTC1/TPD1、ET、参考表或 DAG。旧版本和其他 profile 不得改写其历史。
@@ -1078,3 +1089,28 @@ with `event_time > now + skew` is dropped, counted as
 - 静态登记与已观察 key 共同构成设备集合；从未见且未登记的设备不存在。`silent` 每 episode 一次，只有真实输入才 `resumed`；连接恢复不是设备恢复。输出为 key 加独立事件列，登记未见时 `last_seen=NULL`，不伪造原遥测行。
 - kind12 状态、timer/key、副本、登记 JSON、工作区和输出同 Job 计费；覆盖重建是全局常数更新，不逐 key 重排；输出准入失败不能消费当前 episode。静默状态不 TTL 遗忘。宽限/时间溢出明确拒绝，不把溢出当成没有 timer。
 - `checkpoint.observed_source` 只报告已成功提交的历史 cut，不表示实时健康；状态失败仍沿用原 Source 诊断。本 profile 每决策完整持久化，受 fsync/HTTP RTT 限制，不是高吞吐链路。匹配验证与未测范围见 [本批记录](PRODUCTION.md#silence-validation)。
+
+## MQTT live 静默：非持久 FIFO 合同
+
+- 与 File23/JetStream24 actor 分离；没有 OFC1/OFD1、SourcePosition、CURRENT 或来源 ACK。`SilenceClockPolicy::Live` 是 Silence 专用策略，不扩大其他 timing policy；paused 的 canonical tag 仍为 1，live 为 2，CheckpointPlan 一律拒绝 live 时钟。
+- Connector 一次一个带绝对响应期限的 PINGREQ；只有及时 PINGRESP、无已知 ingress 队列/reader 预读积压且 epoch 未中断时，才入队候选健康事实。所有事实和预算化行共享同一个 FIFO；控制丢失通过后续事件上的 sticky epoch 表达，不能静默丢失失效通知。
+- 独立 Kernel Source 一次消费一个事件，不经过旧批量预取；`LiveFeedStart → 可选一行 → LiveFeedEnd` 在同一 mailbox 排序，Silence 消费端重新验证新鲜度后才能排空 timer。控制不传播为下游遥测；输出仍经原 Kernel Transform/Sink，不绕开执行链。
+- Box 内事实、QueuedRow、队列元数据、工作行与状态受 Job 额度；`mqtt_inbox_*` 的已计费行指标包括队列外最多一个已取出的工作事件，不能直接当作 FIFO occupancy。慢 HTTP 不会无界读入，也不会阻止取消；旧数据路径仍按原批量方式运行。
+- 新尝试用新 generation；连接重建只打断覆盖，不伪造 resumed、不累加断连两侧的宽限。消息和事件均 live-best-effort，任意时刻崩溃可丢失；健康探测不能证明 broker 全局排空或 QoS0 无损。详见 [配置合同](IOT.md#mqtt-live-silence)。
+
+## Action/File 与纯函数（2026-09-26 开发 Preview）
+
+- HTTP/MQTT/Log/File 使用可选 v1 typed JSON tree；field 引用按最终 Sink schema 校验，显式 body:null 与缺省全行不同。HTTP 动态 query、MQTT单level变量限制最终目标，重试不重算 payload；不存在脚本或secret插值。
+- 所有 Action/File 只支持 restart_fresh，拒绝 checkpoint/restore；已有 Alarm/可靠Silence/Resample 的原required HTTP协议不借此开放模板。多动作仍是原 DAG required/best-effort；部分成功不回滚。
+- File输出独占已有allowlisted Linux目录，FD锚定、永久协作锁、有界新段、不覆盖旧文件、不自动删除；配额/坏尾明确失败。可选每批sync_data不冒充source重放/幂等/掉电保证。取消等待已开始的blocking写结束，不遗留旧writer，也不能承诺坏文件系统上的强制停机时限。
+- 新18个纯函数复用SQL/Graph表达式与AllocationBound；明确Unicode scalar、严格数值转换、JSON pointer、UTC微秒与输出硬界。旧CAST、ASCII case、eager首错及semantics.VERSION=1不变；新增名称进入原canonical表达式身份。
+- 生产Log不再留第二份ring；原显式调试capture API不作为Job预算内的生产存储。新File计数是写入/同步调用观测，不是可靠提交水位。
+- 配置范围、预算、示例见[ACTIONS](ACTIONS.md)，候选与验证见[PRODUCTION](PRODUCTION.md#actions-validation)。性能门禁和长稳/存储故障仍独立判断。
+
+## 可靠链路容量批（2026-09-26）
+
+- 旧JSON编码的常见小型primitive行借用字段和值直接写入bounded writer，避免临时Map和字符串复制；≤16字段使用固定栈索引保持旧字典序。Bytes/Dynamic、宽表、重复字段名及serde_json/preserve_order保留旧路径；Float/UInt64/NULL/escaping及可靠envelope字节不变，不变更codec版本。
+- 普通JetStream Actor新增可选空拉取退避上限，默认250ms不变；reset保留所配置的cap。time/observed profile明确拒绝。没有扩大默认pending/pull/队列/内存，也没有减少所有权、retention检查或改变Explicit ACK切点。
+- 解码额度错误只将已验证的 `credit/used/request/cap` 与source sequence放入安全message/context，最终attempt诊断可见；不把任意connector文本或payload带入API。
+- `/v1/metrics.process_credits` 是进程owner追踪的Job reservation/retention/queue/physical/handle及peak。多字段并非并发原子快照，也不覆盖第三方所有分配或等同RSS硬限制；只在停止后的稳定边界核对清零。
+- 原门禁、有限容量和生产认证分开记录，见 [CAPACITY](CAPACITY.md)。过载后的完整排空不表示持续容量达标；拉取超时仍fail-closed，不通过静默跳过或延长期限隐藏问题。

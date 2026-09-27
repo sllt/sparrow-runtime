@@ -5,6 +5,35 @@ use sparrow_testkit::nats::NatsSandbox;
 use std::{sync::Arc, time::Duration};
 
 #[test]
+fn capacity_idle_tuning_admission_and_checkpoint_semantics() {
+    use serde_json::json;
+    let store=Store::open_memory().unwrap();store.put_stream("sensors",r#"{"fields":[{"name":"device_id","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false}]}"#).unwrap();
+    let base=json!({"stream":"sensors","sql":"SELECT device_id, v FROM sensors",
+        "source":{"kind":"jetstream","jetstream":{"servers":["nats://127.0.0.1:4222"],"namespace":"capacity","stream":"INPUT","consumer":"case","ownership_bucket":"OWNERS"}},
+        "sink":{"kind":"http","url":"http://127.0.0.1:9/unused"},"recovery":"aligned","delivery":"checkpointed_at_least_once",
+        "checkpoint_dir":"/tmp/sparrow/capacity-unused","checkpoint":{"interval_ms":1000,"timeout_ms":5000,"resume_latest":true}});
+    let parse=|value:&serde_json::Value|PipelineSpec::from_json(&serde_json::to_vec(value).unwrap());
+    let original=parse(&base).unwrap();assert!(serde_json::to_value(&original).unwrap()["source"]["jetstream"].get("idle_backoff_max_ms").is_none());
+    let old_plan=crate::bind_plan_with_store(&store,&original,"capacity",1).unwrap();
+    for cap in [5u64,7,20,250] {
+        let mut value=base.clone();value["source"]["jetstream"]["idle_backoff_max_ms"]=json!(cap);let spec=parse(&value).unwrap();
+        let plan=crate::bind_plan_with_store(&store,&spec,"capacity",1).unwrap();crate::validate_aligned_plan(&spec,&plan).unwrap();assert_eq!(plan,old_plan,"operational idle tuning must not change checkpoint semantics");
+        let effective=crate::validate::effective_guarantees_with_plan(&spec,&plan);
+        assert_eq!(effective["jetstream_execution"]["idle_backoff_ms"]["maximum"],cap);
+        assert_eq!(effective["jetstream_execution"]["idle_steady_pulls_per_second_max"].as_u64(),Some(1000u64.div_ceil(cap)));
+    }
+    for cap in [0,4,251] {let mut value=base.clone();value["source"]["jetstream"]["idle_backoff_max_ms"]=json!(cap);assert!(parse(&value).is_err());}
+    let mut timed=base;timed.as_object_mut().unwrap().remove("sql");timed["source"]["jetstream"]["idle_backoff_max_ms"]=json!(20);
+    timed["graph"]=json!({"version":1,"pipeline_id":1,"revision_id":1,"nodes":[
+        {"id":1,"kind":"memory_source","table":"sensors","out":[2]},
+        {"id":2,"kind":"debounce","iot":{"keys":["device_id"],"fields":["v"],"emit_first":false,"ttl_micros":0,"max_keys":16,"invalid":"error",
+            "timing":{"kind":"debounce","clock":"paused","quiet_micros":200000,"max_wait_micros":1000000,"leading":false,"trailing":true,"reset_on_repeat":true}},"out":[3]},
+        {"id":3,"kind":"capture_sink","name":"out"}]});
+    let spec=parse(&timed).unwrap();let plan=crate::bind_plan_with_store(&store,&spec,"capacity",1).unwrap();
+    assert!(crate::validate_aligned_plan(&spec,&plan).unwrap_err().message.contains("regular JetStream actor"));
+}
+
+#[test]
 #[ignore = "requires isolated pinned SPARROW_NATS_SERVER"]
 fn k2_stable_requires_new_durable_progress_and_restore_refuses_semantic_or_directory_forks() {
     let kernel = Arc::new(crate::host_kernel().unwrap());

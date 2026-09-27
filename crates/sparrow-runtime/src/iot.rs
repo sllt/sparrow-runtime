@@ -185,7 +185,8 @@ impl IotFreeze {
         let mut seen = BTreeSet::new();
         for _ in 0..header.entries {
             let key_len = take_u16(src, "IoT freeze key arity")? as usize;
-            if key_len == 0 || key_len > MAX_IOT_ARITY {
+            if key_len == 0 || key_len > MAX_IOT_ARITY
+                || (matches!(header.kind, 13..=15) && key_len > 16) {
                 return Err(SparrowError::new(
                     ErrorCode::BoundExceeded,
                     "IoT freeze key arity must be between 1 and 64",
@@ -194,6 +195,10 @@ impl IotFreeze {
             let mut key = Vec::with_capacity(if materialize { key_len } else { 0 });
             let mut key_bytes = Vec::new();
             for _ in 0..key_len {
+                if matches!(header.kind, 13..=15) && src.first() == Some(&1)
+                    && (src.len() < 2 || src[1] > 1) {
+                    return Err(codec("resample noncanonical Bool key"));
+                }
                 if materialize {
                     let value = Scalar::decode_value(src)?;
                     validate_freeze_scalar(&value, true)?;
@@ -226,6 +231,12 @@ impl IotFreeze {
             let ttl = matches!(header.kind,9|10);
             let mut values = Vec::with_capacity(if materialize { value_len } else { 0 });
             let mut prefix = 0;
+            if matches!(header.kind, 13..=15) {
+                values = crate::resample_iot::scan_values(src, value_len, header.kind, now, materialize)?;
+                ensure_decoded_size(input_len.saturating_sub(src.len()))?;
+                if materialize { entries.push(IotEntry { key, values }); }
+                continue;
+            }
             if header.kind == crate::silence_iot::KIND {
                 // Fixed 20-byte metadata, checked before any allocation:
                 // Bool silent | UInt64 episode | Int64 last_seen.
@@ -335,7 +346,7 @@ impl IotFreeze {
         if slot != IOT_STATE_SLOT {
             return Err(codec("IoT freeze StateSlotId is not 3"));
         }
-        if !matches!(kind, 4..=12) {
+        if !matches!(kind, 4..=15) {
             return Err(codec("unknown IoT freeze kind"));
         }
         Ok(IotFreezeHeader {
@@ -384,7 +395,7 @@ impl IotFreeze {
         if self.slot != IOT_STATE_SLOT {
             return Err(codec("IoT freeze StateSlotId is not 3"));
         }
-        if !matches!(self.kind, 4..=12) {
+        if !matches!(self.kind, 4..=15) {
             return Err(codec("unknown IoT freeze kind"));
         }
         if max_keys == 0
@@ -398,6 +409,10 @@ impl IotFreeze {
         }
         let mut seen = BTreeSet::new();
         for entry in &self.entries {
+            if matches!(self.kind, 13..=15) {
+                crate::resample_iot::metadata(&entry.values, self.kind, None)?;
+                if entry.key.len() > 16 { return Err(codec("resample key arity exceeds 16")); }
+            }
             if self.kind == crate::silence_iot::KIND {
                 if entry.values.len() != 3 {
                     return Err(codec(
@@ -439,7 +454,7 @@ impl IotFreeze {
                 return Err(codec("duplicate IoT freeze key"));
             }
             for value in &entry.values {
-                if matches!(self.kind,7|8|11) && value.is_null() { continue; }
+                if matches!(self.kind,7|8|11|13..=15) && value.is_null() { continue; }
                 validate_freeze_scalar(value, false)?;
             }
         }
@@ -478,7 +493,10 @@ impl IotOperator {
         // bounded workspace is charged before `spec.validate` runs and is held
         // across the metadata lease and the timed-state construction. Legacy
         // shapes keep their original allocation profile.
-        let _silence_workspace = if spec.is_silence() {
+        let _silence_workspace = if spec.is_resample() {
+            Some(owner.acquire(CreditKind::Reservation,
+                metadata_bytes(&spec, &input, spec.keys.len(), spec.fields.len()).saturating_add(8192))?)
+        } else if spec.is_silence() {
             Some(owner.acquire(
                 CreditKind::Reservation,
                 crate::silence_iot::registry_workspace(&spec, spec.keys.len()),
@@ -933,6 +951,12 @@ impl IotOperator {
     /// True when this operator is the silence state machine, so the kernel can
     /// decide whether it owes a feed observation this round.
     pub fn is_silence(&self) -> bool { self.spec.is_silence() }
+    pub fn resample_stats(&self) -> crate::ResampleStats {
+        self.timed.as_ref().map(|state| state.resample_stats()).unwrap_or_default()
+    }
+    pub fn report_resample_metrics(&mut self, metrics: &crate::metrics::RuntimeMetrics) {
+        if let Some(state) = &mut self.timed { state.report_resample_metrics(metrics); }
+    }
     pub fn bind_generation(&mut self, generation: [u8; 16]) -> Result<()> {
         if let Some(timed) = &mut self.timed { timed.bind_generation(generation)?; }
         Ok(())

@@ -1,5 +1,5 @@
 //! Sparrow SQL v0.3 gate: event-time TUMBLE/HOP, watermark holdback,
-//! versioned FOR SYSTEM_TIME AS OF lookup. Session / retract / stream-stream
+//! versioned FOR SYSTEM_TIME AS OF lookup and bounded sliding/session. Retract / stream-stream
 //! join stay rejected.
 
 use sqlparser::ast::{
@@ -27,7 +27,6 @@ const SCALAR_FUNCS: &[&str] = &[
 const AGG_FUNCS: &[&str] = &["count", "sum", "avg", "min", "max"];
 
 const REJECTED: &[&str] = &[
-    "session",
     "retract",
     "rank",
     "dense_rank",
@@ -160,7 +159,7 @@ fn group_is_windowed(g: &GroupByExpr) -> Result<bool> {
 
 fn is_window_fn(f: &Function) -> bool {
     let n = f.name.to_string().to_ascii_lowercase();
-    n == "tumble" || n == "count_window" || n == "hop"
+    matches!(n.as_str(),"tumble"|"count_window"|"hop"|"sliding"|"session")
 }
 
 fn group_window_reject(g: &GroupByExpr) -> Result<Option<G0Verdict>> {
@@ -170,12 +169,13 @@ fn group_window_reject(g: &GroupByExpr) -> Result<Option<G0Verdict>> {
     for e in exprs {
         if let Expr::Function(f) = e {
             let n = f.name.to_string().to_ascii_lowercase();
-            if n == "session" {
-                return Ok(Some(rejected(
-                    "SESSION windows and late merge are not part of V0.3",
-                )));
+            if matches!(n.as_str(),"sliding"|"session") {
+                let count=match &f.args {FunctionArguments::List(args)=>args.args.len(),_=>0};
+                if (n=="session" && count!=3) || (n=="sliding" && !(2..=3).contains(&count)) {
+                    return Ok(Some(rejected("SESSION needs (clock, gap, max_duration); SLIDING needs (clock, size [, delay])")));
+                }
             }
-            if n == "tumble" || n == "hop" || n == "count_window" {
+            if matches!(n.as_str(),"tumble"|"hop"|"count_window"|"sliding"|"session") {
                 continue;
             }
             if AGG_FUNCS.contains(&n.as_str()) {
@@ -227,7 +227,7 @@ fn func_reject(func: &Function, windowed: bool) -> Result<Option<G0Verdict>> {
             "function '{name}' is not part of Sparrow SQL v0.3"
         ))));
     }
-    if name == "tumble" || name == "hop" {
+    if matches!(name.as_str(),"tumble"|"hop"|"sliding"|"session") {
         return Ok(Some(rejected(
             "TUMBLE/HOP belong in GROUP BY, not the SELECT list",
         )));
@@ -246,7 +246,7 @@ fn func_reject(func: &Function, windowed: bool) -> Result<Option<G0Verdict>> {
     if name == "watermark" {
         return walk_args(func, windowed);
     }
-    if !SCALAR_FUNCS.contains(&name.as_str()) {
+    if !SCALAR_FUNCS.contains(&name.as_str()) && !crate::g0::additive_function(&name) {
         return Ok(Some(rejected(&format!("unknown function '{name}'"))));
     }
     walk_args(func, windowed)

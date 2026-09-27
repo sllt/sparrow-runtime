@@ -4,9 +4,18 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Cold extension: do not enlarge each legacy IoT stage's reporter/future.
+#[derive(Debug, Default)]
+pub struct ResampleMetrics {
+    pub discarded_inputs: AtomicU64,
+    pub missing_outputs: AtomicU64,
+    pub interpolated_outputs: AtomicU64,
+}
+
 /// Process-wide (or session-wide) counters for V1 observability.
 #[derive(Debug, Default)]
 pub struct RuntimeMetrics {
+    pub resample: Box<ResampleMetrics>,
     /// Per-IoT-operator processing counters, not Source delivery counts.
     pub iot_input_rows: AtomicU64,
     pub iot_emitted_rows: AtomicU64,
@@ -100,6 +109,9 @@ impl RuntimeMetrics {
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
+            resample_discarded_inputs: self.resample.discarded_inputs.load(Ordering::Relaxed),
+            resample_missing_outputs: self.resample.missing_outputs.load(Ordering::Relaxed),
+            resample_interpolated_outputs: self.resample.interpolated_outputs.load(Ordering::Relaxed),
             iot_input_rows: self.iot_input_rows.load(Ordering::Relaxed),
             iot_emitted_rows: self.iot_emitted_rows.load(Ordering::Relaxed),
             iot_filtered_rows: self.iot_filtered_rows.load(Ordering::Relaxed),
@@ -138,6 +150,9 @@ impl RuntimeMetrics {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
+    pub resample_discarded_inputs: u64,
+    pub resample_missing_outputs: u64,
+    pub resample_interpolated_outputs: u64,
     pub iot_input_rows: u64,
     pub iot_emitted_rows: u64,
     pub iot_filtered_rows: u64,
@@ -176,7 +191,7 @@ impl MetricsSnapshot {
     /// Structured log line (budgeted labels only).
     pub fn log_line(&self) -> String {
         format!(
-            "{{\"event\":\"sparrow_metrics\",\"jobs_started\":{},\"jobs_stopped\":{},\"jobs_failed\":{},\"ingested_rows\":{},\"emitted_rows\":{},\"iot_input_rows\":{},\"iot_emitted_rows\":{},\"iot_filtered_rows\":{},\"iot_invalid_rows\":{},\"iot_expired_keys\":{},\"iot_state_keys\":{},\"iot_state_bytes\":{},\"queue_items\":{},\"queue_bytes\":{},\"watermark_lag_micros\":{},\"checkpoint_duration_micros\":{},\"checkpoint_bytes\":{},\"checkpoint_commits\":{},\"checkpoint_aborts\":{},\"state_keys\":{},\"state_bytes\":{},\"live_samples\":{},\"future_dropped\":{},\"timers_live\":{},\"timers_cancelled\":{},\"alarm_notifications_expired\":{},\"alarm_notifications_cancelled\":{},\"alarm_notifications_deferred\":{}}}",
+            "{{\"event\":\"sparrow_metrics\",\"jobs_started\":{},\"jobs_stopped\":{},\"jobs_failed\":{},\"ingested_rows\":{},\"emitted_rows\":{},\"iot_input_rows\":{},\"iot_emitted_rows\":{},\"iot_filtered_rows\":{},\"iot_invalid_rows\":{},\"iot_expired_keys\":{},\"iot_state_keys\":{},\"iot_state_bytes\":{},\"queue_items\":{},\"queue_bytes\":{},\"watermark_lag_micros\":{},\"checkpoint_duration_micros\":{},\"checkpoint_bytes\":{},\"checkpoint_commits\":{},\"checkpoint_aborts\":{},\"state_keys\":{},\"state_bytes\":{},\"live_samples\":{},\"future_dropped\":{},\"timers_live\":{},\"timers_cancelled\":{},\"alarm_notifications_expired\":{},\"alarm_notifications_cancelled\":{},\"alarm_notifications_deferred\":{},\"resample_discarded_inputs\":{},\"resample_missing_outputs\":{},\"resample_interpolated_outputs\":{}}}",
             self.jobs_started,
             self.jobs_stopped,
             self.jobs_failed,
@@ -204,7 +219,10 @@ impl MetricsSnapshot {
             self.timers_cancelled,
             self.alarm_notifications_expired,
             self.alarm_notifications_cancelled,
-            self.alarm_notifications_deferred
+            self.alarm_notifications_deferred,
+            self.resample_discarded_inputs,
+            self.resample_missing_outputs,
+            self.resample_interpolated_outputs
         )
     }
 }

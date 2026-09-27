@@ -79,6 +79,9 @@ pub struct WindowOperator {
     closed_index_bytes: usize,
     accumulator_scratch: Vec<Accumulator>,
     accumulator_scratch_lease: Option<sparrow_model::MemoryLease>,
+    /// Fresh-only PT hopping must not reopen windows after a wall-clock rollback.
+    /// Not part of any legacy freeze or checkpoint identity.
+    hopping_clock_high: i64,
 }
 
 /// Widest input schema the fixed-size-accumulator credit fast path handles on
@@ -117,7 +120,14 @@ fn fixed_size_column_estimate(
 }
 
 impl WindowOperator {
-    pub(crate) fn is_processing_time(&self)->bool {matches!(self.spec.kind,WindowKind::TumblingProcessingTime {..})}
+    fn hopping_now(&mut self, now: i64) -> i64 {
+        if now >= 0 && matches!(self.spec.kind, WindowKind::HoppingProcessingTime { .. }) {
+            self.hopping_clock_high = self.hopping_clock_high.max(now);
+            self.hopping_clock_high
+        } else { now }
+    }
+    pub(crate) fn is_processing_time(&self)->bool {self.spec.kind.uses_processing_time_timer()}
+    fn suffixed_key(&self)->bool {self.spec.kind.uses_event_time() || matches!(self.spec.kind,WindowKind::HoppingProcessingTime {..})}
     pub(crate) fn is_event_time(&self)->bool {self.spec.kind.uses_event_time()}
     /// A logged permanent EOF closes all windows, including positive holdback.
     /// Used only by the durable ET graph, never by an ordinary watermark.
@@ -140,7 +150,7 @@ impl WindowOperator {
         if freeze.operator!=self.operator || freeze.slot!=StateSlotId::new(SLOT) || freeze.kind!=u8::from(count) { return Err(invalid()); }
         let expected = empty_accs(&self.spec,&self.input)?;
         for entry in &freeze.entries {
-            if entry.key.len()!=self.group_idx.len()+usize::from(self.spec.kind.uses_event_time()) || entry.accs.len()!=expected.len() { return Err(invalid()); }
+            if entry.key.len()!=self.group_idx.len()+usize::from(self.suffixed_key()) || entry.accs.len()!=expected.len() { return Err(invalid()); }
             for (value,idx) in entry.key.iter().zip(&self.group_idx) {
                 let field=&self.input.fields[*idx];
                 if !value.matches_type(&field.data_type) && !(value.is_null() && field.nullable) { return Err(invalid()); }
@@ -151,11 +161,11 @@ impl WindowOperator {
                 let (size,slide)=match self.spec.kind {
                     WindowKind::TumblingProcessingTime {size_micros}=>(size_micros,size_micros),
                     WindowKind::TumblingEventTime {size_micros}=>(size_micros,size_micros),
-                    WindowKind::HoppingEventTime {size_micros,slide_micros}=>(size_micros,slide_micros),
+                    WindowKind::HoppingEventTime {size_micros,slide_micros}|WindowKind::HoppingProcessingTime {size_micros,slide_micros}=>(size_micros,slide_micros),
                     _=>return Err(invalid()),
                 };
                 if entry.window_start.checked_add(size)!=Some(entry.window_end) || entry.window_start.rem_euclid(slide)!=0
-                    || (self.spec.kind.uses_event_time() && entry.key.last()!=Some(&Scalar::Int64(entry.window_start))) { return Err(invalid()); }
+                    || (self.suffixed_key() && entry.key.last()!=Some(&Scalar::Int64(entry.window_start))) { return Err(invalid()); }
                 if self.is_processing_time() && entry.count != 0 { return Err(invalid()); }
             }
             for ((actual,prototype),call) in entry.accs.iter().zip(&expected).zip(&self.spec.aggs) {
@@ -203,6 +213,7 @@ impl WindowOperator {
         max_timers: usize,
     ) -> Result<Self> {
         spec.validate()?;
+        if spec.kind.is_buffered() {return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"buffered sliding/session windows use BufferedWindow through Kernel, not the legacy WindowOperator codec"));}
         let group_idx = resolve_keys(&input, &spec.keys)?;
         let event_time_idx = match &spec.event_time_field {
             Some(name) => Some(input.index_of_name(name).ok_or_else(|| {
@@ -293,6 +304,7 @@ impl WindowOperator {
             closed_index_bytes: 0,
             accumulator_scratch,
             accumulator_scratch_lease,
+            hopping_clock_high: 0,
         })
     }
 
@@ -504,6 +516,7 @@ impl WindowOperator {
     }
 
     pub(crate) fn begin_due(&mut self, now: i64) -> bool {
+        let now = self.hopping_now(now);
         if self.spec.kind.uses_event_time() {
             return false;
         }
@@ -515,6 +528,7 @@ impl WindowOperator {
     }
 
     pub fn fire_due(&mut self, now: i64) -> Result<Vec<Row>> {
+        let now = self.hopping_now(now);
         if self.spec.kind.uses_event_time() {
             return Ok(Vec::new());
         }
@@ -527,6 +541,7 @@ impl WindowOperator {
     }
 
     fn on_row(&mut self, row: &Row, now: i64) -> Result<WindowEmission> {
+        let now = self.hopping_now(now);
         if self.variable_accs && self.accumulator_scratch_lease.is_none() {
             self.accumulator_scratch_lease = Some(
                 self.owner.acquire(
@@ -556,6 +571,14 @@ impl WindowOperator {
                 size_micros,
                 slide_micros,
             } => self.on_et_row(row, now, size_micros, Some(slide_micros)),
+            WindowKind::HoppingProcessingTime {size_micros,slide_micros} => {
+                let group=self.group_key(row);
+                for (start,end) in WindowKind::assign_hop(now,size_micros,slide_micros,self.spec.max_overlap)? {
+                    self.upsert_et_window(&group,start,end,row)?;
+                }
+                Ok(WindowEmission::default())
+            }
+            _=>Err(SparrowError::new(ErrorCode::FeatureUnavailable,"buffered window requires its dedicated executor")),
         }
     }
 
@@ -632,6 +655,9 @@ impl WindowOperator {
                 )?;
             }
             self.index_insert(&sk, end)?;
+            if matches!(self.spec.kind,WindowKind::HoppingProcessingTime {..}) {
+                self.timers.schedule(TimerId::window(self.operator,end),end)?;
+            }
         }
         if let WindowStore::Tumble(store) = &mut self.store {
             if self.variable_accs {
@@ -709,7 +735,7 @@ impl WindowOperator {
             };
             if let Some(entry) = entry {
                 self.index_remove(&k, entry.window_end);
-                let group = if self.spec.kind.uses_event_time() {
+                let group = if self.suffixed_key() {
                     group_from_et_key(&k.key)
                 } else {
                     k.key.clone()
@@ -801,6 +827,7 @@ impl WindowOperator {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<Option<RowBatch>> {
+        let cut = if matches!(self.spec.kind, WindowKind::HoppingProcessingTime { .. }) {cut.max(self.hopping_clock_high)} else {cut};
         let mut work = 0usize;
         let mut wire = 0usize;
         let mut count = 0usize;
@@ -1047,7 +1074,8 @@ impl WindowOperator {
                 };
                 self.index_remove(&key, end);
                 if let Some(entry) = entry {
-                    out.push(emit_tumble(&key.key, &entry));
+                    let group=if self.suffixed_key() {group_from_et_key(&key.key)} else {key.key.clone()};
+                    out.push(emit_tumble(&group, &entry));
                 }
             }
         }
@@ -1267,6 +1295,9 @@ impl WindowOperator {
 
     /// Replace in-memory state from a committed freeze (experimental).
     pub fn restore_freeze(&mut self, freeze: &WindowFreeze) -> Result<()> {
+        if self.spec.kind.is_new_window() {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"new window families have no published restore codec/profile"));
+        }
         if freeze.operator != self.operator {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,

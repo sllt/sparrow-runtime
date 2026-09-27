@@ -1873,6 +1873,8 @@ dependencies = [
 name = "sparrow-expr"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "sparrow-formats",
  "sparrow-model",
 ]
 
@@ -1946,6 +1948,7 @@ dependencies = [
 name = "sparrow-sql"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "sparrow-expr",
  "sparrow-model",
  "sparrow-plan",

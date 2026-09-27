@@ -316,7 +316,7 @@ fn func_reject(func: &Function, windowed: bool) -> Result<Option<G0Verdict>> {
         }
         return walk_args(func, windowed);
     }
-    if !SCALAR_FUNCS.contains(&name.as_str()) {
+    if !SCALAR_FUNCS.contains(&name.as_str()) && !crate::g0::additive_function(&name) {
         return Ok(Some(rejected(&format!("unknown function '{name}'"))));
     }
     walk_args(func, windowed)

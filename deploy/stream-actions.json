@@ -1,0 +1,1 @@
+{"fields":[{"name":"device","type":"utf8","nullable":false},{"name":"n","type":"uint64","nullable":false}]}

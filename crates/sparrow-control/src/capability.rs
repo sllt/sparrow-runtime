@@ -15,7 +15,16 @@ pub fn inventory() -> Value {
         })
         .collect();
     json!({"version":1,"combinations":combinations,
+        "actions":{"maturity":"development_preview","version":1,"certified":false,
+            "sinks":["http","mqtt","log","file"],"body":"typed_json_tree_explicit_field_references",
+            "destinations":"fixed_HTTP_origin_path_headers_with_query_templates; MQTT_single_level_variables",
+            "multi_action":"existing_DAG_required_or_best_effort_sinks","recovery":"restart_fresh_only_no_output_ID",
+            "http_per_row":"single_or_query_requires_max_inflight_1_batch_rows_1_linger_0; retries_may_duplicate",
+            "file":{"enabled_by_platform":cfg!(target_os="linux"),"format":"ndjson","directory":"exclusive_existing_allowlisted_directory",
+                "bounds":"row_bytes_segment_bytes_max_bytes_max_files","rotation":"new_segment_no_overwrite_no_auto_delete",
+                "sync":"optional_sync_data_each_batch","restart":"new_segment; partial_tail_rejected; no_source_replay_deduplication"}},
         "jetstream":{"enabled_by_build":cfg!(feature="jetstream"),"maturity":"preview","requires_feature":"jetstream",
+            "idle_backoff_max_ms":{"default":250,"range":[5,250],"scope":"regular_reliable_actor_not_durable_time_or_observed_profiles","tradeoff":"lower_idle_latency_more_empty_pulls"},
             "source":"jetstream","sink":"http","delivery":"checkpointed_at_least_once","recovery":"aligned","snapshot_version":4,
             "snapshot_version_scope":"legacy_zero_or_count_only; IoT uses profiles.reliable_iot; Hysteresis uses v13; references use v10",
             "state_shapes":["zero_state","single_count_window","two_count_windows","single_change_detect_ttl0","single_deadband_ttl0","count_plus_iot_ttl0","two_iot_ttl0"],
@@ -86,6 +95,10 @@ pub fn inventory() -> Value {
             "bounds":"48_scalar_input_fields; max_keys_and_bytes; two_timer_slots_per_key; positive_notification_max_age",
             "not_enabled":["event_time","references","lossy_or_side_outputs","periodic_reminders","offline_detection","resample","exactly_once"]},
         "silence":{"maturity":"development_preview","certified":false,"operator":"silence",
+            "mqtt_live":{"clock":"live","recovery":"restart_fresh","delivery":"live_best_effort",
+                "topology":"MQTT_QoS0_clean_session_then_silence_then_optional_pure_transforms_then_HTTP",
+                "coverage":"fresh_PINGRESP_and_FIFO; full_new_grace_after_discontinuity; not_broker_catchup",
+                "durable":false,"retained":"ignored_and_breaks_coverage","gap_micros":[100000,120000000]},
             "profiles":{"file":23,"jetstream":if cfg!(feature="jetstream"){json!(24)}else{json!("feature_required")}},
             "topology":"append_only_File_or_JetStream -> silence_as_first_state -> optional_pure_transforms -> required_HTTP",
             "clock":"paused_source_observed; input_before_current_feed_fact; downtime_paused",
@@ -96,7 +109,17 @@ pub fn inventory() -> Value {
             "durability":"OFC1_cut_and_OFD1_TIME_PENDING; persist_before_publish; required_flush_before_CURRENT_before_source_ACK",
             "diagnostics":"observed_source_is_a_historical_committed_cut_not_current_source_health",
             "bounds":"48_scalar_input_fields; max_keys_and_bytes; one_timer_per_key; registry_at_most_1024_keys_and_64KiB_canonical",
-            "not_enabled":["mqtt_live","http_push","upstream_transforms","other_state_nodes","dag","event_time","references","historical_replay","exactly_once"]},
+            "not_enabled":["mqtt_recovery","http_push","upstream_transforms","other_state_nodes","dag","event_time","references","historical_replay","exactly_once"]},
+        "resample":{"maturity":"development_preview","certified":false,"operator":"resample",
+            "modes":["last","mean","interpolate"],
+            "profiles":{"file":25,"jetstream":if cfg!(feature="jetstream"){json!(26)}else{json!("feature_required")}},
+            "topology":"append_only_File_or_JetStream -> optional_pure_transforms -> one_Resample -> optional_pure_transforms -> required_HTTP",
+            "clock":"paused_source_ordered; due_before_input; downtime_paused; equality_expires_first",
+            "values":"complete_numeric_vectors; last_preserves_integer_types; mean_and_interpolate_are_float64",
+            "missing":"NULL_vector_for_known_keys_only; no_extrapolation_or_forward_fill",
+            "bounds":"1..16_keys_and_values; 48_flat_fields; max_keys_bytes_timers_and_1..4096_emissions_per_decision; excessive_catch_up_fails",
+            "durability":"v25/v26_with_PTC1_and_TPD1; stable_HTTP_output_ID; full_plan_match",
+            "not_enabled":["MQTT","DAG","other_state_nodes","event_time","references","historical_replay","exactly_once"]},
         "paused_time_iot":{"maturity":"preview","certified":false,"operators":["hold_for","debounce"],
             "source_schema":"scalar_fields_only; full_input_fingerprint_before_projection",
             "sources":{"file":"v14","jetstream":if cfg!(feature="jetstream"){"v15"}else{"feature_required"}},
@@ -123,8 +146,12 @@ pub fn inventory() -> Value {
             "max_bindings_per_pipeline":8,
             "max_rows_per_revision":crate::reference_table::MAX_REFERENCE_TABLE_ROWS,
             "max_payload_bytes_per_revision":crate::reference_table::MAX_REFERENCE_TABLE_BYTES},
-        "windows":{"implemented":["count","processing_time_tumbling","event_time_tumbling","event_time_hopping"],
-            "not_implemented":["session","sliding_count","unbounded_global"],"new_window_policy":"add_only_with_workload_semantics_and_independent_reference"},
+        "windows":{"implemented":["count","processing_time_tumbling","event_time_tumbling","event_time_hopping","processing_time_hopping","sliding_count","processing_time_sliding","event_time_sliding","processing_time_session","event_time_session"],
+            "new_families":{"maturity":"development_preview","recovery":"restart_fresh_only","late_policy":"final_only_L0_no_retractions",
+                "max_buffered_rows":{"default":1024,"maximum":16384},"budget":"per_key_aggregate_inputs_plus_job_memory_keys_timers; overflow_fails_without_silent_drop",
+                "sliding":"one_trigger_per_event; exclusive_lower_inclusive_upper; PT_zero_delay_emits_arrival_prefix",
+                "session":"gap_and_max_duration; equality_starts_new_session; open_ET_sessions_can_resegment"},
+            "not_implemented":["session_late_corrections","new_family_checkpoint_restore","unbounded_global"],"new_window_policy":"add_only_with_workload_semantics_and_independent_reference"},
         "sql":{"runtime_parser":"sparrow_sql_subset","aggregates":["count","sum","avg","min","max"],
             "not_full_ansi_sql":true,"differential_test_parser":"sqlparser 0.62.0 (testkit only)"},
         "http":{"batch":true,"linger":true,"max_inflight":8,"max_outbox_items":1024,
@@ -205,7 +232,8 @@ mod tests {
             if cfg!(feature = "jetstream") { serde_json::json!(24) }
             else { serde_json::json!("feature_required") });
         assert_eq!(silence["events"], serde_json::json!(["silent", "resumed"]));
-        for excluded in ["mqtt_live", "http_push", "dag", "event_time", "references", "upstream_transforms", "other_state_nodes"] {
+        assert_eq!(silence["mqtt_live"]["durable"], false);
+        for excluded in ["mqtt_recovery", "http_push", "dag", "event_time", "references", "upstream_transforms", "other_state_nodes"] {
             assert!(silence["not_enabled"].as_array().unwrap().contains(&serde_json::json!(excluded)));
         }
         assert!(silence["diagnostics"].as_str().unwrap().contains("not_current_source_health"));

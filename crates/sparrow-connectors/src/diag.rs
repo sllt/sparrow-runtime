@@ -21,6 +21,10 @@ pub struct IoDiagnostics {
     pub mqtt_backpressure_waits: AtomicU64,
     pub mqtt_backpressure_recovered: AtomicU64,
     pub mqtt_reconnects: AtomicU64,
+    pub mqtt_feed_probes: AtomicU64,
+    pub mqtt_feed_breaks: AtomicU64,
+    pub mqtt_ping_timeouts: AtomicU64,
+    pub mqtt_retained_ignored: AtomicU64,
     pub mqtt_quickack_calls: AtomicU64,
     pub mqtt_quickack_errors: AtomicU64,
     pub http_posted: AtomicU64,
@@ -33,6 +37,11 @@ pub struct IoDiagnostics {
     pub http_inflight: AtomicU64,
     pub log_written: AtomicU64,
     pub decode_errors: AtomicU64,
+    pub file_written: AtomicU64,
+    pub file_bytes: AtomicU64,
+    pub file_segments: AtomicU64,
+    pub file_syncs: AtomicU64,
+    pub file_failed: AtomicU64,
 }
 
 impl IoDiagnostics {
@@ -60,6 +69,10 @@ impl IoDiagnostics {
             mqtt_backpressure_waits: self.mqtt_backpressure_waits.load(Ordering::Relaxed),
             mqtt_backpressure_recovered: self.mqtt_backpressure_recovered.load(Ordering::Relaxed),
             mqtt_reconnects: self.mqtt_reconnects.load(Ordering::Relaxed),
+            mqtt_feed_probes: self.mqtt_feed_probes.load(Ordering::Relaxed),
+            mqtt_feed_breaks: self.mqtt_feed_breaks.load(Ordering::Relaxed),
+            mqtt_ping_timeouts: self.mqtt_ping_timeouts.load(Ordering::Relaxed),
+            mqtt_retained_ignored: self.mqtt_retained_ignored.load(Ordering::Relaxed),
             mqtt_quickack_calls: self.mqtt_quickack_calls.load(Ordering::Relaxed),
             mqtt_quickack_errors: self.mqtt_quickack_errors.load(Ordering::Relaxed),
             http_posted: self.http_posted.load(Ordering::Relaxed),
@@ -72,6 +85,11 @@ impl IoDiagnostics {
             http_inflight: self.http_inflight.load(Ordering::Relaxed),
             log_written: self.log_written.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
+            file_written: self.file_written.load(Ordering::Relaxed),
+            file_bytes: self.file_bytes.load(Ordering::Relaxed),
+            file_segments: self.file_segments.load(Ordering::Relaxed),
+            file_syncs: self.file_syncs.load(Ordering::Relaxed),
+            file_failed: self.file_failed.load(Ordering::Relaxed),
         }
     }
 }
@@ -94,6 +112,10 @@ pub struct IoSnapshot {
     pub mqtt_backpressure_waits: u64,
     pub mqtt_backpressure_recovered: u64,
     pub mqtt_reconnects: u64,
+    pub mqtt_feed_probes: u64,
+    pub mqtt_feed_breaks: u64,
+    pub mqtt_ping_timeouts: u64,
+    pub mqtt_retained_ignored: u64,
     pub mqtt_quickack_calls: u64,
     pub mqtt_quickack_errors: u64,
     pub http_posted: u64,
@@ -106,6 +128,11 @@ pub struct IoSnapshot {
     pub http_inflight: u64,
     pub log_written: u64,
     pub decode_errors: u64,
+    pub file_written: u64,
+    pub file_bytes: u64,
+    pub file_segments: u64,
+    pub file_syncs: u64,
+    pub file_failed: u64,
 }
 
 impl std::fmt::Display for IoSnapshot {
@@ -149,6 +176,10 @@ impl IoSnapshot {
         self.mqtt_backpressure_waits += other.mqtt_backpressure_waits;
         self.mqtt_backpressure_recovered += other.mqtt_backpressure_recovered;
         self.mqtt_reconnects += other.mqtt_reconnects;
+        self.mqtt_feed_probes += other.mqtt_feed_probes;
+        self.mqtt_feed_breaks += other.mqtt_feed_breaks;
+        self.mqtt_ping_timeouts += other.mqtt_ping_timeouts;
+        self.mqtt_retained_ignored += other.mqtt_retained_ignored;
         self.mqtt_quickack_calls += other.mqtt_quickack_calls;
         self.mqtt_quickack_errors += other.mqtt_quickack_errors;
         self.http_posted += other.http_posted;
@@ -161,5 +192,10 @@ impl IoSnapshot {
         self.http_inflight += other.http_inflight;
         self.log_written += other.log_written;
         self.decode_errors += other.decode_errors;
+        self.file_written += other.file_written;
+        self.file_bytes += other.file_bytes;
+        self.file_segments += other.file_segments;
+        self.file_syncs += other.file_syncs;
+        self.file_failed += other.file_failed;
     }
 }

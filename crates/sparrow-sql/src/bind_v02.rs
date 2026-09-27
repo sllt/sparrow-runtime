@@ -328,6 +328,9 @@ fn window_from_group(
 }
 
 fn count_window_size(f: &Function) -> Result<u64> {
+    if !matches!(&f.args,FunctionArguments::List(list) if list.args.len()==1) {
+        return Err(SparrowError::new(ErrorCode::InvalidArgument,"v0.2 COUNT_WINDOW expects exactly one argument; sliding count uses the extended binder"));
+    }
     match &f.args {
         FunctionArguments::List(list) => match list.args.first() {
             Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(v)))) => {

@@ -11,6 +11,7 @@ enum Shape {
     Forward,
     Utf8,
     CastUtf8,
+    Bounded(OutputAllocation),
 }
 #[derive(Clone, Debug)]
 pub struct AllocationBound {
@@ -39,7 +40,8 @@ impl AllocationBound {
                 let shape = match crate::semantics::function(name).map(|f| f.allocation) {
                     Some(OutputAllocation::Scalar) => Shape::Scalar,
                     Some(OutputAllocation::AsciiUtf8) => Shape::Utf8,
-                    _ => Shape::Forward,
+                    Some(OutputAllocation::Forward) | None => Shape::Forward,
+                    Some(allocation) => Shape::Bounded(allocation),
                 };
                 (shape, args.iter().map(Self::for_expr).collect(), true)
             }
@@ -82,6 +84,7 @@ impl AllocationBound {
             _ => {}
         }
         let mut value = SCALAR;
+        let mut total_value = 0usize;
         let mut allocated = if self.call {
             self.children
                 .len()
@@ -93,6 +96,7 @@ impl AllocationBound {
         for child in &self.children {
             let e = child.estimate(columns);
             value = value.max(e.value);
+            total_value = total_value.saturating_add(e.value);
             allocated = allocated.saturating_add(e.allocated);
         }
         match self.shape {
@@ -101,6 +105,49 @@ impl AllocationBound {
             Shape::CastUtf8 => {
                 value = value.saturating_add(128);
                 allocated = allocated.saturating_add(value.saturating_mul(2));
+            }
+            Shape::Bounded(kind) => {
+                let child = |index: usize| {
+                    self.children
+                        .get(index)
+                        .map_or(SCALAR, |c| c.estimate(columns).value)
+                };
+                let (resident, scratch) = match kind {
+                    OutputAllocation::BoundedText => {
+                        // Decimal formatting of subnormal f64 may exceed 300 bytes.
+                        let n = total_value.min(65536).saturating_add(128).max(512);
+                        (n, n.saturating_mul(2))
+                    }
+                    OutputAllocation::Replace => {
+                        let n = child(0)
+                            .saturating_mul(child(2).max(1))
+                            .min(65536)
+                            .saturating_add(128);
+                        (n, n.saturating_mul(2))
+                    }
+                    OutputAllocation::FixedText => (128, 256),
+                    OutputAllocation::JsonParse => (
+                        65536 + SCALAR,
+                        child(0)
+                            .min(65536 + SCALAR)
+                            .saturating_mul(64)
+                            .saturating_add(65536),
+                    ),
+                    OutputAllocation::JsonObject => {
+                        let n = total_value.saturating_add(2048).min(65536 + SCALAR);
+                        (n, total_value.saturating_mul(4).saturating_add(4096))
+                    }
+                    OutputAllocation::JsonStringify => {
+                        let n = total_value
+                            .saturating_mul(6)
+                            .saturating_add(128)
+                            .min(65536 + 128);
+                        (n, n.saturating_mul(2))
+                    }
+                    _ => unreachable!("scalar/forward/ASCII have separate shapes"),
+                };
+                value = resident.max(SCALAR);
+                allocated = allocated.saturating_add(scratch);
             }
             _ => {}
         }

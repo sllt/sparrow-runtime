@@ -4,6 +4,167 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="capacity-validation"></a>
+## 可靠链路与容量：2026-09-26 s4（高负载仍有边界）
+
+服务器 `box@100.64.0.18`，证据根 `/workspace/bench-compare/capacity-20260926-Jw3FQJ`。最终源码 `source-s4`、冻结 `frozen-s4` / `production-s4`，发布候选 `package-s4-default/jetstream`、独立驱动 `capacity-driver-s4`。测试时本地424个指纹文件与包源码清单逐一相同；基线HEAD `e3bc558` 不是干净提交。未commit/push/tag；本机未编译Cargo/Go。
+
+- 实现及逐案例数值见 [CAPACITY](CAPACITY.md)：旧小型primitive JSON借用编码并保持字节兼容、普通JetStream可选5～250ms idle cap（默认250）、安全额度错误详情、进程tracked credits观测。默认预算/pending/pull、Explicit ACK、持久性和既有恢复协议不变。
+- 最终默认成员/JetStream Release **918 passed / 21 ignored**；独立no-demo **44 passed / 0 ignored**。新5项精确清单**20轮=100次**通过。额外启用 `serde_json/preserve_order` 的两个新测试逐名执行通过，保留宿主feature统一时的旧字节顺序。普通Clippy退出0、119条warning，非`-D warnings`通过；实验Arrow/JIT不混入本批。
+- `matrix-s4` 预先声明58试次，**54个有限正确性通过、4个20k失败，exit=1**；新旧各两次20k都触发fetch reply期限。1k/5k、两Job各5k、20ms响应延迟下1k以及HTTP Push500达到各自有限试次目标；10k零状态/Count的p99约8.2～8.8秒，不是持续容量通过。过载恢复能排空但未达到预声明p99。成功及预期拒绝的28个候选试次停止后tracked余额/handle全部为0，HTTP每Job均复用1条输出连接。
+- idle250与idle20的12条试次，p99约256～257ms对28ms，pull从101增至364～365。8KiB padding在指定schema下成功；16KiB准确命中decode reservation拒绝，0输出、broker ACK floor=0，API保留安全used/request/cap。小样本、固定schema不是普遍容量保证。
+- 原三组ABBA单组全部通过（exit均0），全样本合并也通过；发行验收仍独立判断。
+- `legacy-s4/remaining.exit=0`：两包production smoke（各20次生命周期、恢复/备份/回退）；Action27项及两包6场景/2次SIGKILL；Resample24项及9场景/30次SIGKILL；Silence33项及6场景/30次SIGKILL；Alarm14项及6线性/4图场景；paused27普通+1真实broker；两包MQTT live各9项及broker停启、server强杀、75s持续来包通过。两包持续期均3699条、0持续期重连、0错误静默；不是24/72h长稳。
+- `extra-s4d.exit=0`：冻结K2专项**36项含真实broker、0 ignored**及旧独立K2进程oracle通过；另跑6个paused-time进程场景和两组100行串行提交成本观察。MQTT1k/5k/10k/20k对照共**32试次**全部有限正确，候选20k实际约19985～19992输入/s、p99约5.03～5.07ms；QoS0不是可靠交付，p99未普遍优于旧Action版本。完整口径见CAPACITY，未把这组有限测试叫长稳或新的eKuiper对比。
+
+首次feature-on smoke在任何server/log/config产生之前退出，空目录与`followup-s4c.exit=1`保留。没有记录到精确失败分支，不能把“端口冲突”写成已证根因；随后在新的证据目录显式选取checked-free端口、启用`bash -x`，完整smoke通过。同一冻结包未重编译，原三组性能结果不重跑、不替换。这项夹具失败不隐去，亦不把未运行到的数据面当作原试次已通过。
+
+### 原File性能门禁
+
+仍为原time-graph-v13 fresh基线、冻结K1驱动、32000/131072行、三组ABBA；周期比较同一s4候选的checkpoint关/开（6400行、100ms、20ms响应等待）。阈值保持fresh≥0.97、periodic≥0.90、RSS增量≤2048KiB，没有增加输入量或选取通过的重跑。全部warmup/测量输出完整、无丢重/非法行，对应hash一致，周期提交成功数为正且失败0。
+
+| 负载 | 合并吞吐比 | RSS增量KiB | 测量数 |
+|---|---:|---:|---:|
+| fresh / 0 state | 1.025918 | 568 | 36 |
+| fresh / 2 states | 0.986700 | 840 | 36 |
+| periodic / 0 state | 1.004748 | 452 | 24 |
+| periodic / 2 states | 1.001255 | 184 | 24 |
+
+`performance-s4.exit=0`，只说明匹配s4候选通过该原File回归门槛；双Count不是“明确性能领先”，JetStream高档容量也未因此通过。MQTT live/Action旧候选的失败记录继续保留，不用本结果回写历史通过状态。
+
+### 诊断与复验边界
+
+旧Action第二组失败样本的首条HTTP到达中位数为5.44/5.69ms，首末输出跨度67.01/68.72ms；不把总差异全部算成启动或环境噪声。独立1048576行CPU采样显示JSON标量转换和allocator为实际热点之一，支持减少重复JSON对象/字符串分配的改动，**不证明它解释了所有历史回归**。诊断大样本不替代原32000/131072行门禁。
+
+自查修正了两处冷路径遗漏：effective曾仍固定报告250；安全quota只放context而Supervisor只持久化message，导致最终状态看不到详情。最终s4同时补齐真实状态断言。驱动还分离最终ACK/stop计时，修正输入等价吞吐命名、小样本nearest-rank、来源/Job标识及错误时子进程回收。s2旧矩阵/失败保持原样；s3被中止并复用编译缓存，没有冒充最终候选。
+
+生产包已构建成功后，额外preserve_order检查先因离线缓存缺少锁定的indexmap失败；取回依赖后3个名称含capacity的测试全部通过。首版包装器误以为该宽过滤器只应选中2项，随后改为逐名核对两个新增测试，未放宽断言或改变Rust代码。原错误日志保留。最终README/验收文档晚于包内文档；另仅为下一次打包在 `production-build.sh` 增加复制CAPACITY文档的一行（已做shell检查）。该脚本行不在上述包的旧源清单中，Rust/Go/测试输入仍逐文件匹配，不为文档再次编译或改写原包指纹。以本节及原始产物为准。
+
+```text
+default server  f1bf6ade64f634319093fbe68de4bd0ddb905a428ae1cc5437418896f086a1d9
+JetStream       bdb07d2bcc3d6e6d6e92a7dfb28b42660533852c6595c0e6ba90cb286831436c
+process driver  ffcfcfcefc099803721cc14d96213c4f9a61b792df0ce1363272f6c13eaf20b5
+source manifest fb5c4b50daed540948d14aea6107a36d6c5101a191f936e423042a98c6ad000d
+```
+
+10k/20k可靠持续接入、真实TLS/WAN/目标设备、24/72h及介质故障仍不能宣称通过；第5批剩余与第6批生产门禁保持未完成，前端继续后置。
+
+<a id="actions-validation"></a>
+## Action/File/纯函数：2026-09-26（功能通过，性能仍 HOLD）
+
+服务器 `box@100.64.0.18`，本批根目录 `/workspace/bench-compare/actions-20260926-ImXbuk`。最终 Rust 为 `source-s6`，冻结 `frozen-s6`（Release/JetStream）及 `production-s6`（独立无demo）；包为 `package-s6-default/jetstream`，Go driver 为 `process-s5`（s5/s6对应Go源码逐文件一致）。本地逐文件校验包源清单通过。基线标记 `e3bc558` 不是干净HEAD：包括此前未提交的Resample/MQTT live及本批Action；没有commit/push/tag。本机只编辑、格式化和静态检查，Cargo/Go编译均在服务器，重复试验只复用冻结二进制。
+
+- [合同与模板](ACTIONS.md)：HTTP/MQTT/Log字段映射/typed JSON模板、受控HTTP query/单行value及MQTT topic、有界Linux NDJSON File Sink、18个新增纯函数；多动作复用DAG。仅restart_fresh，不开放aligned、可靠MQTT、持久outbox或跨Sink事务。
+- 全量Release：**913 passed / 21 ignored**；独立no-demo：**44 passed / 0 ignored**。ignored不是通过，专项broker结果单列。Window future仍为legacy **3272 B** / ordered **3080 B**，原≤3328 B及StreamControl≤24 B门槛通过。
+- `validation-s6/exit=0`：固定清单**27×20=540**次精确测试；包括NULL/UInt64/Unicode、严格JSON/时间边界、SQL/Graph共享表达式与融合对照、预算退款、HTTP重试/取消/目标编码、文件轮转/锁/目录替换/坏尾/配额，以及真实Supervisor required/optional多输出失败。
+- 独立Go oracle：两包各3类进程场景，合计**6场景、2次真实SIGKILL**。File新尝试重读产生重复但只写新段、不覆盖旧段，坏尾保留、quota失败不删已写数据；HTTP固定path/query正确转义、503重试payload/URL相同且复用连接；真实隔离Mosquitto上的动态topic和payload匹配黄金值。File强杀点依据完整行写计数，不把该计数当作最终fsync/可靠ACK证明，也不是断电/写中撕裂测试。
+- `legacy-s6/exit=0`：两包production smoke；Resample24项+9进程场景/30次SIGKILL；Silence33项+6场景/30次SIGKILL；Alarm14项+6线性/4图场景；paused27普通+1broker；两包MQTT live各9项及broker停启、server强杀、75s持续来包全部通过。持续期分别3702/3703条，0持续期重连、0错误静默。未因此声明整个历史矩阵中本次未重跑的独立故障门禁已重新认证。
+- 自查修正：极小f64转字符串需要计入长十进制文本及Arc/Scalar开销；新File参数拒绝无意义的网络/QoS选项；MQTT fallback topic在复制前限长；逐行HTTP预算拒绝补齐计数。保留s2内存估算/目录fixture失败、s3测试helper编译失败、s4预算fixture失败；s1误含实验workspace的离线依赖失败也未删除。s5为通过预验证的中间候选，最终证据仅指s6。
+- dev/all-targets/JetStream普通Clippy退出0，去重119条风格/简化提示；不是`-D warnings`通过，见OPT-009。新模板重复扫描、保守JSON scratch和逐行HTTP成本见OPT-014。
+
+### 原性能门禁：未通过，不用合并结果覆盖单组失败
+
+原三组ABBA、原输入量、fresh≥0.97、periodic≥0.90、RSS增量≤2048 KiB均未改；仅候选切到Action s6。fresh仍对照原time-graph-v13基线；periodic按原协议比较当前候选的周期checkpoint关/开，不是旧二进制对照。三个组exit为**0、3、0**。第二组fresh/0-state比值 **0.9695805209 < 0.97**，虽然很接近，也不四舍五入为通过。所有原始及合并输出完整、无丢重/非法行且hash一致，RSS门槛均通过。
+
+| 负载 | 三组合并比值 | RSS增量KiB | 测量数 |
+|---|---:|---:|---:|
+| fresh / 0 state | 0.996476 | 808 | 36 |
+| fresh / 2 states | 0.991946 | 1308 | 36 |
+| periodic / 0 state | 1.004323 | 280 | 24 |
+| periodic / 2 states | 1.000754 | 836 | 24 |
+
+`performance-s6.exit=3`，不重跑挑选样本、不放宽阈值、不据此归因环境噪声；此前MQTT live的0.912865失败同样保留。此测量仍是旧File路径，不是Action吞吐、WAN/p99或File Sink容量认证。下一批优先分离配置启动/稳态成本并定位，再做多规则/慢下游/容量；TLS/WAN、目标设备、24/72h、真实ENOSPC/介质掉电仍NOT RUN。**首批功能开发完成，整批发行仍HOLD。**
+
+```text
+default server  68fcbfef9ec34fc2c13ce850b89043a2333295c5eccb2370a8938afa16a53d9f
+JetStream       4de63b6b1d2417f33977d68716e557311bd6458098b137861af9e03d0b18c04a
+process driver  a69b6a9f7977b8c0f537282b3e4068830ef192def9d4a73eb62c7c541c8873e9
+source manifest ce74f3623fb9e0f3b484b53bbc5db59332b9044b36eb928b0e17b1c5aa23343e
+```
+
+两个包源清单相同。最终验收说明/README/预算与兼容补充在打包之后更新，不改Rust、Go、测试输入或清单；包内文档是当时版本，以上最终结果以工作区本节及服务器原始产物为准。
+
+<a id="mqtt-live-silence-validation"></a>
+## MQTT live 静默：2026-09-26（独立非持久 Preview）
+
+服务器 `box@100.64.0.18`，本批根目录 `/workspace/bench-compare/mqtt-live-20260926-gs7Q5b`。最终 Rust 为 `source-s5`，`source-candidate/crates` 与其逐文件 hash 一致；冻结 Debug `frozen-s5`、Release `frozen-release`，两个包 `package-default/jetstream` 的 source manifest 一致，Go driver 为 `process`。基线 commit 标记仍为 `e3bc558`，**不是干净 HEAD 构建或已发布版本**。本机只编辑/格式化，Cargo/Go 编译均在服务器；重复验证不再编译。
+
+- [实现合同](IOT.md#mqtt-live-silence)：`clock:live`、MQTT QoS0/clean_session、单个 Silence、可选下游纯 Transform、HTTP、restart_fresh。新鲜单 outstanding PINGRESP + 有界 FIFO + sticky epoch + 消费端重新校验；不是 broker 排空/设备故障证明，不复用 File/JetStream journal，不开放 MQTT checkpoint/restore。
+- `full-s5`：**885 passed / 21 ignored**；`full-release`：**886 passed / 21 ignored**。Release 的旧 Window future 为 **3272 B**，有序分支 3080 B，原 ≤3328 B 及 control ≤24 B 断言通过；不能把被忽略测试记为成功。
+- 正式 production 无 demo 测试配置 `production-frozen`：**44 passed / 0 ignored**。另有 control/server 的 no-default-features 135 项通过（含开发依赖，不拿它替代正式包依赖检查）；两包均通过原构建脚本的依赖隔离与 checksum 检查。
+- 新精确清单 **9×20=180**，`repeat-s5/exit=0`；覆盖 FIFO/丢失控制的 sticky epoch、字节/超大行/取消退款、探测与队列新鲜度等号、完整新宽限、能力/恢复拒绝、retained、静默/恢复、连接与管线重启、坏 JSON 两种 policy、无 PINGRESP 但持续 PUBLISH、慢 HTTP/满 ingress 有界取消。冻结可执行文件复用；与全量套件有交集，不累计为独立用例数。
+- `mqtt-default` / `mqtt-jetstream`：每包再次跑精确 9 项，再运行隔离的真实 **Mosquitto 2.0.22**。各有一次 broker kill/start、一次真实 Sparrow SIGKILL；核对断连不制造静默、新完整宽限、连接重建不换 generation、进程重启换 generation/清空已观察 key、retained 不登记/恢复、checkpoint API 拒绝。两个 fixture container 均清理，未停止其他 broker。
+- 两包各持续约 **75 s** 来包（默认包 **3696** 条、feature 包 **3703** 条），收到/解码完整、无 ingress 丢弃、持续来包阶段重连 0、PINGRESP timeout 0、活跃设备误静默 0。停止来包后产生预期静默。这是约 50/s 的低速保活/正确性试次，不是 10k/20k 容量、WAN/p99、eKuiper 对照或 24/72 h soak。
+- 重点旧恢复回归：`legacy-regression/resample`（24 项、两包 9 进程场景/30 次 SIGKILL）、`silence`（33 项、两包 6 场景/30 次 SIGKILL）、`alarm`（14 项、线性 6 + 图 4 场景）均通过；旧 paused 精确 27 regular + 1 broker 用例通过。每个旧清单本轮一次，不冒称重复 20 轮；本批未重新执行所有历史容量/长稳矩阵。
+- 普通 all-targets/JetStream Clippy exit0：按主 span/code/message 去重 **113 条诊断**，原始 compiler-message 194 条（含重复目标诊断）。两个新项是新 connector 文件的 test-module 排列与测试 helper 的 needless borrow，记录为样式债务，未加 `allow`，不声称 `-D warnings` 通过。
+
+### 开发失败与证据边界
+
+保留 s1 的 permit 借用错误、s2/s3 的测试 ID 类型错误及 s4 慢 HTTP 断言失败。s4 把“所有仍持有 Queue credit 的行数”错当成“FIFO occupancy”；自查后新 Source 改为一次仅取一个事实，不走旧批量预取，断言明确为容量 2 加队列外 1 个工作事件，s5 的全量/重复/故障验证通过。普通 Source 未改为逐行。
+
+旧 paused runner 首次把复用 fixture 的 `live_silence_tests` 子模块误选入原清单而拒绝（`legacy-regression/exit=1` 原样保留）。只修正发现阶段的模块排除，不变更旧 expected 清单；`runner-final` + `legacy-regression/paused-final/exit=0` 使用相同冻结 Rust。包内 source manifest 是修正该测试脚本前的候选；本地最终文档与 runner 更新不回写冻结包。Go 首次错误地按 module 构建无 go.mod 的 fixture，改用显式 `*.go` 后 build/vet 均通过，不涉及服务端生产代码变化。
+
+### 性能与剩余发行门禁
+
+按预定三组完整 ABBA，仍使用原 File fresh ≥0.97、periodic ≥0.90、RSS 增量 ≤2048 KiB 门槛；before 为 `time-graph-artifacts-20260923/package-v13-default`，after 为本批默认包，periodic 为同候选的 checkpoint on/off。**第二组 fresh/0-state 为 0.912865，未通过；`performance.exit=3`，本轮不能整体放行。** 另外两组该项为 1.033513 / 1.059092。全部正确性、输出 hash 和 RSS 门槛通过，所有样本保留，不拿下方合并值覆盖单组失败。
+
+| 场景 | 三组合并吞吐比 | RSS 增量 KiB | 有效测量试次 | 门禁说明 |
+|---|---:|---:|---:|---|
+| fresh / 0 state | 1.017236 | 456 | 36 | 合并通过，第二组未过 |
+| fresh / 2 states | 1.002886 | 580 | 36 | 单组及合并通过 |
+| periodic / 0 state | 1.004979 | 264 | 24 | 单组及合并通过 |
+| periodic / 2 states | 0.997656 | 232 | 24 | 单组及合并通过 |
+
+第二组 before/after 都出现变慢；原零状态 32000 行测量约 69～102 ms，`timing=submit_configuration_to_last_sink_arrival`，包含配置提交/启动而非纯稳态计算。另预先声明仅把输入量增至 320000 的诊断 ABBA（`diagnostic-fresh0-320k`）：12 个有效试次、输出 hash 相同，耗时 641～744 ms，吞吐比 **1.028581**。这支持继续排查短试次/调度波动，但**不能据此证明只是环境噪声或排除实现影响**，也不替代原门禁。后续分离启动时延与较长稳态试次、补调度/CPU 证据后再决定修复或调整验证设计，不能直接降低门槛或重跑挑样本。
+
+TLS/WAN、目标设备、高 key 数/速率容量、24/72 h、介质掉电和任意未声明组合仍为 **NOT RUN/未支持**。当前仍是有限 Preview，未 commit/push/tag 或部署到业务环境。
+
+```text
+default server SHA256: eab3efc59a4fe909c444950f0d26b8833c9b1db556b42975977efbb00eaf788d
+JetStream server:      de1f4bc5e51640a75a624b7a63c9aeaac5b0095193ab7f0631d03f62a7e6cab0
+process driver:        d4d480b32c9c289e109ce5f5fa766c37c1b483284bf8a16815dc0eca6721f1e2
+source manifest:       2afc4903b54b430743e2c9cb15529e49ed86352c90bc32612e1104332c7f3053
+Mosquitto image:       eclipse-mosquitto@sha256:199ea8ef2e35ec2b1b37e59cfd1dbae538ed4dfa4a2251a121a52215a6248a21
+```
+
+<a id="resample-validation"></a>
+## Sampling/Resample：2026-09-26（功能候选，发行门禁单列）
+
+服务器 `box@100.64.0.18`，本批根目录 `/workspace/bench-compare/resample-20260926-XA3hbl`。最终 Rust 候选为 `source-s3`，与本地 `crates/` 清单逐文件核对通过；`package-s3-default/jetstream` 的源清单相同。本机只编辑和格式化，Cargo/Go 编译全部在服务器，后续重复使用冻结可执行文件。基线提交为 `e3bc558`，新增能力尚未提交，不把包内的基线 commit 标记当成干净 HEAD 构建。
+
+- 功能：Last/Mean/Interpolate、typed nullable 输出、缺样与精确网格/左右点边界、完整向量 invalid policy、有界 catch-up、原子恢复和退款、独立 File25/JetStream26、PTC1/TPD1、generation 与 HTTP 输出 ID。模板为 `deploy/pipeline-iot-resample.json`，合同见 [IOT](IOT.md#resample-preview)。
+- `full-s3`：Debug 普通测试 **876 passed / 21 ignored**；`frozen-release-s3` 的 Release 全量 **877 passed / 21 ignored**，包含仅在 release 执行的 mailbox 记账和旧 Window future 大小约束。ignored 项不是通过，broker 专项另列。doctest 命令通过，目前没有实际文档样例测试。独立 no-demo **44 passed / 0 ignored**。
+- `resample-final2`：冻结的精确 **24 × 20 = 480** 次测试，以及默认包 3 / feature 包 6 个真实进程场景，共 **30 次真实 SIGKILL**，均通过。覆盖 UInt64 完整精度、Mean 黄金值、插值缺右点不外推、已持久化点/等待格在停机期间不推进、未提交输出完整 ID/内容重放、提交后不重复，以及旧 v24 二进制拒绝且 CURRENT/历史/输出不变。
+- `resample-transform-final3`：补充驱动 `process-g3` 在两种来源的 Mean 用例中加入前后纯 Project；再次通过两包 9 场景 / 30 次真实 SIGKILL，并重新执行 24 项清单一次。这里只改测试驱动，没有改 Rust 或重编译 Server；生产二进制仍是相同的 s3。驱动源码另存 `driver-g3-source`，不覆盖原 `process-s2` / `source-s3` 的记录。
+- `runner-contract-s3`：1 个合法 stub、9 个拒绝反例通过，包含空 guard、错误版本、漏重放/等待格证明、错误强杀数、非零 driver 退出、0 项测试、丢场景和重用证据目录。它只验证编排器，不能作为真实强杀证据。
+- 自查与失败记录保留：s1 的 `StateParticipant::freeze_kind` 仍止于 kind12，导致新快照参与者匹配失败；专项测试发现后扩到15，s2复验通过。s2之后自查发现通用 Scalar decoder 会规范化非0 Bool 并分配临时字节 Vec；s3改用新 profile 的严格固定宽解码，并补非规范 Bool key/used、NaN和截断的物化/非物化一致拒绝用例。没有删除失败结果或放宽生产语义。
+- 普通 dev-profile Clippy 退出0，111条诊断（不含target汇总）；新模块有 `type_complexity` 风格提示。不是 `-D warnings` 通过，维护性项见 [OPT-009](OPTIMIZATION_BACKLOG.md#opt-009)。
+
+当前匹配二进制 SHA256：
+
+```text
+Server default   161505e131c67dd31e816320f9cfb0dcbac82bde8208e1e649efd3ea0a17fe04
+Server JetStream a98dcfe0919c03e33542b5b9e2a0b2e18b48ed3b5f61bd1d32109488b8abfa58
+process-s2       3ade0a810566c01227fccb2c10909cf0de9548f23fc73a6cbf05ff47a4408a22
+process-g3       97b053d66f528e41cb9599dc5848e6992f9a15bf73a8633aeea5be7643bdf1b2
+Rust 包源清单    76e5fee1cd77b90b595b14cec0a9f38dff75890a4eb548cfa73014e6bc6f779b
+```
+
+**旧链路回归**：告警 `alarm-final2`、静默 `silence-final2` 通过各自专项重复与进程矩阵；`regression-s3/exit=0`。时间图、线性时间组合、paused、参考表/迟滞、A/B1/B2、K1/K3/K4 与 K2 的既有门禁全部通过，使用最终 Release 冻结测试和相同 s3 生产包；K2 单独回收 **35 passed / 0 ignored**，并跑真实 broker 进程矩阵。未匹配的默认 ignored 项不因这句话被补记为通过。
+
+**本候选的性能回归门禁通过**：开跑前写入 `performance-plan-s3.json`，固定原三组 ABBA、fresh ≥0.97、periodic ≥0.90、RSS 增量≤2048 KiB。三个单组均 exit0，合并 `performance-s3.exit=0`，全部输出完整、无丢重/非法行，测量输出 hash 一致；没有降低阈值或重跑挑样本。
+
+| 负载 | 合并吞吐比 | RSS 增量 KiB | 测量数 |
+|---|---:|---:|---:|
+| fresh 零状态 | 1.006203 | -16 | 36 |
+| fresh 双 Count | 1.005961 | 576 | 36 |
+| periodic 零状态 | 1.004956 | 116 | 24 |
+| periodic 双 Count | 0.999504 | 308 | 24 |
+
+fresh 与历史 time-graph v13 包比较，periodic 为同候选开/关 checkpoint；总体约持平，不宣称统计显著提速。单组最低 fresh 比值为第二组双 Count 的 0.972894，仍满足原 0.97。这只是旧 File 路径回归，不是重采样极限容量、WAN/p99或eKuiper对照。历史 s8 的失败样本仍保留，不能把本次通过改写成旧失败已被证明只是噪声。
+
+上述是限定功能/故障验证，不是 Sampling 极限容量、eKuiper 新对照或生产认证；MQTT live 静默、TLS/WAN、目标设备、24/72h、介质掉电仍未因此完成。逐决策 fsync/full checkpoint/HTTP 成本仍见 [OPT-012](OPTIMIZATION_BACKLOG.md#opt-012)。
+
 <a id="silence-validation"></a>
 ## 来源观测与静默：2026-09-24（功能通过，性能门禁未整体放行）
 

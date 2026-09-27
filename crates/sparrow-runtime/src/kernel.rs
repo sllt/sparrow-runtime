@@ -28,6 +28,8 @@ use crate::transform::{build_source_batches, build_source_batches_shared, Compil
 use crate::window::WindowOperator;
 
 mod graph;
+mod live_silence;
+mod buffered_window;
 pub use graph::{GraphInput, GraphOutput};
 
 #[derive(Clone, Debug)]
@@ -51,6 +53,7 @@ impl Default for KernelOptions {
 
 /// Kernel job. Live I/O is optional channels so MQTT/HTTP stay out of this crate.
 pub struct JobRequest {
+    live_silence: Option<Arc<live_silence::Config>>,
     pub graph_inputs: HashMap<sparrow_model::OperatorId, GraphInput>,
     pub graph_outputs: HashMap<sparrow_model::OperatorId, GraphOutput>,
     /// Optional connector bootstrap reservation, minted by this Kernel only.
@@ -85,6 +88,7 @@ pub struct JobRequest {
 /// Ordered live ingress envelope (R18).
 #[derive(Debug)]
 pub enum IngressEvent {
+    LiveFeed(sparrow_io::live_feed::LiveFeedEvent),
     /// Only an explicitly wired decode-error side port may accept this marker.
     DecodeError,
     Row(Row),
@@ -116,6 +120,7 @@ impl IngressEvent {
 impl Payload for IngressEvent {
     fn rows(&self) -> usize {
         match self {
+            Self::LiveFeed(event) => event.rows(),
             Self::DecodeError => 1,
             Self::Row(_) => 1,
             Self::Batch(batch) => batch.batch.num_rows(),
@@ -124,6 +129,7 @@ impl Payload for IngressEvent {
     }
     fn bytes(&self) -> usize {
         match self {
+            Self::LiveFeed(event) => event.bytes(),
             Self::DecodeError => 1,
             Self::Row(row) => row.resident_bytes(),
             Self::Batch(batch) => batch.batch.tracked_bytes().saturating_add(batch.metadata.bytes()),
@@ -135,6 +141,7 @@ impl Payload for IngressEvent {
 impl JobRequest {
     pub fn new(plan: PhysicalPlan, rows: Vec<Row>, capture: SharedCapture) -> Self {
         Self {
+            live_silence: None,
             graph_inputs: HashMap::new(),
             graph_outputs: HashMap::new(),
             source_admission: None,
@@ -555,10 +562,15 @@ impl Kernel {
     }
 
     pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
+        if req.plan.has_new_windows() && req.aligned.is_some() {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                "new hopping-PT/sliding/session windows are restart_fresh only"));
+        }
         graph::validate_request(&req)?;
         let graph_time=req.aligned.as_ref().and_then(|a|a.acks.graph_time()).cloned();
         let durable_graph=req.aligned.is_some() && req.plan.edges.is_some() && (req.plan.has_processing_time_state() || req.plan.has_event_time_window());
-        let ordered_time = durable_graph || req.plan.has_timed_iot() || (req.aligned.is_some() && req.plan.has_processing_time_state());
+        if req.live_silence.is_some() { live_silence::validate_request(&req)?; }
+        let ordered_time = req.live_silence.is_none() && (durable_graph || req.plan.has_timed_iot() || (req.aligned.is_some() && req.plan.has_processing_time_state()));
         if ordered_time {
             let manifest = sparrow_plan::CheckpointPlan::from_physical(&req.plan)?;
             let ingress=if durable_graph {
@@ -658,6 +670,7 @@ impl Kernel {
                         | crate::pipeline_checkpoint::PAUSED_FILE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::PAUSED_COMBINED_FILE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::OBSERVED_FILE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::RESAMPLE_FILE_SNAPSHOT_VERSION
                 ) && aligned
                     .acks
                     .output_sequence()
@@ -819,6 +832,7 @@ impl Kernel {
                 .map_err(|e| e.retryable(true).context("admission", "capacity"))?;
         let work = Arc::new(WorkBudget::new(self.job_budget.work_units));
         let ctx = JobCtx {
+            live_silence: req.live_silence.clone(),
             ordered_time,
             graph_time: graph_time.clone(),
             graph_memory: if req.plan.edges.is_some() {Some(Arc::new(owner.acquire(sparrow_model::CreditKind::Reservation,graph::metadata_bytes(&req.plan))?))}else{None},
@@ -950,6 +964,7 @@ fn admit_process(
 }
 
 struct JobCtx {
+    live_silence: Option<Arc<live_silence::Config>>,
     ordered_time: bool,
     graph_time: Option<Arc<crate::graph_cut::GraphRuntime>>,
     graph_memory: Option<Arc<sparrow_model::MemoryLease>>,
@@ -1062,6 +1077,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
     ctx.mailboxes.initialized();
 
     let JobRequest {
+        live_silence: _,
         plan,
         rows,
         capture,
@@ -1169,6 +1185,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
 
 fn clone_ctx(ctx: &JobCtx) -> JobCtx {
     JobCtx {
+        live_silence: ctx.live_silence.clone(),
         ordered_time: ctx.ordered_time,
         graph_time: ctx.graph_time.clone(),
         graph_memory: ctx.graph_memory.clone(),
@@ -1299,6 +1316,9 @@ async fn stage_loop(
                 return budgeted_live_source(ctx, schema, tx, input).await;
             }
             if let Some(events) = live_events {
+                if ctx.live_silence.is_some() {
+                    return Box::pin(live_silence::source(ctx, schema, tx, events)).await;
+                }
                 return if ctx.graph_mode {live_source::<true>(ctx,schema,tx,LiveInput::Ordered(events)).await}
                     else{live_source::<false>(ctx,schema,tx,LiveInput::Ordered(events)).await};
             }
@@ -1382,7 +1402,7 @@ async fn stage_loop(
                 let envelope=if !ctx.graph_mode {rx.recv().await?}else{tokio::select! {
                     biased;
                     _=ctx.cancel.cancelled()=>None,
-                    _=async {let counter=sink_outbox.expect("graph live sink counter");while counter.failed()==0{tokio::time::sleep(std::time::Duration::from_millis(10)).await;}},if ctx.graph_mode&&sink_outbox.is_some()=>{
+                    _=async {let counter=sink_outbox.expect("graph live sink counter");while counter.failed()==0 && live_out.as_ref().is_none_or(|out|!out.is_closed()){tokio::time::sleep(std::time::Duration::from_millis(10)).await;}},if ctx.graph_mode&&sink_outbox.is_some()=>{
                         return Err(SparrowError::new(ErrorCode::JobFailed,"graph sink reported failed output").at_operator(operator));
                     },
                     result=rx.recv()=>result?,
@@ -1480,6 +1500,10 @@ async fn stage_loop(
             let rx = rx
                 .as_mut()
                 .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "window missing rx"))?;
+            if spec.kind.is_buffered() {
+                return buffered_window::task(&ctx, spec, input, rx, &tx, &capture)?.await
+                    .map_err(|e| e.at_operator(operator));
+            }
             let prepared = ctx.aligned.as_ref().and_then(|a|a.windows.lock().expect("prepared windows").remove(&operator));
             if prepared.is_none() && ctx.aligned.as_ref().is_some_and(|a| a.participant_mode) {
                 return Err(SparrowError::new(ErrorCode::Internal, "prepared checkpoint participant missing"));
@@ -1658,6 +1682,7 @@ impl Drop for IotReporter {
 /// Live TTL uses local monotonic idle time. Aligned time profiles instead use
 /// only persisted, FIFO time controls and never wake on this local timer path.
 async fn iot_stage(ctx: &JobCtx, op: &mut crate::iot::IotOperator, rx: &mut MailboxRx, tx: &MailboxTx) -> Result<usize> {
+    if ctx.live_silence.is_some() { return Box::pin(live_silence::stage(ctx, op, rx, tx)).await; }
     if ctx.ordered_time { return timed_iot_stage(ctx,op,rx,tx).await; }
     let started = tokio::time::Instant::now();
     let now = || if ctx.clock.is_virtual() { ctx.clock.now_micros() }
@@ -1727,6 +1752,7 @@ async fn timed_iot_stage(ctx:&JobCtx,op:&mut crate::iot::IotOperator,rx:&mut Mai
     let mut timers=TimerReporter {ctx,live:0,cancelled:0};
     loop {
         reporter.sample(op); timers.sample(op.pending_timers(),0);
+        op.report_resample_metrics(&ctx.metrics);
         let envelope=tokio::select! { biased; _=ctx.cancel.cancelled()=>break, e=rx.recv()=>e? };
         let Some(mut envelope)=envelope else {
             if !ctx.cancel.is_cancelled() { return Err(SparrowError::new(ErrorCode::JobFailed,"ordered processing-time source closed without shutdown")); }
@@ -1778,7 +1804,7 @@ async fn timed_iot_stage(ctx:&JobCtx,op:&mut crate::iot::IotOperator,rx:&mut Mai
             if !tx.send_control(control).await? {break;}
         }
     }
-    reporter.sample(op); op.cleanup(); Ok(0)
+    reporter.sample(op); op.report_resample_metrics(&ctx.metrics); op.cleanup(); Ok(0)
 }
 
 async fn emit_window(
@@ -1934,7 +1960,7 @@ async fn window_stage<const GRAPH:bool>(
                             // A failed checkpoint must abort that request, not
                             // fail the live job while reserving unused output.
                             let emission = match ctrl {
-                                StreamControl::ProcessingTime { .. } | StreamControl::FeedObservation {..} | StreamControl::GraphProgress {..} | StreamControl::GraphRoundEnd {..} => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for windows")),
+                                StreamControl::LiveFeedStart {..} | StreamControl::LiveFeedEnd {..} | StreamControl::ProcessingTime { .. } | StreamControl::FeedObservation {..} | StreamControl::GraphProgress {..} | StreamControl::GraphRoundEnd {..} => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for windows")),
                                 StreamControl::EndOfInput=>{
                                     if !GRAPH{return Err(SparrowError::new(ErrorCode::InvalidArgument,"explicit EOF belongs to graph ingress"));}
                                     eof_received=true;
@@ -2269,6 +2295,9 @@ async fn live_source<const GRAPH:bool>(
                         if matches!(event,IngressEvent::Control(StreamControl::EndOfInput)){ended=true;}
                     }
                     match event {
+                        IngressEvent::LiveFeed(_) => {
+                            return Err(SparrowError::new(ErrorCode::InvalidArgument,"live feed event outside the live silence profile"));
+                        }
                         IngressEvent::DecodeError => {
                             if !publish_live_rows(&ctx,&schema,&tx,&mut rows,origin,&mut n).await? {return Ok(n);}
                             origin=OriginSpan::default();

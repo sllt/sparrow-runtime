@@ -1,9 +1,14 @@
 use crate::{request_start, PipelineSpec, Store, Supervisor};
 use serde_json::{json, Value};
+
+#[path = "live_silence_tests.rs"]
+mod live_silence_tests;
 use std::{sync::Arc, time::Duration};
 
 #[path = "observed_time_tests.rs"]
 mod observed_time_tests;
+#[path = "resample_tests.rs"]
+mod resample_tests;
 
 struct Scratch(std::path::PathBuf);
 impl Drop for Scratch {

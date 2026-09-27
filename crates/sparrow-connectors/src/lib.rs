@@ -10,6 +10,7 @@ pub mod capabilities;
 pub mod diag;
 pub mod error;
 pub mod file_replay;
+pub mod file_sink;
 pub mod http;
 pub mod http_push;
 #[cfg(feature = "jetstream")]

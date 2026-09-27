@@ -10,6 +10,8 @@ pub mod bind_v03;
 pub mod g0;
 pub mod v02;
 pub mod v03;
+#[cfg(test)]
+mod window_completion_tests;
 
 pub use bind::bind_sql;
 pub use bind_v02::bind_sql_v02;

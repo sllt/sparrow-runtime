@@ -186,6 +186,7 @@ fn count_window_cannot_impersonate_event_time() {
         lateness_micros: 3,
         max_overlap: DEFAULT_MAX_HOP_OVERLAP,
         max_future_skew_micros: None,
+        max_buffered_rows: 1024,
     };
     let err = spec.validate().unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArgument);
@@ -209,6 +210,7 @@ fn hop_overlap_planner_bound() {
         lateness_micros: 0,
         max_overlap: 8,
         max_future_skew_micros: None,
+        max_buffered_rows: 1024,
     };
     assert_eq!(bad.validate().unwrap_err().code, ErrorCode::BoundExceeded);
 }

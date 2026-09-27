@@ -700,6 +700,12 @@ type capture struct {
 }
 
 func newCapture() *capture {
+	return newCaptureWithNumbers(false)
+}
+
+// Preserve full-width integers for resampling's Last oracle without changing
+// the legacy matrices' JSON value types.
+func newCaptureWithNumbers(exact bool) *capture {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	must(err)
 	result := &capture{listener: listener, status: http.StatusOK, serveDone: make(chan struct{})}
@@ -715,7 +721,21 @@ func newCapture() *capture {
 				return
 			}
 			var rows []map[string]any
-			if json.Unmarshal(raw, &rows) != nil {
+			var decodeErr error
+			if exact {
+				decoder := json.NewDecoder(bytes.NewReader(raw))
+				decoder.UseNumber()
+				decodeErr = decoder.Decode(&rows)
+				if decodeErr == nil {
+					var trailing any
+					if err := decoder.Decode(&trailing); err != io.EOF {
+						decodeErr = fmt.Errorf("trailing JSON body")
+					}
+				}
+			} else {
+				decodeErr = json.Unmarshal(raw, &rows)
+			}
+			if decodeErr != nil {
 				writer.WriteHeader(http.StatusBadRequest)
 				return
 			}
@@ -2642,6 +2662,12 @@ func main() {
 	oldServerBin := flag.String("old-server-bin", "", "old B2 server binary for profile guards")
 	natsBin := flag.String("nats-server", "", "pinned NATS Server binary")
 	out := flag.String("out", "", "new isolated artifact directory")
+	mqttLive := flag.Bool("mqtt-live-only", false, "run independent live silence lifecycle, broker outage and sustained traffic oracle")
+	actionsOnly := flag.Bool("actions-only", false, "run independent Action/File/function process oracles")
+	capacityPlan := flag.String("capacity-plan", "", "bounded capacity plan JSON; independent correctness and capacity outcomes")
+	capacityCase := flag.String("capacity-case", "", "optional exact case name from capacity-plan")
+	mqttAddress := flag.String("mqtt-address", "", "isolated Mosquitto host:port")
+	mqttContainer := flag.String("mqtt-container", "", "disposable sparrow-mqtt-live-* Docker fixture for outage test")
 	pausedOnly := flag.Bool("paused-time-only", false, "run independent v14/v15 time/process oracles instead of the reference matrix")
 	pausedFileOnly := flag.Bool("paused-file-only", false, "run the three timed File scenarios on a feature-off production binary")
 	completionOnly := flag.Bool("time-completion-only", false, "run v16/v17 PT, TTL and multi-state crash oracles")
@@ -2654,7 +2680,29 @@ func main() {
 	silenceFaultsFileOnly := flag.Bool("silence-faults-file-only", false, "run isolated File and required HTTP source-observed fault oracles")
 	alarmOnly := flag.Bool("alarm-only", false, "run v20/v21 alarm activate/resolve and episode SIGKILL oracles")
 	alarmFileOnly := flag.Bool("alarm-file-only", false, "run v20 alarm oracles on the default feature-off binary")
+	resampleOnly := flag.Bool("resample-only", false, "run v25/v26 sampling SIGKILL and replay oracles")
+	resampleFileOnly := flag.Bool("resample-file-only", false, "run v25 sampling SIGKILL oracles without JetStream")
 	flag.Parse()
+	if *capacityPlan != "" {
+		require(!(*actionsOnly || *mqttLive || *pausedOnly || *pausedFileOnly || *completionOnly || *completionFileOnly || *graphOnly || *alarmOnly || *alarmFileOnly || *alarmGraphOnly || *silenceOnly || *silenceFileOnly || *silenceFaultsOnly || *silenceFaultsFileOnly || *resampleOnly || *resampleFileOnly), "capacity cannot mix scenario modes")
+		require(*serverBin != "" && *natsBin != "" && *out != "", "capacity requires server-bin, nats-server, out")
+		runCapacityPlan(*out, *serverBin, *natsBin, *capacityPlan, *capacityCase)
+		return
+	}
+	if *actionsOnly {
+		require(!(*mqttLive || *pausedOnly || *pausedFileOnly || *completionOnly || *completionFileOnly || *graphOnly || *alarmOnly || *alarmFileOnly || *alarmGraphOnly || *silenceOnly || *silenceFileOnly || *silenceFaultsOnly || *silenceFaultsFileOnly || *resampleOnly || *resampleFileOnly), "actions cannot mix scenario modes")
+		require(*serverBin != "" && *out != "" && *mqttAddress != "", "actions requires server-bin, out and isolated mqtt-address")
+		runActionsProcess(*out, *serverBin, *mqttAddress)
+		return
+	}
+	if *mqttLive {
+		require(!(*pausedOnly || *pausedFileOnly || *completionOnly || *completionFileOnly || *graphOnly || *alarmOnly || *alarmFileOnly || *alarmGraphOnly || *silenceOnly || *silenceFileOnly || *silenceFaultsOnly || *silenceFaultsFileOnly || *resampleOnly || *resampleFileOnly), "MQTT live cannot mix scenario modes")
+		require(*serverBin != "" && *out != "" && *mqttAddress != "" && strings.HasPrefix(*mqttContainer, "sparrow-mqtt-live-"), "MQTT live requires server-bin, out, mqtt-address and a disposable mqtt-container")
+		runMqttLiveProcess(*out, *serverBin, *mqttAddress, *mqttContainer)
+		return
+	}
+	require(!(*resampleOnly || *resampleFileOnly) || !(*pausedOnly || *pausedFileOnly || *completionOnly || *completionFileOnly || *graphOnly || *alarmOnly || *alarmFileOnly || *alarmGraphOnly || *silenceOnly || *silenceFileOnly || *silenceFaultsOnly || *silenceFaultsFileOnly), "resample cannot mix scenario modes")
+	require(!*resampleOnly || !*resampleFileOnly, "resample modes are mutually exclusive")
 	require(!(*silenceFaultsOnly || *silenceFaultsFileOnly) || !(*pausedOnly || *pausedFileOnly || *completionOnly || *completionFileOnly || *graphOnly || *alarmOnly || *alarmFileOnly || *alarmGraphOnly || *silenceOnly || *silenceFileOnly),
 		"silence fault modes cannot be combined with another scenario mode")
 	require(!*silenceFaultsOnly || !*silenceFaultsFileOnly, "silence fault modes are mutually exclusive")
@@ -2679,6 +2727,10 @@ func main() {
 		"server_sha256": hash(*serverBin), "old_server_sha256": hash(*oldServerBin),
 		"nats_sha256": hash(*natsBin), "driver_sha256": hash(self),
 	})
+	if *resampleOnly || *resampleFileOnly {
+		runResampleMatrix(root, *serverBin, *oldServerBin, *natsBin, *resampleFileOnly)
+		return
+	}
 	if *silenceFaultsOnly || *silenceFaultsFileOnly {
 		runSilenceFaultMatrix(root, *serverBin, *natsBin, *silenceFaultsFileOnly)
 		return

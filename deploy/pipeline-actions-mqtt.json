@@ -1,0 +1,10 @@
+{
+  "version":1,"stream":"actions",
+  "sql":"SELECT concat(device, '-out') AS label, n FROM actions",
+  "source":{"kind":"file","path":"/var/lib/sparrow/data/actions.ndjson","file_contract":"append_only"},
+  "sink":{
+    "kind":"mqtt","host":"127.0.0.1","port":1883,"topic":"actions/fallback","client_id":"sparrow-actions-example","qos":0,"clean_session":true,
+    "action":{"version":1,"topic":["actions/",{"$field":"label"}],"body":{"value":{"$field":"n"}}}
+  },
+  "recovery":"restart_fresh","fail_on_decode":true
+}

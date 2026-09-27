@@ -189,6 +189,8 @@ pub struct MqttFramedReader {
 }
 
 impl MqttFramedReader {
+    /// Includes partial frames: a PINGRESP cannot bless unread local bytes.
+    pub fn has_buffered_bytes(&self) -> bool { !self.buf.is_empty() }
     pub fn new() -> Self {
         Self::default()
     }

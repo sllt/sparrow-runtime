@@ -58,7 +58,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
 
     for id in order {
         let node = by_id[&id];
-        if node.iot.is_some() && !matches!(node.kind.as_str(), "change_detect" | "deadband" | "hysteresis" | "hold_for" | "debounce" | "alarm" | "silence") {
+        if node.iot.is_some() && !matches!(node.kind.as_str(), "change_detect" | "deadband" | "hysteresis" | "hold_for" | "debounce" | "alarm" | "silence" | "resample") {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
                 format!("node {}: iot configuration is only valid for change_detect/deadband/hysteresis", node.id),
@@ -235,7 +235,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     output,
                 }
             }
-            "change_detect" | "deadband" | "hysteresis" | "hold_for" | "debounce" | "alarm" | "silence" => {
+            "change_detect" | "deadband" | "hysteresis" | "hold_for" | "debounce" | "alarm" | "silence" | "resample" => {
                 let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
                     SparrowError::new(
                         ErrorCode::InvalidArgument,
@@ -249,7 +249,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     )
                 })?;
                 match node.kind.as_str() {
-                    "hold_for" | "debounce" | "alarm" | "silence" if spec.timing.as_ref().map(|t| t.kind_name()) != Some(node.kind.as_str()) => {
+                    "hold_for" | "debounce" | "alarm" | "silence" | "resample" if spec.timing.as_ref().map(|t| t.kind_name()) != Some(node.kind.as_str()) => {
                         return Err(SparrowError::new(ErrorCode::InvalidArgument, "timed node kind/config mismatch"));
                     }
                     "change_detect" | "deadband" | "hysteresis" if spec.timing.is_some() => {
@@ -283,7 +283,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                 incoming_schema.insert(id, output.clone());
                 BoundKind::Iot { spec, input, output }
             }
-            "hop" | "tumble_et" | "event_time_window" => {
+            "hop" | "tumble_et" | "event_time_window" | "sliding" | "session" | "hop_pt" => {
                 let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
                     SparrowError::new(
                         ErrorCode::InvalidArgument,
@@ -300,7 +300,7 @@ pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPla
                     output,
                 }
             }
-            "session" | "retract" | "late_merge" => {
+            "retract" | "late_merge" => {
                 return Err(SparrowError::new(
                     ErrorCode::FeatureUnavailable,
                     format!(
@@ -674,18 +674,6 @@ fn bind_after_source(
 }
 
 fn bind_window_node(node: &NodeSpec, _input: &Schema) -> Result<WindowSpec> {
-    if node
-        .window
-        .as_ref()
-        .map(|w| w.kind.to_ascii_lowercase() == "session")
-        .unwrap_or(false)
-        || node.kind == "session"
-    {
-        return Err(SparrowError::new(
-            ErrorCode::FeatureUnavailable,
-            "SESSION windows and late merge are not part of V0.3",
-        ));
-    }
     let kind = if let Some(w) = &node.window {
         match w.kind.to_ascii_lowercase().as_str() {
             "tumble_pt" | "tumbling_pt" | "tumbling_processing_time" | "processing_time" => {
@@ -699,12 +687,12 @@ fn bind_window_node(node: &NodeSpec, _input: &Schema) -> Result<WindowSpec> {
                 w.size_micros.unwrap_or(0),
                 w.slide_micros.unwrap_or(0),
             )?,
-            "session" => {
-                return Err(SparrowError::new(
-                    ErrorCode::FeatureUnavailable,
-                    "SESSION windows are not part of V0.3",
-                ));
-            }
+            "hop_pt" | "hopping_processing_time" => WindowKind::hopping_pt(w.size_micros.unwrap_or(0),w.slide_micros.unwrap_or(0))?,
+            "sliding_count" => WindowKind::sliding_count(w.size.unwrap_or(0),w.step.unwrap_or(0))?,
+            "sliding_pt" | "sliding_processing_time" => WindowKind::sliding(w.size_micros.unwrap_or(0),w.delay_micros.unwrap_or(0),false)?,
+            "sliding_et" | "sliding_event_time" => WindowKind::sliding(w.size_micros.unwrap_or(0),w.delay_micros.unwrap_or(0),true)?,
+            "session_pt" | "session_processing_time" => WindowKind::session(w.gap_micros.unwrap_or(0),w.max_duration_micros.unwrap_or(0),false)?,
+            "session_et" | "session_event_time" => WindowKind::session(w.gap_micros.unwrap_or(0),w.max_duration_micros.unwrap_or(0),true)?,
             other => {
                 return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
@@ -777,7 +765,29 @@ fn bind_window_node(node: &NodeSpec, _input: &Schema) -> Result<WindowSpec> {
         lateness_micros,
         max_overlap,
         max_future_skew_micros,
+        max_buffered_rows:node.window.as_ref().and_then(|w|w.max_buffered_rows).unwrap_or(1024),
     };
+    if let Some(w)=&node.window {
+        if kind.is_new_window() {
+            let hopping=matches!(kind,WindowKind::HoppingProcessingTime {..});
+            let session=matches!(kind,WindowKind::SessionProcessingTime {..}|WindowKind::SessionEventTime {..});
+            if (w.size.is_some() && !kind.is_count())
+                || (w.size_micros.is_some() && (kind.is_count() || session))
+                || (w.slide_micros.is_some() && !hopping)
+                || (w.max_overlap.is_some() && !hopping)
+                || (w.max_future_skew_micros.is_some() && !kind.uses_event_time())
+                || (node.event_time_field.is_some() && w.event_time_field.is_some() && node.event_time_field!=w.event_time_field)
+                || (node.lateness_micros.is_some() && w.lateness_micros.is_some() && node.lateness_micros!=w.lateness_micros) {
+                return Err(SparrowError::new(ErrorCode::InvalidArgument,"conflicting or inapplicable window parameters"));
+            }
+        }
+        if (w.step.is_some() && !matches!(kind,WindowKind::SlidingCount {..}))
+            || (w.delay_micros.is_some() && !matches!(kind,WindowKind::SlidingProcessingTime {..}|WindowKind::SlidingEventTime {..}))
+            || ((w.gap_micros.is_some() || w.max_duration_micros.is_some()) && !matches!(kind,WindowKind::SessionProcessingTime {..}|WindowKind::SessionEventTime {..}))
+            || (w.max_buffered_rows.is_some() && !kind.is_buffered()) {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,"new window parameters do not apply to the selected kind"));
+        }
+    }
     spec.validate()?;
     Ok(spec)
 }

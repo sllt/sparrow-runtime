@@ -150,6 +150,16 @@ pub struct WindowNodeSpec {
     pub max_overlap: Option<u32>,
     #[serde(default)]
     pub max_future_skew_micros: Option<i64>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub step: Option<u64>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub delay_micros: Option<i64>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub gap_micros: Option<i64>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub max_duration_micros: Option<i64>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub max_buffered_rows: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -28,7 +28,7 @@ paused_names() {
     # The new OFD1 tests share private File fixtures through this submodule,
     # but belong to the separate exact Silence inventory, not legacy TPD1.
     sed -n 's/^\([^[:space:]]*paused_time_[^[:space:]]*\): test$/\1/p' "$1" |
-        sed '/^paused_time_tests::observed_time_tests::/d'
+        sed -E '/^paused_time_tests::(observed_time_tests|resample_tests|live_silence_tests)::/d'
 }
 while IFS=$'\t' read -r target source; do
     crate=${target//-/_}; binary="$frozen/reliable-test-binaries/$(basename "$source")"; test -x "$binary"

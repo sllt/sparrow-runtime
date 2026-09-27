@@ -30,6 +30,10 @@ mod k4_tests;
 mod paused_time_tests;
 #[cfg(all(test,feature="demo-io"))]
 mod time_graph_tests;
+#[cfg(all(test,feature="demo-io",target_os="linux"))]
+mod actions_tests;
+#[cfg(all(test,feature="demo-io"))]
+mod window_completion_tests;
 pub use checkpoint::CheckpointSpec;
 pub use status::PipelineStatus;
 pub use store::{

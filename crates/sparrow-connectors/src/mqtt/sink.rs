@@ -87,6 +87,7 @@ impl MqttSinkConfig {
 pub struct MqttSink {
     pub config: MqttSinkConfig,
     pub diag: Arc<IoDiagnostics>,
+    action: Option<Box<sparrow_formats::action::ActionSpec>>,
 }
 struct BatchReceipt(Option<Arc<InflightCounter>>);
 impl BatchReceipt {fn ack(&mut self){if let Some(outbox)=self.0.take(){outbox.ack();}}}
@@ -97,6 +98,29 @@ mod observation_tests {
     use super::*;
     use sparrow_model::{MemoryOwner,ResourceBudget};
     use crate::secret::MapSecretResolver;
+    #[tokio::test]
+    async fn actions_mqtt_wire_topic_payload_and_destination_rejection() {
+        use sparrow_model::{Schema,SchemaId,Field,FieldId,DataType,Scalar,Row,RowBatchBuilder,CreditKind};
+        let schema=Arc::new(Schema::new(SchemaId::new(1),vec![Field::new(FieldId::new(1),"device",DataType::Utf8,false)]).unwrap());
+        for topic in ["x".repeat(1025),"bad/+".into(),"bad/#".into()] {
+            let mut cfg=MqttSinkConfig::demo("127.0.0.1",1883);cfg.topic=topic;
+            assert!(MqttSink::bind(cfg,&MapSecretResolver::empty(),&TargetPolicy::allow("127.0.0.1",1883),IoDiagnostics::new()).unwrap()
+                .with_action(Some(Box::new(sparrow_formats::action::ActionSpec::default()))).is_err());
+        }
+        for (value,valid) in [("测-a",true),("a/b",false),("a+",false),("#",false),("\0",false)] {
+            let owner=MemoryOwner::new(ResourceBudget::compact());let diag=IoDiagnostics::new();
+            let action=serde_json::from_value(serde_json::json!({"topic":["site/",{"$field":"device"},"/out"],"body":{"id":{"$field":"device"}}})).unwrap();
+            let sink=MqttSink::bind(MqttSinkConfig::demo("127.0.0.1",1883),&MapSecretResolver::empty(),&TargetPolicy::allow("127.0.0.1",1883),diag.clone()).unwrap().with_action(Some(Box::new(action))).unwrap();
+            let mut builder=RowBatchBuilder::new(schema.clone(),owner.clone(),CreditKind::Reservation,1,65536).unwrap();builder.push(Row{values:vec![Scalar::utf8(value)]}).unwrap();let batch=builder.finish().unwrap();
+            let(left,right)=tokio::io::duplex(65536);let mut writer:super::super::io::MqttStream=Box::pin(left);let mut reader:super::super::io::MqttStream=Box::pin(right);
+            assert_eq!(sink.publish_action(&batch,&batch.rows()[0],&mut writer,&CancellationToken::new()).await.unwrap(),valid);
+            if valid {
+                let Packet::Publish(packet)=read_packet(&mut MqttFramedReader::new(),&mut reader).await.unwrap() else {panic!("expected publish")};
+                assert_eq!(packet.topic,"site/测-a/out");assert_eq!(serde_json::from_slice::<serde_json::Value>(&packet.payload).unwrap(),serde_json::json!({"id":"测-a"}));
+            } else {assert_eq!(diag.snapshot().mqtt_dropped_bad,1);}
+            drop(batch);assert_eq!(owner.usage().physical_bytes,0);
+        }
+    }
     #[tokio::test]
     async fn obs_mqtt_sink_idle_ping_and_disconnect_are_observed() {
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
@@ -126,6 +150,54 @@ mod observation_tests {
 }
 
 impl MqttSink {
+    pub fn with_action(mut self,action:Option<Box<sparrow_formats::action::ActionSpec>>)->Result<Self>{
+        if action.as_ref().is_some_and(|a|a.single || !a.query.is_empty()) {
+            return Err(ConnectorError::new(ErrorCode::InvalidArgument,"MQTT actions do not accept HTTP options"));
+        }
+        if action.as_ref().is_some_and(|a|a.topic.is_none()) &&
+            (self.config.topic.is_empty() || self.config.topic.len()>1024 || self.config.topic.contains(['+','#','\0'])) {
+            return Err(ConnectorError::new(ErrorCode::InvalidArgument,"MQTT action fallback topic must be valid and <=1024 bytes"));
+        }
+        self.action=action;Ok(self)
+    }
+
+    async fn publish_action(&self,batch:&RowBatch,row:&sparrow_model::Row,stream:&mut super::io::MqttStream,cancel:&CancellationToken)->Result<bool>{
+        let action=self.action.as_ref().expect("action");
+        let prepared=(||->sparrow_model::Result<_>{
+            if batch.output_sequence().is_some(){return Err(sparrow_model::SparrowError::new(ErrorCode::UnsupportedRestore,"MQTT action has no reliable receipt"));}
+            let mut lease=batch.lease().owner().acquire(sparrow_model::CreditKind::Reservation,8192)?;
+            let body=action.encode(batch.schema(),std::slice::from_ref(row),false,JsonLimits::default().max_bytes,|cap|lease.grow_to(cap+8192))?;
+            let topic=if let Some(parts)=&action.topic {
+                // A variable occupies one topic level; only configured literals
+                // may introduce separators. No data-controlled wildcard routing.
+                for part in parts.iter().filter(|p|!p.is_string()) {
+                    let value=action.text(std::slice::from_ref(part),batch.schema(),row,1024)?;
+                    if value.contains(['/', '+', '#', '\0']) {return Err(sparrow_model::SparrowError::new(ErrorCode::PolicyDenied,"dynamic topic field must stay within one topic level"));}
+                }
+                action.text(parts,batch.schema(),row,1024)?
+            }else{
+                if self.config.topic.len()>1024{return Err(sparrow_model::SparrowError::new(ErrorCode::BoundExceeded,"action fallback topic exceeds 1024 bytes"));}
+                self.config.topic.clone()
+            };
+            if topic.is_empty() || topic.len()>1024 || topic.contains(['+','#','\0']) {
+                return Err(sparrow_model::SparrowError::new(ErrorCode::PolicyDenied,"invalid expanded MQTT publish topic"));
+            }
+            // Codec holds payload + variable header + final frame at its peak;
+            // include Vec geometric growth and bounded topic/text scratch.
+            lease.grow_to(body.capacity().saturating_mul(5).saturating_add(16*1024))?;
+            Ok((lease,body,topic))
+        })();
+        let (_lease,body,topic)=match prepared {Ok(value)=>value,Err(e)=>{
+            self.diag.mqtt_dropped_bad.fetch_add(1,Ordering::Relaxed);
+            self.diag.observation.health(false,HealthState::Failed,"mqtt_action_failed",Some(e.code));return Ok(false);
+        }};
+        let packet=Packet::Publish(Publish{dup:false,qos:0,retain:false,topic,packet_id:None,payload:body});
+        tokio::select! {biased;_=cancel.cancelled()=>return Err(ConnectorError::new(ErrorCode::JobFailed,"MQTT action cancelled")),
+            result=tokio::time::timeout(self.config.connect_timeout,write_packet(stream,&packet))=>result.map_err(|_|ConnectorError::new(ErrorCode::Internal,"MQTT action write timeout"))??,
+        }
+        self.diag.mqtt_decoded.fetch_add(1,Ordering::Relaxed);self.diag.observation.progress(false,1);Ok(true)
+    }
+
     pub fn bind(
         config: MqttSinkConfig,
         secrets: &dyn SecretResolver,
@@ -133,7 +205,7 @@ impl MqttSink {
         diag: Arc<IoDiagnostics>,
     ) -> Result<Self> {
         config.validate(secrets, policy)?;
-        Ok(Self { config, diag })
+        Ok(Self { config, diag, action:None })
     }
 
     pub async fn run(
@@ -239,6 +311,11 @@ impl MqttSink {
                             let mut all_encoded=true;
                             let schema = batch.schema();
                             for row in batch.rows() {
+                                if self.action.is_some() {
+                                    if !Box::pin(self.publish_action(&batch,row,&mut stream,cancel)).await? {all_encoded=false;}
+                                    next_ping=tokio::time::Instant::now()+ping;
+                                    continue;
+                                }
                                 let started=std::time::Instant::now();
                                 let encoded=encode_json_row(schema,row);
                                 self.diag.observation.record(Latency::Encode,started.elapsed());

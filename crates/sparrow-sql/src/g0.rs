@@ -27,6 +27,9 @@ const ALLOWED_FUNCS: &[&str] = &[
     "greatest",
     "least",
 ];
+pub(crate) fn additive_function(name: &str) -> bool {
+    sparrow_expr::semantics::function(name).is_some() && !ALLOWED_FUNCS.contains(&name)
+}
 
 const REJECTED_FUNCS: &[&str] = &[
     "tumble",
@@ -265,6 +268,15 @@ fn expr_reject(expr: &Expr, in_arith: bool) -> Result<Option<G0Verdict>> {
         Expr::Nested(inner) => expr_reject(inner, in_arith),
         Expr::Value(_) | Expr::TypedString(_) => Ok(None),
         Expr::Function(func) => function_reject(func),
+        Expr::Substring {expr,substring_from:Some(from),substring_for:Some(count),..} => {
+            for child in [expr,from,count] {
+                if let Some(rejected)=expr_reject(child,false)? {return Ok(Some(rejected));}
+            }
+            Ok(None)
+        }
+        Expr::Trim {expr,trim_where:None,trim_what:None,trim_characters:None}
+        | Expr::Ceil {expr,field:sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime)}
+        | Expr::Floor {expr,field:sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime)} => expr_reject(expr,false),
         Expr::Case {
             operand,
             conditions,
@@ -313,7 +325,7 @@ fn function_reject(func: &Function) -> Result<Option<G0Verdict>> {
             "function '{name}' is not part of Sparrow SQL v0"
         ))));
     }
-    if !ALLOWED_FUNCS.contains(&name.as_str()) {
+    if sparrow_expr::semantics::function(&name).is_none() {
         return Ok(Some(rejected(&format!(
             "unknown function '{name}'"
         ))));

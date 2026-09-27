@@ -359,20 +359,38 @@ fn validate_sink_io(
     policy: &TargetPolicy,
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
+    if sink.file.is_some() && sink.kind!="file" {
+        return Err(SparrowError::new(ErrorCode::InvalidArgument,"file options require a File Sink"));
+    }
+    if let Some(action)=&sink.action {
+        if (action.topic.is_some() && sink.kind!="mqtt") || (!action.query.is_empty() && sink.kind!="http")
+            || (action.single && sink.kind!="http") {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,"action topic is MQTT-only; query/single are HTTP-only"));
+        }
+        if action.per_row_http() && (sink.max_inflight.unwrap_or(1)!=1 || sink.batch_rows.unwrap_or(1)!=1 || sink.linger_ms.unwrap_or(0)!=0) {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,"per-row HTTP actions require max_inflight=1, batch_rows=1, linger_ms=0"));
+        }
+    }
     match sink.kind.as_str() {
+        "file" => { file_sink_config(sink)?.validate().map_err(io)?; }
         "http" => {
             let http = http_config(sink, demo)?;
             http.validate(secrets, policy).map_err(io)?;
+            if let Some(action)=&sink.action {sparrow_connectors::HttpSink::validate_action(&http,action).map_err(io)?;}
         }
         "log" => {}
         "mqtt" => {
             let mqtt = mqtt_sink_config(sink, demo)?;
             mqtt.validate(secrets, policy).map_err(io)?;
+            if sink.action.as_ref().is_some_and(|a|a.topic.is_none()) &&
+                (mqtt.topic.len()>1024 || mqtt.topic.contains(['+','#','\0'])) {
+                return Err(SparrowError::new(ErrorCode::InvalidArgument,"MQTT action fallback topic must be valid and <=1024 bytes"));
+            }
         }
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("sink kind `{other}` is not supported (http|log|mqtt)"),
+                format!("sink kind `{other}` is not supported (http|log|mqtt|file)"),
             ));
         }
     }
@@ -394,7 +412,14 @@ pub fn validate_io_with_plan(
 ) -> Result<()> {
     spec.check_delivery()?;
     let Some(io) = &spec.graph_io else {
-        return validate_io(spec, schema, secrets, policy, demo);
+        validate_io(spec, schema, secrets, policy, demo)?;
+        if spec.sink.action.is_some() || spec.sink.kind=="file" {
+            let Some(sparrow_plan::PhysicalStage::CaptureSink {schema:output,..})=plan.stages.last() else {
+                return Err(SparrowError::new(ErrorCode::InvalidSchema,"action requires a typed sink schema"));
+            };
+            validate_action_schema(&spec.sink,output)?;
+        }
+        return Ok(());
     };
 
     for (operator, source) in &io.sources {
@@ -403,7 +428,8 @@ pub fn validate_io_with_plan(
             .map_err(|e| e.at_operator((*operator).into()))?;
     }
     for (operator, sink) in &io.sinks {
-        let _actual = graph_endpoint_schema(plan, *operator, false)?;
+        let actual = graph_endpoint_schema(plan, *operator, false)?;
+        validate_action_schema(sink,&actual).map_err(|e|e.at_operator((*operator).into()))?;
         validate_sink_io(sink, secrets, policy, demo)
             .map_err(|e| e.at_operator((*operator).into()))?;
     }
@@ -549,6 +575,23 @@ pub fn http_push_config(source: &SourceSpec, schema: Schema) -> Result<HttpPushS
     cfg.inbox_capacity = source.inbox_capacity;
     cfg.restore = RestoreClaim::None;
     Ok(cfg)
+}
+
+fn validate_action_schema(sink:&SinkSpec,schema:&Schema)->Result<()> {
+    if let Some(action)=&sink.action {action.validate(schema)?;}
+    else if sink.kind=="file" {sparrow_formats::action::ActionSpec::default().validate(schema)?;}
+    Ok(())
+}
+pub(crate) fn file_sink_config(sink:&SinkSpec)->Result<sparrow_connectors::file_sink::FileSinkConfig> {
+    let config=sink.file.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"File Sink requires file options"))?;
+    if sink.use_demo_io || sink.url.is_some() || sink.host.is_some() || sink.port.is_some()
+        || sink.header_secret.is_some() || sink.topic.is_some() || sink.client_id.is_some() || sink.qos!=0 || !sink.clean_session || sink.tls || sink.skip_verify
+        || sink.batch_rows.is_some() || sink.batch_bytes.is_some() || sink.linger_ms.is_some() || sink.max_inflight.is_some() {
+        return Err(SparrowError::new(ErrorCode::InvalidArgument,"File Sink does not accept network or HTTP batching options"));
+    }
+    Ok(sparrow_connectors::file_sink::FileSinkConfig {directory:config.directory.clone().into(),
+        segment_bytes:config.segment_bytes,max_bytes:config.max_bytes,max_files:config.max_files,
+        row_bytes:config.row_bytes,sync_data:config.sync_data})
 }
 
 pub fn mqtt_sink_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<MqttSinkConfig> {
@@ -848,12 +891,27 @@ fn validate_aligned_plan_inner(
     dependencies: Option<&[sparrow_plan::ReferenceTableDependency]>,
 ) -> sparrow_model::Result<()> {
     let recovery = RecoveryPolicy::parse(&spec.recovery)?;
+    if plan.has_new_windows() && (recovery.is_aligned() || spec.restore.is_some() || spec.checkpoint.is_some() || spec.checkpoint_dir.is_some()) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"new hopping-PT/sliding/session windows currently require restart_fresh without checkpoint or restore"));
+    }
+    let has_actions=spec.sink.action.is_some() || spec.sink.kind=="file" || spec.graph_io.as_ref().is_some_and(|io|
+        io.sinks.values().any(|sink|sink.action.is_some() || sink.kind=="file"));
+    if has_actions && (recovery.is_aligned() || spec.restore.is_some() || spec.checkpoint_dir.is_some() || spec.checkpoint.is_some()) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"Action/File Sink v1 is restart_fresh only; no checkpoint, restore or implicit reliable receipt"));
+    }
+    if spec.source.jetstream.as_ref().and_then(|js|js.idle_backoff_max_ms).is_some()
+        && (plan.has_timed_iot() || plan.has_processing_time_state() || plan.has_silence() || plan.has_resample()) {
+        return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"idle_backoff_max_ms currently applies to the regular JetStream actor, not durable time/observed profiles"));
+    }
     if spec.graph_io.as_ref().is_some_and(|io|io.idle_after_ms.is_some())
         && !(recovery.is_aligned() && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window())) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"idle_after_ms is only supported by durable time graphs"));
     }
-    if plan.has_silence() {
-        validate_observed_time_profile(spec,plan)?;
+    if plan.has_resample() {
+        validate_resample_profile(spec,plan)?;
+    } else if plan.has_silence() {
+        if spec.source.kind == "mqtt" { validate_live_silence_profile(spec, plan)?; }
+        else { validate_observed_time_profile(spec,plan)?; }
     } else if recovery.is_aligned() && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
         validate_time_graph_profile(spec,plan)?;
     } else if plan.has_timed_iot() || (recovery.is_aligned() && plan.has_processing_time_state()) { validate_paused_time_profile(spec,plan)?; }
@@ -908,6 +966,35 @@ fn validate_linear_iot_profile(spec: &PipelineSpec) -> Result<()> {
             "linear aligned IoT recovery requires an explicit checkpoint_dir and HTTP sink",
         ));
     }
+    Ok(())
+}
+
+fn validate_resample_profile(spec:&PipelineSpec,plan:&PhysicalPlan)->Result<()> {
+    validate_paused_time_profile(spec, plan)?;
+    let interval = spec.checkpoint.as_ref().and_then(|c| c.interval_ms).unwrap_or(0);
+    for stage in &plan.stages {
+        if let sparrow_plan::PhysicalStage::Iot { spec: iot, .. } = stage {
+            if let Some(sparrow_plan::IotTimingSpec::Resample(config)) = &iot.timing {
+                if interval.checked_mul(1000).is_none_or(|tick| tick > config.period_micros as u64) {
+                    return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                        "resample period must be at least the checkpoint interval; delayed catch-up still obeys the emission cap"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_live_silence_profile(spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<()> {
+    if spec.source.kind != "mqtt" || spec.recovery != "restart_fresh" || spec.graph_io.is_some()
+        || !spec.reference_tables.is_empty() || spec.sink.kind != "http" || spec.sink.skip_verify
+        || spec.checkpoint.is_some() || spec.checkpoint_dir.is_some() || spec.restore.is_some() {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+            "live silence requires MQTT QoS0/clean_session, restart_fresh and verified HTTP; no checkpoint, restore, graph_io or references"));
+    }
+    refuse_qos_durable(spec.source.qos).map_err(io)?;
+    if !spec.source.clean_session { return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "live silence requires clean_session")); }
+    plan.live_silence_gap()?;
     Ok(())
 }
 
@@ -1097,7 +1184,47 @@ fn reference_snapshot_version(spec: &PipelineSpec, plan: &PhysicalPlan) -> Resul
 /// independent of whether the stored spec currently requests aligned recovery.
 pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
+    if plan.has_new_windows() {
+        value["aligned_eligible"]=serde_json::json!(false);
+        value["aligned_eligibility_reason"]=serde_json::json!("new hopping-PT/sliding/session windows require restart_fresh; checkpoint/profile support is not declared");
+        value["windows"]=serde_json::json!({"maturity":"development_preview","recovery":"restart_fresh_only","session":"final_only_L0","buffered_rows_per_key_default":1024,"buffered_rows_per_key_max":16384});
+        return value;
+    }
+    if plan.has_resample() {
+        let checked = validate_resample_profile(spec, plan);
+        let version = sparrow_plan::CheckpointPlan::from_physical(plan).ok().and_then(|p|
+            sparrow_runtime::snapshot_version_for(&p, if spec.source.kind == "jetstream" {
+                sparrow_runtime::processing_cut::JETSTREAM_KIND
+            } else { sparrow_runtime::processing_cut::FILE_KIND }).ok());
+        value["aligned_eligible"] = serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
+        value["resample"] = serde_json::json!({"maturity":"development_preview","certified":false,
+            "snapshot_version":version,"clock":"paused_source_ordered","cut_codec":"PTC1","decision_codec":"TPD1",
+            "modes":["last","mean","interpolate"],"ordering":"due_before_input; equality_expires_first",
+            "scope":"linear_File_append_only_or_JetStream; optional_pure_transforms; single_Resample; required_HTTP",
+            "identity":"generation+operator+configured_key_values+grid_time",
+            "missing":"NULL_complete_vector; known_keys_only; no_extrapolation_or_forward_fill",
+            "bounds":"max_keys_and_bytes; one_pending_grid_per_key; fail_closed_on_excessive_catch_up",
+            "not_enabled":["MQTT","DAG","references","other_state_combinations","event_time","historical_replay"]});
+        value["recovery_risk"] = serde_json::json!("required_HTTP_may_repeat_before_CURRENT; deduplicate_by_output_identity; no_exactly_once");
+        return value;
+    }
     if plan.has_silence() {
+        if spec.source.kind == "mqtt" {
+            let checked = validate_live_silence_profile(spec, plan);
+            value["aligned_eligible"] = serde_json::json!(false);
+            value["aligned_eligibility_reason"] = serde_json::json!("MQTT live silence has no replay or checkpoint support");
+            value["silence"] = serde_json::json!({"maturity":"development_preview","certified":false,
+                "live_eligible":checked.is_ok(),"eligibility_reason":checked.err().map(|e|e.message),
+                "clock":"live_attempt_monotonic","snapshot_version":null,"scope":"MQTT_Source_then_Silence_then_optional_pure_Transform_then_HTTP",
+                "meaning":"responsive_connection_and_observed_record_absence; not_broker_catchup_or_hardware_failure",
+                "coverage":"fresh_single_outstanding_PINGRESP; FIFO; epoch_break_on_disconnect_drop_backlog_retained_or_decode_loss",
+                "freshness":"probe_response_less_than_gap/4; consumption_less_than_gap/2_from_probe_start",
+                "recovery":"restart_fresh; new_attempt_generation; full_new_grace; no_replay",
+                "retained":"ignored; no_registration_or_resumed; breaks_coverage"});
+            value["recovery_risk"] = serde_json::json!("live_best_effort; records_and_events_may_be_lost; no_durable_alarm_history");
+            return value;
+        }
         let checked=validate_observed_time_profile(spec,plan);
         let version=sparrow_plan::CheckpointPlan::from_physical(plan).ok().and_then(|p|
             sparrow_runtime::snapshot_version_for(&p,if spec.source.kind=="jetstream" {
@@ -1344,10 +1471,11 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
             });
         }
         if let Some(config)=&spec.source.jetstream {
+            let idle_max=config.idle_backoff_max_ms.unwrap_or(250);
             value["jetstream_execution"]=serde_json::json!({
                 "input_batching":"already_ready_rows_bounded_by_kernel_and_pull",
-                "idle_backoff_ms":{"initial":5,"maximum":250,"nonempty_fetch":0},
-                "idle_steady_pulls_per_second_max":4,
+                "idle_backoff_ms":{"initial":5,"maximum":idle_max,"nonempty_fetch":0},
+                "idle_steady_pulls_per_second_max":1000u64.div_ceil(idle_max.max(1)),
                 "ack_policy":"explicit","ack_concurrency":16,"ack_attempts":3,
                 "checkpoint_timeout":"abort_checkpoint_keep_attempt_without_ACK; bootstrap_blocks_input",
                 "sdk_reservation_bytes":512usize*1024+32*config.pull_bytes+(config.pull_messages+2)*4608,
@@ -1534,6 +1662,8 @@ mod tests {
                 file_contract: None,
             },
             sink: crate::spec::SinkSpec {
+                action: None,
+                file: None,
                 kind: "http".into(),
                 url: Some("http://127.0.0.1:1/".into()),
                 skip_verify: false,
@@ -1675,6 +1805,8 @@ mod tests {
     #[test]
     fn n16_http_header_secret_requires_https() {
         let mut sink = crate::spec::SinkSpec {
+            action: None,
+            file: None,
             kind: "http".into(),
             url: Some("http://127.0.0.1:8443/ingest".into()),
             skip_verify: false,

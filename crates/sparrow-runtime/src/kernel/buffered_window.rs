@@ -1,0 +1,270 @@
+//! Cold executor: bounded recomputation does not enlarge the legacy window task.
+use super::*;
+use crate::buffered_window::{BufferedWindow, Ingest};
+
+#[cold]
+pub(super) fn task<'a>(
+    ctx: &'a JobCtx,
+    spec: sparrow_plan::WindowSpec,
+    input: sparrow_model::Schema,
+    rx: &'a mut MailboxRx,
+    tx: &'a MailboxTx,
+    capture: &'a SharedCapture,
+) -> Result<ChargedWindowFuture<impl std::future::Future<Output = Result<usize>> + 'a>> {
+    if ctx.aligned.is_some() || ctx.ordered_time {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "buffered windows require restart_fresh without a durable clock",
+        ));
+    }
+    let future = run(ctx, spec, input, rx, tx, capture);
+    let credit = ctx.owner.acquire(
+        sparrow_model::CreditKind::Reservation,
+        std::mem::size_of_val(&future).saturating_add(64),
+    )?;
+    Ok(ChargedWindowFuture {
+        future: Box::pin(future),
+        _credit: credit,
+    })
+}
+
+async fn charge(ctx: &JobCtx, mut units: u64) -> Result<()> {
+    while units > 0 {
+        if ctx.cancel.is_cancelled() {
+            return Err(SparrowError::new(ErrorCode::Cancelled, "window cancelled"));
+        }
+        let part = units.min(ctx.work.cap().max(1));
+        consume_work(ctx, part).await?;
+        units -= part;
+    }
+    Ok(())
+}
+
+async fn drain(
+    ctx: &JobCtx,
+    op: &mut BufferedWindow,
+    tx: &MailboxTx,
+    time: i64,
+    n: &mut usize,
+) -> Result<bool> {
+    while op.due(time) {
+        charge(ctx, op.work_bound()).await?;
+        if let Some(batch) = op.take_due(time)? {
+            *n += batch.num_rows();
+            if !tx.send(batch).await? {
+                return Ok(false);
+            }
+        }
+    }
+    ctx.metrics
+        .record_state(op.key_count() as u64, op.retention_bytes() as u64);
+    Ok(true)
+}
+
+async fn progress(
+    ctx: &JobCtx,
+    op: &mut BufferedWindow,
+    tx: &MailboxTx,
+    last: &mut Option<i64>,
+    n: &mut usize,
+) -> Result<bool> {
+    if let Some(wm) = op.progress() {
+        if !drain(ctx, op, tx, wm, n).await? {
+            return Ok(false);
+        }
+        if last.is_none_or(|old| wm > old) {
+            if !tx
+                .send_control(StreamControl::Watermark {
+                    input: sparrow_model::InputId::SINGLE.raw(),
+                    wm_micros: wm,
+                })
+                .await?
+            {
+                return Ok(false);
+            }
+            *last = Some(wm);
+        }
+    }
+    Ok(true)
+}
+
+async fn run(
+    ctx: &JobCtx,
+    spec: sparrow_plan::WindowSpec,
+    input: sparrow_model::Schema,
+    rx: &mut MailboxRx,
+    tx: &MailboxTx,
+    capture: &SharedCapture,
+) -> Result<usize> {
+    let mut op = BufferedWindow::new(
+        spec,
+        input.clone(),
+        ctx.owner.clone(),
+        ctx.max_state_keys,
+        ctx.max_timers,
+        ctx.graph_mode,
+    )?;
+    let mut timers = TimerReporter {
+        ctx,
+        live: 0,
+        cancelled: 0,
+    };
+    let (mut closed, mut eof, mut deferred_eof) = (false, false, false);
+    let (mut n, mut last_watermark) = (0, None);
+    loop {
+        if ctx.cancel.is_cancelled() {
+            break;
+        }
+        if op.is_pt() {
+            let now = op.now(ctx.clock.now_micros())?;
+            if !drain(ctx, &mut op, tx, now, &mut n).await? {
+                break;
+            }
+        }
+        timers.sample(op.timers(), 0);
+        let deadline = op.deadline();
+        if closed {
+            if !op.is_pt() || deadline.is_none() {
+                break;
+            }
+            tokio::select! { biased; _ = ctx.cancel.cancelled() => break, _ = ctx.clock.sleep_until(deadline) => {} }
+            continue;
+        }
+        let env = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => break,
+            env = rx.recv() => env?,
+            _ = ctx.clock.sleep_until(deadline) => continue,
+        };
+        let Some(mut env) = env else {
+            if ctx.graph_mode && !eof && !ctx.cancel.is_cancelled() {
+                return Err(SparrowError::new(
+                    ErrorCode::JobFailed,
+                    "window input closed without EOF",
+                ));
+            }
+            closed = true;
+            if op.is_et() && !ctx.graph_mode {
+                if !drain(ctx, &mut op, tx, i64::MAX, &mut n).await? {
+                    break;
+                }
+            }
+            continue;
+        };
+        let (batch, control) = env.take();
+        if let Some(control) = control {
+            match control.clone() {
+                StreamControl::Watermark { input, wm_micros } => {
+                    op.watermark(sparrow_model::InputId(input), wm_micros)?
+                }
+                StreamControl::Idle { input } => {
+                    op.activity(sparrow_model::InputId(input), false)?
+                }
+                StreamControl::Active { input } => {
+                    op.activity(sparrow_model::InputId(input), true)?
+                }
+                StreamControl::EndOfInput => {
+                    if !ctx.graph_mode || eof {
+                        return Err(SparrowError::new(
+                            ErrorCode::InvalidArgument,
+                            "invalid/duplicate window EOF",
+                        ));
+                    }
+                    eof = true;
+                    if op.is_pt() {
+                        closed = true;
+                        deferred_eof = true;
+                    } else {
+                        if op.is_et() && !drain(ctx, &mut op, tx, i64::MAX, &mut n).await? {
+                            break;
+                        }
+                        if !tx.send_control(StreamControl::EndOfInput).await? {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    return Err(SparrowError::new(
+                        ErrorCode::UnsupportedRestore,
+                        "buffered window does not accept checkpoint or durable-clock controls",
+                    ))
+                }
+            }
+            if !eof && !progress(ctx, &mut op, tx, &mut last_watermark, &mut n).await? {
+                break;
+            }
+            if matches!(
+                control,
+                StreamControl::Idle { .. } | StreamControl::Active { .. }
+            ) && !tx.send_control(control.clone()).await?
+            {
+                break;
+            }
+            if let Some((side, drop_when_full)) = &ctx.side_output {
+                graph::publish_control(ctx, side, *drop_when_full, control).await?;
+            }
+        }
+        if let Some(batch) = batch {
+            if eof {
+                return Err(SparrowError::new(
+                    ErrorCode::JobFailed,
+                    "window data after EOF",
+                ));
+            }
+            for row in batch.rows() {
+                charge(ctx, op.work_bound()).await?;
+                let now = op.now(ctx.clock.now_micros())?;
+                if op.is_pt() && !drain(ctx, &mut op, tx, now, &mut n).await? {
+                    return Ok(n);
+                }
+                let started = std::time::Instant::now();
+                let result = op.push(row, now);
+                if let Some(obs) = &ctx.observation {
+                    obs.record(Latency::Window, started.elapsed());
+                }
+                match result? {
+                    Ingest::Accepted(Some(out)) => {
+                        n += out.num_rows();
+                        if !tx.send(out).await? {
+                            return Ok(n);
+                        }
+                    }
+                    Ingest::Accepted(None) => {}
+                    Ingest::Future => ctx.metrics.record_future_dropped(1),
+                    Ingest::Late => {
+                        capture.push_late(std::slice::from_ref(row));
+                        if ctx.side_output.is_some() {
+                            let _scratch = ctx.owner.acquire(
+                                sparrow_model::CreditKind::Reservation,
+                                row.resident_bytes().saturating_mul(2).saturating_add(128),
+                            )?;
+                            let late = Row {
+                                values: row
+                                    .values
+                                    .iter()
+                                    .map(sparrow_model::Scalar::detach_copy)
+                                    .collect(),
+                            };
+                            let out =
+                                crate::window::finish_rows_metered(&input, vec![late], &ctx.owner)?
+                                    .expect("one late row");
+                            drop(_scratch);
+                            graph::publish_side(ctx, out).await?;
+                        }
+                    }
+                }
+                if !progress(ctx, &mut op, tx, &mut last_watermark, &mut n).await? {
+                    return Ok(n);
+                }
+            }
+            ctx.metrics
+                .record_state(op.key_count() as u64, op.retention_bytes() as u64);
+        }
+    }
+    if deferred_eof && !ctx.cancel.is_cancelled() {
+        tx.send_control(StreamControl::EndOfInput).await?;
+    }
+    drop(op);
+    timers.sample(0, 0);
+    Ok(n)
+}

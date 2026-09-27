@@ -3,7 +3,7 @@
 
 use crate::{
     bind_graph, physicalize, Catalog, CheckpointPlan, GraphSpec, InvalidValuePolicy, IotSpec,
-    IotTimingSpec, PhysicalPlan, PhysicalStage, PlanOptions, ProcessingTimePolicy,
+    IotTimingSpec, PhysicalPlan, PhysicalStage, PlanOptions, SilenceClockPolicy,
     ReferenceTableDependency,
 };
 use serde_json::{json, Value};
@@ -87,7 +87,7 @@ fn spec(keys: &[&str], registered: Value, max_keys: usize) -> IotSpec {
             duration_micros: 1_000_000,
             max_observation_gap_micros: 250_000,
             registered_keys: Box::new(serde_json::from_value(registered).unwrap()),
-            clock: ProcessingTimePolicy::Paused,
+            clock: SilenceClockPolicy::Paused,
         }),
     }
 }

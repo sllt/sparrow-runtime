@@ -248,6 +248,8 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
             file_contract: None,
         },
         sink: SinkSpec {
+            action: None,
+            file: None,
             kind: "log".into(),
             url: None,
             skip_verify: false,
@@ -399,6 +401,8 @@ fn mqtt_aligned_still_rejected() {
             file_contract: None,
         },
         sink: SinkSpec {
+            action: None,
+            file: None,
             kind: "log".into(),
             url: None,
             skip_verify: false,

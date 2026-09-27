@@ -193,6 +193,7 @@ impl TimedIot {
             let encoded = key_bytes(&key);
             let previous = self.entries.get(&encoded);
             let (start, deadline, trailing, emit) = match self.timing {
+                IotTimingSpec::Resample(_) => return Err(invalid("resample requires its independent state machine")),
                 IotTimingSpec::Alarm { .. } => return Err(invalid("alarm requires its independent state machine")),
                 IotTimingSpec::Silence { .. } => {
                     return Err(invalid("silence requires its independent feed state machine"))
@@ -478,6 +479,7 @@ impl TimedIot {
                 return Err(invalid("timed IoT freeze row/key mismatch"));
             }
             match self.timing {
+                IotTimingSpec::Resample(_) => return Err(invalid("resample cannot restore a legacy timed state")),
                 IotTimingSpec::Alarm { .. } => return Err(invalid("alarm cannot restore a legacy timed state")),
                 IotTimingSpec::Silence { .. } => {
                     return Err(invalid("silence cannot restore a legacy timed state"))

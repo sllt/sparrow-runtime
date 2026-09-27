@@ -80,6 +80,12 @@ fn eval_call_sig(
     schema: &Schema,
     args: &[Expr],
 ) -> Result<DataType> {
+    let normalized = name.to_ascii_lowercase();
+    if crate::builtin::contains(&normalized) {
+        crate::check_call_arity(&normalized, argc)?;
+        let types = args.iter().map(|a| infer_type(a, schema)).collect::<Result<Vec<_>>>()?;
+        return crate::builtin::signature(&normalized, &types);
+    }
     match name.to_ascii_lowercase().as_str() {
         "abs" | "lower" | "upper" | "length" | "char_length" if argc != 1 => {
             return Err(SparrowError::new(
@@ -150,6 +156,18 @@ pub fn infer_nullable(expr: &Expr, schema: &Schema) -> Result<bool> {
             Ok(infer_nullable(left, schema)? || infer_nullable(right, schema)?)
         }
         Expr::Call { name, args } => match name.to_ascii_lowercase().as_str() {
+            "json_get" => Ok(true),
+            "json_stringify" => Ok(false),
+            "to_int64" | "to_float64" | "to_string" => {
+                if args.iter().any(|arg| matches!(infer_type(arg, schema), Ok(DataType::Dynamic))) {
+                    Ok(true)
+                } else {
+                    args.iter().try_fold(false, |nullable, arg| Ok(nullable | infer_nullable(arg, schema)?))
+                }
+            }
+            name if crate::builtin::contains(name) => {
+                args.iter().try_fold(false, |nullable, arg| Ok(nullable | infer_nullable(arg, schema)?))
+            }
             "nullif" => Ok(true),
             "coalesce" => {
                 if args.is_empty() {

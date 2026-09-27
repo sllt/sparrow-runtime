@@ -1,0 +1,10 @@
+{
+  "version":1,"stream":"actions",
+  "sql":"SELECT concat(device, '-out') AS label, to_string(n) AS number FROM actions",
+  "source":{"kind":"file","path":"/var/lib/sparrow/data/actions.ndjson","file_contract":"append_only"},
+  "sink":{
+    "kind":"http","url":"http://127.0.0.1:9081/webhook","max_inflight":1,"batch_rows":1,"linger_ms":0,
+    "action":{"version":1,"single":true,"body":{"value":{"$field":"number"}},"query":{"device":[{"$field":"label"}]}}
+  },
+  "recovery":"restart_fresh","fail_on_decode":true
+}

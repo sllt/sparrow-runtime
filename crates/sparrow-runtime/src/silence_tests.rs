@@ -10,7 +10,7 @@ use sparrow_model::{
     CreditKind, DataType, ErrorCode, Field, FieldId, MemoryOwner, ResourceBudget, Row, RowBatch,
     RowBatchBuilder, Scalar, Schema, SchemaId,
 };
-use sparrow_plan::{InvalidValuePolicy, IotSpec, IotTimingSpec, ProcessingTimePolicy};
+use sparrow_plan::{InvalidValuePolicy, IotSpec, IotTimingSpec, ProcessingTimePolicy, SilenceClockPolicy};
 use std::sync::Arc;
 
 const DEVICES: [&str; 3] = ["dev-a", "dev-b", "dev-c"];
@@ -51,7 +51,7 @@ fn spec(duration: i64, devices: &[&str]) -> IotSpec {
             duration_micros: duration,
             max_observation_gap_micros: duration / 2,
             registered_keys: registered(devices),
-            clock: ProcessingTimePolicy::Paused,
+            clock: SilenceClockPolicy::Paused,
         }),
     }
 }

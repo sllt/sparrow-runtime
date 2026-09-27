@@ -38,7 +38,7 @@ func currentTimeCut(checkpoint string, requiredVersion ...uint16) timeCut {
 	if len(requiredVersion) == 0 {
 		require(version >= 14 && version <= 17, "wrong legacy timed snapshot version")
 	} else {
-		require(len(requiredVersion) == 1 && (requiredVersion[0] == 20 || requiredVersion[0] == 21) && version == requiredVersion[0], "wrong alarm snapshot version")
+		require(len(requiredVersion) == 1 && (requiredVersion[0] == 20 || requiredVersion[0] == 21 || requiredVersion[0] == 25 || requiredVersion[0] == 26) && version == requiredVersion[0], "wrong requested timed snapshot version")
 	}
 	offset := 38
 	readString := func() string {
@@ -49,7 +49,7 @@ func currentTimeCut(checkpoint string, requiredVersion ...uint16) timeCut {
 		return string(b)
 	}
 	kind, path := readString(), readString()
-	require(((version == 14 || version == 16 || version == 20) && kind == "paused-file-v1") || ((version == 15 || version == 17 || version == 21) && kind == "paused-jetstream-v1"), "timed source/profile mismatch")
+	require(((version == 14 || version == 16 || version == 20 || version == 25) && kind == "paused-file-v1") || ((version == 15 || version == 17 || version == 21 || version == 26) && kind == "paused-jetstream-v1"), "timed source/profile mismatch")
 	decoded, err := hex.DecodeString(path)
 	must(err)
 	require(len(decoded) >= 20 && string(decoded[:4]) == "PTC1", "time cut encoding")
@@ -65,6 +65,7 @@ func currentTimeCut(checkpoint string, requiredVersion ...uint16) timeCut {
 	require(ok && len(plan) >= 4 && string(plan[:4]) == "CPL1", "timed manifest version")
 	states, ok := readU16(payload, &offset)
 	require(ok && states >= 1 && states <= 2 && (version >= 16 || states == 1), "timed profile state count")
+	require(version < 25 || states == 1, "resample has exactly one state")
 	return timeCut{ID: id, Version: version, Ingested: binary.LittleEndian.Uint64(payload[14:22]),
 		Sequence: binary.LittleEndian.Uint64(decoded[4:12]), Micros: int64(binary.LittleEndian.Uint64(decoded[12:20])), NextOutput: next}
 }

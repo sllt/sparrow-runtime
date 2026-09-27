@@ -17,6 +17,8 @@ mod timed_state;
 mod alarm;
 mod alarm_iot;
 mod silence_iot;
+mod resample_iot;
+pub use resample_iot::ResampleStats;
 pub mod observed_cut;
 pub mod processing_cut;
 pub mod graph_cut;
@@ -31,6 +33,9 @@ pub mod timer;
 pub mod transform;
 pub mod watermark;
 pub mod window;
+mod buffered_window;
+#[cfg(test)]
+mod window_completion_tests;
 pub mod pipeline_checkpoint;
 pub use pipeline_checkpoint::{snapshot_version_for, PipelineSnapshot};
 pub use iot::{IotFreeze, IotOperator};
@@ -60,6 +65,8 @@ mod time_graph_tests;
 mod alarm_tests;
 #[cfg(test)]
 mod silence_tests;
+#[cfg(test)]
+mod resample_tests;
 
 pub use aligned::{run_until, AlignedSession};
 pub use barrier::{

@@ -967,6 +967,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
     require_auth(&state, &headers)?;
     let snap = state.supervisor.kernel().metrics.snapshot();
     let io = state.supervisor.io_snapshot().await;
+    let credits = state.supervisor.kernel().process_owner().usage();
     let mailbox_jobs = state.supervisor.mailbox_snapshots().await;
     let flow_jobs = state.supervisor.flow_snapshots().await;
     let io_fields = json!({
@@ -986,6 +987,10 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "mqtt_backpressure_waits": io.mqtt_backpressure_waits,
             "mqtt_backpressure_recovered": io.mqtt_backpressure_recovered,
             "mqtt_reconnects": io.mqtt_reconnects,
+            "mqtt_feed_probes": io.mqtt_feed_probes,
+            "mqtt_feed_breaks": io.mqtt_feed_breaks,
+            "mqtt_ping_timeouts": io.mqtt_ping_timeouts,
+            "mqtt_retained_ignored": io.mqtt_retained_ignored,
             "mqtt_quickack_calls": io.mqtt_quickack_calls,
             "mqtt_quickack_errors": io.mqtt_quickack_errors,
             "http_posted": io.http_posted,
@@ -997,11 +1002,20 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "http_dropped": io.http_dropped,
             "http_inflight": io.http_inflight,
             "log_written": io.log_written,
+            "file_written": io.file_written,
+            "file_bytes": io.file_bytes,
+            "file_segments": io.file_segments,
+            "file_syncs": io.file_syncs,
+            "file_failed": io.file_failed,
             "decode_errors": io.decode_errors,
     });
     let mut value=json!({
         "jobs_started": snap.jobs_started,
         "state_accounting_errors_total": state.supervisor.kernel().process_owner().accounting_errors_total(),
+        "process_credits": {"scope":"tracked_job_credits_not_process_RSS; concurrent_fields_are_not_atomic",
+            "reservation_bytes":credits.reservation_bytes,"retention_bytes":credits.retention_bytes,
+            "queue_bytes":credits.queue_bytes,"physical_bytes":credits.physical_bytes,
+            "peak_physical_bytes":credits.peak_physical_bytes,"live_handles":credits.live_handles},
         "histogram_contract": histogram_contract_json(),
         "jobs_stopped": snap.jobs_stopped,
         "jobs_failed": snap.jobs_failed,
@@ -1043,6 +1057,9 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
     value["alarm_notifications_expired"] = json!(snap.alarm_notifications_expired);
     value["alarm_notifications_cancelled"] = json!(snap.alarm_notifications_cancelled);
     value["alarm_notifications_deferred"] = json!(snap.alarm_notifications_deferred);
+    value["resample_discarded_inputs"] = json!(snap.resample_discarded_inputs);
+    value["resample_missing_outputs"] = json!(snap.resample_missing_outputs);
+    value["resample_interpolated_outputs"] = json!(snap.resample_interpolated_outputs);
     value["iot_state_keys"] = json!(snap.iot_state_keys);
     value["iot_state_bytes"] = json!(snap.iot_state_bytes);
     value["iot_metrics_scope"] = json!("all_iot_operator_instances; one input may be counted by multiple IoT nodes");

@@ -65,9 +65,17 @@ pub struct HysteresisSpec {
 #[serde(rename_all = "snake_case")]
 pub enum ProcessingTimePolicy { Paused }
 
+/// Silence alone admits a non-durable live observation clock. Keep other
+/// timing policies zero-sized so legacy Alarm/HoldFor futures do not grow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SilenceClockPolicy { Paused, Live }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum IotTimingSpec {
+    /// Independent grid state; boxed to preserve the legacy specification size.
+    Resample(Box<crate::ResampleSpec>),
     /// Lifecycle events are never suppressed. Cooldown applies only to the
     /// notification flag; at most one activation notification waits per key.
     Alarm {
@@ -97,18 +105,22 @@ pub enum IotTimingSpec {
         max_observation_gap_micros: i64,
         #[serde(default)]
         registered_keys: Box<Vec<Vec<serde_json::Value>>>,
-        clock: ProcessingTimePolicy,
+        clock: SilenceClockPolicy,
     },
 }
 impl IotTimingSpec {
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Silence { clock: SilenceClockPolicy::Live, .. })
+    }
     pub fn kind_name(&self) -> &'static str {
-        match self { Self::HoldFor { .. } => "hold_for", Self::Debounce { .. } => "debounce", Self::Alarm { .. } => "alarm", Self::Silence { .. } => "silence" }
+        match self { Self::HoldFor { .. } => "hold_for", Self::Debounce { .. } => "debounce", Self::Alarm { .. } => "alarm", Self::Silence { .. } => "silence", Self::Resample(_) => "resample" }
     }
     pub fn state_kind(&self) -> u8 {
-        match self { Self::HoldFor { .. } => 7, Self::Debounce { .. } => 8, Self::Alarm { .. } => 11, Self::Silence { .. } => 12 }
+        match self { Self::HoldFor { .. } => 7, Self::Debounce { .. } => 8, Self::Alarm { .. } => 11, Self::Silence { .. } => 12, Self::Resample(config) => config.mode.state_kind() }
     }
     pub fn validate(&self) -> Result<()> {
         let valid = match self {
+            Self::Resample(config) => return config.validate(),
             Self::Alarm { activate_micros, resolve_micros, cooldown_micros, notification_max_age_micros, .. } =>
                 *activate_micros >= 0 && *resolve_micros >= 0 && *cooldown_micros >= 0 && *notification_max_age_micros > 0,
             Self::HoldFor { duration_micros, .. } => *duration_micros > 0,
@@ -180,11 +192,16 @@ impl IotSpec {
 
     pub fn is_silence(&self) -> bool { matches!(self.timing, Some(IotTimingSpec::Silence { .. })) }
 
+    pub fn is_resample(&self) -> bool { matches!(self.timing, Some(IotTimingSpec::Resample(_))) }
+
     /// Alarm has an independently typed event schema. Legacy IoT stages keep
     /// their original row schema; callers must not silently append fields.
     /// Silence reports the lifecycle of a *missing* telemetry record, so it
     /// keeps only the configured keys and never fabricates the original values.
     pub fn output_schema(&self, input: &Schema) -> Result<Schema> {
+        if let Some(IotTimingSpec::Resample(config)) = &self.timing {
+            return config.output_schema(&self.keys, &self.fields, input);
+        }
         if self.is_silence() {
             return self.silence_output_schema(input);
         }
@@ -310,6 +327,9 @@ impl IotSpec {
     /// IoT stage.
     pub fn validate(&self, input: &Schema) -> Result<()> {
         self.validate_params()?;
+        if let Some(IotTimingSpec::Resample(config)) = &self.timing {
+            config.validate_schema(&self.keys, &self.fields, self.max_keys, input)?;
+        }
         if self.is_alarm() {
             if input.fields.len() > 48 || self.fields.len() != 2
                 || self.fields.iter().any(|name| input.field_by_name(name).is_none_or(|f| f.data_type != DataType::Bool)) {
@@ -705,6 +725,9 @@ pub struct WindowSpec {
     /// Event-time future skew D. `None` means the ET default
     /// ([`sparrow_model::DEFAULT_MAX_FUTURE_SKEW_MICROS`]).
     pub max_future_skew_micros: Option<i64>,
+    /// Buffered sliding/session families: per-key records AND pending triggers.
+    /// This hard work/state bound complements, never replaces, the Job credits.
+    pub max_buffered_rows: usize,
 }
 
 impl WindowSpec {
@@ -717,6 +740,7 @@ impl WindowSpec {
             lateness_micros: 0,
             max_overlap: DEFAULT_MAX_HOP_OVERLAP,
             max_future_skew_micros: None,
+            max_buffered_rows: 1024,
         }
     }
 
@@ -777,10 +801,28 @@ impl WindowSpec {
             WindowKind::HoppingEventTime {
                 size_micros,
                 slide_micros,
+            } | WindowKind::HoppingProcessingTime {
+                size_micros,slide_micros,
             } => {
+                WindowKind::hopping_et(size_micros,slide_micros)?;
                 check_hop_overlap_bound(size_micros, slide_micros, self.max_overlap)?;
             }
+            WindowKind::SlidingCount {size,step} => {
+                WindowKind::sliding_count(size,step)?;
+                if size>self.max_buffered_rows as u64 { return Err(SparrowError::new(ErrorCode::BoundExceeded,"sliding count size exceeds max_buffered_rows")); }
+            }
+            WindowKind::SlidingProcessingTime {size_micros,delay_micros}|WindowKind::SlidingEventTime {size_micros,delay_micros} => {WindowKind::sliding(size_micros,delay_micros,self.kind.uses_event_time())?;}
+            WindowKind::SessionProcessingTime {gap_micros,max_duration_micros}|WindowKind::SessionEventTime {gap_micros,max_duration_micros} => {
+                WindowKind::session(gap_micros,max_duration_micros,self.kind.uses_event_time())?;
+                if self.lateness_micros!=0 {return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"Session v1 is final-only with lateness=0; emitted sessions cannot be merged"));}
+            }
             _ => {}
+        }
+        if self.kind.is_buffered() && !(1..=16384).contains(&self.max_buffered_rows) {
+            return Err(SparrowError::new(ErrorCode::BoundExceeded,"max_buffered_rows must be 1..16384"));
+        }
+        if self.kind.is_buffered() && self.lateness_micros != 0 {
+            return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"buffered windows v1 require lateness=0; final outputs are not retracted"));
         }
         // Hard rule: arrival-order / count windows must not impersonate event-time.
         if !self.kind.uses_event_time() {
@@ -800,6 +842,9 @@ impl WindowSpec {
                 ErrorCode::InvalidArgument,
                 "event-time window requires event_time_field (stream event-time binding)",
             ));
+        }
+        if self.kind.is_new_window() {
+            if let Some(binding) = self.binding() { binding.validate()?; }
         }
         Ok(())
     }
@@ -897,6 +942,13 @@ impl LookupSpec {
 }
 
 pub fn window_output_schema(input: &Schema, spec: &WindowSpec) -> Result<Schema> {
+    if spec.kind.is_new_window() && spec.kind.uses_event_time() {
+        let field = spec.event_time_field.as_deref().and_then(|name| input.field_by_name(name))
+            .ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument,"unknown event-time field for window"))?;
+        if !matches!(field.data_type, DataType::Int64 | DataType::TimestampMicrosUTC) {
+            return Err(SparrowError::new(ErrorCode::TypeMismatch,"event-time window requires Int64/TimestampMicrosUTC"));
+        }
+    }
     let mut fields = Vec::new();
     let mut id = 1u16;
     for k in &spec.keys {
@@ -915,14 +967,14 @@ pub fn window_output_schema(input: &Schema, spec: &WindowSpec) -> Result<Schema>
     // arrival ordinals [0, count) — not timestamps (P3-47).
     fields.push(Field::new(
         FieldId::new(id),
-        if matches!(spec.kind, WindowKind::Count { .. }) { "count_start" } else { "window_start" },
+        if spec.kind.is_count() { "count_start" } else { "window_start" },
         DataType::Int64,
         false,
     ));
     id += 1;
     fields.push(Field::new(
         FieldId::new(id),
-        if matches!(spec.kind, WindowKind::Count { .. }) { "count_end" } else { "window_end" },
+        if spec.kind.is_count() { "count_end" } else { "window_end" },
         DataType::Int64,
         false,
     ));

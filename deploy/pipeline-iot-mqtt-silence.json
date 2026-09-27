@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "stream": "telemetry",
+  "source": {"kind": "mqtt", "host": "127.0.0.1", "port": 1883, "topic": "sensors/json", "qos": 0, "clean_session": true, "inbox_capacity": 32, "inbox_bytes": 262144, "inbox_wait_ms": 5},
+  "sink": {"kind": "http", "url": "http://127.0.0.1:9080/events", "batch_rows": 1, "linger_ms": 0},
+  "fail_on_decode": false,
+  "recovery": "restart_fresh",
+  "graph": {
+    "version": 1, "pipeline_id": 727, "revision_id": 1,
+    "nodes": [
+      {"id": 1, "kind": "memory_source", "table": "telemetry", "out": [2]},
+      {"id": 2, "kind": "silence", "iot": {
+        "keys": ["device_id"], "fields": [], "emit_first": false, "ttl_micros": 0,
+        "max_keys": 128, "invalid": "error",
+        "timing": {"kind": "silence", "clock": "live", "duration_micros": 5000000,
+          "max_observation_gap_micros": 1000000, "registered_keys": [["device-registered"]]}
+      }, "out": [3]},
+      {"id": 3, "kind": "capture_sink", "name": "http"}
+    ]
+  }
+}

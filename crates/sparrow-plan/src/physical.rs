@@ -110,6 +110,22 @@ pub enum TransformStep {
 }
 
 impl PhysicalPlan {
+    /// Cold admission only. Reuse the strict linear silence shape validator,
+    /// without minting/exposing a checkpoint identity for the live plan.
+    pub fn live_silence_gap(&self) -> sparrow_model::Result<i64> {
+        use crate::{IotTimingSpec, SilenceClockPolicy};
+        let denied = || sparrow_model::SparrowError::new(sparrow_model::ErrorCode::UnsupportedRestore,
+            "live silence requires Source->Silence->[pure Transform]->Sink; live clock and 100ms..120s observation gap");
+        if self.edges.is_some() { return Err(denied()); }
+        let mut shape = self.clone();
+        let Some(PhysicalStage::Iot { spec, .. }) = shape.stages.get_mut(1) else { return Err(denied()) };
+        let Some(IotTimingSpec::Silence { clock, max_observation_gap_micros, .. }) = &mut spec.timing else { return Err(denied()) };
+        if *clock != SilenceClockPolicy::Live || !(100_000..=120_000_000).contains(max_observation_gap_micros) { return Err(denied()); }
+        let gap = *max_observation_gap_micros;
+        *clock = SilenceClockPolicy::Paused;
+        crate::CheckpointPlan::from_physical(&shape)?;
+        Ok(gap)
+    }
     pub fn edge_pairs(&self) -> Vec<(usize, usize)> {
         match &self.edges {
             Some(edges) => edges.iter().map(|e| (e.from, e.to)).collect(),
@@ -126,7 +142,7 @@ impl PhysicalPlan {
         for stage in &self.stages {
             match stage {
                 PhysicalStage::WindowAgg { operator, spec, input, .. } => {
-                    if matches!(spec.kind, WindowKind::TumblingProcessingTime { .. }) {
+                    if spec.kind.uses_processing_time_timer() || spec.kind.is_new_window() {
                         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
                             "processing-time windows cannot use recovery=aligned (no PT timer on the aligned path)"));
                     }
@@ -170,18 +186,11 @@ impl PhysicalPlan {
     }
 
     pub fn has_processing_time_window(&self) -> bool {
-        self.stages.iter().any(|s| {
-            matches!(
-                s,
-                PhysicalStage::WindowAgg {
-                    spec: WindowSpec {
-                        kind: sparrow_model::WindowKind::TumblingProcessingTime { .. },
-                        ..
-                    },
-                    ..
-                }
-            )
-        })
+        self.stages.iter().any(|s| matches!(s,PhysicalStage::WindowAgg {spec,..} if spec.kind.uses_processing_time_timer()))
+    }
+
+    pub fn has_new_windows(&self)->bool {
+        self.stages.iter().any(|s|matches!(s,PhysicalStage::WindowAgg {spec,..} if spec.kind.is_new_window()))
     }
 
     pub fn has_event_time_window(&self) -> bool {
@@ -204,7 +213,7 @@ impl PhysicalPlan {
                 PhysicalStage::WindowAgg {
                     spec,
                     ..
-                } if matches!(spec.kind, WindowKind::Count { .. })
+                } if spec.kind.is_count()
             )
         })
     }
@@ -221,6 +230,10 @@ impl PhysicalPlan {
     /// must not hide them behind an upstream transform or another state.
     pub fn has_silence(&self) -> bool {
         self.stages.iter().any(|s| matches!(s, PhysicalStage::Iot { spec, .. } if spec.is_silence()))
+    }
+
+    pub fn has_resample(&self) -> bool {
+        self.stages.iter().any(|s| matches!(s, PhysicalStage::Iot { spec, .. } if spec.is_resample()))
     }
 
     /// These states need source-ordered, durable time when recovery is aligned.
