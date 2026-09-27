@@ -82,7 +82,7 @@ pub struct MailboxSnapshot {
     pub max_completed_wait_us: u64,
 }
 
-#[derive(Clone,Debug,Default)]
+#[derive(Clone, Debug, Default)]
 pub struct InputProgress {
     pub rows_received: u64,
     pub watermark_micros: Option<i64>,
@@ -92,20 +92,38 @@ pub struct InputProgress {
     pub barrier_blocked: bool,
 }
 impl InputProgress {
-    pub(crate) fn received(&mut self,envelope:&crate::mailbox::Envelope) {
-        if let Some(batch)=&envelope.batch{self.rows_received=self.rows_received.saturating_add(batch.num_rows() as u64);self.idle=false;}
+    pub(crate) fn received(&mut self, envelope: &crate::mailbox::Envelope) {
+        if let Some(batch) = &envelope.batch {
+            self.rows_received = self.rows_received.saturating_add(batch.num_rows() as u64);
+            self.idle = false;
+        }
         match &envelope.control {
-            Some(crate::mailbox::StreamControl::EndOfInput)=>self.eof=true,
-            Some(crate::mailbox::StreamControl::Watermark {wm_micros,..})=>self.watermark_micros=Some(self.watermark_micros.map_or(*wm_micros,|w|w.max(*wm_micros))),
-            Some(crate::mailbox::StreamControl::Idle {..})=>self.idle=true,
-            Some(crate::mailbox::StreamControl::Active {..})=>self.idle=false,
-            Some(crate::mailbox::StreamControl::GraphProgress {watermark_micros,flags})=>{
-                if *watermark_micros >= 0 { self.watermark_micros=Some(self.watermark_micros.map_or(*watermark_micros,|w|w.max(*watermark_micros))); }
-                self.idle=flags & 1 != 0;
-                self.eof=flags & 2 != 0;
-            },
-            Some(crate::mailbox::StreamControl::CheckpointBarrier {checkpoint_id})=>self.barrier_received=Some(*checkpoint_id),
-            _=>{},
+            Some(crate::mailbox::StreamControl::EndOfInput) => self.eof = true,
+            Some(crate::mailbox::StreamControl::Watermark { wm_micros, .. }) => {
+                self.watermark_micros = Some(
+                    self.watermark_micros
+                        .map_or(*wm_micros, |w| w.max(*wm_micros)),
+                )
+            }
+            Some(crate::mailbox::StreamControl::Idle { .. }) => self.idle = true,
+            Some(crate::mailbox::StreamControl::Active { .. }) => self.idle = false,
+            Some(crate::mailbox::StreamControl::GraphProgress {
+                watermark_micros,
+                flags,
+            }) => {
+                if *watermark_micros >= 0 {
+                    self.watermark_micros = Some(
+                        self.watermark_micros
+                            .map_or(*watermark_micros, |w| w.max(*watermark_micros)),
+                    );
+                }
+                self.idle = flags & 1 != 0;
+                self.eof = flags & 2 != 0;
+            }
+            Some(crate::mailbox::StreamControl::CheckpointBarrier { checkpoint_id }) => {
+                self.barrier_received = Some(*checkpoint_id)
+            }
+            _ => {}
         }
     }
 }
@@ -276,8 +294,10 @@ impl JobMailboxObserver {
         let lease = owner.acquire(CreditKind::Queue, bytes)?;
         let mut edges = Vec::with_capacity(plan.mailbox_count());
         for (from, to) in plan.edge_pairs() {
-            let observer=MailboxObserver::with_lease(cfg,lease.share())?;
-            if plan.edges.is_some(){observer.lock().snapshot.input_progress=Some(InputProgress::default());}
+            let observer = MailboxObserver::with_lease(cfg, lease.share())?;
+            if plan.edges.is_some() {
+                observer.lock().snapshot.input_progress = Some(InputProgress::default());
+            }
             edges.push(EdgeObserver {
                 from_stage: from,
                 to_stage: to,
@@ -330,6 +350,13 @@ impl JobMailboxObserver {
 fn stage_kind(stage: &sparrow_plan::PhysicalStage) -> &'static str {
     use sparrow_plan::PhysicalStage;
     match stage {
+        PhysicalStage::Analysis { plan, .. } => {
+            if plan.is_join() {
+                "stream_join"
+            } else {
+                "unnest"
+            }
+        }
         PhysicalStage::Branch { .. } => "branch",
         PhysicalStage::Route { .. } => "route",
         PhysicalStage::UnionAll { .. } => "union_all",

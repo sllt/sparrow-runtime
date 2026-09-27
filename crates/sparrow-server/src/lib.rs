@@ -16,9 +16,9 @@ use serde_json::{json, Value};
 #[cfg(feature = "demo-io")]
 use sparrow_control::DemoHarness;
 use sparrow_control::{
-    binder_catalog, capabilities_json, explain_plan_with, honesty_json,
-    request_start_at, request_stop, stream_schema, validate_aligned_plan, DemoIo, PipelineSpec,
-    RestoreSpec, Store, StreamSpec, Supervisor, HONESTY,
+    binder_catalog, capabilities_json, explain_plan_with, honesty_json, request_start_at,
+    request_stop, stream_schema, validate_aligned_plan, DemoIo, PipelineSpec, RestoreSpec, Store,
+    StreamSpec, Supervisor, HONESTY,
 };
 use sparrow_model::{ErrorCode, SparrowError};
 use sparrow_runtime::Kernel;
@@ -49,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/graphs/validate", post(graph_validate))
         .route("/v1/graphs/explain", post(graph_explain))
         .route("/v1/test", post(test_plan))
+        .route("/v1/query", post(query))
         .route("/v1/streams", get(list_streams))
         .route("/v1/streams/{name}", put(put_stream).get(get_stream))
         .route("/v1/tables", get(reference_tables::list_tables))
@@ -301,6 +302,7 @@ async fn root() -> Json<Value> {
             "GET /v1/health",
             "GET /v1/metrics",
             "POST /v1/validate",
+            "POST /v1/query",
             "POST /v1/explain",
             "POST /v1/graphs/validate",
             "POST /v1/graphs/explain",
@@ -388,6 +390,22 @@ async fn test_plan(
     .await
 }
 
+async fn query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    require_auth(&state, &headers)?;
+    let output = sparrow_control::query::execute(state.store.clone(), body.to_vec())
+        .await
+        .map_err(ApiError::from)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        Bytes::from_owner(output),
+    )
+        .into_response())
+}
+
 fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
     spec.check_delivery().map_err(ApiError::from)?;
     let stream = state
@@ -449,10 +467,10 @@ fn run_explain(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
         .unwrap_or(sparrow_model::RecoveryPolicy::RestartFresh);
     let replay = sparrow_control::validate::replay_label_for_spec(spec);
     let mut e = explain_plan_with(&plan, recovery, replay);
-    if spec.source.kind=="jetstream" {
-        e.delivery="checkpointed_at_least_once";
+    if spec.source.kind == "jetstream" {
+        e.delivery = "checkpointed_at_least_once";
         e.guarantee="JetStream replay + HTTP 2xx acceptance + durable checkpoint before ACK; not business exactly-once".into();
-        e.experimental=true;
+        e.experimental = true;
     }
     Ok(json!({
         "accepted": e.accepted,
@@ -669,8 +687,8 @@ fn reference_tables_status(
     latest: &sparrow_control::PipelineRow,
     actual: Option<&sparrow_control::ActualState>,
 ) -> Value {
-    let latest_bindings = serde_json::to_value(&latest.spec.reference_tables)
-        .unwrap_or_else(|_| json!({}));
+    let latest_bindings =
+        serde_json::to_value(&latest.spec.reference_tables).unwrap_or_else(|_| json!({}));
     let running = match actual {
         Some(value) if value.status == "running" => match value.revision {
             None => json!({
@@ -813,7 +831,10 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
     };
     let source_queue = boundary_queue_json(diag.source_queue.get());
     let sink_queue = boundary_queue_json(diag.sink_queue.get());
-    let io = s.graph_ports.as_ref().map_or_else(||diag.snapshot(),|ports|ports.snapshot());
+    let io = s
+        .graph_ports
+        .as_ref()
+        .map_or_else(|| diag.snapshot(), |ports| ports.snapshot());
     let delivery = diag.observation.delivery().unwrap_or_default();
     let mut reasons = Vec::new();
     if s.cancel_requested {
@@ -862,7 +883,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
         .into_iter()
         .map(|(n, h)| (n.into(), histogram_json(&h)))
         .collect();
-    let mut value=json!({"available":true,"running_revision":s.running_revision,"runtime_attempt_id":s.runtime_attempt_id,
+    let mut value = json!({"available":true,"running_revision":s.running_revision,"runtime_attempt_id":s.runtime_attempt_id,
         "scope":"active_runtime_attempt","retention":"active_handles_only","clock":"process_monotonic",
         "snapshot_consistency":"per_component_not_cross_pipeline_atomic",
         "source_kind":s.source_kind,"sink_kind":s.sink_kind,"source":endpoint_json(&source),"sink":endpoint_json(&sink),
@@ -896,22 +917,30 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "origin_propagation":"conservative_input_batch_bounds; window_aggregate_outputs_unknown",
             "device_event_age_available":false,"broker_wait_available":false,"business_ack_available":false,
             "restored_monotonic_age_available":false,"payload_semantics_changed":false}});
-    if let Some(ports)=&s.graph_ports {
-        value["graph_ports"]=json!({"sources":ports.sources.iter().map(|(id,diag)|graph_port_json(*id,true,diag)).collect::<Vec<_>>(),"sinks":ports.sinks.iter().map(|(id,diag)|graph_port_json(*id,false,diag)).collect::<Vec<_>>()});
-        value["source"]=json!({"available":false,"reason":"multiple_ports_see_graph_ports"});
-        value["sink"]=json!({"available":false,"reason":"multiple_ports_see_graph_ports"});
-        value["delivery"]=json!({"available":false,"reason":"per_sink_see_graph_ports"});
-        value["latency_contract"]["local_origin"]=json!("graph_port_specific; no_single_source_origin");
-        value["diagnosis_reasons"]=json!(["graph_inspect_each_port_and_physical_input_progress"]);
+    if let Some(ports) = &s.graph_ports {
+        value["graph_ports"] = json!({"sources":ports.sources.iter().map(|(id,diag)|graph_port_json(*id,true,diag)).collect::<Vec<_>>(),"sinks":ports.sinks.iter().map(|(id,diag)|graph_port_json(*id,false,diag)).collect::<Vec<_>>()});
+        value["source"] = json!({"available":false,"reason":"multiple_ports_see_graph_ports"});
+        value["sink"] = json!({"available":false,"reason":"multiple_ports_see_graph_ports"});
+        value["delivery"] = json!({"available":false,"reason":"per_sink_see_graph_ports"});
+        value["latency_contract"]["local_origin"] =
+            json!("graph_port_specific; no_single_source_origin");
+        value["diagnosis_reasons"] = json!(["graph_inspect_each_port_and_physical_input_progress"]);
     }
     value
 }
 
-fn graph_port_json(id:u32,source:bool,diag:&sparrow_connectors::IoDiagnostics)->Value {
-    let endpoints=diag.observation.endpoints();
-    let endpoint=endpoints.as_ref().map(|(input,output)|endpoint_json(if source{input}else{output}));
-    let queue=boundary_queue_json(if source{diag.source_queue.get()}else{diag.sink_queue.get()});
-    let delivery=diag.observation.delivery().unwrap_or_default();let io=diag.snapshot();
+fn graph_port_json(id: u32, source: bool, diag: &sparrow_connectors::IoDiagnostics) -> Value {
+    let endpoints = diag.observation.endpoints();
+    let endpoint = endpoints
+        .as_ref()
+        .map(|(input, output)| endpoint_json(if source { input } else { output }));
+    let queue = boundary_queue_json(if source {
+        diag.source_queue.get()
+    } else {
+        diag.sink_queue.get()
+    });
+    let delivery = diag.observation.delivery().unwrap_or_default();
+    let io = diag.snapshot();
     json!({"operator_id":id,"role":if source{"source"}else{"sink"},"endpoint":endpoint,"queue":queue,
         "decode_errors":io.decode_errors,"http_failed":io.http_failed,"http_posted":io.http_posted,
         "delivery":{"active_input_batches":delivery.active_groups,"active_rows":delivery.active_rows,"failed_or_cancelled_rows":delivery.failed_rows,"completed_rows":delivery.completed_rows},
@@ -959,7 +988,7 @@ fn mailbox_snapshot_json(s: &sparrow_control::supervisor::PipelineMailboxSnapsho
     })
 }
 
-fn input_progress_json(p:&sparrow_runtime::mailbox_observe::InputProgress)->Value {
+fn input_progress_json(p: &sparrow_runtime::mailbox_observe::InputProgress) -> Value {
     json!({"scope":"physical_edge_received_not_committed","rows_received":p.rows_received,"watermark_micros":p.watermark_micros,"idle":p.idle,"eof":p.eof,"barrier_received":p.barrier_received,"barrier_blocked":p.barrier_blocked})
 }
 
@@ -1009,7 +1038,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "file_failed": io.file_failed,
             "decode_errors": io.decode_errors,
     });
-    let mut value=json!({
+    let mut value = json!({
         "jobs_started": snap.jobs_started,
         "state_accounting_errors_total": state.supervisor.kernel().process_owner().accounting_errors_total(),
         "process_credits": {"scope":"tracked_job_credits_not_process_RSS; concurrent_fields_are_not_atomic",
@@ -1045,10 +1074,10 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         "label_budget": "job_and_connector_only; no per-event labels",
         "honesty": HONESTY,
     });
-    value["graph_dropped_rows"]=json!(snap.graph_dropped_rows);
-    value["graph_side_rows"]=json!(snap.graph_side_rows);
-    value["graph_detached_branches"]=json!(snap.graph_detached_branches);
-    value["graph_branch_failures"]=json!(snap.graph_branch_failures);
+    value["graph_dropped_rows"] = json!(snap.graph_dropped_rows);
+    value["graph_side_rows"] = json!(snap.graph_side_rows);
+    value["graph_detached_branches"] = json!(snap.graph_detached_branches);
+    value["graph_branch_failures"] = json!(snap.graph_branch_failures);
     value["iot_input_rows"] = json!(snap.iot_input_rows);
     value["iot_emitted_rows"] = json!(snap.iot_emitted_rows);
     value["iot_filtered_rows"] = json!(snap.iot_filtered_rows);
@@ -1062,7 +1091,8 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
     value["resample_interpolated_outputs"] = json!(snap.resample_interpolated_outputs);
     value["iot_state_keys"] = json!(snap.iot_state_keys);
     value["iot_state_bytes"] = json!(snap.iot_state_bytes);
-    value["iot_metrics_scope"] = json!("all_iot_operator_instances; one input may be counted by multiple IoT nodes");
+    value["iot_metrics_scope"] =
+        json!("all_iot_operator_instances; one input may be counted by multiple IoT nodes");
     value["iot_filtered_contract"] = json!("includes_invalid_and_suppressed; invalid_is_subset");
     Ok(Json(value))
 }
@@ -1572,12 +1602,12 @@ mod tests {
             .context("path", "/sensitive/fixture")
             .context("field", "temperature");
         let context = public_error_context(&error);
-        assert!(context.iter().any(|entry| {
-            entry["key"] == "operator" && entry["value"] == "OperatorId(42)"
-        }));
-        assert!(context.iter().any(|entry| {
-            entry["key"] == "field" && entry["value"] == "temperature"
-        }));
+        assert!(context
+            .iter()
+            .any(|entry| { entry["key"] == "operator" && entry["value"] == "OperatorId(42)" }));
+        assert!(context
+            .iter()
+            .any(|entry| { entry["key"] == "field" && entry["value"] == "temperature" }));
         assert!(!context.iter().any(|entry| entry["key"] == "path"));
     }
 }

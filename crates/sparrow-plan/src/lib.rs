@@ -7,52 +7,55 @@
 use sparrow_expr::Expr;
 use sparrow_model::{OperatorId, PipelineId, RevisionId, Schema};
 
+pub mod analysis;
 pub mod bind;
 pub mod bound;
-pub mod catalog;
 pub mod canonical;
+pub mod catalog;
 pub mod checkpoint;
+pub use analysis::{AnalysisPlan, JoinMode, StreamJoinSpec, UnnestNodeSpec, UnnestSpec};
+#[cfg(test)]
+mod alarm_tests;
 pub mod compat;
+#[cfg(test)]
+mod core_b2_tests;
 pub mod explain;
 pub mod expr_spec;
 pub mod graph;
-pub mod physical;
-pub mod resample;
-pub mod stateful;
+#[cfg(test)]
+mod hysteresis_completion_tests;
 #[cfg(test)]
 mod k3_tests;
 #[cfg(test)]
 mod k4_tests;
 #[cfg(test)]
-mod core_b2_tests;
-#[cfg(test)]
-mod hysteresis_completion_tests;
-#[cfg(test)]
 mod paused_time_tests;
-#[cfg(test)]
-mod alarm_tests;
+pub mod physical;
+pub mod resample;
 #[cfg(test)]
 mod silence_tests;
+pub mod stateful;
 
 pub use bind::{
     bind_dedup_linear, bind_graph, bind_linear, bind_lookup_linear, bind_window_linear,
 };
 pub use bound::{validate_predicate, BoundKind, BoundLogicalPlan, BoundNode};
 pub use catalog::Catalog;
-pub use explain::{
-    et_tumble_template, explain_bound, explain_graph, validate_graph, GraphExplain, REPLAY_UNBOUND,
-};
-pub use graph::{GraphSpec, GRAPH_SPEC_VERSION};
 pub use checkpoint::{CheckpointPlan, ParticipantId, ReferenceTableDependency, StateParticipant};
-pub use physical::{physicalize, PhysicalPlan, PhysicalStage, PlanOptions, TransformStep};
-pub use resample::{ResampleMode, ResampleSpec};
 pub use compat::{
     decide_state_reuse, expr_fingerprint, where_before_window, where_before_window_physical,
     PlanLayout, StateReuse,
 };
+pub use explain::{
+    et_tumble_template, explain_bound, explain_graph, validate_graph, GraphExplain, REPLAY_UNBOUND,
+};
+pub use graph::{GraphSpec, GRAPH_SPEC_VERSION};
+pub use physical::{physicalize, PhysicalPlan, PhysicalStage, PlanOptions, TransformStep};
+pub use resample::{ResampleMode, ResampleSpec};
 pub use stateful::{
     agg_result_type, lookup_output_schema, window_output_schema, AggCall, DeadbandBaseline,
-    DeadbandMode, DeadbandSpec, DedupSpec, HysteresisDirection, HysteresisSpec, InvalidValuePolicy, IotSpec, IotTimingSpec, ProcessingTimePolicy, SilenceClockPolicy, LookupSpec, WindowSpec,
+    DeadbandMode, DeadbandSpec, DedupSpec, HysteresisDirection, HysteresisSpec, InvalidValuePolicy,
+    IotSpec, IotTimingSpec, LookupSpec, ProcessingTimePolicy, SilenceClockPolicy, WindowSpec,
 };
 
 /// M0 linear stub, still used by the sync `LinearExecutor`.
@@ -120,9 +123,9 @@ impl LogicalPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stateful::{AggCall, WindowSpec};
     use sparrow_expr::{BinaryOp, Expr};
     use sparrow_model::{DataType, Field, FieldId, Scalar, SchemaId};
-    use crate::stateful::{AggCall, WindowSpec};
 
     fn sensor_catalog() -> Catalog {
         let mut c = Catalog::new();
@@ -254,7 +257,10 @@ mod tests {
         .unwrap();
         let bound = bind_graph(&spec, &c).unwrap();
         assert!(matches!(
-            bound.nodes.iter().find(|n| matches!(n.kind, BoundKind::WindowAgg { .. })),
+            bound
+                .nodes
+                .iter()
+                .find(|n| matches!(n.kind, BoundKind::WindowAgg { .. })),
             Some(_)
         ));
     }

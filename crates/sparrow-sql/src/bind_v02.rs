@@ -590,6 +590,20 @@ fn agg_from_expr(e: &SqlExpr, alias: &str) -> Result<Option<AggCall>> {
     let Ok(func) = AggFn::parse(&name) else {
         return Ok(None);
     };
+    if func.is_extended() {
+        let args = crate::bind_v03::strict_window_args(f)?;
+        if args.len() != 1 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "extended aggregates require one expression",
+            ));
+        }
+        return Ok(Some(AggCall::new(
+            func,
+            Some(sql_expr_pub(args[0])?),
+            alias,
+        )));
+    }
     let star = matches!(
         &f.args,
         FunctionArguments::List(list)

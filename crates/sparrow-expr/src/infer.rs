@@ -10,7 +10,10 @@ pub fn infer_type(expr: &Expr, schema: &Schema) -> Result<DataType> {
             .field_by_name(name)
             .map(|f| f.data_type.clone())
             .ok_or_else(|| {
-                SparrowError::new(ErrorCode::InvalidArgument, format!("unknown column '{name}'"))
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown column '{name}'"),
+                )
             }),
         Expr::Literal(s) => Ok(s.data_type()),
         Expr::Cast { target, expr } | Expr::TryCast { target, expr } => {
@@ -74,16 +77,14 @@ pub fn infer_type(expr: &Expr, schema: &Schema) -> Result<DataType> {
     }
 }
 
-fn eval_call_sig(
-    name: &str,
-    argc: usize,
-    schema: &Schema,
-    args: &[Expr],
-) -> Result<DataType> {
+fn eval_call_sig(name: &str, argc: usize, schema: &Schema, args: &[Expr]) -> Result<DataType> {
     let normalized = name.to_ascii_lowercase();
     if crate::builtin::contains(&normalized) {
         crate::check_call_arity(&normalized, argc)?;
-        let types = args.iter().map(|a| infer_type(a, schema)).collect::<Result<Vec<_>>>()?;
+        let types = args
+            .iter()
+            .map(|a| infer_type(a, schema))
+            .collect::<Result<Vec<_>>>()?;
         return crate::builtin::signature(&normalized, &types);
     }
     match name.to_ascii_lowercase().as_str() {
@@ -145,7 +146,10 @@ pub fn infer_nullable(expr: &Expr, schema: &Schema) -> Result<bool> {
             .field_by_name(name)
             .map(|f| f.nullable)
             .ok_or_else(|| {
-                SparrowError::new(ErrorCode::InvalidArgument, format!("unknown column '{name}'"))
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown column '{name}'"),
+                )
             }),
         Expr::Literal(s) => Ok(s.is_null()),
         Expr::Cast { expr, .. } => infer_nullable(expr, schema),
@@ -156,17 +160,25 @@ pub fn infer_nullable(expr: &Expr, schema: &Schema) -> Result<bool> {
             Ok(infer_nullable(left, schema)? || infer_nullable(right, schema)?)
         }
         Expr::Call { name, args } => match name.to_ascii_lowercase().as_str() {
+            name if crate::collection::contains(name) => Ok(true),
             "json_get" => Ok(true),
             "json_stringify" => Ok(false),
             "to_int64" | "to_float64" | "to_string" => {
-                if args.iter().any(|arg| matches!(infer_type(arg, schema), Ok(DataType::Dynamic))) {
+                if args
+                    .iter()
+                    .any(|arg| matches!(infer_type(arg, schema), Ok(DataType::Dynamic)))
+                {
                     Ok(true)
                 } else {
-                    args.iter().try_fold(false, |nullable, arg| Ok(nullable | infer_nullable(arg, schema)?))
+                    args.iter().try_fold(false, |nullable, arg| {
+                        Ok(nullable | infer_nullable(arg, schema)?)
+                    })
                 }
             }
             name if crate::builtin::contains(name) => {
-                args.iter().try_fold(false, |nullable, arg| Ok(nullable | infer_nullable(arg, schema)?))
+                args.iter().try_fold(false, |nullable, arg| {
+                    Ok(nullable | infer_nullable(arg, schema)?)
+                })
             }
             "nullif" => Ok(true),
             "coalesce" => {
@@ -212,7 +224,10 @@ fn is_numeric(t: &DataType) -> bool {
 }
 
 fn is_intish(t: &DataType) -> bool {
-    matches!(t, DataType::Int64 | DataType::UInt64 | DataType::TimestampMicrosUTC)
+    matches!(
+        t,
+        DataType::Int64 | DataType::UInt64 | DataType::TimestampMicrosUTC
+    )
 }
 
 #[cfg(test)]
@@ -236,11 +251,17 @@ mod tests {
     fn p3_46_project_nullable_follows_input_and_expr() {
         let s = schema();
         let id = Expr::Column { name: "id".into() };
-        assert!(!infer_nullable(&id, &s).unwrap(), "non-null column stays non-null");
+        assert!(
+            !infer_nullable(&id, &s).unwrap(),
+            "non-null column stays non-null"
+        );
         let temp = Expr::Column {
             name: "temp".into(),
         };
-        assert!(infer_nullable(&temp, &s).unwrap(), "nullable column stays nullable");
+        assert!(
+            infer_nullable(&temp, &s).unwrap(),
+            "nullable column stays nullable"
+        );
         let lit = Expr::Literal(Scalar::Int64(1));
         assert!(!infer_nullable(&lit, &s).unwrap());
         let try_cast = Expr::TryCast {

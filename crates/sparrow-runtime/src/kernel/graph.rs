@@ -152,6 +152,20 @@ pub(super) fn metadata_bytes(plan: &PhysicalPlan) -> usize {
             .saturating_add(stage_schema(stage, false).map(schema).unwrap_or(0))
             .saturating_add(stage_schema(stage, true).map(schema).unwrap_or(0));
         let expressions = match stage {
+            PhysicalStage::Analysis { plan, .. } => match plan.as_ref() {
+                sparrow_plan::AnalysisPlan::Unnest { spec, .. } => {
+                    expr(&spec.expr).saturating_add(spec.as_field.len() + 256)
+                }
+                sparrow_plan::AnalysisPlan::Join { right, spec, .. } => schema(right)
+                    .saturating_add(
+                        spec.left_keys
+                            .iter()
+                            .chain(&spec.right_keys)
+                            .map(String::len)
+                            .sum::<usize>(),
+                    )
+                    .saturating_add(4096),
+            },
             PhysicalStage::Route { cases, .. } => cases
                 .iter()
                 .fold(0usize, |n, (e, _)| n.saturating_add(expr(e))),
@@ -171,8 +185,13 @@ pub(super) fn metadata_bytes(plan: &PhysicalPlan) -> usize {
                         .saturating_add(a.input.as_ref().map(expr).unwrap_or(0))
                 },
             ),
-            PhysicalStage::Iot { spec, .. } => spec.keys.iter().chain(&spec.fields)
-                .fold(512usize, |n, field| n.saturating_add(field.capacity()).saturating_add(64)),
+            PhysicalStage::Iot { spec, .. } => spec
+                .keys
+                .iter()
+                .chain(&spec.fields)
+                .fold(512usize, |n, field| {
+                    n.saturating_add(field.capacity()).saturating_add(64)
+                }),
             _ => 0,
         };
         bytes = bytes.saturating_add(expressions);
@@ -218,7 +237,8 @@ pub(super) fn validate_request(req: &JobRequest) -> Result<()> {
                     | sparrow_plan::TransformStep::Map { operator, .. } => *operator,
                 })
                 .collect::<Vec<_>>(),
-            PhysicalStage::MemorySource { operator, .. }
+            PhysicalStage::Analysis { operator, .. }
+            | PhysicalStage::MemorySource { operator, .. }
             | PhysicalStage::CaptureSink { operator, .. }
             | PhysicalStage::BestEffortSink { operator, .. }
             | PhysicalStage::Branch { operator, .. }
@@ -237,6 +257,9 @@ pub(super) fn validate_request(req: &JobRequest) -> Result<()> {
         }
         if let PhysicalStage::Iot { spec, input, .. } = stage {
             spec.validate(input)?;
+        }
+        if let PhysicalStage::Analysis { plan, .. } = stage {
+            plan.validate()?;
         }
     }
     let mut side_stages = BTreeSet::new();
@@ -292,7 +315,39 @@ pub(super) fn validate_request(req: &JobRequest) -> Result<()> {
         } else {
             stage_schema(&stages[edge.from], true)?.clone()
         };
-        if from_schema.fields != stage_schema(&stages[edge.to], false)?.fields {
+        let target_schema = if let PhysicalStage::Analysis { plan, .. } = &stages[edge.to] {
+            if let sparrow_plan::AnalysisPlan::Join {
+                spec, left, right, ..
+            } = plan.as_ref()
+            {
+                let PhysicalStage::MemorySource { operator, .. } = &stages[edge.from] else {
+                    return Err(invalid("Join inputs must be direct time-bound sources"));
+                };
+                let (schema, field) = if operator.raw() == spec.left_input {
+                    (left, &spec.left_time)
+                } else if operator.raw() == spec.right_input {
+                    (right, &spec.right_time)
+                } else {
+                    return Err(invalid("Join input port mismatch"));
+                };
+                if !req.plan.source_times.iter().any(|(id, b)| {
+                    id == operator
+                        && b.field == *field
+                        && b.max_future_skew_micros
+                            .is_some_and(|s| s <= sparrow_model::DEFAULT_MAX_FUTURE_SKEW_MICROS)
+                }) {
+                    return Err(invalid(
+                        "Join source requires matching time field and bounded future skew",
+                    ));
+                }
+                schema
+            } else {
+                plan.input()
+            }
+        } else {
+            stage_schema(&stages[edge.to], false)?
+        };
+        if from_schema.fields != target_schema.fields {
             return Err(SparrowError::new(
                 ErrorCode::InvalidSchema,
                 "graph edge schema mismatch",
@@ -328,6 +383,9 @@ pub(super) fn validate_request(req: &JobRequest) -> Result<()> {
                 incoming[i] == 1 && (1..=16).contains(&outgoing[i])
             }
             PhysicalStage::UnionAll { .. } => (2..=16).contains(&incoming[i]) && outgoing[i] == 1,
+            PhysicalStage::Analysis { plan, .. } if plan.is_join() => {
+                incoming[i] == 2 && outgoing[i] == 1
+            }
             _ => incoming[i] == 1 && outgoing[i] == 1 + side,
         };
         if !valid {
@@ -342,10 +400,10 @@ pub(super) fn validate_request(req: &JobRequest) -> Result<()> {
     while let Some(i) = ready.pop() {
         visited += 1;
         if lossy[i]
-            && matches!(
+            && (matches!(
                 stages[i],
                 PhysicalStage::CaptureSink { .. } | PhysicalStage::UnionAll { .. }
-            )
+            ) || matches!(&stages[i],PhysicalStage::Analysis{plan,..} if plan.is_join()))
         {
             return Err(invalid(
                 "lossy branch cannot rejoin or reach a required sink",
@@ -431,13 +489,19 @@ pub(super) fn validate_request(req: &JobRequest) -> Result<()> {
     // receive ordered barriers, even when their data happens to have drained.
     if req.aligned.is_some()
         && if req.graph_inputs.is_empty() {
-            req.live_events.is_none() || !req.rows.is_empty()
-                || req.live_in.is_some() || req.budgeted_in.is_some()
+            req.live_events.is_none()
+                || !req.rows.is_empty()
+                || req.live_in.is_some()
+                || req.budgeted_in.is_some()
         } else {
-            req.graph_inputs.values().any(|input| input.events.is_none())
+            req.graph_inputs
+                .values()
+                .any(|input| input.events.is_none())
         }
     {
-        return Err(invalid("aligned graph sources require ordered event inputs"));
+        return Err(invalid(
+            "aligned graph sources require ordered event inputs",
+        ));
     }
     if req.graph_outputs.keys().any(|id| !sinks.contains(id))
         || (req.live_out.is_some() && (sinks.len() != 1 || !req.graph_outputs.is_empty()))
@@ -459,6 +523,13 @@ pub(super) fn validate_request(req: &JobRequest) -> Result<()> {
 
 fn stage_schema(stage: &PhysicalStage, output: bool) -> Result<&sparrow_model::Schema> {
     Ok(match stage {
+        PhysicalStage::Analysis { plan, .. } => {
+            if output {
+                plan.output()
+            } else {
+                plan.input()
+            }
+        }
         PhysicalStage::MemorySource { schema, .. }
         | PhysicalStage::CaptureSink { schema, .. }
         | PhysicalStage::BestEffortSink { schema, .. } => schema,
@@ -466,7 +537,17 @@ fn stage_schema(stage: &PhysicalStage, output: bool) -> Result<&sparrow_model::S
         | PhysicalStage::Route { input, .. }
         | PhysicalStage::UnionAll { input, .. }
         | PhysicalStage::Deduplicate { input, .. } => input,
-        PhysicalStage::Iot { input, output: schema, .. } => if output { schema } else { input },
+        PhysicalStage::Iot {
+            input,
+            output: schema,
+            ..
+        } => {
+            if output {
+                schema
+            } else {
+                input
+            }
+        }
         PhysicalStage::WindowAgg {
             input,
             output: schema,
@@ -534,6 +615,8 @@ pub(super) async fn run(ctx: JobCtx, mut req: JobRequest) -> Result<JobStats> {
         }
     }
     let mut inputs: Vec<Vec<MailboxRx>> = (0..req.plan.stages.len()).map(|_| vec![]).collect();
+    let mut input_sources: Vec<Vec<Option<sparrow_model::OperatorId>>> =
+        (0..req.plan.stages.len()).map(|_| vec![]).collect();
     let mut outputs: Vec<Vec<(PhysicalEdge, MailboxTx)>> =
         (0..req.plan.stages.len()).map(|_| vec![]).collect();
     for (i, edge) in edges.into_iter().enumerate() {
@@ -543,6 +626,10 @@ pub(super) async fn run(ctx: JobCtx, mut req: JobRequest) -> Result<JobStats> {
             ctx.mailboxes.edge(i),
         )?;
         inputs[edge.to].push(rx);
+        input_sources[edge.to].push(match &req.plan.stages[edge.from] {
+            PhysicalStage::MemorySource { operator, .. } => Some(*operator),
+            _ => None,
+        });
         outputs[edge.from].push((edge, tx));
     }
     ctx.mailboxes.initialized();
@@ -561,6 +648,25 @@ pub(super) async fn run(ctx: JobCtx, mut req: JobRequest) -> Result<JobStats> {
         let mut input = std::mem::take(&mut inputs[i]);
         let mut output = std::mem::take(&mut outputs[i]);
         match stage {
+            PhysicalStage::Analysis { operator, plan } if plan.is_join() => {
+                let sparrow_plan::AnalysisPlan::Join { spec, .. } = plan.as_ref() else {
+                    unreachable!()
+                };
+                if input_sources[i][0].map(|id| id.raw()) != Some(spec.left_input) {
+                    input.swap(0, 1);
+                }
+                ctx.live.fetch_add(1, Ordering::SeqCst);
+                let guard = LiveTaskGuard {
+                    live: ctx.live.clone(),
+                };
+                let tx = output.remove(0).1;
+                set.spawn(async move {
+                    let _guard = guard;
+                    super::analysis::join_task(&child, plan, input, tx)?
+                        .await
+                        .map_err(|e| e.at_operator(operator))
+                });
+            }
             PhysicalStage::Branch { operator, .. }
             | PhysicalStage::Route { operator, .. }
             | PhysicalStage::UnionAll { operator, .. } => {
@@ -575,8 +681,11 @@ pub(super) async fn run(ctx: JobCtx, mut req: JobRequest) -> Result<JobStats> {
                         panic!("injected graph stage panic");
                     }
                     let result = if matches!(stage, PhysicalStage::UnionAll { .. }) {
-                        if child.graph_time.is_some() {time_union::run(&child,operator.raw(),input,output.remove(0).1).await}
-                        else {union(&child, input, output.remove(0).1).await}
+                        if child.graph_time.is_some() {
+                            time_union::run(&child, operator.raw(), input, output.remove(0).1).await
+                        } else {
+                            union(&child, input, output.remove(0).1).await
+                        }
                     } else {
                         router(&child, stage, input.remove(0), output).await
                     };
@@ -613,7 +722,8 @@ pub(super) async fn run(ctx: JobCtx, mut req: JobRequest) -> Result<JobStats> {
                     _ => None,
                 };
                 child.source_operator = source_id;
-                child.source_time = source_id.filter(|_|child.graph_time.is_none())
+                child.source_time = source_id
+                    .filter(|_| child.graph_time.is_none())
                     .and_then(|id| {
                         req.plan
                             .source_times
@@ -1009,7 +1119,17 @@ async fn union(ctx: &JobCtx, mut inputs: Vec<MailboxRx>, output: MailboxTx) -> R
             }
             if let Some(control) = control {
                 match control {
-                    StreamControl::LiveFeedStart {..} | StreamControl::LiveFeedEnd {..} | StreamControl::ProcessingTime { .. } | StreamControl::FeedObservation {..} | StreamControl::GraphProgress {..} | StreamControl::GraphRoundEnd {..} => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered processing time is not enabled for legacy DAG Union")),
+                    StreamControl::LiveFeedStart { .. }
+                    | StreamControl::LiveFeedEnd { .. }
+                    | StreamControl::ProcessingTime { .. }
+                    | StreamControl::FeedObservation { .. }
+                    | StreamControl::GraphProgress { .. }
+                    | StreamControl::GraphRoundEnd { .. } => {
+                        return Err(SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "ordered processing time is not enabled for legacy DAG Union",
+                        ))
+                    }
                     StreamControl::EndOfInput => {
                         ended[i] = true;
                         hub.mark_idle(InputId(i as u16))?;
@@ -1052,7 +1172,9 @@ async fn union(ctx: &JobCtx, mut inputs: Vec<MailboxRx>, output: MailboxTx) -> R
                             return Err(invalid("conflicting active graph barrier"));
                         }
                         if closed.iter().any(|closed| *closed) {
-                            return Err(invalid("UnionAll closed input cannot acknowledge a barrier"));
+                            return Err(invalid(
+                                "UnionAll closed input cannot acknowledge a barrier",
+                            ));
                         }
                         aligning = Some(checkpoint_id);
                         blocked[i] = true;

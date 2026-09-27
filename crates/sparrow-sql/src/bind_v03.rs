@@ -254,19 +254,43 @@ fn window_from_group(
     for e in exprs {
         if let SqlExpr::Function(f) = e {
             let n = f.name.to_string().to_ascii_lowercase();
-            if matches!(n.as_str(),"tumble"|"hop"|"count_window"|"sliding"|"session") && kind.is_some() {
-                return Err(SparrowError::new(ErrorCode::InvalidArgument,"GROUP BY accepts exactly one window assigner"));
+            if matches!(
+                n.as_str(),
+                "tumble" | "hop" | "count_window" | "sliding" | "session"
+            ) && kind.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "GROUP BY accepts exactly one window assigner",
+                ));
             }
-            if n=="sliding" || n=="session" {
-                let args=strict_window_args(f)?;
-                if (n=="sliding" && !(2..=3).contains(&args.len())) || (n=="session" && args.len()!=3) {
-                    return Err(SparrowError::new(ErrorCode::InvalidArgument,"SLIDING(clock,size[,delay]) / SESSION(clock,gap,max_duration)"));
+            if n == "sliding" || n == "session" {
+                let args = strict_window_args(f)?;
+                if (n == "sliding" && !(2..=3).contains(&args.len()))
+                    || (n == "session" && args.len() != 3)
+                {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        "SLIDING(clock,size[,delay]) / SESSION(clock,gap,max_duration)",
+                    ));
                 }
-                let processing=matches!(args[0],SqlExpr::Identifier(id) if id.value.eq_ignore_ascii_case("processing_time"));
-                let first=interval_expr_micros(args[1])?;
-                let second=if args.len()==3 {interval_expr_micros(args[2])?}else{0};
-                kind=Some(if n=="sliding" {WindowKind::sliding(first,second,!processing)?}else{WindowKind::session(first,second,!processing)?});
-                event_time_field=if processing {None}else{Some(col_name(args[0])?)};
+                let processing = matches!(args[0],SqlExpr::Identifier(id) if id.value.eq_ignore_ascii_case("processing_time"));
+                let first = interval_expr_micros(args[1])?;
+                let second = if args.len() == 3 {
+                    interval_expr_micros(args[2])?
+                } else {
+                    0
+                };
+                kind = Some(if n == "sliding" {
+                    WindowKind::sliding(first, second, !processing)?
+                } else {
+                    WindowKind::session(first, second, !processing)?
+                });
+                event_time_field = if processing {
+                    None
+                } else {
+                    Some(col_name(args[0])?)
+                };
                 continue;
             }
             if n == "tumble" {
@@ -286,14 +310,32 @@ fn window_from_group(
                 continue;
             }
             if n == "count_window" {
-                let args=strict_window_args(f)?;
-                if !(1..=2).contains(&args.len()) {return Err(SparrowError::new(ErrorCode::InvalidArgument,"COUNT_WINDOW(size[,step]) expects one or two integer arguments"));}
-                let size=count_window_size(f)?;
-                kind = Some(if args.len()==2 {
-                    let step=match args[1] {SqlExpr::Value(v)=>match &v.value {sqlparser::ast::Value::Number(s,_)=>s.parse::<u64>().ok(),_=>None},_=>None}
-                        .ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"count step must be a positive integer"))?;
-                    WindowKind::sliding_count(size,step)?
-                } else {WindowKind::count(size)?});
+                let args = strict_window_args(f)?;
+                if !(1..=2).contains(&args.len()) {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        "COUNT_WINDOW(size[,step]) expects one or two integer arguments",
+                    ));
+                }
+                let size = count_window_size(f)?;
+                kind = Some(if args.len() == 2 {
+                    let step = match args[1] {
+                        SqlExpr::Value(v) => match &v.value {
+                            sqlparser::ast::Value::Number(s, _) => s.parse::<u64>().ok(),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        SparrowError::new(
+                            ErrorCode::InvalidArgument,
+                            "count step must be a positive integer",
+                        )
+                    })?;
+                    WindowKind::sliding_count(size, step)?
+                } else {
+                    WindowKind::count(size)?
+                });
                 continue;
             }
         }
@@ -375,9 +417,23 @@ fn parse_hop(f: &Function) -> Result<ParsedWindow> {
             "HOP(ts, slide, size) requires three arguments",
         ));
     }
-    if matches!(args[0],SqlExpr::Identifier(id) if id.value.eq_ignore_ascii_case("processing_time")) {
-        if args.len()!=3 {return Err(SparrowError::new(ErrorCode::InvalidArgument,"PT HOP does not accept event-time lateness/skew"));}
-        return Ok(ParsedWindow {kind:WindowKind::hopping_pt(interval_expr_micros(args[2])?,interval_expr_micros(args[1])?)?,event_time_field:None,lateness_micros:0,max_future_skew_micros:None});
+    if matches!(args[0],SqlExpr::Identifier(id) if id.value.eq_ignore_ascii_case("processing_time"))
+    {
+        if args.len() != 3 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "PT HOP does not accept event-time lateness/skew",
+            ));
+        }
+        return Ok(ParsedWindow {
+            kind: WindowKind::hopping_pt(
+                interval_expr_micros(args[2])?,
+                interval_expr_micros(args[1])?,
+            )?,
+            event_time_field: None,
+            lateness_micros: 0,
+            max_future_skew_micros: None,
+        });
     }
     let field = col_name(args[0])?;
     let slide = interval_expr_micros(args[1])?;
@@ -414,13 +470,35 @@ fn is_processing_time(e: &SqlExpr) -> bool {
     }
 }
 
-fn strict_window_args(f:&Function)->Result<Vec<&SqlExpr>> {
-    let bad=||SparrowError::new(ErrorCode::InvalidArgument,"window arguments must be positional expressions without DISTINCT/order/filter/OVER");
-    if f.filter.is_some() || f.over.is_some() || !f.within_group.is_empty() || f.null_treatment.is_some()
-        || !matches!(f.parameters,FunctionArguments::None) || f.uses_odbc_syntax {return Err(bad());}
-    let FunctionArguments::List(list)=&f.args else {return Err(bad());};
-    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {return Err(bad());}
-    list.args.iter().map(|arg|match arg {FunctionArg::Unnamed(FunctionArgExpr::Expr(e))=>Ok(e),_=>Err(bad())}).collect()
+pub(crate) fn strict_window_args(f: &Function) -> Result<Vec<&SqlExpr>> {
+    let bad = || {
+        SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "window arguments must be positional expressions without DISTINCT/order/filter/OVER",
+        )
+    };
+    if f.filter.is_some()
+        || f.over.is_some()
+        || !f.within_group.is_empty()
+        || f.null_treatment.is_some()
+        || !matches!(f.parameters, FunctionArguments::None)
+        || f.uses_odbc_syntax
+    {
+        return Err(bad());
+    }
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(bad());
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return Err(bad());
+    }
+    list.args
+        .iter()
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+            _ => Err(bad()),
+        })
+        .collect()
 }
 
 fn fn_args(f: &Function) -> Vec<&SqlExpr> {
@@ -459,7 +537,7 @@ fn count_window_size(f: &Function) -> Result<u64> {
     }
 }
 
-fn interval_expr_micros(e: &SqlExpr) -> Result<i64> {
+pub(crate) fn interval_expr_micros(e: &SqlExpr) -> Result<i64> {
     match e {
         SqlExpr::Interval(iv) => {
             let s = match iv.value.as_ref() {
@@ -473,9 +551,20 @@ fn interval_expr_micros(e: &SqlExpr) -> Result<i64> {
                 }) => s.clone(),
                 other => other.to_string().trim_matches('\'').to_string(),
             };
-            let n: i64 = s.parse().map_err(|_| SparrowError::new(ErrorCode::InvalidArgument,"window interval must be an integer"))?;
-            if iv.last_field.is_some() || iv.leading_precision.is_some() || iv.fractional_seconds_precision.is_some() {
-                return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"compound/precision window intervals are not supported"));
+            let n: i64 = s.parse().map_err(|_| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "window interval must be an integer",
+                )
+            })?;
+            if iv.last_field.is_some()
+                || iv.leading_precision.is_some()
+                || iv.fractional_seconds_precision.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "compound/precision window intervals are not supported",
+                ));
             }
             let unit = iv
                 .leading_field
@@ -488,9 +577,16 @@ fn interval_expr_micros(e: &SqlExpr) -> Result<i64> {
                 "hour" | "hours" => 3_600_000_000,
                 "millisecond" | "milliseconds" => 1_000,
                 "microsecond" | "microseconds" => 1,
-                _ => return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"unsupported window interval unit")),
+                _ => {
+                    return Err(SparrowError::new(
+                        ErrorCode::FeatureUnavailable,
+                        "unsupported window interval unit",
+                    ))
+                }
             };
-            n.checked_mul(scale).ok_or_else(|| SparrowError::new(ErrorCode::IntegerOverflow,"window interval overflow"))
+            n.checked_mul(scale).ok_or_else(|| {
+                SparrowError::new(ErrorCode::IntegerOverflow, "window interval overflow")
+            })
         }
         SqlExpr::Value(ValueWithSpan {
             value: sqlparser::ast::Value::Number(s, _),

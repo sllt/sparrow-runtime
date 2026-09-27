@@ -4,6 +4,9 @@
 //!
 //! This crate is not a `sparrow-runtime` dependency.
 
+mod analysis;
+#[cfg(test)]
+mod analysis_tests;
 pub mod bind;
 pub mod bind_v02;
 pub mod bind_v03;

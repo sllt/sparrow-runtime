@@ -7,9 +7,84 @@ use sparrow_model::{
     AggFn, DataType, ErrorCode, Result, Scalar, SparrowError, INTEGER_OVERFLOW_POLICY,
 };
 
+/// First/last skip SQL NULL; moments use sequential Welford f64 arithmetic.
+/// Arrival order is defined by the enclosing window, not wall-clock guesses.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExtendedAccumulator {
+    Value {
+        first: bool,
+        value: Option<Scalar>,
+    },
+    Moment {
+        sample: bool,
+        sqrt: bool,
+        n: u64,
+        mean: f64,
+        m2: f64,
+    },
+}
+impl ExtendedAccumulator {
+    fn update(&mut self, input: &Scalar) -> Result<()> {
+        if input.is_null() {
+            return Ok(());
+        }
+        match self {
+            Self::Value { first, value } => {
+                if !*first || value.is_none() {
+                    *value = Some(input.detach_copy());
+                }
+            }
+            Self::Moment { n, mean, m2, .. } => {
+                let x = match input {
+                    Scalar::Int64(v) => *v as f64,
+                    Scalar::UInt64(v) => *v as f64,
+                    Scalar::Float64(v) if v.is_finite() => *v,
+                    _ => {
+                        return Err(SparrowError::new(
+                            ErrorCode::TypeMismatch,
+                            "variance/stddev require finite numeric values",
+                        ))
+                    }
+                };
+                let count = n.checked_add(1).ok_or_else(overflow)?;
+                let delta = x - *mean;
+                let next_mean = *mean + delta / count as f64;
+                let next_m2 = *m2 + delta * (x - next_mean);
+                if !next_mean.is_finite() || !next_m2.is_finite() {
+                    return Err(overflow());
+                }
+                *n = count;
+                *mean = next_mean;
+                *m2 = next_m2;
+            }
+        }
+        Ok(())
+    }
+    fn finish(&self) -> Scalar {
+        match self {
+            Self::Value { value, .. } => value.clone().unwrap_or(Scalar::Null),
+            Self::Moment {
+                sample,
+                sqrt,
+                n,
+                m2,
+                ..
+            } => {
+                if *n <= u64::from(*sample) {
+                    return Scalar::Null;
+                }
+                let variance = (*m2 / (*n - u64::from(*sample)) as f64).max(0.0);
+                Scalar::Float64(if *sqrt { variance.sqrt() } else { variance })
+            }
+        }
+    }
+}
+
 /// One incremental accumulator. Never stores input rows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Accumulator {
+    /// Cold boxed family: keep the legacy accumulator inline layout unchanged.
+    Extended(Box<ExtendedAccumulator>),
     Count {
         /// COUNT(*) including NULL rows.
         rows: u64,
@@ -45,7 +120,32 @@ pub enum Accumulator {
 
 impl Accumulator {
     pub fn new(func: AggFn, ty: DataType, count_star: bool) -> Result<Self> {
+        if matches!(
+            func,
+            AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp
+        ) && !matches!(
+            ty,
+            DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Null
+        ) {
+            return Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                "variance/stddev require numeric inputs",
+            ));
+        }
         Ok(match func {
+            AggFn::First | AggFn::Last => Self::Extended(Box::new(ExtendedAccumulator::Value {
+                first: func == AggFn::First,
+                value: None,
+            })),
+            AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => {
+                Self::Extended(Box::new(ExtendedAccumulator::Moment {
+                    sample: matches!(func, AggFn::VarSamp | AggFn::StddevSamp),
+                    sqrt: matches!(func, AggFn::StddevPop | AggFn::StddevSamp),
+                    n: 0,
+                    mean: 0.0,
+                    m2: 0.0,
+                }))
+            }
             AggFn::Count => Self::Count {
                 rows: 0,
                 non_null: 0,
@@ -75,6 +175,14 @@ impl Accumulator {
     pub fn tracked_bytes(&self) -> usize {
         const BASE: usize = 48;
         match self {
+            Self::Extended(extra) => {
+                128 + match extra.as_ref() {
+                    ExtendedAccumulator::Value { value, .. } => {
+                        value.as_ref().map_or(0, Scalar::resident_bytes)
+                    }
+                    _ => 0,
+                }
+            }
             Self::Min { v } | Self::Max { v } => {
                 BASE + v.as_ref().map(Scalar::resident_bytes).unwrap_or(0)
             }
@@ -88,6 +196,7 @@ impl Accumulator {
 
     pub fn update(&mut self, value: &Scalar) -> Result<()> {
         match self {
+            Self::Extended(extra) => extra.update(value),
             Self::Count {
                 rows,
                 non_null,
@@ -200,6 +309,7 @@ impl Accumulator {
 
     pub fn finish(&self) -> Scalar {
         match self {
+            Self::Extended(extra) => extra.finish(),
             Self::Count {
                 rows,
                 non_null,
@@ -243,6 +353,12 @@ impl Accumulator {
 
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
+            Self::Extended(_) => {
+                return Err(SparrowError::new(
+                    ErrorCode::UnsupportedRestore,
+                    "extended aggregate codec is not published",
+                ))
+            }
             Self::Count {
                 rows,
                 non_null,
@@ -288,6 +404,12 @@ impl Accumulator {
 
     pub fn encoded_len(&self) -> Result<usize> {
         Ok(match self {
+            Self::Extended(_) => {
+                return Err(SparrowError::new(
+                    ErrorCode::UnsupportedRestore,
+                    "extended aggregate codec is not published",
+                ))
+            }
             Self::Count { .. } | Self::Avg { .. } => 18,
             Self::SumI64 { .. } | Self::SumU64 { .. } | Self::SumF64 { .. } => 17,
             Self::Min { v } | Self::Max { v } => {

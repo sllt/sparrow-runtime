@@ -115,7 +115,7 @@ pub struct SourceSpec {
 /// K2 is opt-in and intentionally narrower than File aligned recovery. The
 /// wire shape remains readable on feature-off binaries, which reject it before
 /// creating a connection, reader or checkpoint generation.
-#[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JetStreamSpec {
     pub servers: Vec<String>,
@@ -125,37 +125,52 @@ pub struct JetStreamSpec {
     pub ownership_bucket: String,
     #[serde(default)]
     pub token_secret: Option<String>,
-    #[serde(default="js_pending")]
+    #[serde(default = "js_pending")]
     pub max_pending: usize,
-    #[serde(default="js_pending_bytes")]
+    #[serde(default = "js_pending_bytes")]
     pub pending_bytes: usize,
-    #[serde(default="js_pull")]
+    #[serde(default = "js_pull")]
     pub pull_messages: usize,
-    #[serde(default="js_pull_bytes")]
+    #[serde(default = "js_pull_bytes")]
     pub pull_bytes: usize,
     /// Operational tuning for the regular reliable actor only; not a new
     /// delivery/restore policy. None preserves the existing 250ms idle cap.
-    #[serde(default, skip_serializing_if="Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_backoff_max_ms: Option<u64>,
 }
-fn js_pending()->usize {128}
-fn js_pending_bytes()->usize {256*1024}
-fn js_pull()->usize {8}
-fn js_pull_bytes()->usize {72*1024}
+fn js_pending() -> usize {
+    128
+}
+fn js_pending_bytes() -> usize {
+    256 * 1024
+}
+fn js_pull() -> usize {
+    8
+}
+fn js_pull_bytes() -> usize {
+    72 * 1024
+}
 impl JetStreamSpec {
-    #[cfg(feature="jetstream")]
-    pub(crate) fn connection(&self)->sparrow_connectors::jetstream::ConnectionConfig {
+    #[cfg(feature = "jetstream")]
+    pub(crate) fn connection(&self) -> sparrow_connectors::jetstream::ConnectionConfig {
         sparrow_connectors::jetstream::ConnectionConfig {
-            servers:self.servers.clone(),token_secret:self.token_secret.clone(),
-            subscription_capacity:self.pull_messages+2,pull_bytes:self.pull_bytes,
+            servers: self.servers.clone(),
+            token_secret: self.token_secret.clone(),
+            subscription_capacity: self.pull_messages + 2,
+            pull_bytes: self.pull_bytes,
         }
     }
-    #[cfg(feature="jetstream")]
-    pub(crate) fn reader(&self)->sparrow_connectors::jetstream::ReaderConfig {
+    #[cfg(feature = "jetstream")]
+    pub(crate) fn reader(&self) -> sparrow_connectors::jetstream::ReaderConfig {
         sparrow_connectors::jetstream::ReaderConfig {
-            namespace:self.namespace.clone(),stream:self.stream.clone(),consumer:self.consumer.clone(),
-            ownership_bucket:self.ownership_bucket.clone(),max_pending:self.max_pending,pending_bytes:self.pending_bytes,
-            pull_messages:self.pull_messages,pull_bytes:self.pull_bytes,
+            namespace: self.namespace.clone(),
+            stream: self.stream.clone(),
+            consumer: self.consumer.clone(),
+            ownership_bucket: self.ownership_bucket.clone(),
+            max_pending: self.max_pending,
+            pending_bytes: self.pending_bytes,
+            pull_messages: self.pull_messages,
+            pull_bytes: self.pull_bytes,
         }
     }
 }
@@ -319,20 +334,31 @@ impl PipelineSpec {
 
     pub fn basic_check(&self) -> Result<()> {
         if self.reference_tables.len() > 8 {
-            return Err(SparrowError::new(ErrorCode::BoundExceeded,
-                "at most eight immutable reference table bindings are allowed"));
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "at most eight immutable reference table bindings are allowed",
+            ));
         }
         for (name, binding) in &self.reference_tables {
             crate::store::check_name(name)?;
-            if binding.revision == 0 || binding.revision > i64::MAX as u64
+            if binding.revision == 0
+                || binding.revision > i64::MAX as u64
                 || binding.sha256.len() != 64
-                || !binding.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-                return Err(SparrowError::new(ErrorCode::InvalidArgument,
-                    "reference table binding requires a positive revision and lowercase SHA-256"));
+                || !binding
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "reference table binding requires a positive revision and lowercase SHA-256",
+                ));
             }
             if name == &self.stream {
-                return Err(SparrowError::new(ErrorCode::InvalidArgument,
-                    "reference table name must not shadow the source stream"));
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "reference table name must not shadow the source stream",
+                ));
             }
         }
         if let Some(graph) = &self.graph {
@@ -350,8 +376,7 @@ impl PipelineSpec {
                 }
             }
         }
-        if !self.reference_tables.is_empty()
-            && RecoveryPolicy::parse(&self.recovery)?.is_aligned()
+        if !self.reference_tables.is_empty() && RecoveryPolicy::parse(&self.recovery)?.is_aligned()
         {
             // Reference-dependent aligned profiles are selected after binding:
             // v8 is linear stateless File, v9 is linear File with supported
@@ -360,12 +385,11 @@ impl PipelineSpec {
             // this spec layer; PhysicalPlan validation owns the state/topology
             // matrix and prevents a future operator from being opened here by
             // accident.
-            if !matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay" | "jetstream")
-                || self.sink.kind != "http"
-                || self
-                    .checkpoint_dir
-                    .as_deref()
-                    .is_none_or(str::is_empty)
+            if !matches!(
+                self.source.kind.as_str(),
+                "file" | "file_replay" | "replay" | "jetstream"
+            ) || self.sink.kind != "http"
+                || self.checkpoint_dir.as_deref().is_none_or(str::is_empty)
             {
                 return Err(SparrowError::new(
                     ErrorCode::UnsupportedRestore,
@@ -374,44 +398,109 @@ impl PipelineSpec {
             }
         }
         if let Some(io) = &self.graph_io {
-            if self.graph.is_none() || io.sources.is_empty() || io.sinks.is_empty() || io.sources.len() > 16 || io.sinks.len() > 16 {
-                return Err(SparrowError::new(ErrorCode::InvalidArgument,"graph_io requires graph and 1..16 explicit source/sink bindings"));
+            // SQL bounded stream joins also bind to an explicit graph. The
+            // physical binder below validates exact ports/topology, so ordinary
+            // linear SQL still cannot smuggle unused graph I/O bindings.
+            if (self.graph.is_none() && self.sql.is_none())
+                || io.sources.is_empty()
+                || io.sinks.is_empty()
+                || io.sources.len() > 16
+                || io.sinks.len() > 16
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "graph_io requires SQL/Graph and 1..16 explicit source/sink bindings",
+                ));
             }
-            if io.sources.values().next() != Some(&self.source) || io.sinks.values().next() != Some(&self.sink) {
+            if io.sources.values().next() != Some(&self.source)
+                || io.sinks.values().next() != Some(&self.sink)
+            {
                 return Err(SparrowError::new(ErrorCode::InvalidArgument,"legacy source/sink must match the lowest graph_io operator IDs (no shadow configuration)"));
             }
             for source in io.sources.values() {
                 if source.kind == "jetstream" {
-                    return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"JetStream remains on its tested linear reliability profile"));
+                    return Err(SparrowError::new(
+                        ErrorCode::FeatureUnavailable,
+                        "JetStream remains on its tested linear reliability profile",
+                    ));
                 }
-                let mut single = self.clone(); single.graph_io = None; single.source = source.clone(); single.basic_check()?;
+                let mut single = self.clone();
+                single.graph_io = None;
+                single.source = source.clone();
+                single.basic_check()?;
             }
             for sink in io.sinks.values() {
-                let mut single = self.clone(); single.graph_io = None; single.sink = sink.clone(); single.basic_check()?;
+                let mut single = self.clone();
+                single.graph_io = None;
+                single.sink = sink.clone();
+                single.basic_check()?;
             }
         }
-        if self.source.jetstream.is_some() != (self.source.kind=="jetstream") {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,"source.jetstream is required exclusively for kind=jetstream"));
+        if self.source.jetstream.is_some() != (self.source.kind == "jetstream") {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "source.jetstream is required exclusively for kind=jetstream",
+            ));
         }
-        if self.source.jetstream.as_ref().and_then(|js|js.idle_backoff_max_ms).is_some_and(|ms|!(5..=250).contains(&ms)) {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,"JetStream idle_backoff_max_ms must be 5..250; default 250"));
+        if self
+            .source
+            .jetstream
+            .as_ref()
+            .and_then(|js| js.idle_backoff_max_ms)
+            .is_some_and(|ms| !(5..=250).contains(&ms))
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "JetStream idle_backoff_max_ms must be 5..250; default 250",
+            ));
         }
-        if self.source.kind=="jetstream" {
-            #[cfg(not(feature="jetstream"))]
-            return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"JetStream support requires the jetstream build feature"));
-            #[cfg(feature="jetstream")]
+        if self.source.kind == "jetstream" {
+            #[cfg(not(feature = "jetstream"))]
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "JetStream support requires the jetstream build feature",
+            ));
+            #[cfg(feature = "jetstream")]
             {
-                self.source.jetstream.as_ref().expect("checked JetStream config").reader().validate()?;
-                if self.delivery!="checkpointed_at_least_once" || self.recovery!="aligned" || self.sink.kind!="http" || self.sink.skip_verify || self.source.skip_verify
+                self.source
+                    .jetstream
+                    .as_ref()
+                    .expect("checked JetStream config")
+                    .reader()
+                    .validate()?;
+                if self.delivery != "checkpointed_at_least_once"
+                    || self.recovery != "aligned"
+                    || self.sink.kind != "http"
+                    || self.sink.skip_verify
+                    || self.source.skip_verify
                     || self.checkpoint_dir.as_deref().is_none_or(str::is_empty)
-                    || !self.checkpoint.as_ref().is_some_and(|p|p.resume_latest && p.interval_ms.is_some())
-                    || self.restore.as_ref().is_some_and(|r|r.kind!="checkpoint" || r.snapshot_id.as_deref().is_some_and(|id|id!="aligned" && !id.is_empty())) {
+                    || !self
+                        .checkpoint
+                        .as_ref()
+                        .is_some_and(|p| p.resume_latest && p.interval_ms.is_some())
+                    || self.restore.as_ref().is_some_and(|r| {
+                        r.kind != "checkpoint"
+                            || r.snapshot_id
+                                .as_deref()
+                                .is_some_and(|id| id != "aligned" && !id.is_empty())
+                    })
+                {
                     return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream requires aligned, explicit checkpoint_dir, periodic resume_latest, verified HTTP sink; fixed replay/reset is not yet exposed"));
                 }
-                if self.source.host.is_some() || self.source.port.is_some() || self.source.path.is_some() || self.source.bind.is_some()
-                    || self.source.client_id.is_some() || self.source.username_secret.is_some() || self.source.password_secret.is_some()
-                    || self.source.use_demo_io || self.source.tls || self.source.file_contract.is_some() || self.source.qos!=0
-                    || !self.source.clean_session || self.source.topic!=default_topic() {
+                if self.source.host.is_some()
+                    || self.source.port.is_some()
+                    || self.source.path.is_some()
+                    || self.source.bind.is_some()
+                    || self.source.client_id.is_some()
+                    || self.source.username_secret.is_some()
+                    || self.source.password_secret.is_some()
+                    || self.source.use_demo_io
+                    || self.source.tls
+                    || self.source.file_contract.is_some()
+                    || self.source.qos != 0
+                    || !self.source.clean_session
+                    || self.source.topic != default_topic()
+                {
                     return Err(SparrowError::new(ErrorCode::InvalidArgument,"JetStream connection options belong in source.jetstream; mixed connector fields refused"));
                 }
             }
@@ -427,7 +516,10 @@ impl PipelineSpec {
         if let Some(policy) = &self.checkpoint {
             policy.validate()?;
             if self.recovery != "aligned"
-                || !matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay" | "jetstream")
+                || !matches!(
+                    self.source.kind.as_str(),
+                    "file" | "file_replay" | "replay" | "jetstream"
+                )
             {
                 return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
@@ -527,13 +619,15 @@ impl PipelineSpec {
 
     pub fn check_delivery(&self) -> Result<(DeliveryGuarantee, RecoveryPolicy)> {
         let g = DeliveryGuarantee::parse(&self.delivery)?;
-        if (g==DeliveryGuarantee::CheckpointedAtLeastOnce) != (cfg!(feature="jetstream") && self.source.kind=="jetstream") {
+        if (g == DeliveryGuarantee::CheckpointedAtLeastOnce)
+            != (cfg!(feature = "jetstream") && self.source.kind == "jetstream")
+        {
             return Err(SparrowError::new(ErrorCode::UnsupportedDelivery,"checkpointed_at_least_once is required exclusively for an enabled JetStream profile"));
         }
         let r = RecoveryPolicy::parse(&self.recovery)?;
         let claim = self.restore_claim()?;
         let replayable = matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay")
-            || (cfg!(feature="jetstream") && self.source.kind=="jetstream");
+            || (cfg!(feature = "jetstream") && self.source.kind == "jetstream");
         sparrow_model::check_recovery_capabilities(&self.source.kind, replayable, r, &claim)?;
         Ok((g, r))
     }

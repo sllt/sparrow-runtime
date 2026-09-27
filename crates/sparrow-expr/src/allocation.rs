@@ -126,6 +126,18 @@ impl AllocationBound {
                         (n, n.saturating_mul(2))
                     }
                     OutputAllocation::FixedText => (128, 256),
+                    OutputAllocation::Collection => {
+                        let n = total_value
+                            .saturating_mul(128)
+                            .saturating_add(256)
+                            .min(65536 + SCALAR);
+                        (
+                            n,
+                            total_value
+                                .saturating_mul(4)
+                                .saturating_add(n.saturating_mul(4)),
+                        )
+                    }
                     OutputAllocation::JsonParse => (
                         65536 + SCALAR,
                         child(0)

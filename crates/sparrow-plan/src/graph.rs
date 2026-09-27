@@ -44,6 +44,10 @@ fn default_true() -> bool {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unnest: Option<crate::UnnestNodeSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_join: Option<crate::StreamJoinSpec>,
     pub id: u32,
     pub kind: String,
     #[serde(default)]
@@ -103,7 +107,11 @@ pub struct NodeSpec {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SideOutputKind { DecodeError, Late, RuleReject }
+pub enum SideOutputKind {
+    DecodeError,
+    Late,
+    RuleReject,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SideOutputSpec {
@@ -114,16 +122,29 @@ pub struct SideOutputSpec {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SideOutputFull { Backpressure, Drop }
+pub enum SideOutputFull {
+    Backpressure,
+    Drop,
+}
 
 pub fn decode_error_schema() -> sparrow_model::Schema {
-    use sparrow_model::{DataType,Field,Schema};
-    Schema::new(0x44454345, vec![Field::new(1,"source_operator",DataType::UInt64,false),Field::new(2,"error_code",DataType::Utf8,false)]).expect("static decode error schema")
+    use sparrow_model::{DataType, Field, Schema};
+    Schema::new(
+        0x44454345,
+        vec![
+            Field::new(1, "source_operator", DataType::UInt64, false),
+            Field::new(2, "error_code", DataType::Utf8, false),
+        ],
+    )
+    .expect("static decode error schema")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RouteMode { FirstMatch, AllMatch }
+pub enum RouteMode {
+    FirstMatch,
+    AllMatch,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -150,15 +171,15 @@ pub struct WindowNodeSpec {
     pub max_overlap: Option<u32>,
     #[serde(default)]
     pub max_future_skew_micros: Option<i64>,
-    #[serde(default,skip_serializing_if="Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<u64>,
-    #[serde(default,skip_serializing_if="Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_micros: Option<i64>,
-    #[serde(default,skip_serializing_if="Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gap_micros: Option<i64>,
-    #[serde(default,skip_serializing_if="Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_micros: Option<i64>,
-    #[serde(default,skip_serializing_if="Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_buffered_rows: Option<usize>,
 }
 
@@ -188,7 +209,12 @@ pub struct NamedExprSpec {
 
 impl GraphSpec {
     pub fn from_json(text: &str) -> Result<Self> {
-        if text.len()>64*1024 {return Err(SparrowError::new(ErrorCode::MaxRecordSize,"GraphSpec exceeds 64 KiB"));}
+        if text.len() > 64 * 1024 {
+            return Err(SparrowError::new(
+                ErrorCode::MaxRecordSize,
+                "GraphSpec exceeds 64 KiB",
+            ));
+        }
         let spec: Self = serde_json::from_str(text).map_err(|e| {
             SparrowError::new(ErrorCode::InvalidArgument, format!("GraphSpec JSON: {e}"))
         })?;

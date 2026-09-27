@@ -23,7 +23,11 @@ pub struct BoundNode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoundKind {
-    Branch { input: Schema, best_effort: Vec<OperatorId> },
+    Analysis(Box<crate::AnalysisPlan>),
+    Branch {
+        input: Schema,
+        best_effort: Vec<OperatorId>,
+    },
     Route {
         input: Schema,
         mode: crate::graph::RouteMode,
@@ -31,8 +35,13 @@ pub enum BoundKind {
         default: OperatorId,
         best_effort: Vec<OperatorId>,
     },
-    UnionAll { input: Schema },
-    BestEffortSink { name: String, schema: Schema },
+    UnionAll {
+        input: Schema,
+    },
+    BestEffortSink {
+        name: String,
+        schema: Schema,
+    },
     MemorySource {
         name: String,
         schema: Schema,
@@ -71,13 +80,20 @@ pub enum BoundKind {
     },
     /// Bounded keyed IoT value state. This is deliberately separate from
     /// WindowAgg: it has no window timestamps or aggregate accumulator.
-    Iot { spec: IotSpec, input: Schema, output: Schema },
+    Iot {
+        spec: IotSpec,
+        input: Schema,
+        output: Schema,
+    },
 }
 
 impl BoundKind {
     pub fn output_schema(&self) -> &Schema {
         match self {
-            Self::Branch { input, .. } | Self::Route { input, .. } | Self::UnionAll { input } => input,
+            Self::Analysis(plan) => plan.output(),
+            Self::Branch { input, .. } | Self::Route { input, .. } | Self::UnionAll { input } => {
+                input
+            }
             Self::BestEffortSink { schema, .. } => schema,
             Self::MemorySource { schema, .. } => schema,
             Self::Filter { input, .. } => input,

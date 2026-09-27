@@ -63,13 +63,18 @@ pub struct HysteresisSpec {
 /// Source-ordered processing time. Host downtime never advances this clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProcessingTimePolicy { Paused }
+pub enum ProcessingTimePolicy {
+    Paused,
+}
 
 /// Silence alone admits a non-durable live observation clock. Keep other
 /// timing policies zero-sized so legacy Alarm/HoldFor futures do not grow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SilenceClockPolicy { Paused, Live }
+pub enum SilenceClockPolicy {
+    Paused,
+    Live,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -86,7 +91,10 @@ pub enum IotTimingSpec {
         clock: ProcessingTimePolicy,
     },
     /// Missing samples keep the last valid condition; false cancels it.
-    HoldFor { duration_micros: i64, clock: ProcessingTimePolicy },
+    HoldFor {
+        duration_micros: i64,
+        clock: ProcessingTimePolicy,
+    },
     /// A forced max-wait emission ends the current burst, as does quiet expiry.
     Debounce {
         quiet_micros: i64,
@@ -110,30 +118,75 @@ pub enum IotTimingSpec {
 }
 impl IotTimingSpec {
     pub fn is_live(&self) -> bool {
-        matches!(self, Self::Silence { clock: SilenceClockPolicy::Live, .. })
+        matches!(
+            self,
+            Self::Silence {
+                clock: SilenceClockPolicy::Live,
+                ..
+            }
+        )
     }
     pub fn kind_name(&self) -> &'static str {
-        match self { Self::HoldFor { .. } => "hold_for", Self::Debounce { .. } => "debounce", Self::Alarm { .. } => "alarm", Self::Silence { .. } => "silence", Self::Resample(_) => "resample" }
+        match self {
+            Self::HoldFor { .. } => "hold_for",
+            Self::Debounce { .. } => "debounce",
+            Self::Alarm { .. } => "alarm",
+            Self::Silence { .. } => "silence",
+            Self::Resample(_) => "resample",
+        }
     }
     pub fn state_kind(&self) -> u8 {
-        match self { Self::HoldFor { .. } => 7, Self::Debounce { .. } => 8, Self::Alarm { .. } => 11, Self::Silence { .. } => 12, Self::Resample(config) => config.mode.state_kind() }
+        match self {
+            Self::HoldFor { .. } => 7,
+            Self::Debounce { .. } => 8,
+            Self::Alarm { .. } => 11,
+            Self::Silence { .. } => 12,
+            Self::Resample(config) => config.mode.state_kind(),
+        }
     }
     pub fn validate(&self) -> Result<()> {
         let valid = match self {
             Self::Resample(config) => return config.validate(),
-            Self::Alarm { activate_micros, resolve_micros, cooldown_micros, notification_max_age_micros, .. } =>
-                *activate_micros >= 0 && *resolve_micros >= 0 && *cooldown_micros >= 0 && *notification_max_age_micros > 0,
-            Self::HoldFor { duration_micros, .. } => *duration_micros > 0,
-            Self::Debounce { quiet_micros, max_wait_micros, leading, trailing, .. } =>
-                *quiet_micros > 0 && *max_wait_micros >= *quiet_micros && (*leading || *trailing),
+            Self::Alarm {
+                activate_micros,
+                resolve_micros,
+                cooldown_micros,
+                notification_max_age_micros,
+                ..
+            } => {
+                *activate_micros >= 0
+                    && *resolve_micros >= 0
+                    && *cooldown_micros >= 0
+                    && *notification_max_age_micros > 0
+            }
+            Self::HoldFor {
+                duration_micros, ..
+            } => *duration_micros > 0,
+            Self::Debounce {
+                quiet_micros,
+                max_wait_micros,
+                leading,
+                trailing,
+                ..
+            } => *quiet_micros > 0 && *max_wait_micros >= *quiet_micros && (*leading || *trailing),
             // A silence window must cover at least two observation gaps
             // (`checked_mul` keeps an extreme gap from wrapping into a pass).
-            Self::Silence { duration_micros, max_observation_gap_micros, .. } =>
-                *duration_micros > 0 && *max_observation_gap_micros > 0
-                    && max_observation_gap_micros.checked_mul(2).is_some_and(|gap| gap <= *duration_micros),
+            Self::Silence {
+                duration_micros,
+                max_observation_gap_micros,
+                ..
+            } => {
+                *duration_micros > 0
+                    && *max_observation_gap_micros > 0
+                    && max_observation_gap_micros
+                        .checked_mul(2)
+                        .is_some_and(|gap| gap <= *duration_micros)
+            }
         };
-        if !valid { return Err(SparrowError::new(ErrorCode::InvalidArgument,
-            "timed IoT requires positive durations; debounce max_wait >= quiet and leading or trailing; silence duration >= 2 * max_observation_gap")); }
+        if !valid {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,
+            "timed IoT requires positive durations; debounce max_wait >= quiet and leading or trailing; silence duration >= 2 * max_observation_gap"));
+        }
         Ok(())
     }
 }
@@ -188,11 +241,17 @@ pub struct IotSpec {
 }
 
 impl IotSpec {
-    pub fn is_alarm(&self) -> bool { matches!(self.timing, Some(IotTimingSpec::Alarm { .. })) }
+    pub fn is_alarm(&self) -> bool {
+        matches!(self.timing, Some(IotTimingSpec::Alarm { .. }))
+    }
 
-    pub fn is_silence(&self) -> bool { matches!(self.timing, Some(IotTimingSpec::Silence { .. })) }
+    pub fn is_silence(&self) -> bool {
+        matches!(self.timing, Some(IotTimingSpec::Silence { .. }))
+    }
 
-    pub fn is_resample(&self) -> bool { matches!(self.timing, Some(IotTimingSpec::Resample(_))) }
+    pub fn is_resample(&self) -> bool {
+        matches!(self.timing, Some(IotTimingSpec::Resample(_)))
+    }
 
     /// Alarm has an independently typed event schema. Legacy IoT stages keep
     /// their original row schema; callers must not silently append fields.
@@ -205,7 +264,9 @@ impl IotSpec {
         if self.is_silence() {
             return self.silence_output_schema(input);
         }
-        if !self.is_alarm() { return Ok(input.clone()); }
+        if !self.is_alarm() {
+            return Ok(input.clone());
+        }
         let extra = [
             ("sparrow_alarm_event", DataType::Utf8),
             ("sparrow_alarm_phase", DataType::Utf8),
@@ -219,13 +280,19 @@ impl IotSpec {
         let mut fields = input.fields.clone();
         for (name, ty) in extra {
             if input.field_by_name(name).is_some() {
-                return Err(SparrowError::new(ErrorCode::InvalidSchema, "alarm output field collides with input"));
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    "alarm output field collides with input",
+                ));
             }
-            id = id.checked_add(1).ok_or_else(|| SparrowError::new(ErrorCode::InvalidSchema, "alarm field ID overflow"))?;
+            id = id.checked_add(1).ok_or_else(|| {
+                SparrowError::new(ErrorCode::InvalidSchema, "alarm field ID overflow")
+            })?;
             fields.push(Field::new(FieldId::new(id), name, ty, false));
         }
-        let schema_id = input.id.raw().checked_add(90)
-            .ok_or_else(|| SparrowError::new(ErrorCode::InvalidSchema, "alarm schema ID overflow"))?;
+        let schema_id = input.id.raw().checked_add(90).ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidSchema, "alarm schema ID overflow")
+        })?;
         Schema::new(SchemaId::new(schema_id), fields)
     }
 
@@ -303,7 +370,11 @@ impl IotSpec {
         }
         if let Some(timing) = &self.timing {
             timing.validate()?;
-            if self.ttl_micros != 0 || self.emit_first || self.deadband.is_some() || self.hysteresis.is_some() {
+            if self.ttl_micros != 0
+                || self.emit_first
+                || self.deadband.is_some()
+                || self.hysteresis.is_some()
+            {
                 return Err(SparrowError::new(ErrorCode::InvalidArgument,
                     "timed IoT requires ttl_micros=0 and emit_first=false; leading is explicit; other IoT modes cannot mix"));
             }
@@ -331,10 +402,18 @@ impl IotSpec {
             config.validate_schema(&self.keys, &self.fields, self.max_keys, input)?;
         }
         if self.is_alarm() {
-            if input.fields.len() > 48 || self.fields.len() != 2
-                || self.fields.iter().any(|name| input.field_by_name(name).is_none_or(|f| f.data_type != DataType::Bool)) {
-                return Err(SparrowError::new(ErrorCode::TypeMismatch,
-                    "alarm requires enter/clear Bool fields and at most 48 scalar input fields"));
+            if input.fields.len() > 48
+                || self.fields.len() != 2
+                || self.fields.iter().any(|name| {
+                    input
+                        .field_by_name(name)
+                        .is_none_or(|f| f.data_type != DataType::Bool)
+                })
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    "alarm requires enter/clear Bool fields and at most 48 scalar input fields",
+                ));
             }
             self.output_schema(input)?;
         }
@@ -353,13 +432,21 @@ impl IotSpec {
             self.output_schema(input)?;
         }
         if let Some(timing) = &self.timing {
-            if input.fields.len() > 60 || input.fields.iter().any(|f| !iot_value_type(&f.data_type)) {
+            if input.fields.len() > 60 || input.fields.iter().any(|f| !iot_value_type(&f.data_type))
+            {
                 return Err(SparrowError::new(ErrorCode::FeatureUnavailable,
                     "timed IoT retains full rows and currently requires at most 60 flat scalar fields"));
             }
-            if matches!(timing, IotTimingSpec::HoldFor { .. }) && (self.fields.len() != 1
-                || input.field_by_name(&self.fields[0]).is_none_or(|f| f.data_type != DataType::Bool)) {
-                return Err(SparrowError::new(ErrorCode::TypeMismatch, "hold_for requires one Bool condition field"));
+            if matches!(timing, IotTimingSpec::HoldFor { .. })
+                && (self.fields.len() != 1
+                    || input
+                        .field_by_name(&self.fields[0])
+                        .is_none_or(|f| f.data_type != DataType::Bool))
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    "hold_for requires one Bool condition field",
+                ));
             }
         }
         for name in &self.keys {
@@ -378,7 +465,10 @@ impl IotSpec {
             if !iot_key_type(&field.data_type) {
                 return Err(SparrowError::new(
                     ErrorCode::TypeMismatch,
-                    format!("IoT key field '{name}' has unsupported type {}", field.data_type),
+                    format!(
+                        "IoT key field '{name}' has unsupported type {}",
+                        field.data_type
+                    ),
                 ));
             }
         }
@@ -392,7 +482,10 @@ impl IotSpec {
             if !iot_value_type(&field.data_type) {
                 return Err(SparrowError::new(
                     ErrorCode::TypeMismatch,
-                    format!("IoT value field '{name}' has unsupported type {}", field.data_type),
+                    format!(
+                        "IoT value field '{name}' has unsupported type {}",
+                        field.data_type
+                    ),
                 ));
             }
         }
@@ -403,7 +496,9 @@ impl IotSpec {
                     "deadband requires exactly one value field",
                 ));
             }
-            let field = input.field_by_name(&self.fields[0]).expect("validated value field");
+            let field = input
+                .field_by_name(&self.fields[0])
+                .expect("validated value field");
             if !matches!(
                 field.data_type,
                 DataType::Int64 | DataType::UInt64 | DataType::Float64
@@ -415,11 +510,20 @@ impl IotSpec {
             }
             deadband.validate()?;
         }
-        if self.hysteresis.is_some() && (self.fields.len() != 1
-            || !matches!(input.field_by_name(&self.fields[0]).expect("validated value field").data_type,
-                DataType::Int64 | DataType::UInt64 | DataType::Float64)) {
-            return Err(SparrowError::new(ErrorCode::TypeMismatch,
-                "hysteresis requires exactly one numeric value field"));
+        if self.hysteresis.is_some()
+            && (self.fields.len() != 1
+                || !matches!(
+                    input
+                        .field_by_name(&self.fields[0])
+                        .expect("validated value field")
+                        .data_type,
+                    DataType::Int64 | DataType::UInt64 | DataType::Float64
+                ))
+        {
+            return Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                "hysteresis requires exactly one numeric value field",
+            ));
         }
         Ok(())
     }
@@ -440,7 +544,10 @@ impl IotSpec {
     /// allocates only its result; a runtime caller must account the returned
     /// rows in its bounded control workspace before publishing them.
     pub fn silence_registered_keys(&self, input: &Schema) -> Result<Vec<Vec<Scalar>>> {
-        let Some(IotTimingSpec::Silence { registered_keys, .. }) = &self.timing else {
+        let Some(IotTimingSpec::Silence {
+            registered_keys, ..
+        }) = &self.timing
+        else {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
                 "silence registered keys require a silence timing configuration",
@@ -450,7 +557,9 @@ impl IotSpec {
         if registered_keys.len() > limit {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
-                format!("silence registered keys exceed min(max_keys, {MAX_SILENCE_REGISTERED_KEYS})"),
+                format!(
+                    "silence registered keys exceed min(max_keys, {MAX_SILENCE_REGISTERED_KEYS})"
+                ),
             ));
         }
         let mut key_types = Vec::with_capacity(self.keys.len());
@@ -484,11 +593,19 @@ impl IotSpec {
             // materialised outside the caller's bounded workspace.
             let mut projected = encoded_bytes;
             for (value, ty) in row.iter().zip(&key_types) {
-                projected = projected.checked_add(silence_key_wire_len(value, ty)?).ok_or_else(|| {
-                    SparrowError::new(ErrorCode::BoundExceeded, "silence registry encoding overflow")
-                })?;
+                projected = projected
+                    .checked_add(silence_key_wire_len(value, ty)?)
+                    .ok_or_else(|| {
+                        SparrowError::new(
+                            ErrorCode::BoundExceeded,
+                            "silence registry encoding overflow",
+                        )
+                    })?;
                 if projected > MAX_SILENCE_REGISTRY_BYTES {
-                    return Err(SparrowError::new(ErrorCode::BoundExceeded, "silence registered keys exceed the canonical byte bound"));
+                    return Err(SparrowError::new(
+                        ErrorCode::BoundExceeded,
+                        "silence registered keys exceed the canonical byte bound",
+                    ));
                 }
             }
             let mut values = Vec::with_capacity(row.len());
@@ -500,7 +617,10 @@ impl IotSpec {
                 value.encode_key(&mut encoded);
             }
             encoded_bytes = encoded_bytes.checked_add(encoded.len()).ok_or_else(|| {
-                SparrowError::new(ErrorCode::BoundExceeded, "silence registry encoding overflow")
+                SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    "silence registry encoding overflow",
+                )
             })?;
             if encoded_bytes > MAX_SILENCE_REGISTRY_BYTES {
                 return Err(SparrowError::new(
@@ -524,14 +644,28 @@ impl IotSpec {
     /// by validation and are never recursively walked here.
     pub fn silence_registry_resident_bytes(&self) -> usize {
         use serde_json::Value;
-        let Some(IotTimingSpec::Silence { registered_keys, .. }) = &self.timing else { return 0; };
-        let mut bytes = 64usize.saturating_add(registered_keys.capacity().saturating_mul(std::mem::size_of::<Vec<Value>>()));
+        let Some(IotTimingSpec::Silence {
+            registered_keys, ..
+        }) = &self.timing
+        else {
+            return 0;
+        };
+        let mut bytes = 64usize.saturating_add(
+            registered_keys
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Vec<Value>>()),
+        );
         for row in registered_keys.iter() {
-            bytes = bytes.saturating_add(48).saturating_add(row.capacity().saturating_mul(std::mem::size_of::<Value>()));
+            bytes = bytes
+                .saturating_add(48)
+                .saturating_add(row.capacity().saturating_mul(std::mem::size_of::<Value>()));
             for value in row {
                 bytes = bytes.saturating_add(match value {
                     Value::String(text) => text.capacity().saturating_add(48),
-                    Value::Array(values) => values.capacity().saturating_mul(std::mem::size_of::<Value>()).saturating_add(48),
+                    Value::Array(values) => values
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Value>())
+                        .saturating_add(48),
                     _ => 0,
                 });
             }
@@ -542,14 +676,34 @@ impl IotSpec {
     /// Stable kind tag used by the checkpoint participant registry.  These
     /// values intentionally do not overlap the WindowKind tags.
     pub fn state_kind_tag(&self) -> u8 {
-        if let Some(timing) = &self.timing { return timing.state_kind(); }
-        let base = if self.hysteresis.is_some() { 6 } else if self.deadband.is_some() { 5 } else { 4 };
-        if self.ttl_micros > 0 { base + 5 } else { base }
+        if let Some(timing) = &self.timing {
+            return timing.state_kind();
+        }
+        let base = if self.hysteresis.is_some() {
+            6
+        } else if self.deadband.is_some() {
+            5
+        } else {
+            4
+        };
+        if self.ttl_micros > 0 {
+            base + 5
+        } else {
+            base
+        }
     }
 
     pub fn kind_name(&self) -> &'static str {
-        if let Some(timing) = &self.timing { return timing.kind_name(); }
-        if self.hysteresis.is_some() { "hysteresis" } else if self.deadband.is_some() { "deadband" } else { "change_detect" }
+        if let Some(timing) = &self.timing {
+            return timing.kind_name();
+        }
+        if self.hysteresis.is_some() {
+            "hysteresis"
+        } else if self.deadband.is_some() {
+            "deadband"
+        } else {
+            "change_detect"
+        }
     }
 }
 
@@ -586,14 +740,23 @@ fn silence_key_wire_len(value: &serde_json::Value, ty: &DataType) -> Result<usiz
         (DataType::Utf8, Value::String(s)) => Ok(s.len().saturating_add(5)),
         (DataType::Bytes, Value::Array(bytes)) => {
             if bytes.len() > MAX_SILENCE_REGISTRY_BYTES {
-                return Err(SparrowError::new(ErrorCode::BoundExceeded, "silence registered byte key exceeds bound"));
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    "silence registered byte key exceeds bound",
+                ));
             }
-            if bytes.iter().any(|b| b.as_u64().is_none_or(|v|v>255)) {
-                return Err(SparrowError::new(ErrorCode::TypeMismatch, "silence registered byte key requires u8 values"));
+            if bytes.iter().any(|b| b.as_u64().is_none_or(|v| v > 255)) {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    "silence registered byte key requires u8 values",
+                ));
             }
             Ok(bytes.len().saturating_add(5))
         }
-        _ => Err(SparrowError::new(ErrorCode::TypeMismatch, "silence registered key type mismatch")),
+        _ => Err(SparrowError::new(
+            ErrorCode::TypeMismatch,
+            "silence registered key type mismatch",
+        )),
     }
 }
 
@@ -607,8 +770,12 @@ fn silence_key_scalar(value: &serde_json::Value, ty: &DataType) -> Result<Scalar
     };
     match (ty, value) {
         (DataType::Bool, Value::Bool(v)) => Ok(Scalar::Bool(*v)),
-        (DataType::Int64, Value::Number(n)) if n.is_i64() => Ok(Scalar::Int64(n.as_i64().unwrap_or_default())),
-        (DataType::UInt64, Value::Number(n)) if n.is_u64() => Ok(Scalar::UInt64(n.as_u64().unwrap_or_default())),
+        (DataType::Int64, Value::Number(n)) if n.is_i64() => {
+            Ok(Scalar::Int64(n.as_i64().unwrap_or_default()))
+        }
+        (DataType::UInt64, Value::Number(n)) if n.is_u64() => {
+            Ok(Scalar::UInt64(n.as_u64().unwrap_or_default()))
+        }
         (DataType::TimestampMicrosUTC, Value::Number(n)) if n.is_i64() => {
             Ok(Scalar::TimestampMicrosUTC(n.as_i64().unwrap_or_default()))
         }
@@ -731,6 +898,9 @@ pub struct WindowSpec {
 }
 
 impl WindowSpec {
+    pub fn has_extended_aggs(&self) -> bool {
+        self.aggs.iter().any(|a| a.func.is_extended())
+    }
     pub fn new(kind: WindowKind, keys: Vec<String>, aggs: Vec<AggCall>) -> Self {
         Self {
             kind,
@@ -773,6 +943,16 @@ impl WindowSpec {
                 "window aggregate requires at least one aggregate",
             ));
         }
+        if self
+            .aggs
+            .iter()
+            .any(|a| a.func.is_extended() && (a.input.is_none() || a.count_star))
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "extended aggregate requires exactly one expression, not star",
+            ));
+        }
         if self.lateness_micros < 0 {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
@@ -801,28 +981,59 @@ impl WindowSpec {
             WindowKind::HoppingEventTime {
                 size_micros,
                 slide_micros,
-            } | WindowKind::HoppingProcessingTime {
-                size_micros,slide_micros,
+            }
+            | WindowKind::HoppingProcessingTime {
+                size_micros,
+                slide_micros,
             } => {
-                WindowKind::hopping_et(size_micros,slide_micros)?;
+                WindowKind::hopping_et(size_micros, slide_micros)?;
                 check_hop_overlap_bound(size_micros, slide_micros, self.max_overlap)?;
             }
-            WindowKind::SlidingCount {size,step} => {
-                WindowKind::sliding_count(size,step)?;
-                if size>self.max_buffered_rows as u64 { return Err(SparrowError::new(ErrorCode::BoundExceeded,"sliding count size exceeds max_buffered_rows")); }
+            WindowKind::SlidingCount { size, step } => {
+                WindowKind::sliding_count(size, step)?;
+                if size > self.max_buffered_rows as u64 {
+                    return Err(SparrowError::new(
+                        ErrorCode::BoundExceeded,
+                        "sliding count size exceeds max_buffered_rows",
+                    ));
+                }
             }
-            WindowKind::SlidingProcessingTime {size_micros,delay_micros}|WindowKind::SlidingEventTime {size_micros,delay_micros} => {WindowKind::sliding(size_micros,delay_micros,self.kind.uses_event_time())?;}
-            WindowKind::SessionProcessingTime {gap_micros,max_duration_micros}|WindowKind::SessionEventTime {gap_micros,max_duration_micros} => {
-                WindowKind::session(gap_micros,max_duration_micros,self.kind.uses_event_time())?;
-                if self.lateness_micros!=0 {return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"Session v1 is final-only with lateness=0; emitted sessions cannot be merged"));}
+            WindowKind::SlidingProcessingTime {
+                size_micros,
+                delay_micros,
+            }
+            | WindowKind::SlidingEventTime {
+                size_micros,
+                delay_micros,
+            } => {
+                WindowKind::sliding(size_micros, delay_micros, self.kind.uses_event_time())?;
+            }
+            WindowKind::SessionProcessingTime {
+                gap_micros,
+                max_duration_micros,
+            }
+            | WindowKind::SessionEventTime {
+                gap_micros,
+                max_duration_micros,
+            } => {
+                WindowKind::session(gap_micros, max_duration_micros, self.kind.uses_event_time())?;
+                if self.lateness_micros != 0 {
+                    return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"Session v1 is final-only with lateness=0; emitted sessions cannot be merged"));
+                }
             }
             _ => {}
         }
         if self.kind.is_buffered() && !(1..=16384).contains(&self.max_buffered_rows) {
-            return Err(SparrowError::new(ErrorCode::BoundExceeded,"max_buffered_rows must be 1..16384"));
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "max_buffered_rows must be 1..16384",
+            ));
         }
         if self.kind.is_buffered() && self.lateness_micros != 0 {
-            return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"buffered windows v1 require lateness=0; final outputs are not retracted"));
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "buffered windows v1 require lateness=0; final outputs are not retracted",
+            ));
         }
         // Hard rule: arrival-order / count windows must not impersonate event-time.
         if !self.kind.uses_event_time() {
@@ -844,7 +1055,9 @@ impl WindowSpec {
             ));
         }
         if self.kind.is_new_window() {
-            if let Some(binding) = self.binding() { binding.validate()?; }
+            if let Some(binding) = self.binding() {
+                binding.validate()?;
+            }
         }
         Ok(())
     }
@@ -917,9 +1130,7 @@ impl LookupSpec {
                 "lookup requires a reference table name",
             ));
         }
-        if self.stream_keys.is_empty()
-            || self.stream_keys.len() != self.table_keys.len()
-        {
+        if self.stream_keys.is_empty() || self.stream_keys.len() != self.table_keys.len() {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
                 "lookup ON keys must be non-empty and aligned",
@@ -943,10 +1154,24 @@ impl LookupSpec {
 
 pub fn window_output_schema(input: &Schema, spec: &WindowSpec) -> Result<Schema> {
     if spec.kind.is_new_window() && spec.kind.uses_event_time() {
-        let field = spec.event_time_field.as_deref().and_then(|name| input.field_by_name(name))
-            .ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument,"unknown event-time field for window"))?;
-        if !matches!(field.data_type, DataType::Int64 | DataType::TimestampMicrosUTC) {
-            return Err(SparrowError::new(ErrorCode::TypeMismatch,"event-time window requires Int64/TimestampMicrosUTC"));
+        let field = spec
+            .event_time_field
+            .as_deref()
+            .and_then(|name| input.field_by_name(name))
+            .ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "unknown event-time field for window",
+                )
+            })?;
+        if !matches!(
+            field.data_type,
+            DataType::Int64 | DataType::TimestampMicrosUTC
+        ) {
+            return Err(SparrowError::new(
+                ErrorCode::TypeMismatch,
+                "event-time window requires Int64/TimestampMicrosUTC",
+            ));
         }
     }
     let mut fields = Vec::new();
@@ -967,14 +1192,22 @@ pub fn window_output_schema(input: &Schema, spec: &WindowSpec) -> Result<Schema>
     // arrival ordinals [0, count) — not timestamps (P3-47).
     fields.push(Field::new(
         FieldId::new(id),
-        if spec.kind.is_count() { "count_start" } else { "window_start" },
+        if spec.kind.is_count() {
+            "count_start"
+        } else {
+            "window_start"
+        },
         DataType::Int64,
         false,
     ));
     id += 1;
     fields.push(Field::new(
         FieldId::new(id),
-        if spec.kind.is_count() { "count_end" } else { "window_end" },
+        if spec.kind.is_count() {
+            "count_end"
+        } else {
+            "window_end"
+        },
         DataType::Int64,
         false,
     ));
@@ -1011,6 +1244,19 @@ pub fn lookup_output_schema(stream: &Schema, table: &Schema, keep: &[String]) ->
 pub fn agg_result_type(agg: &AggCall, schema: &Schema) -> Result<DataType> {
     Ok(match agg.func {
         AggFn::Count => DataType::Int64,
+        AggFn::First | AggFn::Last => agg.input_type(schema)?,
+        AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => {
+            if !matches!(
+                agg.input_type(schema)?,
+                DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Null
+            ) {
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    "variance/stddev require numeric input",
+                ));
+            }
+            DataType::Float64
+        }
         AggFn::Avg => DataType::Float64,
         AggFn::Sum => {
             if agg.count_star || agg.input.is_none() {
@@ -1085,11 +1331,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::TypeMismatch);
         assert_eq!(
             agg_result_type(
-                &AggCall::new(
-                    AggFn::Sum,
-                    Some(Expr::Column { name: "v".into() }),
-                    "s",
-                ),
+                &AggCall::new(AggFn::Sum, Some(Expr::Column { name: "v".into() }), "s",),
                 &s,
             )
             .unwrap(),

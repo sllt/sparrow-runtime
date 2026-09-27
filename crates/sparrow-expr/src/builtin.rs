@@ -6,6 +6,9 @@ use sparrow_model::{DataType, DynamicValue, ErrorCode, Result, Scalar, SparrowEr
 
 pub const MAX_BYTES: usize = 65536;
 pub fn contains(name: &str) -> bool {
+    if crate::collection::contains(name) {
+        return true;
+    }
     matches!(
         name,
         "concat"
@@ -65,6 +68,9 @@ fn numeric(t: &DataType) -> bool {
 }
 
 pub fn signature(name: &str, args: &[DataType]) -> Result<DataType> {
+    if crate::collection::contains(name) {
+        return crate::collection::signature(name, args);
+    }
     check_call_arity(name, args.len())?;
     let (valid, result) = match name {
         "concat" => (args.iter().all(text_type), DataType::Utf8),
@@ -149,6 +155,9 @@ fn unwrap_scalar(value: &Scalar) -> Scalar {
     }
 }
 pub fn eval(name: &str, args: Vec<Scalar>) -> Result<Scalar> {
+    if crate::collection::contains(name) {
+        return crate::collection::eval(name, args);
+    }
     check_call_arity(name, args.len())?;
     let mut arg_types: [DataType; 16] = std::array::from_fn(|_| DataType::Null);
     for (index, arg) in args.iter().enumerate() {

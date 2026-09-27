@@ -29,55 +29,119 @@ impl TimeDomain {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowKind {
     /// Fixed-size, non-overlapping processing-time windows.
-    TumblingProcessingTime { size_micros: i64 },
+    TumblingProcessingTime {
+        size_micros: i64,
+    },
     /// Emit after `size` records per key (arrival-order; no event-time).
-    Count { size: u64 },
+    Count {
+        size: u64,
+    },
     /// Fixed-size, non-overlapping event-time windows.
-    TumblingEventTime { size_micros: i64 },
+    TumblingEventTime {
+        size_micros: i64,
+    },
     /// Sliding event-time windows. Overlap `ceil(size/slide)` is planner-capped.
     HoppingEventTime {
         size_micros: i64,
         slide_micros: i64,
     },
-    HoppingProcessingTime { size_micros: i64, slide_micros: i64 },
-    SlidingCount { size: u64, step: u64 },
-    SlidingProcessingTime { size_micros: i64, delay_micros: i64 },
-    SlidingEventTime { size_micros: i64, delay_micros: i64 },
-    SessionProcessingTime { gap_micros: i64, max_duration_micros: i64 },
-    SessionEventTime { gap_micros: i64, max_duration_micros: i64 },
+    HoppingProcessingTime {
+        size_micros: i64,
+        slide_micros: i64,
+    },
+    SlidingCount {
+        size: u64,
+        step: u64,
+    },
+    SlidingProcessingTime {
+        size_micros: i64,
+        delay_micros: i64,
+    },
+    SlidingEventTime {
+        size_micros: i64,
+        delay_micros: i64,
+    },
+    SessionProcessingTime {
+        gap_micros: i64,
+        max_duration_micros: i64,
+    },
+    SessionEventTime {
+        gap_micros: i64,
+        max_duration_micros: i64,
+    },
 }
 
 impl WindowKind {
     /// New families have a separate, explicitly admitted execution/restore boundary.
     pub fn is_new_window(self) -> bool {
-        self.is_buffered() || matches!(self,Self::HoppingProcessingTime {..})
+        self.is_buffered() || matches!(self, Self::HoppingProcessingTime { .. })
     }
     pub fn is_buffered(self) -> bool {
-        matches!(self,Self::SlidingCount {..}|Self::SlidingProcessingTime {..}|Self::SlidingEventTime {..}
-            |Self::SessionProcessingTime {..}|Self::SessionEventTime {..})
+        matches!(
+            self,
+            Self::SlidingCount { .. }
+                | Self::SlidingProcessingTime { .. }
+                | Self::SlidingEventTime { .. }
+                | Self::SessionProcessingTime { .. }
+                | Self::SessionEventTime { .. }
+        )
     }
-    pub fn is_count(self) -> bool { matches!(self,Self::Count {..}|Self::SlidingCount {..}) }
-    pub fn hopping_pt(size_micros:i64,slide_micros:i64)->Result<Self> {
-        Self::hopping_et(size_micros,slide_micros)?;
-        Ok(Self::HoppingProcessingTime {size_micros,slide_micros})
+    pub fn is_count(self) -> bool {
+        matches!(self, Self::Count { .. } | Self::SlidingCount { .. })
     }
-    pub fn sliding_count(size:u64,step:u64)->Result<Self> {
-        if size==0 || step==0 || step>size || size>i64::MAX as u64 {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,"sliding count requires 1 <= step <= size <= i64::MAX"));
+    pub fn hopping_pt(size_micros: i64, slide_micros: i64) -> Result<Self> {
+        Self::hopping_et(size_micros, slide_micros)?;
+        Ok(Self::HoppingProcessingTime {
+            size_micros,
+            slide_micros,
+        })
+    }
+    pub fn sliding_count(size: u64, step: u64) -> Result<Self> {
+        if size == 0 || step == 0 || step > size || size > i64::MAX as u64 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "sliding count requires 1 <= step <= size <= i64::MAX",
+            ));
         }
-        Ok(Self::SlidingCount {size,step})
+        Ok(Self::SlidingCount { size, step })
     }
-    pub fn sliding(size_micros:i64,delay_micros:i64,event_time:bool)->Result<Self> {
-        if size_micros<=0 || delay_micros<0 || size_micros.checked_add(delay_micros).is_none() {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,"sliding requires positive size, nonnegative delay and representable span"));
+    pub fn sliding(size_micros: i64, delay_micros: i64, event_time: bool) -> Result<Self> {
+        if size_micros <= 0 || delay_micros < 0 || size_micros.checked_add(delay_micros).is_none() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "sliding requires positive size, nonnegative delay and representable span",
+            ));
         }
-        Ok(if event_time {Self::SlidingEventTime {size_micros,delay_micros}} else {Self::SlidingProcessingTime {size_micros,delay_micros}})
+        Ok(if event_time {
+            Self::SlidingEventTime {
+                size_micros,
+                delay_micros,
+            }
+        } else {
+            Self::SlidingProcessingTime {
+                size_micros,
+                delay_micros,
+            }
+        })
     }
-    pub fn session(gap_micros:i64,max_duration_micros:i64,event_time:bool)->Result<Self> {
-        if gap_micros<=0 || max_duration_micros<=0 {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,"session requires positive gap and maximum duration"));
+    pub fn session(gap_micros: i64, max_duration_micros: i64, event_time: bool) -> Result<Self> {
+        if gap_micros <= 0 || max_duration_micros <= 0 {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "session requires positive gap and maximum duration",
+            ));
         }
-        Ok(if event_time {Self::SessionEventTime {gap_micros,max_duration_micros}} else {Self::SessionProcessingTime {gap_micros,max_duration_micros}})
+        Ok(if event_time {
+            Self::SessionEventTime {
+                gap_micros,
+                max_duration_micros,
+            }
+        } else {
+            Self::SessionProcessingTime {
+                gap_micros,
+                max_duration_micros,
+            }
+        })
     }
     pub fn tumbling_pt(size_micros: i64) -> Result<Self> {
         if size_micros <= 0 {
@@ -130,20 +194,36 @@ impl WindowKind {
 
     pub fn time_domain(self) -> TimeDomain {
         match self {
-            Self::TumblingProcessingTime { .. } | Self::Count { .. } | Self::HoppingProcessingTime {..}
-            |Self::SlidingCount {..}|Self::SlidingProcessingTime {..}|Self::SessionProcessingTime {..} => TimeDomain::ProcessingTime,
-            Self::TumblingEventTime { .. } | Self::HoppingEventTime { .. }|Self::SlidingEventTime {..}|Self::SessionEventTime {..} => TimeDomain::EventTime,
+            Self::TumblingProcessingTime { .. }
+            | Self::Count { .. }
+            | Self::HoppingProcessingTime { .. }
+            | Self::SlidingCount { .. }
+            | Self::SlidingProcessingTime { .. }
+            | Self::SessionProcessingTime { .. } => TimeDomain::ProcessingTime,
+            Self::TumblingEventTime { .. }
+            | Self::HoppingEventTime { .. }
+            | Self::SlidingEventTime { .. }
+            | Self::SessionEventTime { .. } => TimeDomain::EventTime,
         }
     }
 
     pub fn uses_processing_time_timer(self) -> bool {
-        matches!(self, Self::TumblingProcessingTime { .. }|Self::HoppingProcessingTime {..}|Self::SlidingProcessingTime {..}|Self::SessionProcessingTime {..})
+        matches!(
+            self,
+            Self::TumblingProcessingTime { .. }
+                | Self::HoppingProcessingTime { .. }
+                | Self::SlidingProcessingTime { .. }
+                | Self::SessionProcessingTime { .. }
+        )
     }
 
     pub fn uses_event_time(self) -> bool {
         matches!(
             self,
-            Self::TumblingEventTime { .. } | Self::HoppingEventTime { .. }|Self::SlidingEventTime {..}|Self::SessionEventTime {..}
+            Self::TumblingEventTime { .. }
+                | Self::HoppingEventTime { .. }
+                | Self::SlidingEventTime { .. }
+                | Self::SessionEventTime { .. }
         )
     }
 
@@ -197,7 +277,9 @@ impl WindowKind {
                 ));
             }
         }
-        if ts >= last && ts < last.saturating_add(size_micros) && !out.iter().any(|(s, _)| *s == last)
+        if ts >= last
+            && ts < last.saturating_add(size_micros)
+            && !out.iter().any(|(s, _)| *s == last)
         {
             out.insert(0, (last, last.saturating_add(size_micros)));
         }
@@ -255,9 +337,26 @@ pub enum AggFn {
     Avg,
     Min,
     Max,
+    First,
+    Last,
+    VarPop,
+    VarSamp,
+    StddevPop,
+    StddevSamp,
 }
 
 impl AggFn {
+    pub fn is_extended(self) -> bool {
+        matches!(
+            self,
+            Self::First
+                | Self::Last
+                | Self::VarPop
+                | Self::VarSamp
+                | Self::StddevPop
+                | Self::StddevSamp
+        )
+    }
     pub fn parse(name: &str) -> Result<Self> {
         match name.to_ascii_lowercase().as_str() {
             "count" => Ok(Self::Count),
@@ -265,6 +364,12 @@ impl AggFn {
             "avg" | "average" | "mean" => Ok(Self::Avg),
             "min" => Ok(Self::Min),
             "max" => Ok(Self::Max),
+            "first" => Ok(Self::First),
+            "last" => Ok(Self::Last),
+            "var_pop" => Ok(Self::VarPop),
+            "var_samp" => Ok(Self::VarSamp),
+            "stddev_pop" => Ok(Self::StddevPop),
+            "stddev_samp" => Ok(Self::StddevSamp),
             other => Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
                 format!("aggregate '{other}' is not part of V0.3"),
@@ -279,6 +384,12 @@ impl AggFn {
             Self::Avg => "avg",
             Self::Min => "min",
             Self::Max => "max",
+            Self::First => "first",
+            Self::Last => "last",
+            Self::VarPop => "var_pop",
+            Self::VarSamp => "var_samp",
+            Self::StddevPop => "stddev_pop",
+            Self::StddevSamp => "stddev_samp",
         }
     }
 }

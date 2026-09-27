@@ -89,44 +89,75 @@ pub fn bind_plan_with_store(
     let mut catalog = binder_catalog(store)?;
     for table in &references {
         if catalog.get(&table.name).is_ok()
-            || spec.graph.as_ref().is_some_and(|graph| graph.catalog.iter().any(|t| t.name == table.name)) {
-            return Err(SparrowError::new(ErrorCode::InvalidSchema,
-                "managed reference table schema must not shadow a stream or inline graph catalog"));
+            || spec
+                .graph
+                .as_ref()
+                .is_some_and(|graph| graph.catalog.iter().any(|t| t.name == table.name))
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidSchema,
+                "managed reference table schema must not shadow a stream or inline graph catalog",
+            ));
         }
         catalog.insert(table.name.clone(), table.table.schema(&table.name)?);
     }
     let plan = bind_plan(spec, &catalog, name, revision)?;
     let mut used = std::collections::BTreeSet::new();
     for stage in &plan.stages {
-        let sparrow_plan::PhysicalStage::Lookup { spec: lookup, input, .. } = stage else { continue };
-        let table = references.iter().find(|t| t.name == lookup.table).ok_or_else(|| {
-            SparrowError::new(ErrorCode::InvalidArgument,
-                format!("Lookup '{}' requires an explicit immutable reference_tables binding", lookup.table))
-        })?;
+        let sparrow_plan::PhysicalStage::Lookup {
+            spec: lookup,
+            input,
+            ..
+        } = stage
+        else {
+            continue;
+        };
+        let table = references
+            .iter()
+            .find(|t| t.name == lookup.table)
+            .ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "Lookup '{}' requires an explicit immutable reference_tables binding",
+                        lookup.table
+                    ),
+                )
+            })?;
         if lookup.temporal || lookup.as_of_field.is_some() {
-            return Err(SparrowError::new(ErrorCode::FeatureUnavailable,
-                "managed temporal Lookup requires a pinned version timeline and is not yet enabled"));
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "managed temporal Lookup requires a pinned version timeline and is not yet enabled",
+            ));
         }
         if lookup.table_keys != table.table.keys {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,
-                "Lookup table keys must exactly match the immutable table key order"));
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "Lookup table keys must exactly match the immutable table key order",
+            ));
         }
         let schema = table.table.schema(&table.name)?;
         for (stream_key, table_key) in lookup.stream_keys.iter().zip(&lookup.table_keys) {
-            let source = input.field_by_name(stream_key).ok_or_else(||
-                SparrowError::new(ErrorCode::InvalidSchema, "Lookup stream key is absent"))?;
-            let target = schema.field_by_name(table_key).ok_or_else(||
-                SparrowError::new(ErrorCode::InvalidSchema, "Lookup table key is absent"))?;
+            let source = input.field_by_name(stream_key).ok_or_else(|| {
+                SparrowError::new(ErrorCode::InvalidSchema, "Lookup stream key is absent")
+            })?;
+            let target = schema.field_by_name(table_key).ok_or_else(|| {
+                SparrowError::new(ErrorCode::InvalidSchema, "Lookup table key is absent")
+            })?;
             if source.data_type != target.data_type {
-                return Err(SparrowError::new(ErrorCode::TypeMismatch,
-                    "Lookup stream and table key types must match without coercion"));
+                return Err(SparrowError::new(
+                    ErrorCode::TypeMismatch,
+                    "Lookup stream and table key types must match without coercion",
+                ));
             }
         }
         used.insert(table.name.as_str());
     }
     if used.len() != spec.reference_tables.len() {
-        return Err(SparrowError::new(ErrorCode::InvalidArgument,
-            "reference_tables contains a binding not used by any Lookup"));
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "reference_tables contains a binding not used by any Lookup",
+        ));
     }
     Ok(plan)
 }
@@ -153,24 +184,60 @@ pub fn bind_plan(
     };
     // Authoring GraphSpec is preserved in the catalog; execution identity is
     // the named pipeline and its committed revision, not client-supplied IDs.
-    bound.pipeline=pipeline;bound.revision=rev;
+    bound.pipeline = pipeline;
+    bound.revision = rev;
     let plan = physicalize(&bound, &PlanOptions { fuse: true });
     if let Some(io) = &spec.graph_io {
-        let sources: std::collections::BTreeSet<_> = plan.stages.iter().filter_map(|s|match s { sparrow_plan::PhysicalStage::MemorySource { operator,.. } => Some(operator.raw()),_=>None }).collect();
-        let sinks: std::collections::BTreeSet<_> = plan.stages.iter().filter_map(|s|match s { sparrow_plan::PhysicalStage::CaptureSink { operator,.. } | sparrow_plan::PhysicalStage::BestEffortSink { operator,.. } => Some(operator.raw()),_=>None }).collect();
-        if plan.edges.is_none() || sources != io.sources.keys().copied().collect() || sinks != io.sinks.keys().copied().collect() {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,"graph_io must bind every graph source/sink ID exactly once"));
+        let sources: std::collections::BTreeSet<_> = plan
+            .stages
+            .iter()
+            .filter_map(|s| match s {
+                sparrow_plan::PhysicalStage::MemorySource { operator, .. } => Some(operator.raw()),
+                _ => None,
+            })
+            .collect();
+        let sinks: std::collections::BTreeSet<_> = plan
+            .stages
+            .iter()
+            .filter_map(|s| match s {
+                sparrow_plan::PhysicalStage::CaptureSink { operator, .. }
+                | sparrow_plan::PhysicalStage::BestEffortSink { operator, .. } => {
+                    Some(operator.raw())
+                }
+                _ => None,
+            })
+            .collect();
+        if plan.edges.is_none()
+            || sources != io.sources.keys().copied().collect()
+            || sinks != io.sinks.keys().copied().collect()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "graph_io must bind every graph source/sink ID exactly once",
+            ));
         }
-        for (stage,side) in &plan.side_outputs {
-            if side.kind==sparrow_plan::graph::SideOutputKind::DecodeError {
-                let sparrow_plan::PhysicalStage::MemorySource {operator,..}=&plan.stages[*stage] else{unreachable!()};
-                if spec.effective_fail_on_decode() || !matches!(io.sources[&operator.raw()].kind.as_str(),"file"|"file_replay"|"replay") {
+        for (stage, side) in &plan.side_outputs {
+            if side.kind == sparrow_plan::graph::SideOutputKind::DecodeError {
+                let sparrow_plan::PhysicalStage::MemorySource { operator, .. } =
+                    &plan.stages[*stage]
+                else {
+                    unreachable!()
+                };
+                if spec.effective_fail_on_decode()
+                    || !matches!(
+                        io.sources[&operator.raw()].kind.as_str(),
+                        "file" | "file_replay" | "replay"
+                    )
+                {
                     return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"decode-error side outputs currently require File input and fail_on_decode=false"));
                 }
             }
         }
     } else if plan.edges.is_some() {
-        return Err(SparrowError::new(ErrorCode::InvalidArgument,"DAG pipelines require explicit graph_io source/sink bindings"));
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "DAG pipelines require explicit graph_io source/sink bindings",
+        ));
     }
     Ok(plan)
 }
@@ -178,7 +245,7 @@ pub fn bind_plan(
 pub fn replay_label_for_source(kind: &str) -> &'static str {
     match kind {
         "file" | "file_replay" | "replay" => "replayable",
-        "jetstream" if cfg!(feature="jetstream") => "replayable",
+        "jetstream" if cfg!(feature = "jetstream") => "replayable",
         "mqtt" | "mqtt_source" | "http_push" | "http" => "unsupported",
         _ => sparrow_plan::REPLAY_UNBOUND,
     }
@@ -188,9 +255,11 @@ pub fn replay_label_for_spec(spec: &PipelineSpec) -> &'static str {
     spec.graph_io.as_ref().map_or_else(
         || replay_label_for_source(&spec.source.kind),
         |io| {
-            if io.sources.values().all(|source| {
-                matches!(source.kind.as_str(), "file" | "file_replay" | "replay")
-            }) {
+            if io
+                .sources
+                .values()
+                .all(|source| matches!(source.kind.as_str(), "file" | "file_replay" | "replay"))
+            {
                 "replayable"
             } else {
                 "unsupported"
@@ -200,7 +269,11 @@ pub fn replay_label_for_spec(spec: &PipelineSpec) -> &'static str {
 }
 
 pub fn explain_plan(plan: &PhysicalPlan) -> ExplainReport {
-    explain_plan_with(plan, RecoveryPolicy::RestartFresh, sparrow_plan::REPLAY_UNBOUND)
+    explain_plan_with(
+        plan,
+        RecoveryPolicy::RestartFresh,
+        sparrow_plan::REPLAY_UNBOUND,
+    )
 }
 
 pub fn explain_plan_with(
@@ -304,13 +377,22 @@ fn validate_source_io(
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
     match source.kind.as_str() {
-        #[cfg(feature="jetstream")]
+        #[cfg(feature = "jetstream")]
         "jetstream" => {
-            let config=source.jetstream.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"JetStream config required"))?;
+            let config = source.jetstream.as_ref().ok_or_else(|| {
+                SparrowError::new(ErrorCode::InvalidArgument, "JetStream config required")
+            })?;
             config.reader().validate()?;
             config.connection().validate(policy)?;
-            check_data_path(std::path::Path::new(spec.checkpoint_dir.as_deref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"checkpoint_dir required"))?)).map_err(io)?;
-            if let Some(reference)=&config.token_secret { secrets.resolve(reference).map_err(io)?; }
+            check_data_path(std::path::Path::new(
+                spec.checkpoint_dir.as_deref().ok_or_else(|| {
+                    SparrowError::new(ErrorCode::InvalidArgument, "checkpoint_dir required")
+                })?,
+            ))
+            .map_err(io)?;
+            if let Some(reference) = &config.token_secret {
+                secrets.resolve(reference).map_err(io)?;
+            }
         }
         "mqtt" => {
             refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
@@ -359,32 +441,55 @@ fn validate_sink_io(
     policy: &TargetPolicy,
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
-    if sink.file.is_some() && sink.kind!="file" {
-        return Err(SparrowError::new(ErrorCode::InvalidArgument,"file options require a File Sink"));
+    if sink.file.is_some() && sink.kind != "file" {
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "file options require a File Sink",
+        ));
     }
-    if let Some(action)=&sink.action {
-        if (action.topic.is_some() && sink.kind!="mqtt") || (!action.query.is_empty() && sink.kind!="http")
-            || (action.single && sink.kind!="http") {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,"action topic is MQTT-only; query/single are HTTP-only"));
+    if let Some(action) = &sink.action {
+        if (action.topic.is_some() && sink.kind != "mqtt")
+            || (!action.query.is_empty() && sink.kind != "http")
+            || (action.single && sink.kind != "http")
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "action topic is MQTT-only; query/single are HTTP-only",
+            ));
         }
-        if action.per_row_http() && (sink.max_inflight.unwrap_or(1)!=1 || sink.batch_rows.unwrap_or(1)!=1 || sink.linger_ms.unwrap_or(0)!=0) {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,"per-row HTTP actions require max_inflight=1, batch_rows=1, linger_ms=0"));
+        if action.per_row_http()
+            && (sink.max_inflight.unwrap_or(1) != 1
+                || sink.batch_rows.unwrap_or(1) != 1
+                || sink.linger_ms.unwrap_or(0) != 0)
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "per-row HTTP actions require max_inflight=1, batch_rows=1, linger_ms=0",
+            ));
         }
     }
     match sink.kind.as_str() {
-        "file" => { file_sink_config(sink)?.validate().map_err(io)?; }
+        "file" => {
+            file_sink_config(sink)?.validate().map_err(io)?;
+        }
         "http" => {
             let http = http_config(sink, demo)?;
             http.validate(secrets, policy).map_err(io)?;
-            if let Some(action)=&sink.action {sparrow_connectors::HttpSink::validate_action(&http,action).map_err(io)?;}
+            if let Some(action) = &sink.action {
+                sparrow_connectors::HttpSink::validate_action(&http, action).map_err(io)?;
+            }
         }
         "log" => {}
         "mqtt" => {
             let mqtt = mqtt_sink_config(sink, demo)?;
             mqtt.validate(secrets, policy).map_err(io)?;
-            if sink.action.as_ref().is_some_and(|a|a.topic.is_none()) &&
-                (mqtt.topic.len()>1024 || mqtt.topic.contains(['+','#','\0'])) {
-                return Err(SparrowError::new(ErrorCode::InvalidArgument,"MQTT action fallback topic must be valid and <=1024 bytes"));
+            if sink.action.as_ref().is_some_and(|a| a.topic.is_none())
+                && (mqtt.topic.len() > 1024 || mqtt.topic.contains(['+', '#', '\0']))
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "MQTT action fallback topic must be valid and <=1024 bytes",
+                ));
             }
         }
         other => {
@@ -413,11 +518,16 @@ pub fn validate_io_with_plan(
     spec.check_delivery()?;
     let Some(io) = &spec.graph_io else {
         validate_io(spec, schema, secrets, policy, demo)?;
-        if spec.sink.action.is_some() || spec.sink.kind=="file" {
-            let Some(sparrow_plan::PhysicalStage::CaptureSink {schema:output,..})=plan.stages.last() else {
-                return Err(SparrowError::new(ErrorCode::InvalidSchema,"action requires a typed sink schema"));
+        if spec.sink.action.is_some() || spec.sink.kind == "file" {
+            let Some(sparrow_plan::PhysicalStage::CaptureSink { schema: output, .. }) =
+                plan.stages.last()
+            else {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    "action requires a typed sink schema",
+                ));
             };
-            validate_action_schema(&spec.sink,output)?;
+            validate_action_schema(&spec.sink, output)?;
         }
         return Ok(());
     };
@@ -429,23 +539,36 @@ pub fn validate_io_with_plan(
     }
     for (operator, sink) in &io.sinks {
         let actual = graph_endpoint_schema(plan, *operator, false)?;
-        validate_action_schema(sink,&actual).map_err(|e|e.at_operator((*operator).into()))?;
+        validate_action_schema(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
         validate_sink_io(sink, secrets, policy, demo)
             .map_err(|e| e.at_operator((*operator).into()))?;
     }
     Ok(())
 }
 
-pub(crate) fn graph_endpoint_schema(plan: &PhysicalPlan, operator: u32, source: bool) -> Result<Schema> {
+pub(crate) fn graph_endpoint_schema(
+    plan: &PhysicalPlan,
+    operator: u32,
+    source: bool,
+) -> Result<Schema> {
     plan.stages
         .iter()
         .find_map(|stage| match stage {
-            sparrow_plan::PhysicalStage::MemorySource { operator: id, schema, .. }
-                if source && id.raw() == operator => Some(schema.clone()),
-            sparrow_plan::PhysicalStage::CaptureSink { operator: id, schema, .. }
-                if !source && id.raw() == operator => Some(schema.clone()),
-            sparrow_plan::PhysicalStage::BestEffortSink { operator: id, schema, .. }
-                if !source && id.raw() == operator => Some(schema.clone()),
+            sparrow_plan::PhysicalStage::MemorySource {
+                operator: id,
+                schema,
+                ..
+            } if source && id.raw() == operator => Some(schema.clone()),
+            sparrow_plan::PhysicalStage::CaptureSink {
+                operator: id,
+                schema,
+                ..
+            } if !source && id.raw() == operator => Some(schema.clone()),
+            sparrow_plan::PhysicalStage::BestEffortSink {
+                operator: id,
+                schema,
+                ..
+            } if !source && id.raw() == operator => Some(schema.clone()),
             _ => None,
         })
         .ok_or_else(|| {
@@ -551,10 +674,18 @@ pub fn http_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<Http
     }
     let mut cfg = HttpSinkConfig::demo(url.clone());
     cfg.outbox_capacity = sink.outbox_capacity;
-    if let Some(n) = sink.batch_rows { cfg.batch_rows = n; }
-    if let Some(n) = sink.batch_bytes { cfg.batch_bytes = n; }
-    if let Some(ms) = sink.linger_ms { cfg.linger = std::time::Duration::from_millis(ms); }
-    if let Some(n) = sink.max_inflight { cfg.max_inflight = n; }
+    if let Some(n) = sink.batch_rows {
+        cfg.batch_rows = n;
+    }
+    if let Some(n) = sink.batch_bytes {
+        cfg.batch_bytes = n;
+    }
+    if let Some(ms) = sink.linger_ms {
+        cfg.linger = std::time::Duration::from_millis(ms);
+    }
+    if let Some(n) = sink.max_inflight {
+        cfg.max_inflight = n;
+    }
     cfg.header_secret = sink.header_secret.clone();
     cfg.tls = TlsConfig {
         enabled: (sink.tls && url.starts_with("https://")) || sink.header_secret.is_some(),
@@ -577,21 +708,52 @@ pub fn http_push_config(source: &SourceSpec, schema: Schema) -> Result<HttpPushS
     Ok(cfg)
 }
 
-fn validate_action_schema(sink:&SinkSpec,schema:&Schema)->Result<()> {
-    if let Some(action)=&sink.action {action.validate(schema)?;}
-    else if sink.kind=="file" {sparrow_formats::action::ActionSpec::default().validate(schema)?;}
+fn validate_action_schema(sink: &SinkSpec, schema: &Schema) -> Result<()> {
+    if let Some(action) = &sink.action {
+        action.validate(schema)?;
+    } else if sink.kind == "file" {
+        sparrow_formats::action::ActionSpec::default().validate(schema)?;
+    }
     Ok(())
 }
-pub(crate) fn file_sink_config(sink:&SinkSpec)->Result<sparrow_connectors::file_sink::FileSinkConfig> {
-    let config=sink.file.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"File Sink requires file options"))?;
-    if sink.use_demo_io || sink.url.is_some() || sink.host.is_some() || sink.port.is_some()
-        || sink.header_secret.is_some() || sink.topic.is_some() || sink.client_id.is_some() || sink.qos!=0 || !sink.clean_session || sink.tls || sink.skip_verify
-        || sink.batch_rows.is_some() || sink.batch_bytes.is_some() || sink.linger_ms.is_some() || sink.max_inflight.is_some() {
-        return Err(SparrowError::new(ErrorCode::InvalidArgument,"File Sink does not accept network or HTTP batching options"));
+pub(crate) fn file_sink_config(
+    sink: &SinkSpec,
+) -> Result<sparrow_connectors::file_sink::FileSinkConfig> {
+    let config = sink.file.as_ref().ok_or_else(|| {
+        SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "File Sink requires file options",
+        )
+    })?;
+    if sink.use_demo_io
+        || sink.url.is_some()
+        || sink.host.is_some()
+        || sink.port.is_some()
+        || sink.header_secret.is_some()
+        || sink.topic.is_some()
+        || sink.client_id.is_some()
+        || sink.qos != 0
+        || !sink.clean_session
+        || sink.tls
+        || sink.skip_verify
+        || sink.batch_rows.is_some()
+        || sink.batch_bytes.is_some()
+        || sink.linger_ms.is_some()
+        || sink.max_inflight.is_some()
+    {
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "File Sink does not accept network or HTTP batching options",
+        ));
     }
-    Ok(sparrow_connectors::file_sink::FileSinkConfig {directory:config.directory.clone().into(),
-        segment_bytes:config.segment_bytes,max_bytes:config.max_bytes,max_files:config.max_files,
-        row_bytes:config.row_bytes,sync_data:config.sync_data})
+    Ok(sparrow_connectors::file_sink::FileSinkConfig {
+        directory: config.directory.clone().into(),
+        segment_bytes: config.segment_bytes,
+        max_bytes: config.max_bytes,
+        max_files: config.max_files,
+        row_bytes: config.row_bytes,
+        sync_data: config.sync_data,
+    })
 }
 
 pub fn mqtt_sink_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<MqttSinkConfig> {
@@ -666,10 +828,16 @@ pub(crate) fn decode_reference_sha256(value: &str) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
         let high = (pair[0] as char).to_digit(16).ok_or_else(|| {
-            SparrowError::new(ErrorCode::InvalidArgument, "reference table SHA-256 is not hex")
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "reference table SHA-256 is not hex",
+            )
         })?;
         let low = (pair[1] as char).to_digit(16).ok_or_else(|| {
-            SparrowError::new(ErrorCode::InvalidArgument, "reference table SHA-256 is not hex")
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "reference table SHA-256 is not hex",
+            )
         })?;
         out[index] = ((high << 4) | low) as u8;
     }
@@ -724,7 +892,10 @@ pub(crate) fn validate_reference_dependencies(
         let binding = spec.reference_tables.get(&dependency.name).ok_or_else(|| {
             SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                format!("verified reference table '{}' is not bound by the pipeline", dependency.name),
+                format!(
+                    "verified reference table '{}' is not bound by the pipeline",
+                    dependency.name
+                ),
             )
         })?;
         let canonical = decode_reference_sha256(&binding.sha256)?;
@@ -762,10 +933,7 @@ pub(crate) fn checkpoint_plan_with_references(
     sparrow_plan::CheckpointPlan::from_physical_with_references(plan, dependencies.to_vec())
 }
 
-fn validate_reference_checkpoint_profile(
-    spec: &PipelineSpec,
-    plan: &PhysicalPlan,
-) -> Result<()> {
+fn validate_reference_checkpoint_profile(spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<()> {
     if spec.reference_tables.is_empty() {
         return Ok(());
     }
@@ -790,17 +958,16 @@ fn validate_reference_checkpoint_profile(
         })?;
         if plan.edges.is_none()
             || io.sources.is_empty()
-            || io.sources.values().any(|source| {
-                !matches!(source.kind.as_str(), "file" | "file_replay" | "replay")
-            })
+            || io
+                .sources
+                .values()
+                .any(|source| !matches!(source.kind.as_str(), "file" | "file_replay" | "replay"))
             || io.sinks.is_empty()
             || io.sinks.values().any(|sink| sink.kind != "http")
-            || plan.stages.iter().any(|stage| {
-                matches!(
-                    stage,
-                    sparrow_plan::PhysicalStage::BestEffortSink { .. }
-                )
-            })
+            || plan
+                .stages
+                .iter()
+                .any(|stage| matches!(stage, sparrow_plan::PhysicalStage::BestEffortSink { .. }))
             || plan
                 .edges
                 .as_ref()
@@ -845,10 +1012,7 @@ fn validate_reference_checkpoint_profile(
     // number.  This keeps control from accidentally opening a new IoT kind
     // (for example Hysteresis) through the old v8 stateless path.
     let dependencies = reference_dependency_shape(spec)?;
-    let layout = sparrow_plan::CheckpointPlan::from_physical_with_references(
-        plan,
-        dependencies,
-    )?;
+    let layout = sparrow_plan::CheckpointPlan::from_physical_with_references(plan, dependencies)?;
     let version = sparrow_runtime::pipeline_checkpoint::snapshot_version_for(&layout, source_kind)?;
     let expected = if graph {
         11
@@ -891,30 +1055,82 @@ fn validate_aligned_plan_inner(
     dependencies: Option<&[sparrow_plan::ReferenceTableDependency]>,
 ) -> sparrow_model::Result<()> {
     let recovery = RecoveryPolicy::parse(&spec.recovery)?;
-    if plan.has_new_windows() && (recovery.is_aligned() || spec.restore.is_some() || spec.checkpoint.is_some() || spec.checkpoint_dir.is_some()) {
+    if (plan.has_analysis() || plan.has_extended_aggs())
+        && (recovery.is_aligned()
+            || spec.restore.is_some()
+            || spec.checkpoint.is_some()
+            || spec.checkpoint_dir.is_some())
+    {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "UNNEST/stream Join are restart_fresh only, without checkpoint or restore",
+        ));
+    }
+    if plan.has_new_windows()
+        && (recovery.is_aligned()
+            || spec.restore.is_some()
+            || spec.checkpoint.is_some()
+            || spec.checkpoint_dir.is_some())
+    {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"new hopping-PT/sliding/session windows currently require restart_fresh without checkpoint or restore"));
     }
-    let has_actions=spec.sink.action.is_some() || spec.sink.kind=="file" || spec.graph_io.as_ref().is_some_and(|io|
-        io.sinks.values().any(|sink|sink.action.is_some() || sink.kind=="file"));
-    if has_actions && (recovery.is_aligned() || spec.restore.is_some() || spec.checkpoint_dir.is_some() || spec.checkpoint.is_some()) {
+    let has_actions = spec.sink.action.is_some()
+        || spec.sink.kind == "file"
+        || spec.graph_io.as_ref().is_some_and(|io| {
+            io.sinks
+                .values()
+                .any(|sink| sink.action.is_some() || sink.kind == "file")
+        });
+    if has_actions
+        && (recovery.is_aligned()
+            || spec.restore.is_some()
+            || spec.checkpoint_dir.is_some()
+            || spec.checkpoint.is_some())
+    {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"Action/File Sink v1 is restart_fresh only; no checkpoint, restore or implicit reliable receipt"));
     }
-    if spec.source.jetstream.as_ref().and_then(|js|js.idle_backoff_max_ms).is_some()
-        && (plan.has_timed_iot() || plan.has_processing_time_state() || plan.has_silence() || plan.has_resample()) {
+    if spec
+        .source
+        .jetstream
+        .as_ref()
+        .and_then(|js| js.idle_backoff_max_ms)
+        .is_some()
+        && (plan.has_timed_iot()
+            || plan.has_processing_time_state()
+            || plan.has_silence()
+            || plan.has_resample())
+    {
         return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"idle_backoff_max_ms currently applies to the regular JetStream actor, not durable time/observed profiles"));
     }
-    if spec.graph_io.as_ref().is_some_and(|io|io.idle_after_ms.is_some())
-        && !(recovery.is_aligned() && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window())) {
-        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"idle_after_ms is only supported by durable time graphs"));
+    if spec
+        .graph_io
+        .as_ref()
+        .is_some_and(|io| io.idle_after_ms.is_some())
+        && !(recovery.is_aligned()
+            && plan.edges.is_some()
+            && (plan.has_processing_time_state() || plan.has_event_time_window()))
+    {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "idle_after_ms is only supported by durable time graphs",
+        ));
     }
     if plan.has_resample() {
-        validate_resample_profile(spec,plan)?;
+        validate_resample_profile(spec, plan)?;
     } else if plan.has_silence() {
-        if spec.source.kind == "mqtt" { validate_live_silence_profile(spec, plan)?; }
-        else { validate_observed_time_profile(spec,plan)?; }
-    } else if recovery.is_aligned() && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
-        validate_time_graph_profile(spec,plan)?;
-    } else if plan.has_timed_iot() || (recovery.is_aligned() && plan.has_processing_time_state()) { validate_paused_time_profile(spec,plan)?; }
+        if spec.source.kind == "mqtt" {
+            validate_live_silence_profile(spec, plan)?;
+        } else {
+            validate_observed_time_profile(spec, plan)?;
+        }
+    } else if recovery.is_aligned()
+        && plan.edges.is_some()
+        && (plan.has_processing_time_state() || plan.has_event_time_window())
+    {
+        validate_time_graph_profile(spec, plan)?;
+    } else if plan.has_timed_iot() || (recovery.is_aligned() && plan.has_processing_time_state()) {
+        validate_paused_time_profile(spec, plan)?;
+    }
     if !recovery.is_aligned() {
         return Ok(());
     }
@@ -922,13 +1138,19 @@ fn validate_aligned_plan_inner(
         validate_linear_iot_profile(spec)?;
     }
     if let Some(io) = &spec.graph_io {
-        if spec.checkpoint_dir.as_deref().is_none_or(str::is_empty) || io.sources.values().any(|s| !matches!(s.kind.as_str(),"file"|"file_replay"|"replay"))
-            || io.sinks.values().any(|s|s.kind!="http") {
+        if spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
+            || io
+                .sources
+                .values()
+                .any(|s| !matches!(s.kind.as_str(), "file" | "file_replay" | "replay"))
+            || io.sinks.values().any(|s| s.kind != "http")
+        {
             return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"graph aligned requires explicit checkpoint_dir, replayable File inputs and required HTTP outputs"));
         }
     }
     if !matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay")
-        && !(cfg!(feature="jetstream") && spec.source.kind=="jetstream") {
+        && !(cfg!(feature = "jetstream") && spec.source.kind == "jetstream")
+    {
         return Err(SparrowError::new(
             ErrorCode::UnsupportedRestore,
             "aligned recovery requires a ReplayableSource (file); MQTT replay remains unsupported",
@@ -969,13 +1191,20 @@ fn validate_linear_iot_profile(spec: &PipelineSpec) -> Result<()> {
     Ok(())
 }
 
-fn validate_resample_profile(spec:&PipelineSpec,plan:&PhysicalPlan)->Result<()> {
+fn validate_resample_profile(spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<()> {
     validate_paused_time_profile(spec, plan)?;
-    let interval = spec.checkpoint.as_ref().and_then(|c| c.interval_ms).unwrap_or(0);
+    let interval = spec
+        .checkpoint
+        .as_ref()
+        .and_then(|c| c.interval_ms)
+        .unwrap_or(0);
     for stage in &plan.stages {
         if let sparrow_plan::PhysicalStage::Iot { spec: iot, .. } = stage {
             if let Some(sparrow_plan::IotTimingSpec::Resample(config)) = &iot.timing {
-                if interval.checked_mul(1000).is_none_or(|tick| tick > config.period_micros as u64) {
+                if interval
+                    .checked_mul(1000)
+                    .is_none_or(|tick| tick > config.period_micros as u64)
+                {
                     return Err(SparrowError::new(ErrorCode::InvalidArgument,
                         "resample period must be at least the checkpoint interval; delayed catch-up still obeys the emission cap"));
                 }
@@ -985,70 +1214,161 @@ fn validate_resample_profile(spec:&PipelineSpec,plan:&PhysicalPlan)->Result<()> 
     Ok(())
 }
 
-pub(crate) fn validate_live_silence_profile(spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<()> {
-    if spec.source.kind != "mqtt" || spec.recovery != "restart_fresh" || spec.graph_io.is_some()
-        || !spec.reference_tables.is_empty() || spec.sink.kind != "http" || spec.sink.skip_verify
-        || spec.checkpoint.is_some() || spec.checkpoint_dir.is_some() || spec.restore.is_some() {
+pub(crate) fn validate_live_silence_profile(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+) -> Result<()> {
+    if spec.source.kind != "mqtt"
+        || spec.recovery != "restart_fresh"
+        || spec.graph_io.is_some()
+        || !spec.reference_tables.is_empty()
+        || spec.sink.kind != "http"
+        || spec.sink.skip_verify
+        || spec.checkpoint.is_some()
+        || spec.checkpoint_dir.is_some()
+        || spec.restore.is_some()
+    {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
             "live silence requires MQTT QoS0/clean_session, restart_fresh and verified HTTP; no checkpoint, restore, graph_io or references"));
     }
     refuse_qos_durable(spec.source.qos).map_err(io)?;
-    if !spec.source.clean_session { return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "live silence requires clean_session")); }
+    if !spec.source.clean_session {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "live silence requires clean_session",
+        ));
+    }
     plan.live_silence_gap()?;
     Ok(())
 }
 
-fn validate_observed_time_profile(spec:&PipelineSpec,plan:&PhysicalPlan)->Result<()> {
+fn validate_observed_time_profile(spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<()> {
     // Transport/storage prerequisites are shared, but not the time codec or
     // timer/input ordering. CheckpointPlan enforces Source -> Silence first.
-    validate_paused_time_profile(spec,plan)?;
-    let gap = plan.stages.iter().find_map(|stage| match stage {
-        sparrow_plan::PhysicalStage::Iot {spec,..} => match &spec.timing {
-            Some(sparrow_plan::IotTimingSpec::Silence {max_observation_gap_micros,..}) => Some(*max_observation_gap_micros),
-            _=>None,
-        }, _=>None,
-    }).ok_or_else(||SparrowError::new(ErrorCode::UnsupportedRestore,"observed time requires silence"))?;
-    let interval=spec.checkpoint.as_ref().and_then(|p|p.interval_ms).expect("validated interval");
-    if u64::try_from(gap).is_err() || interval.checked_mul(2000).is_none_or(|twice|twice>gap as u64) {
-        return Err(SparrowError::new(ErrorCode::InvalidArgument,"silence observation gap must allow at least two checkpoint intervals"));
+    validate_paused_time_profile(spec, plan)?;
+    let gap = plan
+        .stages
+        .iter()
+        .find_map(|stage| match stage {
+            sparrow_plan::PhysicalStage::Iot { spec, .. } => match &spec.timing {
+                Some(sparrow_plan::IotTimingSpec::Silence {
+                    max_observation_gap_micros,
+                    ..
+                }) => Some(*max_observation_gap_micros),
+                _ => None,
+            },
+            _ => None,
+        })
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "observed time requires silence",
+            )
+        })?;
+    let interval = spec
+        .checkpoint
+        .as_ref()
+        .and_then(|p| p.interval_ms)
+        .expect("validated interval");
+    if u64::try_from(gap).is_err()
+        || interval
+            .checked_mul(2000)
+            .is_none_or(|twice| twice > gap as u64)
+    {
+        return Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "silence observation gap must allow at least two checkpoint intervals",
+        ));
     }
     Ok(())
 }
 
-fn validate_paused_time_profile(spec:&PipelineSpec,plan:&PhysicalPlan)->Result<()> {
-    let supported_source=matches!(spec.source.kind.as_str(),"file"|"file_replay"|"replay")
-        || (cfg!(feature="jetstream") && spec.source.kind=="jetstream");
-    if spec.recovery!="aligned" || !supported_source || spec.graph_io.is_some() || plan.edges.is_some()
-        || !spec.reference_tables.is_empty() || !plan.source_times.is_empty() || !plan.side_outputs.is_empty()
-        || spec.sink.kind!="http" || spec.sink.skip_verify
+fn validate_paused_time_profile(spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<()> {
+    let supported_source = matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay")
+        || (cfg!(feature = "jetstream") && spec.source.kind == "jetstream");
+    if spec.recovery != "aligned"
+        || !supported_source
+        || spec.graph_io.is_some()
+        || plan.edges.is_some()
+        || !spec.reference_tables.is_empty()
+        || !plan.source_times.is_empty()
+        || !plan.side_outputs.is_empty()
+        || spec.sink.kind != "http"
+        || spec.sink.skip_verify
         || spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
         || !spec.fail_on_decode
-        || !spec.checkpoint.as_ref().is_some_and(|p|p.resume_latest && p.interval_ms.is_some_and(|n|(100..=1000).contains(&n)))
-        || spec.restore.as_ref().is_some_and(|r| r.kind!="checkpoint" || r.snapshot_id.as_deref().is_some_and(|id|!id.is_empty() && id!="aligned")) {
+        || !spec.checkpoint.as_ref().is_some_and(|p| {
+            p.resume_latest && p.interval_ms.is_some_and(|n| (100..=1000).contains(&n))
+        })
+        || spec.restore.as_ref().is_some_and(|r| {
+            r.kind != "checkpoint"
+                || r.snapshot_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty() && id != "aligned")
+        })
+    {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
             "paused processing-time recovery requires linear File/JetStream, verified HTTP, explicit checkpoint_dir, fail_on_decode=true and resume_latest with interval_ms=100..1000; historical restore, references and side/time inputs are not enabled"));
     }
-    if spec.source.kind!="jetstream" && resolve_file_contract(spec,RecoveryPolicy::Aligned)?!=sparrow_connectors::FileContract::AppendOnly {
-        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"paused-time File input requires append_only; EOF must not stop timers"));
+    if spec.source.kind != "jetstream"
+        && resolve_file_contract(spec, RecoveryPolicy::Aligned)?
+            != sparrow_connectors::FileContract::AppendOnly
+    {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "paused-time File input requires append_only; EOF must not stop timers",
+        ));
     }
     sparrow_plan::CheckpointPlan::from_physical(plan)?;
     Ok(())
 }
 
-pub(crate) fn validate_time_graph_profile(spec:&PipelineSpec,plan:&PhysicalPlan)->Result<()> {
-    let Some(io)=&spec.graph_io else {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"durable time graph requires graph_io"));};
-    if spec.recovery!="aligned" || plan.edges.is_none() || !spec.reference_tables.is_empty() || !plan.side_outputs.is_empty()
-        || !spec.fail_on_decode || spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
-        || !spec.checkpoint.as_ref().is_some_and(|p|p.resume_latest && p.interval_ms.is_some_and(|n|(100..=1000).contains(&n)))
-        || spec.restore.as_ref().is_some_and(|r|r.kind!="checkpoint" || r.snapshot_id.as_deref().is_some_and(|s|!s.is_empty()&&s!="aligned"))
-        || io.sources.values().any(|s|!matches!(s.kind.as_str(),"file"|"file_replay"|"replay"))
-        || io.sinks.values().any(|s|s.kind!="http"||s.skip_verify)
-        || io.idle_after_ms.is_some_and(|n|!(100..=86400000).contains(&n)) {
+pub(crate) fn validate_time_graph_profile(spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<()> {
+    let Some(io) = &spec.graph_io else {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "durable time graph requires graph_io",
+        ));
+    };
+    if spec.recovery != "aligned"
+        || plan.edges.is_none()
+        || !spec.reference_tables.is_empty()
+        || !plan.side_outputs.is_empty()
+        || !spec.fail_on_decode
+        || spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
+        || !spec.checkpoint.as_ref().is_some_and(|p| {
+            p.resume_latest && p.interval_ms.is_some_and(|n| (100..=1000).contains(&n))
+        })
+        || spec.restore.as_ref().is_some_and(|r| {
+            r.kind != "checkpoint"
+                || r.snapshot_id
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty() && s != "aligned")
+        })
+        || io
+            .sources
+            .values()
+            .any(|s| !matches!(s.kind.as_str(), "file" | "file_replay" | "replay"))
+        || io.sinks.values().any(|s| s.kind != "http" || s.skip_verify)
+        || io
+            .idle_after_ms
+            .is_some_and(|n| !(100..=86400000).contains(&n))
+    {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"durable time graph requires File inputs, verified required HTTP, independent directory, fail_on_decode, resume_latest and 100..1000 ms decisions; optional idle_after_ms=100..86400000; no historical replay/references/side outputs"));
     }
-    let manifest=sparrow_plan::CheckpointPlan::from_physical(plan)?;
-    if !manifest.is_time_graph() {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"graph has no supported durable time state"));}
-    for source in io.sources.values() {let mut single=spec.clone();single.graph_io=None;single.source=source.clone();resolve_file_contract(&single,RecoveryPolicy::Aligned)?;}
+    let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    if !manifest.is_time_graph() {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "graph has no supported durable time state",
+        ));
+    }
+    for source in io.sources.values() {
+        let mut single = spec.clone();
+        single.graph_io = None;
+        single.source = source.clone();
+        resolve_file_contract(&single, RecoveryPolicy::Aligned)?;
+    }
     Ok(())
 }
 
@@ -1116,8 +1436,9 @@ pub fn reject_named_delivery(name: &str) -> Result<DeliveryGuarantee> {
 /// Effective delivery + recovery + risk for a stored pipeline spec.
 pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
     let recovery = RecoveryPolicy::parse(&spec.recovery).unwrap_or(RecoveryPolicy::RestartFresh);
-    let reliable=cfg!(feature="jetstream") && spec.source.kind=="jetstream";
-    let replayable = matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") || reliable;
+    let reliable = cfg!(feature = "jetstream") && spec.source.kind == "jetstream";
+    let replayable =
+        matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") || reliable;
     let replay = if replayable {
         ReplaySupport::Replayable.as_str()
     } else {
@@ -1182,20 +1503,39 @@ fn reference_snapshot_version(spec: &PipelineSpec, plan: &PhysicalPlan) -> Resul
 
 /// Eligibility is a property of both the replayable source and the bound plan,
 /// independent of whether the stored spec currently requests aligned recovery.
-pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) -> serde_json::Value {
+pub fn effective_guarantees_with_plan(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
+    if plan.has_analysis() || plan.has_extended_aggs() {
+        value["aligned_eligible"] = serde_json::json!(false);
+        value["aligned_eligibility_reason"] =
+            serde_json::json!("bounded analysis operators have no published checkpoint profile");
+        value["analysis"] = serde_json::json!({"maturity":"development_preview","recovery":"restart_fresh_only","certified":false});
+        return value;
+    }
     if plan.has_new_windows() {
-        value["aligned_eligible"]=serde_json::json!(false);
+        value["aligned_eligible"] = serde_json::json!(false);
         value["aligned_eligibility_reason"]=serde_json::json!("new hopping-PT/sliding/session windows require restart_fresh; checkpoint/profile support is not declared");
-        value["windows"]=serde_json::json!({"maturity":"development_preview","recovery":"restart_fresh_only","session":"final_only_L0","buffered_rows_per_key_default":1024,"buffered_rows_per_key_max":16384});
+        value["windows"] = serde_json::json!({"maturity":"development_preview","recovery":"restart_fresh_only","session":"final_only_L0","buffered_rows_per_key_default":1024,"buffered_rows_per_key_max":16384});
         return value;
     }
     if plan.has_resample() {
         let checked = validate_resample_profile(spec, plan);
-        let version = sparrow_plan::CheckpointPlan::from_physical(plan).ok().and_then(|p|
-            sparrow_runtime::snapshot_version_for(&p, if spec.source.kind == "jetstream" {
-                sparrow_runtime::processing_cut::JETSTREAM_KIND
-            } else { sparrow_runtime::processing_cut::FILE_KIND }).ok());
+        let version = sparrow_plan::CheckpointPlan::from_physical(plan)
+            .ok()
+            .and_then(|p| {
+                sparrow_runtime::snapshot_version_for(
+                    &p,
+                    if spec.source.kind == "jetstream" {
+                        sparrow_runtime::processing_cut::JETSTREAM_KIND
+                    } else {
+                        sparrow_runtime::processing_cut::FILE_KIND
+                    },
+                )
+                .ok()
+            });
         value["aligned_eligible"] = serde_json::json!(checked.is_ok());
         value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
         value["resample"] = serde_json::json!({"maturity":"development_preview","certified":false,
@@ -1213,7 +1553,8 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
         if spec.source.kind == "mqtt" {
             let checked = validate_live_silence_profile(spec, plan);
             value["aligned_eligible"] = serde_json::json!(false);
-            value["aligned_eligibility_reason"] = serde_json::json!("MQTT live silence has no replay or checkpoint support");
+            value["aligned_eligibility_reason"] =
+                serde_json::json!("MQTT live silence has no replay or checkpoint support");
             value["silence"] = serde_json::json!({"maturity":"development_preview","certified":false,
                 "live_eligible":checked.is_ok(),"eligibility_reason":checked.err().map(|e|e.message),
                 "clock":"live_attempt_monotonic","snapshot_version":null,"scope":"MQTT_Source_then_Silence_then_optional_pure_Transform_then_HTTP",
@@ -1222,17 +1563,28 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
                 "freshness":"probe_response_less_than_gap/4; consumption_less_than_gap/2_from_probe_start",
                 "recovery":"restart_fresh; new_attempt_generation; full_new_grace; no_replay",
                 "retained":"ignored; no_registration_or_resumed; breaks_coverage"});
-            value["recovery_risk"] = serde_json::json!("live_best_effort; records_and_events_may_be_lost; no_durable_alarm_history");
+            value["recovery_risk"] = serde_json::json!(
+                "live_best_effort; records_and_events_may_be_lost; no_durable_alarm_history"
+            );
             return value;
         }
-        let checked=validate_observed_time_profile(spec,plan);
-        let version=sparrow_plan::CheckpointPlan::from_physical(plan).ok().and_then(|p|
-            sparrow_runtime::snapshot_version_for(&p,if spec.source.kind=="jetstream" {
-                sparrow_runtime::observed_cut::JETSTREAM_KIND
-            } else { sparrow_runtime::observed_cut::FILE_KIND }).ok());
-        value["aligned_eligible"]=serde_json::json!(checked.is_ok());
-        value["aligned_eligibility_reason"]=serde_json::json!(checked.err().map(|e|e.message));
-        value["silence"]=serde_json::json!({"maturity":"development_preview","certified":false,
+        let checked = validate_observed_time_profile(spec, plan);
+        let version = sparrow_plan::CheckpointPlan::from_physical(plan)
+            .ok()
+            .and_then(|p| {
+                sparrow_runtime::snapshot_version_for(
+                    &p,
+                    if spec.source.kind == "jetstream" {
+                        sparrow_runtime::observed_cut::JETSTREAM_KIND
+                    } else {
+                        sparrow_runtime::observed_cut::FILE_KIND
+                    },
+                )
+                .ok()
+            });
+        value["aligned_eligible"] = serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
+        value["silence"] = serde_json::json!({"maturity":"development_preview","certified":false,
             "snapshot_version":version,"clock":"paused_source_observed","cut_codec":"OFC1","decision_codec":"OFD1",
             "scope":"linear_File_append_only_or_JetStream; Source_then_Silence_then_optional_Transform_then_required_HTTP",
             "devices":"observed_keys_union_bounded_static_registry","events":["silent","resumed"],
@@ -1246,7 +1598,11 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
         value["recovery_risk"]=serde_json::json!("required_HTTP_may_repeat_before_CURRENT; deduplicate_by_output_identity; no_exactly_once");
         return value;
     }
-    if plan.stages.iter().any(|s| matches!(s,sparrow_plan::PhysicalStage::Iot {spec,..} if spec.is_alarm())) {
+    if plan
+        .stages
+        .iter()
+        .any(|s| matches!(s,sparrow_plan::PhysicalStage::Iot {spec,..} if spec.is_alarm()))
+    {
         value["alarm"] = serde_json::json!({"maturity":"development_preview","certified":false,
             "phases":["normal","pending","active","recovering"],"events":["activate","resolve","notify"],
             "episode_identity":["state_generation","operator","configured_key_values","per_key_episode"],
@@ -1256,22 +1612,28 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
             "timers":"two_logical_slots_per_key; due_before_input; condition_wins_equal_notification_deadline"});
     }
     if plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
-        let mut candidate=spec.clone();candidate.recovery="aligned".into();
+        let mut candidate = spec.clone();
+        candidate.recovery = "aligned".into();
         let checked = validate_time_graph_profile(&candidate, plan);
-        let version = sparrow_plan::CheckpointPlan::from_physical(plan).ok().and_then(|p|
-            sparrow_runtime::snapshot_version_for(&p, sparrow_runtime::graph_cut::KIND).ok());
+        let version = sparrow_plan::CheckpointPlan::from_physical(plan)
+            .ok()
+            .and_then(|p| {
+                sparrow_runtime::snapshot_version_for(&p, sparrow_runtime::graph_cut::KIND).ok()
+            });
         value["graph"] = serde_json::json!("dag");
         value["aligned_eligible"] = serde_json::json!(checked.is_ok());
         value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
-        if spec.recovery!="aligned" {
+        if spec.recovery != "aligned" {
             // Eligibility is not activation: ordinary live graphs still use
             // host time/ready-order and have no durable output identity.
-            value["checkpoint_participants"]=serde_json::json!({"active":false,"snapshot_version":null,
+            value["checkpoint_participants"] = serde_json::json!({"active":false,"snapshot_version":null,
                 "candidate_snapshot_version":version,"certified":false});
-            value["graph_time"]=serde_json::json!({"mode":"live_restart_fresh","durable_rounds":false,
+            value["graph_time"] = serde_json::json!({"mode":"live_restart_fresh","durable_rounds":false,
                 "stable_output_ids":false,"ordering":"legacy_ready_order"});
-            value["recovery_risk"]=serde_json::json!("restart_fresh_loses_graph_state");
-            if plan.has_iot() {value["iot"]=serde_json::json!({"recovery":"restart_fresh_empty_state_no_persisted_generation","ttl_micros":iot_ttls(plan)});}
+            value["recovery_risk"] = serde_json::json!("restart_fresh_loses_graph_state");
+            if plan.has_iot() {
+                value["iot"] = serde_json::json!({"recovery":"restart_fresh_empty_state_no_persisted_generation","ttl_micros":iot_ttls(plan)});
+            }
             return value;
         }
         value["checkpoint_participants"] = serde_json::json!({
@@ -1289,14 +1651,23 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
         return value;
     }
     if plan.has_timed_iot() || (spec.recovery == "aligned" && plan.has_processing_time_state()) {
-        let checked=validate_paused_time_profile(spec,plan);
+        let checked = validate_paused_time_profile(spec, plan);
         let manifest = sparrow_plan::CheckpointPlan::from_physical(plan).ok();
-        let version = manifest.as_ref().and_then(|p| sparrow_runtime::snapshot_version_for(p,
-            if spec.source.kind=="jetstream" { sparrow_runtime::processing_cut::JETSTREAM_KIND } else { sparrow_runtime::processing_cut::FILE_KIND }).ok());
-        value["aligned_eligible"]=serde_json::json!(checked.is_ok());
-        value["aligned_eligibility_reason"]=serde_json::json!(checked.err().map(|e|e.message));
+        let version = manifest.as_ref().and_then(|p| {
+            sparrow_runtime::snapshot_version_for(
+                p,
+                if spec.source.kind == "jetstream" {
+                    sparrow_runtime::processing_cut::JETSTREAM_KIND
+                } else {
+                    sparrow_runtime::processing_cut::FILE_KIND
+                },
+            )
+            .ok()
+        });
+        value["aligned_eligible"] = serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
         value["recovery_risk"]=serde_json::json!("required_HTTP_may_repeat_before_commit; deduplicate_by_output_identity; no_exactly_once");
-        value["iot"]=serde_json::json!({"operators":["hold_for","debounce","change_detect","deadband","hysteresis"],"clock":"paused_source_ordered",
+        value["iot"] = serde_json::json!({"operators":["hold_for","debounce","change_detect","deadband","hysteresis"],"clock":"paused_source_ordered",
             "snapshot_version":version,"maturity":"preview","certified":false,
             "profile":if manifest.as_ref().is_some_and(|p|p.is_single_timed_iot()) {"one_timed_state_linear_no_references"} else {"bounded_linear_time_states"},"recovery":"CURRENT_only; TIME_PENDING_required",
             "max_states":2,"windows":["processing_time_tumbling","count"],"ttl":"last_valid_input; expire_before_input_at_equal_cut",
@@ -1328,7 +1699,11 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
     let recovery = RecoveryPolicy::parse(&spec.recovery).unwrap_or(RecoveryPolicy::RestartFresh);
     let reliable_iot = cfg!(feature = "jetstream") && spec.source.kind == "jetstream";
     let unreferenced_iot_version = if plan_has_hysteresis(plan) {
-        if reliable_iot { 13 } else { 12 }
+        if reliable_iot {
+            13
+        } else {
+            12
+        }
     } else if reliable_iot {
         7
     } else {
@@ -1382,20 +1757,25 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
         });
     }
     if plan.edges.is_some() {
-        let mut aligned=spec.clone();aligned.recovery="aligned".into();
-        let eligibility=validate_aligned_plan(&aligned,plan);
-        value["graph"]=serde_json::json!("dag");
-        value["aligned_eligible"]=serde_json::json!(eligibility.is_ok());
-        value["aligned_eligibility_reason"]=serde_json::json!(eligibility.err().map_or_else(||"graph_required_file_count_participants".into(),|e|e.message));
+        let mut aligned = spec.clone();
+        aligned.recovery = "aligned".into();
+        let eligibility = validate_aligned_plan(&aligned, plan);
+        value["graph"] = serde_json::json!("dag");
+        value["aligned_eligible"] = serde_json::json!(eligibility.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(eligibility.err().map_or_else(
+            || "graph_required_file_count_participants".into(),
+            |e| e.message
+        ));
         let iot = plan.has_iot();
         let iot_ttl = iot_ttls(plan);
-        let snapshot_version = reference_version.unwrap_or(if iot {
-            iot_snapshot_version
+        let snapshot_version =
+            reference_version.unwrap_or(if iot { iot_snapshot_version } else { 5 });
+        let manifest = if reference_version.is_some() {
+            "CPL3"
         } else {
-            5
-        });
-        let manifest = if reference_version.is_some() { "CPL3" } else { "CPL1/CP01DAG1" };
-        value["checkpoint_participants"]=serde_json::json!({
+            "CPL1/CP01DAG1"
+        };
+        value["checkpoint_participants"] = serde_json::json!({
             "scope":if reference_version.is_some() {"graph_File_required_HTTP_static_Lookup_Count_or_IoT"} else if iot {"graph_File_required_HTTP_stateless_Count_or_IoT"} else {"graph_File_required_HTTP_stateless_or_Count"},
             "snapshot_version":snapshot_version,
             "manifest":manifest,
@@ -1413,12 +1793,27 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
                 "ttl_micros":iot_ttl
             });
         }
-        value["recovery_risk"]=serde_json::json!(if spec.recovery=="aligned"{"external_outputs_may_repeat; no_cross_sink_rollback; Count_Union_interleaving_not_global_order"}else{"restart_fresh_loses_graph_state"});
-        value["replay"]=serde_json::json!(if spec.graph_io.as_ref().is_some_and(|io|io.sources.values().all(|s|matches!(s.kind.as_str(),"file"|"file_replay"|"replay"))){"replayable"}else{"unsupported"});
+        value["recovery_risk"] = serde_json::json!(if spec.recovery == "aligned" {
+            "external_outputs_may_repeat; no_cross_sink_rollback; Count_Union_interleaving_not_global_order"
+        } else {
+            "restart_fresh_loses_graph_state"
+        });
+        value["replay"] = serde_json::json!(if spec.graph_io.as_ref().is_some_and(|io| io
+            .sources
+            .values()
+            .all(|s| matches!(s.kind.as_str(), "file" | "file_replay" | "replay")))
+        {
+            "replayable"
+        } else {
+            "unsupported"
+        });
         return value;
     }
-    if spec.source.kind=="jetstream" {
-        let accepted=spec.basic_check().and_then(|_|spec.check_delivery()).and_then(|_|validate_aligned_plan(spec,plan));
+    if spec.source.kind == "jetstream" {
+        let accepted = spec
+            .basic_check()
+            .and_then(|_| spec.check_delivery())
+            .and_then(|_| validate_aligned_plan(spec, plan));
         let iot = plan.has_iot();
         let accepted_ok = accepted.is_ok();
         let eligibility_reason = accepted
@@ -1429,20 +1824,21 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
                 if let Some(version) = reference_version {
                     format!("jetstream_static_reference_dependencies_profile{version}")
                 } else if iot {
-                    format!("jetstream_reliable_iot_v{iot_snapshot_version}_ttl0_count_or_iot_state")
+                    format!(
+                        "jetstream_reliable_iot_v{iot_snapshot_version}_ttl0_count_or_iot_state"
+                    )
                 } else {
                     "jetstream_zero_or_one_two_count_windows".into()
                 }
             });
-        value["requested_delivery"]=serde_json::json!(spec.delivery);
-        if !accepted_ok {value["delivery"]=serde_json::json!("unavailable");}
-        value["aligned_eligible"]=serde_json::json!(accepted_ok);
-        value["aligned_eligibility_reason"]=serde_json::json!(eligibility_reason);
-        let snapshot_version = reference_version.unwrap_or(if iot {
-            iot_snapshot_version
-        } else {
-            4
-        });
+        value["requested_delivery"] = serde_json::json!(spec.delivery);
+        if !accepted_ok {
+            value["delivery"] = serde_json::json!("unavailable");
+        }
+        value["aligned_eligible"] = serde_json::json!(accepted_ok);
+        value["aligned_eligibility_reason"] = serde_json::json!(eligibility_reason);
+        let snapshot_version =
+            reference_version.unwrap_or(if iot { iot_snapshot_version } else { 4 });
         let profile = reference_version.map_or_else(
             || {
                 if plan_has_hysteresis(plan) {
@@ -1455,7 +1851,7 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
             },
             |version| format!("reference_jetstream_v{version}"),
         );
-        value["checkpoint_participants"]=serde_json::json!({"snapshot_version":snapshot_version,"profile":profile,"manifest_version":if reference_version.is_some() {"CPL3"} else {"CPL1"},"scope":if reference_version.is_some() {"single_jetstream_static_reference_required_http"} else if iot {"single_jetstream_single_required_http_sink_iot"} else {"single_jetstream_single_required_http_sink"},
+        value["checkpoint_participants"] = serde_json::json!({"snapshot_version":snapshot_version,"profile":profile,"manifest_version":if reference_version.is_some() {"CPL3"} else {"CPL1"},"scope":if reference_version.is_some() {"single_jetstream_static_reference_required_http"} else if iot {"single_jetstream_single_required_http_sink_iot"} else {"single_jetstream_single_required_http_sink"},
             "restore_compatibility":if iot {iot_restore_compatibility} else {"full_computation_and_source_reader_binding"},"downstream_changes":if iot {iot_downstream_changes} else {"rejected_until_explicit_lineage_fork"},
             "confirmation":"HTTP_2xx_acceptance_not_business_commit","source_ack":"after_durable_checkpoint","output_ids":"128bit_epoch_64bit_ordinal",
             "certified":false,"maturity":"preview","poison":"fail_then_finite_retry_or_held","durable_outbox":false,"dlq":false});
@@ -1470,9 +1866,9 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
                 "ttl_micros":iot_ttls(plan)
             });
         }
-        if let Some(config)=&spec.source.jetstream {
-            let idle_max=config.idle_backoff_max_ms.unwrap_or(250);
-            value["jetstream_execution"]=serde_json::json!({
+        if let Some(config) = &spec.source.jetstream {
+            let idle_max = config.idle_backoff_max_ms.unwrap_or(250);
+            value["jetstream_execution"] = serde_json::json!({
                 "input_batching":"already_ready_rows_bounded_by_kernel_and_pull",
                 "idle_backoff_ms":{"initial":5,"maximum":idle_max,"nonempty_fetch":0},
                 "idle_steady_pulls_per_second_max":1000u64.div_ceil(idle_max.max(1)),
@@ -1503,23 +1899,29 @@ pub fn effective_guarantees_with_plan(spec: &PipelineSpec, plan: &PhysicalPlan) 
                 value["aligned_eligible"] = serde_json::json!(true);
                 let iot = plan.has_iot();
                 let iot_ttl = iot_ttls(plan);
-                value["aligned_eligibility_reason"] = serde_json::json!(if let Some(version) = reference_version {
-                    format!("static_reference_dependencies_profile{version}")
-                } else if iot {
-                    format!("IoT_state_participants_v{iot_snapshot_version}")
-                } else {
-                    match manifest.states.len() {
-                        0=>"zero_state_file_cut",
-                        1=>"single_supported_window",
-                        _=>"two_count_window_participants",
-                    }.to_string()
-                });
+                value["aligned_eligibility_reason"] =
+                    serde_json::json!(if let Some(version) = reference_version {
+                        format!("static_reference_dependencies_profile{version}")
+                    } else if iot {
+                        format!("IoT_state_participants_v{iot_snapshot_version}")
+                    } else {
+                        match manifest.states.len() {
+                            0 => "zero_state_file_cut",
+                            1 => "single_supported_window",
+                            _ => "two_count_window_participants",
+                        }
+                        .to_string()
+                    });
                 let snapshot_version = reference_version.unwrap_or(if iot {
                     iot_snapshot_version
                 } else {
                     sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION
                 });
-                let manifest_version = if reference_version.is_some() { "CPL3" } else { "CPL1" };
+                let manifest_version = if reference_version.is_some() {
+                    "CPL3"
+                } else {
+                    "CPL1"
+                };
                 value["checkpoint_participants"] = serde_json::json!({"source":manifest.source.raw(),"required_sink":manifest.sink.raw(),
                     "snapshot_version":snapshot_version,
                     "manifest_version":manifest_version,"semantics_version":if iot {"CP01_full_plan_IoT_state"} else if reference_version.is_some() {"CP01_full_plan_static_reference_dependencies"} else {"CP01+RCP2"},"restore_compatibility":if iot {iot_restore_compatibility} else if reference_version.is_some() {"source_and_exact_static_reference_revision_sha256_runtime_crc; separate profile-specific directory"} else {"source_and_all_state_upstream_prefixes; plain_CP01_full_plan_strict"},
@@ -1601,17 +2003,30 @@ mod tests {
             "source": {"kind": "mqtt", "host": "127.0.0.1", "port": 1883},
             "sink": {"kind": "log"}
         });
-        let schema = Schema::new(SchemaId::new(1), vec![sparrow_model::Field::new(
-            sparrow_model::FieldId::new(1), "device_id", sparrow_model::DataType::Utf8, false,
-        )]).unwrap();
+        let schema = Schema::new(
+            SchemaId::new(1),
+            vec![sparrow_model::Field::new(
+                sparrow_model::FieldId::new(1),
+                "device_id",
+                sparrow_model::DataType::Utf8,
+                false,
+            )],
+        )
+        .unwrap();
         let spec = PipelineSpec::from_json(&serde_json::to_vec(&base).unwrap()).unwrap();
         assert_eq!(spec.source.inbox_wait_ms, None);
         let default_cfg = mqtt_config(&spec.source, schema.clone(), None, "budget").unwrap();
-        assert_eq!(default_cfg.inbox_bytes, Some(256*1024));
+        assert_eq!(default_cfg.inbox_bytes, Some(256 * 1024));
         assert!(!default_cfg.tcp_quickack);
-        assert!(serde_json::to_value(&spec).unwrap()["source"].get("inbox_wait_ms").is_none());
-        assert_eq!(mqtt_config(&spec.source, schema.clone(), None, "wait").unwrap().inbox_wait_timeout,
-            std::time::Duration::from_millis(5));
+        assert!(serde_json::to_value(&spec).unwrap()["source"]
+            .get("inbox_wait_ms")
+            .is_none());
+        assert_eq!(
+            mqtt_config(&spec.source, schema.clone(), None, "wait")
+                .unwrap()
+                .inbox_wait_timeout,
+            std::time::Duration::from_millis(5)
+        );
         for ms in [0, 5, 1000] {
             let mut value = base.clone();
             value["source"]["inbox_wait_ms"] = serde_json::json!(ms);
@@ -1619,7 +2034,12 @@ mod tests {
             let cfg = mqtt_config(&spec.source, schema.clone(), None, "wait").unwrap();
             assert_eq!(cfg.inbox_wait_timeout, std::time::Duration::from_millis(ms));
         }
-        for ms in [serde_json::json!(1001), serde_json::json!(u64::MAX), serde_json::json!(-1), serde_json::json!(0.5)] {
+        for ms in [
+            serde_json::json!(1001),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(-1),
+            serde_json::json!(0.5),
+        ] {
             let mut value = base.clone();
             value["source"]["inbox_wait_ms"] = ms;
             assert!(PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
@@ -1627,7 +2047,12 @@ mod tests {
         let mut value = base;
         value["source"]["kind"] = serde_json::json!("file");
         value["source"]["inbox_wait_ms"] = serde_json::json!(5);
-        assert_eq!(PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err().code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
     }
 
     #[test]

@@ -34,6 +34,15 @@ pub fn bind_sql(
                 "empty SQL statement",
             ));
         }
+        if crate::analysis::accepts(&statements[0]) {
+            if statements.len() != 1 {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "exactly one analysis SELECT is required",
+                ));
+            }
+            return crate::analysis::bind(&statements[0], catalog, pipeline, revision);
+        }
         match classify_statement(&statements[0]) {
             SqlFamily::V03 => {
                 return crate::bind_v03::bind_sql_v03(sql, catalog, pipeline, revision);
@@ -88,7 +97,9 @@ fn classify_statement(stmt: &Statement) -> SqlFamily {
     if let Some(name) = group_window_fn(select) {
         return match name.as_str() {
             "hop" | "sliding" | "session" => SqlFamily::V03,
-            "count_window" if matches!(&select.group_by,sqlparser::ast::GroupByExpr::Expressions(exprs,_) if exprs.iter().any(|e|matches!(e,SqlExpr::Function(f) if f.name.to_string().eq_ignore_ascii_case("count_window") && matches!(&f.args,FunctionArguments::List(args) if args.args.len()!=1)))) => SqlFamily::V03,
+            "count_window" if matches!(&select.group_by,sqlparser::ast::GroupByExpr::Expressions(exprs,_) if exprs.iter().any(|e|matches!(e,SqlExpr::Function(f) if f.name.to_string().eq_ignore_ascii_case("count_window") && matches!(&f.args,FunctionArguments::List(args) if args.args.len()!=1)))) => {
+                SqlFamily::V03
+            }
             "tumble" if group_tumble_is_event_time(select) => SqlFamily::V03,
             "tumble" | "count_window" => SqlFamily::V02,
             _ => SqlFamily::V02,
@@ -411,17 +422,54 @@ fn sql_expr(expr: &SqlExpr) -> Result<Expr> {
                 }),
             }
         }
-        SqlExpr::Substring { expr, substring_from, substring_for, .. } => {
-            let from=substring_from.as_ref().ok_or_else(||SparrowError::new(ErrorCode::FeatureUnavailable,"substring requires explicit start and count"))?;
-            let count=substring_for.as_ref().ok_or_else(||SparrowError::new(ErrorCode::FeatureUnavailable,"substring requires explicit start and count"))?;
-            Ok(Expr::Call{name:"substring".into(),args:vec![sql_expr(expr)?,sql_expr(from)?,sql_expr(count)?]})
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let from = substring_from.as_ref().ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "substring requires explicit start and count",
+                )
+            })?;
+            let count = substring_for.as_ref().ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "substring requires explicit start and count",
+                )
+            })?;
+            Ok(Expr::Call {
+                name: "substring".into(),
+                args: vec![sql_expr(expr)?, sql_expr(from)?, sql_expr(count)?],
+            })
         }
-        SqlExpr::Trim { expr, trim_where:None, trim_what:None, trim_characters:None } =>
-            Ok(Expr::Call{name:"trim".into(),args:vec![sql_expr(expr)?]}),
-        SqlExpr::Ceil {expr,field:sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime)} =>
-            Ok(Expr::Call{name:"ceil".into(),args:vec![sql_expr(expr)?]}),
-        SqlExpr::Floor {expr,field:sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime)} =>
-            Ok(Expr::Call{name:"floor".into(),args:vec![sql_expr(expr)?]}),
+        SqlExpr::Trim {
+            expr,
+            trim_where: None,
+            trim_what: None,
+            trim_characters: None,
+        } => Ok(Expr::Call {
+            name: "trim".into(),
+            args: vec![sql_expr(expr)?],
+        }),
+        SqlExpr::Ceil {
+            expr,
+            field:
+                sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime),
+        } => Ok(Expr::Call {
+            name: "ceil".into(),
+            args: vec![sql_expr(expr)?],
+        }),
+        SqlExpr::Floor {
+            expr,
+            field:
+                sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime),
+        } => Ok(Expr::Call {
+            name: "floor".into(),
+            args: vec![sql_expr(expr)?],
+        }),
         SqlExpr::Function(func) => map_function(func),
         other => Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,
@@ -433,11 +481,20 @@ fn sql_expr(expr: &SqlExpr) -> Result<Expr> {
 fn map_function(func: &Function) -> Result<Expr> {
     let name = func.name.to_string();
     if crate::g0::additive_function(&name.to_ascii_lowercase()) {
-        let simple_args=matches!(&func.args,FunctionArguments::List(list) if list.duplicate_treatment.is_none()
+        let simple_args = matches!(&func.args,FunctionArguments::List(list) if list.duplicate_treatment.is_none()
             && list.clauses.is_empty() && list.args.iter().all(|arg|matches!(arg,FunctionArg::Unnamed(FunctionArgExpr::Expr(_)))));
-        if !simple_args || !matches!(func.parameters,FunctionArguments::None) || func.uses_odbc_syntax
-            || func.filter.is_some() || func.over.is_some() || func.null_treatment.is_some() || !func.within_group.is_empty() {
-            return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"pure builtins require positional scalar arguments without modifiers"));
+        if !simple_args
+            || !matches!(func.parameters, FunctionArguments::None)
+            || func.uses_odbc_syntax
+            || func.filter.is_some()
+            || func.over.is_some()
+            || func.null_treatment.is_some()
+            || !func.within_group.is_empty()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "pure builtins require positional scalar arguments without modifiers",
+            ));
         }
     }
     let mut args = Vec::new();
@@ -616,7 +673,12 @@ mod tests {
             "SELECT json_object('a', 1, 'b') AS x FROM sensor_readings",
             "SELECT substring(device_id FROM 1) AS x FROM sensor_readings",
             "SELECT trim(LEADING 'a' FROM device_id) AS x FROM sensor_readings",
-        ] {assert!(bind_sql(sql,&catalog(),PipelineId::new(1),RevisionId::new(1)).is_err(),"{sql}");}
+        ] {
+            assert!(
+                bind_sql(sql, &catalog(), PipelineId::new(1), RevisionId::new(1)).is_err(),
+                "{sql}"
+            );
+        }
     }
 
     fn join_catalog() -> Catalog {

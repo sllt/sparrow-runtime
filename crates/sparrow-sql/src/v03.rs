@@ -2,13 +2,13 @@
 //! versioned FOR SYSTEM_TIME AS OF lookup and bounded sliding/session. Retract / stream-stream
 //! join stay rejected.
 
+use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
     TableVersion, TableWithJoins,
 };
 use sqlparser::parser::Parser;
-use sparrow_model::error::{ErrorCode, Result, SparrowError};
 
 use crate::g0::{g0_dialect, G0Verdict};
 
@@ -24,7 +24,19 @@ const SCALAR_FUNCS: &[&str] = &[
     "least",
 ];
 
-const AGG_FUNCS: &[&str] = &["count", "sum", "avg", "min", "max"];
+const AGG_FUNCS: &[&str] = &[
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "first",
+    "last",
+    "var_pop",
+    "var_samp",
+    "stddev_pop",
+    "stddev_samp",
+];
 
 const REJECTED: &[&str] = &[
     "retract",
@@ -40,9 +52,8 @@ const REJECTED: &[&str] = &[
 ];
 
 pub fn check_sql_v03(sql: &str) -> Result<G0Verdict> {
-    let statements = Parser::parse_sql(&g0_dialect(), sql).map_err(|e| {
-        SparrowError::new(ErrorCode::InvalidArgument, format!("parse error: {e}"))
-    })?;
+    let statements = Parser::parse_sql(&g0_dialect(), sql)
+        .map_err(|e| SparrowError::new(ErrorCode::InvalidArgument, format!("parse error: {e}")))?;
     if statements.len() != 1 {
         return Ok(G0Verdict {
             accepted: false,
@@ -90,9 +101,7 @@ fn check_select(select: &Select) -> Result<G0Verdict> {
     }
     let windowed = group_is_windowed(&select.group_by)?;
     if !matches!(&select.group_by, GroupByExpr::Expressions(e, _) if e.is_empty()) && !windowed {
-        return reject(
-            "unbounded GROUP BY without TUMBLE/HOP/COUNT_WINDOW is rejected",
-        );
+        return reject("unbounded GROUP BY without TUMBLE/HOP/COUNT_WINDOW is rejected");
     }
     if windowed {
         if let Some(v) = group_window_reject(&select.group_by)? {
@@ -123,7 +132,9 @@ fn join_reject(from: &TableWithJoins) -> Result<Option<G0Verdict>> {
     }
     if let Some(j) = from.joins.first() {
         match &j.join_operator {
-            JoinOperator::FullOuter(_) | JoinOperator::RightOuter(_) | JoinOperator::CrossJoin(_) => {
+            JoinOperator::FullOuter(_)
+            | JoinOperator::RightOuter(_)
+            | JoinOperator::CrossJoin(_) => {
                 return Ok(Some(rejected(
                     "FULL/RIGHT/CROSS JOIN is not part of V0.3 (stream-stream join is out)",
                 )));
@@ -159,7 +170,10 @@ fn group_is_windowed(g: &GroupByExpr) -> Result<bool> {
 
 fn is_window_fn(f: &Function) -> bool {
     let n = f.name.to_string().to_ascii_lowercase();
-    matches!(n.as_str(),"tumble"|"count_window"|"hop"|"sliding"|"session")
+    matches!(
+        n.as_str(),
+        "tumble" | "count_window" | "hop" | "sliding" | "session"
+    )
 }
 
 fn group_window_reject(g: &GroupByExpr) -> Result<Option<G0Verdict>> {
@@ -169,13 +183,19 @@ fn group_window_reject(g: &GroupByExpr) -> Result<Option<G0Verdict>> {
     for e in exprs {
         if let Expr::Function(f) = e {
             let n = f.name.to_string().to_ascii_lowercase();
-            if matches!(n.as_str(),"sliding"|"session") {
-                let count=match &f.args {FunctionArguments::List(args)=>args.args.len(),_=>0};
-                if (n=="session" && count!=3) || (n=="sliding" && !(2..=3).contains(&count)) {
+            if matches!(n.as_str(), "sliding" | "session") {
+                let count = match &f.args {
+                    FunctionArguments::List(args) => args.args.len(),
+                    _ => 0,
+                };
+                if (n == "session" && count != 3) || (n == "sliding" && !(2..=3).contains(&count)) {
                     return Ok(Some(rejected("SESSION needs (clock, gap, max_duration); SLIDING needs (clock, size [, delay])")));
                 }
             }
-            if matches!(n.as_str(),"tumble"|"hop"|"count_window"|"sliding"|"session") {
+            if matches!(
+                n.as_str(),
+                "tumble" | "hop" | "count_window" | "sliding" | "session"
+            ) {
                 continue;
             }
             if AGG_FUNCS.contains(&n.as_str()) {
@@ -200,7 +220,10 @@ fn proj_reject(item: &SelectItem, windowed: bool) -> Result<Option<G0Verdict>> {
 
 fn expr_reject(expr: &Expr, windowed: bool) -> Result<Option<G0Verdict>> {
     match expr {
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) | Expr::TypedString(_)
+        Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::TypedString(_)
         | Expr::Interval(_) => Ok(None),
         Expr::IsNull(i) | Expr::IsNotNull(i) | Expr::UnaryOp { expr: i, .. } | Expr::Nested(i) => {
             expr_reject(i, windowed)
@@ -227,7 +250,7 @@ fn func_reject(func: &Function, windowed: bool) -> Result<Option<G0Verdict>> {
             "function '{name}' is not part of Sparrow SQL v0.3"
         ))));
     }
-    if matches!(name.as_str(),"tumble"|"hop"|"sliding"|"session") {
+    if matches!(name.as_str(), "tumble" | "hop" | "sliding" | "session") {
         return Ok(Some(rejected(
             "TUMBLE/HOP belong in GROUP BY, not the SELECT list",
         )));
@@ -270,9 +293,9 @@ fn walk_args(func: &Function, windowed: bool) -> Result<Option<G0Verdict>> {
             Ok(None)
         }
         FunctionArguments::None => Ok(None),
-        FunctionArguments::Subquery(_) => {
-            Ok(Some(rejected("function subquery args are not part of v0.3")))
-        }
+        FunctionArguments::Subquery(_) => Ok(Some(rejected(
+            "function subquery args are not part of v0.3",
+        ))),
     }
 }
 

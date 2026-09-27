@@ -10,6 +10,7 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 - Event-time tumbling + hopping windows, watermarks, holdback, late side output
 - Processing-time tumbling windows and count windows (arrival-order; they do **not** impersonate event-time)
 - Window completion Preview: PT hopping, sliding count, per-event PT/ET sliding and bounded PT/ET sessions; **restart_fresh only**, see [`docs/WINDOWS.md`](docs/WINDOWS.md) for semantics and validation status
+- Bounded analysis Preview: collection/encoding functions, UNNEST, two-source ET interval/window inner/left joins, six additional aggregates and an independently admitted finite-query API. See [`docs/ANALYSIS.md`](docs/ANALYSIS.md) for limits and matching validation; new operators/aggregates are **restart_fresh only**, not production-certified.
 - Incremental COUNT/SUM/AVG/MIN/MAX (checked integer overflow)
 - Versioned as-of-event-time lookup in embedded plans (not eligible for current Server aligned restore)
 - Aligned single-job checkpoint (`aligned`) for Replayable **File**: zero state, one Count/ET window, or two Count windows in a linear chain — **not** default exactly-once
@@ -187,7 +188,7 @@ release.
 
 **Not shipped:** WASM operator runtime (optional spike under
 `experiments/wasm-spike/`, off default build), Graph Designer UI, session
-late merge, retract, stream-stream join, distributed shuffle. NATS JetStream is an optional, default-off Preview; see [`docs/JETSTREAM.md`](docs/JETSTREAM.md).
+late merge, retract, unrestricted/recoverable stream-stream join, distributed shuffle. Bounded fresh-only Join is described in [`docs/ANALYSIS.md`](docs/ANALYSIS.md). NATS JetStream is an optional, default-off Preview; see [`docs/JETSTREAM.md`](docs/JETSTREAM.md).
 
 See `docs/v1-report.md`.
 

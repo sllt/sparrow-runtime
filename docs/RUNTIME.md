@@ -1,5 +1,7 @@
 # Runtime ownership (A3 / A4)
 
+2026-09-27 有界分析Preview：UNNEST保留单个输入batch、逐行计费续行；双输入ET Join分别接收水位，Idle不证明无匹配，Left未决行约束输出水位。行/key/输出fan-out都有额度，清理/取消退还所有权；新future和扩展聚合冷路径Box先计费，旧codec不变。有限查询使用独立Kernel、总工作计数及2个准入槽，响应字节持有额度/槽直到发完，取消后join查询任务才释放worker。新算子/聚合仅restart_fresh；957/45及新20×5通过，合同和未实现项见[ANALYSIS](ANALYSIS.md)，精确[验证范围](PRODUCTION.md#analysis-validation)。没有新的性能/长稳/发行放行结论。
+
 2026-09-27 窗口补齐Preview已完成本批自查与验证：PT hopping、SlidingCount、PT/ET逐事件Sliding、PT/ET Session；匹配候选937项回归、44项no-demo及19×5专项通过。新窗口仅 `restart_fresh`，Control、CheckpointPlan、PlanLayout复用判定、Kernel及新窗口旧codec恢复入口均明确拒绝aligned/restore。PT hopping复用增量store；其他新族使用独立冷路径，保存有界、detached聚合输入，以支持MIN/MAX和乱序Session重分段；key/event/deadline索引、候选、输出分别计费，按key/rows/bytes/timers上限失败，不静默丢弃。旧窗口快照编码不变，匹配旧恢复回归通过。详见 [窗口合同、初次失败及最终证据](WINDOWS.md)；没有新族容量/长稳或整体生产认证。
 
 **2026-09-23 时间型 DAG（限定 Preview 已验收）**：独立 v18/PT、v19/ET 使用 GTD1 决策日志和 GTC1 聚合 cut，持久化来源时间/idle/EOF、固定边序 Union progress 与各 Sink 输出 cursor。File actor 先记录再发布一轮，所有状态/barrier/真实 HTTP flush 到齐后提交 CURRENT；ET future-skew 使用已记录墙钟，PT 使用停机暂停时钟。新协议不改变旧 Union ready-order 或扩大默认预算。完整范围、内存边界、EOF 和重复输出合同见 [DAG](DAG.md#time-graph-recovery)；774/44、专项/真实故障/旧矩阵及原三组 ABBA 通过，见 [匹配证据](PRODUCTION.md#time-graph-validation)。仍非目标容量、长稳或生产认证。

@@ -9,3 +9,5 @@ description = "Sparrow expression IR and scalar evaluator (G1a-thin in M0)"
 sparrow-model.workspace = true
 sparrow-formats.workspace = true
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+base64 = "0.22"
+ring = "0.17"

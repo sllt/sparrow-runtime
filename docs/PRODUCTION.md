@@ -4,6 +4,20 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="analysis-validation"></a>
+## 函数与有界分析：2026-09-27 限定 Preview
+
+验证时基线为 `728b228`，本批当时是该提交之后的工作区候选；后续提交不改写验证指纹，无push/tag。服务器 `box@100.64.0.19`，证据根 `/workspace/bench-compare/analysis-20260927-lPMZOQ`，最终源码目录 `source-r4`；目录名不是额外版本/性能承诺。440个代码/构建/测试文件由 `source-final.sha256`逐一核对，本地与服务器一致，清单自身SHA-256为 `270f688f783ffd1512532b9905552b712c65c0f4790b47fe793432042ca2981a`；文档验收更新另存，不改测试源码。
+
+- 默认12成员、JetStream feature、locked Release：**957 passed / 21 ignored**，`tests-final.log/.exit`（0）。未用 `--workspace`混入实验包，未把ignored的真实broker/介质测试算作通过。
+- 独立无demo Server/CLI：**45 passed / 0 ignored**，`no-demo-final.log/.exit`（0）。命令为 `cargo test --locked --release --quiet --no-default-features -p sparrow-server -p sparrow-cli`，包括新API集成测试，不仅是lib测试。
+- 同一最终源码/feature编译结果，新 `analysis_` 清单20项×5轮：**100 passed / 0 ignored**，`repeat-final.log/.exit`（0）。包括真实双File→Join→required HTTP、认证查询API、独立Kernel/响应准入、取消/额度退款，及独立数学oracle、SQL/Graph/恢复拒绝矩阵；不是20种压力档或长稳。
+- 全量命令：`cargo test --locked --release --quiet --no-fail-fast --features sparrow-server/jetstream`；重复命令在同一范围增加过滤 `analysis_`，最后做no-demo入口验证。本机未进行Cargo/Go编译；未重启或修改现有服务。
+- 初轮 `tests-r1/r2` 暴露新枚举漏分支与新future尾表达式借用，已修复。首个可执行全量 `tests-r3` 有两个新增Control失败：SQL Join的graph_io被旧“仅Graph authoring”校验拒绝，以及测试把Dynamic UInt64正整数交给旧受限CAST。前者开放SQL/Graph共同绑定后仍严格核验物理端口；后者改用已有有范围检查的`to_int64`，不暗改旧CAST。原始失败日志保留，后续`tests-r4`及最终全部通过。
+- 自查另修正Join双侧时间字段的独立传播、`join_time`下游窗口lineage、typed Timestamp UNNEST、ordinal别名冲突、SQL表修饰拒绝及线性UNNEST元数据预留，并补对应功能/边界测试。
+
+限定功能合同见[ANALYSIS](ANALYSIS.md)。新增UNNEST/Join/聚合无恢复codec，不能继承旧profile资格。**NOT RUN**：新Join/展开容量、ABBA性能门禁、独立生产打包/外部CLI进程矩阵、TLS/WAN、24/72小时长稳、全新SIGKILL恢复、Clippy零告警和整体发行认证。JetStream10k/20k专项继续按用户要求暂停；没有用本批通过改写历史高档失败。集合函数和Join保守额度/扫描成本另记[OPT-016](OPTIMIZATION_BACKLOG.md#opt-016)。
+
 <a id="capacity-validation"></a>
 ## 可靠链路与容量：2026-09-26 s4（高负载仍有边界）
 

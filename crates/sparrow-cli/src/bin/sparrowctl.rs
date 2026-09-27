@@ -107,7 +107,7 @@ fn parse(args: &[String]) -> Result<Command> {
         ["capabilities"] => (Method::GET, vec!["capabilities".into()], None),
         ["pipelines"] => (Method::GET, vec!["pipelines".into()], None),
         ["streams"] => (Method::GET, vec!["streams".into()], None),
-        ["validate", file] | ["explain", file] => (
+        ["validate", file] | ["explain", file] | ["query", file] => (
             Method::POST,
             vec![positional[0].into()],
             Some(read_input(file)?),
@@ -238,7 +238,7 @@ fn help() {
     println!(
         "sparrowctl — authenticated JSON management client\n\
 commands: health | capabilities | streams | pipelines\n\
-  validate FILE | explain FILE | put-stream NAME FILE\n\
+  validate FILE | explain FILE | query FILE | put-stream NAME FILE\n\
   put-pipeline NAME FILE [--if-match ETAG]\n\
   status NAME | diagnose NAME [--output NEW_FILE] | checkpoints NAME\n\
   start NAME [--revision N] | stop NAME | kill NAME\n\

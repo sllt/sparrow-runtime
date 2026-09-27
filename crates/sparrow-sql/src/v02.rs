@@ -1,13 +1,13 @@
 //! Sparrow SQL v0.2 gate: PT windows, count windows, incremental aggs,
 //! and static lookup JOIN. Event-time / hop / session / watermark stay rejected.
 
+use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
     TableWithJoins,
 };
 use sqlparser::parser::Parser;
-use sparrow_model::error::{ErrorCode, Result, SparrowError};
 
 use crate::g0::{g0_dialect, G0Verdict};
 
@@ -23,7 +23,19 @@ const SCALAR_FUNCS: &[&str] = &[
     "least",
 ];
 
-const AGG_FUNCS: &[&str] = &["count", "sum", "avg", "min", "max"];
+const AGG_FUNCS: &[&str] = &[
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "first",
+    "last",
+    "var_pop",
+    "var_samp",
+    "stddev_pop",
+    "stddev_samp",
+];
 
 const REJECTED: &[&str] = &[
     "hop",
@@ -41,9 +53,8 @@ const REJECTED: &[&str] = &[
 ];
 
 pub fn check_sql_v02(sql: &str) -> Result<G0Verdict> {
-    let statements = Parser::parse_sql(&g0_dialect(), sql).map_err(|e| {
-        SparrowError::new(ErrorCode::InvalidArgument, format!("parse error: {e}"))
-    })?;
+    let statements = Parser::parse_sql(&g0_dialect(), sql)
+        .map_err(|e| SparrowError::new(ErrorCode::InvalidArgument, format!("parse error: {e}")))?;
     if statements.len() != 1 {
         return Ok(G0Verdict {
             accepted: false,
@@ -78,7 +89,9 @@ fn check_query(query: &Query) -> Result<G0Verdict> {
 
 fn check_select(select: &Select) -> Result<G0Verdict> {
     if select.distinct.is_some() {
-        return reject("SELECT DISTINCT is not part of Sparrow SQL v0.2 (use bounded DEDUP in Graph)");
+        return reject(
+            "SELECT DISTINCT is not part of Sparrow SQL v0.2 (use bounded DEDUP in Graph)",
+        );
     }
     if select.having.is_some() {
         return reject("HAVING is not part of Sparrow SQL v0.2");
@@ -119,11 +132,15 @@ fn check_select(select: &Select) -> Result<G0Verdict> {
 
 fn join_reject(from: &TableWithJoins) -> Result<Option<G0Verdict>> {
     if from.joins.len() > 1 {
-        return Ok(Some(rejected("only one static lookup JOIN is part of V0.2")));
+        return Ok(Some(rejected(
+            "only one static lookup JOIN is part of V0.2",
+        )));
     }
     if let Some(j) = from.joins.first() {
         match &j.join_operator {
-            JoinOperator::FullOuter(_) | JoinOperator::RightOuter(_) | JoinOperator::CrossJoin(_) => {
+            JoinOperator::FullOuter(_)
+            | JoinOperator::RightOuter(_)
+            | JoinOperator::CrossJoin(_) => {
                 return Ok(Some(rejected(
                     "FULL/RIGHT/CROSS JOIN is not part of V0.2 (stream-stream join is out)",
                 )));
@@ -156,9 +173,9 @@ fn join_reject(from: &TableWithJoins) -> Result<Option<G0Verdict>> {
 
 fn group_is_windowed(g: &GroupByExpr) -> Result<bool> {
     match g {
-        GroupByExpr::Expressions(exprs, _) => {
-            Ok(exprs.iter().any(|e| matches!(e, Expr::Function(f) if is_window_fn(f))))
-        }
+        GroupByExpr::Expressions(exprs, _) => Ok(exprs
+            .iter()
+            .any(|e| matches!(e, Expr::Function(f) if is_window_fn(f)))),
         _ => Ok(false),
     }
 }
@@ -202,7 +219,11 @@ fn group_window_reject(g: &GroupByExpr) -> Result<Option<G0Verdict>> {
 fn tumble_reject(f: &Function) -> Result<Option<G0Verdict>> {
     let args = match &f.args {
         FunctionArguments::List(list) => &list.args,
-        _ => return Ok(Some(rejected("TUMBLE requires (PROCESSING_TIME, INTERVAL)"))),
+        _ => {
+            return Ok(Some(rejected(
+                "TUMBLE requires (PROCESSING_TIME, INTERVAL)",
+            )))
+        }
     };
     if args.is_empty() {
         return Ok(Some(rejected("TUMBLE requires PROCESSING_TIME")));
@@ -255,7 +276,10 @@ fn proj_reject(item: &SelectItem, windowed: bool) -> Result<Option<G0Verdict>> {
 
 fn expr_reject(expr: &Expr, in_arith: bool, windowed: bool) -> Result<Option<G0Verdict>> {
     match expr {
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) | Expr::TypedString(_)
+        Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::TypedString(_)
         | Expr::Interval(_) => Ok(None),
         Expr::IsNull(i) | Expr::IsNotNull(i) | Expr::UnaryOp { expr: i, .. } | Expr::Nested(i) => {
             expr_reject(i, in_arith, windowed)
@@ -340,9 +364,9 @@ fn walk_args(func: &Function, windowed: bool) -> Result<Option<G0Verdict>> {
             Ok(None)
         }
         FunctionArguments::None => Ok(None),
-        FunctionArguments::Subquery(_) => {
-            Ok(Some(rejected("function subquery args are not part of v0.2")))
-        }
+        FunctionArguments::Subquery(_) => Ok(Some(rejected(
+            "function subquery args are not part of v0.2",
+        ))),
     }
 }
 

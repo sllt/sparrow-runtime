@@ -27,9 +27,10 @@ use crate::metrics::RuntimeMetrics;
 use crate::transform::{build_source_batches, build_source_batches_shared, CompiledTransform};
 use crate::window::WindowOperator;
 
+mod analysis;
+mod buffered_window;
 mod graph;
 mod live_silence;
-mod buffered_window;
 pub use graph::{GraphInput, GraphOutput};
 
 #[derive(Clone, Debug)]
@@ -53,6 +54,8 @@ impl Default for KernelOptions {
 
 /// Kernel job. Live I/O is optional channels so MQTT/HTTP stay out of this crate.
 pub struct JobRequest {
+    /// Optional finite-query aggregate work limit; normal live jobs are unlimited.
+    pub work_lifetime: Option<u64>,
     live_silence: Option<Arc<live_silence::Config>>,
     pub graph_inputs: HashMap<sparrow_model::OperatorId, GraphInput>,
     pub graph_outputs: HashMap<sparrow_model::OperatorId, GraphOutput>,
@@ -102,19 +105,30 @@ pub enum IngressEvent {
 /// Field order deliberately frees the Box before refunding its metadata lease.
 #[derive(Debug)]
 pub struct BoxedIngressBatch {
-    batch:Box<RowBatch>,
-    metadata:sparrow_model::MemoryLease,
+    batch: Box<RowBatch>,
+    metadata: sparrow_model::MemoryLease,
 }
 impl BoxedIngressBatch {
-    fn into_batch(self)->RowBatch {self.batch.share()}
+    fn into_batch(self) -> RowBatch {
+        self.batch.share()
+    }
 }
 impl IngressEvent {
-    pub fn admitted_batch(batch:RowBatch)->Result<Self> {
+    pub fn admitted_batch(batch: RowBatch) -> Result<Self> {
         if batch.output_sequence().is_some() {
-            return Err(SparrowError::new(ErrorCode::InvalidArgument,"final output identity cannot be injected at source ingress"));
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "final output identity cannot be injected at source ingress",
+            ));
         }
-        let metadata=batch.lease().owner().acquire(sparrow_model::CreditKind::Reservation,std::mem::size_of::<RowBatch>())?;
-        Ok(Self::Batch(BoxedIngressBatch{batch:Box::new(batch),metadata}))
+        let metadata = batch.lease().owner().acquire(
+            sparrow_model::CreditKind::Reservation,
+            std::mem::size_of::<RowBatch>(),
+        )?;
+        Ok(Self::Batch(BoxedIngressBatch {
+            batch: Box::new(batch),
+            metadata,
+        }))
     }
 }
 impl Payload for IngressEvent {
@@ -132,7 +146,10 @@ impl Payload for IngressEvent {
             Self::LiveFeed(event) => event.bytes(),
             Self::DecodeError => 1,
             Self::Row(row) => row.resident_bytes(),
-            Self::Batch(batch) => batch.batch.tracked_bytes().saturating_add(batch.metadata.bytes()),
+            Self::Batch(batch) => batch
+                .batch
+                .tracked_bytes()
+                .saturating_add(batch.metadata.bytes()),
             Self::Control(_) => 1,
         }
     }
@@ -142,6 +159,7 @@ impl JobRequest {
     pub fn new(plan: PhysicalPlan, rows: Vec<Row>, capture: SharedCapture) -> Self {
         Self {
             live_silence: None,
+            work_lifetime: None,
             graph_inputs: HashMap::new(),
             graph_outputs: HashMap::new(),
             source_admission: None,
@@ -409,9 +427,13 @@ impl Drop for QueueAdmit {
     }
 }
 
-struct SourceSlot { jobs:Arc<AtomicUsize> }
+struct SourceSlot {
+    jobs: Arc<AtomicUsize>,
+}
 impl Drop for SourceSlot {
-    fn drop(&mut self) {self.jobs.fetch_sub(1,Ordering::SeqCst);}
+    fn drop(&mut self) {
+        self.jobs.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub struct Kernel {
@@ -438,39 +460,55 @@ pub struct SourceAdmission {
     owner: Arc<MemoryOwner>,
     pipeline: PipelineId,
     attempt: JobAttemptId,
-    slot:Arc<SourceSlot>,
+    slot: Arc<SourceSlot>,
 }
 impl SourceAdmission {
-    pub fn owner(&self) -> Arc<MemoryOwner> { self.owner.clone() }
-    pub fn attempt(&self) -> JobAttemptId { self.attempt }
+    pub fn owner(&self) -> Arc<MemoryOwner> {
+        self.owner.clone()
+    }
+    pub fn attempt(&self) -> JobAttemptId {
+        self.attempt
+    }
     /// The connector keeps this through actual shutdown, not just Kernel task
     /// completion. Otherwise a closing SDK could spend a replacement's quota.
-    pub fn lifecycle_guard(&self)->Arc<dyn Send+Sync> {self.slot.clone()}
+    pub fn lifecycle_guard(&self) -> Arc<dyn Send + Sync> {
+        self.slot.clone()
+    }
 }
 
 impl Kernel {
     pub fn prepare_source_admission(&self, pipeline: PipelineId) -> Result<SourceAdmission> {
-        let _gate=self.admit_lock.lock().expect("source admission");
+        let _gate = self.admit_lock.lock().expect("source admission");
         self.source_admission_locked(pipeline)
     }
 
-    fn source_admission_locked(&self,pipeline:PipelineId)->Result<SourceAdmission> {
-        let jobs=self.admitted_jobs.load(Ordering::SeqCst).saturating_add(1);
-        let max=(self.opts.budget.retention_bytes/self.job_budget.retention_bytes.max(1))
-            .min(self.opts.budget.reservation_bytes/self.job_budget.reservation_bytes.max(1));
-        if jobs>max {
-            return Err(SparrowError::new(ErrorCode::ResourceExhausted,
-                format!("capacity: {}/{} jobs admitted; retry later",jobs-1,max))
-                .retryable(true).context("admission","capacity"));
+    fn source_admission_locked(&self, pipeline: PipelineId) -> Result<SourceAdmission> {
+        let jobs = self.admitted_jobs.load(Ordering::SeqCst).saturating_add(1);
+        let max = (self.opts.budget.retention_bytes / self.job_budget.retention_bytes.max(1))
+            .min(self.opts.budget.reservation_bytes / self.job_budget.reservation_bytes.max(1));
+        if jobs > max {
+            return Err(SparrowError::new(
+                ErrorCode::ResourceExhausted,
+                format!("capacity: {}/{} jobs admitted; retry later", jobs - 1, max),
+            )
+            .retryable(true)
+            .context("admission", "capacity"));
         }
-        self.admitted_jobs.fetch_add(1,Ordering::SeqCst);
-        let slot=Arc::new(SourceSlot{jobs:self.admitted_jobs.clone()});
+        self.admitted_jobs.fetch_add(1, Ordering::SeqCst);
+        let slot = Arc::new(SourceSlot {
+            jobs: self.admitted_jobs.clone(),
+        });
         let attempt = JobAttemptId::new(self.next_attempt.fetch_add(1, Ordering::SeqCst));
         Ok(SourceAdmission {
             process: self.process_owner.clone(),
-            owner: MemoryOwner::child(self.process_owner.clone(), self.job_budget,
-                format!("pipeline={} attempt={}", pipeline.raw(), attempt.raw())),
-            pipeline, attempt, slot,
+            owner: MemoryOwner::child(
+                self.process_owner.clone(),
+                self.job_budget,
+                format!("pipeline={} attempt={}", pipeline.raw(), attempt.raw()),
+            ),
+            pipeline,
+            attempt,
+            slot,
         })
     }
     pub fn new(opts: KernelOptions) -> Result<Self> {
@@ -533,7 +571,9 @@ impl Kernel {
             .max_bytes
             .min(self.job_budget.reservation_bytes)
     }
-    pub fn ingress_batch_rows(&self) -> usize { self.opts.rows_per_batch }
+    pub fn ingress_batch_rows(&self) -> usize {
+        self.opts.rows_per_batch
+    }
 
     /// Process-wide memory owner shared by every job on this kernel (P1-20).
     pub fn process_owner(&self) -> &Arc<MemoryOwner> {
@@ -562,48 +602,122 @@ impl Kernel {
     }
 
     pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
+        if (req.plan.has_analysis() || req.plan.has_extended_aggs()) && req.aligned.is_some() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "analysis/extended aggregates are restart_fresh only",
+            ));
+        }
+        for stage in &req.plan.stages {
+            if let PhysicalStage::Analysis { plan, .. } = stage {
+                plan.validate()?;
+                if plan.is_join() && req.plan.edges.is_none() {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        "Join requires an explicit two-input graph",
+                    ));
+                }
+            }
+        }
         if req.plan.has_new_windows() && req.aligned.is_some() {
-            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-                "new hopping-PT/sliding/session windows are restart_fresh only"));
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "new hopping-PT/sliding/session windows are restart_fresh only",
+            ));
         }
         graph::validate_request(&req)?;
-        let graph_time=req.aligned.as_ref().and_then(|a|a.acks.graph_time()).cloned();
-        let durable_graph=req.aligned.is_some() && req.plan.edges.is_some() && (req.plan.has_processing_time_state() || req.plan.has_event_time_window());
-        if req.live_silence.is_some() { live_silence::validate_request(&req)?; }
-        let ordered_time = req.live_silence.is_none() && (durable_graph || req.plan.has_timed_iot() || (req.aligned.is_some() && req.plan.has_processing_time_state()));
+        let graph_time = req
+            .aligned
+            .as_ref()
+            .and_then(|a| a.acks.graph_time())
+            .cloned();
+        let durable_graph = req.aligned.is_some()
+            && req.plan.edges.is_some()
+            && (req.plan.has_processing_time_state() || req.plan.has_event_time_window());
+        if req.live_silence.is_some() {
+            live_silence::validate_request(&req)?;
+        }
+        let ordered_time = req.live_silence.is_none()
+            && (durable_graph
+                || req.plan.has_timed_iot()
+                || (req.aligned.is_some() && req.plan.has_processing_time_state()));
         if ordered_time {
             let manifest = sparrow_plan::CheckpointPlan::from_physical(&req.plan)?;
-            let ingress=if durable_graph {
-                graph_time.as_ref().is_some_and(|g|g.check_plan(&req.plan).is_ok() && g.initial.micros==req.clock.now_micros())
-                    && req.live_events.is_none() && req.graph_inputs.len()==manifest.source_ids().len()
-                    && req.graph_inputs.values().all(|s|s.events.is_some() && s.rows.is_empty() && s.live.is_none() && s.budgeted.is_none() && s.trailing_controls.is_empty())
-                    && req.graph_outputs.len()==manifest.sink_ids().len()
-                    && req.graph_outputs.values().all(|s|s.live.is_some() && s.outbox.is_some())
-            } else {req.live_events.is_some() && graph_time.is_none()};
-            if !req.clock.is_virtual() || req.clock.now_micros()<0 || !ingress
-                || req.live_ctrl.is_some() || req.live_in.is_some() || req.budgeted_in.is_some()
-                || !req.rows.is_empty() || !req.trailing_controls.is_empty()
-                || req.aligned.as_ref().is_none_or(|a| a.pipeline.is_none() || (!durable_graph && a.acks.output_sequence().is_none())) {
+            let ingress = if durable_graph {
+                graph_time.as_ref().is_some_and(|g| {
+                    g.check_plan(&req.plan).is_ok() && g.initial.micros == req.clock.now_micros()
+                }) && req.live_events.is_none()
+                    && req.graph_inputs.len() == manifest.source_ids().len()
+                    && req.graph_inputs.values().all(|s| {
+                        s.events.is_some()
+                            && s.rows.is_empty()
+                            && s.live.is_none()
+                            && s.budgeted.is_none()
+                            && s.trailing_controls.is_empty()
+                    })
+                    && req.graph_outputs.len() == manifest.sink_ids().len()
+                    && req
+                        .graph_outputs
+                        .values()
+                        .all(|s| s.live.is_some() && s.outbox.is_some())
+            } else {
+                req.live_events.is_some() && graph_time.is_none()
+            };
+            if !req.clock.is_virtual()
+                || req.clock.now_micros() < 0
+                || !ingress
+                || req.live_ctrl.is_some()
+                || req.live_in.is_some()
+                || req.budgeted_in.is_some()
+                || !req.rows.is_empty()
+                || !req.trailing_controls.is_empty()
+                || req.aligned.as_ref().is_none_or(|a| {
+                    a.pipeline.is_none() || (!durable_graph && a.acks.output_sequence().is_none())
+                })
+            {
                 return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
                     "time recovery requires ordered ingress, an initial logical clock and complete aligned output identity"));
             }
             manifest.validate()?;
         }
-        if graph_time.is_some() && !durable_graph {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"graph time context requires a durable time graph"));}
+        if graph_time.is_some() && !durable_graph {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "graph time context requires a durable time graph",
+            ));
+        }
         for stage in &req.plan.stages {
-            if let PhysicalStage::Iot { operator, spec, input, output } = stage {
+            if let PhysicalStage::Iot {
+                operator,
+                spec,
+                input,
+                output,
+            } = stage
+            {
                 spec.validate(input).map_err(|e| e.at_operator(*operator))?;
                 if spec.output_schema(input)?.fields != output.fields {
-                    return Err(SparrowError::new(ErrorCode::InvalidSchema, "IoT output schema mismatch").at_operator(*operator));
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidSchema,
+                        "IoT output schema mismatch",
+                    )
+                    .at_operator(*operator));
                 }
                 if spec.ttl_micros > 0 && self.job_budget.max_timers == 0 {
-                    return Err(SparrowError::new(ErrorCode::ResourceExhausted, "IoT TTL requires a bounded timer slot").at_operator(*operator));
+                    return Err(SparrowError::new(
+                        ErrorCode::ResourceExhausted,
+                        "IoT TTL requires a bounded timer slot",
+                    )
+                    .at_operator(*operator));
                 }
             }
         }
-        if req.source_admission.as_ref().is_some_and(|a|
-            !Arc::ptr_eq(&a.process, &self.process_owner) || a.pipeline != req.plan.pipeline) {
-            return Err(SparrowError::new(ErrorCode::PolicyDenied, "source admission belongs to another Kernel or pipeline"));
+        if req.source_admission.as_ref().is_some_and(|a| {
+            !Arc::ptr_eq(&a.process, &self.process_owner) || a.pipeline != req.plan.pipeline
+        }) {
+            return Err(SparrowError::new(
+                ErrorCode::PolicyDenied,
+                "source admission belongs to another Kernel or pipeline",
+            ));
         }
         if req.plan.stages.len() < 2 {
             return Err(SparrowError::new(
@@ -619,16 +733,29 @@ impl Kernel {
                 ));
             }
             if req.plan.edges.is_some() && aligned.acks.output_sequence().is_some() {
-                return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "graph state is not enabled for the JetStream output profile"));
+                return Err(SparrowError::new(
+                    ErrorCode::UnsupportedRestore,
+                    "graph state is not enabled for the JetStream output profile",
+                ));
             }
-            if aligned.acks.output_sequence().is_some() && (req.live_out.is_none() || aligned.pipeline.is_none()) {
-                return Err(SparrowError::new(ErrorCode::InvalidArgument,"reliable output requires a live required sink and participant checkpoint"));
+            if aligned.acks.output_sequence().is_some()
+                && (req.live_out.is_none() || aligned.pipeline.is_none())
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "reliable output requires a live required sink and participant checkpoint",
+                ));
             }
             if req.plan.has_iot()
                 && aligned
                     .acks
                     .output_sequence()
-                    .zip(aligned.pipeline.as_ref().map(|pipeline| pipeline.generation))
+                    .zip(
+                        aligned
+                            .pipeline
+                            .as_ref()
+                            .map(|pipeline| pipeline.generation),
+                    )
                     .is_some_and(|(output, generation)| output.epoch() != generation)
             {
                 return Err(SparrowError::new(
@@ -658,10 +785,8 @@ impl Kernel {
                 } else {
                     "file"
                 };
-                let profile = crate::pipeline_checkpoint::snapshot_version_for(
-                    &pipeline.plan,
-                    source_kind,
-                )?;
+                let profile =
+                    crate::pipeline_checkpoint::snapshot_version_for(&pipeline.plan, source_kind)?;
                 if matches!(
                     profile,
                     crate::pipeline_checkpoint::REFERENCE_RELIABLE_SNAPSHOT_VERSION
@@ -692,11 +817,7 @@ impl Kernel {
                     // Validate the physical Lookup schema/key/output contract
                     // against the attached table; name/revision alone is not
                     // a restore proof.
-                    validate_static_lookup_bindings(
-                        &req.plan,
-                        &req.tables,
-                        &self.process_owner,
-                    )?;
+                    validate_static_lookup_bindings(&req.plan, &req.tables, &self.process_owner)?;
                     let live = sparrow_plan::CheckpointPlan::from_physical_with_references(
                         &req.plan,
                         dependencies,
@@ -709,7 +830,9 @@ impl Kernel {
                             "reference tables require a dependency-bearing checkpoint plan",
                         ));
                     }
-                    pipeline.plan.check_compatible(&sparrow_plan::CheckpointPlan::from_physical(&req.plan)?)?;
+                    pipeline.plan.check_compatible(
+                        &sparrow_plan::CheckpointPlan::from_physical(&req.plan)?,
+                    )?;
                 }
             } else {
                 if !req.tables.is_empty() {
@@ -733,12 +856,20 @@ impl Kernel {
         .flatten()
         .collect();
         for input in req.graph_inputs.values() {
-            if let Some(observer) = input.events.as_ref().and_then(|r| r.observer()) { boundary_queues.push(observer); }
-            if let Some(observer) = input.live.as_ref().and_then(|r| r.observer()) { boundary_queues.push(observer); }
-            if let Some(observer) = input.budgeted.as_ref().and_then(|r| r.observer()) { boundary_queues.push(observer); }
+            if let Some(observer) = input.events.as_ref().and_then(|r| r.observer()) {
+                boundary_queues.push(observer);
+            }
+            if let Some(observer) = input.live.as_ref().and_then(|r| r.observer()) {
+                boundary_queues.push(observer);
+            }
+            if let Some(observer) = input.budgeted.as_ref().and_then(|r| r.observer()) {
+                boundary_queues.push(observer);
+            }
         }
         for output in req.graph_outputs.values() {
-            if let Some(observer) = output.live.as_ref().and_then(|t| t.observer()) { boundary_queues.push(observer); }
+            if let Some(observer) = output.live.as_ref().and_then(|t| t.observer()) {
+                boundary_queues.push(observer);
+            }
         }
         let ingress_metadata = req
             .budgeted_in
@@ -746,7 +877,14 @@ impl Kernel {
             .filter(|r| r.observer().is_none())
             .map(|rx| sparrow_model::QueuedRow::channel_budget(rx.max_capacity()))
             .unwrap_or(0)
-            .saturating_add(req.graph_inputs.values().filter_map(|input|input.budgeted.as_ref()).filter(|rx|rx.observer().is_none()).map(|rx|sparrow_model::QueuedRow::channel_budget(rx.max_capacity())).sum::<usize>());
+            .saturating_add(
+                req.graph_inputs
+                    .values()
+                    .filter_map(|input| input.budgeted.as_ref())
+                    .filter(|rx| rx.observer().is_none())
+                    .map(|rx| sparrow_model::QueuedRow::channel_budget(rx.max_capacity()))
+                    .sum::<usize>(),
+            );
         let boundary_metadata = boundary_queues
             .iter()
             .map(|o| o.metadata_bytes())
@@ -781,9 +919,9 @@ impl Kernel {
         )?;
         // A prepared connector already owns its job quota. Ordinary jobs
         // acquire the same slot here; neither path charges admission twice.
-        let admission=match req.source_admission.take() {
-            Some(admission)=>admission,
-            None=>self.source_admission_locked(req.plan.pipeline)?,
+        let admission = match req.source_admission.take() {
+            Some(admission) => admission,
+            None => self.source_admission_locked(req.plan.pipeline)?,
         };
         self.queue_reserved.fetch_add(queue_need, Ordering::SeqCst);
         let admit = QueueAdmit {
@@ -832,10 +970,20 @@ impl Kernel {
                 .map_err(|e| e.retryable(true).context("admission", "capacity"))?;
         let work = Arc::new(WorkBudget::new(self.job_budget.work_units));
         let ctx = JobCtx {
+            query_work: req
+                .work_lifetime
+                .map(|limit| Arc::new(AtomicU64::new(limit))),
             live_silence: req.live_silence.clone(),
             ordered_time,
             graph_time: graph_time.clone(),
-            graph_memory: if req.plan.edges.is_some() {Some(Arc::new(owner.acquire(sparrow_model::CreditKind::Reservation,graph::metadata_bytes(&req.plan))?))}else{None},
+            graph_memory: if req.plan.edges.is_some() || req.plan.has_analysis() {
+                Some(Arc::new(owner.acquire(
+                    sparrow_model::CreditKind::Reservation,
+                    graph::metadata_bytes(&req.plan),
+                )?))
+            } else {
+                None
+            },
             side_port: None,
             graph_mode: false,
             source_time: None,
@@ -865,11 +1013,28 @@ impl Kernel {
                 .aligned
                 .take()
                 .map(|job| {
-                    if graph_time.as_ref().is_some_and(|g|!g.belongs_to(&owner) || job.pipeline.as_ref().is_none_or(|p|p.generation!=g.generation)) {
-                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"graph control state belongs to another owner or generation"));
+                    if graph_time.as_ref().is_some_and(|g| {
+                        !g.belongs_to(&owner)
+                            || job
+                                .pipeline
+                                .as_ref()
+                                .is_none_or(|p| p.generation != g.generation)
+                    }) {
+                        return Err(SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "graph control state belongs to another owner or generation",
+                        ));
                     }
-                    crate::barrier::RuntimeAligned::prepare(job, &req.plan, &owner, attempt.raw(), self.job_budget.max_state_keys, self.job_budget.max_timers,
-                        (ordered_time && !req.plan.has_event_time_window()).then(||req.clock.now_micros()))
+                    crate::barrier::RuntimeAligned::prepare(
+                        job,
+                        &req.plan,
+                        &owner,
+                        attempt.raw(),
+                        self.job_budget.max_state_keys,
+                        self.job_budget.max_timers,
+                        (ordered_time && !req.plan.has_event_time_window())
+                            .then(|| req.clock.now_micros()),
+                    )
                 })
                 .transpose()?,
             observation: req.observation.clone(),
@@ -964,6 +1129,7 @@ fn admit_process(
 }
 
 struct JobCtx {
+    query_work: Option<Arc<AtomicU64>>,
     live_silence: Option<Arc<live_silence::Config>>,
     ordered_time: bool,
     graph_time: Option<Arc<crate::graph_cut::GraphRuntime>>,
@@ -1058,7 +1224,9 @@ impl JobHandle {
 }
 
 async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<JobStats> {
-    if req.plan.edges.is_some() { return graph::run(ctx, req).await; }
+    if req.plan.edges.is_some() {
+        return graph::run(ctx, req).await;
+    }
     let n = req.plan.stages.len();
     if n < 2 {
         return Err(SparrowError::new(
@@ -1077,6 +1245,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
     ctx.mailboxes.initialized();
 
     let JobRequest {
+        work_lifetime: _,
         live_silence: _,
         plan,
         rows,
@@ -1185,6 +1354,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
 
 fn clone_ctx(ctx: &JobCtx) -> JobCtx {
     JobCtx {
+        query_work: ctx.query_work.clone(),
         live_silence: ctx.live_silence.clone(),
         ordered_time: ctx.ordered_time,
         graph_time: ctx.graph_time.clone(),
@@ -1219,7 +1389,23 @@ fn clone_ctx(ctx: &JobCtx) -> JobCtx {
     }
 }
 
+fn consume_query_work(ctx: &JobCtx, units: u64) -> Result<()> {
+    if let Some(limit) = &ctx.query_work {
+        limit
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(units)
+            })
+            .map_err(|_| {
+                SparrowError::new(
+                    ErrorCode::ResourceExhausted,
+                    "finite query total work limit exceeded",
+                )
+            })?;
+    }
+    Ok(())
+}
 async fn consume_work(ctx: &JobCtx, units: u64) -> Result<()> {
+    consume_query_work(ctx, units)?;
     if ctx.work.would_exhaust(units) {
         tokio::task::yield_now().await;
         ctx.work.begin_quantum();
@@ -1267,7 +1453,7 @@ fn spawn_stage(
         let is_source = matches!(&stage, PhysicalStage::MemorySource { .. });
         let optional = ctx.optional_branch;
         let local_cancel = ctx.cancel.clone();
-        let branch_metrics=ctx.metrics.clone();
+        let branch_metrics = ctx.metrics.clone();
         let result = stage_loop(
             ctx,
             stage,
@@ -1286,8 +1472,15 @@ fn spawn_stage(
         min_remaining.fetch_min(work.remaining(), Ordering::Relaxed);
         // Window stages return their output count. Do not add intermediate
         // emissions to JobStats.ingested_rows when joining all stage tasks.
-        if optional && result.is_err() { local_cancel.cancel(); branch_metrics.graph_branch_failures.fetch_add(1,Ordering::Relaxed); Ok(0) }
-        else { result.map(|rows| if is_source { rows } else { 0 }) }
+        if optional && result.is_err() {
+            local_cancel.cancel();
+            branch_metrics
+                .graph_branch_failures
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(0)
+        } else {
+            result.map(|rows| if is_source { rows } else { 0 })
+        }
     });
 }
 
@@ -1306,9 +1499,23 @@ async fn stage_loop(
     trailing_controls: Vec<StreamControl>,
 ) -> Result<usize> {
     match stage {
-        PhysicalStage::Branch { .. } | PhysicalStage::Route { .. } | PhysicalStage::UnionAll { .. } => {
-            Err(SparrowError::new(ErrorCode::InvalidArgument, "graph operator requires explicit topology"))
+        PhysicalStage::Analysis { operator, plan } => {
+            let tx =
+                tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "analysis output absent"))?;
+            let rx = rx
+                .as_mut()
+                .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "analysis input absent"))?;
+            let result = analysis::unnest_task(&ctx, plan, rx, &tx)?
+                .await
+                .map_err(|e| e.at_operator(operator));
+            result
         }
+        PhysicalStage::Branch { .. }
+        | PhysicalStage::Route { .. }
+        | PhysicalStage::UnionAll { .. } => Err(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "graph operator requires explicit topology",
+        )),
         PhysicalStage::MemorySource { schema, .. } => {
             let tx =
                 tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "source missing mailbox"))?;
@@ -1319,13 +1526,22 @@ async fn stage_loop(
                 if ctx.live_silence.is_some() {
                     return Box::pin(live_silence::source(ctx, schema, tx, events)).await;
                 }
-                return if ctx.graph_mode {live_source::<true>(ctx,schema,tx,LiveInput::Ordered(events)).await}
-                    else{live_source::<false>(ctx,schema,tx,LiveInput::Ordered(events)).await};
+                return if ctx.graph_mode {
+                    live_source::<true>(ctx, schema, tx, LiveInput::Ordered(events)).await
+                } else {
+                    live_source::<false>(ctx, schema, tx, LiveInput::Ordered(events)).await
+                };
             }
             if let Some(live_in) = live_in {
-                let input=LiveInput::Split {rows:live_in,controls:live_ctrl};
-                return if ctx.graph_mode {live_source::<true>(ctx,schema,tx,input).await}
-                    else{live_source::<false>(ctx,schema,tx,input).await};
+                let input = LiveInput::Split {
+                    rows: live_in,
+                    controls: live_ctrl,
+                };
+                return if ctx.graph_mode {
+                    live_source::<true>(ctx, schema, tx, input).await
+                } else {
+                    live_source::<false>(ctx, schema, tx, input).await
+                };
             }
             let batches = build_source_batches(schema, rows, &ctx.owner, ctx.rows_per_batch)?;
             let mut n = 0usize;
@@ -1335,7 +1551,9 @@ async fn stage_loop(
                 if let Some(obs) = &ctx.observation {
                     obs.runtime_rows(true, b.num_rows());
                 }
-                if !graph::send_source(&ctx,&tx,b.with_source_operator(ctx.source_operator)).await? {
+                if !graph::send_source(&ctx, &tx, b.with_source_operator(ctx.source_operator))
+                    .await?
+                {
                     return Ok(n);
                 }
             }
@@ -1344,7 +1562,9 @@ async fn stage_loop(
                     return Ok(n);
                 }
             }
-            if ctx.graph_mode {publish_source_control(&ctx,&tx,StreamControl::EndOfInput).await?;}
+            if ctx.graph_mode {
+                publish_source_control(&ctx, &tx, StreamControl::EndOfInput).await?;
+            }
             Ok(n)
         }
         PhysicalStage::Transform { steps } => {
@@ -1369,6 +1589,7 @@ async fn stage_loop(
                         tokio::task::yield_now().await;
                         ctx.work.begin_quantum();
                     }
+                    consume_query_work(&ctx, compiled.work_units(batch.num_rows()))?;
                     let started = std::time::Instant::now();
                     let result = compiled.apply(&batch, &ctx.owner, &ctx.work);
                     if let Some(obs) = &ctx.observation {
@@ -1382,7 +1603,9 @@ async fn stage_loop(
                         );
                     }
                     if let Some(out) = result? {
-                        let out = out.with_origin(batch.origin()).with_source_operator(batch.source_operator());
+                        let out = out
+                            .with_origin(batch.origin())
+                            .with_source_operator(batch.source_operator());
                         if !tx.send(out).await? {
                             return Ok(0);
                         }
@@ -1391,24 +1614,46 @@ async fn stage_loop(
             }
             Ok(0)
         }
-        PhysicalStage::CaptureSink { schema, operator, .. } | PhysicalStage::BestEffortSink { schema, operator, .. } => {
-            let mut ended=false;
-            let sink_outbox = ctx.sink_outbox.as_ref().or_else(||ctx.aligned.as_ref().map(|a|&a.outbox));
-            let mut next_output=if let Some(graph)=&ctx.graph_time {Some(graph.sink_sequence(operator.raw())?)} else {ctx.aligned.as_ref().and_then(|a|a.acks.output_sequence())};
+        PhysicalStage::CaptureSink {
+            schema, operator, ..
+        }
+        | PhysicalStage::BestEffortSink {
+            schema, operator, ..
+        } => {
+            let mut ended = false;
+            let sink_outbox = ctx
+                .sink_outbox
+                .as_ref()
+                .or_else(|| ctx.aligned.as_ref().map(|a| &a.outbox));
+            let mut next_output = if let Some(graph) = &ctx.graph_time {
+                Some(graph.sink_sequence(operator.raw())?)
+            } else {
+                ctx.aligned.as_ref().and_then(|a| a.acks.output_sequence())
+            };
             let rx = rx
                 .as_mut()
                 .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "sink missing rx"))?;
             loop {
-                let envelope=if !ctx.graph_mode {rx.recv().await?}else{tokio::select! {
-                    biased;
-                    _=ctx.cancel.cancelled()=>None,
-                    _=async {let counter=sink_outbox.expect("graph live sink counter");while counter.failed()==0 && live_out.as_ref().is_none_or(|out|!out.is_closed()){tokio::time::sleep(std::time::Duration::from_millis(10)).await;}},if ctx.graph_mode&&sink_outbox.is_some()=>{
-                        return Err(SparrowError::new(ErrorCode::JobFailed,"graph sink reported failed output").at_operator(operator));
-                    },
-                    result=rx.recv()=>result?,
-                }};
-                let Some(mut env)=envelope else{
-                    if ctx.graph_mode&&!ended&&!ctx.cancel.is_cancelled(){return Err(SparrowError::new(ErrorCode::JobFailed,"graph sink input closed without EOF").at_operator(operator));}
+                let envelope = if !ctx.graph_mode {
+                    rx.recv().await?
+                } else {
+                    tokio::select! {
+                        biased;
+                        _=ctx.cancel.cancelled()=>None,
+                        _=async {let counter=sink_outbox.expect("graph live sink counter");while counter.failed()==0 && live_out.as_ref().is_none_or(|out|!out.is_closed()){tokio::time::sleep(std::time::Duration::from_millis(10)).await;}},if ctx.graph_mode&&sink_outbox.is_some()=>{
+                            return Err(SparrowError::new(ErrorCode::JobFailed,"graph sink reported failed output").at_operator(operator));
+                        },
+                        result=rx.recv()=>result?,
+                    }
+                };
+                let Some(mut env) = envelope else {
+                    if ctx.graph_mode && !ended && !ctx.cancel.is_cancelled() {
+                        return Err(SparrowError::new(
+                            ErrorCode::JobFailed,
+                            "graph sink input closed without EOF",
+                        )
+                        .at_operator(operator));
+                    }
                     break;
                 };
                 capture.stall.wait_if_stalled(&ctx.cancel).await;
@@ -1417,16 +1662,26 @@ async fn stage_loop(
                 }
                 let (batch, ctrl) = env.take();
                 if ctx.graph_mode {
-                    if matches!(ctrl,Some(StreamControl::EndOfInput)){ended=true;}
-                    if ended&&batch.is_some(){return Err(SparrowError::new(ErrorCode::JobFailed,"graph sink received data after EOF").at_operator(operator));}
+                    if matches!(ctrl, Some(StreamControl::EndOfInput)) {
+                        ended = true;
+                    }
+                    if ended && batch.is_some() {
+                        return Err(SparrowError::new(
+                            ErrorCode::JobFailed,
+                            "graph sink received data after EOF",
+                        )
+                        .at_operator(operator));
+                    }
                 }
                 if let Some(batch) = batch {
-                    let batch=if let Some(position)=next_output {
-                        let following=position.advance(batch.num_rows())?;
-                        let batch=batch.with_output_sequence(position)?;
-                        next_output=Some(following);
+                    let batch = if let Some(position) = next_output {
+                        let following = position.advance(batch.num_rows())?;
+                        let batch = batch.with_output_sequence(position)?;
+                        next_output = Some(following);
                         batch
-                    } else {batch};
+                    } else {
+                        batch
+                    };
                     // Count final plan output once, not every intermediate
                     // window emission (which may still be filtered downstream).
                     ctx.metrics.record_emit(batch.num_rows() as u64);
@@ -1477,14 +1732,22 @@ async fn stage_loop(
                         if flush.ok && flush.dropped == 0 {
                             sink_outbox.expect("aligned outbox").mark();
                         }
-                        aj.acks.sink_flushed_for(checkpoint_id, flush, next_output, Some(operator)).await;
+                        aj.acks
+                            .sink_flushed_for(checkpoint_id, flush, next_output, Some(operator))
+                            .await;
                     }
                 }
             }
-            if ctx.graph_mode&&!ctx.cancel.is_cancelled() {
-                if let Some(counter)=sink_outbox {
-                    let flush=tokio::select!{biased;_=ctx.cancel.cancelled()=>return Ok(0),flush=crate::barrier::wait_outbox(counter,std::time::Duration::from_secs(30))=>flush};
-                    if !flush.ok||flush.timed_out||flush.dropped!=0{return Err(SparrowError::new(ErrorCode::JobFailed,"required graph sink final flush failed").at_operator(operator));}
+            if ctx.graph_mode && !ctx.cancel.is_cancelled() {
+                if let Some(counter) = sink_outbox {
+                    let flush = tokio::select! {biased;_=ctx.cancel.cancelled()=>return Ok(0),flush=crate::barrier::wait_outbox(counter,std::time::Duration::from_secs(30))=>flush};
+                    if !flush.ok || flush.timed_out || flush.dropped != 0 {
+                        return Err(SparrowError::new(
+                            ErrorCode::JobFailed,
+                            "required graph sink final flush failed",
+                        )
+                        .at_operator(operator));
+                    }
                 }
             }
             Ok(0)
@@ -1501,22 +1764,37 @@ async fn stage_loop(
                 .as_mut()
                 .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "window missing rx"))?;
             if spec.kind.is_buffered() {
-                return buffered_window::task(&ctx, spec, input, rx, &tx, &capture)?.await
+                return buffered_window::task(&ctx, spec, input, rx, &tx, &capture)?
+                    .await
                     .map_err(|e| e.at_operator(operator));
             }
-            let prepared = ctx.aligned.as_ref().and_then(|a|a.windows.lock().expect("prepared windows").remove(&operator));
+            let prepared = ctx.aligned.as_ref().and_then(|a| {
+                a.windows
+                    .lock()
+                    .expect("prepared windows")
+                    .remove(&operator)
+            });
             if prepared.is_none() && ctx.aligned.as_ref().is_some_and(|a| a.participant_mode) {
-                return Err(SparrowError::new(ErrorCode::Internal, "prepared checkpoint participant missing"));
+                return Err(SparrowError::new(
+                    ErrorCode::Internal,
+                    "prepared checkpoint participant missing",
+                ));
             }
-            let mut op = if let Some(window)=prepared { window } else { WindowOperator::new(
-                operator,
-                spec,
-                input,
-                Arc::clone(&ctx.owner),
-                ctx.max_state_keys,
-                ctx.max_timers,
-            )? };
-            if ctx.graph_mode { op.use_external_watermarks(); }
+            let mut op = if let Some(window) = prepared {
+                window
+            } else {
+                WindowOperator::new(
+                    operator,
+                    spec,
+                    input,
+                    Arc::clone(&ctx.owner),
+                    ctx.max_state_keys,
+                    ctx.max_timers,
+                )?
+            };
+            if ctx.graph_mode {
+                op.use_external_watermarks();
+            }
             let restore = ctx
                 .aligned
                 .as_ref()
@@ -1524,22 +1802,41 @@ async fn stage_loop(
             if let Some(restored) = restore {
                 op.restore_freeze(&restored.freeze)?;
             }
-            if ctx.graph_mode {window_stage::<true>(&ctx, &mut op, rx, &tx, &capture).await}
-            else{window_stage::<false>(&ctx, &mut op, rx, &tx, &capture).await}
+            if ctx.graph_mode {
+                window_stage::<true>(&ctx, &mut op, rx, &tx, &capture).await
+            } else {
+                window_stage::<false>(&ctx, &mut op, rx, &tx, &capture).await
+            }
         }
-        PhysicalStage::Iot { operator, spec, input, .. } => {
+        PhysicalStage::Iot {
+            operator,
+            spec,
+            input,
+            ..
+        } => {
             let tx = tx.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "IoT missing tx"))?;
-            let rx = rx.as_mut().ok_or_else(|| SparrowError::new(ErrorCode::Internal, "IoT missing rx"))?;
-            let prepared = ctx.aligned.as_ref().and_then(|a| a.iot.lock().expect("prepared IoT state").remove(&operator));
+            let rx = rx
+                .as_mut()
+                .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "IoT missing rx"))?;
+            let prepared = ctx
+                .aligned
+                .as_ref()
+                .and_then(|a| a.iot.lock().expect("prepared IoT state").remove(&operator));
             if prepared.is_none() && ctx.aligned.as_ref().is_some_and(|a| a.participant_mode) {
-                return Err(SparrowError::new(ErrorCode::Internal, "prepared IoT checkpoint participant missing").at_operator(operator));
+                return Err(SparrowError::new(
+                    ErrorCode::Internal,
+                    "prepared IoT checkpoint participant missing",
+                )
+                .at_operator(operator));
             }
             let mut op = match prepared {
                 Some(op) => op,
                 None => crate::iot::IotOperator::new(operator, spec, input, ctx.owner.clone())
                     .map_err(|error| error.at_operator(operator))?,
             };
-            iot_stage(&ctx, &mut op, rx, &tx).await.map_err(|e| e.at_operator(operator))
+            iot_stage(&ctx, &mut op, rx, &tx)
+                .await
+                .map_err(|e| e.at_operator(operator))
         }
         PhysicalStage::Deduplicate {
             operator,
@@ -1580,7 +1877,13 @@ async fn stage_loop(
                     let out = op.build_metered_batch(rows)?;
                     drop(scratch);
                     if let Some(out) = out {
-                        if !tx.send(out.with_origin(batch.origin()).with_source_operator(batch.source_operator())).await? {
+                        if !tx
+                            .send(
+                                out.with_origin(batch.origin())
+                                    .with_source_operator(batch.source_operator()),
+                            )
+                            .await?
+                        {
                             break;
                         }
                     }
@@ -1629,7 +1932,13 @@ async fn stage_loop(
                         obs.record(Latency::Lookup, started.elapsed());
                     }
                     if let Some(out) = result? {
-                        if !tx.send(out.with_origin(batch.origin()).with_source_operator(batch.source_operator())).await? {
+                        if !tx
+                            .send(
+                                out.with_origin(batch.origin())
+                                    .with_source_operator(batch.source_operator()),
+                            )
+                            .await?
+                        {
                             break;
                         }
                     }
@@ -1651,21 +1960,66 @@ impl IotReporter {
     fn sample(&mut self, op: &crate::iot::IotOperator) {
         let current = op.stats();
         for (counter, value, previous) in [
-            (&self.metrics.iot_input_rows, current.input_rows, self.previous.input_rows),
-            (&self.metrics.iot_emitted_rows, current.emitted_rows, self.previous.emitted_rows),
-            (&self.metrics.iot_filtered_rows, current.filtered_rows, self.previous.filtered_rows),
-            (&self.metrics.iot_invalid_rows, current.invalid_rows, self.previous.invalid_rows),
-            (&self.metrics.iot_expired_keys, current.expired_keys, self.previous.expired_keys),
-            (&self.metrics.alarm_notifications_expired, current.notifications_expired, self.previous.notifications_expired),
-            (&self.metrics.alarm_notifications_cancelled, current.notifications_cancelled, self.previous.notifications_cancelled),
-            (&self.metrics.alarm_notifications_deferred, current.notifications_deferred, self.previous.notifications_deferred),
-        ] { counter.fetch_add(value.saturating_sub(previous), Ordering::Relaxed); }
-        for (counter, previous, value) in [
-            (&self.metrics.iot_state_keys, &mut self.keys, op.key_count() as u64),
-            (&self.metrics.iot_state_bytes, &mut self.bytes, op.retention_bytes() as u64),
+            (
+                &self.metrics.iot_input_rows,
+                current.input_rows,
+                self.previous.input_rows,
+            ),
+            (
+                &self.metrics.iot_emitted_rows,
+                current.emitted_rows,
+                self.previous.emitted_rows,
+            ),
+            (
+                &self.metrics.iot_filtered_rows,
+                current.filtered_rows,
+                self.previous.filtered_rows,
+            ),
+            (
+                &self.metrics.iot_invalid_rows,
+                current.invalid_rows,
+                self.previous.invalid_rows,
+            ),
+            (
+                &self.metrics.iot_expired_keys,
+                current.expired_keys,
+                self.previous.expired_keys,
+            ),
+            (
+                &self.metrics.alarm_notifications_expired,
+                current.notifications_expired,
+                self.previous.notifications_expired,
+            ),
+            (
+                &self.metrics.alarm_notifications_cancelled,
+                current.notifications_cancelled,
+                self.previous.notifications_cancelled,
+            ),
+            (
+                &self.metrics.alarm_notifications_deferred,
+                current.notifications_deferred,
+                self.previous.notifications_deferred,
+            ),
         ] {
-            if value >= *previous { counter.fetch_add(value - *previous, Ordering::Relaxed); }
-            else { counter.fetch_sub(*previous - value, Ordering::Relaxed); }
+            counter.fetch_add(value.saturating_sub(previous), Ordering::Relaxed);
+        }
+        for (counter, previous, value) in [
+            (
+                &self.metrics.iot_state_keys,
+                &mut self.keys,
+                op.key_count() as u64,
+            ),
+            (
+                &self.metrics.iot_state_bytes,
+                &mut self.bytes,
+                op.retention_bytes() as u64,
+            ),
+        ] {
+            if value >= *previous {
+                counter.fetch_add(value - *previous, Ordering::Relaxed);
+            } else {
+                counter.fetch_sub(*previous - value, Ordering::Relaxed);
+            }
             *previous = value;
         }
         self.previous = current;
@@ -1674,21 +2028,48 @@ impl IotReporter {
 
 impl Drop for IotReporter {
     fn drop(&mut self) {
-        self.metrics.iot_state_keys.fetch_sub(self.keys, Ordering::Relaxed);
-        self.metrics.iot_state_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.metrics
+            .iot_state_keys
+            .fetch_sub(self.keys, Ordering::Relaxed);
+        self.metrics
+            .iot_state_bytes
+            .fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 
 /// Live TTL uses local monotonic idle time. Aligned time profiles instead use
 /// only persisted, FIFO time controls and never wake on this local timer path.
-async fn iot_stage(ctx: &JobCtx, op: &mut crate::iot::IotOperator, rx: &mut MailboxRx, tx: &MailboxTx) -> Result<usize> {
-    if ctx.live_silence.is_some() { return Box::pin(live_silence::stage(ctx, op, rx, tx)).await; }
-    if ctx.ordered_time { return timed_iot_stage(ctx,op,rx,tx).await; }
+async fn iot_stage(
+    ctx: &JobCtx,
+    op: &mut crate::iot::IotOperator,
+    rx: &mut MailboxRx,
+    tx: &MailboxTx,
+) -> Result<usize> {
+    if ctx.live_silence.is_some() {
+        return Box::pin(live_silence::stage(ctx, op, rx, tx)).await;
+    }
+    if ctx.ordered_time {
+        return timed_iot_stage(ctx, op, rx, tx).await;
+    }
     let started = tokio::time::Instant::now();
-    let now = || if ctx.clock.is_virtual() { ctx.clock.now_micros() }
-        else { started.elapsed().as_micros().min(i64::MAX as u128) as i64 };
-    let mut reporter = IotReporter { metrics: ctx.metrics.clone(), previous: Default::default(), keys: 0, bytes: 0 };
-    let mut timers = TimerReporter { ctx, live: 0, cancelled: 0 };
+    let now = || {
+        if ctx.clock.is_virtual() {
+            ctx.clock.now_micros()
+        } else {
+            started.elapsed().as_micros().min(i64::MAX as u128) as i64
+        }
+    };
+    let mut reporter = IotReporter {
+        metrics: ctx.metrics.clone(),
+        previous: Default::default(),
+        keys: 0,
+        bytes: 0,
+    };
+    let mut timers = TimerReporter {
+        ctx,
+        live: 0,
+        cancelled: 0,
+    };
     let mut ended = false;
     loop {
         reporter.sample(op);
@@ -1707,33 +2088,61 @@ async fn iot_stage(ctx: &JobCtx, op: &mut crate::iot::IotOperator, rx: &mut Mail
         };
         let Some(mut envelope) = envelope else {
             if ctx.graph_mode && !ended && !ctx.cancel.is_cancelled() {
-                return Err(SparrowError::new(ErrorCode::JobFailed, "IoT input closed without EOF"));
+                return Err(SparrowError::new(
+                    ErrorCode::JobFailed,
+                    "IoT input closed without EOF",
+                ));
             }
             break;
         };
         let (batch, control) = envelope.take();
         if let Some(batch) = batch {
-            if ended { return Err(SparrowError::new(ErrorCode::JobFailed, "IoT data after EOF")); }
+            if ended {
+                return Err(SparrowError::new(
+                    ErrorCode::JobFailed,
+                    "IoT data after EOF",
+                ));
+            }
             consume_work(ctx, batch.num_rows() as u64).await?;
             let output = op.on_batch(&batch, now());
             reporter.sample(op);
             if let Some(output) = output? {
-                if !tx.send(output.with_origin(batch.origin()).with_source_operator(batch.source_operator())).await? { break; }
+                if !tx
+                    .send(
+                        output
+                            .with_origin(batch.origin())
+                            .with_source_operator(batch.source_operator()),
+                    )
+                    .await?
+                {
+                    break;
+                }
             }
         }
         if let Some(control) = control {
             match &control {
                 StreamControl::CheckpointBarrier { checkpoint_id } => {
                     if let Some(aligned) = &ctx.aligned {
-                        if !aligned.acks.is_active(*checkpoint_id) { continue; }
-                        let freeze = crate::barrier::EncodedFreeze::from_iot(op, &ctx.owner, ctx.max_state_keys);
-                        aligned.acks.iot_frozen(*checkpoint_id, op.operator_id(), freeze).await;
+                        if !aligned.acks.is_active(*checkpoint_id) {
+                            continue;
+                        }
+                        let freeze = crate::barrier::EncodedFreeze::from_iot(
+                            op,
+                            &ctx.owner,
+                            ctx.max_state_keys,
+                        );
+                        aligned
+                            .acks
+                            .iot_frozen(*checkpoint_id, op.operator_id(), freeze)
+                            .await;
                     }
                 }
                 StreamControl::EndOfInput => ended = true,
                 _ => {}
             }
-            if !tx.send_control(control).await? { break; }
+            if !tx.send_control(control).await? {
+                break;
+            }
         }
     }
     reporter.sample(op);
@@ -1745,66 +2154,123 @@ async fn iot_stage(ctx: &JobCtx, op: &mut crate::iot::IotOperator, rx: &mut Mail
 /// each durable decision before the following data or checkpoint barrier.
 /// Silence is the explicit exception: time only opens its decision, input
 /// updates last-seen, and the following source fact authorizes timer draining.
-async fn timed_iot_stage(ctx:&JobCtx,op:&mut crate::iot::IotOperator,rx:&mut MailboxRx,tx:&MailboxTx) -> Result<usize> {
+async fn timed_iot_stage(
+    ctx: &JobCtx,
+    op: &mut crate::iot::IotOperator,
+    rx: &mut MailboxRx,
+    tx: &MailboxTx,
+) -> Result<usize> {
     let mut now = ctx.clock.now_micros();
     op.validate_processing_cut(now)?;
-    let mut reporter=IotReporter {metrics:ctx.metrics.clone(),previous:Default::default(),keys:0,bytes:0};
-    let mut timers=TimerReporter {ctx,live:0,cancelled:0};
+    let mut reporter = IotReporter {
+        metrics: ctx.metrics.clone(),
+        previous: Default::default(),
+        keys: 0,
+        bytes: 0,
+    };
+    let mut timers = TimerReporter {
+        ctx,
+        live: 0,
+        cancelled: 0,
+    };
     loop {
-        reporter.sample(op); timers.sample(op.pending_timers(),0);
+        reporter.sample(op);
+        timers.sample(op.pending_timers(), 0);
         op.report_resample_metrics(&ctx.metrics);
-        let envelope=tokio::select! { biased; _=ctx.cancel.cancelled()=>break, e=rx.recv()=>e? };
-        let Some(mut envelope)=envelope else {
-            if !ctx.cancel.is_cancelled() { return Err(SparrowError::new(ErrorCode::JobFailed,"ordered processing-time source closed without shutdown")); }
+        let envelope = tokio::select! { biased; _=ctx.cancel.cancelled()=>break, e=rx.recv()=>e? };
+        let Some(mut envelope) = envelope else {
+            if !ctx.cancel.is_cancelled() {
+                return Err(SparrowError::new(
+                    ErrorCode::JobFailed,
+                    "ordered processing-time source closed without shutdown",
+                ));
+            }
             break;
         };
-        let (batch,control)=envelope.take();
-        if let Some(batch)=batch {
-            consume_work(ctx,batch.num_rows() as u64).await?;
-            if let Some(output)=op.on_batch(&batch,now)? {
-                if !tx.send(output).await? {break;}
+        let (batch, control) = envelope.take();
+        if let Some(batch) = batch {
+            consume_work(ctx, batch.num_rows() as u64).await?;
+            if let Some(output) = op.on_batch(&batch, now)? {
+                if !tx.send(output).await? {
+                    break;
+                }
             }
         }
-        if let Some(control)=control {
+        if let Some(control) = control {
             match &control {
-                StreamControl::ProcessingTime {micros}=>{
-                    op.set_processing_time(*micros)?; now=*micros;
+                StreamControl::ProcessingTime { micros } => {
+                    op.set_processing_time(*micros)?;
+                    now = *micros;
                     // Publish the cut before timer-derived rows. Every downstream
                     // stage expires its old state at this cut before accepting
                     // upstream timer output at the same cut (half-open boundary).
-                    if !tx.send_control(control.clone()).await? { break; }
-                    while op.next_deadline().is_some_and(|deadline|deadline<=now) {
-                        consume_work(ctx,1).await?;
-                        if let Some(output)=op.take_timed_due(now)? {
-                            if !tx.send(output).await? {op.cleanup();return Ok(0);}
+                    if !tx.send_control(control.clone()).await? {
+                        break;
+                    }
+                    while op.next_deadline().is_some_and(|deadline| deadline <= now) {
+                        consume_work(ctx, 1).await?;
+                        if let Some(output) = op.take_timed_due(now)? {
+                            if !tx.send(output).await? {
+                                op.cleanup();
+                                return Ok(0);
+                            }
                         }
                     }
                     continue;
                 }
-                StreamControl::FeedObservation {coverage_since} if op.is_silence()=>{
-                    if *coverage_since < -1 {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"invalid feed coverage sentinel"));}
-                    op.observe_feed((*coverage_since!=-1).then_some(*coverage_since))?;
-                    while op.next_deadline().is_some_and(|deadline|deadline<=now) {
-                        consume_work(ctx,1).await?;
-                        if let Some(output)=op.take_timed_due(now)? {
-                            if !tx.send(output).await? {op.cleanup();return Ok(0);}
+                StreamControl::FeedObservation { coverage_since } if op.is_silence() => {
+                    if *coverage_since < -1 {
+                        return Err(SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "invalid feed coverage sentinel",
+                        ));
+                    }
+                    op.observe_feed((*coverage_since != -1).then_some(*coverage_since))?;
+                    while op.next_deadline().is_some_and(|deadline| deadline <= now) {
+                        consume_work(ctx, 1).await?;
+                        if let Some(output) = op.take_timed_due(now)? {
+                            if !tx.send(output).await? {
+                                op.cleanup();
+                                return Ok(0);
+                            }
                         }
                     }
                 }
-                StreamControl::CheckpointBarrier {checkpoint_id}=>{
-                    let aligned=ctx.aligned.as_ref().expect("timed admission");
-                    if !aligned.acks.is_active(*checkpoint_id) {continue;}
-                    let freeze=crate::barrier::EncodedFreeze::from_iot(op,&ctx.owner,ctx.max_state_keys);
-                    aligned.acks.iot_frozen(*checkpoint_id,op.operator_id(),freeze).await;
+                StreamControl::CheckpointBarrier { checkpoint_id } => {
+                    let aligned = ctx.aligned.as_ref().expect("timed admission");
+                    if !aligned.acks.is_active(*checkpoint_id) {
+                        continue;
+                    }
+                    let freeze =
+                        crate::barrier::EncodedFreeze::from_iot(op, &ctx.owner, ctx.max_state_keys);
+                    aligned
+                        .acks
+                        .iot_frozen(*checkpoint_id, op.operator_id(), freeze)
+                        .await;
                 }
-                StreamControl::GraphProgress {watermark_micros,flags} if ctx.graph_time.is_some()=>{crate::graph_cut::Progress::from_control(*watermark_micros,*flags)?;}
-                StreamControl::GraphRoundEnd {..} if ctx.graph_time.is_some()=>{},
-                _=>return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"timed IoT accepts only ordered time and checkpoint controls")),
+                StreamControl::GraphProgress {
+                    watermark_micros,
+                    flags,
+                } if ctx.graph_time.is_some() => {
+                    crate::graph_cut::Progress::from_control(*watermark_micros, *flags)?;
+                }
+                StreamControl::GraphRoundEnd { .. } if ctx.graph_time.is_some() => {}
+                _ => {
+                    return Err(SparrowError::new(
+                        ErrorCode::UnsupportedRestore,
+                        "timed IoT accepts only ordered time and checkpoint controls",
+                    ))
+                }
             }
-            if !tx.send_control(control).await? {break;}
+            if !tx.send_control(control).await? {
+                break;
+            }
         }
     }
-    reporter.sample(op); op.report_resample_metrics(&ctx.metrics); op.cleanup(); Ok(0)
+    reporter.sample(op);
+    op.report_resample_metrics(&ctx.metrics);
+    op.cleanup();
+    Ok(0)
 }
 
 async fn emit_window(
@@ -1823,8 +2289,12 @@ async fn emit_window(
     }
     let batches = build_rows_chunked(ctx, op, emission.finals)?;
     if ctx.side_output.is_some() && !emission.lates.is_empty() {
-        if let Some(batch) = op.build_late_batch(emission.lates)? { graph::publish_side(ctx, batch).await?; }
-    } else { drop(emission.lates); }
+        if let Some(batch) = op.build_late_batch(emission.lates)? {
+            graph::publish_side(ctx, batch).await?;
+        }
+    } else {
+        drop(emission.lates);
+    }
     drop(scratch); // all raw outputs now have their own resident-sized leases
     for out in batches {
         if !tx.send(out).await? {
@@ -1838,18 +2308,25 @@ async fn emit_window(
             else {
                 break;
             };
-            if ctx.graph_time.is_some() {consume_work(ctx,out.num_rows() as u64).await?;}
+            if ctx.graph_time.is_some() {
+                consume_work(ctx, out.num_rows() as u64).await?;
+            }
             if !tx.send(out).await? {
                 return Ok(false);
             }
         }
-        if ctx.graph_time.is_some() && wm==i64::MAX {op.advance_graph_final();} else {op.advance_holdback(wm)?;}
-        if ctx.graph_time.is_none() && !tx
-            .send_control(StreamControl::Watermark {
-                input: sparrow_model::InputId::SINGLE.raw(),
-                wm_micros: wm,
-            })
-            .await?
+        if ctx.graph_time.is_some() && wm == i64::MAX {
+            op.advance_graph_final();
+        } else {
+            op.advance_holdback(wm)?;
+        }
+        if ctx.graph_time.is_none()
+            && !tx
+                .send_control(StreamControl::Watermark {
+                    input: sparrow_model::InputId::SINGLE.raw(),
+                    wm_micros: wm,
+                })
+                .await?
         {
             return Ok(false);
         }
@@ -1907,7 +2384,7 @@ async fn emit_due(
     Ok(true)
 }
 
-async fn window_stage<const GRAPH:bool>(
+async fn window_stage<const GRAPH: bool>(
     ctx: &JobCtx,
     op: &mut WindowOperator,
     rx: &mut MailboxRx,
@@ -1915,7 +2392,7 @@ async fn window_stage<const GRAPH:bool>(
     capture: &SharedCapture,
 ) -> Result<usize> {
     if ctx.ordered_time {
-        return ordered_window_task(ctx,op,rx,tx,capture)?.await;
+        return ordered_window_task(ctx, op, rx, tx, capture)?.await;
     }
     let mut timer_reporter = TimerReporter {
         ctx,
@@ -1923,8 +2400,8 @@ async fn window_stage<const GRAPH:bool>(
         cancelled: 0,
     };
     let mut input_closed = false;
-    let mut eof_received=false;
-    let mut deferred_eof=false;
+    let mut eof_received = false;
+    let mut deferred_eof = false;
     let mut n = 0usize;
     loop {
         timer_reporter.sample(op.live_timers(), op.cancelled_timers());
@@ -2031,7 +2508,9 @@ async fn window_stage<const GRAPH:bool>(
             }
         }
     }
-    if deferred_eof&&!ctx.cancel.is_cancelled(){tx.send_control(StreamControl::EndOfInput).await?;}
+    if deferred_eof && !ctx.cancel.is_cancelled() {
+        tx.send_control(StreamControl::EndOfInput).await?;
+    }
     op.cleanup();
     timer_reporter.sample(op.live_timers(), op.cancelled_timers());
     Ok(n)
@@ -2041,99 +2520,203 @@ async fn window_stage<const GRAPH:bool>(
 /// its complete async state in every legacy window task. Field drop order
 /// keeps the reservation until the boxed future (including cancellation) drops.
 struct ChargedWindowFuture<F> {
-    future:std::pin::Pin<Box<F>>,
-    _credit:sparrow_model::MemoryLease,
+    future: std::pin::Pin<Box<F>>,
+    _credit: sparrow_model::MemoryLease,
 }
-impl<F:std::future::Future> std::future::Future for ChargedWindowFuture<F> {
-    type Output=F::Output;
-    fn poll(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<Self::Output> {
+impl<F: std::future::Future> std::future::Future for ChargedWindowFuture<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         self.get_mut().future.as_mut().poll(cx)
     }
 }
 
 #[cold]
-fn ordered_window_task<'a>(ctx:&'a JobCtx,op:&'a mut WindowOperator,rx:&'a mut MailboxRx,
-    tx:&'a MailboxTx,capture:&'a SharedCapture)
-    ->Result<ChargedWindowFuture<impl std::future::Future<Output=Result<usize>>+'a>> {
+fn ordered_window_task<'a>(
+    ctx: &'a JobCtx,
+    op: &'a mut WindowOperator,
+    rx: &'a mut MailboxRx,
+    tx: &'a MailboxTx,
+    capture: &'a SharedCapture,
+) -> Result<ChargedWindowFuture<impl std::future::Future<Output = Result<usize>> + 'a>> {
     // Keep construction outside the parent async body: otherwise even a
     // subsequently boxed local can retain its large generator storage there.
-    let future=ordered_window_stage(ctx,op,rx,tx,capture);
-    let credit=ctx.owner.acquire(sparrow_model::CreditKind::Reservation,std::mem::size_of_val(&future).saturating_add(64))?;
-    Ok(ChargedWindowFuture {future:Box::pin(future),_credit:credit})
+    let future = ordered_window_stage(ctx, op, rx, tx, capture);
+    let credit = ctx.owner.acquire(
+        sparrow_model::CreditKind::Reservation,
+        std::mem::size_of_val(&future).saturating_add(64),
+    )?;
+    Ok(ChargedWindowFuture {
+        future: Box::pin(future),
+        _credit: credit,
+    })
 }
 
 #[cfg(test)]
-pub(crate) fn time_graph_window_future_sizes() -> (usize,usize) {
-    fn bytes<F>(_:impl FnOnce(&'static JobCtx,&'static mut WindowOperator,&'static mut MailboxRx,
-        &'static MailboxTx,&'static SharedCapture)->F)->usize {std::mem::size_of::<F>()}
+pub(crate) fn time_graph_window_future_sizes() -> (usize, usize) {
+    fn bytes<F>(
+        _: impl FnOnce(
+            &'static JobCtx,
+            &'static mut WindowOperator,
+            &'static mut MailboxRx,
+            &'static MailboxTx,
+            &'static SharedCapture,
+        ) -> F,
+    ) -> usize {
+        std::mem::size_of::<F>()
+    }
     // Type inspection only: no references are constructed and neither async
     // function is called. Keep cold durable futures off the legacy task layout.
-    (bytes(window_stage::<false>),bytes(ordered_window_stage))
+    (bytes(window_stage::<false>), bytes(ordered_window_stage))
 }
 
 /// PT/Count stages in a durable clock pipeline never sample or wake on a host
 /// clock. A time control is forwarded before derived rows, just as for IoT.
-async fn ordered_window_stage(ctx: &JobCtx, op: &mut WindowOperator, rx: &mut MailboxRx,
-    tx: &MailboxTx, capture: &SharedCapture) -> Result<usize> {
+async fn ordered_window_stage(
+    ctx: &JobCtx,
+    op: &mut WindowOperator,
+    rx: &mut MailboxRx,
+    tx: &MailboxTx,
+    capture: &SharedCapture,
+) -> Result<usize> {
     let mut now = ctx.clock.now_micros();
-    if !op.is_event_time() {op.validate_processing_cut(now)?;}
+    if !op.is_event_time() {
+        op.validate_processing_cut(now)?;
+    }
     let mut n = 0;
-    let mut timers = TimerReporter { ctx, live: 0, cancelled: 0 };
+    let mut timers = TimerReporter {
+        ctx,
+        live: 0,
+        cancelled: 0,
+    };
     loop {
-        timers.sample(op.live_timers(),op.cancelled_timers());
+        timers.sample(op.live_timers(), op.cancelled_timers());
         let envelope = tokio::select! { biased; _=ctx.cancel.cancelled()=>break, e=rx.recv()=>e? };
         let Some(mut envelope) = envelope else {
-            if !ctx.cancel.is_cancelled() { return Err(SparrowError::new(ErrorCode::JobFailed,"ordered time window input closed without shutdown")); }
+            if !ctx.cancel.is_cancelled() {
+                return Err(SparrowError::new(
+                    ErrorCode::JobFailed,
+                    "ordered time window input closed without shutdown",
+                ));
+            }
             break;
         };
         let (batch, control) = envelope.take();
         if let Some(batch) = batch {
-            consume_work(ctx,batch.num_rows() as u64).await?;
+            consume_work(ctx, batch.num_rows() as u64).await?;
             let scratch = op.working_credit(Some(&batch))?;
-            let observation=ctx.graph_time.as_ref().filter(|g|g.event_time).map_or(now,|g|g.observed_micros());
-            let emission = op.on_batch_without_timers(&batch,observation)?;
+            let observation = ctx
+                .graph_time
+                .as_ref()
+                .filter(|g| g.event_time)
+                .map_or(now, |g| g.observed_micros());
+            let emission = op.on_batch_without_timers(&batch, observation)?;
             n += emission.finals.len();
-            if !emit_window(ctx,op,tx,capture,emission,Some(scratch)).await? { break; }
+            if !emit_window(ctx, op, tx, capture, emission, Some(scratch)).await? {
+                break;
+            }
         }
         if let Some(control) = control {
             match control {
-                StreamControl::ProcessingTime {micros} => {
-                    if micros < now { return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"processing time cannot move backwards")); }
+                StreamControl::ProcessingTime { micros } => {
+                    if micros < now {
+                        return Err(SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "processing time cannot move backwards",
+                        ));
+                    }
                     now = micros;
-                    if !tx.send_control(StreamControl::ProcessingTime {micros}).await? {break;}
-                    if op.is_event_time() {continue;}
-                    op.begin_due(now);
-                    while let Some(out) = op.take_closed_batch(now,ctx.mailbox.max_items,ctx.mailbox.max_bytes)? {
-                        consume_work(ctx,out.num_rows() as u64).await?;
-                        n += out.num_rows();
-                        if !tx.send(out).await? {op.cleanup();return Ok(n);}
+                    if !tx
+                        .send_control(StreamControl::ProcessingTime { micros })
+                        .await?
+                    {
+                        break;
                     }
-                    ctx.metrics.record_state(op.key_count() as u64,op.retention_bytes() as u64);
-                }
-                StreamControl::CheckpointBarrier {checkpoint_id} => {
-                    let aligned = ctx.aligned.as_ref().expect("ordered admission");
-                    if !aligned.acks.is_active(checkpoint_id) {continue;}
-                    let freeze = crate::barrier::EncodedFreeze::from_operator(op,&ctx.owner,ctx.max_state_keys);
-                    aligned.acks.state_frozen(checkpoint_id,op.operator_id(),freeze).await;
-                    if !tx.send_control(StreamControl::CheckpointBarrier {checkpoint_id}).await? {break;}
-                }
-                StreamControl::GraphProgress {watermark_micros,flags} if ctx.graph_time.is_some() => {
-                    let mut p=crate::graph_cut::Progress::from_control(watermark_micros,flags)?;
                     if op.is_event_time() {
-                        let emission=if p.eof {
-                            let mut emission=op.finish_input()?;emission.pending_close=Some(i64::MAX);emission
-                        } else if p.idle {op.mark_idle(sparrow_model::InputId::SINGLE)?}
-                        else {op.mark_active(sparrow_model::InputId::SINGLE)?;match p.watermark {Some(wm)=>op.observe_watermark(sparrow_model::InputId::SINGLE,wm)?,None=>Default::default()}};
-                        n+=emission.finals.len();
-                        if !emit_window(ctx,op,tx,capture,emission,None).await? {break;}
-                        p.watermark=op.wm_out();
+                        continue;
                     }
-                    if !tx.send_control(p.control()).await? {break;}
+                    op.begin_due(now);
+                    while let Some(out) =
+                        op.take_closed_batch(now, ctx.mailbox.max_items, ctx.mailbox.max_bytes)?
+                    {
+                        consume_work(ctx, out.num_rows() as u64).await?;
+                        n += out.num_rows();
+                        if !tx.send(out).await? {
+                            op.cleanup();
+                            return Ok(n);
+                        }
+                    }
+                    ctx.metrics
+                        .record_state(op.key_count() as u64, op.retention_bytes() as u64);
                 }
-                StreamControl::GraphRoundEnd {sequence} if ctx.graph_time.is_some() => {
-                    if !tx.send_control(StreamControl::GraphRoundEnd {sequence}).await? {break;}
+                StreamControl::CheckpointBarrier { checkpoint_id } => {
+                    let aligned = ctx.aligned.as_ref().expect("ordered admission");
+                    if !aligned.acks.is_active(checkpoint_id) {
+                        continue;
+                    }
+                    let freeze = crate::barrier::EncodedFreeze::from_operator(
+                        op,
+                        &ctx.owner,
+                        ctx.max_state_keys,
+                    );
+                    aligned
+                        .acks
+                        .state_frozen(checkpoint_id, op.operator_id(), freeze)
+                        .await;
+                    if !tx
+                        .send_control(StreamControl::CheckpointBarrier { checkpoint_id })
+                        .await?
+                    {
+                        break;
+                    }
                 }
-                _ => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered windows accept only time and checkpoint controls")),
+                StreamControl::GraphProgress {
+                    watermark_micros,
+                    flags,
+                } if ctx.graph_time.is_some() => {
+                    let mut p = crate::graph_cut::Progress::from_control(watermark_micros, flags)?;
+                    if op.is_event_time() {
+                        let emission = if p.eof {
+                            let mut emission = op.finish_input()?;
+                            emission.pending_close = Some(i64::MAX);
+                            emission
+                        } else if p.idle {
+                            op.mark_idle(sparrow_model::InputId::SINGLE)?
+                        } else {
+                            op.mark_active(sparrow_model::InputId::SINGLE)?;
+                            match p.watermark {
+                                Some(wm) => {
+                                    op.observe_watermark(sparrow_model::InputId::SINGLE, wm)?
+                                }
+                                None => Default::default(),
+                            }
+                        };
+                        n += emission.finals.len();
+                        if !emit_window(ctx, op, tx, capture, emission, None).await? {
+                            break;
+                        }
+                        p.watermark = op.wm_out();
+                    }
+                    if !tx.send_control(p.control()).await? {
+                        break;
+                    }
+                }
+                StreamControl::GraphRoundEnd { sequence } if ctx.graph_time.is_some() => {
+                    if !tx
+                        .send_control(StreamControl::GraphRoundEnd { sequence })
+                        .await?
+                    {
+                        break;
+                    }
+                }
+                _ => {
+                    return Err(SparrowError::new(
+                        ErrorCode::UnsupportedRestore,
+                        "ordered windows accept only time and checkpoint controls",
+                    ))
+                }
             }
         }
     }
@@ -2228,7 +2811,12 @@ async fn budgeted_live_source(
             },
         };
         let Some((first, mut origin)) = first else {
-            if ctx.graph_mode&&!ctx.cancel.is_cancelled(){return Err(SparrowError::new(ErrorCode::JobFailed,"live graph input closed without EOF"));}
+            if ctx.graph_mode && !ctx.cancel.is_cancelled() {
+                return Err(SparrowError::new(
+                    ErrorCode::JobFailed,
+                    "live graph input closed without EOF",
+                ));
+            }
             return Ok(n);
         };
         let mut builder = sparrow_model::RowBatchBuilder::new(
@@ -2252,19 +2840,22 @@ async fn budgeted_live_source(
                 Err(_) => break,
             }
         }
-        let batch = builder.finish()?.with_origin(origin).with_source_operator(ctx.source_operator);
+        let batch = builder
+            .finish()?
+            .with_origin(origin)
+            .with_source_operator(ctx.source_operator);
         n += batch.num_rows();
         ctx.metrics.record_ingest(batch.num_rows() as u64);
         if let Some(obs) = &ctx.observation {
             obs.runtime_rows(true, batch.num_rows());
         }
-        if !graph::send_source(&ctx,&tx,batch).await? {
+        if !graph::send_source(&ctx, &tx, batch).await? {
             return Ok(n);
         }
     }
 }
 
-async fn live_source<const GRAPH:bool>(
+async fn live_source<const GRAPH: bool>(
     ctx: JobCtx,
     schema: sparrow_model::Schema,
     tx: MailboxTx,
@@ -2272,7 +2863,7 @@ async fn live_source<const GRAPH:bool>(
 ) -> Result<usize> {
     let schema = Arc::new(schema);
     let mut n = 0usize;
-    let mut ended=false;
+    let mut ended = false;
     let mut ready = Vec::new();
     loop {
         tokio::select! {
@@ -2364,21 +2955,43 @@ async fn publish_live_rows(
         if let Some(obs) = &ctx.observation {
             obs.runtime_rows(true, batch.num_rows());
         }
-        if !graph::send_source(ctx,tx,batch.with_origin(origin).with_source_operator(ctx.source_operator)).await? {
+        if !graph::send_source(
+            ctx,
+            tx,
+            batch
+                .with_origin(origin)
+                .with_source_operator(ctx.source_operator),
+        )
+        .await?
+        {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-async fn publish_source_control(ctx:&JobCtx, tx:&MailboxTx, control:StreamControl) -> Result<bool> {
-    graph::source_activity(ctx,&control);
-    if let Some((side,drop_when_full))=&ctx.side_output { graph::publish_control(ctx, side, *drop_when_full, control.clone()).await?; }
-    let checkpoint_id=match &control { StreamControl::CheckpointBarrier {checkpoint_id}=>Some(*checkpoint_id), _=>None };
-    if !tx.send_control(control).await? {return Ok(false);}
-    if let (Some(id),Some(aligned))=(checkpoint_id,&ctx.aligned) {
-        if let Some(source) = ctx.source_operator { aligned.acks.source_cut_for(id, source).await; }
-        else { aligned.acks.source_cut(id).await; }
+async fn publish_source_control(
+    ctx: &JobCtx,
+    tx: &MailboxTx,
+    control: StreamControl,
+) -> Result<bool> {
+    graph::source_activity(ctx, &control);
+    if let Some((side, drop_when_full)) = &ctx.side_output {
+        graph::publish_control(ctx, side, *drop_when_full, control.clone()).await?;
+    }
+    let checkpoint_id = match &control {
+        StreamControl::CheckpointBarrier { checkpoint_id } => Some(*checkpoint_id),
+        _ => None,
+    };
+    if !tx.send_control(control).await? {
+        return Ok(false);
+    }
+    if let (Some(id), Some(aligned)) = (checkpoint_id, &ctx.aligned) {
+        if let Some(source) = ctx.source_operator {
+            aligned.acks.source_cut_for(id, source).await;
+        } else {
+            aligned.acks.source_cut(id).await;
+        }
     }
     Ok(true)
 }

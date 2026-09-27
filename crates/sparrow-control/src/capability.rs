@@ -152,7 +152,12 @@ pub fn inventory() -> Value {
                 "sliding":"one_trigger_per_event; exclusive_lower_inclusive_upper; PT_zero_delay_emits_arrival_prefix",
                 "session":"gap_and_max_duration; equality_starts_new_session; open_ET_sessions_can_resegment"},
             "not_implemented":["session_late_corrections","new_family_checkpoint_restore","unbounded_global"],"new_window_policy":"add_only_with_workload_semantics_and_independent_reference"},
-        "sql":{"runtime_parser":"sparrow_sql_subset","aggregates":["count","sum","avg","min","max"],
+        "analysis":{"maturity":"development_preview","certified":false,"recovery":"restart_fresh_only",
+            "unnest":{"max_rows":4096,"default_max_rows":1024,"null_empty":"zero_rows","ordinal":"one_based_per_operator_input; source_operator_preserved_when_known","controls":"after_all_expanded_rows"},
+            "joins":{"kinds":["interval_inner","interval_left","tumbling_window_inner","tumbling_window_left"],"inputs":"two_direct_explicit_event_time_sources","late":"error_L0","idle":"does_not_authorize_cleanup_or_unmatched","max_rows_per_side":4096,"default_max_rows_per_side":1024,"max_matches_per_row":4096,"default_max_matches_per_row":1024},
+            "finite_query":{"endpoint":"POST /v1/query","io":"inline_rows_or_client_prepared_history_only; no_source_sink_IO","concurrency":2,"kernel":"independent","request_bytes":65536,"sql_bytes":8192,"max_input_rows":4096,"max_output_rows":4096,"max_output_bytes":1048576,"max_timeout_ms":30000}},
+        "sql":{"runtime_parser":"sparrow_sql_subset","aggregates":["count","sum","avg","min","max","first","last","var_pop","var_samp","stddev_pop","stddev_samp"],
+            "extended_aggregates":{"recovery":"restart_fresh_only","order":"arrival_order_or_buffered_ET_timestamp_then_arrival","moments":"Welford_f64_finite; no_merge_codec; integers_may_lose_precision_above_2pow53"},
             "not_full_ansi_sql":true,"differential_test_parser":"sqlparser 0.62.0 (testkit only)"},
         "http":{"batch":true,"linger":true,"max_inflight":8,"max_outbox_items":1024,
             "durable_outbox":false,"exactly_once":false,"oversized_output":"bounded_rejection_not_implicit_splitting"},
@@ -174,7 +179,10 @@ mod tests {
         assert_eq!(value["dag"]["certified"], false);
         assert_eq!(value["iot"]["aligned"]["snapshot_version"], 6);
         assert_eq!(value["iot"]["aligned"]["ttl_micros"], 0);
-        assert_eq!(value["iot"]["jetstream"]["supported"], cfg!(feature="jetstream"));
+        assert_eq!(
+            value["iot"]["jetstream"]["supported"],
+            cfg!(feature = "jetstream")
+        );
         assert_eq!(value["iot"]["jetstream"]["snapshot_version"], 7);
         assert!(value["dag"]["aligned"]
             .as_str()
@@ -216,9 +224,13 @@ mod tests {
         assert_eq!(value["iot"]["jetstream"]["snapshot_version"], 7);
         assert_eq!(value["iot"]["jetstream"]["ttl_micros"], 0);
         assert_eq!(value["iot"]["jetstream"]["required_sink"], "http");
-        assert!(value["jetstream"]["state_shapes"].as_array().unwrap()
+        assert!(value["jetstream"]["state_shapes"]
+            .as_array()
+            .unwrap()
             .contains(&serde_json::json!("two_iot_ttl0")));
-        assert!(value["jetstream"]["snapshot_version_scope"].as_str().unwrap()
+        assert!(value["jetstream"]["snapshot_version_scope"]
+            .as_str()
+            .unwrap()
             .contains("legacy_zero_or_count_only"));
     }
 
@@ -228,15 +240,34 @@ mod tests {
         let silence = &value["silence"];
         assert_eq!(silence["certified"], false);
         assert_eq!(silence["profiles"]["file"], 23);
-        assert_eq!(silence["profiles"]["jetstream"],
-            if cfg!(feature = "jetstream") { serde_json::json!(24) }
-            else { serde_json::json!("feature_required") });
+        assert_eq!(
+            silence["profiles"]["jetstream"],
+            if cfg!(feature = "jetstream") {
+                serde_json::json!(24)
+            } else {
+                serde_json::json!("feature_required")
+            }
+        );
         assert_eq!(silence["events"], serde_json::json!(["silent", "resumed"]));
         assert_eq!(silence["mqtt_live"]["durable"], false);
-        for excluded in ["mqtt_recovery", "http_push", "dag", "event_time", "references", "upstream_transforms", "other_state_nodes"] {
-            assert!(silence["not_enabled"].as_array().unwrap().contains(&serde_json::json!(excluded)));
+        for excluded in [
+            "mqtt_recovery",
+            "http_push",
+            "dag",
+            "event_time",
+            "references",
+            "upstream_transforms",
+            "other_state_nodes",
+        ] {
+            assert!(silence["not_enabled"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(excluded)));
         }
-        assert!(silence["diagnostics"].as_str().unwrap().contains("not_current_source_health"));
+        assert!(silence["diagnostics"]
+            .as_str()
+            .unwrap()
+            .contains("not_current_source_health"));
         assert_eq!(value["alarm"]["profiles"]["file"], 20);
         assert_eq!(value["paused_time_iot"]["sources"]["file"], "v14");
     }

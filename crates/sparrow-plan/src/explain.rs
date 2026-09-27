@@ -41,21 +41,41 @@ impl GraphExplain {
         recovery: RecoveryPolicy,
         replay: &'static str,
     ) -> Self {
-        let stages = plan
-            .stages
-            .iter()
-            .map(stage_label)
-            .collect::<Vec<_>>();
+        let stages = plan.stages.iter().map(stage_label).collect::<Vec<_>>();
         let mut physical: Vec<String> = plan
             .stages
             .iter()
             .enumerate()
             .map(|(i, s)| format!("{i}:{}", stage_label(s)))
             .collect();
-        if let Some(edges)=&plan.edges {
-            physical.extend(edges.iter().enumerate().map(|(id,e)|format!("edge:{id} chain:{} -> chain:{} port:{} contract:{}",e.from,e.to,e.port.raw(),if e.best_effort{"best_effort; full=data_drop; control_full=detach_branch"}else{"required; full=backpressure"})));
-            physical.extend(plan.source_times.iter().map(|(id,time)|format!("source_time:{} field:{} out_of_orderness_micros:{}",id.raw(),time.field,time.out_of_orderness_micros)));
-            physical.extend(plan.side_outputs.iter().map(|(i,side)|format!("side_output:chain:{i} kind:{:?} port:{} full:{:?}",side.kind,side.to,side.full)));
+        if let Some(edges) = &plan.edges {
+            physical.extend(edges.iter().enumerate().map(|(id, e)| {
+                format!(
+                    "edge:{id} chain:{} -> chain:{} port:{} contract:{}",
+                    e.from,
+                    e.to,
+                    e.port.raw(),
+                    if e.best_effort {
+                        "best_effort; full=data_drop; control_full=detach_branch"
+                    } else {
+                        "required; full=backpressure"
+                    }
+                )
+            }));
+            physical.extend(plan.source_times.iter().map(|(id, time)| {
+                format!(
+                    "source_time:{} field:{} out_of_orderness_micros:{}",
+                    id.raw(),
+                    time.field,
+                    time.out_of_orderness_micros
+                )
+            }));
+            physical.extend(plan.side_outputs.iter().map(|(i, side)| {
+                format!(
+                    "side_output:chain:{i} kind:{:?} port:{} full:{:?}",
+                    side.kind, side.to, side.full
+                )
+            }));
         }
         let fused = plan.fused();
         let fusion = if fused {
@@ -64,7 +84,8 @@ impl GraphExplain {
             "no transform fusion".into()
         };
         let time = if recovery.is_aligned() && plan.has_processing_time_state() {
-            "processing-time / paused_source_ordered; downstream_due_before_upstream_timer_rows".into()
+            "processing-time / paused_source_ordered; downstream_due_before_upstream_timer_rows"
+                .into()
         } else if plan.has_event_time_window() {
             format!(
                 "event-time ({})",
@@ -110,6 +131,15 @@ fn describe_state(plan: &PhysicalPlan) -> String {
     let mut bits = Vec::new();
     for s in &plan.stages {
         match s {
+            PhysicalStage::Analysis { operator, plan } => bits.push(format!(
+                "bounded_analysis op={} kind={} recovery=restart_fresh",
+                operator.raw(),
+                if plan.is_join() {
+                    "stream_join"
+                } else {
+                    "unnest"
+                }
+            )),
             PhysicalStage::WindowAgg { spec, operator, .. } => {
                 bits.push(format!(
                     "window_agg op={} keys={} kind={:?}",
@@ -143,14 +173,20 @@ fn describe_state(plan: &PhysicalPlan) -> String {
                     spec.invalid
                 ));
                 if let Some(hysteresis) = &spec.hysteresis {
-                    bits.push(format!("hysteresis direction={} enter={} exit={}",
+                    bits.push(format!(
+                        "hysteresis direction={} enter={} exit={}",
                         match hysteresis.direction {
                             crate::HysteresisDirection::High => "high",
                             crate::HysteresisDirection::Low => "low",
-                        }, hysteresis.enter, hysteresis.exit));
+                        },
+                        hysteresis.enter,
+                        hysteresis.exit
+                    ));
                 }
-                if let Some(timing)=&spec.timing {
-                    bits.push(format!("timing={timing:?}; clock=paused_source_ordered; due_before_input"));
+                if let Some(timing) = &spec.timing {
+                    bits.push(format!(
+                        "timing={timing:?}; clock=paused_source_ordered; due_before_input"
+                    ));
                 }
             }
             _ => {}
@@ -165,6 +201,13 @@ fn describe_state(plan: &PhysicalPlan) -> String {
 
 fn stage_label(s: &PhysicalStage) -> String {
     match s {
+        PhysicalStage::Analysis { plan, .. } => {
+            if plan.is_join() {
+                "stream_join".into()
+            } else {
+                "unnest".into()
+            }
+        }
         PhysicalStage::Branch { .. } => "branch:broadcast".into(),
         PhysicalStage::Route { mode, .. } => format!("route:{mode:?}"),
         PhysicalStage::UnionAll { .. } => "union_all:per-input-ordered".into(),
@@ -244,6 +287,13 @@ pub fn bound_kinds(bound: &BoundLogicalPlan) -> Vec<String> {
         .nodes
         .iter()
         .map(|n| match &n.kind {
+            BoundKind::Analysis(plan) => {
+                if plan.is_join() {
+                    "stream_join".into()
+                } else {
+                    "unnest".into()
+                }
+            }
             BoundKind::Branch { .. } => "branch".into(),
             BoundKind::Route { .. } => "route".into(),
             BoundKind::UnionAll { .. } => "union_all".into(),

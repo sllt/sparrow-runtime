@@ -4,6 +4,8 @@
 //! Arrow, Axum, SQLite, MQTT, and `sqlparser` stay out of this crate.
 
 pub mod aggregate;
+mod alarm;
+mod alarm_iot;
 pub mod aligned;
 pub mod barrier;
 pub mod capture;
@@ -12,15 +14,16 @@ pub mod clock;
 pub mod coordinator;
 pub mod dedup;
 pub mod iot;
+mod resample_iot;
+mod silence_iot;
 mod timed_iot;
 mod timed_state;
-mod alarm;
-mod alarm_iot;
-mod silence_iot;
-mod resample_iot;
 pub use resample_iot::ResampleStats;
-pub mod observed_cut;
-pub mod processing_cut;
+#[cfg(test)]
+mod analysis_tests;
+mod bounded_join;
+mod buffered_window;
+pub mod finite;
 pub mod graph_cut;
 pub mod kernel;
 pub mod linear;
@@ -28,17 +31,28 @@ pub mod lookup;
 pub mod mailbox;
 pub mod mailbox_observe;
 pub mod metrics;
+pub mod observed_cut;
+pub mod pipeline_checkpoint;
+pub mod processing_cut;
 pub mod state;
 pub mod timer;
 pub mod transform;
 pub mod watermark;
 pub mod window;
-mod buffered_window;
 #[cfg(test)]
 mod window_completion_tests;
-pub mod pipeline_checkpoint;
-pub use pipeline_checkpoint::{snapshot_version_for, PipelineSnapshot};
 pub use iot::{IotFreeze, IotOperator};
+pub use pipeline_checkpoint::{snapshot_version_for, PipelineSnapshot};
+#[cfg(test)]
+mod alarm_tests;
+#[cfg(test)]
+mod core_a_tests;
+#[cfg(test)]
+mod core_b2_tests;
+#[cfg(test)]
+mod core_b_tests;
+#[cfg(test)]
+mod hysteresis_completion_tests;
 #[cfg(test)]
 mod k1_tests;
 #[cfg(test)]
@@ -46,32 +60,22 @@ mod k3_tests;
 #[cfg(test)]
 mod k4_tests;
 #[cfg(test)]
-mod core_a_tests;
-#[cfg(test)]
-mod core_b_tests;
-#[cfg(test)]
-mod core_b2_tests;
+mod paused_time_tests;
 #[cfg(test)]
 mod reference_completion_tests;
 #[cfg(test)]
-mod hysteresis_completion_tests;
+mod resample_tests;
 #[cfg(test)]
-mod paused_time_tests;
+mod silence_tests;
 #[cfg(test)]
 mod time_completion_tests;
 #[cfg(test)]
 mod time_graph_tests;
-#[cfg(test)]
-mod alarm_tests;
-#[cfg(test)]
-mod silence_tests;
-#[cfg(test)]
-mod resample_tests;
 
 pub use aligned::{run_until, AlignedSession};
 pub use barrier::{
-    wait_aligned_acks, wait_outbox, AlignedAck, AlignedAcks, AlignedJob, BarrierAcks, CheckpointAcks,
-    FlushOutcome, PipelineRestore, ParticipantAcks, ParticipantOutcome,
+    wait_aligned_acks, wait_outbox, AlignedAck, AlignedAcks, AlignedJob, BarrierAcks,
+    CheckpointAcks, FlushOutcome, ParticipantAcks, ParticipantOutcome, PipelineRestore,
 };
 pub use capture::{CaptureMode, SharedCapture, StallGate};
 pub use checkpoint::{
@@ -81,7 +85,8 @@ pub use checkpoint::{
 pub use clock::RuntimeClock;
 pub use coordinator::{CheckpointCoordinator, CheckpointPhase};
 pub use kernel::{
-    GraphInput, GraphOutput, IngressEvent, JobHandle, JobRequest, JobStats, Kernel, KernelOptions, SourceAdmission,
+    GraphInput, GraphOutput, IngressEvent, JobHandle, JobRequest, JobStats, Kernel, KernelOptions,
+    SourceAdmission,
 };
 pub use linear::{drain, LinearExecutor, RuntimeConfig};
 pub use lookup::{ReferenceTable, VersionedReferenceTable};
@@ -252,7 +257,9 @@ mod g2_tests {
                 live.clone(),
             ))
             .unwrap();
-        let b_stats = k.block_on(b.wait()).expect("peer job froze behind stalled sink");
+        let b_stats = k
+            .block_on(b.wait())
+            .expect("peer job froze behind stalled sink");
         assert_eq!(b_stats.captured_rows, 2);
         stalled.stall.release();
         k.block_on(a.wait()).unwrap();

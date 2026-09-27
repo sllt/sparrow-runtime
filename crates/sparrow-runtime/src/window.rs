@@ -124,66 +124,138 @@ impl WindowOperator {
         if now >= 0 && matches!(self.spec.kind, WindowKind::HoppingProcessingTime { .. }) {
             self.hopping_clock_high = self.hopping_clock_high.max(now);
             self.hopping_clock_high
-        } else { now }
+        } else {
+            now
+        }
     }
-    pub(crate) fn is_processing_time(&self)->bool {self.spec.kind.uses_processing_time_timer()}
-    fn suffixed_key(&self)->bool {self.spec.kind.uses_event_time() || matches!(self.spec.kind,WindowKind::HoppingProcessingTime {..})}
-    pub(crate) fn is_event_time(&self)->bool {self.spec.kind.uses_event_time()}
+    pub(crate) fn is_processing_time(&self) -> bool {
+        self.spec.kind.uses_processing_time_timer()
+    }
+    fn suffixed_key(&self) -> bool {
+        self.spec.kind.uses_event_time()
+            || matches!(self.spec.kind, WindowKind::HoppingProcessingTime { .. })
+    }
+    pub(crate) fn is_event_time(&self) -> bool {
+        self.spec.kind.uses_event_time()
+    }
     /// A logged permanent EOF closes all windows, including positive holdback.
     /// Used only by the durable ET graph, never by an ordinary watermark.
     pub(crate) fn advance_graph_final(&mut self) {
-        if let Some(holdback)=&mut self.holdback {holdback.restore(Some(i64::MAX),Some(i64::MAX));}
+        if let Some(holdback) = &mut self.holdback {
+            holdback.restore(Some(i64::MAX), Some(i64::MAX));
+        }
     }
-    pub(crate) fn finish_input(&mut self)->Result<WindowEmission> {
+    pub(crate) fn finish_input(&mut self) -> Result<WindowEmission> {
         self.hub.mark_active(self.default_input)?;
-        self.hub.set_watermark(self.default_input,i64::MAX)?;
+        self.hub.set_watermark(self.default_input, i64::MAX)?;
         self.drain_watermark()
     }
-    pub(crate) fn use_external_watermarks(&mut self) { self.external_watermarks = true; }
-    pub(crate) fn operator_id(&self) -> OperatorId { self.operator }
+    pub(crate) fn use_external_watermarks(&mut self) {
+        self.external_watermarks = true;
+    }
+    pub(crate) fn operator_id(&self) -> OperatorId {
+        self.operator
+    }
 
     /// K1 validates every restored instance before input activation. Legacy raw
     /// restore retains its separate embedding contract.
-    pub(crate) fn validate_participant_restore(&self, freeze:&WindowFreeze) -> Result<()> {
-        let invalid = || SparrowError::new(ErrorCode::UnsupportedRestore,"restored window state does not match participant schema/accumulators/bounds");
-        let count = matches!(self.spec.kind,WindowKind::Count {..});
-        if freeze.operator!=self.operator || freeze.slot!=StateSlotId::new(SLOT) || freeze.kind!=u8::from(count) { return Err(invalid()); }
-        let expected = empty_accs(&self.spec,&self.input)?;
+    pub(crate) fn validate_participant_restore(&self, freeze: &WindowFreeze) -> Result<()> {
+        let invalid = || {
+            SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "restored window state does not match participant schema/accumulators/bounds",
+            )
+        };
+        let count = matches!(self.spec.kind, WindowKind::Count { .. });
+        if freeze.operator != self.operator
+            || freeze.slot != StateSlotId::new(SLOT)
+            || freeze.kind != u8::from(count)
+        {
+            return Err(invalid());
+        }
+        let expected = empty_accs(&self.spec, &self.input)?;
         for entry in &freeze.entries {
-            if entry.key.len()!=self.group_idx.len()+usize::from(self.suffixed_key()) || entry.accs.len()!=expected.len() { return Err(invalid()); }
-            for (value,idx) in entry.key.iter().zip(&self.group_idx) {
-                let field=&self.input.fields[*idx];
-                if !value.matches_type(&field.data_type) && !(value.is_null() && field.nullable) { return Err(invalid()); }
+            if entry.key.len() != self.group_idx.len() + usize::from(self.suffixed_key())
+                || entry.accs.len() != expected.len()
+            {
+                return Err(invalid());
             }
-            if let WindowKind::Count {size} = self.spec.kind {
-                if entry.count==0 || entry.count>=size { return Err(invalid()); }
+            for (value, idx) in entry.key.iter().zip(&self.group_idx) {
+                let field = &self.input.fields[*idx];
+                if !value.matches_type(&field.data_type) && !(value.is_null() && field.nullable) {
+                    return Err(invalid());
+                }
+            }
+            if let WindowKind::Count { size } = self.spec.kind {
+                if entry.count == 0 || entry.count >= size {
+                    return Err(invalid());
+                }
             } else {
-                let (size,slide)=match self.spec.kind {
-                    WindowKind::TumblingProcessingTime {size_micros}=>(size_micros,size_micros),
-                    WindowKind::TumblingEventTime {size_micros}=>(size_micros,size_micros),
-                    WindowKind::HoppingEventTime {size_micros,slide_micros}|WindowKind::HoppingProcessingTime {size_micros,slide_micros}=>(size_micros,slide_micros),
-                    _=>return Err(invalid()),
+                let (size, slide) = match self.spec.kind {
+                    WindowKind::TumblingProcessingTime { size_micros } => {
+                        (size_micros, size_micros)
+                    }
+                    WindowKind::TumblingEventTime { size_micros } => (size_micros, size_micros),
+                    WindowKind::HoppingEventTime {
+                        size_micros,
+                        slide_micros,
+                    }
+                    | WindowKind::HoppingProcessingTime {
+                        size_micros,
+                        slide_micros,
+                    } => (size_micros, slide_micros),
+                    _ => return Err(invalid()),
                 };
-                if entry.window_start.checked_add(size)!=Some(entry.window_end) || entry.window_start.rem_euclid(slide)!=0
-                    || (self.suffixed_key() && entry.key.last()!=Some(&Scalar::Int64(entry.window_start))) { return Err(invalid()); }
-                if self.is_processing_time() && entry.count != 0 { return Err(invalid()); }
+                if entry.window_start.checked_add(size) != Some(entry.window_end)
+                    || entry.window_start.rem_euclid(slide) != 0
+                    || (self.suffixed_key()
+                        && entry.key.last() != Some(&Scalar::Int64(entry.window_start)))
+                {
+                    return Err(invalid());
+                }
+                if self.is_processing_time() && entry.count != 0 {
+                    return Err(invalid());
+                }
             }
-            for ((actual,prototype),call) in entry.accs.iter().zip(&expected).zip(&self.spec.aggs) {
-                if std::mem::discriminant(actual)!=std::mem::discriminant(prototype) { return Err(invalid()); }
-                let n=match actual {
-                    Accumulator::Count {rows,non_null,star}=>{
-                        if *star!=call.count_star || non_null>rows || (count && *rows!=entry.count) { return Err(invalid()); }
+            for ((actual, prototype), call) in entry.accs.iter().zip(&expected).zip(&self.spec.aggs)
+            {
+                if std::mem::discriminant(actual) != std::mem::discriminant(prototype) {
+                    return Err(invalid());
+                }
+                let n = match actual {
+                    Accumulator::Extended(_) => return Err(invalid()),
+                    Accumulator::Count {
+                        rows,
+                        non_null,
+                        star,
+                    } => {
+                        if *star != call.count_star
+                            || non_null > rows
+                            || (count && *rows != entry.count)
+                        {
+                            return Err(invalid());
+                        }
                         *rows
                     }
-                    Accumulator::SumI64 {n,..}|Accumulator::SumU64 {n,..}|Accumulator::SumF64 {n,..}|Accumulator::Avg {n,..}=>*n,
-                    Accumulator::Min {v}|Accumulator::Max {v}=>{
-                        if let Some(v)=v {
-                            if v.is_null() || v.is_nan() || !v.matches_type(&call.input_type(&self.input)?) { return Err(invalid()); }
+                    Accumulator::SumI64 { n, .. }
+                    | Accumulator::SumU64 { n, .. }
+                    | Accumulator::SumF64 { n, .. }
+                    | Accumulator::Avg { n, .. } => *n,
+                    Accumulator::Min { v } | Accumulator::Max { v } => {
+                        if let Some(v) = v {
+                            if v.is_null()
+                                || v.is_nan()
+                                || !v.matches_type(&call.input_type(&self.input)?)
+                            {
+                                return Err(invalid());
+                            }
                         }
                         0
                     }
                 };
-                if count && n>entry.count {return Err(invalid());}
+                if count && n > entry.count {
+                    return Err(invalid());
+                }
             }
         }
         Ok(())
@@ -191,15 +263,28 @@ impl WindowOperator {
 
     pub(crate) fn validate_processing_cut(&self, now: i64) -> Result<()> {
         if now < 0 || self.spec.kind.uses_event_time() {
-            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"invalid ordered window time policy"));
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "invalid ordered window time policy",
+            ));
         }
         if let WindowStore::Tumble(store) = &self.store {
-            if store.iter().any(|(_,e)| e.window_start < 0 || e.window_start > now || e.window_end <= now) {
-                return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"PT restore has a future window or overdue timer"));
+            if store
+                .iter()
+                .any(|(_, e)| e.window_start < 0 || e.window_start > now || e.window_end <= now)
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::UnsupportedRestore,
+                    "PT restore has a future window or overdue timer",
+                ));
             }
         }
-        if self.wm_in().is_some() || self.wm_out().is_some() || self.hub.last_effective().is_some() {
-            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"ordered window cannot restore event-time watermarks"));
+        if self.wm_in().is_some() || self.wm_out().is_some() || self.hub.last_effective().is_some()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "ordered window cannot restore event-time watermarks",
+            ));
         }
         Ok(())
     }
@@ -213,7 +298,9 @@ impl WindowOperator {
         max_timers: usize,
     ) -> Result<Self> {
         spec.validate()?;
-        if spec.kind.is_buffered() {return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"buffered sliding/session windows use BufferedWindow through Kernel, not the legacy WindowOperator codec"));}
+        if spec.kind.is_buffered() {
+            return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"buffered sliding/session windows use BufferedWindow through Kernel, not the legacy WindowOperator codec"));
+        }
         let group_idx = resolve_keys(&input, &spec.keys)?;
         let event_time_idx = match &spec.event_time_field {
             Some(name) => Some(input.index_of_name(name).ok_or_else(|| {
@@ -241,7 +328,10 @@ impl WindowOperator {
         let variable_accs = spec.aggs.iter().any(|a| {
             matches!(
                 a.func,
-                sparrow_model::AggFn::Min | sparrow_model::AggFn::Max
+                sparrow_model::AggFn::Min
+                    | sparrow_model::AggFn::Max
+                    | sparrow_model::AggFn::First
+                    | sparrow_model::AggFn::Last
             )
         });
         let store = match spec.kind {
@@ -571,14 +661,22 @@ impl WindowOperator {
                 size_micros,
                 slide_micros,
             } => self.on_et_row(row, now, size_micros, Some(slide_micros)),
-            WindowKind::HoppingProcessingTime {size_micros,slide_micros} => {
-                let group=self.group_key(row);
-                for (start,end) in WindowKind::assign_hop(now,size_micros,slide_micros,self.spec.max_overlap)? {
-                    self.upsert_et_window(&group,start,end,row)?;
+            WindowKind::HoppingProcessingTime {
+                size_micros,
+                slide_micros,
+            } => {
+                let group = self.group_key(row);
+                for (start, end) in
+                    WindowKind::assign_hop(now, size_micros, slide_micros, self.spec.max_overlap)?
+                {
+                    self.upsert_et_window(&group, start, end, row)?;
                 }
                 Ok(WindowEmission::default())
             }
-            _=>Err(SparrowError::new(ErrorCode::FeatureUnavailable,"buffered window requires its dedicated executor")),
+            _ => Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "buffered window requires its dedicated executor",
+            )),
         }
     }
 
@@ -602,7 +700,9 @@ impl WindowOperator {
                 }
             }
         }
-        if !self.external_watermarks { self.hub.observe_event(self.default_input, ts, now)?; }
+        if !self.external_watermarks {
+            self.hub.observe_event(self.default_input, ts, now)?;
+        }
         let assigned = if let Some(slide) = slide {
             WindowKind::assign_hop(ts, size, slide, self.spec.max_overlap)?
         } else {
@@ -655,8 +755,9 @@ impl WindowOperator {
                 )?;
             }
             self.index_insert(&sk, end)?;
-            if matches!(self.spec.kind,WindowKind::HoppingProcessingTime {..}) {
-                self.timers.schedule(TimerId::window(self.operator,end),end)?;
+            if matches!(self.spec.kind, WindowKind::HoppingProcessingTime { .. }) {
+                self.timers
+                    .schedule(TimerId::window(self.operator, end), end)?;
             }
         }
         if let WindowStore::Tumble(store) = &mut self.store {
@@ -745,7 +846,11 @@ impl WindowOperator {
             self.closed_index.retain(|_, v| {
                 let keep = v != &k;
                 if !keep {
-                    self.closed_index_bytes = self.owner.replace_accounted_bytes(self.closed_index_bytes, v.index_bytes(), 0);
+                    self.closed_index_bytes = self.owner.replace_accounted_bytes(
+                        self.closed_index_bytes,
+                        v.index_bytes(),
+                        0,
+                    );
                 }
                 keep
             });
@@ -765,7 +870,11 @@ impl WindowOperator {
         let old = self
             .closed_index
             .insert((window_end, key.encoded_bytes().to_vec()), indexed);
-        self.closed_index_bytes = self.owner.replace_accounted_bytes(self.closed_index_bytes, old.as_ref().map_or(0, StateKey::index_bytes), bytes);
+        self.closed_index_bytes = self.owner.replace_accounted_bytes(
+            self.closed_index_bytes,
+            old.as_ref().map_or(0, StateKey::index_bytes),
+            bytes,
+        );
         Ok(())
     }
 
@@ -774,7 +883,9 @@ impl WindowOperator {
             .closed_index
             .remove(&(window_end, key.encoded_bytes().to_vec()))
         {
-            self.closed_index_bytes = self.owner.replace_accounted_bytes(self.closed_index_bytes, old.index_bytes(), 0);
+            self.closed_index_bytes =
+                self.owner
+                    .replace_accounted_bytes(self.closed_index_bytes, old.index_bytes(), 0);
         }
     }
 
@@ -827,7 +938,11 @@ impl WindowOperator {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<Option<RowBatch>> {
-        let cut = if matches!(self.spec.kind, WindowKind::HoppingProcessingTime { .. }) {cut.max(self.hopping_clock_high)} else {cut};
+        let cut = if matches!(self.spec.kind, WindowKind::HoppingProcessingTime { .. }) {
+            cut.max(self.hopping_clock_high)
+        } else {
+            cut
+        };
         let mut work = 0usize;
         let mut wire = 0usize;
         let mut count = 0usize;
@@ -1074,7 +1189,11 @@ impl WindowOperator {
                 };
                 self.index_remove(&key, end);
                 if let Some(entry) = entry {
-                    let group=if self.suffixed_key() {group_from_et_key(&key.key)} else {key.key.clone()};
+                    let group = if self.suffixed_key() {
+                        group_from_et_key(&key.key)
+                    } else {
+                        key.key.clone()
+                    };
                     out.push(emit_tumble(&group, &entry));
                 }
             }
@@ -1295,8 +1414,11 @@ impl WindowOperator {
 
     /// Replace in-memory state from a committed freeze (experimental).
     pub fn restore_freeze(&mut self, freeze: &WindowFreeze) -> Result<()> {
-        if self.spec.kind.is_new_window() {
-            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"new window families have no published restore codec/profile"));
+        if self.spec.kind.is_new_window() || self.spec.has_extended_aggs() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "new window families have no published restore codec/profile",
+            ));
         }
         if freeze.operator != self.operator {
             return Err(SparrowError::new(
