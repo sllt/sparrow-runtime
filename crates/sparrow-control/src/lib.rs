@@ -5,9 +5,12 @@
 
 #[cfg(test)]
 mod analysis_tests;
+#[cfg(test)]
+mod plugin_tests;
 pub mod capability;
 pub mod checkpoint;
 pub mod query;
+pub mod plugins;
 pub mod reference_table;
 pub mod spec;
 pub mod status;

@@ -483,6 +483,7 @@ impl Writer {
     fn expr(&mut self, expr: &Expr, depth: usize) -> Result<()> {
         self.depth(depth)?;
         match expr {
+            Expr::Plugin {..} => Err(SparrowError::new(ErrorCode::UnsupportedRestore,"plugin functions have no state semantics/restore profile")),
             Expr::Column { name } => {
                 self.tag(0)?;
                 self.bytes(name.as_bytes())

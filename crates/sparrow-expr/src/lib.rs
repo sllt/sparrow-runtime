@@ -12,6 +12,7 @@ mod builtin;
 mod collection;
 pub mod infer;
 pub mod kernels;
+pub mod plugins;
 pub mod semantics;
 pub use bind::{bind, eval_bound, BoundExpr};
 pub use infer::{infer_nullable, infer_type};
@@ -54,6 +55,7 @@ impl BinaryOp {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
+    Plugin { function: std::sync::Arc<plugins::Function>, args: Vec<Expr> },
     Column {
         name: String,
     },
@@ -86,6 +88,17 @@ pub enum Expr {
     },
 }
 
+impl Expr {
+    pub fn visit_plugins(&self,visit:&mut impl FnMut(&std::sync::Arc<plugins::Function>)) {
+        match self {
+            Self::Plugin{function,args}=>{visit(function);for arg in args{arg.visit_plugins(visit);}},
+            Self::Call{args,..}=>for arg in args{arg.visit_plugins(visit);},
+            Self::Cast{expr,..}|Self::TryCast{expr,..}|Self::DynamicGet{expr,..}|Self::IsNull(expr)|Self::IsNotNull(expr)|Self::Not(expr)=>expr.visit_plugins(visit),
+            Self::Binary{left,right,..}=>{left.visit_plugins(visit);right.visit_plugins(visit);},
+            _=>{},
+        }
+    }
+}
 pub fn eval(expr: &Expr, schema: &Schema, row: &[Scalar]) -> Result<Scalar> {
     eval_bound(&bind(expr, schema)?, row)
 }

@@ -133,6 +133,7 @@ impl CheckpointPlan {
         plan: &PhysicalPlan,
         reference_tables: Vec<ReferenceTableDependency>,
     ) -> Result<Self> {
+        if plan.has_plugins() {return Err(rejected("plugin functions have no checkpoint/restore profile"));}
         if plan.has_analysis() || plan.has_extended_aggs() {
             return Err(rejected("analysis/extended aggregates have no published checkpoint profile; restart_fresh only"));
         }

@@ -21,6 +21,9 @@ pub fn bind_sql(
     pipeline: PipelineId,
     revision: RevisionId,
 ) -> Result<BoundLogicalPlan> {
+    sparrow_expr::plugins::with_registry(catalog.plugins.clone(),||bind_sql_inner(sql,catalog,pipeline,revision))
+}
+fn bind_sql_inner(sql:&str,catalog:&Catalog,pipeline:PipelineId,revision:RevisionId)->Result<BoundLogicalPlan>{
     if sql.trim().is_empty() {
         return Err(SparrowError::new(
             ErrorCode::InvalidArgument,
@@ -534,7 +537,7 @@ fn map_function(func: &Function) -> Result<Expr> {
         }
         _ => {}
     }
-    Ok(Expr::Call { name, args })
+    sparrow_expr::plugins::call(name,args)
 }
 
 fn map_op(op: &BinaryOperator) -> Result<BinaryOp> {

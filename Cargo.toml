@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/sparrow-model",
+    "crates/sparrow-plugin",
     "crates/sparrow-expr",
     "crates/sparrow-plan",
     "crates/sparrow-io",
@@ -18,6 +19,7 @@ members = [
 ]
 default-members = [
     "crates/sparrow-model",
+    "crates/sparrow-plugin",
     "crates/sparrow-expr",
     "crates/sparrow-plan",
     "crates/sparrow-io",
@@ -40,6 +42,7 @@ description = "Sparrow: single-node IoT/Edge streaming dataflow runtime"
 
 [workspace.dependencies]
 sparrow-model = { path = "crates/sparrow-model", version = "0.1.0" }
+sparrow-plugin = { path = "crates/sparrow-plugin", version = "0.1.0" }
 sparrow-expr = { path = "crates/sparrow-expr", version = "0.1.0" }
 sparrow-plan = { path = "crates/sparrow-plan", version = "0.1.0" }
 sparrow-io = { path = "crates/sparrow-io", version = "0.1.0" }

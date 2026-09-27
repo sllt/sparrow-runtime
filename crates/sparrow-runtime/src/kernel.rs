@@ -602,6 +602,9 @@ impl Kernel {
     }
 
     pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
+        let mut plugin_count=0usize;req.plan.visit_plugins(&mut |_|plugin_count+=1);
+        if plugin_count>64{return Err(SparrowError::new(ErrorCode::BoundExceeded,"job exceeds 64 plugin call sites"));}
+        if plugin_count>0 && req.aligned.is_some(){return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"native plugin functions require restart_fresh"));}
         if (req.plan.has_analysis() || req.plan.has_extended_aggs()) && req.aligned.is_some() {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
@@ -976,7 +979,7 @@ impl Kernel {
             live_silence: req.live_silence.clone(),
             ordered_time,
             graph_time: graph_time.clone(),
-            graph_memory: if req.plan.edges.is_some() || req.plan.has_analysis() {
+            graph_memory: if req.plan.edges.is_some() || req.plan.has_analysis() || plugin_count>0 {
                 Some(Arc::new(owner.acquire(
                     sparrow_model::CreditKind::Reservation,
                     graph::metadata_bytes(&req.plan),
@@ -1039,12 +1042,16 @@ impl Kernel {
                 .transpose()?,
             observation: req.observation.clone(),
         };
+        let plugin_pins=if plugin_count>0 {
+            let credit=owner.acquire(sparrow_model::CreditKind::Reservation,plugin_count.saturating_mul(32).saturating_add(128))?;
+            Some((req.plan.plugin_functions(),credit))
+        }else{None};
         self.metrics.jobs_started.fetch_add(1, Ordering::Relaxed);
         let handle = self
             .rt
             .as_ref()
             .expect("live kernel runtime")
-            .spawn(run_job(ctx, req, admit));
+            .spawn(async move {let _pins=plugin_pins;run_job(ctx,req,admit).await});
         Ok(JobHandle {
             attempt,
             owner,

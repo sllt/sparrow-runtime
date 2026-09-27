@@ -33,6 +33,7 @@ pub struct Store {
 }
 
 struct StoreInner {
+    plugins: std::sync::OnceLock<Arc<sparrow_expr::plugins::Manager>>,
     conn: Mutex<Connection>,
     fail_before_commit: AtomicBool,
     stream_epoch: AtomicU64,
@@ -52,7 +53,7 @@ struct StatusEffectiveEntry {
     name: String,
     // SQLite data_version detects writes through OTHER Store/connections;
     // stream_epoch handles this connection's own schema writes.
-    key: (u64, u64, u64, u64),
+    key: (u64, u64, u64, u64, u64),
     value: serde_json::Value,
 }
 
@@ -112,6 +113,10 @@ pub struct AuditRow {
 }
 
 impl Store {
+    pub fn configure_plugins(&self,manager:Arc<sparrow_expr::plugins::Manager>)->Result<()> {
+        self.inner.plugins.set(manager).map_err(|_|SparrowError::new(ErrorCode::InvalidArgument,"plugin registry is already configured"))
+    }
+    pub fn plugins(&self)->Option<Arc<sparrow_expr::plugins::Manager>>{self.inner.plugins.get().cloned()}
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -132,6 +137,7 @@ impl Store {
         note_secrets_key_on_open()?;
         Ok(Self {
             inner: Arc::new(StoreInner {
+                plugins: std::sync::OnceLock::new(),
                 conn: Mutex::new(conn),
                 fail_before_commit: AtomicBool::new(false),
                 stream_epoch: AtomicU64::new(0),
@@ -147,6 +153,7 @@ impl Store {
         note_secrets_key_on_open()?;
         Ok(Self {
             inner: Arc::new(StoreInner {
+                plugins: std::sync::OnceLock::new(),
                 conn: Mutex::new(conn),
                 fail_before_commit: AtomicBool::new(false),
                 stream_epoch: AtomicU64::new(0),
@@ -904,6 +911,7 @@ impl Store {
                 row.latest_revision,
                 self.inner.stream_epoch.load(Ordering::Relaxed),
                 self.inner.reference_epoch.load(Ordering::Relaxed),
+                self.plugins().map_or(0,|p|p.epoch().saturating_add(1)),
                 version,
             );
             let mut cache = self

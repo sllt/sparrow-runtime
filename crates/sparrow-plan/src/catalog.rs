@@ -9,6 +9,7 @@ use sparrow_model::{Field, FieldId, Schema, SchemaId};
 
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
+    pub plugins: Option<std::sync::Arc<sparrow_expr::plugins::Manager>>,
     tables: HashMap<String, Schema>,
     next_schema: u32,
 }

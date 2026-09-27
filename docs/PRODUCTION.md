@@ -4,6 +4,21 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="native-plugins-validation"></a>
+## 插件共同管理与可信原生函数：2026-09-27 首个子批
+
+验证基线 `c413707`（已提交的有界分析）；本段证据对应其后的原生函数工作区。服务器 `box@100.64.0.19`，根 `/workspace/bench-compare/plugins-20260927-29sBzf`，最终源码 `source`，no-demo二进制 `frozen/`。457个代码/构建/SDK/测试文件的本地与服务器指纹一致，`source-commit.sha256` 自身SHA-256为 `246a759225bbca3597332f60bd0e42fdae1831ba2ada2ffabc660194b20a08a8`。提交前仅清理新Cargo.toml尾部空行，再次执行全量/专项/no-demo验证；生成的Server/CLI与进程验证二进制逐字节相同，原`source-final.sha256`/reviewed日志仍保留。验收后的文档另存，不改测试源码。Rust/Cargo1.98.0，Linux x86_64；没有本机Cargo编译，也没有恢复JetStream高负载专题。
+
+- 默认13成员（新增sparrow-plugin）、locked Release、`--features sparrow-server/jetstream`：**970 passed / 21 ignored**，`tests-commit.log/.exit=0`。ignored不算通过，也不是实验workspace全部验收。
+- 同一最终源码新 `plugins_` 13项×5轮：**65 passed / 0 ignored**，`repeat-commit.log/.exit=0`。每个测试进程加载真实C共享库，使用私有临时目录；不是13种性能档。
+- 独立生产入口 `cargo test --locked --release --quiet --no-default-features -p sparrow-server -p sparrow-cli`：**47 passed / 0 ignored**，`no-demo-commit.log/.exit=0`；随后同scope的`cargo build --bins`退出0，`build-commit.log/.exit`。
+- `process-reviewed.log/.exit=0`、`process-reviewed/result.json`：使用真实Server/CLI与两个独立artifact，输入21输出v1=42、v2=63、回退v1=42；运行中disable拒绝、safe-mode保留approval但不加载、正常重启自动恢复批准版本、驻留uninstall拒绝、停用后重启允许卸载、旧规则缺包拒绝。只操作独立catalog/目录/子进程，未修改已有服务。`frozen.sha256`记录匹配二进制。
+- 首轮完整回归969/47、新12×5通过；review后新增覆盖7种scalar的矩阵测试，总计新13项，并增加加载前审计断言，形成上述最终970/47/65。初轮 `process-final` 被测试输出目录的group-write权限拒绝；`process-r2` 已验证第一段42输出及运行pin，后被缺少If-Match拒绝更新。脚本补`umask 077`与真实ETag，未降低生产校验；`process-r3`及最终reviewed完整流程通过，所有初始失败记录保留。
+
+本批只开放[PLUGINS](PLUGINS.md)所列的可信原生标量合同；版本/hash pin、目录锁、sealed加载、默认关闭、原生边界前审计、NULL/类型/输出检查、元数据/host输出额度及Job结束退款均随本批review/验证。native不提供沙箱、强制中断或热卸载，有限查询拒绝native，aligned/恢复资格不继承旧profile。脚本/WASM、外部Transform/Source/Sink、签名验签及递归动态依赖固定仍未完成。
+
+**NOT RUN**：aarch64实机、长期负载/RSS、ABBA性能、SIGKILL/掉电/磁盘故障矩阵、完整发行包验收、Clippy零告警及整体生产认证。C ABI的输出检查不能保护宿主免受恶意机器码破坏；可信代码前提不可省略。
+
 <a id="analysis-validation"></a>
 ## 函数与有界分析：2026-09-27 限定 Preview
 

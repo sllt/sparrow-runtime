@@ -28,7 +28,7 @@ const ALLOWED_FUNCS: &[&str] = &[
     "least",
 ];
 pub(crate) fn additive_function(name: &str) -> bool {
-    sparrow_expr::semantics::function(name).is_some() && !ALLOWED_FUNCS.contains(&name)
+    name=="plugin_call" || (sparrow_expr::semantics::function(name).is_some() && !ALLOWED_FUNCS.contains(&name))
 }
 
 const REJECTED_FUNCS: &[&str] = &[
@@ -325,7 +325,7 @@ fn function_reject(func: &Function) -> Result<Option<G0Verdict>> {
             "function '{name}' is not part of Sparrow SQL v0"
         ))));
     }
-    if sparrow_expr::semantics::function(&name).is_none() {
+    if name!="plugin_call" && sparrow_expr::semantics::function(&name).is_none() {
         return Ok(Some(rejected(&format!(
             "unknown function '{name}'"
         ))));

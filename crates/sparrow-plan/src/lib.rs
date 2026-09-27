@@ -31,6 +31,7 @@ mod k4_tests;
 #[cfg(test)]
 mod paused_time_tests;
 pub mod physical;
+mod plugins;
 pub mod resample;
 #[cfg(test)]
 mod silence_tests;

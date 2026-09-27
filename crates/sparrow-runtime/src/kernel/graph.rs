@@ -132,6 +132,7 @@ pub(super) fn metadata_bytes(plan: &PhysicalPlan) -> usize {
     }
     fn expr(e: &Expr) -> usize {
         128usize.saturating_add(match e {
+            Expr::Plugin {args,..} => args.iter().fold(4096usize,|n,e|n.saturating_add(expr(e))),
             Expr::Column { name } => name.capacity(),
             Expr::Literal(v) => v.resident_bytes(),
             Expr::Cast { expr: e, target } | Expr::TryCast { expr: e, target } => {

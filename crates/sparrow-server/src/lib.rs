@@ -25,6 +25,7 @@ use sparrow_runtime::Kernel;
 use tower_http::limit::RequestBodyLimitLayer;
 mod operations;
 mod reference_tables;
+mod plugins;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:43180";
 pub const MAX_BODY: usize = 64 * 1024;
@@ -88,6 +89,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/demo/capture", get(demo_capture))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
+        .merge(plugins::router())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             management_guard,

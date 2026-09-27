@@ -12,6 +12,7 @@ use crate::{cast, check_call_arity, eval_binary, eval_call_values, BinaryOp, Exp
 /// Expression tree with column names replaced by schema indices.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoundExpr {
+    Plugin { function: std::sync::Arc<crate::plugins::Function>, args: Vec<BoundExpr> },
     Column { index: usize },
     Literal(Scalar),
     Cast {
@@ -43,6 +44,10 @@ pub enum BoundExpr {
 /// Resolve every [`Expr::Column`] against `schema`. Unknown names fail closed.
 pub fn bind(expr: &Expr, schema: &Schema) -> Result<BoundExpr> {
     match expr {
+        Expr::Plugin {function,args} => {
+            function.signature(&args.iter().map(|e|crate::infer_type(e,schema)).collect::<Result<Vec<_>>>()?)?;
+            Ok(BoundExpr::Plugin{function:function.clone(),args:args.iter().map(|e|bind(e,schema)).collect::<Result<_>>()?})
+        },
         Expr::Column { name } => {
             let index = schema.index_of_name(name).ok_or_else(|| {
                 SparrowError::new(ErrorCode::InvalidArgument, format!("unknown column '{name}'"))
@@ -92,6 +97,7 @@ pub fn bind(expr: &Expr, schema: &Schema) -> Result<BoundExpr> {
 /// Evaluate a bind-time tree. Column access is an index; no schema scan.
 pub fn eval_bound(expr: &BoundExpr, row: &[Scalar]) -> Result<Scalar> {
     match expr {
+        BoundExpr::Plugin {function,args} => function.invoke(&args.iter().map(|e|eval_bound(e,row)).collect::<Result<Vec<_>>>()?),
         BoundExpr::Column { index } => row.get(*index).cloned().ok_or_else(||
             SparrowError::new(ErrorCode::Internal,
                 format!("bound column {index} outside row of width {}", row.len()))),

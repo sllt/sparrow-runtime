@@ -79,13 +79,10 @@ impl ExprSpec {
             Self::IsNull { expr } => Expr::IsNull(Box::new(expr.into_expr()?)),
             Self::IsNotNull { expr } => Expr::IsNotNull(Box::new(expr.into_expr()?)),
             Self::Not { expr } => Expr::Not(Box::new(expr.into_expr()?)),
-            Self::Call { name, args } => Expr::Call {
-                name,
-                args: args
+            Self::Call { name, args } => sparrow_expr::plugins::call(name, args
                     .into_iter()
                     .map(ExprSpec::into_expr)
-                    .collect::<Result<Vec<_>>>()?,
-            },
+                    .collect::<Result<Vec<_>>>()?)?,
             Self::DynGet { expr, key } => Expr::DynamicGet {
                 expr: Box::new(expr.into_expr()?),
                 key,

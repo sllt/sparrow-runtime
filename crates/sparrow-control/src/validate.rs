@@ -70,6 +70,7 @@ pub fn stream_to_schema(row: &StreamRow) -> Result<Schema> {
 
 pub fn binder_catalog(store: &Store) -> Result<Catalog> {
     let mut cat = Catalog::new();
+    cat.plugins=store.plugins();
     for row in store.list_streams()? {
         cat.insert(row.name.clone(), stream_to_schema(&row)?);
     }
@@ -1055,6 +1056,9 @@ fn validate_aligned_plan_inner(
     dependencies: Option<&[sparrow_plan::ReferenceTableDependency]>,
 ) -> sparrow_model::Result<()> {
     let recovery = RecoveryPolicy::parse(&spec.recovery)?;
+    if plan.has_plugins() && (recovery.is_aligned()||spec.restore.is_some()||spec.checkpoint.is_some()||spec.checkpoint_dir.is_some()) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"native functions require restart_fresh without checkpoint or restore"));
+    }
     if (plan.has_analysis() || plan.has_extended_aggs())
         && (recovery.is_aligned()
             || spec.restore.is_some()
@@ -1508,6 +1512,7 @@ pub fn effective_guarantees_with_plan(
     plan: &PhysicalPlan,
 ) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
+    if plan.has_plugins(){value["aligned_eligible"]=serde_json::json!(false);value["aligned_eligibility_reason"]=serde_json::json!("native plugin functions have no recovery profile");value["plugins"]=serde_json::json!({"recovery":"restart_fresh_only","trusted_native":true,"preemptible":false});return value;}
     if plan.has_analysis() || plan.has_extended_aggs() {
         value["aligned_eligible"] = serde_json::json!(false);
         value["aligned_eligibility_reason"] =

@@ -15,6 +15,7 @@ pub fn inventory() -> Value {
         })
         .collect();
     json!({"version":1,"combinations":combinations,
+        "plugins":{"maturity":"development_preview","native_scalar":true,"native_default_enabled":false,"target":"Linux ELF64 GNU x86_64/aarch64; exact manifest target required","abi":1,"script":false,"wasm":false,"external_source_sink":false,"external_transform":false,"sandbox":false,"preemptible":false,"hot_unload":false,"recovery":"restart_fresh_only","binding":"literal package/version/manifest_sha256/function; per-catalog registry","max_packages":16,"max_resident_generations_per_process":16,"max_artifact_bytes":4194304,"signature_verification":false,"trust":"explicit administrator hash approval; not authenticity proof"},
         "actions":{"maturity":"development_preview","version":1,"certified":false,
             "sinks":["http","mqtt","log","file"],"body":"typed_json_tree_explicit_field_references",
             "destinations":"fixed_HTTP_origin_path_headers_with_query_templates; MQTT_single_level_variables",

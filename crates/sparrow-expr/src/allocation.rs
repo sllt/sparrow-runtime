@@ -5,6 +5,7 @@ use sparrow_model::{DataType, Scalar};
 
 #[derive(Clone, Debug)]
 enum Shape {
+    Plugin(usize,usize),
     Column(usize),
     Literal(usize),
     Scalar,
@@ -29,6 +30,7 @@ impl AllocationBound {
     pub fn for_expr(expr: &BoundExpr) -> Self {
         use BoundExpr::*;
         let (shape, children, call) = match expr {
+            Plugin {function,args} => (Shape::Plugin(function.definition().max_output_bytes,function.scratch_bytes()),args.iter().map(Self::for_expr).collect(),true),
             Column { index } => (Shape::Column(*index), vec![], false),
             Literal(value) => (Shape::Literal(value.resident_bytes()), vec![], false),
             Binary { left, right, .. } => (
@@ -101,6 +103,7 @@ impl AllocationBound {
         }
         match self.shape {
             Shape::Scalar => value = SCALAR,
+            Shape::Plugin(output,scratch) => {value=output.saturating_add(SCALAR+64);allocated=allocated.saturating_add(scratch);},
             Shape::Utf8 => allocated = allocated.saturating_add(value.saturating_mul(2)),
             Shape::CastUtf8 => {
                 value = value.saturating_add(128);

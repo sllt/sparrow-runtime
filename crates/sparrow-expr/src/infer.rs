@@ -6,6 +6,7 @@ use sparrow_model::{DataType, Schema};
 
 pub fn infer_type(expr: &Expr, schema: &Schema) -> Result<DataType> {
     match expr {
+        Expr::Plugin {function,args} => function.signature(&args.iter().map(|e|infer_type(e,schema)).collect::<Result<Vec<_>>>()?),
         Expr::Column { name } => schema
             .field_by_name(name)
             .map(|f| f.data_type.clone())
@@ -142,6 +143,7 @@ fn eval_call_sig(name: &str, argc: usize, schema: &Schema, args: &[Expr]) -> Res
 /// are never null.
 pub fn infer_nullable(expr: &Expr, schema: &Schema) -> Result<bool> {
     match expr {
+        Expr::Plugin {..} => Ok(true),
         Expr::Column { name } => schema
             .field_by_name(name)
             .map(|f| f.nullable)

@@ -1,5 +1,7 @@
 # Runtime ownership (A3 / A4)
 
+2026-09-27 可信原生函数Preview：Catalog限定的绑定scope生成不可变函数句柄；SQL/Graph使用同一类型/NULL合同，行执行不查可变registry。Job级pin持续到全部task结束，停用/卸载不能替换运行依赖。host output buffer、表达式元数据和pin容器预留额度；原生内部资源/ELF不是Job硬配额，不能伪装沙箱。默认不加载，启用需显式配置与完整hash批准；sealed memfd加载后驻留至退出，不做热卸载。新表达式无恢复codec，有限查询因不可抢占明确拒绝native。970/47、新13×5及真实CLI升级/回退/重启通过，见[合同](PLUGINS.md)和[匹配证据](PRODUCTION.md#native-plugins-validation)。脚本/WASM及Source/Sink插件尚未开放。
+
 2026-09-27 有界分析Preview：UNNEST保留单个输入batch、逐行计费续行；双输入ET Join分别接收水位，Idle不证明无匹配，Left未决行约束输出水位。行/key/输出fan-out都有额度，清理/取消退还所有权；新future和扩展聚合冷路径Box先计费，旧codec不变。有限查询使用独立Kernel、总工作计数及2个准入槽，响应字节持有额度/槽直到发完，取消后join查询任务才释放worker。新算子/聚合仅restart_fresh；957/45及新20×5通过，合同和未实现项见[ANALYSIS](ANALYSIS.md)，精确[验证范围](PRODUCTION.md#analysis-validation)。没有新的性能/长稳/发行放行结论。
 
 2026-09-27 窗口补齐Preview已完成本批自查与验证：PT hopping、SlidingCount、PT/ET逐事件Sliding、PT/ET Session；匹配候选937项回归、44项no-demo及19×5专项通过。新窗口仅 `restart_fresh`，Control、CheckpointPlan、PlanLayout复用判定、Kernel及新窗口旧codec恢复入口均明确拒绝aligned/restore。PT hopping复用增量store；其他新族使用独立冷路径，保存有界、detached聚合输入，以支持MIN/MAX和乱序Session重分段；key/event/deadline索引、候选、输出分别计费，按key/rows/bytes/timers上限失败，不静默丢弃。旧窗口快照编码不变，匹配旧恢复回归通过。详见 [窗口合同、初次失败及最终证据](WINDOWS.md)；没有新族容量/长稳或整体生产认证。

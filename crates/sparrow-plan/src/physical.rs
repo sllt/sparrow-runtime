@@ -181,6 +181,7 @@ impl PhysicalPlan {
     /// admission so embedded callers cannot bypass the control-plane check.
     pub fn aligned_window(&self) -> sparrow_model::Result<(OperatorId, &WindowSpec, &Schema)> {
         use sparrow_model::{ErrorCode, SparrowError};
+        if self.has_plugins(){return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"native plugins have no aligned window profile"));}
         if self.has_analysis() || self.has_extended_aggs() {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,

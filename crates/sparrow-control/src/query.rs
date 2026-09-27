@@ -101,6 +101,7 @@ pub async fn execute(store: Arc<crate::Store>, bytes: Vec<u8>) -> Result<QueryOu
             return Err(invalid("query requires 1..4 inputs and SQL <=8KiB"));
         }
         let mut catalog = sparrow_plan::Catalog::new();
+        catalog.plugins=store.plugins();
         let mut names = BTreeSet::new();
         for input in &request.inputs {
             if input.stream.len() > 128 || !names.insert(&input.stream) {

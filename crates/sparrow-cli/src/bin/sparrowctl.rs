@@ -5,6 +5,16 @@ use std::io::Read;
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, String>;
+fn read_plugin(manifest:&str,artifact:&str)->Result<Value>{
+    use base64::Engine;
+    let manifest=read_input(manifest)?;
+    let file=std::fs::File::open(artifact).map_err(|e|format!("plugin artifact: {e}"))?;
+    if !file.metadata().map_err(|e|format!("plugin artifact: {e}"))?.is_file(){return Err("plugin artifact must be a regular file".into());}
+    let mut bytes=Vec::new();file.take(4*1024*1024+1).read_to_end(&mut bytes).map_err(|e|format!("plugin artifact: {e}"))?;
+    if bytes.len()>4*1024*1024{return Err("plugin artifact exceeds 4MiB".into());}
+    Ok(json!({"manifest":manifest,"artifact_base64":base64::engine::general_purpose::STANDARD.encode(bytes)}))
+}
+fn digest(s:&str)->Result<String>{if s.len()==64&&s.bytes().all(|c|c.is_ascii_digit()||(b'a'..=b'f').contains(&c)){Ok(s.into())}else{Err("plugin manifest hash must be 64 lowercase hex digits".into())}}
 const INPUT_CAP: u64 = 64 * 1024;
 const RESPONSE_CAP: usize = 2 * 1024 * 1024;
 struct Command {
@@ -103,6 +113,13 @@ fn parse(args: &[String]) -> Result<Command> {
         );
     }
     let (method, segments, body) = match positional.as_slice() {
+        ["plugins"] => (Method::GET,vec!["plugins".into()],None),
+        ["plugin-install",manifest,artifact] => (Method::POST,vec!["plugins".into(),"install".into()],Some(read_plugin(manifest,artifact)?)),
+        [op @ ("plugin-enable"|"plugin-disable"|"plugin-uninstall"),id] => {
+            let id=digest(id)?;let action=op.trim_start_matches("plugin-");
+            let body=if action=="enable"{json!({"approve_manifest_sha256":id})}else{json!({})};
+            (Method::POST,vec!["plugins".into(),id,action.into()],Some(body))
+        },
         ["health"] => (Method::GET, vec!["health".into()], None),
         ["capabilities"] => (Method::GET, vec!["capabilities".into()], None),
         ["pipelines"] => (Method::GET, vec!["pipelines".into()], None),
@@ -238,6 +255,8 @@ fn help() {
     println!(
         "sparrowctl — authenticated JSON management client\n\
 commands: health | capabilities | streams | pipelines\n\
+  plugins | plugin-install MANIFEST_JSON SHARED_LIBRARY\n\
+  plugin-enable MANIFEST_SHA256 | plugin-disable MANIFEST_SHA256 | plugin-uninstall MANIFEST_SHA256\n\
   validate FILE | explain FILE | query FILE | put-stream NAME FILE\n\
   put-pipeline NAME FILE [--if-match ETAG]\n\
   status NAME | diagnose NAME [--output NEW_FILE] | checkpoints NAME\n\
@@ -364,5 +383,15 @@ mod tests {
         }
         assert!(parse(&args(&["status", "p", "--url", "http://127.0.0.1:43180"])).is_ok());
         assert!(parse(&args(&["restore", "p", "--snapshot-id", "3"])).is_ok());
+    }
+    #[test]
+    fn plugins_cli_explicit_digest_and_management_routes(){
+        let hash="a".repeat(64);
+        for action in ["plugin-enable","plugin-disable","plugin-uninstall"]{
+            let command=parse(&args(&[action,&hash])).unwrap();assert_eq!(command.segments,vec!["plugins",hash.as_str(),action.trim_start_matches("plugin-")]);
+            if action=="plugin-enable"{assert_eq!(command.body.unwrap()["approve_manifest_sha256"],hash);}
+            for bad in ["../etc", "latest", "ABC", ""]{assert!(parse(&args(&[action,bad])).is_err());}
+        }
+        assert_eq!(parse(&args(&["plugins"])).unwrap().method,Method::GET);
     }
 }

@@ -27,6 +27,9 @@ pub fn bind_sql_v03(
     pipeline: PipelineId,
     revision: RevisionId,
 ) -> Result<BoundLogicalPlan> {
+    sparrow_expr::plugins::with_registry(catalog.plugins.clone(),||bind_sql_v03_inner(sql,catalog,pipeline,revision))
+}
+fn bind_sql_v03_inner(sql:&str,catalog:&Catalog,pipeline:PipelineId,revision:RevisionId)->Result<BoundLogicalPlan>{
     let verdict = check_sql_v03(sql)?;
     if !verdict.accepted {
         return Err(SparrowError::new(

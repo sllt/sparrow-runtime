@@ -13,6 +13,9 @@ use sparrow_model::error::{ErrorCode, Result, SparrowError};
 use sparrow_model::{AggFn, OperatorId, PipelineId, RevisionId, Schema, SchemaId, WindowKind};
 
 pub fn bind_graph(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPlan> {
+    sparrow_expr::plugins::with_registry(catalog.plugins.clone(),||bind_graph_inner(spec,catalog))
+}
+fn bind_graph_inner(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalPlan> {
     if spec.version != crate::graph::GRAPH_SPEC_VERSION {
         return Err(SparrowError::new(
             ErrorCode::FeatureUnavailable,

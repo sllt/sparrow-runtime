@@ -330,6 +330,7 @@ fn run() -> Result<(), SparrowError> {
         Store::open(&opts.catalog)?
     };
     let store = Arc::new(store);
+    sparrow_control::plugins::configure_from_env(&store,opts.safe_mode)?;
     let kernel = Arc::new(match opts.max_jobs {
         Some(n) => host_kernel_with_max_jobs(n)?,
         None => host_kernel()?,

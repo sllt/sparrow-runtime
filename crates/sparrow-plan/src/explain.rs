@@ -129,6 +129,7 @@ impl GraphExplain {
 
 fn describe_state(plan: &PhysicalPlan) -> String {
     let mut bits = Vec::new();
+    plan.visit_plugins(&mut |f|bits.push(format!("native_function {}:{}:{}:{} recovery=restart_fresh",f.package(),f.version(),f.digest(),f.definition().name)));
     for s in &plan.stages {
         match s {
             PhysicalStage::Analysis { operator, plan } => bits.push(format!(
