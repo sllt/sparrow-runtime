@@ -67,7 +67,14 @@ pub fn execute(
     cancel: CancellationToken,
 ) -> Result<FiniteResult> {
     limits.validate()?;
-    if plan.has_plugins(){return Err(bound("finite queries reject plugins: native is not preemptible; script aggregate query work budgeting is not enabled"));}
+    let deadline = std::time::Instant::now() + Duration::from_millis(limits.timeout_ms);
+    let mut unsafe_plugin = false;
+    plan.visit_plugins(&mut |f| unsafe_plugin |= !f.is_script());
+    if unsafe_plugin {
+        return Err(bound(
+            "finite queries reject in-process native/non-preemptible plugins",
+        ));
+    }
     if plan.stages.len() > 32
         || plan
             .stages
@@ -181,11 +188,12 @@ pub fn execute(
     }
     request.live_out = Some(tx);
     request.work_lifetime = Some(limits.work_units);
+    request.script_deadline = Some(deadline);
     let handle = kernel.submit(request)?;
     let job_cancel = handle.cancellation();
     let batches=kernel.block_on(async {
         let mut wait=Box::pin(handle.wait());let mut done=None;let mut closed=false;
-        let deadline=tokio::time::sleep(Duration::from_millis(limits.timeout_ms));tokio::pin!(deadline);
+        let deadline=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));tokio::pin!(deadline);
         let mut output=Vec::new();let mut row_count=0usize;let mut total=0usize;
         loop {
             if closed&&done.is_some(){break;}

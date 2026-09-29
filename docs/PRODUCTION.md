@@ -4,6 +4,23 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="script-completion-validation"></a>
+## JavaScript 收尾：缓存、诊断和有限查询
+
+2026-09-29，基线 `96dab24`，服务器 `box@100.64.0.19`，证据根 `/workspace/bench-compare/scripts-completion-20260929-Yu0lr7`。本批只收尾 JS 标量，不代表 WASM、签名/依赖协议或 Source/Sink 插件 SDK 完成。具体边界见 [PLUGINS](PLUGINS.md#有界诊断与有限查询)。
+
+- 代码/测试集中完成后在服务器验证；没有本机 Cargo 编译。首轮991/48及专项全部通过。随后自查发现QuickJS列号是UTF-8字节而非UTF-16，补坐标转换及CR/LF/CRLF/U+2028/U+2029换行测试，并对含中文/emoji的真实脚本验证精确位置；原首轮源码/日志/冻结保留在 `source-r1/`、`*-r1.log`、`frozen/`。没有隐去初轮或以其替代最终结果。
+- 最终默认14成员 locked Release＋JetStream feature：**992 passed / 22 ignored**，`full-r2.log/.exit=0`；不是包含实验包的全 workspace。新增 ignored 是显式性能微测试，随后独立运行通过，不把其余 ignored 算作通过。
+- no-demo Server/CLI：**48 passed / 0 ignored**，`no-demo-final.log/.exit=0`；生产入口构建通过，`build-final.log/.exit=0`，Server/CLI与首轮逐字节相同，只有worker代码/测试改变。匹配的普通 worker、Server、CLI、17项集成测试和worker单元测试冻结在 `frozen-final/`，指纹 `frozen-final.sha256`，来源 `frozen-final-origins.txt`。
+- 同一最终冻结 worker：17项脚本集成×5轮＝**85 passed**；4项非性能worker单测×5轮＝**20 passed**，`scripts-final-1..5.log/.exit` 与 `worker-final-1..5.log/.exit` 全为0。覆盖缓存hash/上限与重新启用、严格模式/Function.toString/全局/原型/闭包隔离、compile/initialize/call诊断及Unicode坐标、恶意getter/Proxy不触发、总预算跨行/嵌套调用/NULL/失败不退款、SQL与Graph有限查询、超时/调用方取消与pin/输出内存回收，同时重跑原有类型、资源、并发和生命周期反例。
+- `process-script-final.log/.exit=0`：真实认证API/CLI查询输出42、整次预算拒绝、错误仅含阶段和数值坐标（实际 `call`/`1:23`，无 `PRIVATE_PAYLOAD`），缓存身份和有界大小可观测；File→JS→File升级/回退42→63→42，safe-mode、重启、故障隔离、pin、热卸载全部通过。
+- `process-native-final.log/.exit=0`：原生仍拒绝有限查询，驻留后仍须停用＋重启才能卸载；v1 manifest identity 与前批 `scripts-20260929-MKWwFR/native-process-final/install-v1.json`相同。`worker-limits-final.log/.exit=0`：独立worker复杂正则受控失败、超大frame/截断header拒绝；退出0，不称为实际触发SIGALRM的验证。
+- **缓存微测试** `cache-bench-final.log/.exit=0`：同一测试二进制、新VM/相同bootstrap/64MiB堆和中断期限，解析与缓存按ABBA顺序；每轮每项2000次＋20次预热，两项共16000次。各模式两轮p50均值：BigInt **165.4→116.0μs**，JSON **175.5→119.0μs**，下降约30～32%。这是无IPC的进程内libtest微测，没有worker进程RLIMIT，**不与上一批Boa选型数值直接比较，也不代表流水线吞吐/p99或生产容量**。
+
+本地与 `source/` **466个代码/构建/SDK/测试文件**逐一匹配，`source-final.sha256`自身SHA-256为 `7ce0144126164b1c58476e3fe264009dfe0e47a4c81a75ba5a8bbc97a1df6e45`；`source-verification.exit=0`。复现命令见证据根 `sparrow-js-final-validation.sh`，正式文档另行归档，不改变已测源码。自查覆盖原生hash不变、仅内部生成bytecode、C值/缓冲区所有权、无用户getter诊断、task-local预算隔离及失败回收。
+
+内部IPC升级ipc2，Server/worker必须配套部署；JS manifest target/源文件身份不变。仍为限定Preview：**未做aarch64实机、长时间soak/RSS、多规则公平性、完整发行打包、进程强杀/OS沙箱矩阵、aligned脚本恢复或全系统生产认证**。JetStream 10k/20k专题继续暂停。
+
 <a id="script-plugins-validation"></a>
 ## JavaScript 标量：2026-09-29 限定 Preview
 
@@ -24,7 +41,7 @@
 
 初轮 QuickJS 982/47与真实脚本进程试跑也通过。本轮review覆盖声明相关IPC预算/错误上下文、继承信号清理、无脚本Job不安装task-local及独立worker冻结；最终Rust候选重新通过上述完整回归。验收脚本去除xxd依赖、打包脚本扩大SDK/示例指纹范围属于收尾Shell改动，另做语法/依赖与真实worker检查，未因此再编译Rust。过程源码/失败日志仍保留，源码指纹不以“同分支/同版本号”替代。
 
-**仍未宣称**：长时间 soak、aarch64实机、父进程SIGKILL/独立SIGALRM/掉电故障矩阵、完整发行包认证、seccomp/namespace安全沙箱、多租户隔离、流水线容量认证、aligned恢复或有限查询脚本资格。编译缓存、批量IPC/实例池和增强错误栈仍在 OPT-016，不将整个EXT-08或第8批勾选完成。
+**首批当时未宣称**：长时间 soak、aarch64实机、父进程SIGKILL/独立SIGALRM/掉电故障矩阵、完整发行包认证、seccomp/namespace安全沙箱、多租户隔离、流水线容量认证、aligned恢复或有限查询脚本资格。缓存/安全源码栈/有限查询已在后续[JS收尾](#script-completion-validation)交付；批量IPC/实例池与容量继续归 [OPT-017](OPTIMIZATION_BACKLOG.md#opt-017)，第8批整体仍未完成。
 
 <a id="native-plugins-validation"></a>
 ## 插件共同管理与可信原生函数：2026-09-27 首个子批

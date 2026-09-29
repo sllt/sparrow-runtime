@@ -274,6 +274,13 @@ fn scripts_context_isolation_and_bounded_worker_admission() {
         assert_eq!(f.invoke(&[Scalar::Int64(0)]).unwrap(), Scalar::Int64(1));
     }
     eprintln!("scripts 500 fresh-context IPC calls: {:?}", start.elapsed());
+    let cache = m.list().unwrap()[0].script_cache.clone().unwrap();
+    assert_eq!(cache.compiled_scripts, 2);
+    assert!((1..=script::MAX_CACHE_BYTES).contains(&cache.bytes));
+    assert_eq!(
+        cache.artifact_sha256,
+        m.list().unwrap()[0].manifest.artifact_sha256
+    );
     let source = "({f(v){return v;}})";
     for n in 2..=4 {
         let hash = m
@@ -541,6 +548,27 @@ fn scripts_sql_graph_kernel_execution_and_fresh_only() {
         &sparrow_plan::bind_graph(&graph, &catalog).unwrap(),
         &Default::default(),
     );
+    // Both authoring paths use the same bounded finite execution, including
+    // releasing output credits and function pins after the result is dropped.
+    for finite_plan in [plan.clone(), graph.clone()] {
+        let result = finite(
+            finite_plan,
+            vec![Scalar::Int64(21), Scalar::Null],
+            Default::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(result.output_rows, 2);
+        let rows: Vec<_> = result
+            .batches
+            .iter()
+            .flat_map(|b| b.rows().iter().map(|r| r.values.clone()))
+            .collect();
+        assert_eq!(rows, vec![vec![Scalar::Int64(42)], vec![Scalar::Null]]);
+        let owner = result.owner();
+        drop(result);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
     let out = sparrow_runtime::SharedCapture::new();
     kernel
         .run(sparrow_runtime::JobRequest::new(
@@ -556,4 +584,303 @@ fn scripts_sql_graph_kernel_execution_and_fresh_only() {
     drop(plan);
     m.disable(&h).unwrap();
     assert_eq!(kernel.live_tasks(), 0);
+}
+
+fn sql_plan(manager: Arc<Manager>, digest: &str, nested: bool) -> sparrow_plan::PhysicalPlan {
+    let mut catalog = sparrow_plan::Catalog::new();
+    catalog.plugins = Some(manager);
+    catalog.insert(
+        "s",
+        sparrow_model::Schema::new(
+            1,
+            vec![sparrow_model::Field::new(
+                1,
+                "value",
+                sparrow_model::DataType::Int64,
+                true,
+            )],
+        )
+        .unwrap(),
+    );
+    let call = |arg: &str| format!("plugin_call('script_test','v1','{digest}','f',{arg})");
+    let value = call("value");
+    let value = if nested { call(&value) } else { value };
+    sparrow_plan::physicalize(
+        &sparrow_sql::bind_sql(
+            &format!("SELECT {value} AS value FROM s"),
+            &catalog,
+            1.into(),
+            1.into(),
+        )
+        .unwrap(),
+        &Default::default(),
+    )
+}
+fn finite(
+    plan: sparrow_plan::PhysicalPlan,
+    values: Vec<Scalar>,
+    limits: sparrow_runtime::finite::FiniteLimits,
+    cancel: tokio_util::sync::CancellationToken,
+) -> sparrow_model::Result<sparrow_runtime::finite::FiniteResult> {
+    let source = plan
+        .stages
+        .iter()
+        .find_map(|s| match s {
+            sparrow_plan::PhysicalStage::MemorySource { operator, .. } => Some(*operator),
+            _ => None,
+        })
+        .unwrap();
+    sparrow_runtime::finite::execute(
+        plan,
+        [(
+            source,
+            values
+                .into_iter()
+                .map(|v| sparrow_model::Row { values: vec![v] })
+                .collect(),
+        )]
+        .into(),
+        limits,
+        cancel,
+    )
+}
+
+#[test]
+fn scripts_cached_lexical_closure_and_function_source_remain_fresh() {
+    let _serial = SERIAL.lock().unwrap();
+    let d = dir();
+    let source = "let n=0n; function helper(v) { return v + 1n; }\n({f(v){if(Array.prototype.privateState)throw 1;Array.prototype.privateState=1;if(!helper.toString().includes('return v + 1n'))throw 2;if((function(){return this})()!==undefined)throw 3;return helper(v)+n++;}})";
+    let (m, h, f) = load(&d, source, ValueType::Int64);
+    for _ in 0..50 {
+        assert_eq!(f.invoke(&[Scalar::Int64(4)]).unwrap(), Scalar::Int64(5));
+    }
+    let cache = m.list().unwrap()[0].script_cache.clone().unwrap();
+    assert_eq!(cache.artifact_sha256, sha256(source.as_bytes()));
+    assert_eq!(cache.compiled_scripts, 2);
+    drop(f);
+    m.disable(&h).unwrap();
+    assert!(m.list().unwrap()[0].script_cache.is_none());
+    m.enable(&h, &h).unwrap();
+    assert_eq!(
+        m.list().unwrap()[0].script_cache.as_ref().unwrap().bytes,
+        cache.bytes
+    );
+}
+
+#[test]
+fn scripts_safe_diagnostics_for_compile_initialize_and_call() {
+    let _serial = SERIAL.lock().unwrap();
+    let d = dir();
+    let m = Manager::open_with_scripts(&d.0.join("plugins"), false, Some(worker(&d))).unwrap();
+    for (n, source, phase) in [
+        (1, "({ f(v) { return +; } })", "compile"),
+        (2, "throw new Error('PRIVATE_PAYLOAD');", "initialize"),
+    ] {
+        let h = m
+            .install(
+                manifest(source, &format!("v{n}"), ValueType::Int64),
+                source.as_bytes(),
+            )
+            .unwrap()
+            .manifest_sha256;
+        let error = m.enable(&h, &h).unwrap_err();
+        assert!(
+            error
+                .context
+                .iter()
+                .any(|(k, v)| k == "script_phase" && v == phase),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .context
+                .iter()
+                .any(|(k, v)| k == "script_frames" && !v.is_empty()),
+            "{error:?}"
+        );
+        assert!(!format!("{error:?}").contains("PRIVATE_PAYLOAD"));
+        m.uninstall(&h).unwrap();
+    }
+    drop(m);
+    let source="function helper(v) {\n if(v===0n)return 7n;\n throw new Error('PRIVATE_PAYLOAD');\n}\n({f(v){return helper(v);}})";
+    let (m, h, f) = load(&d, source, ValueType::Int64);
+    let error = f.invoke(&[Scalar::Int64(1)]).unwrap_err();
+    assert!(error
+        .context
+        .iter()
+        .any(|(k, v)| k == "script_phase" && v == "call"));
+    let frames = &error
+        .context
+        .iter()
+        .find(|(k, _)| k == "script_frames")
+        .unwrap()
+        .1;
+    assert!(frames.starts_with("3:"), "{frames}");
+    assert!(frames.contains(",5:"), "{frames}");
+    assert!(!format!("{error:?}").contains("PRIVATE_PAYLOAD"));
+    assert_eq!(f.invoke(&[Scalar::Int64(0)]).unwrap(), Scalar::Int64(7));
+    drop(f);
+    m.disable(&h).unwrap();
+    m.uninstall(&h).unwrap();
+    drop(m);
+    let source = "const text='😀中';\r\nfunction helper(v) { const label='😀中'; throw new Error('PRIVATE'); }\u{2028}({f(v){return helper(v);}})";
+    let (_m, _h, f) = load(&d, source, ValueType::Int64);
+    let error = f.invoke(&[Scalar::Int64(1)]).unwrap_err();
+    let frames = &error
+        .context
+        .iter()
+        .find(|(k, _)| k == "script_frames")
+        .unwrap()
+        .1;
+    let column = "function helper(v) { const label='😀中'; throw new "
+        .encode_utf16()
+        .count()
+        + 1;
+    assert!(frames.starts_with(&format!("2:{column},3:")), "{frames}");
+}
+
+#[test]
+fn scripts_shared_work_budget_payload_null_errors_and_deadline() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let _serial = SERIAL.lock().unwrap();
+    let d = dir();
+    let (_m, _h, f) = load(&d, "({f(v){if(v<0n)throw 1;return v;}})", ValueType::Int64);
+    let cost = script::CALL_WORK_UNITS + 8;
+    let work = Arc::new(AtomicU64::new(cost * 2));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(script::scope_with_budget(
+        tokio_util::sync::CancellationToken::new(),
+        Some(work.clone()),
+        None,
+        async {
+            assert_eq!(f.invoke(&[Scalar::Null]).unwrap(), Scalar::Null);
+            assert_eq!(work.load(Ordering::Relaxed), cost * 2);
+            f.invoke(&[Scalar::Int64(1)]).unwrap();
+            assert_eq!(work.load(Ordering::Relaxed), cost);
+        },
+    ));
+    // A separate stage/task using the same allowance cannot reset the budget.
+    rt.block_on(script::scope_with_budget(
+        tokio_util::sync::CancellationToken::new(),
+        Some(work.clone()),
+        None,
+        async {
+            assert_eq!(
+                f.invoke(&[Scalar::Int64(-1)]).unwrap_err().code,
+                ErrorCode::JobFailed
+            );
+            assert_eq!(work.load(Ordering::Relaxed), 0); // failures aren't refunded
+            assert_eq!(
+                f.invoke(&[Scalar::Int64(2)]).unwrap_err().code,
+                ErrorCode::ResourceExhausted
+            );
+        },
+    ));
+    rt.block_on(script::scope_with_budget(
+        tokio_util::sync::CancellationToken::new(),
+        None,
+        Some(Instant::now()),
+        async {
+            assert_eq!(
+                f.invoke(&[Scalar::Int64(2)]).unwrap_err().code,
+                ErrorCode::BoundExceeded
+            );
+        },
+    ));
+    assert_eq!(f.invoke(&[Scalar::Int64(2)]).unwrap(), Scalar::Int64(2));
+}
+
+#[test]
+fn scripts_finite_aggregate_budget_across_rows_and_nested_calls() {
+    use sparrow_runtime::finite::FiniteLimits;
+    let _serial = SERIAL.lock().unwrap();
+    let d = dir();
+    let (m, h, f) = load(&d, "({f(v){return v*2n;}})", ValueType::Int64);
+    drop(f);
+    for (nested, count) in [(false, 10), (true, 1)] {
+        let result = finite(
+            sql_plan(m.clone(), &h, nested),
+            vec![Scalar::Int64(1); count],
+            FiniteLimits {
+                work_units: 15_000,
+                ..Default::default()
+            },
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let error = result
+            .err()
+            .expect("aggregate budget must reject, without partial success");
+        assert_eq!(error.code, ErrorCode::ResourceExhausted, "{error:?}");
+        assert!(error.message.contains("aggregate JavaScript"), "{error:?}");
+        assert_eq!(m.list().unwrap()[0].script_worker_state, Some("ready"));
+    }
+    // Rejected query has joined/released its pins; NULL propagation needs no VM.
+    let result = finite(
+        sql_plan(m.clone(), &h, false),
+        vec![Scalar::Null; 10],
+        FiniteLimits {
+            work_units: 15_000,
+            ..Default::default()
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(result.output_rows, 10);
+    drop(result);
+    m.disable(&h).unwrap();
+    m.uninstall(&h).unwrap();
+    assert_eq!(script::worker_count(), 0);
+}
+
+#[test]
+fn scripts_finite_deadline_and_caller_cancel_join_before_return() {
+    use sparrow_runtime::finite::FiniteLimits;
+    let _serial = SERIAL.lock().unwrap();
+    for caller_cancel in [false, true] {
+        let d = dir();
+        let (m, h, f) = load(&d, "({f(v){while(true){}return v;}})", ValueType::Int64);
+        drop(f);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let plan = sql_plan(m.clone(), &h, false);
+        let trigger = if caller_cancel {
+            let c = cancel.clone();
+            let manager = m.clone();
+            Some(std::thread::spawn(move || {
+                let start = Instant::now();
+                while manager.list().unwrap()[0].script_worker_state != Some("busy") {
+                    assert!(start.elapsed() < Duration::from_secs(2));
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                c.cancel();
+            }))
+        } else {
+            None
+        };
+        let start = Instant::now();
+        let error = finite(
+            plan,
+            vec![Scalar::Int64(1)],
+            FiniteLimits {
+                timeout_ms: if caller_cancel { 2000 } else { 20 },
+                ..Default::default()
+            },
+            cancel,
+        )
+        .err()
+        .unwrap();
+        if let Some(t) = trigger {
+            t.join().unwrap();
+        }
+        assert!(
+            matches!(error.code, ErrorCode::Cancelled | ErrorCode::BoundExceeded),
+            "{error:?}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(m.list().unwrap()[0].script_worker_state, Some("failed"));
+        m.disable(&h).unwrap();
+        m.uninstall(&h).unwrap();
+        assert_eq!(script::worker_count(), 0);
+    }
 }

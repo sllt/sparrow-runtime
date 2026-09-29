@@ -98,16 +98,23 @@ SQL/Graph 调用方式不变，例如 `plugin_call('script_math','v1','完整man
 ### 隔离、配额和故障
 
 - 每个已激活版本独占一个复用的执行进程，同版本调用串行；全服务进程最多 **4 个脚本 worker 名额**。名额与原生 16 次驻留加载尝试独立。仍可安装最多 16 个包版本，但未使用的脚本版本应停用以释放名额。
-- **每次调用新建 Runtime＋Context**，不共享全局变量、原型修改、闭包状态或 Promise 队列；不执行异步 jobs。包源代码保留在 worker 中，不使用持久字节码/编译缓存或跨调用实例池，也不接受上传 bytecode。该隔离策略存在初始化/解析开销，后续缓存优化须重新证明状态隔离。
+- **每次调用新建 Runtime＋Context**，不共享全局变量、原型修改、闭包状态或 Promise 队列；不执行异步 jobs。启用时由同一 worker 编译 bootstrap 和已校验源文件，仅缓存生成的不可变 bytecode，合计最多 **256KiB/worker**；调用时重载，仍重新执行顶层初始化。没有跨调用实例池、磁盘缓存或外部 bytecode 上传接口。保留严格模式、Function.toString 的源文本与调试位置。
+- `script_cache` 返回 artifact SHA-256、缓存字节数和编译脚本数（2），停用后为 null；是加载元数据，不是 worker 存活证明。缓存包含在 128MiB 进程上限内，不计作宿主 Job owner 内存。重启/重新启用会从源码重新编译。内部 IPC 升级为 `sparrow-js-quickjs-ng-0.16.2-ipc2`，须配套部署 Server 与 worker；源文件 manifest target/hash 合同不变，不接纳旧协议 worker。
 - worker 地址空间 `RLIMIT_AS=128MiB`（不是 RSS 预分配），每个 QuickJS Runtime 堆上限 64MiB、JS 栈上限 1MiB。主机全 Job 的 IPC 编码/解码/返回值另按函数类型计入既有 reservation；worker 自身的地址空间**不冒充**已由 Job `MemoryOwner` 记账。部署总内存预算须包含子进程。
 - 每次调用最多 8 个参数、总标量 payload 最多 64KiB；文本/Bytes 输出受函数声明上限约束，最高 64KiB。IPC frame 最高 512KiB，实际响应还按声明收紧；长度检查先于主进程分配。
 - 调用期限 **100ms**，包含等待同版本的其他调用和 IPC；启用验证期限 2s。内层 QuickJS 中断只是辅助，主进程轮询期限/Job cancellation 后 kill＋wait 回收进程，防止正则等内建长操作绕过中断。不是实时调度 SLA，也不能消除阻塞内核 I/O 的影响。
 - worker 自带调用 1s/初始化 3s 的 SIGALRM 兜底；父进程消失时，空闲 worker 由 stdin EOF 退出，忙碌 worker 由自身 watchdog 终止。没有使用 Linux 绑定到创建线程的 PDEATHSIG，避免 Tokio 临时 blocking 线程退出误杀 worker。
 - 清空 worker 环境并关闭继承的非标准 fd，不注册 FS、网络、模块 loader 或宿主回调；关闭 eval/Function 及 async/generator constructor 动态编译路径、Date、Math.random、SharedArrayBuffer/Atomics 等入口。**资源/进程隔离不是 seccomp、namespace 或不可信多租户的完整 OS 沙箱**；worker 仍以服务用户运行，不承诺防御引擎漏洞。代码仍需管理员审查及精确 hash 批准。
-- 脚本异常让对应 Job 失败，不静默丢弃/吞错。期限、取消、worker 退出或协议故障会把该版本的 worker 标记为 failed，不自动无限重启；同一版本的其他调用也会失败，其他版本的 worker 独立。先停止使用者，再 disable→enable 恢复。`script_worker_state` 为最近观测到的 ready/busy/failed/unloaded 状态，不是周期 liveness probe。
+- 脚本异常让对应 Job 失败，不静默丢弃/吞错。持有 worker 的调用超时、取消、worker 退出或协议故障会把该版本的 worker 标记为 failed，不自动无限重启；排队前/期间被拒绝不会杀死另一调用的 worker。异常被正常返回时 worker 可继续使用；已失败版本先停止使用者，再 disable→enable 恢复。其他版本的 worker 独立。`script_worker_state` 为最近观测到的 ready/busy/failed/unloaded 状态，不是周期 liveness probe。
 - disable 仍拒绝存在 plan/job pin 的包；脚本无 pin 时会回收进程，随后可以**不重启 Server 就卸载**。原生仍必须停用后重启，不能混同。顶层 `hot_unload:false` 表示并非所有后端支持；以包的 `hot_unload` 或 `script_hot_unload` 为准。
 
-脚本仍 **restart_fresh-only**，不能用于 aligned/checkpoint 恢复。`/v1/query` 当前也拒绝脚本：单次可取消不等于已经实现整次有限查询的脚本工作预算。WASM、外部 Source/Sink、编译缓存、批量 IPC、实例池、长期 soak、aarch64 验证另行交付。
+### 有界诊断与有限查询
+
+错误上下文包含 `script_phase`（compile/initialize/export/arguments/call/result/cache/runtime），可取得位置时再包含 `script_frames`，最多 8 个 `行:列`，均从 1 开始，列按源码 UTF-16 计。不返回异常 message、文件路径、函数名或业务参数。worker 在执行用户代码之前保存原生 Error stack getter，只对引擎直接确认的 Error 对象调用它，不访问自定义 stack/message getter、Proxy 或任意对象的 toString。非 Error、超大栈或没有有效源码坐标时省略 frames；自定义 Error.prepareStackTrace 可以影响坐标，因此位置仅作诊断提示，**不是可信来源证明**。
+
+`/v1/query` 与 `sparrowctl query` 允许已启用、精确版本/hash 固定的 JS 标量。每个非 NULL 调用预扣 **10,000 + 参数 payload 字节数**，与所有 stage 共享整次查询的 `limits.work_units`，失败/排队尝试不退款；NULL 传播不进入 VM。它是保守的调用准入成本，**不是 VM 指令计量器**。默认 1,000,000 work units 还需支付普通算子成本，因此不足 100 次整型调用；上限 10,000,000。嵌套调用、跨行/跨 stage 不重置预算。
+
+查询还共享一个绝对执行截止时间，每次调用实际期限取查询剩余时间与 100ms 的较小值；取消/失败后 join 全部任务才释放查询准入，不返回部分成功结果。原生或其他不可抢占插件仍拒绝进入有限查询。脚本仍 **restart_fresh-only**，不能用于 aligned/checkpoint 恢复。WASM、外部 Source/Sink、批量 IPC、实例池、长期 soak、aarch64 验证另行交付。
 
 ### 为什么最终选择 QuickJS
 

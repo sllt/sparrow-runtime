@@ -132,7 +132,9 @@ pub(super) fn metadata_bytes(plan: &PhysicalPlan) -> usize {
     }
     fn expr(e: &Expr) -> usize {
         128usize.saturating_add(match e {
-            Expr::Plugin {args,..} => args.iter().fold(4096usize,|n,e|n.saturating_add(expr(e))),
+            Expr::Plugin { args, .. } => args
+                .iter()
+                .fold(4096usize, |n, e| n.saturating_add(expr(e))),
             Expr::Column { name } => name.capacity(),
             Expr::Literal(v) => v.resident_bytes(),
             Expr::Cast { expr: e, target } | Expr::TryCast { expr: e, target } => {
@@ -690,8 +692,16 @@ pub(super) async fn run(ctx: JobCtx, mut req: JobRequest) -> Result<JobStats> {
                     } else {
                         let future = router(&child, stage, input.remove(0), output);
                         if child.script_plugins {
-                            sparrow_expr::plugins::script::scope(child.cancel.clone(), future).await
-                        } else { future.await }
+                            sparrow_expr::plugins::script::scope_with_budget(
+                                child.cancel.clone(),
+                                child.query_work.clone(),
+                                child.script_deadline,
+                                future,
+                            )
+                            .await
+                        } else {
+                            future.await
+                        }
                     };
                     if child.optional_branch && result.is_err() {
                         child.cancel.cancel();

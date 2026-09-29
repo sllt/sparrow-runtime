@@ -24,8 +24,8 @@ use sparrow_model::{ErrorCode, SparrowError};
 use sparrow_runtime::Kernel;
 use tower_http::limit::RequestBodyLimitLayer;
 mod operations;
-mod reference_tables;
 mod plugins;
+mod reference_tables;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:43180";
 pub const MAX_BODY: usize = 64 * 1024;
@@ -195,7 +195,37 @@ fn public_error_context(error: &SparrowError) -> Vec<Value> {
     error
         .context
         .iter()
-        .filter(|(key, _)| ALLOWED.contains(&key.as_str()))
+        .filter(|(key, value)| {
+            ALLOWED.contains(&key.as_str())
+                || match key.as_str() {
+                    "plugin_package" | "plugin_version" | "plugin_function" => {
+                        value.len() <= 32
+                            && !value.is_empty()
+                            && value
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    }
+                    "script_phase" => matches!(
+                        value.as_str(),
+                        "compile"
+                            | "initialize"
+                            | "export"
+                            | "arguments"
+                            | "call"
+                            | "result"
+                            | "cache"
+                            | "runtime"
+                    ),
+                    "script_frames" => {
+                        value.len() <= 128
+                            && !value.is_empty()
+                            && value
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || b == b':' || b == b',')
+                    }
+                    _ => false,
+                }
+        })
         .take(8)
         .map(|(key, value)| {
             json!({
@@ -1611,5 +1641,25 @@ mod tests {
             .iter()
             .any(|entry| { entry["key"] == "field" && entry["value"] == "temperature" }));
         assert!(!context.iter().any(|entry| entry["key"] == "path"));
+    }
+
+    #[test]
+    fn scripts_api_diagnostics_only_expose_safe_phase_and_coordinates() {
+        let error = SparrowError::new(ErrorCode::JobFailed, "script failed")
+            .context("script_phase", "call")
+            .context("script_frames", "3:4,5:7")
+            .context("plugin_package", "script_math")
+            .context("plugin_version", "v1")
+            .context("plugin_function", "double")
+            .context("stack", "PRIVATE: input=secret")
+            .context("script_frames", "1:2 PRIVATE")
+            .context("script_phase", "PRIVATE")
+            .context("plugin_function", "/private/path");
+        let context = public_error_context(&error);
+        assert_eq!(context.len(), 5);
+        let encoded = serde_json::to_string(&context).unwrap();
+        assert!(encoded.contains("3:4,5:7"));
+        assert!(!encoded.contains("PRIVATE"));
+        assert!(!encoded.contains("/private"));
     }
 }

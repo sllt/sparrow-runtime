@@ -1,10 +1,13 @@
 //! Not a general JS shell: private framed IPC, no filesystem/module/network API.
 use rquickjs::{
-    function::Args, BigInt, Coerced, Context, Ctx, FromJs, Function, IntoJs, Object, Runtime,
-    TypedArray, Value,
+    function::Args, BigInt, Coerced, Context, Ctx, FromJs, Function, IntoJs, Runtime, TypedArray,
+    Value,
 };
 use sparrow_plugin::{
-    script::{Request, Response, WireValue, PROTOCOL, WIRE_BYTES, WORKER_MEMORY},
+    script::{
+        ErrorPhase, ReadyInfo, Request, Response, ScriptFailure, WireValue, PROTOCOL, WIRE_BYTES,
+        WORKER_MEMORY,
+    },
     FunctionDef, Manifest, ValueType,
 };
 use std::{
@@ -12,20 +15,29 @@ use std::{
     time::{Duration, Instant},
 };
 type Result<T> = std::result::Result<T, &'static str>;
+type ScriptResult<T> = std::result::Result<T, ScriptFailure>;
+mod cache;
+mod diagnostic;
 
-fn with_context<T>(timeout_ms: u64, f: impl for<'js> FnOnce(Ctx<'js>) -> Result<T>) -> Result<T> {
+fn with_runtime<T>(
+    timeout_ms: u64,
+    f: impl for<'js> FnOnce(Ctx<'js>) -> ScriptResult<T>,
+) -> ScriptResult<T> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let runtime = Runtime::new().map_err(|_| "runtime")?;
+    let runtime =
+        Runtime::new().map_err(|_| ScriptFailure::plain(ErrorPhase::Runtime, "runtime"))?;
     // Do not enable rust-alloc/allocator features: they make set_memory_limit a
     // no-op. RLIMIT_AS additionally bounds Rust buffers and engine overhead.
     runtime.set_memory_limit(64 * 1024 * 1024);
     runtime.set_max_stack_size(1024 * 1024);
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
-    let context = Context::full(&runtime).map_err(|_| "context")?;
-    context.with(|ctx| {
-        // No module loader, std/os or host callbacks. A fresh Runtime + Context
-        // also discards globals, prototype mutations and pending Promise jobs.
-        ctx.eval::<(),_>(r#"(() => {
+    let context = Context::full(&runtime)
+        .map_err(|_| ScriptFailure::plain(ErrorPhase::Runtime, "context"))?;
+    // No module loader, std/os or host callbacks. Every call reloads immutable
+    // cached bytecode into a NEW Runtime/Context, never a reused JS object graph.
+    context.with(f)
+}
+const BOOTSTRAP: &str = r#"(() => {
         for (const name of ['Date', 'Temporal', 'WeakRef', 'FinalizationRegistry',
                             'SharedArrayBuffer', 'Atomics']) {
             Object.defineProperty(globalThis, name, {value: undefined, writable: false, configurable: false});
@@ -39,10 +51,8 @@ fn with_context<T>(timeout_ms: u64, f: impl for<'js> FnOnce(Ctx<'js>) -> Result<
         for (const name of ['eval', 'Function']) {
             Object.defineProperty(globalThis, name, {value: denyCodeGeneration, writable: false, configurable: false});
         }
-    })();"#).map_err(|_| "bootstrap")?;
-        f(ctx)
-    })
-}
+        return Object.getOwnPropertyDescriptor(Error.prototype, 'stack').get;
+    })();"#;
 
 fn input<'js>(value: WireValue, ctx: &Ctx<'js>) -> Result<Value<'js>> {
     Ok(match value {
@@ -125,47 +135,38 @@ fn output(value: Value<'_>, def: &FunctionDef) -> Result<WireValue> {
         }
     })
 }
-fn exports<'js>(source: &str, ctx: &Ctx<'js>) -> Result<Object<'js>> {
-    ctx.eval(source)
-        .map_err(|_| "syntax, initialization or exports object")
-}
-fn validate(manifest: &Manifest, source: &str) -> Result<()> {
-    if !manifest.is_script() {
-        return Err("kind");
-    }
-    manifest
-        .check_artifact(source.as_bytes())
-        .map_err(|_| "manifest")?;
-    with_context(1500, |ctx| {
-        let object = exports(source, &ctx)?;
-        for def in &manifest.functions {
-            object
-                .get::<_, Function>(def.name.as_str())
-                .map_err(|_| "export must be callable")?;
-        }
-        Ok(())
-    })
-}
-fn invoke(manifest: &Manifest, source: &str, id: u32, args: Vec<WireValue>) -> Result<WireValue> {
+fn invoke(
+    manifest: &Manifest,
+    cache: &cache::Cache,
+    id: u32,
+    args: Vec<WireValue>,
+) -> ScriptResult<WireValue> {
     let def = manifest
         .functions
         .iter()
         .find(|f| f.id == id)
-        .ok_or("function")?;
+        .ok_or_else(|| ScriptFailure::plain(ErrorPhase::Export, "function"))?;
     if args.len() != def.inputs.len() {
-        return Err("arity");
+        return Err(ScriptFailure::plain(ErrorPhase::Arguments, "arity"));
     }
-    with_context(100, |ctx| {
-        let object = exports(source, &ctx)?;
-        let function: Function = object.get(def.name.as_str()).map_err(|_| "export")?;
+    with_runtime(100, |ctx| {
+        let (object, diagnostic) = cache.open(&ctx)?;
+        let function: Function = object
+            .get(def.name.as_str())
+            .map_err(|_| diagnostic.capture(&ctx, ErrorPhase::Export, "export"))?;
         let mut arguments = Args::new(ctx.clone(), args.len());
         for v in args {
             arguments
-                .push_arg(input(v, &ctx)?)
-                .map_err(|_| "arguments")?;
+                .push_arg(
+                    input(v, &ctx)
+                        .map_err(|e| diagnostic.capture(&ctx, ErrorPhase::Arguments, e))?,
+                )
+                .map_err(|_| diagnostic.capture(&ctx, ErrorPhase::Arguments, "arguments"))?;
         }
-        let result: Value = function.call_arg(arguments).map_err(|_| "execution")?;
-        output(result, def)
+        let result: Value = function
+            .call_arg(arguments)
+            .map_err(|_| diagnostic.capture(&ctx, ErrorPhase::Call, "execution"))?;
+        output(result, def).map_err(|e| diagnostic.capture(&ctx, ErrorPhase::Result, e))
     })
 }
 
@@ -200,17 +201,26 @@ fn run() -> Result<()> {
         return Err("load required");
     };
     alarm(3);
-    if let Err(e) = validate(&manifest, &source) {
-        write(&mut output, &Response::Error(e.into()))?;
-        return Err(e);
-    }
-    write(&mut output, &Response::Ready(PROTOCOL.into()))?;
+    let cache = match cache::Cache::prepare(&manifest, source) {
+        Ok(cache) => cache,
+        Err(e) => {
+            write(&mut output, &Response::Failure(e))?;
+            return Err("compile/initialization");
+        }
+    };
+    write(
+        &mut output,
+        &Response::Ready(ReadyInfo {
+            protocol: PROTOCOL.into(),
+            cache: cache.info(),
+        }),
+    )?;
     alarm(0);
     while let Ok(Request::Call { id, args }) = read(&mut input) {
         alarm(1);
-        let response = match invoke(&manifest, &source, id, args) {
+        let response = match invoke(&manifest, &cache, id, args) {
             Ok(value) => Response::Value(value),
-            Err(e) => Response::Error(e.into()),
+            Err(e) => Response::Failure(e),
         };
         write(&mut output, &response)?;
         alarm(0);

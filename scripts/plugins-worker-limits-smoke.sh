@@ -32,7 +32,7 @@ grep -a -q '"status":"Ready"' "$root/reply.bin"
 # Either the engine interrupted the builtin or the autonomous SIGALRM fired.
 # A timeout(1) kill (124/137) is NOT a pass.
 if [[ "$code" == 0 ]]; then
-    grep -a -q '"status":"Error"' "$root/reply.bin"
+    grep -a -q '"status":"Failure"' "$root/reply.bin"
 else
     test "$code" = 142
 fi

@@ -93,6 +93,19 @@ start
 "$ctl" plugin-install "$root/v1/manifest.json" "$root/v1/$artifact" > "$root/install-v1.json"
 old=$(jq -er '.manifest_sha256' "$root/install-v1.json")
 "$ctl" plugin-enable "$old" > "$root/enable-v1.json"
+jq -n --arg sql "SELECT plugin_call('$package','v1','$old','double',value) AS doubled FROM s" \
+  '{sql:$sql,inputs:[{stream:"s",rows:[{value:21}]}]}' > "$root/query.json"
+if [[ "$kind" == script ]]; then
+  "$ctl" query "$root/query.json" > "$root/query-success.json"
+  jq -e '.complete and .rows==[{doubled:42}]' "$root/query-success.json" >/dev/null
+  jq '.limits={work_units:10000}' "$root/query.json" > "$root/query-budget.json"
+  reject query-budget-rejected.json "$ctl" query "$root/query-budget.json"
+  grep -q 'aggregate JavaScript work limit' "$root/query-budget-rejected.json"
+  "$ctl" plugins > "$root/cache.json"
+  jq -e '.packages|all(.[]; .script_cache.compiled_scripts==2 and .script_cache.bytes>0 and .script_cache.bytes<=262144 and .script_cache.artifact_sha256==.manifest.artifact_sha256)' "$root/cache.json" >/dev/null
+else
+  reject query-native-rejected.json "$ctl" query "$root/query.json"
+fi
 run_version v1 "$old" 42 first
 "$ctl" plugin-disable "$old" > "$root/disable-v1.json"
 "$ctl" plugin-install "$root/v2/manifest.json" "$root/v2/$artifact" > "$root/install-v2.json"
@@ -102,6 +115,20 @@ run_version v2 "$new" 63 upgrade
 "$ctl" plugin-enable "$old" > "$root/reenable-v1.json"
 run_version v1 "$old" 42 rollback
 if [[ "$kind" == script ]]; then
+  mkdir "$root/diagnostic"
+  printf '%s\n' "({double(v){throw new Error('PRIVATE_PAYLOAD');}})" > "$root/diagnostic/script_math.js"
+  hash=$(sha256sum "$root/diagnostic/script_math.js"); hash=${hash%% *}
+  jq --arg hash "$hash" '.version="diagnostic" | .artifact_sha256=$hash | .functions=[.functions[0]]' "$root/v1/manifest.json" > "$root/diagnostic/manifest.json"
+  "$ctl" plugin-install "$root/diagnostic/manifest.json" "$root/diagnostic/script_math.js" > "$root/install-diagnostic.json"
+  diagnostic=$(jq -er '.manifest_sha256' "$root/install-diagnostic.json")
+  "$ctl" plugin-enable "$diagnostic" > "$root/enable-diagnostic.json"
+  jq --arg sql "SELECT plugin_call('$package','diagnostic','$diagnostic','double',value) AS doubled FROM s" '.sql=$sql' "$root/query.json" > "$root/query-diagnostic.json"
+  reject query-diagnostic-rejected.json "$ctl" query "$root/query-diagnostic.json"
+  jq -e '.error.context|any(.[]; .key=="script_phase" and .value=="call")' "$root/query-diagnostic-rejected.json" >/dev/null
+  jq -e '.error.context|any(.[]; .key=="script_frames" and (.value|test("^1:[0-9]+")))' "$root/query-diagnostic-rejected.json" >/dev/null
+  ! grep -q PRIVATE_PAYLOAD "$root/query-diagnostic-rejected.json"
+  "$ctl" plugin-disable "$diagnostic" > "$root/disable-diagnostic.json"
+  "$ctl" plugin-uninstall "$diagnostic" > "$root/uninstall-diagnostic.json"
   mkdir "$root/bad"
   printf '%s\n' "({double(value) { /(a+)+\$/.test('a'.repeat(30)+'!'); return value; }})" > "$root/bad/script_math.js"
   hash=$(sha256sum "$root/bad/script_math.js"); hash=${hash%% *}

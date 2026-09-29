@@ -55,6 +55,7 @@ pub struct PackageInfo {
     pub hot_unload: bool,
     /// Not a liveness probe: a child exit is observed on the next call.
     pub script_worker_state: Option<&'static str>,
+    pub script_cache: Option<crate::script::CacheInfo>,
 }
 impl Entry {
     fn info(&self) -> PackageInfo {
@@ -69,6 +70,10 @@ impl Entry {
                 .as_ref()
                 .map_or(0, |l| l.pins.load(Ordering::SeqCst)),
             hot_unload: self.manifest.is_script(),
+            script_cache: match self.loaded.as_ref().map(|l| &l.backend) {
+                Some(Backend::Script(script)) => Some(script.cache().clone()),
+                _ => None,
+            },
             script_worker_state: if self.manifest.is_script() {
                 Some(match self.loaded.as_ref().map(|l| &l.backend) {
                     Some(Backend::Script(script)) => script.state(),

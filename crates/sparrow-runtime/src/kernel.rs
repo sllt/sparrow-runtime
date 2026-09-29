@@ -56,6 +56,8 @@ impl Default for KernelOptions {
 pub struct JobRequest {
     /// Optional finite-query aggregate work limit; normal live jobs are unlimited.
     pub work_lifetime: Option<u64>,
+    /// Absolute deadline for finite-query script calls, shared by all stages.
+    pub script_deadline: Option<std::time::Instant>,
     live_silence: Option<Arc<live_silence::Config>>,
     pub graph_inputs: HashMap<sparrow_model::OperatorId, GraphInput>,
     pub graph_outputs: HashMap<sparrow_model::OperatorId, GraphOutput>,
@@ -160,6 +162,7 @@ impl JobRequest {
         Self {
             live_silence: None,
             work_lifetime: None,
+            script_deadline: None,
             graph_inputs: HashMap::new(),
             graph_outputs: HashMap::new(),
             source_admission: None,
@@ -602,9 +605,20 @@ impl Kernel {
     }
 
     pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
-        let mut plugin_count=0usize;req.plan.visit_plugins(&mut |_|plugin_count+=1);
-        if plugin_count>64{return Err(SparrowError::new(ErrorCode::BoundExceeded,"job exceeds 64 plugin call sites"));}
-        if plugin_count>0 && req.aligned.is_some(){return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"native plugin functions require restart_fresh"));}
+        let mut plugin_count = 0usize;
+        req.plan.visit_plugins(&mut |_| plugin_count += 1);
+        if plugin_count > 64 {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "job exceeds 64 plugin call sites",
+            ));
+        }
+        if plugin_count > 0 && req.aligned.is_some() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "native plugin functions require restart_fresh",
+            ));
+        }
         if (req.plan.has_analysis() || req.plan.has_extended_aggs()) && req.aligned.is_some() {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
@@ -973,16 +987,19 @@ impl Kernel {
                 .map_err(|e| e.retryable(true).context("admission", "capacity"))?;
         let work = Arc::new(WorkBudget::new(self.job_budget.work_units));
         let mut script_plugins = false;
-        req.plan.visit_plugins(&mut |f| script_plugins |= f.is_script());
+        req.plan
+            .visit_plugins(&mut |f| script_plugins |= f.is_script());
         let ctx = JobCtx {
             script_plugins,
+            script_deadline: req.script_deadline,
             query_work: req
                 .work_lifetime
                 .map(|limit| Arc::new(AtomicU64::new(limit))),
             live_silence: req.live_silence.clone(),
             ordered_time,
             graph_time: graph_time.clone(),
-            graph_memory: if req.plan.edges.is_some() || req.plan.has_analysis() || plugin_count>0 {
+            graph_memory: if req.plan.edges.is_some() || req.plan.has_analysis() || plugin_count > 0
+            {
                 Some(Arc::new(owner.acquire(
                     sparrow_model::CreditKind::Reservation,
                     graph::metadata_bytes(&req.plan),
@@ -1045,16 +1062,24 @@ impl Kernel {
                 .transpose()?,
             observation: req.observation.clone(),
         };
-        let plugin_pins=if plugin_count>0 {
-            let credit=owner.acquire(sparrow_model::CreditKind::Reservation,plugin_count.saturating_mul(32).saturating_add(128))?;
-            Some((req.plan.plugin_functions(),credit))
-        }else{None};
+        let plugin_pins = if plugin_count > 0 {
+            let credit = owner.acquire(
+                sparrow_model::CreditKind::Reservation,
+                plugin_count.saturating_mul(32).saturating_add(128),
+            )?;
+            Some((req.plan.plugin_functions(), credit))
+        } else {
+            None
+        };
         self.metrics.jobs_started.fetch_add(1, Ordering::Relaxed);
         let handle = self
             .rt
             .as_ref()
             .expect("live kernel runtime")
-            .spawn(async move {let _pins=plugin_pins;run_job(ctx,req,admit).await});
+            .spawn(async move {
+                let _pins = plugin_pins;
+                run_job(ctx, req, admit).await
+            });
         Ok(JobHandle {
             attempt,
             owner,
@@ -1140,6 +1165,7 @@ fn admit_process(
 
 struct JobCtx {
     script_plugins: bool,
+    script_deadline: Option<std::time::Instant>,
     query_work: Option<Arc<AtomicU64>>,
     live_silence: Option<Arc<live_silence::Config>>,
     ordered_time: bool,
@@ -1257,6 +1283,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
 
     let JobRequest {
         work_lifetime: _,
+        script_deadline: _,
         live_silence: _,
         plan,
         rows,
@@ -1366,6 +1393,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
 fn clone_ctx(ctx: &JobCtx) -> JobCtx {
     JobCtx {
         script_plugins: ctx.script_plugins,
+        script_deadline: ctx.script_deadline,
         query_work: ctx.query_work.clone(),
         live_silence: ctx.live_silence.clone(),
         ordered_time: ctx.ordered_time,
@@ -1467,6 +1495,8 @@ fn spawn_stage(
         let local_cancel = ctx.cancel.clone();
         let branch_metrics = ctx.metrics.clone();
         let script_plugins = ctx.script_plugins;
+        let script_work = ctx.query_work.clone();
+        let script_deadline = ctx.script_deadline;
         let future = stage_loop(
             ctx,
             stage,
@@ -1482,7 +1512,13 @@ fn spawn_stage(
             trailing_controls,
         );
         let result = if script_plugins {
-            sparrow_expr::plugins::script::scope(local_cancel.clone(), future).await
+            sparrow_expr::plugins::script::scope_with_budget(
+                local_cancel.clone(),
+                script_work,
+                script_deadline,
+                future,
+            )
+            .await
         } else {
             future.await
         };

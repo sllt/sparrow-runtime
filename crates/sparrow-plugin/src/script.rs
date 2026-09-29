@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use sparrow_model::{ErrorCode, Result, Scalar, SparrowError};
 use std::{
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
@@ -14,7 +17,12 @@ pub const WORKER_MEMORY: usize = 128 * 1024 * 1024;
 pub const WIRE_BYTES: usize = 512 * 1024;
 pub const CALL_TIMEOUT_MS: u64 = 100;
 pub const LOAD_TIMEOUT_MS: u64 = 2000;
-pub const PROTOCOL: &str = "sparrow-js-quickjs-ng-0.16.2-v1";
+pub const PROTOCOL: &str = "sparrow-js-quickjs-ng-0.16.2-ipc2";
+pub const MAX_CACHE_BYTES: usize = 256 * 1024;
+pub const MAX_ERROR_FRAMES: usize = 8;
+/// Conservative admission charge, NOT a claim about VM instruction counts.
+/// Together with a single-call deadline it bounds total admitted JS work.
+pub const CALL_WORK_UNITS: u64 = 10_000;
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 fn output_bytes(def: &FunctionDef) -> usize {
     if matches!(def.output, crate::ValueType::Utf8 | crate::ValueType::Bytes) {
@@ -47,16 +55,38 @@ pub fn scratch_bytes(def: &FunctionDef) -> usize {
         + 4 * output_bytes(def)
         + 8192
 }
-tokio::task_local! { static CANCEL: CancellationToken; }
+struct Execution {
+    cancel: CancellationToken,
+    work: Option<Arc<AtomicU64>>,
+    deadline: Option<Instant>,
+}
+tokio::task_local! { static EXECUTION: Execution; }
 
 /// Task-local scope is restored on every poll, including after thread migration.
 /// Never attach one job's cancellation token to a shared compiled Function.
 pub async fn scope<F: std::future::Future>(cancel: CancellationToken, future: F) -> F::Output {
-    CANCEL.scope(cancel, future).await
+    scope_with_budget(cancel, None, None, future).await
+}
+pub async fn scope_with_budget<F: std::future::Future>(
+    cancel: CancellationToken,
+    work: Option<Arc<AtomicU64>>,
+    deadline: Option<Instant>,
+    future: F,
+) -> F::Output {
+    EXECUTION
+        .scope(
+            Execution {
+                cancel,
+                work,
+                deadline,
+            },
+            future,
+        )
+        .await
 }
 fn check(deadline: Instant) -> Result<()> {
-    if CANCEL
-        .try_with(CancellationToken::is_cancelled)
+    if EXECUTION
+        .try_with(|e| e.cancel.is_cancelled())
         .unwrap_or(false)
     {
         return Err(SparrowError::new(
@@ -71,6 +101,30 @@ fn check(deadline: Instant) -> Result<()> {
         ));
     }
     Ok(())
+}
+fn call_deadline() -> Instant {
+    let deadline = Instant::now() + Duration::from_millis(CALL_TIMEOUT_MS);
+    EXECUTION
+        .try_with(|e| e.deadline.map_or(deadline, |end| end.min(deadline)))
+        .unwrap_or(deadline)
+}
+fn charge_call(payload: usize) -> Result<()> {
+    EXECUTION
+        .try_with(|e| {
+            if let Some(work) = &e.work {
+                work.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(CALL_WORK_UNITS.saturating_add(payload as u64))
+                })
+                .map_err(|_| {
+                    SparrowError::new(
+                        ErrorCode::ResourceExhausted,
+                        "finite query aggregate JavaScript work limit exceeded",
+                    )
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap_or(Ok(()))
 }
 pub fn worker_count() -> usize {
     WORKERS.load(Ordering::SeqCst)
@@ -149,12 +203,134 @@ pub enum Request {
     Call { id: u32, args: Vec<WireValue> },
 }
 #[doc(hidden)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheInfo {
+    pub artifact_sha256: String,
+    pub bytes: usize,
+    pub compiled_scripts: usize,
+}
+#[doc(hidden)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadyInfo {
+    pub protocol: String,
+    pub cache: CacheInfo,
+}
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorPhase {
+    Compile,
+    Initialize,
+    Export,
+    Arguments,
+    Call,
+    Result,
+    Cache,
+    Runtime,
+}
+impl ErrorPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compile => "compile",
+            Self::Initialize => "initialize",
+            Self::Export => "export",
+            Self::Arguments => "arguments",
+            Self::Call => "call",
+            Self::Result => "result",
+            Self::Cache => "cache",
+            Self::Runtime => "runtime",
+        }
+    }
+}
+#[doc(hidden)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorFrame {
+    pub line: u32,
+    pub column: u32,
+}
+#[doc(hidden)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptFailure {
+    pub reason: String,
+    pub phase: ErrorPhase,
+    pub frames: Vec<ErrorFrame>,
+}
+impl ScriptFailure {
+    pub fn plain(phase: ErrorPhase, reason: &str) -> Self {
+        Self {
+            reason: reason.into(),
+            phase,
+            frames: Vec::new(),
+        }
+    }
+    fn into_error(self) -> Result<SparrowError> {
+        if self.reason.len() > 64
+            || self.frames.len() > MAX_ERROR_FRAMES
+            || self.frames.iter().any(|f| {
+                f.line == 0
+                    || f.line > crate::MAX_SCRIPT as u32 + 1
+                    || f.column == 0
+                    || f.column > crate::MAX_SCRIPT as u32 + 1
+            })
+        {
+            return Err(invalid("invalid JavaScript diagnostic frame"));
+        }
+        let (code, message) = match self.reason.as_str() {
+            "signed overflow" | "unsigned overflow" => (
+                ErrorCode::IntegerOverflow,
+                "JavaScript integer output overflow",
+            ),
+            "output bytes" => (
+                ErrorCode::BoundExceeded,
+                "JavaScript output byte limit exceeded",
+            ),
+            "cache too large" => (
+                ErrorCode::BoundExceeded,
+                "JavaScript compile cache limit exceeded",
+            ),
+            "bool output"
+            | "BigInt output required"
+            | "Number output required"
+            | "nonfinite output"
+            | "string output"
+            | "invalid Unicode"
+            | "Uint8Array output"
+            | "detached bytes" => (
+                ErrorCode::TypeMismatch,
+                "JavaScript result type/encoding rejected",
+            ),
+            _ => (
+                ErrorCode::JobFailed,
+                "JavaScript compilation, exception or execution limit",
+            ),
+        };
+        let mut error =
+            SparrowError::new(code, message).context("script_phase", self.phase.as_str());
+        if !self.frames.is_empty() {
+            // Numeric coordinates only. Do not echo stack messages, filenames,
+            // function names, arguments or script-controlled strings.
+            let frames = self
+                .frames
+                .iter()
+                .map(|f| format!("{}:{}", f.line, f.column))
+                .collect::<Vec<_>>()
+                .join(",");
+            error = error.context("script_frames", frames);
+        }
+        Ok(error)
+    }
+}
+#[doc(hidden)]
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "status", content = "value", deny_unknown_fields)]
 pub enum Response {
-    Ready(String),
+    Ready(ReadyInfo),
     Value(WireValue),
-    Error(String),
+    Failure(ScriptFailure),
 }
 
 pub fn validate_worker(worker: &Path) -> Result<()> {
@@ -188,9 +364,13 @@ pub fn validate_worker(worker: &Path) -> Result<()> {
 pub struct Script {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     worker: std::sync::Mutex<Option<Worker>>,
+    cache: CacheInfo,
     _permit: Permit,
 }
 impl Script {
+    pub fn cache(&self) -> &CacheInfo {
+        &self.cache
+    }
     pub fn state(&self) -> &'static str {
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         {
@@ -224,16 +404,25 @@ impl Script {
                 source: String::from_utf8(source.to_vec())
                     .map_err(|_| invalid("invalid JavaScript UTF-8"))?,
             };
-            match worker.exchange(&request, deadline, 512)? {
-                Response::Ready(version) if version == PROTOCOL => {}
+            let cache = match worker.exchange(&request, deadline, 512)? {
+                Response::Ready(info)
+                    if info.protocol == PROTOCOL
+                        && info.cache.artifact_sha256 == manifest.artifact_sha256
+                        && (1..=MAX_CACHE_BYTES).contains(&info.cache.bytes)
+                        && info.cache.compiled_scripts == 2 =>
+                {
+                    info.cache
+                }
+                Response::Failure(error) => return Err(error.into_error()?),
                 _ => {
                     return Err(invalid(
                         "JavaScript compile/exports or worker protocol rejected",
                     ))
                 }
-            }
+            };
             Ok(Self {
                 worker: std::sync::Mutex::new(Some(worker)),
+                cache,
                 _permit: permit,
             })
         }
@@ -244,7 +433,7 @@ impl Script {
         }
     }
     pub fn invoke(&self, def: &FunctionDef, args: &[Scalar]) -> Result<Scalar> {
-        let deadline = Instant::now() + Duration::from_millis(CALL_TIMEOUT_MS);
+        let deadline = call_deadline();
         check(deadline)?;
         if args.len() != def.inputs.len()
             || args
@@ -274,6 +463,9 @@ impl Script {
         if args.iter().any(|v| matches!(v, WireValue::Null)) {
             return Ok(Scalar::Null);
         }
+        // Reserve before queuing; rejected/failed attempts do not refund this
+        // conservative aggregate work allowance. NULL propagation needs no VM.
+        charge_call(payload)?;
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         {
             let mut slot = loop {
@@ -315,34 +507,13 @@ impl Script {
                     }
                     Ok(result)
                 }
-                Response::Error(reason) => {
-                    let (code, message) = match reason.as_str() {
-                        "signed overflow" | "unsigned overflow" => (
-                            ErrorCode::IntegerOverflow,
-                            "JavaScript integer output overflow",
-                        ),
-                        "output bytes" => (
-                            ErrorCode::BoundExceeded,
-                            "JavaScript output byte limit exceeded",
-                        ),
-                        "bool output"
-                        | "BigInt output required"
-                        | "Number output required"
-                        | "nonfinite output"
-                        | "string output"
-                        | "invalid Unicode"
-                        | "Uint8Array output"
-                        | "detached bytes" => (
-                            ErrorCode::TypeMismatch,
-                            "JavaScript result type/encoding rejected",
-                        ),
-                        _ => (
-                            ErrorCode::JobFailed,
-                            "JavaScript exception, limit or invalid output",
-                        ),
-                    };
-                    Err(SparrowError::new(code, message))
-                }
+                Response::Failure(error) => match error.into_error() {
+                    Ok(error) => Err(error),
+                    Err(error) => {
+                        *slot = None;
+                        Err(error)
+                    }
+                },
                 _ => {
                     *slot = None;
                     Err(invalid("unexpected JavaScript worker reply"))
