@@ -41,7 +41,7 @@ async fn list(
         let _permit = permit;
         let manager = control::manager(&state.store)?;
         Ok(Json(json!({"packages":manager.list()?,"native_allowed":manager.native_allowed(),
-            "script_allowed":manager.script_allowed(),"script_worker_slots":control::script_worker_slots(),
+            "script_allowed":manager.script_allowed(),"wasm_allowed":manager.wasm_allowed(),"isolated_worker_slots":control::script_worker_slots(),"script_worker_slots":control::script_worker_slots(),
             "resident_generations":control::resident_count(),"hot_unload":false,"script_hot_unload":true})))
     }).await
 }

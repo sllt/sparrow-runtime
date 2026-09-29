@@ -1,5 +1,6 @@
 //! Host-side bounded IPC. The JS engine is linked only into sparrow-js-worker.
 use crate::{invalid, FunctionDef, Manifest, MAX_VALUE};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sparrow_model::{ErrorCode, Result, Scalar, SparrowError};
 use std::{
@@ -18,6 +19,7 @@ pub const WIRE_BYTES: usize = 512 * 1024;
 pub const CALL_TIMEOUT_MS: u64 = 100;
 pub const LOAD_TIMEOUT_MS: u64 = 2000;
 pub const PROTOCOL: &str = "sparrow-js-quickjs-ng-0.16.2-ipc2";
+pub const WASM_PROTOCOL: &str = "sparrow-wasm-wasmi-2.0.0-ipc1";
 pub const MAX_CACHE_BYTES: usize = 256 * 1024;
 pub const MAX_ERROR_FRAMES: usize = 8;
 /// Conservative admission charge, NOT a claim about VM instruction counts.
@@ -292,6 +294,10 @@ impl ScriptFailure {
                 ErrorCode::BoundExceeded,
                 "JavaScript compile cache limit exceeded",
             ),
+            "wasm fuel" | "wasm memory" => (
+                ErrorCode::BoundExceeded,
+                "WebAssembly resource limit exceeded",
+            ),
             "bool output"
             | "BigInt output required"
             | "Number output required"
@@ -398,18 +404,28 @@ impl Script {
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         {
             let deadline = Instant::now() + Duration::from_millis(LOAD_TIMEOUT_MS);
-            let mut worker = Worker::spawn(executable)?;
+            let mut worker = Worker::spawn(executable, manifest.is_wasm())?;
             let request = Request::Load {
                 manifest: manifest.clone(),
-                source: String::from_utf8(source.to_vec())
-                    .map_err(|_| invalid("invalid JavaScript UTF-8"))?,
+                source: if manifest.is_wasm() {
+                    base64::engine::general_purpose::STANDARD.encode(source)
+                } else {
+                    String::from_utf8(source.to_vec())
+                        .map_err(|_| invalid("invalid JavaScript UTF-8"))?
+                },
             };
             let cache = match worker.exchange(&request, deadline, 512)? {
                 Response::Ready(info)
-                    if info.protocol == PROTOCOL
+                    if info.protocol
+                        == if manifest.is_wasm() {
+                            WASM_PROTOCOL
+                        } else {
+                            PROTOCOL
+                        }
                         && info.cache.artifact_sha256 == manifest.artifact_sha256
                         && (1..=MAX_CACHE_BYTES).contains(&info.cache.bytes)
-                        && info.cache.compiled_scripts == 2 =>
+                        && info.cache.compiled_scripts
+                            == if manifest.is_wasm() { 1 } else { 2 } =>
                 {
                     info.cache
                 }
@@ -540,14 +556,18 @@ impl Drop for Worker {
 }
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 impl Worker {
-    fn spawn(executable: &Path) -> Result<Self> {
+    fn spawn(executable: &Path, wasm: bool) -> Result<Self> {
         use std::{
             os::fd::AsRawFd,
             process::{Command, Stdio},
         };
         let mut command = Command::new(executable);
         command
-            .arg("--sparrow-js-worker-v1")
+            .arg(if wasm {
+                "--sparrow-wasm-worker-v1"
+            } else {
+                "--sparrow-js-worker-v1"
+            })
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::piped())

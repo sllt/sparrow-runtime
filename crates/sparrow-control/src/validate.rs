@@ -1512,7 +1512,14 @@ pub fn effective_guarantees_with_plan(
     plan: &PhysicalPlan,
 ) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
-    if plan.has_plugins(){value["aligned_eligible"]=serde_json::json!(false);value["aligned_eligibility_reason"]=serde_json::json!("native plugin functions have no recovery profile");value["plugins"]=serde_json::json!({"recovery":"restart_fresh_only","trusted_native":true,"preemptible":false});return value;}
+    if plan.has_plugins() {
+        let mut native = false;
+        plan.visit_plugins(&mut |function| native |= !function.is_preemptible());
+        value["aligned_eligible"] = serde_json::json!(false);
+        value["aligned_eligibility_reason"] = serde_json::json!("plugin functions have no recovery profile");
+        value["plugins"] = serde_json::json!({"recovery":"restart_fresh_only","trusted_native":native,"preemptible":!native});
+        return value;
+    }
     if plan.has_analysis() || plan.has_extended_aggs() {
         value["aligned_eligible"] = serde_json::json!(false);
         value["aligned_eligibility_reason"] =

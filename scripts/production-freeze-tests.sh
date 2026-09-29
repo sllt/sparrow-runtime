@@ -33,10 +33,12 @@ while IFS= read -r file_path; do
 done < <(jq -r '.[].exe' "$art/$profile-test-binaries.json")
 # Script integration tests need the matching ordinary worker, not its empty
 # libtest harness or a later build at the Cargo target path.
-worker=$(jq -Rr 'fromjson?|select(.reason=="compiler-artifact" and .target.name=="sparrow-js-worker" and (.profile.test|not) and .executable!=null)|.executable' "$art/$profile-messages.jsonl" | tail -1)
+for name in sparrow-js-worker sparrow-wasm-worker; do
+worker=$(jq -Rr --arg name "$name" 'fromjson?|select(.reason=="compiler-artifact" and .target.name==$name and (.profile.test|not) and .executable!=null)|.executable' "$art/$profile-messages.jsonl" | tail -1)
 if [[ -n "$worker" ]]; then
-    install -m 755 "$worker" "$art/$profile-test-binaries/sparrow-js-worker"
+    install -m 755 "$worker" "$art/$profile-test-binaries/$name"
 fi
+done
 (cd "$art"; find "$profile-test-binaries" -type f -print | LC_ALL=C sort |
     while IFS= read -r file_path; do sha256sum "$file_path"; done) > "$art/$profile-test-binaries.sha256"
 printf 'FROZEN_TEST_PROFILE_OK %s %s\n' "$profile" "$art"

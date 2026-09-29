@@ -22,15 +22,21 @@ struct Loaded {
 enum Backend {
     Native(Native),
     Script(crate::script::Script),
+    Wasm(crate::script::Script),
 }
 impl Backend {
     fn load(manifest: &Manifest, bytes: &[u8], worker: Option<&Path>) -> Result<Self> {
-        if manifest.is_script() {
-            Ok(Self::Script(crate::script::Script::load(
+        if manifest.is_isolated() {
+            let isolated = crate::script::Script::load(
                 manifest,
                 bytes,
-                worker.ok_or_else(|| invalid("JavaScript worker is not configured"))?,
-            )?))
+                worker.ok_or_else(|| invalid("isolated scalar worker is not configured"))?,
+            )?;
+            Ok(if manifest.is_wasm() {
+                Self::Wasm(isolated)
+            } else {
+                Self::Script(isolated)
+            })
         } else {
             Ok(Self::Native(Native::load(manifest, bytes)?))
         }
@@ -56,6 +62,8 @@ pub struct PackageInfo {
     /// Not a liveness probe: a child exit is observed on the next call.
     pub script_worker_state: Option<&'static str>,
     pub script_cache: Option<crate::script::CacheInfo>,
+    pub wasm_worker_state: Option<&'static str>,
+    pub wasm_module: Option<crate::script::CacheInfo>,
 }
 impl Entry {
     fn info(&self) -> PackageInfo {
@@ -69,7 +77,19 @@ impl Entry {
                 .loaded
                 .as_ref()
                 .map_or(0, |l| l.pins.load(Ordering::SeqCst)),
-            hot_unload: self.manifest.is_script(),
+            hot_unload: self.manifest.is_isolated(),
+            wasm_module: match self.loaded.as_ref().map(|l| &l.backend) {
+                Some(Backend::Wasm(worker)) => Some(worker.cache().clone()),
+                _ => None,
+            },
+            wasm_worker_state: if self.manifest.is_wasm() {
+                Some(match self.loaded.as_ref().map(|l| &l.backend) {
+                    Some(Backend::Wasm(worker)) => worker.state(),
+                    _ => "unloaded",
+                })
+            } else {
+                None
+            },
             script_cache: match self.loaded.as_ref().map(|l| &l.backend) {
                 Some(Backend::Script(script)) => Some(script.cache().clone()),
                 _ => None,
@@ -89,6 +109,7 @@ pub struct Manager {
     root: PathBuf,
     allow_native: bool,
     script_worker: Option<PathBuf>,
+    wasm_worker: Option<PathBuf>,
     entries: Mutex<BTreeMap<String, Entry>>,
     epoch: AtomicU64,
     _lock: Arc<sparrow_io::fs_lock::FileLock>,
@@ -129,6 +150,9 @@ impl Drop for Function {
     }
 }
 impl Function {
+    pub fn is_preemptible(&self) -> bool {
+        matches!(&self.loaded.backend, Backend::Script(_) | Backend::Wasm(_))
+    }
     pub fn is_script(&self) -> bool {
         matches!(&self.loaded.backend, Backend::Script(_))
     }
@@ -162,6 +186,10 @@ impl Function {
         let result = match &self.loaded.backend {
             Backend::Native(n) => n.invoke(&self.definition, args),
             Backend::Script(s) => s.invoke(&self.definition, args),
+            Backend::Wasm(w) => w.invoke(&self.definition, args).map_err(|mut e| {
+                e.message = e.message.replace("JavaScript", "WebAssembly");
+                e
+            }),
         };
         result.map_err(|e| {
             e.context("plugin_package", &self.package)
@@ -170,7 +198,7 @@ impl Function {
         })
     }
     pub fn scratch_bytes(&self) -> usize {
-        if self.is_script() {
+        if self.is_preemptible() {
             return crate::script::scratch_bytes(&self.definition);
         }
         self.definition
@@ -237,7 +265,18 @@ impl Manager {
         allow_native: bool,
         script_worker: Option<PathBuf>,
     ) -> Result<Arc<Self>> {
-        if let Some(worker) = &script_worker {
+        Self::open_with_workers(root, allow_native, script_worker, None)
+    }
+    pub fn open_with_workers(
+        root: &Path,
+        allow_native: bool,
+        script_worker: Option<PathBuf>,
+        wasm_worker: Option<PathBuf>,
+    ) -> Result<Arc<Self>> {
+        for worker in [script_worker.as_ref(), wasm_worker.as_ref()]
+            .into_iter()
+            .flatten()
+        {
             crate::script::validate_worker(worker)?;
         }
         // Parent directory is administrator-owned. Refuse a symlink or writable
@@ -321,12 +360,22 @@ impl Manager {
             };
             let allowed = if manifest.is_script() {
                 script_worker.is_some()
+            } else if manifest.is_wasm() {
+                wasm_worker.is_some()
             } else {
                 allow_native
             };
             let loaded = if desired && allowed {
                 Some(Arc::new(Loaded {
-                    backend: Backend::load(&manifest, &bytes, script_worker.as_deref())?,
+                    backend: Backend::load(
+                        &manifest,
+                        &bytes,
+                        if manifest.is_wasm() {
+                            wasm_worker.as_deref()
+                        } else {
+                            script_worker.as_deref()
+                        },
+                    )?,
                     pins: AtomicUsize::new(0),
                     _lock: lock.clone(),
                 }))
@@ -336,7 +385,7 @@ impl Manager {
             entries.insert(
                 digest.clone(),
                 Entry {
-                    resident_attempted: loaded.is_some() && !manifest.is_script(),
+                    resident_attempted: loaded.is_some() && !manifest.is_isolated(),
                     manifest,
                     digest,
                     desired,
@@ -349,6 +398,7 @@ impl Manager {
             root: root.to_owned(),
             allow_native,
             script_worker,
+            wasm_worker,
             entries: Mutex::new(entries),
             epoch: AtomicU64::new(0),
             _lock: lock,
@@ -362,6 +412,9 @@ impl Manager {
     }
     pub fn script_allowed(&self) -> bool {
         self.script_worker.is_some()
+    }
+    pub fn wasm_allowed(&self) -> bool {
+        self.wasm_worker.is_some()
     }
     fn entries(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, Entry>>> {
         self.entries
@@ -424,6 +477,8 @@ impl Manager {
             .ok_or_else(|| invalid("plugin not installed"))?;
         if if entry.manifest.is_script() {
             !self.script_allowed()
+        } else if entry.manifest.is_wasm() {
+            !self.wasm_allowed()
         } else {
             !self.allow_native
         } {
@@ -433,7 +488,7 @@ impl Manager {
             ));
         }
         if entry.enabled {
-            if matches!(entry.loaded.as_ref().map(|l| &l.backend), Some(Backend::Script(s)) if s.state()=="failed")
+            if matches!(entry.loaded.as_ref().map(|l| &l.backend), Some(Backend::Script(s)|Backend::Wasm(s)) if s.state()=="failed")
             {
                 return Err(invalid(
                     "JavaScript worker failed; stop users, disable and re-enable package",
@@ -451,9 +506,17 @@ impl Manager {
                     "previous native activation failed; restart before retry",
                 ));
             }
-            entry.resident_attempted = !entry.manifest.is_script();
+            entry.resident_attempted = !entry.manifest.is_isolated();
             entry.loaded = Some(Arc::new(Loaded {
-                backend: Backend::load(&entry.manifest, &bytes, self.script_worker.as_deref())?,
+                backend: Backend::load(
+                    &entry.manifest,
+                    &bytes,
+                    if entry.manifest.is_wasm() {
+                        self.wasm_worker.as_deref()
+                    } else {
+                        self.script_worker.as_deref()
+                    },
+                )?,
                 pins: AtomicUsize::new(0),
                 _lock: self._lock.clone(),
             }));
@@ -489,7 +552,7 @@ impl Manager {
         }
         entry.enabled = false;
         entry.desired = false;
-        if entry.manifest.is_script() {
+        if entry.manifest.is_isolated() {
             entry.loaded = None;
         }
         self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -543,7 +606,7 @@ impl Manager {
             .as_ref()
             .ok_or_else(|| invalid("plugin backend not loaded"))?
             .clone();
-        if matches!(&loaded.backend, Backend::Script(s) if s.state()=="failed") {
+        if matches!(&loaded.backend, Backend::Script(s)|Backend::Wasm(s) if s.state()=="failed") {
             return Err(invalid(
                 "JavaScript worker failed; stop users, disable and re-enable package",
             ));

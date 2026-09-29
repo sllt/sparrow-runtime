@@ -8,6 +8,8 @@ pub const MAX_PACKAGES: usize = 16;
 pub const MAX_VALUE: usize = 64 * 1024;
 pub const JS_TARGET: &str = "javascript-quickjs-ng-0.16.2-v1";
 pub const MAX_SCRIPT: usize = 32 * 1024;
+pub const WASM_TARGET: &str = "wasm32-sparrow-scalar-v1";
+pub const MAX_WASM: usize = 128 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -108,12 +110,20 @@ pub fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 impl Manifest {
+    pub fn is_wasm(&self) -> bool {
+        self.kind == "wasm_scalar"
+    }
+    pub fn is_isolated(&self) -> bool {
+        self.is_script() || self.is_wasm()
+    }
     pub fn is_script(&self) -> bool {
         self.kind == "javascript_scalar"
     }
     pub fn artifact_name(&self) -> &'static str {
         if self.is_script() {
             "artifact.js"
+        } else if self.is_wasm() {
+            "artifact.wasm"
         } else {
             "artifact.so"
         }
@@ -121,6 +131,8 @@ impl Manifest {
     pub fn validate(&self) -> Result<()> {
         let target_ok = if self.is_script() {
             self.target == JS_TARGET && host_target() != "unsupported"
+        } else if self.is_wasm() {
+            self.target == WASM_TARGET && host_target() != "unsupported"
         } else {
             self.kind == "native_scalar"
                 && self.target == host_target()
@@ -181,6 +193,14 @@ impl Manifest {
         if self.is_script() {
             if bytes.len() > MAX_SCRIPT || std::str::from_utf8(bytes).is_err() {
                 return Err(invalid("JavaScript source must be UTF-8 and at most 32KiB"));
+            }
+            return Ok(());
+        }
+        if self.is_wasm() {
+            if bytes.len() > MAX_WASM || !bytes.starts_with(b"\0asm\x01\0\0\0") {
+                return Err(invalid(
+                    "WASM requires a core v1 binary module of at most 128KiB",
+                ));
             }
             return Ok(());
         }

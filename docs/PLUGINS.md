@@ -1,6 +1,6 @@
-# 插件：共同管理、可信原生与 JavaScript 函数 Preview
+# 插件：共同管理、原生、JavaScript 与 WASM 函数 Preview
 
-第8批按子批交付：共同管理＋可信原生标量（2026-09-27），随后 JavaScript 标量（2026-09-29）。支持包安装/校验、版本固定、启停/查询、显式升级回退与 SQL/Graph 调用。**仍为未发行的 Development Preview**，验证范围见 [PRODUCTION](PRODUCTION.md#script-plugins-validation)。WASM、Transform 和 Source/Sink 外部插件仍待实现，不能把标量子批算作整个插件体系完成。
+第8批按子批交付：共同管理＋可信原生标量、JavaScript 标量及 WASM 标量。支持包安装/校验、版本固定、启停/查询、显式升级回退与 SQL/Graph 调用。**仍为未发行的 Development Preview**，验证范围见 [PRODUCTION](PRODUCTION.md)。Transform 和 Source/Sink 外部插件仍待实现，不能把标量子批算作整个插件体系完成。
 
 ## 信任与部署
 
@@ -114,7 +114,29 @@ SQL/Graph 调用方式不变，例如 `plugin_call('script_math','v1','完整man
 
 `/v1/query` 与 `sparrowctl query` 允许已启用、精确版本/hash 固定的 JS 标量。每个非 NULL 调用预扣 **10,000 + 参数 payload 字节数**，与所有 stage 共享整次查询的 `limits.work_units`，失败/排队尝试不退款；NULL 传播不进入 VM。它是保守的调用准入成本，**不是 VM 指令计量器**。默认 1,000,000 work units 还需支付普通算子成本，因此不足 100 次整型调用；上限 10,000,000。嵌套调用、跨行/跨 stage 不重置预算。
 
-查询还共享一个绝对执行截止时间，每次调用实际期限取查询剩余时间与 100ms 的较小值；取消/失败后 join 全部任务才释放查询准入，不返回部分成功结果。原生或其他不可抢占插件仍拒绝进入有限查询。脚本仍 **restart_fresh-only**，不能用于 aligned/checkpoint 恢复。WASM、外部 Source/Sink、批量 IPC、实例池、长期 soak、aarch64 验证另行交付。
+查询还共享一个绝对执行截止时间，每次调用实际期限取查询剩余时间与 100ms 的较小值；取消/失败后 join 全部任务才释放查询准入，不返回部分成功结果。原生或其他不可抢占插件仍拒绝进入有限查询。脚本仍 **restart_fresh-only**，不能用于 aligned/checkpoint 恢复。外部 Source/Sink、批量 IPC、可变实例复用、长期 soak、aarch64 验证另行交付。
+
+## WASM 标量函数
+
+引擎固定 **wasmi 2.0.0**，只进入独立 `sparrow-wasm-worker`，不进入 Server/CLI；解释执行而非 JIT，不开 WASI 或任何 imports。模块校验和 eager 编译在 worker 内完成，禁止 start 函数、memory64、多memory、自定义页大小和SIMD；不接受 Wasmi 内部IR上传。每版本复用不可变 Module，每调用重建 Store/Instance；同版本串行，JS/WASM共享全服务进程4个worker名额，不跨调用复用可变内存、全局或table。即使模块声明最大memory，宿主仍有独立上限。
+
+模块最多128KiB；线性内存最多16MiB、一个memory/一个table、table最多4096项、调用深度128、每次 **1,000,000 fuel**（包含ABI/buffer准备），进程地址空间128MiB。父进程继续执行100ms调用期限/取消，Load期限2s，child有1s/3s watchdog。`memory.grow` 失败可以返回 `-1`；这不代表允许增长，也不要求所有失败都表现为trap。fuel是引擎工作计量，与有限查询保守的 `10,000＋参数字节` 准入成本分开；两种限制同时存在。[Wasmi fuel 文档](https://docs.rs/wasmi/2.0.0/wasmi/struct.Config.html#method.consume_fuel)。
+
+```sh
+export SPARROW_PLUGIN_DIR=/var/lib/sparrow/plugins
+export SPARROW_ENABLE_WASM_PLUGINS=1
+export SPARROW_WASM_WORKER=/opt/sparrow/current/bin/sparrow-wasm-worker
+export SPARROW_WASM_PACK=/opt/sparrow/current/bin/sparrow-wasm-pack
+bash scripts/build-wasm-plugin-example.sh /tmp/wasm-math-v1
+sparrowctl plugin-install /tmp/wasm-math-v1/manifest.json /tmp/wasm-math-v1/wasm_math.wasm
+sparrowctl plugin-enable MANIFEST_SHA256
+```
+
+`sparrow-wasm-pack` 是离线WAT→WASM构建工具，不是服务端解释WAT的入口；也可使用独立项目的C/Rust编译器生成符合ABI的wasm32模块。SDK是 `sdk/wasm/sparrow_wasm_v1.h`，可执行样例为 `examples/plugins/wasm_math.wat`。manifest使用 `kind:"wasm_scalar"`、`target:"wasm32-sparrow-scalar-v1"`，函数签名/类型/NULL及 `plugin_call` SQL/Graph语法与前述相同。无需native/JS开关；safe-mode阻止自动及手动激活。
+
+ABI只传i32偏移和长度，不传宿主指针：导出 `memory`、`sparrow_wasm_abi_v1()->i32`、`sparrow_wasm_buffer_v1()->i32`、`sparrow_wasm_call_v1(i32,i32,i32,i32,i32,i32)->i32`。buffer返回至少131328字节、8对齐的已分配arena；前192字节最多8个24字节input descriptor，192处是output descriptor，256处input payload，65792处output payload。descriptor为little-endian `{tag:u32,len:u32,bits:u64,offset:u32,reserved:u32}`。数值len/offset/reserved为0；文本/Bytes bits/reserved为0，输出offset必须是宿主给定输出区域，不允许越界/任意guest区域读取。输出必须完整写入才返回0，非零状态失败；NULL合法，宿主只在完整验证后发布结果。整数运算溢出策略由插件代码明确处理，样例double检查溢出，不把WASM的自动wrap说成宿主自动检测算术溢出。
+
+`wasm_module`记录artifact SHA-256、输入模块bytes、compiled_scripts=1；bytes不是编译IR/RSS大小，实际编译/执行内存由进程上限约束。`wasm_worker_state`与JS的最近观测状态合同相同。WASM允许有限查询，使用共享总预算/绝对期限；停用前要求plan/job pin释放，停用后可热卸载。当前仍fresh-only，不能因WASM能抢占就认为任意插件具备aligned恢复资格。引擎隔离不替代对引擎漏洞的完整OS沙箱或多租户认证。
 
 ### 为什么最终选择 QuickJS
 

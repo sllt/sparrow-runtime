@@ -8,7 +8,7 @@ ctl=$(realpath "${2:?sparrowctl binary}")
 root=${3:?new evidence directory}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 kind=${SPARROW_PLUGIN_SMOKE_KIND:-native}
-case "$kind" in native|script) ;; *) exit 2;; esac
+case "$kind" in native|script|wasm) ;; *) exit 2;; esac
 package=${kind}_math
 artifact=native_math.so
 for tool in ss jq sha256sum timeout; do command -v "$tool" >/dev/null; done
@@ -20,10 +20,14 @@ export SPARROW_SECRETS_KEY=0123456789abcdef0123456789abcdef
 export SPARROW_REQUIRE_SECRETS_KEY=1 SPARROW_DATA_ROOTS="$root"
 export SPARROW_URL="http://127.0.0.1:$port"
 export SPARROW_PLUGIN_DIR="$root/plugins" SPARROW_ENABLE_NATIVE_PLUGINS=1
-export SPARROW_ENABLE_SCRIPT_PLUGINS=0
+export SPARROW_ENABLE_SCRIPT_PLUGINS=0 SPARROW_ENABLE_WASM_PLUGINS=0
 if [[ "$kind" == script ]]; then
   export SPARROW_ENABLE_NATIVE_PLUGINS=0 SPARROW_ENABLE_SCRIPT_PLUGINS=1
   artifact=script_math.js
+fi
+if [[ "$kind" == wasm ]]; then
+  export SPARROW_ENABLE_NATIVE_PLUGINS=0 SPARROW_ENABLE_WASM_PLUGINS=1
+  artifact=wasm_math.wasm
 fi
 pid=
 etag=
@@ -81,6 +85,9 @@ bash "$repo/scripts/build-$kind-plugin-example.sh" "$root/v1"
 mkdir "$root/v2"
 if [[ "$kind" == native ]]; then
   cc -std=c11 -O2 -fPIC -shared -Wall -Wextra -Werror -DSPARROW_PLUGIN_FACTOR=3 -I"$repo/sdk/native" "$repo/examples/plugins/native_math.c" -o "$root/v2/$artifact"
+elif [[ "$kind" == wasm ]]; then
+  sed -e 's/(i64.const 2)))/(i64.const 3)))/' -e 's/4611686018427387903/3074457345618258602/' -e 's/-4611686018427387904/-3074457345618258602/' "$repo/examples/plugins/wasm_math.wat" > "$root/v2/wasm_math.wat"
+  "$SPARROW_WASM_PACK" "$root/v2/wasm_math.wat" "$root/v2/$artifact"
 else
   sed 's/value \* 2n/value * 3n/' "$root/v1/$artifact" > "$root/v2/$artifact"
 fi
@@ -95,14 +102,18 @@ old=$(jq -er '.manifest_sha256' "$root/install-v1.json")
 "$ctl" plugin-enable "$old" > "$root/enable-v1.json"
 jq -n --arg sql "SELECT plugin_call('$package','v1','$old','double',value) AS doubled FROM s" \
   '{sql:$sql,inputs:[{stream:"s",rows:[{value:21}]}]}' > "$root/query.json"
-if [[ "$kind" == script ]]; then
+if [[ "$kind" != native ]]; then
   "$ctl" query "$root/query.json" > "$root/query-success.json"
   jq -e '.complete and .rows==[{doubled:42}]' "$root/query-success.json" >/dev/null
   jq '.limits={work_units:10000}' "$root/query.json" > "$root/query-budget.json"
   reject query-budget-rejected.json "$ctl" query "$root/query-budget.json"
-  grep -q 'aggregate JavaScript work limit' "$root/query-budget-rejected.json"
+  grep -q 'aggregate .* work limit' "$root/query-budget-rejected.json"
   "$ctl" plugins > "$root/cache.json"
-  jq -e '.packages|all(.[]; .script_cache.compiled_scripts==2 and .script_cache.bytes>0 and .script_cache.bytes<=262144 and .script_cache.artifact_sha256==.manifest.artifact_sha256)' "$root/cache.json" >/dev/null
+  if [[ "$kind" == script ]]; then
+    jq -e '.packages|all(.[]; .script_cache.compiled_scripts==2 and .script_cache.bytes>0 and .script_cache.bytes<=262144 and .script_cache.artifact_sha256==.manifest.artifact_sha256)' "$root/cache.json" >/dev/null
+  else
+    jq -e '.packages|all(.[]; .wasm_module.compiled_scripts==1 and .wasm_module.bytes>0 and .wasm_module.bytes<=131072 and .wasm_module.artifact_sha256==.manifest.artifact_sha256)' "$root/cache.json" >/dev/null
+  fi
 else
   reject query-native-rejected.json "$ctl" query "$root/query.json"
 fi
@@ -163,5 +174,5 @@ for id in "$old" "$new"; do "$ctl" plugin-uninstall "$id" > "$root/uninstall-$id
 "$ctl" plugins > "$root/empty.json"; jq -e '.packages|length==0' "$root/empty.json" >/dev/null
 reject missing-dependency.json "$ctl" validate "$root/pipeline.json"
 stop
-jq -n --arg kind "$kind" '{passed:true,kind:$kind,upgrade_outputs:[42,63,42],safe_mode:true,restart:true,resident_uninstall_rejected:($kind=="native"),hot_unload:($kind=="script"),script_failure_isolated:($kind=="script"),missing_dependency_rejected:true}' > "$root/result.json"
+jq -n --arg kind "$kind" '{passed:true,kind:$kind,upgrade_outputs:[42,63,42],safe_mode:true,restart:true,resident_uninstall_rejected:($kind=="native"),hot_unload:($kind!="native"),script_failure_isolated:($kind=="script"),missing_dependency_rejected:true}' > "$root/result.json"
 printf '%s plugin process smoke passed\n' "$kind"

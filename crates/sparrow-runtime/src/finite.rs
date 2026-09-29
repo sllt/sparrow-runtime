@@ -69,7 +69,7 @@ pub fn execute(
     limits.validate()?;
     let deadline = std::time::Instant::now() + Duration::from_millis(limits.timeout_ms);
     let mut unsafe_plugin = false;
-    plan.visit_plugins(&mut |f| unsafe_plugin |= !f.is_script());
+    plan.visit_plugins(&mut |f| unsafe_plugin |= !f.is_preemptible());
     if unsafe_plugin {
         return Err(bound(
             "finite queries reject in-process native/non-preemptible plugins",

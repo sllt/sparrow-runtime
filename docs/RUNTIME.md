@@ -1,5 +1,7 @@
 # Runtime ownership (A3 / A4)
 
+2026-09-29 WASM Preview：wasmi 2.0.0在独立worker中校验/缓存不可变Module，每次新Store/Instance；每版本同时一个实例，JS/WASM共享4个worker名额。无imports/WASI/JIT，memory16MiB/1M fuel/128MiB进程上限与父进程100ms期限同时生效。WASM复用task-local总预算/取消，有限查询只允许可抢占后端；pure native仍拒绝。`memory.grow`的-1代表拒绝，不冒充成功或一律要求trap。SDK wasm32只传有界偏移/长度，宿主验证完全部输出才发布；Module元数据bytes为源模块大小，不是IR/RSS。997/48、WASM5×5、JS17回归及三后端真实CLI通过，见[WASM验收](PRODUCTION.md#wasm-plugins-validation)。仍fresh-only，未借此开放任意插件恢复。
+
 2026-09-29 JavaScript Preview：QuickJS-ng 0.16.2 只进入独立 worker，不链接 Server/CLI 地址空间。版本复用进程，每次调用新 Runtime/Context；默认关闭，脚本和原生使用独立 opt-in。单包串行、全进程 4 个 worker 名额、每 worker 128MiB 地址空间/64MiB VM 堆；Job 另按声明类型预留有界 IPC scratch，不能把子进程内存冒充计入 Job owner。含脚本的 stage/router future 使用 task-local cancellation，避免给跨 Job 共享 Function 绑定一个 Job 的 token；无脚本的热路径不安装该 scope。100ms 到期/取消后 kill＋wait，pin 持有至 Job tasks 退出；脚本停用后可卸载，原生驻留合同不变。仍 fresh-only。首批982/47、新12×5及真实CLI/独立worker边界通过；部署、故障恢复、选型与待优化项见 [PLUGINS](PLUGINS.md#javascript-标量函数)，精确验收见 [PRODUCTION](PRODUCTION.md#script-plugins-validation)。以下历史记录按各自日期/构建解释。
 
 JS 收尾：worker 从已校验源文件编译最多256KiB不可变缓存，每调用重载到新VM，保留严格模式/源码位置，不接受外部bytecode。安全诊断仅输出阶段及最多8个数值行列坐标，不透传异常文本、不访问用户getter；原始UTF-8字节列转换为UTF-16列，包含中文/emoji及JS换行符测试。有限查询开放JS，使用同一 `query_work` 原子余额按每非NULL调用10,000＋参数字节预扣，并向stage/router传递同一绝对截止时间；不按行重置，不称作VM指令计量。失败/取消join后退出、无部分成功；native仍拒绝，aligned仍不开放。内部IPC升级ipc2，Server/worker必须配套。992/48、17×5集成＋4×5单测及真实JS/native CLI回归通过；缓存微测不是生产容量，见[匹配验收](PRODUCTION.md#script-completion-validation)。

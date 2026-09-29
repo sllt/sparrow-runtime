@@ -1,0 +1,22 @@
+[package]
+name = "sparrow-wasm-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Process-isolated, fuel-bounded WASM scalar plugin worker"
+
+[dependencies]
+sparrow-plugin.workspace = true
+wasmi = { version = "=2.0.0", default-features = false, features = ["std", "validate"] }
+base64 = "0.22"
+serde_json = "1"
+libc = "0.2"
+wat = "=1.245.1"
+
+[dev-dependencies]
+sparrow-model.workspace = true
+sparrow-plan.workspace = true
+sparrow-sql.workspace = true
+sparrow-runtime.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

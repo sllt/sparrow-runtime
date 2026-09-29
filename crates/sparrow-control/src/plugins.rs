@@ -36,13 +36,31 @@ pub fn configure_from_env(store: &crate::Store, safe_mode: bool) -> Result<()> {
     } else {
         None
     };
+    let wasm = match std::env::var("SPARROW_ENABLE_WASM_PLUGINS").as_deref() {
+        Ok("1") => true,
+        Ok("0") | Err(_) => false,
+        _ => return Err(invalid("SPARROW_ENABLE_WASM_PLUGINS must be 0 or 1")),
+    };
+    let wasm_worker = if wasm && !safe_mode {
+        Some(match std::env::var_os("SPARROW_WASM_WORKER") {
+            Some(path) => path.into(),
+            None => std::env::current_exe()
+                .map_err(|_| invalid("cannot locate WASM worker"))?
+                .with_file_name("sparrow-wasm-worker"),
+        })
+    } else {
+        None
+    };
     match std::env::var_os("SPARROW_PLUGIN_DIR") {
-        Some(root) => store.configure_plugins(Manager::open_with_scripts(
+        Some(root) => store.configure_plugins(Manager::open_with_workers(
             std::path::Path::new(&root),
             native && !safe_mode,
             worker,
+            wasm_worker,
         )?),
-        None if native || script => Err(invalid("plugins require an explicit SPARROW_PLUGIN_DIR")),
+        None if native || script || wasm => {
+            Err(invalid("plugins require an explicit SPARROW_PLUGIN_DIR"))
+        }
         None => Ok(()),
     }
 }

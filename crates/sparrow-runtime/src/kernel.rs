@@ -988,7 +988,7 @@ impl Kernel {
         let work = Arc::new(WorkBudget::new(self.job_budget.work_units));
         let mut script_plugins = false;
         req.plan
-            .visit_plugins(&mut |f| script_plugins |= f.is_script());
+            .visit_plugins(&mut |f| script_plugins |= f.is_preemptible());
         let ctx = JobCtx {
             script_plugins,
             script_deadline: req.script_deadline,

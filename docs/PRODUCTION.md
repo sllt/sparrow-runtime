@@ -4,6 +4,20 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="wasm-plugins-validation"></a>
+## WASM 标量：2026-09-29 限定 Preview
+
+基线 `c2219a7`，服务器 `box@100.64.0.19`，证据根 `/workspace/bench-compare/plugins-core-20260929-qkkVtm`，本批源码 `source/`。Wasmi 2.0.0只进入独立worker，配套离线WAT构建工具、C-layout wasm32头文件及真实可安装样例；WASM与原生/JS共享显式hash批准和SQL/Graph绑定，不开启任意恢复资格。
+
+- 默认15成员、locked Release＋JetStream feature：**997 passed / 22 ignored**，`wasm-full-r3.log/.exit=0`；no-demo Server/CLI **48 passed / 0 ignored**，`wasm-no-demo.log/.exit=0`。没有本机编译，没有恢复JetStream高负载专题。
+- Server/CLI/JS worker/WASM worker/离线pack构建通过，`wasm-build.log/.exit=0`；最终可执行文件冻结在 `wasm-frozen/`，`wasm-frozen.sha256`。通过Cargo当前feature profile的 `wasm-test-artifacts.jsonl`冻结测试，避免按同名旧target产物猜版本。
+- WASM 5项×5轮 **25 passed**，`wasm-repeat-1..5.log/.exit=0`；冻结JS17项回归通过，`wasm-js-regression.log/.exit=0`。覆盖7种scalar/精确整数与NULL、64KiB payload、非法输出指针/UTF8/长度/类型、无限循环fuel、拒绝memory增长/初始超限、OOB/trap、ABI/导出/import/start拒绝、500次新实例全局重置、SQL/Graph、有限查询跨行预算、取消、safe-mode/重启/pin/热卸载以及恢复资格拒绝。
+- 真实Server/CLI三条后端均通过：`wasm-process-{wasm,script,native}.log/.exit=0`。WASM v1→v2→v1输出42→63→42，有限查询输出42及预算拒绝、模块hash/输入bytes可观测，safe-mode/重启/运行pin及热卸载验证；原生仍拒绝有限查询、仍需重启才能卸载驻留代码。WASM样例由发行工具从WAT构建，不以测试内伪返回代替插件进程。
+- 首轮 `wasm-full-r1`是feature API编译失败：memory64未编入时不存在关闭该proposal的方法，移除该调用并保持feature关闭。第二轮 `wasm-full-r2`只有新增内存测试失败：把拒绝 `memory.grow` 只能表现为trap的预期写错，现按WASM的`-1`语义验证拒绝增长，宿主上限不放宽。另修正预存的effective插件视图将所有后端都写成native/non-preemptible的问题。原始日志保留。
+- 初始冻结脚本因target中多份JS测试同名而退出，未运行进程测试；改由Cargo返回准确artifact路径后完成上述验证，没有重编造试次。最终 **476个代码/构建/SDK/测试文件**本地与服务器一致，`wasm-source.sha256`自身SHA-256为 `ed45d7cb2d464e181a5b5323f3e4c7c1d7619e022c6d437d238631ee7259df8a`。
+
+剩余签名/包依赖/持久引用、外部Transform/Source/Sink仍是后续子批。**未宣称**WASM业务吞吐/p99、长期RSS/soak、aarch64、完整OS多租户沙箱、任意插件aligned或整个插件阶段完成；WASM fuel不是整次查询的精确工作计量。
+
 <a id="script-completion-validation"></a>
 ## JavaScript 收尾：缓存、诊断和有限查询
 

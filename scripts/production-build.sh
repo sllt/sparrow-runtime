@@ -44,7 +44,7 @@ fi
 rustc -vV > "$out/evidence/rustc.txt"
 cargo --version > "$out/evidence/cargo.txt"
 cp Cargo.lock "$out/evidence/Cargo.lock"
-for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl sparrow-js-worker:sparrow-js-worker; do
+for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl sparrow-js-worker:sparrow-js-worker sparrow-wasm-worker:sparrow-wasm-worker sparrow-wasm-worker:sparrow-wasm-pack; do
     package=${pair%:*}; binary=${pair#*:}
     features=()
     if [[ "$jetstream" == 1 && "$binary" == sparrow-server ]]; then features=(--features jetstream); fi
@@ -75,6 +75,12 @@ for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl sparrow-js-work
     if [[ "$binary" == sparrow-js-worker ]] && grep -Eq 'rquickjs(-core)? feature "(rust-alloc|allocator|loader)"' "$out/evidence/$binary-features.txt"; then
         printf 'Unexpected JS allocator/module-loader feature\n' >&2; exit 3
     fi
+    if [[ "$binary" != sparrow-wasm-* ]] && grep -Eq 'wasmi v' "$out/evidence/$binary-dependencies.txt"; then
+        printf 'WASM engine must be isolated from Server/CLI\n' >&2; exit 3
+    fi
+    if [[ "$binary" == sparrow-wasm-* ]] && grep -Eq 'wasmi feature "(memory64|simd|wat|unstable)"' "$out/evidence/$binary-features.txt"; then
+        printf 'Unexpected WASM execution proposal/input feature\n' >&2; exit 3
+    fi
     if [[ "$jetstream" == 0 || "$binary" == sparrowctl ]] && grep -q 'async-nats v' "$out/evidence/$binary-dependencies.txt"; then
         printf 'NATS SDK leaked into a feature-off production binary\n' >&2; exit 3
     fi
@@ -103,7 +109,10 @@ cp docs/CAPACITY.md "$out/docs/"
 cp docs/WINDOWS.md "$out/docs/"
 cp docs/ANALYSIS.md "$out/docs/"
 cp docs/PLUGINS.md "$out/docs/"
-mkdir -p "$out/sdk/native" "$out/examples/plugins" "$out/scripts"
+mkdir -p "$out/sdk/native" "$out/sdk/wasm" "$out/examples/plugins" "$out/scripts"
+cp sdk/wasm/sparrow_wasm_v1.h "$out/sdk/wasm/"
+cp examples/plugins/wasm_math.wat "$out/examples/plugins/"
+cp scripts/build-wasm-plugin-example.sh "$out/scripts/"
 cp sdk/native/sparrow_plugin_v1.h "$out/sdk/native/"
 cp examples/plugins/native_math.c "$out/examples/plugins/"
 cp examples/plugins/script_math.js "$out/examples/plugins/"
@@ -122,6 +131,6 @@ jq -n --arg commit "$SPARROW_BUILD_COMMIT" --arg target "$host" --arg mode "$mod
     '{format:"sparrow-build-v1",source_commit:$commit,source_manifest_sha256:$source,
       target:$target,rust:"1.98.0",profile:"release",build_mode:$mode,default_features:false,
       jetstream_enabled:($jetstream==1),jetstream_maturity:"preview_not_profile_certified",
-      binaries:["sparrow-server","sparrowctl","sparrow-js-worker"],certification:"requires_matching_test_evidence"}' > "$out/build.json"
+      binaries:["sparrow-server","sparrowctl","sparrow-js-worker","sparrow-wasm-worker","sparrow-wasm-pack"],certification:"requires_matching_test_evidence"}' > "$out/build.json"
 (cd "$out" && find bin deploy docs evidence sdk examples scripts -type f -print | LC_ALL=C sort | while IFS= read -r file_path; do sha256sum "$file_path"; done; sha256sum build.json) > "$out/SHA256SUMS"
 printf 'PRODUCTION_PACKAGE_OK %s\n' "$out"
