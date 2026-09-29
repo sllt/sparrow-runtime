@@ -135,11 +135,7 @@ fn describe_state(plan: &PhysicalPlan) -> String {
             PhysicalStage::Analysis { operator, plan } => bits.push(format!(
                 "bounded_analysis op={} kind={} recovery=restart_fresh",
                 operator.raw(),
-                if plan.is_join() {
-                    "stream_join"
-                } else {
-                    "unnest"
-                }
+                plan.label()
             )),
             PhysicalStage::WindowAgg { spec, operator, .. } => {
                 bits.push(format!(
@@ -203,11 +199,7 @@ fn describe_state(plan: &PhysicalPlan) -> String {
 fn stage_label(s: &PhysicalStage) -> String {
     match s {
         PhysicalStage::Analysis { plan, .. } => {
-            if plan.is_join() {
-                "stream_join".into()
-            } else {
-                "unnest".into()
-            }
+            plan.label().into()
         }
         PhysicalStage::Branch { .. } => "branch:broadcast".into(),
         PhysicalStage::Route { mode, .. } => format!("route:{mode:?}"),
@@ -289,11 +281,7 @@ pub fn bound_kinds(bound: &BoundLogicalPlan) -> Vec<String> {
         .iter()
         .map(|n| match &n.kind {
             BoundKind::Analysis(plan) => {
-                if plan.is_join() {
-                    "stream_join".into()
-                } else {
-                    "unnest".into()
-                }
+                plan.label().into()
             }
             BoundKind::Branch { .. } => "branch".into(),
             BoundKind::Route { .. } => "route".into(),

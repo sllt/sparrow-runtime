@@ -156,6 +156,9 @@ pub(super) fn metadata_bytes(plan: &PhysicalPlan) -> usize {
             .saturating_add(stage_schema(stage, true).map(schema).unwrap_or(0));
         let expressions = match stage {
             PhysicalStage::Analysis { plan, .. } => match plan.as_ref() {
+                // A 4KiB JSON config can own many small Vec/Map allocations;
+                // do not account only encoded bytes or a small fixed handle.
+                sparrow_plan::AnalysisPlan::External { .. } => 4096 * 64 + 16 * 1024,
                 sparrow_plan::AnalysisPlan::Unnest { spec, .. } => {
                     expr(&spec.expr).saturating_add(spec.as_field.len() + 256)
                 }

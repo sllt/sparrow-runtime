@@ -39,6 +39,12 @@ fn span(bytes: &[u8], offset: u64, size: u64) -> Result<&[u8]> {
     Ok(&bytes[offset as usize..end as usize])
 }
 pub(crate) fn validate(bytes: &[u8]) -> Result<()> {
+    validate_inner(bytes, true)
+}
+pub(crate) fn validate_executable(bytes: &[u8]) -> Result<()> {
+    validate_inner(bytes, false)
+}
+fn validate_inner(bytes: &[u8], require_dynamic: bool) -> Result<()> {
     if bytes.len() < 64 {
         return Err(invalid("truncated ELF64 header"));
     }
@@ -77,7 +83,11 @@ pub(crate) fn validate(bytes: &[u8]) -> Result<()> {
         }
     }
     let Some(dynamic) = dynamic else {
-        return Err(invalid("native plugin requires a bounded dynamic ELF"));
+        return if require_dynamic {
+            Err(invalid("native plugin requires a bounded dynamic ELF"))
+        } else {
+            Ok(())
+        };
     };
     let mut strtab = None;
     let mut strsz = None;

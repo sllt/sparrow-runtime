@@ -1273,8 +1273,8 @@ impl Store {
                 if let Some(revision)=revision {
                     // Invalid revisions fail per pipeline during convergence;
                     // they must not prevent healthy siblings from booting.
-                    if load_pipeline_revision(c,&name,revision).is_ok_and(|r| r.spec.fixed_snapshot_id().is_some()) {
-                        c.execute("UPDATE actual_state SET restart_blocked=1,last_error=CASE WHEN last_error LIKE 'held:%' THEN last_error ELSE 'held: fixed snapshot replay requires explicit start after process restart; last: ' || COALESCE(last_error,'unknown') END WHERE name=?1",[&name]).map_err(db)?;
+                    if load_pipeline_revision(c,&name,revision).is_ok_and(|r| r.spec.requires_explicit_restart()) {
+                        c.execute("UPDATE actual_state SET restart_blocked=1,last_error=CASE WHEN last_error LIKE 'held:%' THEN last_error ELSE 'held: fixed snapshot or external plugin requires explicit start after process restart; last: ' || COALESCE(last_error,'unknown') END WHERE name=?1",[&name]).map_err(db)?;
                     }
                 }
             }
@@ -2579,6 +2579,7 @@ mod tests {
             sql: Some("SELECT device_id FROM sensors".into()),
             graph: None,
             source: SourceSpec {
+                plugin: None,
                 jetstream: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
@@ -2601,6 +2602,7 @@ mod tests {
                 file_contract: None,
             },
             sink: SinkSpec {
+                plugin: None,
                 action: None,
                 file: None,
                 kind: "http".into(),

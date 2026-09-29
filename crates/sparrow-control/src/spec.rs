@@ -66,6 +66,8 @@ pub struct GraphIoSpec {
 pub struct SourceSpec {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<sparrow_expr::plugins::extension::Binding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jetstream: Option<JetStreamSpec>,
     #[serde(default)]
     pub host: Option<String>,
@@ -179,6 +181,8 @@ impl JetStreamSpec {
 #[serde(deny_unknown_fields)]
 pub struct SinkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<sparrow_expr::plugins::extension::Binding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<Box<FileSinkSpec>>,
@@ -272,6 +276,14 @@ pub fn fail_on_decode_from_env() -> bool {
 }
 
 impl PipelineSpec {
+    pub fn has_external_plugins(&self) -> bool {
+        self.source.plugin.is_some() || self.sink.plugin.is_some()
+            || self.graph.as_ref().is_some_and(|g|g.nodes.iter().any(|n|n.plugin.is_some()))
+            || self.graph_io.as_ref().is_some_and(|io|io.sources.values().any(|s|s.plugin.is_some())||io.sinks.values().any(|s|s.plugin.is_some()))
+    }
+    pub fn requires_explicit_restart(&self) -> bool {
+        self.fixed_snapshot_id().is_some() || self.has_external_plugins()
+    }
     /// A numeric restore is an explicit replay operation, never an implicit
     /// request to replay the same history after failure/process restart.
     pub fn fixed_snapshot_id(&self) -> Option<u64> {
@@ -286,6 +298,7 @@ impl PipelineSpec {
 
     pub fn checkpoint_warnings(&self) -> Vec<&'static str> {
         let mut warnings = Vec::new();
+        if self.has_external_plugins() {warnings.push("external_plugin_requires_explicit_start_after_failure_or_process_restart");}
         if self.fixed_snapshot_id().is_some() {
             warnings
                 .push("fixed_snapshot_requires_explicit_start_after_failure_or_process_restart");
@@ -333,6 +346,35 @@ impl PipelineSpec {
     }
 
     pub fn basic_check(&self) -> Result<()> {
+        for (kind, binding) in [(&self.source.kind, &self.source.plugin), (&self.sink.kind, &self.sink.plugin)] {
+            if (kind == "plugin") != binding.is_some() {
+                return Err(SparrowError::new(ErrorCode::InvalidArgument, "plugin binding is required exclusively for kind=plugin"));
+            }
+            if let Some(binding) = binding { binding.validate()?; }
+        }
+        let external = self.source.plugin.is_some() || self.sink.plugin.is_some()
+            || self.graph.as_ref().is_some_and(|g|g.nodes.iter().any(|n|n.plugin.is_some()));
+        if external && (self.recovery != "restart_fresh" || self.delivery != "live_best_effort"
+            || self.restore.is_some() || self.checkpoint.is_some() || self.checkpoint_dir.is_some()) {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "external plugins are live_best_effort/restart_fresh only; no durable acknowledgement or checkpoint"));
+        }
+        if self.source.plugin.is_some() && (self.source.host.is_some() || self.source.port.is_some()
+            || self.source.path.is_some() || self.source.bind.is_some() || self.source.client_id.is_some()
+            || self.source.username_secret.is_some() || self.source.password_secret.is_some()
+            || self.source.use_demo_io || self.source.tls || self.source.skip_verify
+            || self.source.file_contract.is_some() || self.source.qos != 0 || !self.source.clean_session
+            || self.source.topic != default_topic() || self.source.inbox_wait_ms.is_some()
+            || self.source.inbox_bytes.is_some() || self.source.tcp_quickack.is_some()) {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument, "external source options belong exclusively in plugin.config"));
+        }
+        if self.sink.plugin.is_some() && (self.sink.action.is_some() || self.sink.file.is_some()
+            || self.sink.url.is_some() || self.sink.host.is_some() || self.sink.port.is_some()
+            || self.sink.topic.is_some() || self.sink.client_id.is_some() || self.sink.header_secret.is_some()
+            || self.sink.use_demo_io || self.sink.tls || self.sink.skip_verify || self.sink.qos != 0
+            || !self.sink.clean_session || self.sink.batch_rows.is_some() || self.sink.batch_bytes.is_some()
+            || self.sink.linger_ms.is_some() || self.sink.max_inflight.is_some()) {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument, "external sink options belong exclusively in plugin.config; action rendering is not applied"));
+        }
         if self.reference_tables.len() > 8 {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,

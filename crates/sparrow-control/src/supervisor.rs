@@ -349,6 +349,7 @@ fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
         "log" => "log",
         "mqtt" => "mqtt",
         "file" => "file",
+        "plugin" => "plugin",
         _ => "http",
     }
 }
@@ -951,9 +952,9 @@ impl Supervisor {
             if a.restart_blocked {
                 let desired=s.desired(&name)?;
                 let fixed=desired.revision.map(|r|s.get_pipeline_revision(&name,r))
-                    .transpose()?.is_some_and(|r|r.spec.fixed_snapshot_id().is_some());
+                    .transpose()?.is_some_and(|r|r.spec.requires_explicit_restart());
                 if fixed {
-                    let msg = "held: fixed snapshot replay requires explicit start after failure or process restart";
+                    let msg = "held: fixed snapshot or external plugin requires explicit start after failure or process restart";
                     if !a.last_error.as_deref().unwrap_or("").starts_with("held:") {
                         s.set_last_error(&name, Some(&format!("{msg}; last: {}", a.last_error.as_deref().unwrap_or("unknown"))))?;
                     }
@@ -1225,7 +1226,14 @@ impl Supervisor {
         let capture = SharedCapture::disabled();
         let mut request =
             JobRequest::new(plan, Vec::new(), capture).with_observation(diag.observation.clone());
-        let (tx_in, tx_budgeted) = if kind == "mqtt" {
+        let mut tx_plugin=None;
+        let (tx_in, tx_budgeted) = if kind == "plugin" {
+            let (tx,rx)=observed::channel(inbox);
+            diag.observe_source(&tx);
+            request=request.with_live_events(rx).with_live_out(tx_out);
+            tx_plugin=Some(tx);
+            (None,None)
+        } else if kind == "mqtt" {
             let (tx, rx) = observed::channel(inbox);
             diag.observe_source(&tx);
             request = request.with_budgeted_live_io(rx, tx_out);
@@ -1241,6 +1249,11 @@ impl Supervisor {
         let cancel = job.cancellation();
         let source_result: Result<JoinHandle<Result<()>>> = async {
             Ok(match kind {
+                "plugin" => {
+                    let binding=spec.source.plugin.as_ref().expect("validated plugin source");
+                    let extension=crate::plugins::manager(&self.store)?.resolve_extension(binding,sparrow_expr::plugins::extension::Role::Source)?;
+                    crate::plugin_io::source(self.kernel.handle(),extension,binding.config.clone(),schema,tx_plugin.expect("plugin ingress"),cancel.clone(),job.memory_owner(),diag.clone(),false,self.kernel.ingress_batch_rows())
+                }
                 "http_push" => {
                     let cfg = http_push_config(&spec.source, schema)?;
                     let push = HttpPushSource::bind(cfg, &self.secrets, policy, Arc::clone(&diag))
@@ -1296,6 +1309,7 @@ impl Supervisor {
             }
         };
         let sink_result = self.spawn_sink(
+            job.memory_owner(),
             spec,
             rx_out,
             cancel.clone(),
@@ -1315,7 +1329,7 @@ impl Supervisor {
         };
         Ok(RunningJob {
             graph_ports: None,
-            source_kind: if kind == "mqtt" { "mqtt" } else { "http_push" },
+            source_kind: match kind {"mqtt"=>"mqtt","plugin"=>"plugin",_=>"http_push"},
             sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
             stable: false,
@@ -1397,8 +1411,9 @@ impl Supervisor {
                 r
             }
         });
-        let sink_result = self.spawn_sink(
-            spec,
+       let sink_result = self.spawn_sink(
+            job.memory_owner(),
+           spec,
             rx_out,
             cancel.clone(),
             Arc::clone(&diag),
@@ -1820,8 +1835,9 @@ impl Supervisor {
             }
             source_result
         });
-        let sink_result = self.spawn_sink(
-            spec,
+       let sink_result = self.spawn_sink(
+            job.memory_owner(),
+           spec,
             rx_out,
             cancel.clone(),
             Arc::clone(&diag),
@@ -1863,6 +1879,7 @@ impl Supervisor {
 
     fn spawn_sink(
         &self,
+        owner: Arc<sparrow_model::MemoryOwner>,
         spec: &crate::spec::PipelineSpec,
         rx_out: observed::Receiver<sparrow_model::RowBatch>,
         cancel: CancellationToken,
@@ -1872,6 +1889,11 @@ impl Supervisor {
         outbox: Option<Arc<InflightCounter>>,
     ) -> Result<JoinHandle<()>> {
         Ok(match spec.sink.kind.as_str() {
+            "plugin" => {
+                let binding=spec.sink.plugin.as_ref().expect("validated plugin sink");
+                let extension=crate::plugins::manager(&self.store)?.resolve_extension(binding,sparrow_expr::plugins::extension::Role::Sink)?;
+                crate::plugin_io::sink(self.kernel.handle(),extension,binding.config.clone(),rx_out,cancel,owner,diag,outbox)
+            }
             "file" => {
                 let config=crate::validate::file_sink_config(&spec.sink)?;
                 config.validate().map_err(SparrowError::from)?;
@@ -1929,6 +1951,7 @@ impl Supervisor {
 
     async fn join_job(&self, job: RunningJob) -> Result<()> {
         let file_diag=(job.graph_ports.is_none() && job.sink_kind=="file").then(||job.diag.clone());
+        let plugin_diags=job.graph_ports.as_ref().map_or_else(||vec![job.diag.clone()],|ports|ports.sources.values().chain(ports.sinks.values()).cloned().collect::<Vec<_>>());
         match job.kind {
             RunningKind::Live {
                 handle,
@@ -1944,7 +1967,10 @@ impl Supervisor {
                         format!("source task panicked: {e}"),
                     )),
                 };
-                let _ = sink.await;
+                if sink.await.is_err() {return Err(SparrowError::new(sparrow_model::ErrorCode::JobFailed,"sink actor panicked"));}
+                if plugin_diags.iter().any(|d|d.plugin_failed.load(std::sync::atomic::Ordering::Relaxed)>0) {
+                    return Err(SparrowError::new(sparrow_model::ErrorCode::JobFailed,"external plugin failed; inspect connector health; no automatic replay"));
+                }
                 if file_diag.as_ref().is_some_and(|d|d.file_failed.load(std::sync::atomic::Ordering::Relaxed)>0) {
                     return Err(SparrowError::new(sparrow_model::ErrorCode::JobFailed,"File Sink failed; inspect sink health and file_failed; no automatic rollback or replay"));
                 }

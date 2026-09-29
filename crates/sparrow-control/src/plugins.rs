@@ -9,6 +9,9 @@ pub const MAX_INSTALL_BODY: usize = 6 * 1024 * 1024;
 pub fn script_worker_slots() -> usize {
     sparrow_expr::plugins::script::worker_count()
 }
+pub fn external_sessions() -> usize {
+    sparrow_expr::plugins::extension::active_sessions()
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Install {
@@ -18,6 +21,9 @@ struct Install {
     signature: Option<sparrow_expr::plugins::trust::Signature>,
 }
 pub fn configure_from_env(store: &crate::Store, safe_mode: bool) -> Result<()> {
+    let external=match std::env::var("SPARROW_ENABLE_EXTERNAL_PLUGINS").as_deref() {
+        Ok("1")=>true,Ok("0")|Err(_)=>false,_=>return Err(invalid("SPARROW_ENABLE_EXTERNAL_PLUGINS must be 0 or 1")),
+    };
     let native = match std::env::var("SPARROW_ENABLE_NATIVE_PLUGINS").as_deref() {
         Ok("1") => true,
         Ok("0") | Err(_) => false,
@@ -54,7 +60,7 @@ pub fn configure_from_env(store: &crate::Store, safe_mode: bool) -> Result<()> {
         None
     };
     match std::env::var_os("SPARROW_PLUGIN_DIR") {
-        Some(root) => store.configure_plugins(Manager::open_with_policy(
+        Some(root) => store.configure_plugins(Manager::open_with_extensions(
             std::path::Path::new(&root),
             native && !safe_mode,
             worker,
@@ -65,8 +71,9 @@ pub fn configure_from_env(store: &crate::Store, safe_mode: bool) -> Result<()> {
                 )?,
                 None => Default::default(),
             },
+            external&&!safe_mode,
         )?),
-        None if native || script || wasm => {
+        None if native || script || wasm || external => {
             Err(invalid("plugins require an explicit SPARROW_PLUGIN_DIR"))
         }
         None => Ok(()),

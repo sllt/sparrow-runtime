@@ -47,6 +47,7 @@ impl Supervisor {
             result
         });
         let sink = match self.spawn_sink(
+            job.memory_owner(),
             spec,
             rx_out,
             cancel.clone(),

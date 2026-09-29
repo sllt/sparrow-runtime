@@ -1,0 +1,28 @@
+[package]
+name = "sparrow-extension-example"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Deliberately independent: no server/runtime/model dependency or Rust ABI.
+[workspace]
+[dependencies]
+sparrow-extension-sdk = { path = "../../crates/sparrow-extension-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[features]
+conformance = []
+[[bin]]
+name = "sparrow-extension-example"
+path = "src/main.rs"
+[[bin]]
+name = "sparrow-extension-fault"
+path = "src/fault.rs"
+required-features = ["conformance"]
+
+[profile.release]
+strip = true
+panic = "abort"

@@ -321,6 +321,7 @@ impl Supervisor {
             single.graph_io = None;
             single.sink = sink_spec;
             match self.spawn_sink(
+                job.memory_owner(),
                 &single,
                 rx,
                 cancel.clone(),

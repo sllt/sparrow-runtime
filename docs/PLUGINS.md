@@ -1,6 +1,6 @@
-# 插件：共同管理、原生、JavaScript 与 WASM 函数 Preview
+# 插件：共同管理、原生/JavaScript/WASM 函数与外部扩展 Preview
 
-第8批按子批交付：共同管理＋可信原生标量、JavaScript 标量及 WASM 标量。支持包安装/校验、版本固定、启停/查询、显式升级回退与 SQL/Graph 调用。**仍为未发行的 Development Preview**，验证范围见 [PRODUCTION](PRODUCTION.md)。Transform 和 Source/Sink 外部插件仍待实现，不能把标量子批算作整个插件体系完成。
+第8批包括共同管理、可信原生/JavaScript/WASM标量，以及独立进程的Transform、Source/Sink扩展。支持包安装/校验、签名/依赖、版本固定、历史引用保护、启停/查询、显式升级回退。标量走SQL/Graph；外部多行Transform走Graph，Connector通过类型化端口绑定。**仍为未发行的 Development Preview**，匹配验证范围见 [PRODUCTION](PRODUCTION.md)；外部SDK与隔离/恢复边界见 [EXTENSIONS](EXTENSIONS.md)。
 
 ## 信任与部署
 
@@ -156,7 +156,7 @@ SQL/Graph 调用方式不变，例如 `plugin_call('script_math','v1','完整man
 
 `/v1/query` 与 `sparrowctl query` 允许已启用、精确版本/hash 固定的 JS 标量。每个非 NULL 调用预扣 **10,000 + 参数 payload 字节数**，与所有 stage 共享整次查询的 `limits.work_units`，失败/排队尝试不退款；NULL 传播不进入 VM。它是保守的调用准入成本，**不是 VM 指令计量器**。默认 1,000,000 work units 还需支付普通算子成本，因此不足 100 次整型调用；上限 10,000,000。嵌套调用、跨行/跨 stage 不重置预算。
 
-查询还共享一个绝对执行截止时间，每次调用实际期限取查询剩余时间与 100ms 的较小值；取消/失败后 join 全部任务才释放查询准入，不返回部分成功结果。原生或其他不可抢占插件仍拒绝进入有限查询。脚本仍 **restart_fresh-only**，不能用于 aligned/checkpoint 恢复。外部 Source/Sink、批量 IPC、可变实例复用、长期 soak、aarch64 验证另行交付。
+查询还共享一个绝对执行截止时间，每次调用实际期限取查询剩余时间与 100ms 的较小值；取消/失败后 join 全部任务才释放查询准入，不返回部分成功结果。原生或其他不可抢占插件仍拒绝进入有限查询。脚本仍 **restart_fresh-only**，不能用于 aligned/checkpoint 恢复。外部Source/Sink现有独立SDK，见 [EXTENSIONS](EXTENSIONS.md)；标量批量IPC、可变实例复用、长期soak、aarch64验证仍单列。
 
 ## WASM 标量函数
 

@@ -5,6 +5,10 @@ use std::sync::{Arc, OnceLock};
 /// checkpoint or delivery receipt.
 #[derive(Debug, Default)]
 pub struct IoDiagnostics {
+    pub plugin_source_rows: AtomicU64,
+    pub plugin_sink_rows: AtomicU64,
+    pub plugin_polls: AtomicU64,
+    pub plugin_failed: AtomicU64,
     pub observation: Arc<sparrow_model::observation::FlowObservation>,
     pub source_queue: OnceLock<Arc<sparrow_io::observed::QueueObserver>>,
     pub sink_queue: OnceLock<Arc<sparrow_io::observed::QueueObserver>>,
@@ -53,6 +57,10 @@ impl IoDiagnostics {
 
     pub fn snapshot(&self) -> IoSnapshot {
         IoSnapshot {
+            plugin_source_rows: self.plugin_source_rows.load(Ordering::Relaxed),
+            plugin_sink_rows: self.plugin_sink_rows.load(Ordering::Relaxed),
+            plugin_polls: self.plugin_polls.load(Ordering::Relaxed),
+            plugin_failed: self.plugin_failed.load(Ordering::Relaxed),
             mqtt_received: self.mqtt_received.load(Ordering::Relaxed),
             mqtt_inbox_metadata_bytes: self.mqtt_inbox_metadata_bytes.load(Ordering::Relaxed),
             mqtt_pending_bytes: self.mqtt_pending_bytes.load(Ordering::Relaxed),
@@ -96,6 +104,10 @@ impl IoDiagnostics {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IoSnapshot {
+    pub plugin_source_rows: u64,
+    pub plugin_sink_rows: u64,
+    pub plugin_polls: u64,
+    pub plugin_failed: u64,
     pub mqtt_received: u64,
     pub mqtt_inbox_metadata_bytes: u64,
     pub mqtt_pending_bytes: u64,
@@ -160,6 +172,10 @@ impl std::fmt::Display for IoSnapshot {
 
 impl IoSnapshot {
     pub fn add_assign(&mut self, other: &IoSnapshot) {
+        self.plugin_source_rows += other.plugin_source_rows;
+        self.plugin_sink_rows += other.plugin_sink_rows;
+        self.plugin_polls += other.plugin_polls;
+        self.plugin_failed += other.plugin_failed;
         self.mqtt_received += other.mqtt_received;
         self.mqtt_inbox_metadata_bytes += other.mqtt_inbox_metadata_bytes;
         self.mqtt_pending_bytes += other.mqtt_pending_bytes;

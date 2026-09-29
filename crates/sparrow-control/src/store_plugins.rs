@@ -70,11 +70,28 @@ pub(crate) fn references(spec: &PipelineSpec) -> Result<Vec<PackageReference>> {
         Ok(())
     }
     if let Some(spec) = &spec.graph {
-        graph(
-            &serde_json::to_value(spec).map_err(|_| plugin_error("invalid Graph"))?,
-            &mut refs,
-        )?;
+        for node in &spec.nodes {
+            // Only expression trees are code. In particular plugin.config is
+            // opaque data and may legally contain objects shaped like calls.
+            let expressions=node.predicate.iter()
+                .chain(node.exprs.iter().flatten().map(|e|&e.expr))
+                .chain(node.aggs.iter().flatten().filter_map(|e|e.expr.as_ref()))
+                .chain(node.routes.iter().flatten().map(|e|&e.predicate))
+                .chain(node.unnest.iter().map(|e|&e.expr));
+            for expr in expressions {
+                graph(&serde_json::to_value(expr).map_err(|_|plugin_error("invalid Graph expression"))?, &mut refs)?;
+            }
+            if let Some(binding)=&node.plugin {binding.validate()?;refs.push(binding.reference());}
+        }
     }
+    for binding in spec.source.plugin.iter().chain(spec.sink.plugin.iter())
+        .chain(spec.graph_io.iter().flat_map(|io|io.sources.values().filter_map(|s|s.plugin.as_ref())))
+        .chain(spec.graph_io.iter().flat_map(|io|io.sinks.values().filter_map(|s|s.plugin.as_ref()))) {
+        binding.validate()?;refs.push(binding.reference());
+    }
+    refs.sort_by(|a,b|a.manifest_sha256.cmp(&b.manifest_sha256));
+    refs.dedup();
+    if refs.len()>64 {return Err(plugin_error("too many pipeline plugin dependencies"));}
     Ok(refs)
 }
 fn plugin_error(message: &str) -> SparrowError {

@@ -1068,6 +1068,8 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "file_segments": io.file_segments,
             "file_syncs": io.file_syncs,
             "file_failed": io.file_failed,
+            "plugin_source_rows":io.plugin_source_rows,"plugin_sink_rows":io.plugin_sink_rows,
+            "plugin_polls":io.plugin_polls,"plugin_failed":io.plugin_failed,
             "decode_errors": io.decode_errors,
     });
     let mut value = json!({

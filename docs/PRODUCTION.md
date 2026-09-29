@@ -4,6 +4,23 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="external-plugins-validation"></a>
+## 外部 SDK 与插件核心整体验收：2026-09-29
+
+基线 `e87b50c`，服务器 `box@100.64.0.19`，Linux x86_64 GNU，按仓库锁定的 **Rust 1.98.0** 构建（服务器默认1.98.1未用于本批）。证据根 `/workspace/bench-compare/plugins-core-20260929-qkkVtm`，本批源码 `source-extension/`。本机没有Cargo/Go/C编译，也没有恢复JetStream高负载专题。
+
+- 默认**16成员**、locked Release＋JetStream feature：`extensions-full-final.log/.exit=0`，**1008 passed / 30 ignored**。其中新增8个外部fixture测试在下述独立测试中全部显式执行，不把ignored当通过。首次全量 `extensions-full-r1` 也是1008通过，当时仅6个新fixture测试；后续补足停止背压和资源不足前不Open的反例。
+- no-demo **Control＋Server**：`extensions-no-demo.log/.exit=0`，**146 passed / 5 ignored**；这5个Control外部fixture另行重复执行。此口径比历史仅Server/CLI的48项更宽，不混写为同一组统计。
+- 独立 `examples/extensions` 项目只依赖SDK/serde/libc，Source、Sink、Transform共用示例程序但每角色独立批准；另建conformance故障程序。`extensions-example-build.log/.exit=0`。Host 3项＋Control 5项＋SDK 3项，各**5轮，共55 passed**，`extensions-{host,control,sdk}-repeat-1..5.log/.exit=0`。覆盖schema/NULL/精确整数、frame/展开/sequence/水位拒绝、崩溃/OOM/超时/取消、8进程名额、FD/环境清理、pin、Source确认与Sink flush、线性/DAG、单格背压队列、停止回收、配置数据不误当表达式、历史引用/退休、重启及失败不自动重放、预算不足不创建Sink文件。
+- 冻结标量及包回归：native **7**、JS **17**、WASM **5**、packages **4**，`extensions-{native_registry,scripts,wasm,packages}-regression.log/.exit=0`。原生format1 v1 manifest identity与前批 `packages-process-native` 完全相同。测试可执行文件由Cargo JSON精确路径冻结在 `extensions-frozen-tests/`，有 `extensions-test-artifacts.tsv` 和SHA256清单，不按残留target文件名猜版本。
+- 真实no-demo Server/CLI：`extensions-process.log/.exit=0`，强制Ed25519、默认关闭、Source→Transform→Sink、manifest v1→v2→v1的配置输出 **42→63→42**、checked overflow不发布部分结果、失败不自动重试、持久引用、safe-mode、重启和停用/卸载通过。外部示例的两个revision使用相同executable、不同manifest/config；这是版本绑定/回退验证，不是不同代码版本或性能比较。
+- **混合后端** `extensions-mixed-process.log/.exit=0`：外部Source→JS double→WASM double→原生double→外部Transform→外部Sink；**10轮，每轮2048行，共20480行，全部按序得到输入×16**。含管理/启动/停止的总时长 **29s**，不能用它推导容量。每轮结束external session=0、标量worker=2；停用后两种worker均为0。服务RSS第1轮 **19508KiB**、第10轮 **20708KiB**（+1200KiB）；保留逐轮 `/proc` 和子进程快照，不把两点RSS或29s重复试验称为24h长稳。
+- 三种标量真实升级回退/有限查询资格/重启、包签名/依赖/撤销/退休、JS独立alarm边界均再次通过：`extensions-{native,script,wasm,packages}-process.log/.exit=0`、`extensions-js-standalone.log/.exit=0`。
+- **实际生产候选包** `extensions-production-package/`：独立no-default-feature构建6个binary，发行依赖/feature检查通过，SDK/示例/锁文件/正式文档在包内；`extensions-production.log/.exit=0`。从包内源码再次独立构建样例，`extensions-shipped-sdk.log/.exit=0`；SDK依赖树确认不链接runtime/model/control/server/plugin/connectors；包校验和验证通过。`SHA256SUMS`自身SHA-256为 `e2a2181a0ca90b3053f35d4364ccb926e4e3e23ca3bf5aef196b5c21030c773b`。包是以基线commit标识、源码指纹区分的candidate，不冒充已打tag的正式release。
+- 最终**499个代码/构建/SDK/测试文件**与服务器一致：`extensions-source.sha256`自身SHA-256为 `a62b9b7b8390a56b38e268156d7f6beb7a068063b26585f089f0ba756349e563`，`extensions-source-verify.exit=0`；完整复现编排在 `extensions-validation.sh`。最终验收注记是后补证据索引，不据此重新标记已冻结包的文件hash。
+
+自查收紧了外部进程错误后的Flush/Close行为、Source批次与Kernel上限、配置容器计费、失败/重启显式启动门禁及Sink错误不得记为completed。当前原生/JS/WASM函数、包管理及独立Transform/Source/Sink SDK的**约定插件核心范围已齐备**。仍是fresh-only Preview，不是任意第三方插件、aarch64、24h soak、完整存储故障、多租户OS沙箱或任意aligned/exactly-once的认证；性能/批量IPC与长稳按 [OPT-017/018](OPTIMIZATION_BACKLOG.md) 后续处理，支持边界与回退见 [EXTENSIONS](EXTENSIONS.md)。
+
 <a id="package-lifecycle-validation"></a>
 ## 包签名、依赖及持久引用：2026-09-29
 

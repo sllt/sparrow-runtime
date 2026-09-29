@@ -131,6 +131,9 @@ pub async fn execute(store: Arc<crate::Store>, bytes: Vec<u8>) -> Result<QueryOu
             _ => return Err(invalid("query requires exactly one of sql/graph")),
         };
         let plan = sparrow_plan::physicalize(&bound, &Default::default());
+        if plan.has_external_plugins() {
+            return Err(invalid("finite queries do not execute trusted native Transform programs"));
+        }
         let mut supplied = HashMap::new();
         for input in request.inputs {
             if supplied.insert(input.stream, input.rows).is_some() {

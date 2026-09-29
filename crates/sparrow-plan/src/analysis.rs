@@ -78,6 +78,12 @@ pub struct StreamJoinSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AnalysisPlan {
+    External {
+        extension: std::sync::Arc<sparrow_expr::plugins::Extension>,
+        config: serde_json::Value,
+        input: Schema,
+        output: Schema,
+    },
     Unnest {
         spec: UnnestSpec,
         input: Schema,
@@ -94,20 +100,35 @@ pub enum AnalysisPlan {
 impl AnalysisPlan {
     pub fn input(&self) -> &Schema {
         match self {
-            Self::Unnest { input, .. } => input,
+            Self::Unnest { input, .. } | Self::External { input, .. } => input,
             Self::Join { left, .. } => left,
         }
     }
     pub fn output(&self) -> &Schema {
         match self {
-            Self::Unnest { output, .. } | Self::Join { output, .. } => output,
+            Self::Unnest { output, .. } | Self::Join { output, .. } | Self::External { output, .. } => output,
         }
     }
     pub fn is_join(&self) -> bool {
         matches!(self, Self::Join { .. })
     }
+    pub fn label(&self) -> &'static str {
+        match self { Self::Unnest {..} => "unnest", Self::Join {..} => "stream_join", Self::External {..} => "plugin_transform" }
+    }
+    pub fn external(extension: std::sync::Arc<sparrow_expr::plugins::Extension>, config: serde_json::Value, input: Schema) -> Result<Self> {
+        use sparrow_expr::plugins::extension as ext;
+        let d=extension.declaration();
+        if d.role != ext::Role::Transform || !ext::matches_schema(&d.input, &input, true)
+            || (!config.is_null() && !config.is_object()) {
+            return Err(invalid("external Transform input/configuration mismatch"));
+        }
+        ext::protocol::encode(&config,ext::protocol::MAX_CONFIG).map_err(|_|invalid("external config exceeds 4KiB"))?;
+        let output=ext::schema(&d.output, input.id.raw().saturating_add(81))?;
+        Ok(Self::External {extension,config,input,output})
+    }
     pub fn validate(&self) -> Result<()> {
         let rebuilt = match self {
+            Self::External {extension,config,input,..} => Self::external(extension.clone(),config.clone(),input.clone())?,
             Self::Unnest { spec, input, .. } => Self::unnest(spec.clone(), input.clone())?,
             Self::Join {
                 spec, left, right, ..

@@ -351,11 +351,7 @@ fn stage_kind(stage: &sparrow_plan::PhysicalStage) -> &'static str {
     use sparrow_plan::PhysicalStage;
     match stage {
         PhysicalStage::Analysis { plan, .. } => {
-            if plan.is_join() {
-                "stream_join"
-            } else {
-                "unnest"
-            }
+            plan.label()
         }
         PhysicalStage::Branch { .. } => "branch",
         PhysicalStage::Route { .. } => "route",

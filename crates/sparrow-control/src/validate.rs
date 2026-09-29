@@ -103,6 +103,7 @@ pub fn bind_plan_with_store(
         catalog.insert(table.name.clone(), table.table.schema(&table.name)?);
     }
     let plan = bind_plan(spec, &catalog, name, revision)?;
+    validate_external_bindings(store, spec, &plan)?;
     let mut used = std::collections::BTreeSet::new();
     for stage in &plan.stages {
         let sparrow_plan::PhysicalStage::Lookup {
@@ -161,6 +162,45 @@ pub fn bind_plan_with_store(
         ));
     }
     Ok(plan)
+}
+
+fn validate_external_bindings(store: &Store, spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<()> {
+    use sparrow_expr::plugins::extension::{matches_schema, Role};
+    let check=|binding: Option<&sparrow_expr::plugins::extension::Binding>, schema:&Schema, role| -> Result<()> {
+        if let Some(binding)=binding {
+            let extension=crate::plugins::manager(store)?.resolve_extension(binding,role)?;
+            let d=extension.declaration();
+            let fields=if role==Role::Source {&d.output} else {&d.input};
+            if !matches_schema(fields,schema,role==Role::Sink) {
+                return Err(SparrowError::new(ErrorCode::InvalidSchema,"external connector declaration does not match its physical port schema"));
+            }
+        }
+        Ok(())
+    };
+    let mut external=plan.has_external_plugins();
+    if let Some(io)=&spec.graph_io {
+        for (id,source) in &io.sources {
+            external|=source.plugin.is_some();
+            check(source.plugin.as_ref(),&graph_endpoint_schema(plan,*id,true)?,Role::Source)?;
+        }
+        for (id,sink) in &io.sinks {
+            external|=sink.plugin.is_some();
+            check(sink.plugin.as_ref(),&graph_endpoint_schema(plan,*id,false)?,Role::Sink)?;
+        }
+    } else {
+        external|=spec.source.plugin.is_some()||spec.sink.plugin.is_some();
+        for stage in &plan.stages {
+            match stage {
+                sparrow_plan::PhysicalStage::MemorySource {schema,..} => check(spec.source.plugin.as_ref(),schema,Role::Source)?,
+                sparrow_plan::PhysicalStage::CaptureSink {schema,..} => check(spec.sink.plugin.as_ref(),schema,Role::Sink)?,
+                _=>{}
+            }
+        }
+    }
+    if external && (plan.has_silence() || plan.has_timed_iot() || plan.has_processing_time_state()) {
+        return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"external plugins do not support processing-time/feed-observation control profiles"));
+    }
+    Ok(())
 }
 
 pub fn bind_plan(
@@ -247,7 +287,7 @@ pub fn replay_label_for_source(kind: &str) -> &'static str {
     match kind {
         "file" | "file_replay" | "replay" => "replayable",
         "jetstream" if cfg!(feature = "jetstream") => "replayable",
-        "mqtt" | "mqtt_source" | "http_push" | "http" => "unsupported",
+        "mqtt" | "mqtt_source" | "http_push" | "http" | "plugin" => "unsupported",
         _ => sparrow_plan::REPLAY_UNBOUND,
     }
 }
@@ -378,6 +418,7 @@ fn validate_source_io(
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
     match source.kind.as_str() {
+        "plugin" => source.plugin.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"plugin Source binding required"))?.validate()?,
         #[cfg(feature = "jetstream")]
         "jetstream" => {
             let config = source.jetstream.as_ref().ok_or_else(|| {
@@ -470,6 +511,7 @@ fn validate_sink_io(
         }
     }
     match sink.kind.as_str() {
+        "plugin" => sink.plugin.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"plugin Sink binding required"))?.validate()?,
         "file" => {
             file_sink_config(sink)?.validate().map_err(io)?;
         }
@@ -1390,6 +1432,7 @@ pub fn capabilities_json() -> serde_json::Value {
         "recovery_aligned": RecoveryPolicy::Aligned.as_str(),
         "exactly_once": "rejected",
         "connectors": [
+            {"kind":"plugin","roles":["source","sink"],"replay":"unsupported","delivery":"live_best_effort","recovery":"restart_fresh","default_enabled":false},
             {
                 "kind": mqtt.kind,
                 "replay": mqtt.replay.as_str(),
@@ -1512,12 +1555,14 @@ pub fn effective_guarantees_with_plan(
     plan: &PhysicalPlan,
 ) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
-    if plan.has_plugins() {
+    let external=plan.has_external_plugins() || spec.source.plugin.is_some() || spec.sink.plugin.is_some()
+        || spec.graph_io.as_ref().is_some_and(|io|io.sources.values().any(|s|s.plugin.is_some())||io.sinks.values().any(|s|s.plugin.is_some()));
+    if plan.has_plugins() || external {
         let mut native = false;
         plan.visit_plugins(&mut |function| native |= !function.is_preemptible());
         value["aligned_eligible"] = serde_json::json!(false);
         value["aligned_eligibility_reason"] = serde_json::json!("plugin functions have no recovery profile");
-        value["plugins"] = serde_json::json!({"recovery":"restart_fresh_only","trusted_native":native,"preemptible":!native});
+        value["plugins"] = serde_json::json!({"recovery":"restart_fresh_only","trusted_native":native||external,"preemptible":!native,"external_process":external,"os_sandbox":false,"durable_ack":false});
         return value;
     }
     if plan.has_analysis() || plan.has_extended_aggs() {
@@ -2077,6 +2122,7 @@ mod tests {
             sql: Some("SELECT device_id FROM sensors".into()),
             graph: None,
             source: SourceSpec {
+                plugin: None,
                 jetstream: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
@@ -2099,6 +2145,7 @@ mod tests {
                 file_contract: None,
             },
             sink: crate::spec::SinkSpec {
+                plugin: None,
                 action: None,
                 file: None,
                 kind: "http".into(),
@@ -2158,6 +2205,7 @@ mod tests {
     #[test]
     fn v02_default_mqtt_client_id_is_unique_per_instance() {
         let src = SourceSpec {
+                plugin: None,
             jetstream: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
@@ -2201,6 +2249,7 @@ mod tests {
     #[test]
     fn p0_11_mqtt_credentials_require_tls() {
         let mut src = SourceSpec {
+                plugin: None,
             jetstream: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
@@ -2242,6 +2291,7 @@ mod tests {
     #[test]
     fn n16_http_header_secret_requires_https() {
         let mut sink = crate::spec::SinkSpec {
+                plugin: None,
             action: None,
             file: None,
             kind: "http".into(),

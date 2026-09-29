@@ -70,7 +70,7 @@ pub fn execute(
     let deadline = std::time::Instant::now() + Duration::from_millis(limits.timeout_ms);
     let mut unsafe_plugin = false;
     plan.visit_plugins(&mut |f| unsafe_plugin |= !f.is_preemptible());
-    if unsafe_plugin {
+    if unsafe_plugin || plan.has_external_plugins() {
         return Err(bound(
             "finite queries reject in-process native/non-preemptible plugins",
         ));

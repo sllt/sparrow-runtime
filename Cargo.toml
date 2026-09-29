@@ -5,6 +5,7 @@ members = [
     "crates/sparrow-plugin",
     "crates/sparrow-js-worker",
     "crates/sparrow-wasm-worker",
+    "crates/sparrow-extension-sdk",
     "crates/sparrow-expr",
     "crates/sparrow-plan",
     "crates/sparrow-io",
@@ -24,6 +25,7 @@ default-members = [
     "crates/sparrow-plugin",
     "crates/sparrow-js-worker",
     "crates/sparrow-wasm-worker",
+    "crates/sparrow-extension-sdk",
     "crates/sparrow-expr",
     "crates/sparrow-plan",
     "crates/sparrow-io",
@@ -47,6 +49,7 @@ description = "Sparrow: single-node IoT/Edge streaming dataflow runtime"
 [workspace.dependencies]
 sparrow-model = { path = "crates/sparrow-model", version = "0.1.0" }
 sparrow-plugin = { path = "crates/sparrow-plugin", version = "0.1.0" }
+sparrow-extension-sdk = { path = "crates/sparrow-extension-sdk", version = "0.1.0" }
 sparrow-expr = { path = "crates/sparrow-expr", version = "0.1.0" }
 sparrow-plan = { path = "crates/sparrow-plan", version = "0.1.0" }
 sparrow-io = { path = "crates/sparrow-io", version = "0.1.0" }

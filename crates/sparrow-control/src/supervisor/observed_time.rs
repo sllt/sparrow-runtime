@@ -296,6 +296,7 @@ impl Supervisor {
         }
         let (cmd, commands) = tokio::sync::mpsc::channel(1);
         let sink = match self.spawn_sink(
+            job.memory_owner(),
             spec,
             rx_out,
             cancel.clone(),

@@ -24,9 +24,20 @@ enum Backend {
     Native(Native),
     Script(crate::script::Script),
     Wasm(crate::script::Script),
+    External(Arc<crate::extension::Executable>),
 }
 impl Backend {
     fn load(manifest: &Manifest, bytes: &[u8], worker: Option<&Path>) -> Result<Self> {
+        if manifest.is_external() {
+            return Ok(Self::External(Arc::new(crate::extension::Executable::new(
+                bytes,
+                manifest
+                    .package
+                    .as_ref()
+                    .and_then(|p| p.extension.as_ref())
+                    .ok_or_else(|| invalid("extension declaration absent"))?,
+            )?)));
+        }
         if manifest.is_isolated() {
             let isolated = crate::script::Script::load(
                 manifest,
@@ -118,6 +129,7 @@ pub struct Manager {
     script_worker: Option<PathBuf>,
     wasm_worker: Option<PathBuf>,
     trust: TrustPolicy,
+    allow_external: bool,
     entries: Mutex<BTreeMap<String, Entry>>,
     epoch: AtomicU64,
     _lock: Arc<sparrow_io::fs_lock::FileLock>,
@@ -129,6 +141,54 @@ impl std::fmt::Debug for Manager {
             .finish_non_exhaustive()
     }
 }
+/// A live expression owns this pin; cloning an Arc cannot release it early.
+pub struct Extension {
+    loaded: Arc<Loaded>,
+    declaration: crate::extension::Declaration,
+    reference: crate::PackageReference,
+}
+impl std::fmt::Debug for Extension {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Extension")
+            .field("reference", &self.reference)
+            .field("role", &self.declaration.role)
+            .finish()
+    }
+}
+impl PartialEq for Extension {
+    fn eq(&self, other: &Self) -> bool {
+        self.reference == other.reference && self.declaration == other.declaration
+    }
+}
+impl Drop for Extension {
+    fn drop(&mut self) {
+        self.loaded.pins.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl Extension {
+    pub fn declaration(&self) -> &crate::extension::Declaration {
+        &self.declaration
+    }
+    pub fn reference(&self) -> &crate::PackageReference {
+        &self.reference
+    }
+    pub fn open(
+        self: &Arc<Self>,
+        config: &serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::extension::Session> {
+        if !config.is_null() && !config.is_object() {
+            return Err(invalid("extension configuration must be an object"));
+        }
+        crate::extension::protocol::encode(config, crate::extension::protocol::MAX_CONFIG)
+            .map_err(|_| invalid("extension configuration exceeds 4KiB"))?;
+        let Backend::External(executable) = &self.loaded.backend else {
+            return Err(invalid("extension backend mismatch"));
+        };
+        crate::extension::Session::open(executable, self.clone(), config, cancel)
+    }
+}
+
 /// A live expression owns this pin; cloning an Arc cannot release it early.
 pub struct Function {
     loaded: Arc<Loaded>,
@@ -198,6 +258,7 @@ impl Function {
                 e.message = e.message.replace("JavaScript", "WebAssembly");
                 e
             }),
+            Backend::External(_) => Err(invalid("extension is not a scalar function")),
         };
         result.map_err(|e| {
             e.context("plugin_package", &self.package)
@@ -340,6 +401,16 @@ impl Manager {
         wasm_worker: Option<PathBuf>,
         trust: TrustPolicy,
     ) -> Result<Arc<Self>> {
+        Self::open_with_extensions(root, allow_native, script_worker, wasm_worker, trust, false)
+    }
+    pub fn open_with_extensions(
+        root: &Path,
+        allow_native: bool,
+        script_worker: Option<PathBuf>,
+        wasm_worker: Option<PathBuf>,
+        trust: TrustPolicy,
+        allow_external: bool,
+    ) -> Result<Arc<Self>> {
         trust.validate()?;
         for worker in [script_worker.as_ref(), wasm_worker.as_ref()]
             .into_iter()
@@ -454,7 +525,9 @@ impl Manager {
         // Preflight the ENTIRE installed dependency graph and active publisher
         // policy before entering any native constructor or guest initialization.
         let allowed = |m: &Manifest| {
-            if m.is_script() {
+            if m.is_external() {
+                allow_external
+            } else if m.is_script() {
                 script_worker.is_some()
             } else if m.is_wasm() {
                 wasm_worker.is_some()
@@ -511,6 +584,7 @@ impl Manager {
             script_worker,
             wasm_worker,
             trust,
+            allow_external,
             entries: Mutex::new(entries),
             epoch: AtomicU64::new(0),
             _lock: lock,
@@ -521,6 +595,45 @@ impl Manager {
     }
     pub fn signature_required(&self) -> bool {
         self.trust.require_signed
+    }
+    pub fn external_allowed(&self) -> bool {
+        self.allow_external
+    }
+    pub fn resolve_extension(
+        &self,
+        binding: &crate::extension::Binding,
+        role: crate::extension::Role,
+    ) -> Result<Arc<Extension>> {
+        binding.validate()?;
+        let entries = self.entries()?;
+        let entry = entries
+            .get(&binding.manifest_sha256)
+            .filter(|e| {
+                e.enabled
+                    && e.manifest.name == binding.name
+                    && e.manifest.version == binding.version
+                    && e.manifest.is_external()
+            })
+            .ok_or_else(|| invalid("extension missing, disabled or hash/version mismatch"))?;
+        let declaration = entry
+            .manifest
+            .package
+            .as_ref()
+            .and_then(|p| p.extension.as_ref())
+            .filter(|d| d.role == role)
+            .ok_or_else(|| invalid("extension role mismatch"))?
+            .clone();
+        let loaded = entry
+            .loaded
+            .as_ref()
+            .ok_or_else(|| invalid("extension executable not loaded"))?
+            .clone();
+        loaded.pins.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(Extension {
+            loaded,
+            declaration,
+            reference: binding.reference(),
+        }))
     }
     /// Control holds its catalog lock before entering this method. Keep the
     /// registry stable through publication; standalone registries have no DB.
@@ -689,7 +802,9 @@ impl Manager {
             .ok_or_else(|| invalid("plugin not installed"))?;
         self.trust
             .verify(&entry.manifest, entry.signature.as_ref())?;
-        if if entry.manifest.is_script() {
+        if if entry.manifest.is_external() {
+            !self.allow_external
+        } else if entry.manifest.is_script() {
             !self.script_allowed()
         } else if entry.manifest.is_wasm() {
             !self.wasm_allowed()

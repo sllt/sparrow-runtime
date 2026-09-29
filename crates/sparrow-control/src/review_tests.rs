@@ -226,6 +226,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
         sql: Some(sql.into()),
         graph: None,
         source: SourceSpec {
+            plugin: None,
             kind: "file".into(),
             jetstream: None,
             host: None,
@@ -248,6 +249,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
             file_contract: None,
         },
         sink: SinkSpec {
+            plugin: None,
             action: None,
             file: None,
             kind: "log".into(),
@@ -379,6 +381,7 @@ fn mqtt_aligned_still_rejected() {
         sql: Some("SELECT device_id FROM sensors".into()),
         graph: None,
         source: SourceSpec {
+            plugin: None,
             kind: "mqtt".into(),
             jetstream: None,
             host: Some("127.0.0.1".into()),
@@ -401,6 +404,7 @@ fn mqtt_aligned_still_rejected() {
             file_contract: None,
         },
         sink: SinkSpec {
+            plugin: None,
             action: None,
             file: None,
             kind: "log".into(),

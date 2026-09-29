@@ -7,6 +7,8 @@
 mod analysis_tests;
 #[cfg(test)]
 mod plugin_tests;
+#[cfg(test)]
+mod extension_tests;
 pub mod capability;
 pub mod checkpoint;
 pub mod query;
@@ -19,6 +21,7 @@ pub mod supervisor;
 pub mod validate;
 
 mod file_source;
+mod plugin_io;
 
 pub use reference_table::{
     reference_table_sha256, ReferenceTableMetadata, ReferenceTableRow, ReferenceTableSpec,

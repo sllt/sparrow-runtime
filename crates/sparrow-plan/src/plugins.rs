@@ -1,5 +1,8 @@
 use crate::{AnalysisPlan, PhysicalPlan, PhysicalStage, TransformStep};
 impl PhysicalPlan {
+    pub fn has_external_plugins(&self) -> bool {
+        self.stages.iter().any(|s|matches!(s,PhysicalStage::Analysis {plan,..} if matches!(plan.as_ref(),AnalysisPlan::External {..})))
+    }
     pub fn visit_plugins(
         &self,
         visit: &mut impl FnMut(&std::sync::Arc<sparrow_expr::plugins::Function>),
@@ -44,7 +47,7 @@ impl PhysicalPlan {
     pub fn has_plugins(&self) -> bool {
         let mut found = false;
         self.visit_plugins(&mut |_| found = true);
-        found
+        found || self.has_external_plugins()
     }
     pub fn plugin_functions(&self) -> Vec<std::sync::Arc<sparrow_expr::plugins::Function>> {
         let mut pins = Vec::new();

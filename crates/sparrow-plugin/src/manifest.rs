@@ -99,6 +99,8 @@ pub struct PackageMetadata {
     pub dependencies: Vec<PackageReference>,
     /// Deployment baseline, never silently fetched or treated as bundled code.
     pub platform: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension: Option<crate::extension::Declaration>,
 }
 pub fn identifier(s: &str) -> bool {
     !s.is_empty()
@@ -138,17 +140,22 @@ pub fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 impl Manifest {
+    pub fn is_external(&self) -> bool {
+        self.kind == "native_extension"
+    }
     pub fn is_wasm(&self) -> bool {
         self.kind == "wasm_scalar"
     }
     pub fn is_isolated(&self) -> bool {
-        self.is_script() || self.is_wasm()
+        self.is_script() || self.is_wasm() || self.is_external()
     }
     pub fn is_script(&self) -> bool {
         self.kind == "javascript_scalar"
     }
     pub fn artifact_name(&self) -> &'static str {
-        if self.is_script() {
+        if self.is_external() {
+            "artifact.elf"
+        } else if self.is_script() {
             "artifact.js"
         } else if self.is_wasm() {
             "artifact.wasm"
@@ -162,7 +169,7 @@ impl Manifest {
         } else if self.is_wasm() {
             self.target == WASM_TARGET
         } else {
-            self.kind == "native_scalar"
+            (self.kind == "native_scalar" || self.is_external())
                 && matches!(
                     self.target.as_str(),
                     "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
@@ -177,16 +184,31 @@ impl Manifest {
             || !identifier(&self.name)
             || !identifier(&self.version)
             || !digest_name(&self.artifact_sha256)
-            || !self.deterministic
             || !self.thread_safe
-            || self.null_policy != "propagate"
-            || !(1..=16).contains(&self.functions.len())
+            || if self.is_external() {
+                self.format != 2 || !self.functions.is_empty() || self.null_policy != "typed_rows"
+            } else {
+                !self.deterministic
+                    || self.null_policy != "propagate"
+                    || !(1..=16).contains(&self.functions.len())
+            }
         {
             return Err(invalid(
                 "unsupported plugin manifest/version/target or scalar trust contract",
             ));
         }
         if let Some(package) = &self.package {
+            if self.is_external() != package.extension.is_some() {
+                return Err(invalid("extension declaration does not match backend kind"));
+            }
+            if let Some(declaration) = &package.extension {
+                declaration
+                    .validate()
+                    .map_err(|_| invalid("invalid external extension schema/capabilities"))?;
+                if self.deterministic != (declaration.role == crate::extension::Role::Transform) {
+                    return Err(invalid("external transform must be pure; connectors must not claim deterministic functions"));
+                }
+            }
             if package.dependencies.len() > 8 || package.platform.len() > 8 {
                 return Err(invalid("package dependency bound exceeded"));
             }
@@ -278,13 +300,18 @@ impl Manifest {
             || &bytes[..4] != b"\x7fELF"
             || bytes[4] != 2
             || bytes[5] != 1
-            || u16::from_le_bytes([bytes[16], bytes[17]]) != 3
+            || !(u16::from_le_bytes([bytes[16], bytes[17]]) == 3
+                || (self.is_external() && u16::from_le_bytes([bytes[16], bytes[17]]) == 2))
             || u16::from_le_bytes([bytes[18], bytes[19]]) != machine
         {
             return Err(invalid(
                 "plugin requires a matching ELF64 little-endian shared object",
             ));
         }
-        crate::native_dependencies::validate(bytes)
+        if self.is_external() {
+            crate::native_dependencies::validate_executable(bytes)
+        } else {
+            crate::native_dependencies::validate(bytes)
+        }
     }
 }

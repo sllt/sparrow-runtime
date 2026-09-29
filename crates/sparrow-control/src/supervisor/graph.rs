@@ -15,6 +15,12 @@ struct Cut {
     reply: tokio::sync::oneshot::Sender<Result<SourcePosition>>,
 }
 enum Input {
+    Plugin {
+        extension: Arc<sparrow_expr::plugins::Extension>,
+        config: serde_json::Value,
+        schema: sparrow_model::Schema,
+        tx: observed::Sender<IngressEvent>,
+    },
     File {
         source: FileReplaySource,
         contract: FileContract,
@@ -327,6 +333,14 @@ impl Supervisor {
             single.source = source_spec.clone();
             let mut binding = GraphInput::default();
             let input = match source_spec.kind.as_str() {
+                "plugin" => {
+                    let plugin=source_spec.plugin.as_ref().expect("validated plugin source");
+                    let extension=crate::plugins::manager(&self.store)?.resolve_extension(plugin,sparrow_expr::plugins::extension::Role::Source)?;
+                    let (tx,rx)=observed::channel(source_spec.inbox_capacity);
+                    diag.observe_source(&tx);
+                    binding.events=Some(rx);
+                    Input::Plugin {extension,config:plugin.config.clone(),schema,tx}
+                }
                 "file" | "file_replay" | "replay" => {
                     let contract = crate::validate::resolve_file_contract(
                         &single,
@@ -458,6 +472,7 @@ impl Supervisor {
             single.graph_io = None;
             single.sink = sink;
             match self.spawn_sink(
+                job.memory_owner(),
                 &single,
                 rx,
                 cancel.clone(),
@@ -466,24 +481,30 @@ impl Supervisor {
                 policy,
                 Some(outbox),
             ) {
-                Ok(handle) => sinks.push(handle),
+                Ok(handle) => sinks.push((handle,ports.sinks[&id].clone())),
                 Err(error) => {
                     cancel.cancel();
                     let _ = job.stop().await;
-                    for sink in sinks {
+                    for (sink,_) in sinks {
                         let _ = sink.await;
                     }
                     return Err(error);
                 }
             }
         }
+        let sink_cancel=cancel.clone();
         let sink = self.kernel.handle().spawn(async move {
-            for sink in sinks {
-                let _ = sink.await;
+            for (sink,diag) in sinks {
+                if sink.await.is_err() {
+                    diag.plugin_failed.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                    diag.observation.health(false,HealthState::Failed,"sink_actor_panicked",Some(ErrorCode::JobFailed));
+                    sink_cancel.cancel();
+                }
             }
         });
         let mut tasks = tokio::task::JoinSet::new();
         let max_row_bytes = self.kernel.ingress_row_limit();
+        let batch_rows=self.kernel.ingress_batch_rows();
         for (id, input) in inputs {
             let child = cancel.clone();
             let diag = ports.sources[&id].clone();
@@ -491,6 +512,9 @@ impl Supervisor {
             tasks.spawn_on(
                 async move {
                     let result = match input {
+                        Input::Plugin {extension,config,schema,tx} => {
+                            crate::plugin_io::source(tokio::runtime::Handle::current(),extension,config,schema,tx,child.clone(),owner,diag,true,batch_rows).await.map_err(|_|SparrowError::new(ErrorCode::JobFailed,"external Source actor panicked"))?
+                        }
                         Input::File {
                             source,
                             contract,

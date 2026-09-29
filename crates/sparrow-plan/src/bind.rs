@@ -68,6 +68,7 @@ fn bind_graph_inner(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalP
     for id in order {
         let node = by_id[&id];
         if (node.unnest.is_some() && node.kind != "unnest")
+            || (node.plugin.is_some() && node.kind != "plugin_transform")
             || (node.stream_join.is_some()
                 && !matches!(node.kind.as_str(), "interval_join" | "window_join"))
         {
@@ -78,7 +79,7 @@ fn bind_graph_inner(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalP
         }
         if matches!(
             node.kind.as_str(),
-            "unnest" | "interval_join" | "window_join"
+            "unnest" | "interval_join" | "window_join" | "plugin_transform"
         ) && (node.table.is_some()
             || node.predicate.is_some()
             || node.exprs.is_some()
@@ -118,6 +119,13 @@ fn bind_graph_inner(spec: &GraphSpec, catalog: &Catalog) -> Result<BoundLogicalP
             ));
         }
         let kind = match node.kind.as_str() {
+            "plugin_transform" => {
+                let input=incoming_schema.get(&id).cloned().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"plugin Transform has no input"))?;
+                let binding=node.plugin.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"plugin Transform requires an immutable binding"))?;
+                let manager=cat.plugins.as_ref().ok_or_else(||SparrowError::new(ErrorCode::FeatureUnavailable,"plugin registry unavailable"))?;
+                let extension=manager.resolve_extension(binding,sparrow_expr::plugins::extension::Role::Transform)?;
+                BoundKind::Analysis(Box::new(crate::AnalysisPlan::external(extension,binding.config.clone(),input)?))
+            }
             "unnest" => {
                 let input = incoming_schema.get(&id).cloned().ok_or_else(|| {
                     SparrowError::new(ErrorCode::InvalidArgument, "UNNEST has no input")

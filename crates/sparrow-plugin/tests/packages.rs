@@ -81,6 +81,7 @@ fn reference(m: &Manifest) -> PackageReference {
 fn requires(mut m: Manifest, deps: Vec<PackageReference>) -> Manifest {
     m.format = 2;
     m.package = Some(PackageMetadata {
+        extension:None,
         dependencies: deps,
         platform: vec!["sparrow_abi_v1".into(), "quickjs_ng_0_16_2".into()],
     });

@@ -56,6 +56,9 @@ async fn unnest(
     rx: &mut MailboxRx,
     tx: &MailboxTx,
 ) -> Result<usize> {
+    if matches!(plan.as_ref(), AnalysisPlan::External {..}) {
+        return external(ctx,*plan,rx,tx).await;
+    }
     let AnalysisPlan::Unnest {
         spec,
         input,
@@ -210,6 +213,75 @@ async fn unnest(
         }
     }
     Ok(0)
+}
+
+/// One blocking actor per Transform. Scratch and lifecycle accounting survive
+/// until its child is reaped, including cancellation during a callback.
+async fn external(ctx: &JobCtx, plan: AnalysisPlan, rx: &mut MailboxRx, tx: &MailboxTx) -> Result<usize> {
+    use sparrow_expr::plugins::extension as ext;
+    let AnalysisPlan::External {extension,config,input:_,output}=plan else {unreachable!()};
+    let declaration=extension.declaration().clone();
+    let scratch=ctx.owner.acquire(CreditKind::Reservation,ext::scratch_bytes(&declaration))?;
+    type Call=(ext::Row,tokio::sync::oneshot::Sender<Result<Vec<ext::Row>>>);
+    let (commands,mut calls)=tokio::sync::mpsc::channel::<Call>(1);
+    let (ready,opened)=tokio::sync::oneshot::channel();
+    let cancel=ctx.cancel.clone();
+    ctx.live.fetch_add(1,Ordering::SeqCst);
+    let guard=LiveTaskGuard {live:ctx.live.clone()};
+    let worker=tokio::task::spawn_blocking(move || -> Result<()> {
+        let (_scratch,_guard)=(scratch,guard);
+        let mut session=match extension.open(&config,cancel) {
+            Ok(s)=>s,Err(e)=>{let _=ready.send(Err(e));return Ok(());}
+        };
+        if ready.send(Ok(())).is_err() {return Ok(());}
+        while let Some((row,reply))=calls.blocking_recv() {
+            let result=session.transform(row);
+            let failed=result.is_err();
+            if reply.send(result).is_err() || failed {return Ok(());}
+        }
+        session.close()
+    });
+    let result=async {
+        opened.await.map_err(|_|SparrowError::new(ErrorCode::JobFailed,"external Transform actor stopped during open"))??;
+        let mut eof=false;
+        loop {
+            let env=tokio::select! {biased;_=ctx.cancel.cancelled()=>break,env=rx.recv()=>env?};
+            let Some(mut env)=env else {
+                if ctx.graph_mode&&!eof&&!ctx.cancel.is_cancelled() {return Err(SparrowError::new(ErrorCode::JobFailed,"external Transform input closed without EOF"));}
+                break;
+            };
+            let (batch,control)=env.take();
+            if let Some(control)=control {
+                match control {
+                    StreamControl::Watermark {..}|StreamControl::Idle {..}|StreamControl::Active {..} if !eof=>{},
+                    StreamControl::EndOfInput if ctx.graph_mode&&!eof=>eof=true,
+                    _=>return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"external Transform control/lifecycle rejected")),
+                }
+                if !tx.send_control(control).await? {break;}
+            }
+            if let Some(batch)=batch {
+                if eof {return Err(SparrowError::new(ErrorCode::JobFailed,"external Transform row after EOF"));}
+                for row in batch.rows() {
+                    charge(ctx,10_000+row.values.len() as u64).await?;
+                    let row=ext::from_row(row,declaration.limits.max_frame_bytes)?;
+                    let (reply,received)=tokio::sync::oneshot::channel();
+                    commands.send((row,reply)).await.map_err(|_|SparrowError::new(ErrorCode::JobFailed,"external Transform actor closed"))?;
+                    // IPC observes cancellation: never drop an active call or
+                    // publish a partially validated expansion.
+                    let rows=received.await.map_err(|_|SparrowError::new(ErrorCode::JobFailed,"external Transform actor stopped"))??;
+                    let rows=ext::into_rows(rows,&declaration.output,declaration.limits.max_rows)?;
+                    charge(ctx,rows.len() as u64).await?;
+                    if let Some(out)=crate::window::finish_rows_metered(&output,rows,&ctx.owner)? {
+                        if !tx.send(out.with_origin(batch.origin()).with_source_operator(batch.source_operator())).await? {return Ok(0);}
+                    }
+                }
+            }
+        }
+        Ok(0)
+    }.await;
+    drop(commands);
+    let joined=worker.await.map_err(|_|SparrowError::new(ErrorCode::JobFailed,"external Transform actor panicked"))?;
+    match result {Err(e)=>Err(e),Ok(n)=>{joined?;Ok(n)}}
 }
 
 pub(super) fn join_task<'a>(

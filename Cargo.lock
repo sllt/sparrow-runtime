@@ -1944,6 +1944,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparrow-extension-sdk"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sparrow-formats"
 version = "0.1.0"
 dependencies = [
@@ -2000,6 +2009,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "sparrow-extension-sdk",
  "sparrow-io",
  "sparrow-model",
  "tokio",

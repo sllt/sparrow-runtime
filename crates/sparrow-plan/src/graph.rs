@@ -45,6 +45,8 @@ fn default_true() -> bool {
 #[serde(deny_unknown_fields)]
 pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<sparrow_expr::plugins::extension::Binding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unnest: Option<crate::UnnestNodeSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_join: Option<crate::StreamJoinSpec>,
