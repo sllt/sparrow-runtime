@@ -46,6 +46,7 @@ fn manager(d: &Dir) -> Arc<Manager> {
 }
 fn manifest(bytes: &[u8], version: &str, ty: ValueType) -> Manifest {
     Manifest {
+        package:None,
         format: 1,
         name: "wasm_test".into(),
         version: version.into(),

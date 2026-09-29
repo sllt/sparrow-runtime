@@ -14,15 +14,57 @@ export SPARROW_ENABLE_NATIVE_PLUGINS=1
 
 目录属于服务用户，不接受目录symlink、组/其他用户可写目录，单进程持锁。开启目录但不开native开关时可安装/查看，不可激活；safe-mode不自动恢复激活，也拒绝enable。已批准enabled版本会在后续正常启动、Supervisor启动之前校验并加载。缺包、损坏、ABI/平台不符明确失败，不自动切换版本。
 
-**只运行已审查的可信本地代码**。认证管理员必须再次批准完整manifest SHA-256；hash证明所选字节/声明身份，不证明作者或安全性。本版不实现数字签名验签、插件商店、依赖下载。原生代码与进程同权限，可以破坏进程，不能强制中断、不能靠catch_unwind提供沙箱；原生内部堆分配、线程、I/O也不受宿主行预算强制管控。ABI要求纯函数、线程安全、不保留宿主指针、不跨边界抛异常、及时返回，只是可信代码合同。因此 `/v1/query` 明确拒绝native调用，不冒充可抢占的有限查询。
+**只运行已审查的可信本地代码**。认证管理员必须再次批准完整manifest SHA-256；hash证明所选字节/声明身份，不证明发布者或安全性。支持下述离线Ed25519发布者策略；默认兼容旧的显式hash批准，生产可配置强制签名。签名不取消代码审查，不实现插件商店或依赖下载。原生代码与进程同权限，可以破坏进程，不能强制中断、不能靠catch_unwind提供沙箱；原生内部堆分配、线程、I/O也不受宿主行预算强制管控。ABI要求纯函数、线程安全、不保留宿主指针、不跨边界抛异常、及时返回，只是可信代码合同。因此 `/v1/query` 明确拒绝native调用，不冒充可抢占的有限查询。
 
 首版ABI为Linux ELF64 little-endian GNU、x86_64/aarch64匹配目标；平台声明不是两种架构均已实测。manifest最大16KiB，artifact最大4MiB，安装最多16个包版本；HTTP上传最多6MiB，单个插件管理请求准入，普通管理接口仍为64KiB。每进程最多16次原生驻留加载尝试，失败也可能执行过构造函数，所以同样占名额。
 
-name/version/function标识均为1～32个小写字母、数字或下划线（例如`v1`），不是自动解析semver。第三方动态依赖不被打包、下载或递归hash固定，平台动态库属于管理员维护的部署基线；artifact hash不等于整个进程依赖树的证明。备份/回退必须同时保留catalog和插件目录，在停止管理变更后操作，不能只备份SQLite而遗漏规则固定的包。
+name/version/function标识均为1～32个小写字母、数字或下划线（例如`v1`），不是自动解析semver。包间依赖可按完整hash固定，平台动态库则属于管理员维护的部署基线；两者不混同，artifact hash不等于整个进程依赖树的证明。ELF加载前解析有界program headers/dynamic table，拒绝未知DT_NEEDED、RPATH/RUNPATH、audit/filter/auxiliary以及未知解释器；允许的GNU平台soname是libc/libm/libdl/libpthread/librt/libgcc_s/libstdc++及对应ld-linux。其他库需静态链接或使用明确的外部进程方案；不自动下载、设置搜索路径或装载包内共享库，不能把这些检查叫作native沙箱。备份/回退同时保留catalog、插件目录和信任策略，不能只备份SQLite。
 
 库从**验证hash后的sealed memfd**加载，不把可被替换的磁盘路径交给dlopen。库和sealed fd驻留至进程退出，不调用dlclose；宿主不承诺安全热卸载。disable只阻止新绑定，存在plan/job引用则拒绝；disable后需重启才能通过管理API卸载该驻留版本。失败激活不得反复重试耗尽句柄，须重启检查。API会在跨入原生构造函数之前记录批准尝试，失败时不能只依靠成功后的审计。`resident`对已尝试激活的版本采取保守标记，不是实时调用或精确RSS指标。
 
 ## 构建、安装和调用
+
+### 发布者、依赖与持久引用
+
+`SPARROW_PLUGIN_TRUST_STORE=/etc/sparrow/plugin-trust.json` 指向管理员/服务用户所有、不可被组或其他用户写入的普通文件；不接受symlink/FIFO。放在插件目录之外，策略启动时加载，变更/撤销须重启，不宣称热撤销已经运行的代码。示例：
+
+```json
+{"format":1,"require_signed":true,"publishers":[{"id":"team","public_key_base64":"BASE64_32_BYTE_ED25519_PUBLIC_KEY","packages":["my_plugin"],"kinds":["javascript_scalar"],"revoked":false}]}
+```
+
+最多16个发布者，包名可用显式列表或管理员选择的`*`；kind有独立授权。未签名、未知/撤销key、错误范围或被篡改内容不能在强制策略下激活。启动先核验整个待激活依赖图及签名，再进入任何原生构造函数或guest初始化；safe-mode不激活，可用于重新签署/卸载旧包。签名验证仅证明受信key批准了确切manifest字节，不证明代码安全或原始作者身份。
+
+```sh
+sparrow-plugin-sign keygen NEW_PRIVATE.pk8 NEW_PUBLIC.json
+sparrow-plugin-sign sign manifest.json team NEW_PRIVATE.pk8 NEW_SIGNATURE.json
+sparrow-plugin-sign verify manifest.json /etc/sparrow/plugin-trust.json NEW_SIGNATURE.json
+sparrowctl plugin-install manifest.json artifact NEW_SIGNATURE.json
+# 给已有的同一manifest身份添加/替换证明，必须显式操作，不能靠重复install偷换来源。
+sparrowctl plugin-attest MANIFEST_SHA256 NEW_SIGNATURE.json
+```
+
+私钥只由离线工具读取，生成文件0600，不上传到Server。签名是Ed25519原始签名，消息为ASCII `sparrow-package-signature-v1`＋NUL、key_id字节长度的u32大端、key_id字节、`Manifest::bytes()`的JSON；使用提供的工具避免自行猜测字段顺序。分离式signature为`{"algorithm":"ed25519","key_id":"team","signature_base64":"..."}`。HTTP install可附加`signature`字段，attest端点为`POST /v1/plugins/{hash}/attest`。format1的canonical字段/顺序及hash不变，签名不修改代码身份；签名/hash的结构校验可离线跨目标进行，实际native激活仍核验当前主机架构。
+
+format2在原manifest末尾增加`package`：
+
+```json
+{"dependencies":[{"name":"helper","version":"v1","manifest_sha256":"完整SHA256"}],"platform":["sparrow_abi_v1","linux_gnu"]}
+```
+
+直接依赖最多8个、深度最多8、总包数仍16；缺包、同一闭包的版本冲突、自依赖/循环或未知平台项拒绝。先安装/批准启用依赖，再启用父包；启用的父包保护依赖不被停用，任何已安装父包保护其依赖不被卸载，卸载按反向顺序进行。依赖是部署和生命周期约束，不隐式提供guest import、函数间RPC或动态链接。平台项仅允许已实现的ABI/Linux GNU/对应JS或WASM约束，不把声明当成系统库hash证明。
+
+catalog升级至 **schema v4**：SQL AST/Graph的准确包引用随每个不可变pipeline revision在同一事务持久化；旧目录启动时原子回填，缺失保护表/结构拒绝维护。管理uninstall在同一SQLite写事务内核验全部历史引用并持有registry顺序锁，不能利用PUT/卸载并发造成已提交规则缺包。停止规则后可以停用版本，但只要历史revision仍引用它就不能卸载。
+
+```sh
+sparrowctl plugin-references MANIFEST_SHA256
+# 必须desired及observed均stopped，且全部历史为无checkpoint的restart_fresh。
+# 显式删除该pipeline的全部catalog历史和依赖引用；不删外部数据文件。
+sparrowctl retire-pipeline PIPELINE CURRENT_ETAG
+```
+
+退休操作要求确切当前ETag，运行/待启动/含checkpoint历史均拒绝。需要历史回退时不要退休，保留包即可。旧schema v3二进制不能直接打开已升级catalog；代码回退须恢复匹配的catalog备份和插件/信任目录。新插件没有因此获得aligned资格。
+
+### 标量示例
 
 可运行C样例和ABI头分别位于 `examples/plugins/native_math.c`、`sdk/native/sparrow_plugin_v1.h`：
 
@@ -66,7 +108,7 @@ artifact大小/加载次数上限不是进程RSS上限；ELF段、系统依赖�
 
 真实no-demo Server/CLI进程也通过：File→native→File，同一输入21在v1/v2/v1输出 **42→63→42**；运行中停用拒绝、safe-mode不自动加载、正常重启恢复启用、驻留卸载拒绝、停用重启后卸载、缺包拒绝。可复现脚本为 `scripts/plugins-native-smoke.sh SERVER CLI NEW_EVIDENCE_DIR`。初轮脚本权限/CAS失败保留，不放宽生产校验；最终源码、二进制和日志指纹见[匹配证据](PRODUCTION.md#native-plugins-validation)。未测aarch64、长稳、ABI恶意机器码隔离、掉电存储故障或性能/整体发行认证。
 
-后续为 WASM、Transform/Source/Sink SDK 及必要隔离。签名信任链、任意 native 隔离/强制终止、外部 Connector 恢复、自定义 UDAF 不因 scalar 通过而自动获得支持。
+后续为 Transform/Source/Sink SDK 及必要隔离。任意native机器码的安全沙箱、外部Connector的持久恢复、自定义UDAF不因scalar或签名通过而自动获得支持。
 
 ## JavaScript 标量函数
 

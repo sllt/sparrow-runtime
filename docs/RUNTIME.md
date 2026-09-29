@@ -1,5 +1,7 @@
 # Runtime ownership (A3 / A4)
 
+2026-09-29 包生命周期：可选/强制Ed25519策略、不可变format2依赖图在进入任何插件代码前完成预检；所有开启后端的依赖必须先获批准并启用。catalog v4随不可变revision原子保存SQL/Graph包引用，受管卸载按catalog→registry锁序和SQLite写事务检查历史引用；停止不等于可卸载，显式ETag退休仅清理无checkpoint的停止态fresh历史。原生format1身份不变，metadata可跨目标签名但native激活仍核验本机；ELF未知依赖/搜索路径拒绝，平台库不是包内hash闭包。1005/48、包4×5、三后端CLI及签名/撤销/迁移验证见[证据](PRODUCTION.md#package-lifecycle-validation)。旧v3二进制回退须配套catalog备份。
+
 2026-09-29 WASM Preview：wasmi 2.0.0在独立worker中校验/缓存不可变Module，每次新Store/Instance；每版本同时一个实例，JS/WASM共享4个worker名额。无imports/WASI/JIT，memory16MiB/1M fuel/128MiB进程上限与父进程100ms期限同时生效。WASM复用task-local总预算/取消，有限查询只允许可抢占后端；pure native仍拒绝。`memory.grow`的-1代表拒绝，不冒充成功或一律要求trap。SDK wasm32只传有界偏移/长度，宿主验证完全部输出才发布；Module元数据bytes为源模块大小，不是IR/RSS。997/48、WASM5×5、JS17回归及三后端真实CLI通过，见[WASM验收](PRODUCTION.md#wasm-plugins-validation)。仍fresh-only，未借此开放任意插件恢复。
 
 2026-09-29 JavaScript Preview：QuickJS-ng 0.16.2 只进入独立 worker，不链接 Server/CLI 地址空间。版本复用进程，每次调用新 Runtime/Context；默认关闭，脚本和原生使用独立 opt-in。单包串行、全进程 4 个 worker 名额、每 worker 128MiB 地址空间/64MiB VM 堆；Job 另按声明类型预留有界 IPC scratch，不能把子进程内存冒充计入 Job owner。含脚本的 stage/router future 使用 task-local cancellation，避免给跨 Job 共享 Function 绑定一个 Job 的 token；无脚本的热路径不安装该 scope。100ms 到期/取消后 kill＋wait，pin 持有至 Job tasks 退出；脚本停用后可卸载，原生驻留合同不变。仍 fresh-only。首批982/47、新12×5及真实CLI/独立worker边界通过；部署、故障恢复、选型与待优化项见 [PLUGINS](PLUGINS.md#javascript-标量函数)，精确验收见 [PRODUCTION](PRODUCTION.md#script-plugins-validation)。以下历史记录按各自日期/构建解释。

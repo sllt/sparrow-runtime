@@ -11,6 +11,7 @@ pub mod bind;
 pub mod bind_v02;
 pub mod bind_v03;
 pub mod g0;
+pub mod plugin_references;
 pub mod v02;
 pub mod v03;
 #[cfg(test)]

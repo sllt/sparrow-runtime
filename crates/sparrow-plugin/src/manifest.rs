@@ -71,6 +71,34 @@ pub struct Manifest {
     pub thread_safe: bool,
     pub null_policy: String,
     pub functions: Vec<FunctionDef>,
+    /// Omitted for legacy format 1, preserving its exact canonical hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<PackageMetadata>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageReference {
+    pub name: String,
+    pub version: String,
+    pub manifest_sha256: String,
+}
+impl PackageReference {
+    pub fn validate(&self) -> Result<()> {
+        if !identifier(&self.name)
+            || !identifier(&self.version)
+            || !digest_name(&self.manifest_sha256)
+        {
+            return Err(invalid("invalid immutable package dependency"));
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageMetadata {
+    pub dependencies: Vec<PackageReference>,
+    /// Deployment baseline, never silently fetched or treated as bundled code.
+    pub platform: Vec<String>,
 }
 pub fn identifier(s: &str) -> bool {
     !s.is_empty()
@@ -130,16 +158,20 @@ impl Manifest {
     }
     pub fn validate(&self) -> Result<()> {
         let target_ok = if self.is_script() {
-            self.target == JS_TARGET && host_target() != "unsupported"
+            self.target == JS_TARGET
         } else if self.is_wasm() {
-            self.target == WASM_TARGET && host_target() != "unsupported"
+            self.target == WASM_TARGET
         } else {
             self.kind == "native_scalar"
-                && self.target == host_target()
-                && host_target() != "unsupported"
+                && matches!(
+                    self.target.as_str(),
+                    "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+                )
         };
-        if self.format != 1
-            || self.abi != 1
+        if !matches!(
+            (self.format, self.package.is_some()),
+            (1, false) | (2, true)
+        ) || self.abi != 1
             || self.semantics != 1
             || !target_ok
             || !identifier(&self.name)
@@ -153,6 +185,32 @@ impl Manifest {
             return Err(invalid(
                 "unsupported plugin manifest/version/target or scalar trust contract",
             ));
+        }
+        if let Some(package) = &self.package {
+            if package.dependencies.len() > 8 || package.platform.len() > 8 {
+                return Err(invalid("package dependency bound exceeded"));
+            }
+            let mut refs = std::collections::BTreeSet::new();
+            for dependency in &package.dependencies {
+                dependency.validate()?;
+                if dependency.name == self.name
+                    || !refs.insert((&dependency.name, &dependency.version))
+                {
+                    return Err(invalid("self/duplicate package dependency"));
+                }
+            }
+            let mut platform = std::collections::BTreeSet::new();
+            for component in &package.platform {
+                if !matches!(
+                    component.as_str(),
+                    "sparrow_abi_v1" | "linux_gnu" | "wasm32_core_v1" | "quickjs_ng_0_16_2"
+                ) || !platform.insert(component)
+                    || (component == "wasm32_core_v1" && !self.is_wasm())
+                    || (component == "quickjs_ng_0_16_2" && !self.is_script())
+                {
+                    return Err(invalid("unknown/incompatible platform dependency"));
+                }
+            }
         }
         let mut names = std::collections::BTreeSet::new();
         let mut ids = std::collections::BTreeSet::new();
@@ -182,6 +240,9 @@ impl Manifest {
         self.validate()?;
         serde_json::to_vec(self).map_err(|_| invalid("invalid manifest"))
     }
+    pub fn dependencies(&self) -> &[PackageReference] {
+        self.package.as_ref().map_or(&[], |p| &p.dependencies)
+    }
     pub fn identity(&self) -> Result<String> {
         Ok(sha256(&self.bytes()?))
     }
@@ -205,6 +266,9 @@ impl Manifest {
             return Ok(());
         }
         // Reject a wrong class/endian/architecture before executing any loader code.
+        if self.target != host_target() || host_target() == "unsupported" {
+            return Err(invalid("native artifact target does not match this host"));
+        }
         let machine = if cfg!(target_arch = "x86_64") {
             62u16
         } else {
@@ -221,6 +285,6 @@ impl Manifest {
                 "plugin requires a matching ELF64 little-endian shared object",
             ));
         }
-        Ok(())
+        crate::native_dependencies::validate(bytes)
     }
 }

@@ -115,6 +115,13 @@ fn parse(args: &[String]) -> Result<Command> {
     let (method, segments, body) = match positional.as_slice() {
         ["plugins"] => (Method::GET,vec!["plugins".into()],None),
         ["plugin-install",manifest,artifact] => (Method::POST,vec!["plugins".into(),"install".into()],Some(read_plugin(manifest,artifact)?)),
+        ["plugin-install",manifest,artifact,signature] => {
+            let mut body=read_plugin(manifest,artifact)?;body["signature"]=read_input(signature)?;
+            (Method::POST,vec!["plugins".into(),"install".into()],Some(body))
+        },
+        ["plugin-attest",id,signature] => (Method::POST,vec!["plugins".into(),digest(id)?,"attest".into()],Some(read_input(signature)?)),
+        ["plugin-references",id] => (Method::GET,vec!["plugins".into(),digest(id)?,"references".into()],None),
+        ["retire-pipeline",id,etag] => (Method::POST,vec!["pipelines".into(),name(id)?,"retire".into()],Some(json!({"approve_etag":etag}))),
         [op @ ("plugin-enable"|"plugin-disable"|"plugin-uninstall"),id] => {
             let id=digest(id)?;let action=op.trim_start_matches("plugin-");
             let body=if action=="enable"{json!({"approve_manifest_sha256":id})}else{json!({})};
@@ -255,7 +262,9 @@ fn help() {
     println!(
         "sparrowctl — authenticated JSON management client\n\
 commands: health | capabilities | streams | pipelines\n\
-  plugins | plugin-install MANIFEST_JSON ARTIFACT\n\
+  plugins | plugin-install MANIFEST_JSON ARTIFACT [SIGNATURE_JSON]\n\
+  plugin-attest MANIFEST_SHA256 SIGNATURE_JSON | plugin-references MANIFEST_SHA256\n\
+  retire-pipeline NAME CURRENT_ETAG (deletes stopped fresh catalog history, not data files)\n\
   plugin-enable MANIFEST_SHA256 | plugin-disable MANIFEST_SHA256 | plugin-uninstall MANIFEST_SHA256\n\
   validate FILE | explain FILE | query FILE | put-stream NAME FILE\n\
   put-pipeline NAME FILE [--if-match ETAG]\n\

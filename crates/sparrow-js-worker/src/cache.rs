@@ -194,7 +194,7 @@ mod tests {
         // both paths. No IPC or process RLIMIT in this libtest microbenchmark.
         for source in ["({f(v){return v*2n;}})",
             "({f(v){const x=JSON.parse('{\"temperature\":21,\"enabled\":true}');return x.enabled?BigInt(x.temperature)*v:0n;}})"] {
-            let manifest=Manifest {format:1,name:"bench".into(),version:"v1".into(),
+            let manifest=Manifest {package:None,format:1,name:"bench".into(),version:"v1".into(),
                 kind:"javascript_scalar".into(),abi:1,semantics:1,target:JS_TARGET.into(),
                 artifact_sha256:sparrow_plugin::sha256(source.as_bytes()),deterministic:true,thread_safe:true,
                 null_policy:"propagate".into(),functions:vec![FunctionDef{name:"f".into(),id:1,

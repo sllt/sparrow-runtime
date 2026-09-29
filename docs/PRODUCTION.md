@@ -4,6 +4,20 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="package-lifecycle-validation"></a>
+## 包签名、依赖及持久引用：2026-09-29
+
+基线 `26fc3a3`，`box@100.64.0.19`，同证据根 `/workspace/bench-compare/plugins-core-20260929-qkkVtm`，本批为 `source-package/`，不覆盖前批 `source/`。交付离线Ed25519工具及发布者范围/撤销策略、format2精确部署依赖图、ELF平台依赖检查、显式attest、catalog v4历史引用保护和带ETag的停止态fresh规则退休。仍须管理员明确批准hash，不把签名当安全沙箱或隐式下载/动态链接器。
+
+- 默认15成员 locked Release＋JetStream feature：**1005 passed / 22 ignored**，`packages-full-final.log/.exit=0`；no-demo Server/CLI **48 passed / 0 ignored**，`packages-no-demo.log/.exit=0`。第一次全量仅两个旧迁移测试把成功版本硬编码为3，改为`CATALOG_SCHEMA_VERSION`；保留`packages-full-r1`，R2/R3及最终均通过。自查补强策略/FIFO读取和保护表的PK/FK结构验证。
+- 新包签名/依赖4项×5＝**20 passed**；冻结原生7、JS17、WASM5项回归通过，`packages-repeat-*`、`packages-{native_registry,scripts,wasm}-regression`退出0。全量同时覆盖旧目录v3→v4回填、失败事务回滚、历史引用不随最新SQL消失、退休CAS/停止态门禁、缺保护表拒绝及SQL AST排除注释/字符串误识别。
+- 六个生产工具/入口构建成功，`packages-build.log/.exit=0`，`packages-frozen/`与`packages-frozen.sha256`固定匹配产物；测试路径从最终Cargo artifact消息取出，不猜target文件名。没有本机编译。
+- `packages-process.log/.exit=0`与`packages-process/result.json`：真实签名工具→认证API/CLI；拒绝unsigned/签名重放/未启用依赖，父包阻止依赖停用，查询输出42；停用后仍因历史引用拒绝卸载，明确退休后释放；旧身份attest前后hash相同，强制签名重启通过。撤销后正常启动给出`policy_denied: plugin publisher signature ...`，safe-mode可启动且worker数0，未伪装热撤销已有进程。
+- 三后端实际Server/CLI升级回退、safe-mode、重启、持久引用拒绝/退休及热卸载/原生驻留拒绝均通过：`packages-process-{native,script,wasm}.log/.exit=0`。原生v1 manifest identity与前批相同。
+- **483个代码/构建/SDK/测试文件**匹配，`packages-source.sha256`自身SHA-256为 `afd935edcd5dbd0637f69995633cdaf1774e53e5c85b7a97e2f6408bd4390fbe`，`packages-source-verify.exit=0`。证据脚本 `sparrow-packages-validation.sh`。
+
+catalog v4不可由旧v3二进制直接打开；回退要恢复匹配catalog、插件目录和信任策略。退休仅处理全部历史为停止态、无checkpoint的fresh规则，不删除外部文件，不泛化为checkpoint GC。尚未宣称任意OS/动态库闭包安全、磁盘故障矩阵、完整发行包验收或全插件阶段完成；下一子批为外部Transform/Source/Sink及其隔离SDK。
+
 <a id="wasm-plugins-validation"></a>
 ## WASM 标量：2026-09-29 限定 Preview
 

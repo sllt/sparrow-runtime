@@ -9,6 +9,9 @@ pub fn router() -> Router<AppState> {
         .route("/v1/plugins/{digest}/enable", post(enable))
         .route("/v1/plugins/{digest}/disable", post(disable))
         .route("/v1/plugins/{digest}/uninstall", post(uninstall))
+        .route("/v1/plugins/{digest}/attest", post(attest))
+        .route("/v1/plugins/{digest}/references", get(references))
+        .route("/v1/pipelines/{name}/retire", post(retire))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
         .merge(
@@ -42,7 +45,7 @@ async fn list(
         let manager = control::manager(&state.store)?;
         Ok(Json(json!({"packages":manager.list()?,"native_allowed":manager.native_allowed(),
             "script_allowed":manager.script_allowed(),"wasm_allowed":manager.wasm_allowed(),"isolated_worker_slots":control::script_worker_slots(),"script_worker_slots":control::script_worker_slots(),
-            "resident_generations":control::resident_count(),"hot_unload":false,"script_hot_unload":true})))
+            "signature_required":manager.signature_required(),"resident_generations":control::resident_count(),"hot_unload":false,"script_hot_unload":true})))
     }).await
 }
 async fn install(
@@ -148,11 +151,71 @@ async fn uninstall(
 ) -> ApiResult<Json<Value>> {
     blocking_api(move || {
         let _permit = permit;
-        control::manager(&state.store)?.uninstall(&digest)?;
+        state.store.uninstall_plugin(&digest)?;
         state
             .store
             .audit("token", "plugin_uninstall", Some(&digest), None, "ok")?;
         Ok(Json(json!({"uninstalled":digest})))
+    })
+    .await
+}
+async fn attest(
+    State(state): State<AppState>,
+    Path(digest): Path<String>,
+    Extension(permit): Extension<Permit>,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    let signature = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::from(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "invalid plugin attestation",
+        ))
+    })?;
+    blocking_api(move || {
+        let _permit = permit;
+        let info = control::manager(&state.store)?.attest(&digest, signature)?;
+        state
+            .store
+            .audit("token", "plugin_attest", Some(&digest), None, "ok")?;
+        Ok(Json(json!(info)))
+    })
+    .await
+}
+async fn references(
+    State(state): State<AppState>,
+    Path(digest): Path<String>,
+    Extension(permit): Extension<Permit>,
+) -> ApiResult<Json<Value>> {
+    blocking_api(move || {
+        let _permit = permit;
+        Ok(Json(state.store.plugin_references(&digest)?))
+    })
+    .await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Retirement {
+    approve_etag: String,
+}
+async fn retire(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Extension(permit): Extension<Permit>,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    let approval: Retirement = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::from(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "retirement requires exact current ETag approval",
+        ))
+    })?;
+    blocking_api(move || {
+        let _permit = permit;
+        state.store.retire_pipeline(&name, &approval.approve_etag)?;
+        state
+            .store
+            .audit("token", "pipeline_retire", Some(&name), None, "ok")?;
+        Ok(Json(json!({"retired":name,"external_files_deleted":false})))
     })
     .await
 }

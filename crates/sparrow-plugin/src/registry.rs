@@ -1,3 +1,4 @@
+use crate::trust::{Signature, TrustPolicy};
 use crate::{
     invalid, native::Native, FunctionDef, Manifest, MAX_ARTIFACT, MAX_MANIFEST, MAX_PACKAGES,
 };
@@ -49,6 +50,8 @@ struct Entry {
     enabled: bool,
     resident_attempted: bool,
     loaded: Option<Arc<Loaded>>,
+    signature: Option<Signature>,
+    signature_verified: bool,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct PackageInfo {
@@ -59,6 +62,8 @@ pub struct PackageInfo {
     pub resident: bool,
     pub pins: usize,
     pub hot_unload: bool,
+    pub publisher: Option<String>,
+    pub signature_verified: bool,
     /// Not a liveness probe: a child exit is observed on the next call.
     pub script_worker_state: Option<&'static str>,
     pub script_cache: Option<crate::script::CacheInfo>,
@@ -78,6 +83,8 @@ impl Entry {
                 .as_ref()
                 .map_or(0, |l| l.pins.load(Ordering::SeqCst)),
             hot_unload: self.manifest.is_isolated(),
+            publisher: self.signature.as_ref().map(|s| s.key_id.clone()),
+            signature_verified: self.signature_verified,
             wasm_module: match self.loaded.as_ref().map(|l| &l.backend) {
                 Some(Backend::Wasm(worker)) => Some(worker.cache().clone()),
                 _ => None,
@@ -110,6 +117,7 @@ pub struct Manager {
     allow_native: bool,
     script_worker: Option<PathBuf>,
     wasm_worker: Option<PathBuf>,
+    trust: TrustPolicy,
     entries: Mutex<BTreeMap<String, Entry>>,
     epoch: AtomicU64,
     _lock: Arc<sparrow_io::fs_lock::FileLock>,
@@ -219,7 +227,7 @@ fn read(path: &Path, cap: usize) -> Result<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let file = options.open(path).map_err(io)?;
     let meta = file.metadata().map_err(io)?;
@@ -256,6 +264,50 @@ impl Drop for Staging {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+fn dependency_order(entries: &BTreeMap<String, Entry>, manifest: &Manifest) -> Result<Vec<String>> {
+    fn visit(
+        entries: &BTreeMap<String, Entry>,
+        reference: &crate::PackageReference,
+        depth: usize,
+        names: &mut BTreeMap<String, String>,
+        active: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) -> Result<()> {
+        if depth > 8 || active.contains(&reference.manifest_sha256) {
+            return Err(invalid("cyclic or excessive package dependency depth"));
+        }
+        let entry = entries
+            .get(&reference.manifest_sha256)
+            .filter(|e| {
+                e.manifest.name == reference.name && e.manifest.version == reference.version
+            })
+            .ok_or_else(|| invalid("missing package dependency or name/version/hash mismatch"))?;
+        if names
+            .get(&reference.name)
+            .is_some_and(|id| id != &reference.manifest_sha256)
+        {
+            return Err(invalid("conflicting transitive package versions"));
+        }
+        names.insert(reference.name.clone(), reference.manifest_sha256.clone());
+        if out.contains(&reference.manifest_sha256) {
+            return Ok(());
+        }
+        active.push(reference.manifest_sha256.clone());
+        for dependency in entry.manifest.dependencies() {
+            visit(entries, dependency, depth + 1, names, active, out)?;
+        }
+        active.pop();
+        out.push(reference.manifest_sha256.clone());
+        Ok(())
+    }
+    let mut names = BTreeMap::from([(manifest.name.clone(), manifest.identity()?)]);
+    let mut out = Vec::new();
+    let mut active = Vec::new();
+    for reference in manifest.dependencies() {
+        visit(entries, reference, 1, &mut names, &mut active, &mut out)?;
+    }
+    Ok(out)
+}
 impl Manager {
     pub fn open(root: &Path, allow_native: bool) -> Result<Arc<Self>> {
         Self::open_with_scripts(root, allow_native, None)
@@ -273,6 +325,22 @@ impl Manager {
         script_worker: Option<PathBuf>,
         wasm_worker: Option<PathBuf>,
     ) -> Result<Arc<Self>> {
+        Self::open_with_policy(
+            root,
+            allow_native,
+            script_worker,
+            wasm_worker,
+            TrustPolicy::default(),
+        )
+    }
+    pub fn open_with_policy(
+        root: &Path,
+        allow_native: bool,
+        script_worker: Option<PathBuf>,
+        wasm_worker: Option<PathBuf>,
+        trust: TrustPolicy,
+    ) -> Result<Arc<Self>> {
+        trust.validate()?;
         for worker in [script_worker.as_ref(), wasm_worker.as_ref()]
             .into_iter()
             .flatten()
@@ -358,47 +426,91 @@ impl Manager {
             } else {
                 false
             };
-            let allowed = if manifest.is_script() {
-                script_worker.is_some()
-            } else if manifest.is_wasm() {
-                wasm_worker.is_some()
-            } else {
-                allow_native
-            };
-            let loaded = if desired && allowed {
-                Some(Arc::new(Loaded {
-                    backend: Backend::load(
-                        &manifest,
-                        &bytes,
-                        if manifest.is_wasm() {
-                            wasm_worker.as_deref()
-                        } else {
-                            script_worker.as_deref()
-                        },
-                    )?,
-                    pins: AtomicUsize::new(0),
-                    _lock: lock.clone(),
-                }))
+            let signature_path = item.path().join("signature.json");
+            let signature: Option<Signature> = if signature_path.try_exists().map_err(io)? {
+                Some(
+                    serde_json::from_slice(&read(&signature_path, 1024)?)
+                        .map_err(|_| invalid("invalid installed signature"))?,
+                )
             } else {
                 None
             };
+            let signature_verified =
+                signature.is_some() && trust.verify(&manifest, signature.as_ref()).is_ok();
             entries.insert(
                 digest.clone(),
                 Entry {
-                    resident_attempted: loaded.is_some() && !manifest.is_isolated(),
+                    resident_attempted: false,
                     manifest,
                     digest,
                     desired,
-                    enabled: desired && allowed,
-                    loaded,
+                    enabled: false,
+                    loaded: None,
+                    signature,
+                    signature_verified,
                 },
             );
+        }
+        // Preflight the ENTIRE installed dependency graph and active publisher
+        // policy before entering any native constructor or guest initialization.
+        let allowed = |m: &Manifest| {
+            if m.is_script() {
+                script_worker.is_some()
+            } else if m.is_wasm() {
+                wasm_worker.is_some()
+            } else {
+                allow_native
+            }
+        };
+        let mut activation = Vec::new();
+        for entry in entries.values() {
+            let deps = dependency_order(&entries, &entry.manifest)?;
+            if entry.desired && allowed(&entry.manifest) {
+                for id in deps
+                    .into_iter()
+                    .chain(std::iter::once(entry.digest.clone()))
+                {
+                    let required = &entries[&id];
+                    if !required.desired || !allowed(&required.manifest) {
+                        return Err(invalid(
+                            "approved package requires enabled compatible dependencies",
+                        ));
+                    }
+                    trust.verify(&required.manifest, required.signature.as_ref())?;
+                    if !activation.contains(&id) {
+                        activation.push(id);
+                    }
+                }
+            }
+        }
+        for digest in activation {
+            let entry = entries.get_mut(&digest).unwrap();
+            let bytes = read(
+                &root.join(&digest).join(entry.manifest.artifact_name()),
+                MAX_ARTIFACT,
+            )?;
+            entry.resident_attempted = !entry.manifest.is_isolated();
+            entry.loaded = Some(Arc::new(Loaded {
+                backend: Backend::load(
+                    &entry.manifest,
+                    &bytes,
+                    if entry.manifest.is_wasm() {
+                        wasm_worker.as_deref()
+                    } else {
+                        script_worker.as_deref()
+                    },
+                )?,
+                pins: AtomicUsize::new(0),
+                _lock: lock.clone(),
+            }));
+            entry.enabled = true;
         }
         Ok(Arc::new(Self {
             root: root.to_owned(),
             allow_native,
             script_worker,
             wasm_worker,
+            trust,
             entries: Mutex::new(entries),
             epoch: AtomicU64::new(0),
             _lock: lock,
@@ -406,6 +518,71 @@ impl Manager {
     }
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
+    }
+    pub fn signature_required(&self) -> bool {
+        self.trust.require_signed
+    }
+    /// Control holds its catalog lock before entering this method. Keep the
+    /// registry stable through publication; standalone registries have no DB.
+    pub fn with_references<T>(
+        &self,
+        refs: &[crate::PackageReference],
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if refs.len() > 64 {
+            return Err(invalid("too many pipeline package references"));
+        }
+        let entries = self.entries()?;
+        for reference in refs {
+            reference.validate()?;
+            let entry = entries
+                .get(&reference.manifest_sha256)
+                .filter(|e| {
+                    e.manifest.name == reference.name && e.manifest.version == reference.version
+                })
+                .ok_or_else(|| invalid("pipeline package reference is missing or mismatched"))?;
+            self.trust
+                .verify(&entry.manifest, entry.signature.as_ref())?;
+            dependency_order(&entries, &entry.manifest)?;
+        }
+        let result = publish();
+        drop(entries);
+        result
+    }
+    pub fn attest(&self, digest: &str, signature: Signature) -> Result<PackageInfo> {
+        let mut entries = self.entries()?;
+        let entry = entries
+            .get_mut(digest)
+            .ok_or_else(|| invalid("plugin not installed"))?;
+        self.trust.verify(&entry.manifest, Some(&signature))?;
+        let dir = self.root.join(digest);
+        let persisted: Manifest =
+            serde_json::from_slice(&read(&dir.join("manifest.json"), MAX_MANIFEST)?)
+                .map_err(|_| invalid("invalid installed manifest"))?;
+        if persisted != entry.manifest {
+            return Err(invalid("installed manifest changed"));
+        }
+        entry.manifest.check_artifact(&read(
+            &dir.join(entry.manifest.artifact_name()),
+            MAX_ARTIFACT,
+        )?)?;
+        let staging = Staging(self.root.join(format!(
+            ".staging-attest-{}-{}",
+            std::process::id(),
+            self.epoch()
+        )));
+        std::fs::create_dir(&staging.0).map_err(io)?;
+        write_new(
+            &staging.0.join("signature.json"),
+            &serde_json::to_vec(&signature).map_err(|_| invalid("invalid signature"))?,
+        )?;
+        std::fs::rename(staging.0.join("signature.json"), dir.join("signature.json"))
+            .map_err(io)?;
+        sync_dir(&dir)?;
+        entry.signature = Some(signature);
+        entry.signature_verified = true;
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(entry.info())
     }
     pub fn native_allowed(&self) -> bool {
         self.allow_native
@@ -425,11 +602,26 @@ impl Manager {
         Ok(self.entries()?.values().map(Entry::info).collect())
     }
     pub fn install(&self, manifest: Manifest, bytes: &[u8]) -> Result<PackageInfo> {
+        self.install_signed(manifest, bytes, None)
+    }
+    pub fn install_signed(
+        &self,
+        manifest: Manifest,
+        bytes: &[u8],
+        signature: Option<Signature>,
+    ) -> Result<PackageInfo> {
         manifest.check_artifact(bytes)?;
+        self.trust.verify(&manifest, signature.as_ref())?;
         let encoded = manifest.bytes()?;
         let digest = crate::sha256(&encoded);
         let mut entries = self.entries()?;
+        dependency_order(&entries, &manifest)?;
         if let Some(existing) = entries.get(&digest) {
+            if existing.signature != signature {
+                return Err(invalid(
+                    "package already installed with different provenance; use explicit attest",
+                ));
+            }
             return Ok(existing.info());
         }
         if entries.len() >= MAX_PACKAGES
@@ -449,6 +641,12 @@ impl Manager {
         std::fs::create_dir(&staging.0).map_err(io)?;
         write_new(&staging.0.join("manifest.json"), &encoded)?;
         write_new(&staging.0.join(manifest.artifact_name()), bytes)?;
+        if let Some(signature) = &signature {
+            write_new(
+                &staging.0.join("signature.json"),
+                &serde_json::to_vec(signature).map_err(|_| invalid("invalid signature"))?,
+            )?;
+        }
         sync_dir(&staging.0)?;
         std::fs::rename(&staging.0, self.root.join(&digest)).map_err(io)?;
         sync_dir(&self.root)?;
@@ -459,6 +657,8 @@ impl Manager {
             enabled: false,
             resident_attempted: false,
             loaded: None,
+            signature_verified: signature.is_some(),
+            signature,
         };
         let info = entry.info();
         entries.insert(digest, entry);
@@ -472,9 +672,23 @@ impl Manager {
             ));
         }
         let mut entries = self.entries()?;
+        let manifest = &entries
+            .get(digest)
+            .ok_or_else(|| invalid("plugin not installed"))?
+            .manifest;
+        for dep in dependency_order(&entries, manifest)? {
+            let dependency = &entries[&dep];
+            if !dependency.enabled {
+                return Err(invalid("package dependency must be enabled first"));
+            }
+            self.trust
+                .verify(&dependency.manifest, dependency.signature.as_ref())?;
+        }
         let entry = entries
             .get_mut(digest)
             .ok_or_else(|| invalid("plugin not installed"))?;
+        self.trust
+            .verify(&entry.manifest, entry.signature.as_ref())?;
         if if entry.manifest.is_script() {
             !self.script_allowed()
         } else if entry.manifest.is_wasm() {
@@ -536,6 +750,17 @@ impl Manager {
     }
     pub fn disable(&self, digest: &str) -> Result<PackageInfo> {
         let mut entries = self.entries()?;
+        if entries.values().any(|e| {
+            e.enabled
+                && e.manifest
+                    .dependencies()
+                    .iter()
+                    .any(|d| d.manifest_sha256 == digest)
+        }) {
+            return Err(invalid(
+                "enabled package depends on this version; disable dependents first",
+            ));
+        }
         let entry = entries
             .get_mut(digest)
             .ok_or_else(|| invalid("plugin not installed"))?;
@@ -560,6 +785,16 @@ impl Manager {
     }
     pub fn uninstall(&self, digest: &str) -> Result<()> {
         let mut entries = self.entries()?;
+        if entries.values().any(|e| {
+            e.manifest
+                .dependencies()
+                .iter()
+                .any(|d| d.manifest_sha256 == digest)
+        }) {
+            return Err(invalid(
+                "installed package depends on this version; uninstall dependents first",
+            ));
+        }
         let entry = entries
             .get(digest)
             .ok_or_else(|| invalid("plugin not installed"))?;

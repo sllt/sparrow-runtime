@@ -44,7 +44,7 @@ fi
 rustc -vV > "$out/evidence/rustc.txt"
 cargo --version > "$out/evidence/cargo.txt"
 cp Cargo.lock "$out/evidence/Cargo.lock"
-for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl sparrow-js-worker:sparrow-js-worker sparrow-wasm-worker:sparrow-wasm-worker sparrow-wasm-worker:sparrow-wasm-pack; do
+for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl sparrow-js-worker:sparrow-js-worker sparrow-wasm-worker:sparrow-wasm-worker sparrow-wasm-worker:sparrow-wasm-pack sparrow-plugin:sparrow-plugin-sign; do
     package=${pair%:*}; binary=${pair#*:}
     features=()
     if [[ "$jetstream" == 1 && "$binary" == sparrow-server ]]; then features=(--features jetstream); fi
@@ -131,6 +131,6 @@ jq -n --arg commit "$SPARROW_BUILD_COMMIT" --arg target "$host" --arg mode "$mod
     '{format:"sparrow-build-v1",source_commit:$commit,source_manifest_sha256:$source,
       target:$target,rust:"1.98.0",profile:"release",build_mode:$mode,default_features:false,
       jetstream_enabled:($jetstream==1),jetstream_maturity:"preview_not_profile_certified",
-      binaries:["sparrow-server","sparrowctl","sparrow-js-worker","sparrow-wasm-worker","sparrow-wasm-pack"],certification:"requires_matching_test_evidence"}' > "$out/build.json"
+      binaries:["sparrow-server","sparrowctl","sparrow-js-worker","sparrow-wasm-worker","sparrow-wasm-pack","sparrow-plugin-sign"],certification:"requires_matching_test_evidence"}' > "$out/build.json"
 (cd "$out" && find bin deploy docs evidence sdk examples scripts -type f -print | LC_ALL=C sort | while IFS= read -r file_path; do sha256sum "$file_path"; done; sha256sum build.json) > "$out/SHA256SUMS"
 printf 'PRODUCTION_PACKAGE_OK %s\n' "$out"

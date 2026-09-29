@@ -2,7 +2,7 @@
 # Isolated processes and package directories only. No existing service changes.
 set -euo pipefail
 umask 077
-unset SPARROW_SAFE_MODE
+unset SPARROW_SAFE_MODE SPARROW_PLUGIN_TRUST_STORE
 server=$(realpath "${1:?server binary}")
 ctl=$(realpath "${2:?sparrowctl binary}")
 root=${3:?new evidence directory}
@@ -152,6 +152,9 @@ if [[ "$kind" == script ]]; then
   jq -e --arg hash "$bad" '.packages[]|select(.manifest_sha256==$hash)|.script_worker_state=="failed"' "$root/after-failure.json" >/dev/null
   reject failed-worker-enable.json "$ctl" plugin-enable "$bad"
   "$ctl" plugin-disable "$bad" > "$root/disable-bad.json"
+  reject retained-bad.json "$ctl" plugin-uninstall "$bad"
+  "$ctl" retire-pipeline native "$etag" > "$root/retire-bad-history.json"
+  etag=
   "$ctl" plugin-uninstall "$bad" > "$root/uninstall-bad.json"
   run_version v1 "$old" 42 after-failure
 fi
@@ -162,6 +165,10 @@ reject safe-mode-enable.json "$ctl" plugin-enable "$old"
 stop; start
 "$ctl" plugins > "$root/restarted.json"
 jq -e '.packages|length==2 and all(.[]; .enabled)' "$root/restarted.json" >/dev/null
+"$ctl" plugin-references "$old" > "$root/references.json"
+jq -e '.count>0' "$root/references.json" >/dev/null
+reject retained-history.json "$ctl" plugin-uninstall "$old"
+"$ctl" retire-pipeline native "$etag" > "$root/retire-history.json"
 for id in "$old" "$new"; do
   "$ctl" plugin-disable "$id" > "$root/disable-$id.json"
   if [[ "$kind" == native ]]; then reject "resident-$id.json" "$ctl" plugin-uninstall "$id"; fi

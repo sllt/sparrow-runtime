@@ -1,8 +1,10 @@
 //! Immutable scalar packages: trusted native ABI or process-bounded JavaScript.
 mod manifest;
 mod native;
+mod native_dependencies;
 mod registry;
 pub mod script;
+pub mod trust;
 #[doc(hidden)]
 pub mod worker;
 pub use manifest::*;

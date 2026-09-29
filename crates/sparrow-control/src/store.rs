@@ -19,7 +19,9 @@ use crate::reference_table::{
 use crate::spec::PipelineSpec;
 use crate::status::PipelineStatus;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 3;
+pub const CATALOG_SCHEMA_VERSION: u32 = 4;
+#[path="store_plugins.rs"]
+mod plugin_catalog;
 pub const FORMAT_VERSION: u32 = 1;
 const AUDIT_CAP: usize = 200;
 const ATTEMPT_CAP: usize = 100;
@@ -802,6 +804,7 @@ impl Store {
         activate: bool,
     ) -> Result<PipelineRow> {
         check_name(name)?;
+        let plugin_refs=plugin_catalog::references(spec)?;
         self.write(|c| {
             let current: Option<(u64, String)> = c
                 .query_row(
@@ -849,6 +852,9 @@ impl Store {
                 params![name, next as i64, spec_json, etag, ts],
             )
             .map_err(db)?;
+            if !plugin_refs.is_empty() {
+                crate::plugins::manager(self)?.with_references(&plugin_refs,||plugin_catalog::insert(c,name,next,&plugin_refs))?;
+            }
             // Materialize every immutable table dependency in the same
             // transaction as the pipeline revision.  GC therefore cannot
             // observe a committed pipeline whose referenced revision is not
@@ -1892,16 +1898,18 @@ fn init(conn: &Connection) -> Result<()> {
             "#,
         )
         .map_err(db)?;
-        if ver == CATALOG_SCHEMA_VERSION && !reference_catalog_schema_complete(conn)? {
+        if ver >= 3 && !reference_catalog_schema_complete(conn)? {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
                 "catalog schema v3 is missing immutable reference-table dependency tables; refusing to continue or GC",
             ));
         }
+        if ver>=4 && !plugin_catalog::schema_complete(conn)? {return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"catalog schema v4 is missing plugin reference protection; refusing maintenance"));}
         if ver < CATALOG_SCHEMA_VERSION {
             migrate_actual_consecutive_failures(conn)?;
             migrate_restart_blocked(conn)?;
             migrate_reference_table_catalog(conn)?;
+            plugin_catalog::migrate(conn)?;
             if ver == 0 {
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES ('catalog_schema_version', ?1), ('format_version', ?2)",
@@ -2969,7 +2977,7 @@ mod tests {
     fn r5_v1_migration_preserves_failures_and_does_not_rearm_unlocked_jobs() {
         let c = legacy_v1_catalog();
         init(&c).unwrap();
-        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 3);
+        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), CATALOG_SCHEMA_VERSION);
         assert_eq!(meta_u32(&c, "format_version").unwrap(), 1);
         for (name, expected) in [
             ("a", true),
@@ -3031,7 +3039,7 @@ mod tests {
             .is_err());
         c.execute_batch("DROP TRIGGER fail_migration;").unwrap();
         init(&c).unwrap();
-        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), 3);
+        assert_eq!(meta_u32(&c, "catalog_schema_version").unwrap(), CATALOG_SCHEMA_VERSION);
     }
 
     #[test]

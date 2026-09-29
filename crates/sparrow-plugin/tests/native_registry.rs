@@ -45,6 +45,7 @@ fn artifact() -> &'static Vec<u8> {
 }
 fn manifest(version: &str) -> Manifest {
     Manifest {
+        package:None,
         format: 1,
         name: "native_test".into(),
         version: version.into(),

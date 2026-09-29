@@ -14,6 +14,8 @@ pub fn script_worker_slots() -> usize {
 struct Install {
     manifest: Manifest,
     artifact_base64: String,
+    #[serde(default)]
+    signature: Option<sparrow_expr::plugins::trust::Signature>,
 }
 pub fn configure_from_env(store: &crate::Store, safe_mode: bool) -> Result<()> {
     let native = match std::env::var("SPARROW_ENABLE_NATIVE_PLUGINS").as_deref() {
@@ -52,11 +54,17 @@ pub fn configure_from_env(store: &crate::Store, safe_mode: bool) -> Result<()> {
         None
     };
     match std::env::var_os("SPARROW_PLUGIN_DIR") {
-        Some(root) => store.configure_plugins(Manager::open_with_workers(
+        Some(root) => store.configure_plugins(Manager::open_with_policy(
             std::path::Path::new(&root),
             native && !safe_mode,
             worker,
             wasm_worker,
+            match std::env::var_os("SPARROW_PLUGIN_TRUST_STORE") {
+                Some(path) => sparrow_expr::plugins::trust::TrustPolicy::from_file(
+                    std::path::Path::new(&path),
+                )?,
+                None => Default::default(),
+            },
         )?),
         None if native || script || wasm => {
             Err(invalid("plugins require an explicit SPARROW_PLUGIN_DIR"))
@@ -88,5 +96,5 @@ pub fn install(store: &crate::Store, bytes: &[u8]) -> Result<PackageInfo> {
     let artifact = base64::engine::general_purpose::STANDARD
         .decode(&body.artifact_base64)
         .map_err(|_| invalid("invalid plugin base64"))?;
-    manager(store)?.install(body.manifest, &artifact)
+    manager(store)?.install_signed(body.manifest, &artifact, body.signature)
 }

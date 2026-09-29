@@ -50,6 +50,7 @@ fn worker(root: &Dir) -> PathBuf {
 }
 fn manifest(source: &str, version: &str, ty: ValueType) -> Manifest {
     Manifest {
+        package:None,
         format: 1,
         name: "script_test".into(),
         version: version.into(),
