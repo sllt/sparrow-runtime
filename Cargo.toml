@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/sparrow-model",
     "crates/sparrow-plugin",
+    "crates/sparrow-js-worker",
     "crates/sparrow-expr",
     "crates/sparrow-plan",
     "crates/sparrow-io",
@@ -20,6 +21,7 @@ members = [
 default-members = [
     "crates/sparrow-model",
     "crates/sparrow-plugin",
+    "crates/sparrow-js-worker",
     "crates/sparrow-expr",
     "crates/sparrow-plan",
     "crates/sparrow-io",

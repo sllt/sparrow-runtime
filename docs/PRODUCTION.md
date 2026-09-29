@@ -4,6 +4,28 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="script-plugins-validation"></a>
+## JavaScript 标量：2026-09-29 限定 Preview
+
+基线为原生标量提交 `09db48b`。同一服务器 `box@100.64.0.19` 的证据根为 `/workspace/bench-compare/scripts-20260929-MKWwFR`，最终选型为 **QuickJS-ng 0.16.2 / rquickjs 0.14.0 + 独立执行进程**，不保留生产 Boa 依赖。具体支持边界见 [PLUGINS](PLUGINS.md#javascript-标量函数)。没有恢复 JetStream 高负载专题，没有本机 Cargo 编译。
+
+- 选型微测试：`engine-evaluation-r4.json`、`engine-results-r4.jsonl`、`engine-summary-r4.json`、`engine-source-r4.sha256`、`engine-evidence-r4.sha256` 与 `frozen/engine-eval-r4`。Rust 1.98.0，Linux x86_64/8 vCPU；ABBA、6 项×1,000次×4轮（24,000次），每项另预热20次；共享进程隔离策略而非混比同进程与跨进程。QuickJS 的 64MiB 内层堆限制及中断回调开启，128MiB 进程地址空间与100ms父进程期限两者相同。
+- 两者各测无限循环、嵌套循环、过大 ArrayBuffer、递归、复杂正则、超大 BigInt。正常用例全部完成，异常由引擎拒绝或父进程超时终止；这不是任意恶意代码的安全证明。`engine-run-r4.exit=0`。首次 Boa 10k 循环预算拒绝64KiB JSON，调整1M后重跑；原始日志及 R3 源码归档保留，未拿配置失败算作性能优势。
+- Boa 原型仅作为选型验证：`scripts-tests-r3.log` 的10项脚本＋7项原生通过，不冒充最终 QuickJS 验证。其初轮被 Cargo 产物 group-write 权限拒绝，随后测试按安全安装方式复制私有 executable；第二轮暴露统一1.5MiB scratch超过默认Job配额，改成按声明类型有界预留并收紧响应frame，未放宽配额。
+
+最终 QuickJS 源码目录 `source-quickjs/` 与本地 **464 个代码/构建/SDK/测试文件**逐一匹配；`source-final.sha256` 自身 SHA-256：`8f10e34e59cc4bc23265f2cfda07c222726d9cfcd9206c5ca97705ad85ff6e47`。文档收尾另记，不改变 Rust 验收构建。最终二进制和脚本测试可执行文件位于 `frozen/final/`，指纹为 `frozen-final.sha256`。
+
+- 默认14成员、locked Release、`--features sparrow-server/jetstream`：**982 passed / 21 ignored**，`quickjs-final-full.log/.exit=0`。不是包含实验包的 `--workspace`，ignored不算通过。
+- 独立 no-demo Server/CLI：**47 passed / 0 ignored**，`quickjs-final-no-demo.log/.exit=0`；Server/CLI/worker 的生产二进制构建通过，`quickjs-final-build.log/.exit=0`。Server/CLI 的 normal/build 依赖图没有 JS 引擎，worker没有意外开启 allocator/rust-alloc/loader，见三个 `*-dependencies.txt` 及 `worker-features.txt`。打包/冻结脚本做了语法与依赖门禁检查，未冒充完整发行包验收。
+- 最终冻结 worker＋12项脚本测试，重复5轮：**60 passed / 0 ignored**，`script-test-list.txt`、`scripts-repeat-final.log/.exit=0`。覆盖7类scalar/精确64位BigInt/NULL、UTF8与Bytes边界、动态构造器拒绝、异步结果拒绝、64MiB VM内存上限、无限循环/递归/超时、取消/Job退款、全局状态隔离、版本/pin/重启/热卸载、worker配额与失败恢复、SQL/Graph以及fresh-only拒绝。
+- 真实 no-demo Server/CLI：`process-final.log/.exit=0`、`process-final/result.json`，File→JS→File，v1/v2/回退输出 **42→63→42**；另让复杂正则使Job失败，Server保持健康，其他版本继续输出42。运行pin、safe-mode、正常重启恢复批准版本、失败worker拒绝伪重新启用、停用后热卸载及缺包拒绝均通过。复现：`scripts/plugins-script-smoke.sh SERVER CLI NEW_DIR`，worker放在Server同目录或显式设置 `SPARROW_JS_WORKER`。
+- 原生真实进程回归 `native-process-final.log/.exit=0` 通过，仍要求驻留版本停用后重启才能卸载。v1 manifest identity 与09-27历史 `process-reviewed/install-v1.json`完全相同，未改原生manifest编码/hash合同。
+- 无Server父进程期限控制的worker测试：`worker-limits-final-r2.log/.exit=0` 与目录内 `result.json`，复杂正则返回受控Error，超大frame/截断header被拒绝。本次 `standalone_exit=0`，**没有把它当成实际触发SIGALRM的证据**。首轮缺少测试脚本依赖 `xxd`，在启动worker前退出；改成Bash帧头编码后通过，未改引擎限额或Rust代码。复现：`scripts/plugins-worker-limits-smoke.sh WORKER NEW_DIR`。
+
+初轮 QuickJS 982/47与真实脚本进程试跑也通过。本轮review覆盖声明相关IPC预算/错误上下文、继承信号清理、无脚本Job不安装task-local及独立worker冻结；最终Rust候选重新通过上述完整回归。验收脚本去除xxd依赖、打包脚本扩大SDK/示例指纹范围属于收尾Shell改动，另做语法/依赖与真实worker检查，未因此再编译Rust。过程源码/失败日志仍保留，源码指纹不以“同分支/同版本号”替代。
+
+**仍未宣称**：长时间 soak、aarch64实机、父进程SIGKILL/独立SIGALRM/掉电故障矩阵、完整发行包认证、seccomp/namespace安全沙箱、多租户隔离、流水线容量认证、aligned恢复或有限查询脚本资格。编译缓存、批量IPC/实例池和增强错误栈仍在 OPT-016，不将整个EXT-08或第8批勾选完成。
+
 <a id="native-plugins-validation"></a>
 ## 插件共同管理与可信原生函数：2026-09-27 首个子批
 

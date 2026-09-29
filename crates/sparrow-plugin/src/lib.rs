@@ -1,7 +1,8 @@
-//! Explicitly trusted, immutable native scalar packages. No process sandbox.
+//! Immutable scalar packages: trusted native ABI or process-bounded JavaScript.
 mod manifest;
 mod native;
 mod registry;
+pub mod script;
 pub use manifest::*;
 pub use native::{resident_count, MAX_RESIDENT};
 pub use registry::{Function, Manager, PackageInfo};

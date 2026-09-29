@@ -688,7 +688,10 @@ pub(super) async fn run(ctx: JobCtx, mut req: JobRequest) -> Result<JobStats> {
                             union(&child, input, output.remove(0).1).await
                         }
                     } else {
-                        router(&child, stage, input.remove(0), output).await
+                        let future = router(&child, stage, input.remove(0), output);
+                        if child.script_plugins {
+                            sparrow_expr::plugins::script::scope(child.cancel.clone(), future).await
+                        } else { future.await }
                     };
                     if child.optional_branch && result.is_err() {
                         child.cancel.cancel();

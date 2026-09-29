@@ -67,7 +67,7 @@ pub fn execute(
     cancel: CancellationToken,
 ) -> Result<FiniteResult> {
     limits.validate()?;
-    if plan.has_plugins(){return Err(bound("in-process native plugins are not preemptible; finite query execution rejects them"));}
+    if plan.has_plugins(){return Err(bound("finite queries reject plugins: native is not preemptible; script aggregate query work budgeting is not enabled"));}
     if plan.stages.len() > 32
         || plan
             .stages

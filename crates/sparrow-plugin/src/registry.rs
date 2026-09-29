@@ -15,9 +15,26 @@ use std::{
 };
 
 struct Loaded {
-    native: Native,
+    backend: Backend,
     pins: AtomicUsize,
     _lock: Arc<sparrow_io::fs_lock::FileLock>,
+}
+enum Backend {
+    Native(Native),
+    Script(crate::script::Script),
+}
+impl Backend {
+    fn load(manifest: &Manifest, bytes: &[u8], worker: Option<&Path>) -> Result<Self> {
+        if manifest.is_script() {
+            Ok(Self::Script(crate::script::Script::load(
+                manifest,
+                bytes,
+                worker.ok_or_else(|| invalid("JavaScript worker is not configured"))?,
+            )?))
+        } else {
+            Ok(Self::Native(Native::load(manifest, bytes)?))
+        }
+    }
 }
 struct Entry {
     manifest: Manifest,
@@ -36,6 +53,8 @@ pub struct PackageInfo {
     pub resident: bool,
     pub pins: usize,
     pub hot_unload: bool,
+    /// Not a liveness probe: a child exit is observed on the next call.
+    pub script_worker_state: Option<&'static str>,
 }
 impl Entry {
     fn info(&self) -> PackageInfo {
@@ -44,18 +63,27 @@ impl Entry {
             manifest_sha256: self.digest.clone(),
             desired_enabled: self.desired,
             enabled: self.enabled,
-            resident: self.resident_attempted,
+            resident: self.resident_attempted || self.loaded.is_some(),
             pins: self
                 .loaded
                 .as_ref()
                 .map_or(0, |l| l.pins.load(Ordering::SeqCst)),
-            hot_unload: false,
+            hot_unload: self.manifest.is_script(),
+            script_worker_state: if self.manifest.is_script() {
+                Some(match self.loaded.as_ref().map(|l| &l.backend) {
+                    Some(Backend::Script(script)) => script.state(),
+                    _ => "unloaded",
+                })
+            } else {
+                None
+            },
         }
     }
 }
 pub struct Manager {
     root: PathBuf,
     allow_native: bool,
+    script_worker: Option<PathBuf>,
     entries: Mutex<BTreeMap<String, Entry>>,
     epoch: AtomicU64,
     _lock: Arc<sparrow_io::fs_lock::FileLock>,
@@ -96,6 +124,9 @@ impl Drop for Function {
     }
 }
 impl Function {
+    pub fn is_script(&self) -> bool {
+        matches!(&self.loaded.backend, Backend::Script(_))
+    }
     pub fn definition(&self) -> &FunctionDef {
         &self.definition
     }
@@ -123,9 +154,20 @@ impl Function {
         Ok(self.definition.output.data_type())
     }
     pub fn invoke(&self, args: &[Scalar]) -> Result<Scalar> {
-        self.loaded.native.invoke(&self.definition, args)
+        let result = match &self.loaded.backend {
+            Backend::Native(n) => n.invoke(&self.definition, args),
+            Backend::Script(s) => s.invoke(&self.definition, args),
+        };
+        result.map_err(|e| {
+            e.context("plugin_package", &self.package)
+                .context("plugin_version", &self.version)
+                .context("plugin_function", &self.definition.name)
+        })
     }
     pub fn scratch_bytes(&self) -> usize {
+        if self.is_script() {
+            return crate::script::scratch_bytes(&self.definition);
+        }
         self.definition
             .max_output_bytes
             .saturating_mul(3)
@@ -183,6 +225,16 @@ impl Drop for Staging {
 }
 impl Manager {
     pub fn open(root: &Path, allow_native: bool) -> Result<Arc<Self>> {
+        Self::open_with_scripts(root, allow_native, None)
+    }
+    pub fn open_with_scripts(
+        root: &Path,
+        allow_native: bool,
+        script_worker: Option<PathBuf>,
+    ) -> Result<Arc<Self>> {
+        if let Some(worker) = &script_worker {
+            crate::script::validate_worker(worker)?;
+        }
         // Parent directory is administrator-owned. Refuse a symlink or writable
         // package root; artifact loads additionally use a verified sealed copy.
         if !root.exists() {
@@ -251,7 +303,7 @@ impl Manager {
             {
                 return Err(invalid("installed plugin identity/version conflict"));
             }
-            let bytes = read(&item.path().join("artifact.so"), MAX_ARTIFACT)?;
+            let bytes = read(&item.path().join(manifest.artifact_name()), MAX_ARTIFACT)?;
             manifest.check_artifact(&bytes)?;
             let marker = item.path().join("enabled");
             let desired = if marker.exists() {
@@ -262,9 +314,14 @@ impl Manager {
             } else {
                 false
             };
-            let loaded = if desired && allow_native {
+            let allowed = if manifest.is_script() {
+                script_worker.is_some()
+            } else {
+                allow_native
+            };
+            let loaded = if desired && allowed {
                 Some(Arc::new(Loaded {
-                    native: Native::load(&manifest, &bytes)?,
+                    backend: Backend::load(&manifest, &bytes, script_worker.as_deref())?,
                     pins: AtomicUsize::new(0),
                     _lock: lock.clone(),
                 }))
@@ -274,11 +331,11 @@ impl Manager {
             entries.insert(
                 digest.clone(),
                 Entry {
+                    resident_attempted: loaded.is_some() && !manifest.is_script(),
                     manifest,
                     digest,
                     desired,
-                    enabled: desired && allow_native,
-                    resident_attempted: loaded.is_some(),
+                    enabled: desired && allowed,
                     loaded,
                 },
             );
@@ -286,6 +343,7 @@ impl Manager {
         Ok(Arc::new(Self {
             root: root.to_owned(),
             allow_native,
+            script_worker,
             entries: Mutex::new(entries),
             epoch: AtomicU64::new(0),
             _lock: lock,
@@ -296,6 +354,9 @@ impl Manager {
     }
     pub fn native_allowed(&self) -> bool {
         self.allow_native
+    }
+    pub fn script_allowed(&self) -> bool {
+        self.script_worker.is_some()
     }
     fn entries(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, Entry>>> {
         self.entries
@@ -329,7 +390,7 @@ impl Manager {
         )));
         std::fs::create_dir(&staging.0).map_err(io)?;
         write_new(&staging.0.join("manifest.json"), &encoded)?;
-        write_new(&staging.0.join("artifact.so"), bytes)?;
+        write_new(&staging.0.join(manifest.artifact_name()), bytes)?;
         sync_dir(&staging.0)?;
         std::fs::rename(&staging.0, self.root.join(&digest)).map_err(io)?;
         sync_dir(&self.root)?;
@@ -347,12 +408,6 @@ impl Manager {
         Ok(info)
     }
     pub fn enable(&self, digest: &str, approve: &str) -> Result<PackageInfo> {
-        if !self.allow_native {
-            return Err(SparrowError::new(
-                ErrorCode::PolicyDenied,
-                "native plugins are disabled by server configuration",
-            ));
-        }
         if !crate::digest_name(digest) || approve != digest {
             return Err(invalid(
                 "explicit approval must equal exact manifest SHA256",
@@ -362,19 +417,38 @@ impl Manager {
         let entry = entries
             .get_mut(digest)
             .ok_or_else(|| invalid("plugin not installed"))?;
+        if if entry.manifest.is_script() {
+            !self.script_allowed()
+        } else {
+            !self.allow_native
+        } {
+            return Err(SparrowError::new(
+                ErrorCode::PolicyDenied,
+                "plugin backend is disabled by server configuration",
+            ));
+        }
         if entry.enabled {
+            if matches!(entry.loaded.as_ref().map(|l| &l.backend), Some(Backend::Script(s)) if s.state()=="failed")
+            {
+                return Err(invalid(
+                    "JavaScript worker failed; stop users, disable and re-enable package",
+                ));
+            }
             return Ok(entry.info());
         }
         if entry.loaded.is_none() {
-            let bytes = read(&self.root.join(digest).join("artifact.so"), MAX_ARTIFACT)?;
+            let bytes = read(
+                &self.root.join(digest).join(entry.manifest.artifact_name()),
+                MAX_ARTIFACT,
+            )?;
             if entry.resident_attempted {
                 return Err(invalid(
                     "previous native activation failed; restart before retry",
                 ));
             }
-            entry.resident_attempted = true;
+            entry.resident_attempted = !entry.manifest.is_script();
             entry.loaded = Some(Arc::new(Loaded {
-                native: Native::load(&entry.manifest, &bytes)?,
+                backend: Backend::load(&entry.manifest, &bytes, self.script_worker.as_deref())?,
                 pins: AtomicUsize::new(0),
                 _lock: self._lock.clone(),
             }));
@@ -410,6 +484,9 @@ impl Manager {
         }
         entry.enabled = false;
         entry.desired = false;
+        if entry.manifest.is_script() {
+            entry.loaded = None;
+        }
         self.epoch.fetch_add(1, Ordering::SeqCst);
         Ok(entry.info())
     }
@@ -461,6 +538,11 @@ impl Manager {
             .as_ref()
             .ok_or_else(|| invalid("plugin backend not loaded"))?
             .clone();
+        if matches!(&loaded.backend, Backend::Script(s) if s.state()=="failed") {
+            return Err(invalid(
+                "JavaScript worker failed; stop users, disable and re-enable package",
+            ));
+        }
         loaded.pins.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(Function {
             loaded,

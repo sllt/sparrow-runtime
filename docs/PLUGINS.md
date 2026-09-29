@@ -1,6 +1,6 @@
-# 插件：共同管理与可信原生函数 Preview
+# 插件：共同管理、可信原生与 JavaScript 函数 Preview
 
-第8批首个完整子批：包安装/校验、版本固定、启停/查询、显式升级回退，以及SQL/Graph调用原生标量函数。**2026-09-27 实现、自查和限定服务器验证完成，尚未发行。** 脚本、WASM、Transform和Source/Sink外部插件尚未实现，不能把本子批算作整个插件体系完成。
+第8批按子批交付：共同管理＋可信原生标量（2026-09-27），随后 JavaScript 标量（2026-09-29）。支持包安装/校验、版本固定、启停/查询、显式升级回退与 SQL/Graph 调用。**仍为未发行的 Development Preview**，验证范围见 [PRODUCTION](PRODUCTION.md#script-plugins-validation)。WASM、Transform 和 Source/Sink 外部插件仍待实现，不能把标量子批算作整个插件体系完成。
 
 ## 信任与部署
 
@@ -66,4 +66,57 @@ artifact大小/加载次数上限不是进程RSS上限；ELF段、系统依赖�
 
 真实no-demo Server/CLI进程也通过：File→native→File，同一输入21在v1/v2/v1输出 **42→63→42**；运行中停用拒绝、safe-mode不自动加载、正常重启恢复启用、驻留卸载拒绝、停用重启后卸载、缺包拒绝。可复现脚本为 `scripts/plugins-native-smoke.sh SERVER CLI NEW_EVIDENCE_DIR`。初轮脚本权限/CAS失败保留，不放宽生产校验；最终源码、二进制和日志指纹见[匹配证据](PRODUCTION.md#native-plugins-validation)。未测aarch64、长稳、ABI恶意机器码隔离、掉电存储故障或性能/整体发行认证。
 
-下一子批为脚本函数，其后WASM，最终完成Transform/Source/Sink SDK及必要隔离。签名信任链、任意native隔离/强制终止、外部Connector恢复、自定义UDAF不因这次scalar通过而自动获得支持。
+后续为 WASM、Transform/Source/Sink SDK 及必要隔离。签名信任链、任意 native 隔离/强制终止、外部 Connector 恢复、自定义 UDAF 不因 scalar 通过而自动获得支持。
+
+## JavaScript 标量函数
+
+引擎固定为 **QuickJS-ng 0.16.2（rquickjs 0.14.0）**，不是 Node.js、浏览器或 Boa。引擎只链接进独立的 `sparrow-js-worker`，不进入 Server/CLI 的进程地址空间。现阶段支持 Linux GNU x86_64/aarch64，实机验证仅 x86_64；要求 Linux `close_range` 支持（5.9+）。
+
+```sh
+export SPARROW_PLUGIN_DIR=/var/lib/sparrow/plugins
+export SPARROW_ENABLE_SCRIPT_PLUGINS=1
+# 默认寻找 sparrow-server 同目录的此文件，也可显式指定绝对路径。
+export SPARROW_JS_WORKER=/opt/sparrow/current/bin/sparrow-js-worker
+bash scripts/build-script-plugin-example.sh /tmp/script-math-v1
+sparrowctl plugin-install /tmp/script-math-v1/manifest.json /tmp/script-math-v1/script_math.js
+sparrowctl plugin-enable MANIFEST_SHA256
+```
+
+管理员负责安全安装 worker 及其父目录；worker 必须为 root/服务用户所有、非 symlink、非 setuid/setgid、不可被组/其他用户写入的可执行普通文件。生产构建脚本一并打包 worker、JS 示例和生成 manifest 的脚本。**不需要启用原生插件开关**；safe-mode 同样阻止脚本自动激活和手工 enable。默认 systemd 示例使用 safe-mode，启用插件须显式选择非 safe-mode 的部署配置。
+
+manifest 使用 `kind:"javascript_scalar"`、`target:"javascript-quickjs-ng-0.16.2-v1"`，其余共用 ABI/semantics v1、函数类型声明及 NULL 传播合同。源文件最多 32KiB UTF-8；最后一个表达式返回按声明名称导出函数的对象，不是 ES module：
+
+```javascript
+({
+    double(value) { return value * 2n; },
+    upper(value) { return value.toUpperCase(); }
+})
+```
+
+SQL/Graph 调用方式不变，例如 `plugin_call('script_math','v1','完整manifest_sha256','double',value)`。Int64、UInt64、微秒 Timestamp **精确映射为 BigInt**，须用 `2n` 而不是 `2`；返回 Number 不会隐式截断为 64 位整数。Float64 对应有限 Number，Bool 对应 boolean，UTF8 对应 string，Bytes 对应 Uint8Array。严格拒绝整数溢出、类型错误、非有限浮点和非法 UTF-16 字符串；返回 null 允许传播，undefined、Promise 和其他对象不是标量输出。
+
+### 隔离、配额和故障
+
+- 每个已激活版本独占一个复用的执行进程，同版本调用串行；全服务进程最多 **4 个脚本 worker 名额**。名额与原生 16 次驻留加载尝试独立。仍可安装最多 16 个包版本，但未使用的脚本版本应停用以释放名额。
+- **每次调用新建 Runtime＋Context**，不共享全局变量、原型修改、闭包状态或 Promise 队列；不执行异步 jobs。包源代码保留在 worker 中，不使用持久字节码/编译缓存或跨调用实例池，也不接受上传 bytecode。该隔离策略存在初始化/解析开销，后续缓存优化须重新证明状态隔离。
+- worker 地址空间 `RLIMIT_AS=128MiB`（不是 RSS 预分配），每个 QuickJS Runtime 堆上限 64MiB、JS 栈上限 1MiB。主机全 Job 的 IPC 编码/解码/返回值另按函数类型计入既有 reservation；worker 自身的地址空间**不冒充**已由 Job `MemoryOwner` 记账。部署总内存预算须包含子进程。
+- 每次调用最多 8 个参数、总标量 payload 最多 64KiB；文本/Bytes 输出受函数声明上限约束，最高 64KiB。IPC frame 最高 512KiB，实际响应还按声明收紧；长度检查先于主进程分配。
+- 调用期限 **100ms**，包含等待同版本的其他调用和 IPC；启用验证期限 2s。内层 QuickJS 中断只是辅助，主进程轮询期限/Job cancellation 后 kill＋wait 回收进程，防止正则等内建长操作绕过中断。不是实时调度 SLA，也不能消除阻塞内核 I/O 的影响。
+- worker 自带调用 1s/初始化 3s 的 SIGALRM 兜底；父进程消失时，空闲 worker 由 stdin EOF 退出，忙碌 worker 由自身 watchdog 终止。没有使用 Linux 绑定到创建线程的 PDEATHSIG，避免 Tokio 临时 blocking 线程退出误杀 worker。
+- 清空 worker 环境并关闭继承的非标准 fd，不注册 FS、网络、模块 loader 或宿主回调；关闭 eval/Function 及 async/generator constructor 动态编译路径、Date、Math.random、SharedArrayBuffer/Atomics 等入口。**资源/进程隔离不是 seccomp、namespace 或不可信多租户的完整 OS 沙箱**；worker 仍以服务用户运行，不承诺防御引擎漏洞。代码仍需管理员审查及精确 hash 批准。
+- 脚本异常让对应 Job 失败，不静默丢弃/吞错。期限、取消、worker 退出或协议故障会把该版本的 worker 标记为 failed，不自动无限重启；同一版本的其他调用也会失败，其他版本的 worker 独立。先停止使用者，再 disable→enable 恢复。`script_worker_state` 为最近观测到的 ready/busy/failed/unloaded 状态，不是周期 liveness probe。
+- disable 仍拒绝存在 plan/job pin 的包；脚本无 pin 时会回收进程，随后可以**不重启 Server 就卸载**。原生仍必须停用后重启，不能混同。顶层 `hot_unload:false` 表示并非所有后端支持；以包的 `hot_unload` 或 `script_hot_unload` 为准。
+
+脚本仍 **restart_fresh-only**，不能用于 aligned/checkpoint 恢复。`/v1/query` 当前也拒绝脚本：单次可取消不等于已经实现整次有限查询的脚本工作预算。WASM、外部 Source/Sink、编译缓存、批量 IPC、实例池、长期 soak、aarch64 验证另行交付。
+
+### 为什么最终选择 QuickJS
+
+同服务器、128MiB 进程地址空间、100ms 父进程期限、复用进程但每请求新 Context；ABBA 顺序、6 种正常 workload，每轮每项 1,000 次（另预热 20 次），共 24,000 次。QuickJS 同时开启 64MiB Runtime 上限和中断回调。各轮 p50 的均值：
+
+| 场景 | Boa 0.22.0 | QuickJS-ng 0.16.2 |
+|---|---:|---:|
+| BigInt 计算 | 381μs | 143μs |
+| JSON 业务规则 | 452μs | 153μs |
+| 64KiB JSON 字符串 | 1,917μs | 627μs |
+
+这是包含测试 IPC、新 Context 和解析/执行的微测试，**不是完整 Sparrow 流水线吞吐，也不是复用上下文/字节码缓存的排名**。同口径 QuickJS 约快 2.5～3 倍；两者的复杂正则都需要父进程兜底。Boa 初轮 10k 循环预算误拒绝 64KiB JSON（内置函数也消耗预算），调整为 1M 后重跑全部普通用例通过，并非把初轮配置失败算作引擎缺陷。完整版本、配置、源码/二进制指纹及原始失败日志见 [匹配证据](PRODUCTION.md#script-plugins-validation)。

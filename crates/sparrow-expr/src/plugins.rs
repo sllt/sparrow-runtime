@@ -1,5 +1,6 @@
 //! Binding-only registry scope. Runtime expressions contain immutable owning
-//! handles, never a mutable name lookup or thread-local execution dependency.
+//! handles, never a mutable name lookup. Script cancellation uses a separate
+//! task-local scope, not this binding-only thread-local registry.
 use crate::Expr;
 use sparrow_model::{ErrorCode, Result, Scalar, SparrowError};
 pub use sparrow_plugin::*;

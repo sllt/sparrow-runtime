@@ -972,7 +972,10 @@ impl Kernel {
             JobMailboxObserver::new(&req.plan, attempt.raw(), self.opts.mailbox, &owner)
                 .map_err(|e| e.retryable(true).context("admission", "capacity"))?;
         let work = Arc::new(WorkBudget::new(self.job_budget.work_units));
+        let mut script_plugins = false;
+        req.plan.visit_plugins(&mut |f| script_plugins |= f.is_script());
         let ctx = JobCtx {
+            script_plugins,
             query_work: req
                 .work_lifetime
                 .map(|limit| Arc::new(AtomicU64::new(limit))),
@@ -1136,6 +1139,7 @@ fn admit_process(
 }
 
 struct JobCtx {
+    script_plugins: bool,
     query_work: Option<Arc<AtomicU64>>,
     live_silence: Option<Arc<live_silence::Config>>,
     ordered_time: bool,
@@ -1361,6 +1365,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
 
 fn clone_ctx(ctx: &JobCtx) -> JobCtx {
     JobCtx {
+        script_plugins: ctx.script_plugins,
         query_work: ctx.query_work.clone(),
         live_silence: ctx.live_silence.clone(),
         ordered_time: ctx.ordered_time,
@@ -1461,7 +1466,8 @@ fn spawn_stage(
         let optional = ctx.optional_branch;
         let local_cancel = ctx.cancel.clone();
         let branch_metrics = ctx.metrics.clone();
-        let result = stage_loop(
+        let script_plugins = ctx.script_plugins;
+        let future = stage_loop(
             ctx,
             stage,
             rx,
@@ -1474,8 +1480,12 @@ fn spawn_stage(
             live_ctrl,
             live_events,
             trailing_controls,
-        )
-        .await;
+        );
+        let result = if script_plugins {
+            sparrow_expr::plugins::script::scope(local_cancel.clone(), future).await
+        } else {
+            future.await
+        };
         min_remaining.fetch_min(work.remaining(), Ordering::Relaxed);
         // Window stages return their output count. Do not add intermediate
         // emissions to JobStats.ingested_rows when joining all stage tasks.

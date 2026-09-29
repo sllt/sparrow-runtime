@@ -11,7 +11,7 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 - Processing-time tumbling windows and count windows (arrival-order; they do **not** impersonate event-time)
 - Window completion Preview: PT hopping, sliding count, per-event PT/ET sliding and bounded PT/ET sessions; **restart_fresh only**, see [`docs/WINDOWS.md`](docs/WINDOWS.md) for semantics and validation status
 - Bounded analysis Preview: collection/encoding functions, UNNEST, two-source ET interval/window inner/left joins, six additional aggregates and an independently admitted finite-query API. See [`docs/ANALYSIS.md`](docs/ANALYSIS.md) for limits and matching validation; new operators/aggregates are **restart_fresh only**, not production-certified.
-- Trusted native scalar plugin Preview: immutable packages, explicit hash approval, SQL/Graph bindings and management API/CLI. Disabled by default; no sandbox, preemption, hot unload or aligned recovery. Script/WASM and external Source/Sink plugins are not yet enabled. See [`docs/PLUGINS.md`](docs/PLUGINS.md).
+- Scalar plugin Preview: immutable native/JavaScript packages, explicit hash approval, SQL/Graph bindings and management API/CLI. JavaScript uses isolated QuickJS-ng workers with memory/deadline limits and fresh contexts; native remains trusted in-process code. Both default off and restart-fresh only. WASM and external Source/Sink plugins remain pending. See [`docs/PLUGINS.md`](docs/PLUGINS.md).
 - Incremental COUNT/SUM/AVG/MIN/MAX (checked integer overflow)
 - Versioned as-of-event-time lookup in embedded plans (not eligible for current Server aligned restore)
 - Aligned single-job checkpoint (`aligned`) for Replayable **File**: zero state, one Count/ET window, or two Count windows in a linear chain — **not** default exactly-once

@@ -1,5 +1,7 @@
 # Runtime ownership (A3 / A4)
 
+2026-09-29 JavaScript Preview：QuickJS-ng 0.16.2 只进入独立 worker，不链接 Server/CLI 地址空间。版本复用进程，每次调用新 Runtime/Context；默认关闭，脚本和原生使用独立 opt-in。单包串行、全进程 4 个 worker 名额、每 worker 128MiB 地址空间/64MiB VM 堆；Job 另按声明类型预留有界 IPC scratch，不能把子进程内存冒充计入 Job owner。含脚本的 stage/router future 使用 task-local cancellation，避免给跨 Job 共享 Function 绑定一个 Job 的 token；无脚本的热路径不安装该 scope。100ms 到期/取消后 kill＋wait，pin 持有至 Job tasks 退出；脚本停用后可卸载，原生驻留合同不变。仍 fresh-only，有限查询因缺少全查询脚本工作预算继续拒绝。982/47、新12×5及真实CLI/独立worker边界通过；部署、故障恢复、选型与待优化项见 [PLUGINS](PLUGINS.md#javascript-标量函数)，精确验收见 [PRODUCTION](PRODUCTION.md#script-plugins-validation)。以下历史记录按各自日期/构建解释。
+
 2026-09-27 可信原生函数Preview：Catalog限定的绑定scope生成不可变函数句柄；SQL/Graph使用同一类型/NULL合同，行执行不查可变registry。Job级pin持续到全部task结束，停用/卸载不能替换运行依赖。host output buffer、表达式元数据和pin容器预留额度；原生内部资源/ELF不是Job硬配额，不能伪装沙箱。默认不加载，启用需显式配置与完整hash批准；sealed memfd加载后驻留至退出，不做热卸载。新表达式无恢复codec，有限查询因不可抢占明确拒绝native。970/47、新13×5及真实CLI升级/回退/重启通过，见[合同](PLUGINS.md)和[匹配证据](PRODUCTION.md#native-plugins-validation)。脚本/WASM及Source/Sink插件尚未开放。
 
 2026-09-27 有界分析Preview：UNNEST保留单个输入batch、逐行计费续行；双输入ET Join分别接收水位，Idle不证明无匹配，Left未决行约束输出水位。行/key/输出fan-out都有额度，清理/取消退还所有权；新future和扩展聚合冷路径Box先计费，旧codec不变。有限查询使用独立Kernel、总工作计数及2个准入槽，响应字节持有额度/槽直到发完，取消后join查询任务才释放worker。新算子/聚合仅restart_fresh；957/45及新20×5通过，合同和未实现项见[ANALYSIS](ANALYSIS.md)，精确[验证范围](PRODUCTION.md#analysis-validation)。没有新的性能/长稳/发行放行结论。

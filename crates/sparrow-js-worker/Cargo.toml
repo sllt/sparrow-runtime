@@ -1,0 +1,20 @@
+[package]
+name = "sparrow-js-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Resource-isolated QuickJS-ng JavaScript scalar worker"
+
+[dependencies]
+sparrow-plugin.workspace = true
+rquickjs = { version = "=0.14.0", default-features = false }
+serde_json = "1"
+libc = "0.2"
+
+[dev-dependencies]
+sparrow-model.workspace = true
+sparrow-plan.workspace = true
+sparrow-sql.workspace = true
+sparrow-runtime.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

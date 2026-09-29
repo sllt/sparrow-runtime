@@ -6,6 +6,8 @@ pub const MAX_ARTIFACT: usize = 4 * 1024 * 1024;
 pub const MAX_MANIFEST: usize = 16 * 1024;
 pub const MAX_PACKAGES: usize = 16;
 pub const MAX_VALUE: usize = 64 * 1024;
+pub const JS_TARGET: &str = "javascript-quickjs-ng-0.16.2-v1";
+pub const MAX_SCRIPT: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,11 +108,28 @@ pub fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 impl Manifest {
+    pub fn is_script(&self) -> bool {
+        self.kind == "javascript_scalar"
+    }
+    pub fn artifact_name(&self) -> &'static str {
+        if self.is_script() {
+            "artifact.js"
+        } else {
+            "artifact.so"
+        }
+    }
     pub fn validate(&self) -> Result<()> {
+        let target_ok = if self.is_script() {
+            self.target == JS_TARGET && host_target() != "unsupported"
+        } else {
+            self.kind == "native_scalar"
+                && self.target == host_target()
+                && host_target() != "unsupported"
+        };
         if self.format != 1
             || self.abi != 1
             || self.semantics != 1
-            || self.kind != "native_scalar"
+            || !target_ok
             || !identifier(&self.name)
             || !identifier(&self.version)
             || !digest_name(&self.artifact_sha256)
@@ -118,8 +137,6 @@ impl Manifest {
             || !self.thread_safe
             || self.null_policy != "propagate"
             || !(1..=16).contains(&self.functions.len())
-            || self.target != host_target()
-            || host_target() == "unsupported"
         {
             return Err(invalid(
                 "unsupported plugin manifest/version/target or scalar trust contract",
@@ -158,8 +175,14 @@ impl Manifest {
     }
     pub fn check_artifact(&self, bytes: &[u8]) -> Result<()> {
         self.validate()?;
-        if bytes.len() < 20 || bytes.len() > MAX_ARTIFACT || sha256(bytes) != self.artifact_sha256 {
+        if bytes.is_empty() || bytes.len() > MAX_ARTIFACT || sha256(bytes) != self.artifact_sha256 {
             return Err(invalid("plugin artifact size/hash mismatch"));
+        }
+        if self.is_script() {
+            if bytes.len() > MAX_SCRIPT || std::str::from_utf8(bytes).is_err() {
+                return Err(invalid("JavaScript source must be UTF-8 and at most 32KiB"));
+            }
+            return Ok(());
         }
         // Reject a wrong class/endian/architecture before executing any loader code.
         let machine = if cfg!(target_arch = "x86_64") {
@@ -167,7 +190,8 @@ impl Manifest {
         } else {
             183
         };
-        if &bytes[..4] != b"\x7fELF"
+        if bytes.len() < 20
+            || &bytes[..4] != b"\x7fELF"
             || bytes[4] != 2
             || bytes[5] != 1
             || u16::from_le_bytes([bytes[16], bytes[17]]) != 3

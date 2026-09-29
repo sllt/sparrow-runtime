@@ -37,7 +37,13 @@ async fn list(
     State(state): State<AppState>,
     Extension(permit): Extension<Permit>,
 ) -> ApiResult<Json<Value>> {
-    blocking_api(move||{let _permit=permit;let manager=control::manager(&state.store)?;Ok(Json(json!({"packages":manager.list()?,"native_allowed":manager.native_allowed(),"resident_generations":control::resident_count(),"hot_unload":false}))) }).await
+    blocking_api(move || {
+        let _permit = permit;
+        let manager = control::manager(&state.store)?;
+        Ok(Json(json!({"packages":manager.list()?,"native_allowed":manager.native_allowed(),
+            "script_allowed":manager.script_allowed(),"script_worker_slots":control::script_worker_slots(),
+            "resident_generations":control::resident_count(),"hot_unload":false,"script_hot_unload":true})))
+    }).await
 }
 async fn install(
     State(state): State<AppState>,
@@ -80,7 +86,7 @@ async fn enable(
         if state.safe_mode {
             return Err(ApiError::from(SparrowError::new(
                 ErrorCode::PolicyDenied,
-                "safe mode refuses native code activation",
+                "safe mode refuses plugin code activation",
             )));
         }
         if digest.len() != 64

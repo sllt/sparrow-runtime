@@ -255,7 +255,7 @@ fn help() {
     println!(
         "sparrowctl — authenticated JSON management client\n\
 commands: health | capabilities | streams | pipelines\n\
-  plugins | plugin-install MANIFEST_JSON SHARED_LIBRARY\n\
+  plugins | plugin-install MANIFEST_JSON ARTIFACT\n\
   plugin-enable MANIFEST_SHA256 | plugin-disable MANIFEST_SHA256 | plugin-uninstall MANIFEST_SHA256\n\
   validate FILE | explain FILE | query FILE | put-stream NAME FILE\n\
   put-pipeline NAME FILE [--if-match ETAG]\n\

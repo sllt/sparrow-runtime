@@ -6,6 +6,9 @@ pub use sparrow_expr::plugins::{
 };
 use sparrow_model::{ErrorCode, Result, SparrowError};
 pub const MAX_INSTALL_BODY: usize = 6 * 1024 * 1024;
+pub fn script_worker_slots() -> usize {
+    sparrow_expr::plugins::script::worker_count()
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Install {
@@ -18,14 +21,28 @@ pub fn configure_from_env(store: &crate::Store, safe_mode: bool) -> Result<()> {
         Ok("0") | Err(_) => false,
         _ => return Err(invalid("SPARROW_ENABLE_NATIVE_PLUGINS must be 0 or 1")),
     };
+    let script = match std::env::var("SPARROW_ENABLE_SCRIPT_PLUGINS").as_deref() {
+        Ok("1") => true,
+        Ok("0") | Err(_) => false,
+        _ => return Err(invalid("SPARROW_ENABLE_SCRIPT_PLUGINS must be 0 or 1")),
+    };
+    let worker = if script && !safe_mode {
+        Some(match std::env::var_os("SPARROW_JS_WORKER") {
+            Some(path) => path.into(),
+            None => std::env::current_exe()
+                .map_err(|_| invalid("cannot locate JavaScript worker"))?
+                .with_file_name("sparrow-js-worker"),
+        })
+    } else {
+        None
+    };
     match std::env::var_os("SPARROW_PLUGIN_DIR") {
-        Some(root) => store.configure_plugins(Manager::open(
+        Some(root) => store.configure_plugins(Manager::open_with_scripts(
             std::path::Path::new(&root),
             native && !safe_mode,
+            worker,
         )?),
-        None if native => Err(invalid(
-            "native plugins require an explicit SPARROW_PLUGIN_DIR",
-        )),
+        None if native || script => Err(invalid("plugins require an explicit SPARROW_PLUGIN_DIR")),
         None => Ok(()),
     }
 }
