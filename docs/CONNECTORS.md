@@ -294,6 +294,23 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | 关闭 | Sink 的当前批次、outbox、在途发送、队列及 Close 共用一个 stop deadline（`flush_timeout_ms`），不逐批 / 逐消息重置；剩余计 `discarded_on_close`，未全部入队的 batch receipt 失败；实际 actor / backing 退出前不提前退款 |
 | 指标 | `websocket_source_*` / `websocket_sink_*`，pipeline status 中的 `websocket_source` / `websocket_sink` 对象 |
 
+## 附：Redis Sink / Lookup（`sink.kind: "redis"`，`external_lookups.*.redis`）
+
+说明见 [REDIS.md](REDIS.md)。无需 feature；自带有界 RESP2 客户端（Redis 6.2 / 7.x 单节点，Cluster / Sentinel / RESP3 不支持）。
+
+| 合同项 | Redis 的实现 |
+|---|---|
+| 语义 | capability `redis_sink`：`live_best_effort` / `restart_fresh` / replay `unsupported`；批次在每条命令都收到期望回复后回执；拒绝 restore、checkpoint、aligned（含 graph Sink）。Lookup 沿用外部 Lookup 的 live-only 合同 |
+| 命令 | `set`（可选 `PX`）、`hset`、`xadd`（可选 `MAXLEN =/~`）、`publish`、`lpush` / `rpush`；key / channel / field 为列模板，NULL 或超长渲染计 `dropped_bad` |
+| 内存 | 128 KiB 连接 + 流水线缓冲 / 槽位静态预扣（JSON 值另加一份 `pipeline_bytes`），≤ reservation/2，检查过的算术；每行编码前先扣 scratch；回复按头部长度拒绝，读缓冲固定。Lookup 每 key 256 KiB scratch，窗口 ≤ reservation/2 |
+| 背压 | 同一时刻一个流水线，受 `pipeline_rows` / `pipeline_bytes` / `flush_interval_ms` 约束；outbox 有界 |
+| 密钥与 TLS | 用户名 / 密码只经 secret 引用且仅限 `rediss://`；rustls 强制校验，`ca_pem` 替换根证书；URL 中不允许 userinfo |
+| 白名单 | host:port 经 `TargetPolicy` |
+| 重试 | 连接建立失败（未发送）对所有命令重试；已发送后断线 / 超时只重发 `set` / `hset`，`xadd` / `publish` / `push` 不重发并计 `unknown_outcome`；Lookup 只在复用的空闲连接收到任何回复前断开时重发一次 |
+| 失败 | 普通错误回复只使所在批失败（`command_errors`）；`NOAUTH` / `WRONGPASS` / `NOPERM`、Cluster 重定向、`READONLY`、schema 不匹配使 job 失败（`redis_sink_fatal`） |
+| 关闭 | `flush_timeout_ms` 截止时间覆盖在途流水线、重试等待、排队批次 |
+| 指标 | `redis_sink_*`，pipeline status 的 `redis_sink` 对象；Lookup 计数在 `lookup_runtime.external` |
+
 ## 附：TCP Source / Sink（`kind: "tcp"`，始终构建）
 
 说明见 [TCP.md](TCP.md)。只做客户端模式（`host:port`，可选 TLS）；listen 模式单独立项。

@@ -17,6 +17,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.98.0 --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/sparrow-services/redis
+          key: redis-tls-${{ runner.os }}-${{ matrix.profile }}-6.2.24-7.2.16-v1
+      - name: Install pinned isolated Redis test service
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          if [[ "$PROFILE" == standalone ]]; then
+            version=6.2.24
+            digest=c3f112749c7cb108597713469cc9beed305e91f036fba313ce8dcbad829f5821
+          else
+            version=7.2.16
+            digest=960a8ec15e34ff40e57ff16837b26b33bd81f2da6d24497bb63de532a323a18e
+          fi
+          dest="$HOME/.cache/sparrow-services/redis/$version"
+          if [[ ! -x "$dest/redis-server" ]]; then
+            mkdir -p "$dest" "$RUNNER_TEMP/redis-build"
+            curl --fail --location --retry 3 "https://download.redis.io/releases/redis-$version.tar.gz" \
+              -o "$RUNNER_TEMP/redis-build/source.tar.gz"
+            printf '%s  %s\n' "$digest" "$RUNNER_TEMP/redis-build/source.tar.gz" | sha256sum --check
+            tar -xzf "$RUNNER_TEMP/redis-build/source.tar.gz" -C "$RUNNER_TEMP/redis-build"
+            if ! make -C "$RUNNER_TEMP/redis-build/redis-$version" -j2 BUILD_TLS=yes MALLOC=libc \
+              redis-server > "$RUNNER_TEMP/redis-build/build.log" 2>&1; then
+              tail -n 60 "$RUNNER_TEMP/redis-build/build.log"
+              exit 1
+            fi
+            install -m 755 "$RUNNER_TEMP/redis-build/redis-$version/src/redis-server" "$dest/redis-server"
+          fi
+          "$dest/redis-server" --version
+          printf 'SPARROW_REDIS_SERVER=%s\n' "$dest/redis-server" >> "$GITHUB_ENV"
       - name: Install pinned isolated InfluxDB test service
         run: |
           set -euo pipefail
@@ -38,7 +70,7 @@ jobs:
             ~/.cargo/git
             target
           key: websocket-contracts-${{ runner.os }}-1.98.0-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}
-      - name: Production feature combinations and WebSocket/TCP/InfluxDB contracts
+      - name: Production feature combinations and network connector contracts
         env:
           PROFILE: ${{ matrix.profile }}
         run: |
@@ -83,6 +115,8 @@ jobs:
             run_contracts "$control" 'tcp_tests::' "tcp-control-$round"
             run_contracts "$connector" 'influxdb::' "influxdb-connector-$round"
             run_contracts "$control" 'influxdb_tests::' "influxdb-control-$round"
+            run_contracts "$connector" 'redis::' "redis-connector-$round"
+            run_contracts "$control" 'redis_tests::' "redis-control-$round"
           done
       - uses: actions/upload-artifact@v4
         if: always()

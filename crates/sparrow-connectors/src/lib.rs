@@ -25,6 +25,7 @@ pub mod mqtt;
 pub mod nats;
 pub(crate) mod net;
 pub mod policy;
+pub mod redis;
 pub(crate) mod scratch;
 pub mod secret;
 pub mod tcp;
@@ -59,6 +60,7 @@ pub use policy::{
     check_bind_addr, check_data_path, check_data_path_in, configured_data_roots, data_roots,
     default_data_root, default_data_roots, ensure_default_data_root, AllowedTarget, TargetPolicy,
 };
+pub use redis::{RedisLookup, RedisLookupConfig, RedisSink, RedisSinkConfig};
 pub use secret::{MapSecretResolver, SecretResolver};
 pub use tcp::{TcpSink, TcpSinkConfig, TcpSource, TcpSourceConfig};
 pub use tls::TlsConfig;

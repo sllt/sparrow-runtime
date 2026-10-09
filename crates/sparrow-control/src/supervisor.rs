@@ -389,6 +389,16 @@ fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
         ));
     }
     if diags.iter().any(|d| {
+        d.redis_sink_fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }) {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "Redis Sink stopped the job (AUTH/ACL rejection, cluster redirection, read-only replica, or a schema that does not fit the command); inspect sink health and redis_sink_*; no replay",
+        ));
+    }
+    if diags.iter().any(|d| {
         d.websocket_sink_fatal
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
@@ -421,6 +431,7 @@ fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
         "tcp" => "tcp",
         "jetstream" => "jetstream",
         "databus" => "databus",
+        "redis" => "redis",
         "influxdb" => "influxdb",
         "file" => "file",
         "plugin" => "plugin",
@@ -2338,6 +2349,12 @@ impl Supervisor {
                     owner,
                     diag,
                 )?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
+            "redis" => {
+                let cfg = crate::validate::redis_sink_config(&spec.sink)?;
+                let sink =
+                    sparrow_connectors::RedisSink::bind(cfg, &self.secrets, policy, owner, diag)?;
                 self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
             "influxdb" => {

@@ -121,6 +121,20 @@ pub struct IoDiagnostics {
     pub databus_sink_discarded_on_close: AtomicU64,
     pub databus_sink_batches: AtomicU64,
     pub databus_sink_fatal: AtomicU64,
+    pub redis_sink_commands_ok: AtomicU64,
+    pub redis_sink_pipelines: AtomicU64,
+    pub redis_sink_bytes_sent: AtomicU64,
+    pub redis_sink_command_errors: AtomicU64,
+    pub redis_sink_publish_no_receivers: AtomicU64,
+    pub redis_sink_dropped_bad: AtomicU64,
+    pub redis_sink_dropped_oversize: AtomicU64,
+    pub redis_sink_dropped_budget: AtomicU64,
+    pub redis_sink_retries: AtomicU64,
+    pub redis_sink_connects: AtomicU64,
+    pub redis_sink_connect_failures: AtomicU64,
+    pub redis_sink_unknown_outcome: AtomicU64,
+    pub redis_sink_discarded_on_close: AtomicU64,
+    pub redis_sink_fatal: AtomicU64,
     pub influxdb_sink_rows_written: AtomicU64,
     pub influxdb_sink_requests_ok: AtomicU64,
     pub influxdb_sink_bytes_sent: AtomicU64,
@@ -396,6 +410,24 @@ impl IoDiagnostics {
                 .load(Ordering::Relaxed),
             databus_sink_batches: self.databus_sink_batches.load(Ordering::Relaxed),
             databus_sink_fatal: self.databus_sink_fatal.load(Ordering::Relaxed),
+            redis_sink_commands_ok: self.redis_sink_commands_ok.load(Ordering::Relaxed),
+            redis_sink_pipelines: self.redis_sink_pipelines.load(Ordering::Relaxed),
+            redis_sink_bytes_sent: self.redis_sink_bytes_sent.load(Ordering::Relaxed),
+            redis_sink_command_errors: self.redis_sink_command_errors.load(Ordering::Relaxed),
+            redis_sink_publish_no_receivers: self
+                .redis_sink_publish_no_receivers
+                .load(Ordering::Relaxed),
+            redis_sink_dropped_bad: self.redis_sink_dropped_bad.load(Ordering::Relaxed),
+            redis_sink_dropped_oversize: self.redis_sink_dropped_oversize.load(Ordering::Relaxed),
+            redis_sink_dropped_budget: self.redis_sink_dropped_budget.load(Ordering::Relaxed),
+            redis_sink_retries: self.redis_sink_retries.load(Ordering::Relaxed),
+            redis_sink_connects: self.redis_sink_connects.load(Ordering::Relaxed),
+            redis_sink_connect_failures: self.redis_sink_connect_failures.load(Ordering::Relaxed),
+            redis_sink_unknown_outcome: self.redis_sink_unknown_outcome.load(Ordering::Relaxed),
+            redis_sink_discarded_on_close: self
+                .redis_sink_discarded_on_close
+                .load(Ordering::Relaxed),
+            redis_sink_fatal: self.redis_sink_fatal.load(Ordering::Relaxed),
             influxdb_sink_rows_written: self.influxdb_sink_rows_written.load(Ordering::Relaxed),
             influxdb_sink_requests_ok: self.influxdb_sink_requests_ok.load(Ordering::Relaxed),
             influxdb_sink_bytes_sent: self.influxdb_sink_bytes_sent.load(Ordering::Relaxed),
@@ -653,6 +685,20 @@ pub struct IoSnapshot {
     pub databus_sink_discarded_on_close: u64,
     pub databus_sink_batches: u64,
     pub databus_sink_fatal: u64,
+    pub redis_sink_commands_ok: u64,
+    pub redis_sink_pipelines: u64,
+    pub redis_sink_bytes_sent: u64,
+    pub redis_sink_command_errors: u64,
+    pub redis_sink_publish_no_receivers: u64,
+    pub redis_sink_dropped_bad: u64,
+    pub redis_sink_dropped_oversize: u64,
+    pub redis_sink_dropped_budget: u64,
+    pub redis_sink_retries: u64,
+    pub redis_sink_connects: u64,
+    pub redis_sink_connect_failures: u64,
+    pub redis_sink_unknown_outcome: u64,
+    pub redis_sink_discarded_on_close: u64,
+    pub redis_sink_fatal: u64,
     pub influxdb_sink_rows_written: u64,
     pub influxdb_sink_requests_ok: u64,
     pub influxdb_sink_bytes_sent: u64,
@@ -893,6 +939,20 @@ impl IoSnapshot {
         self.databus_sink_discarded_on_close += other.databus_sink_discarded_on_close;
         self.databus_sink_batches += other.databus_sink_batches;
         self.databus_sink_fatal += other.databus_sink_fatal;
+        self.redis_sink_commands_ok += other.redis_sink_commands_ok;
+        self.redis_sink_pipelines += other.redis_sink_pipelines;
+        self.redis_sink_bytes_sent += other.redis_sink_bytes_sent;
+        self.redis_sink_command_errors += other.redis_sink_command_errors;
+        self.redis_sink_publish_no_receivers += other.redis_sink_publish_no_receivers;
+        self.redis_sink_dropped_bad += other.redis_sink_dropped_bad;
+        self.redis_sink_dropped_oversize += other.redis_sink_dropped_oversize;
+        self.redis_sink_dropped_budget += other.redis_sink_dropped_budget;
+        self.redis_sink_retries += other.redis_sink_retries;
+        self.redis_sink_connects += other.redis_sink_connects;
+        self.redis_sink_connect_failures += other.redis_sink_connect_failures;
+        self.redis_sink_unknown_outcome += other.redis_sink_unknown_outcome;
+        self.redis_sink_discarded_on_close += other.redis_sink_discarded_on_close;
+        self.redis_sink_fatal += other.redis_sink_fatal;
         self.influxdb_sink_rows_written += other.influxdb_sink_rows_written;
         self.influxdb_sink_requests_ok += other.influxdb_sink_requests_ok;
         self.influxdb_sink_bytes_sent += other.influxdb_sink_bytes_sent;

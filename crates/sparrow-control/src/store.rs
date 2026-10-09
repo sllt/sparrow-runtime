@@ -2651,6 +2651,7 @@ mod tests {
                 databus: None,
                 influxdb: None,
                 websocket: None,
+                redis: None,
                 tcp: None,
                 jetstream: None,
                 plugin: None,

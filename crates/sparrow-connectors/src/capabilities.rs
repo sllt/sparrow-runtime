@@ -79,6 +79,16 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// Redis commands (SET/HSET/XADD/PUBLISH/LPUSH/RPUSH) acknowledged by
+    /// their reply. Checkpoints/replay are refused (the target is not bound
+    /// into checkpoints), so restarts start fresh.
+    pub const REDIS_SINK: Self = Self {
+        kind: "redis_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     /// InfluxDB v2 `/api/v2/write`. A batch is acknowledged after HTTP 204;
     /// checkpoints/replay are refused (target identity is not bound into
     /// checkpoints), so restarts start fresh.

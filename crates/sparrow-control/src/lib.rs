@@ -104,6 +104,8 @@ mod nats_tests;
 #[cfg(test)]
 mod reference_completion_tests;
 #[cfg(test)]
+mod redis_tests;
+#[cfg(test)]
 mod tcp_tests;
 #[cfg(test)]
 mod websocket_tests;

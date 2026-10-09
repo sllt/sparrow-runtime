@@ -1036,6 +1036,11 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "semantics":"live_best_effort_at_most_once_no_application_ack",
             "scope":"this_attempt; sent=written_to_socket_not_peer_receipt"});
     }
+    if s.sink_kind == "redis" {
+        value["redis_sink"] = json!({"commands_ok":io.redis_sink_commands_ok,"pipelines":io.redis_sink_pipelines,"bytes_sent":io.redis_sink_bytes_sent,"command_errors":io.redis_sink_command_errors,"publish_no_receivers":io.redis_sink_publish_no_receivers,"dropped_bad":io.redis_sink_dropped_bad,"dropped_oversize":io.redis_sink_dropped_oversize,"dropped_budget":io.redis_sink_dropped_budget,"retries":io.redis_sink_retries,"connects":io.redis_sink_connects,"connect_failures":io.redis_sink_connect_failures,"unknown_outcome":io.redis_sink_unknown_outcome,"discarded_on_close":io.redis_sink_discarded_on_close,"fatal":io.redis_sink_fatal,
+            "semantics":"live_best_effort; batch_acked_after_every_command_reply; unknown_outcome=non_idempotent_command_sent_without_reply_not_resent",
+            "scope":"this_attempt"});
+    }
     if s.source_kind == "tcp" {
         value["tcp_source"] = json!({"received":io.tcp_source_received,"rows":io.tcp_source_rows,"bytes_read":io.tcp_source_bytes_read,
             "dropped_bad":io.tcp_source_dropped_bad,"dropped_oversize":io.tcp_source_dropped_oversize,"dropped_partial":io.tcp_source_dropped_partial,
@@ -1495,6 +1500,32 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "websocket_source_inbox_bytes",
             io.websocket_source_inbox_bytes,
         ),
+        ("redis_sink_commands_ok", io.redis_sink_commands_ok),
+        ("redis_sink_pipelines", io.redis_sink_pipelines),
+        ("redis_sink_bytes_sent", io.redis_sink_bytes_sent),
+        ("redis_sink_command_errors", io.redis_sink_command_errors),
+        (
+            "redis_sink_publish_no_receivers",
+            io.redis_sink_publish_no_receivers,
+        ),
+        ("redis_sink_dropped_bad", io.redis_sink_dropped_bad),
+        (
+            "redis_sink_dropped_oversize",
+            io.redis_sink_dropped_oversize,
+        ),
+        ("redis_sink_dropped_budget", io.redis_sink_dropped_budget),
+        ("redis_sink_retries", io.redis_sink_retries),
+        ("redis_sink_connects", io.redis_sink_connects),
+        (
+            "redis_sink_connect_failures",
+            io.redis_sink_connect_failures,
+        ),
+        ("redis_sink_unknown_outcome", io.redis_sink_unknown_outcome),
+        (
+            "redis_sink_discarded_on_close",
+            io.redis_sink_discarded_on_close,
+        ),
+        ("redis_sink_fatal", io.redis_sink_fatal),
         ("tcp_source_received", io.tcp_source_received),
         ("tcp_source_rows", io.tcp_source_rows),
         ("tcp_source_bytes_read", io.tcp_source_bytes_read),
