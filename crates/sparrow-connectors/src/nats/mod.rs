@@ -8,6 +8,7 @@ mod client;
 pub mod common;
 mod sink;
 mod source;
+mod wire;
 
 pub use client::{BoundToken, NatsClientConfig};
 pub use sink::{NatsSink, NatsSinkConfig};

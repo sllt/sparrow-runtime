@@ -972,7 +972,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "reconnects":io.nats_source_reconnects,"client_errors":io.nats_source_client_errors,
             "inbox_items":io.nats_source_inbox_items,"inbox_bytes":io.nats_source_inbox_bytes,
             "semantics":"live_best_effort_at_most_once_no_replay_no_ack",
-            "scope":"this_attempt; slow_consumer_events=lower_bound_of_sdk_drop_events"});
+            "scope":"this_attempt; slow_consumer_events=exact_local_prefetch_drops_not_total_network_loss"});
     }
     if s.sink_kind == "nats" {
         value["nats_sink"] = json!({"published":io.nats_sink_published,"failed":io.nats_sink_failed,

@@ -219,9 +219,9 @@ Control crate：
 | 合同项 | NATS Core 的实现 |
 |---|---|
 | 语义 | Source / Sink 均为 `live_best_effort` / `restart_fresh` / replay `unsupported`，at-most-once、无 ACK；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
-| 内存 | SDK 缓冲 `capacity × (max_payload_bytes + 8 KiB) + 256 KiB` 记入 job reservation（≤ reservation/2）；服务器 `max_payload` 大于配置时 Source 拒绝连接；inbox 按 `inbox_bytes` 计入 queue 账本 |
-| 背压 | inbox 满时 Source 等待；SDK 订阅缓冲满后丢弃并计 `nats_source_slow_consumer`（下界）；Sink outbox 有界，发布超时计 `nats_sink_failed` |
+| 内存 | `(capacity + min(capacity,16)) × (max_payload_bytes + 8 KiB) + 256 KiB` 记入 reservation（≤ reservation/2），包括 Sink SDK command/writer 重叠，Source 保守沿用；Source 每次 INFO 后、SUB 前检查服务器 payload 上限，并在分配前校验 frame；inbox 按 `inbox_bytes` 计入 queue 账本，解码/编码 scratch 另行预扣 |
+| 背压 | inbox 满时 Source 等待；有界 wire prefetch 满后丢弃并精确计 `nats_source_slow_consumer`（不是全链路损失）；Sink outbox 有界，发布超时计 `nats_sink_failed` |
 | 重连 | 每次断线 ≤ `reconnect_attempts`（1..100，拒绝 0=无限），100 ms→2 s 退避；耗尽后 Source 可重试失败、Sink 退避重开 |
 | 认证 | 仅 `token_secret`，必须 `tls://`；URL 不得含 userinfo；端点经 `TargetPolicy` |
-| 关闭 | Sink 在 `flush_timeout_ms` 内发布已排队批次、flush，剩余计 `discarded_on_close`；等待 SDK 真实退出后退款 |
+| 关闭 | 从取消起当前在途与已排队批次共用 `flush_timeout_ms`；flush 只证明本地 socket 写出，不是 broker ACK；剩余计 `discarded_on_close`；缓冲、调用方和 SDK 均退出后才退还对应信用 |
 | 指标 | `nats_source_*` / `nats_sink_*`，pipeline status 中的 `nats_source` / `nats_sink` 对象 |

@@ -190,7 +190,7 @@ fn nats_spec_matrix_rejects_mixed_fields_and_durable_claims() {
         "unbounded reconnect is refused"
     );
     let mut v = base.clone();
-    v["source"]["nats"]["max_payload_bytes"] = json!(1024 * 1024);
+    v["source"]["nats"]["max_payload_bytes"] = json!(512 * 1024);
     v["source"]["nats"]["subscription_capacity"] = json!(16);
     assert_eq!(
         check(&v, &allowed),
@@ -200,17 +200,24 @@ fn nats_spec_matrix_rejects_mixed_fields_and_durable_claims() {
 
     // Each client fits half the reservation, but the pair must fit 3/4.
     let mut v = base.clone();
-    v["source"]["nats"]["max_payload_bytes"] = json!(1024 * 1024);
+    v["source"]["nats"]["max_payload_bytes"] = json!(512 * 1024);
     v["source"]["nats"]["subscription_capacity"] = json!(1);
-    v["sink"]["nats"]["max_payload_bytes"] = json!(1024 * 1024);
+    v["sink"]["nats"]["max_payload_bytes"] = json!(512 * 1024);
     v["sink"]["nats"]["client_capacity"] = json!(1);
     check(&v, &allowed).unwrap();
     v["source"]["nats"]["max_payload_bytes"] = json!(65536);
-    v["source"]["nats"]["subscription_capacity"] = json!(24);
+    v["source"]["nats"]["subscription_capacity"] = json!(12);
     assert_eq!(
         check(&v, &allowed),
         Err(BoundExceeded),
         "sum of NATS SDK buffers over the pipeline"
+    );
+    let mut v = base.clone();
+    v["source"]["nats"]["max_payload_bytes"] = json!(usize::MAX);
+    assert_eq!(
+        check(&v, &allowed),
+        Err(BoundExceeded),
+        "malformed bounds must never panic during the total reservation check"
     );
     assert_eq!(crate::replay_label_for_source("nats"), "unsupported");
     let stored = serde_json::to_value(parse(&base).unwrap()).unwrap();
