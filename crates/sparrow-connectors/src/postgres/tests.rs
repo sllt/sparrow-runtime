@@ -27,6 +27,59 @@ fn target() -> PgTarget {
     t
 }
 
+#[test]
+fn name_values_cannot_be_silently_truncated_by_postgres() {
+    assert_eq!(
+        encoded_len(PgKind::Name, &Scalar::utf8("x".repeat(63))).unwrap(),
+        63
+    );
+    assert_eq!(
+        encoded_len(PgKind::Name, &Scalar::utf8("x".repeat(64))),
+        Err("postgres_name_would_truncate")
+    );
+}
+
+#[tokio::test]
+async fn source_reserves_connection_credit_before_opening_a_socket() {
+    use sparrow_model::{CreditKind, MemoryOwner, ResourceBudget};
+    use std::sync::Arc;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut cfg = source_config();
+    cfg.target = PgTarget::new(format!("postgresql://127.0.0.1:{port}/app"), "plain");
+    cfg.target.sslmode = PgSslMode::Disable;
+    cfg.inbox_capacity = 1;
+    cfg.fetch_rows = 1;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let _hog = owner
+        .acquire(
+            CreditKind::Reservation,
+            owner.budget().reservation_bytes - super::conn::CONNECTION_RESERVATION + 1,
+        )
+        .unwrap();
+    let source = PgSource::bind(
+        cfg,
+        &MapSecretResolver::empty(),
+        &TargetPolicy::allow("127.0.0.1", port),
+        64 * 1024,
+        crate::IoDiagnostics::new(),
+    )
+    .unwrap();
+    let (tx, _rx) = sparrow_io::observed::channel(1);
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        source.run_budgeted(
+            tx,
+            tokio_util::sync::CancellationToken::new(),
+            Arc::clone(&owner),
+            64 * 1024,
+        ),
+    )
+    .await
+    .expect("reject credit before network I/O");
+    assert_eq!(result.unwrap_err().code, ErrorCode::ResourceExhausted);
+}
+
 // ------------------------------------------------------------ conn --
 
 #[test]
@@ -672,12 +725,15 @@ fn sink_bounds_and_budget_math() {
     assert_eq!(c.peak_bytes(), None);
     let c = base();
     let peak = c.peak_bytes().unwrap();
-    assert_eq!(peak, 128 * 1024 + 2 * 512 * 1024 + 1024);
+    assert_eq!(peak, 128 * 1024 + 2 * 512 * 1024 + 8 * 1024);
     c.check_reservation_budget(peak * 2).unwrap();
     assert!(c.check_reservation_budget(peak * 2 - 1).is_err());
     // DO UPDATE remembers conflict keys per chunk.
     let c = PgSinkConfig::new(target(), "t", upsert(&["name"]));
-    assert_eq!(c.peak_bytes().unwrap(), peak + 1000 * 64 + 512 * 1024);
+    assert_eq!(
+        c.peak_bytes().unwrap(),
+        peak + 1000 * 96 + 512 * 1024 + 64 * 1024
+    );
     // The defaults fit the smallest (compact) profile, DO UPDATE included.
     c.check_reservation_budget(sparrow_model::ResourceBudget::compact().reservation_bytes)
         .unwrap();
@@ -822,14 +878,14 @@ fn source_bounds_and_budget_math() {
     assert_eq!(big.page_bytes(1), None);
     assert!(c.check_reservation_budget(usize::MAX, usize::MAX).is_err());
     let page = c.page_bytes(1024).unwrap();
-    assert_eq!(page, 500 * (1024 + 256) + 64 * 1024 + 128 * 1024);
+    assert_eq!(page, 500 * (1024 + 256 + 64 * 64) + 64 * 1024 + 128 * 1024);
     c.check_reservation_budget(page * 2, 1024).unwrap();
     // Derived default: the largest page that fits, capped at 1000 rows.
     let compact = sparrow_model::ResourceBudget::compact().reservation_bytes;
     let n = PgSourceConfig::fitting_fetch_rows(compact, 64 * 1024);
     assert_eq!(
         n,
-        (compact / 2 - 64 * 1024 - 128 * 1024) / (64 * 1024 + 256)
+        (compact / 2 - 64 * 1024 - 128 * 1024) / (64 * 1024 + 256 + 64 * 64)
     );
     let mut fit = source_config();
     fit.fetch_rows = n;

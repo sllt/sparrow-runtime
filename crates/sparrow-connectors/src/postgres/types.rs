@@ -454,6 +454,7 @@ pub fn encoded_len(kind: PgKind, value: &Scalar) -> Result<usize, &'static str> 
                 Err("postgres_float_not_finite")
             }
         }
+        (PgKind::Name, Scalar::Utf8(s)) if s.len() > 63 => Err("postgres_name_would_truncate"),
         (k, Scalar::Utf8(s)) if k.is_text() => text_ok(s),
         (PgKind::Json, Scalar::Utf8(s)) => {
             text_ok(s)?;

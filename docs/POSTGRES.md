@@ -16,7 +16,7 @@ PostgreSQL 以三种方式接入，均需要 build feature `postgres`（`sparrow
 
 - **只用扩展查询协议**：配置的查询只能是一条语句，`SELECT 1; DROP TABLE t` 在 prepare 时被服务器拒绝。
 - **消息大小**：tokio-postgres 的解码器对单条后端消息没有上限，会一直缓冲直到整条消息到达。本仓库在 socket 与客户端之间加了一层读取包装：解析每条后端消息的头部，长度超过该连接的上限（行上限 + 64 KiB）时直接让连接失败，不缓冲消息体。
-- **取消**：丢弃 tokio-postgres 的查询 future 不会让服务器停止执行（连接任务会继续读完回复）。所以凡是因超时或停止而放弃的语句（包括连接后的 prepare 和目录查询），都会另开一个连接发送 cancel request（受 `connect_timeout_ms` 限制），并关闭原连接；服务器随之回滚未提交的事务。
+- **取消**：丢弃 tokio-postgres 的查询 future 不会让服务器停止执行。超时或停止会关闭原连接，并尝试另开连接发送 cancel request（受 `connect_timeout_ms` 限制）。每个 target 最多 16 个在途取消任务，覆盖最大 Lookup 并发；超出时只关闭原连接，不再创建后台任务。取消是 best effort，不是远端已回滚的确认；网络故障时尤其不能把本地停止期限等同于服务器回滚期限。
 - **认证**：SCRAM-SHA-256 / MD5 / cleartext 由客户端处理。不使用 SCRAM channel binding（`channel_binding=disable`），服务器身份由 `verify-full` 保证。因为客户端在服务器要求时会发送明文密码，所以密码只允许在 `verify-full` 下使用。
 
 ## 连接
@@ -119,15 +119,16 @@ Source 是 `live_best_effort` / `restart_fresh`，拒绝 restore、checkpoint �
 
 **内存与边界**
 
-- `fetch_rows`（1..=10000）：省略时取能放进 job reservation 一半的最大页（不超过 1000 行），按 job 的行上限计算；显式值只检查、不下调，放不下时报 `BoundExceeded`。校验阶段按最小（compact）kernel 检查（行上限 64 KiB、reservation 4 MiB，即最多 28 行）。
-- 每次查询前，先按 `fetch_rows × (行上限 + 256) + 64 KiB` 从 job reservation 预扣整页额度，额度不足时等待重试（`budget_waits`）。另有 128 KiB 连接额度。
+- `fetch_rows`（1..=10000）：省略时取能放进 job reservation 一半的最大页（不超过 1000 行），按 job 的行上限计算；显式值只检查、不下调，放不下时报 `BoundExceeded`。校验阶段按最小（compact）kernel 检查。
+- 每次查询前，按 `fetch_rows × (行上限 + 256 + 64×64) + 64 KiB` 预扣整页额度，包含最多 64 列的 SDK offset 元数据。另有从连接前到退出实际持有的 128 KiB 连接额度。列描述探测只选择绑定字段及 tracking 列。
+- 页额度不足时只计 `budget_waits`，保留连接并有界等待，不再冒充 query failure 或触发重连。
 - 服务器端计算每行的二进制大小，超过行上限的行只回传标志位，不回传值，计 `dropped_oversize`。
 - 解码失败的行计 `dropped_bad`；`fail_on_decode` 为 true 时 Source 报 `CodecViolation` 并停止。
 - inbox 字节（`postgres.inbox_bytes`，默认 256 KiB）与条数（`source.inbox_capacity`）有界；满时等待（`backpressure_waits`），不丢行。
 
 **错误与重连**
 
-- 连接失败、连接中断、超时（`query_timeout_ms`，100..=300000，默认 30000）、页额度暂时不足、执行时的服务器错误（如查询中的除零、序列化失败）：断开并以退避重连（从 `poll_interval_ms` 起翻倍，上限 60 秒），计 `query_failures` / `timeouts`。
+- 连接失败、连接中断、超时（`query_timeout_ms`，100..=300000，默认 30000）、执行时的服务器错误（如查询中的除零、序列化失败）：断开并以退避重连（从 `poll_interval_ms` 起翻倍，上限 60 秒），计 `query_failures` / `timeouts`。
 - 认证失败、查询语法 / 权限 / 对象不存在（SQLSTATE 42xxx 等）、形状不符：报错并停止 job，不重试。
 
 **停止**：取消时丢弃在途语句，向服务器发送 cancel request 并关闭连接。
@@ -247,6 +248,15 @@ SELECT * FROM ROWS FROM (unnest($1::text[]), unnest($2::float8[]), unnest($3::ti
 
 - 单元测试：标识符引用、sslmode、URL、secret 与策略、SQLSTATE 分类、消息长度包装、类型编解码（含 numeric 和数组参数的线格式）、语句生成、配置边界（含 `usize::MAX`）。
 - 真实 PostgreSQL（可选，`SPARROW_POSTGRES_BIN` 指向 PostgreSQL 16.x 的 `bin` 目录，需带 OpenSSL 构建）：TLS + SCRAM、认证失败、sslmode 拒绝、超大消息、Sink 类型 / UPSERT 幂等 / 坏行 / schema 与权限失败 / COMMIT 结果未知 / 重连 / 停止取消在途语句、Source 进度 / 相同跟踪值 / 超大行 / 重连 / 停止取消、Lookup 批量 / 未命中 / 错误 / 超时取消 / 连接池恢复，以及经 Supervisor 的 Source → Lookup → UPSERT Sink 端到端。
+
+## 边界与验收
+
+- plain INSERT 的 COMMIT 结果未知时不重发，并使 job fail closed；可靠 output identity 被误传入也 fail closed。
+- 重连后按新表类型重新检查尚未丢弃的行，不能用旧的校验结果确认已经跳过的行。
+- 参数数组的总容量（含头）受 `chunk_bytes` 限制，不能因各列几何扩容突破上限；元数据计 8 KiB，冲突 key 及构建中 key 在分配前计费，单个冲突 key 最多 64 KiB。
+- 数值、定长字符、JSONB、低精度时间及非确定性 collation 的冲突 key 可能被服务器归并；DO UPDATE 在这些情况下逐行发语句，但仍在同一事务里保持输入顺序。其他 key 保留批量语句。
+- Lookup key 拒绝非确定性 collation；`name` 值超过 63 字节时拒绝而不是让数据库截断。目录查询仅请求绑定列。
+- 真实 PostgreSQL 测试默认 ignored；`websocket-contracts` CI 显式构建 postgres feature，校验并使用官方 PostgreSQL 16.15（OpenSSL），再用固定测试二进制重复执行真实服务测试。缺少服务不再空跑通过。
 
 ## 不承诺
 

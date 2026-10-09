@@ -1,8 +1,8 @@
 //! Opt-in tests against a real PostgreSQL 16 server.
 //!
 //! Set `SPARROW_POSTGRES_BIN` to the `bin` directory of a PostgreSQL 16.x
-//! installation built with OpenSSL (`initdb`, `postgres`); every test is a
-//! no-op otherwise. Each test initialises its own cluster in a temporary
+//! installation built with OpenSSL (`initdb`, `postgres`) and run with
+//! `--include-ignored`. Each test initialises its own cluster in a temporary
 //! directory on a free port, with TLS (the test CA's `localhost`
 //! certificate) and these roles:
 //!
@@ -75,10 +75,9 @@ fn secrets() -> MapSecretResolver {
 
 impl Server {
     async fn start() -> Option<Self> {
-        let Some(bin) = std::env::var_os("SPARROW_POSTGRES_BIN").map(PathBuf::from) else {
-            eprintln!("SPARROW_POSTGRES_BIN not set; skipping real PostgreSQL test");
-            return None;
-        };
+        let bin = std::env::var_os("SPARROW_POSTGRES_BIN")
+            .map(PathBuf::from)
+            .expect("SPARROW_POSTGRES_BIN must name the pinned PostgreSQL test installation");
         let version = Command::new(bin.join("postgres"))
             .arg("--version")
             .output()
@@ -283,6 +282,7 @@ async fn until<'a>(
 // --------------------------------------------------------- connection --
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
 async fn real_tls_scram_auth_and_refusals() {
     let Some(server) = Server::start().await else {
         return;
@@ -385,6 +385,112 @@ async fn real_tls_scram_auth_and_refusals() {
 }
 
 // --------------------------------------------------------------- sink --
+
+#[tokio::test]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
+async fn real_cancel_requests_have_a_bounded_background_pool() {
+    let server = Server::start().await.unwrap();
+    let target = Arc::new(
+        server
+            .plain_target("plain")
+            .bind(&secrets(), &server.policy(), 128 * 1024)
+            .unwrap(),
+    );
+    let conn = target.connect().await.unwrap();
+    // No await in this single-threaded burst: slots stay held. There must
+    // be enough for a full 16-request Lookup wave, but not an unbounded
+    // task backlog when the server cannot be reached.
+    for _ in 0..100 {
+        drop(super::conn::CancelOnDrop::new(&conn, &target));
+    }
+    assert_eq!(target.pending_cancels(), super::conn::MAX_PENDING_CANCELS);
+    until(Duration::from_secs(10), || {
+        Box::pin(async { target.pending_cancels() == 0 })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
+async fn real_upsert_preserves_input_order_when_server_coerces_distinct_keys() {
+    let server = Server::start().await.unwrap();
+    let cases = [
+        (
+            "numeric_keys",
+            "numeric",
+            DataType::Utf8,
+            Scalar::utf8("1.0"),
+            Scalar::utf8("1.00"),
+        ),
+        (
+            "char_keys",
+            "char(4)",
+            DataType::Utf8,
+            Scalar::utf8("x"),
+            Scalar::utf8("x "),
+        ),
+        (
+            "json_keys",
+            "jsonb",
+            DataType::Utf8,
+            Scalar::utf8("1.0"),
+            Scalar::utf8("1"),
+        ),
+        (
+            "time_keys",
+            "timestamp(0)",
+            DataType::TimestampMicrosUTC,
+            Scalar::TimestampMicrosUTC(1_700_000_000_000_001),
+            Scalar::TimestampMicrosUTC(1_700_000_000_010_001),
+        ),
+    ];
+    for (table, sql_type, data_type, first, second) in cases {
+        server
+            .exec(&format!(
+                "CREATE TABLE {table} (id {sql_type} PRIMARY KEY, v int8)"
+            ))
+            .await;
+        let cfg = PgSinkConfig::new(
+            server.tls_target(),
+            table,
+            PgWriteMode::Upsert {
+                conflict_key: vec!["id".into()],
+                update_columns: vec!["v".into()],
+            },
+        );
+        let schema = schema(vec![
+            field(1, "id", data_type, false),
+            field(2, "v", DataType::Int64, false),
+        ]);
+        let h = SinkHarness::start(&server, cfg, schema);
+        h.send(vec![
+            Row {
+                values: vec![first, Scalar::Int64(1)],
+            },
+            Row {
+                values: vec![second, Scalar::Int64(2)],
+            },
+        ])
+        .await;
+        assert_eq!(h.settled(1).await, (1, 0), "{table}");
+        assert_eq!(
+            server
+                .count(&format!("SELECT count(*) FROM {table} WHERE v=2"))
+                .await,
+            1
+        );
+        assert_eq!(
+            server.count(&format!("SELECT count(*) FROM {table}")).await,
+            1
+        );
+        let snap = h.finish().await;
+        assert_eq!(
+            snap.postgres_sink_statements, 2,
+            "{table}: split statements, one atomic transaction"
+        );
+        assert_eq!(snap.postgres_sink_transactions, 1);
+    }
+}
 
 struct SinkHarness {
     tx: Option<sparrow_io::observed::Sender<RowBatch>>,
@@ -522,6 +628,7 @@ fn typed_row(id: i64) -> Row {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
 async fn real_sink_types_upsert_idempotency_and_bad_rows() {
     let Some(server) = Server::start().await else {
         return;
@@ -625,6 +732,7 @@ async fn real_sink_types_upsert_idempotency_and_bad_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
 async fn real_sink_schema_and_permission_failures_stop_the_job() {
     let Some(server) = Server::start().await else {
         return;
@@ -727,6 +835,7 @@ impl CutProxy {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
 async fn real_sink_commit_outcome_unknown_insert_vs_upsert() {
     let Some(server) = Server::start().await else {
         return;
@@ -788,6 +897,10 @@ async fn real_sink_commit_outcome_unknown_insert_vs_upsert() {
     assert_eq!((outbox.acked(), outbox.failed()), (0, 1));
     let snap = diag.snapshot();
     assert_eq!(
+        snap.postgres_sink_fatal, 1,
+        "unknown INSERT commit must fail the job closed"
+    );
+    assert_eq!(
         (
             snap.postgres_sink_unknown_outcome,
             snap.postgres_sink_retries
@@ -830,6 +943,7 @@ async fn real_sink_commit_outcome_unknown_insert_vs_upsert() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
 async fn real_sink_reconnects_and_stop_cancels_in_flight_statement() {
     let Some(server) = Server::start().await else {
         return;
@@ -984,6 +1098,7 @@ fn ids(rows: &[Row]) -> Vec<i64> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
 async fn real_source_tracks_progress_ties_and_oversize() {
     let Some(server) = Server::start().await else {
         return;
@@ -1081,6 +1196,7 @@ async fn real_source_tracks_progress_ties_and_oversize() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
 async fn real_source_refusals_and_stop_cancels_query() {
     let Some(server) = Server::start().await else {
         return;
@@ -1212,6 +1328,7 @@ fn int(v: i64) -> Scalar {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
 async fn real_lookup_batches_misses_and_errors() {
     let Some(server) = Server::start().await else {
         return;
@@ -1376,6 +1493,7 @@ impl ExternalLookup for Provider {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
 async fn real_lookup_through_the_batched_operator() {
     let Some(server) = Server::start().await else {
         return;

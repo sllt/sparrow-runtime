@@ -680,11 +680,9 @@ mod enabled {
     }
 
     #[test]
+    #[ignore = "requires SPARROW_POSTGRES_BIN (isolated PostgreSQL 16)"]
     fn real_postgres_source_lookup_and_upsert_sink_through_the_supervisor() {
-        let Some(pg) = Pg::start() else {
-            eprintln!("SPARROW_POSTGRES_BIN not set; skipping real PostgreSQL test");
-            return;
-        };
+        let pg = Pg::start().expect("SPARROW_POSTGRES_BIN is required");
         pg.sql(
             "app",
             "CREATE TABLE readings (id int8 PRIMARY KEY, device_id text NOT NULL, v float8);\

@@ -71,7 +71,9 @@ pub const DEFAULT_INBOX_BYTES: usize = 256 * 1024;
 const MAX_INBOX: usize = 4096;
 /// Per-row bookkeeping charged with the page (decoded `Row` vector, the
 /// client's row offsets).
-const ROW_OVERHEAD: usize = 256;
+// tokio-postgres retains per-column offsets as well as each Row's header.
+// A flat 256 bytes is not enough for the supported 64-column schema.
+const ROW_OVERHEAD: usize = 256 + MAX_FIELDS * 64;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
@@ -390,6 +392,8 @@ enum Poll {
     Done(bool),
     /// Query failed; retry after backoff.
     Retry(&'static str),
+    /// Local credit pressure is not a database/query failure.
+    BudgetWait,
     Stopped,
 }
 
@@ -452,6 +456,10 @@ impl PgSource {
         self.config.check_inbox_budget(owner.budget().queue_bytes)?;
         self.config
             .check_reservation_budget(owner.budget().reservation_bytes, max_row_bytes)?;
+        // poll subtracts this from page_bytes, so it must actually be held
+        // here for the entire connection/session lifetime.
+        let _connection =
+            owner.acquire(CreditKind::Reservation, super::conn::CONNECTION_RESERVATION)?;
         let mut budget = owner.budget();
         budget.queue_bytes = self.config.inbox_bytes;
         let queue = MemoryOwner::child(owner.clone(), budget, "postgres-source-inbox");
@@ -489,6 +497,15 @@ impl PgSource {
                 Poll::Done(false) => {
                     failures = 0;
                     self.config.poll_interval
+                }
+                Poll::BudgetWait => {
+                    self.diag.observation.health(
+                        true,
+                        HealthState::Ready,
+                        "postgres_source_budget_wait",
+                        None,
+                    );
+                    Duration::from_millis(10)
                 }
                 Poll::Retry(reason) => {
                     session = None;
@@ -576,7 +593,27 @@ impl PgSource {
         &self,
         conn: &PgConn,
     ) -> Result<std::result::Result<(Shape, Statement, Statement), &'static str>> {
-        let probe = format!("SELECT * FROM ({}) AS q LIMIT 0", self.config.query);
+        // Probe only the requested columns, not an arbitrary-width SELECT *
+        // result. This also bounds the client's retained row description.
+        let mut names: Vec<&str> = self
+            .config
+            .schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        if !names.contains(&self.config.tracking_column.as_str()) {
+            names.push(&self.config.tracking_column);
+        }
+        let selected = names
+            .into_iter()
+            .map(quote_ident)
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        let probe = format!(
+            "SELECT {selected} FROM ({}) AS q LIMIT 0",
+            self.config.query
+        );
         let statement = match conn.client.prepare(&probe).await {
             Ok(s) => s,
             Err(e) => return self.statement_error(&e),
@@ -674,7 +711,7 @@ impl PgSource {
                 self.diag
                     .postgres_source_budget_waits
                     .fetch_add(1, Ordering::Relaxed);
-                return Ok(Poll::Retry("postgres_source_budget_wait"));
+                return Ok(Poll::BudgetWait);
             }
         };
         let started = std::time::Instant::now();

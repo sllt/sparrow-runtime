@@ -297,7 +297,13 @@ impl PgLookup {
     }
 
     async fn describe(&self, conn: &PgConn) -> Result<(Statement, Vec<PgKind>)> {
-        let table = table_columns(conn, &self.schema_name, &self.table)
+        let columns = self
+            .schema
+            .fields
+            .iter()
+            .map(|f| f.name.clone())
+            .collect::<Vec<_>>();
+        let table = table_columns(conn, &self.schema_name, &self.table, &columns)
             .await
             .map_err(|e| query_error(&e))?;
         if table.is_empty() {
@@ -329,6 +335,14 @@ impl PgLookup {
             kinds.push(kind);
         }
         for &i in &self.key_index {
+            if !table
+                .iter()
+                .find(|c| c.name == self.schema.fields[i].name)
+                .expect("matched column")
+                .deterministic_collation
+            {
+                return Err(err(ErrorCode::InvalidSchema, "PostgreSQL lookup keys require deterministic collation (typed key equality is exact)"));
+            }
             if !key_kind(kinds[i]) {
                 return Err(err(
                     ErrorCode::InvalidSchema,

@@ -49,6 +49,9 @@ pub const CONNECTION_RESERVATION: usize = 128 * 1024;
 /// Slack over a role's row bound for the DataRow framing, row
 /// descriptions and error/notice messages.
 pub const MESSAGE_SLACK: usize = 64 * 1024;
+// Covers one cancellation for every supported Lookup pool slot, while a
+// repeatedly unreachable target cannot create unbounded detached tasks.
+pub(crate) const MAX_PENDING_CANCELS: usize = 16;
 
 pub(crate) fn err(code: ErrorCode, message: impl Into<String>) -> SparrowError {
     SparrowError::new(code, message.into())
@@ -311,6 +314,7 @@ impl PgTarget {
             tls,
             connect_timeout: self.connect_timeout,
             max_message,
+            cancel_slots: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_CANCELS)),
         })
     }
 }
@@ -505,6 +509,9 @@ pub struct BoundTarget {
     tls: Option<PgTls>,
     connect_timeout: Duration,
     max_message: usize,
+    // Cancellation requests themselves must not create an unbounded task
+    // backlog during repeated timeouts against an unreachable server.
+    cancel_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for BoundTarget {
@@ -616,8 +623,13 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let Ok(permit) = self.target.cancel_slots.clone().try_acquire_owned() else {
+                    // Best effort: the abandoned session is also closed.
+                    return;
+                };
                 let target = self.target.clone();
                 handle.spawn(async move {
+                    let _permit = permit;
                     let _ = target.cancel(&token).await;
                 });
             }
@@ -626,6 +638,11 @@ impl Drop for CancelOnDrop {
 }
 
 impl BoundTarget {
+    #[cfg(test)]
+    pub(crate) fn pending_cancels(&self) -> usize {
+        MAX_PENDING_CANCELS - self.cancel_slots.available_permits()
+    }
+
     pub fn tls(&self) -> bool {
         self.tls.is_some()
     }

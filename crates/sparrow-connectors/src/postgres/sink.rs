@@ -64,9 +64,10 @@ use crate::secret::SecretResolver;
 pub const MAX_COLUMNS: usize = 64;
 const MAX_OUTBOX: usize = 4096;
 /// Fixed per-chunk bookkeeping.
-const CHUNK_OVERHEAD: usize = 1024;
+const CHUNK_OVERHEAD: usize = 8 * 1024;
 /// Hash-set entry overhead per conflict key remembered in a chunk.
-const KEY_SLOT: usize = 64;
+const KEY_SLOT: usize = 96;
+const MAX_CONFLICT_KEY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PgWriteMode {
@@ -132,7 +133,10 @@ impl PgSinkConfig {
             PgWriteMode::Upsert { update_columns, .. } if !update_columns.is_empty() => self
                 .chunk_rows
                 .checked_mul(KEY_SLOT)?
-                .checked_add(self.chunk_bytes)?,
+                // Existing conflict-key set plus the next key while the
+                // previous chunk is being flushed.
+                .checked_add(self.chunk_bytes)?
+                .checked_add(self.chunk_bytes.min(MAX_CONFLICT_KEY_BYTES))?,
             _ => 0,
         };
         CONNECTION_RESERVATION
@@ -362,6 +366,8 @@ pub struct TableColumn {
     pub name: String,
     pub kind: Option<PgKind>,
     pub not_null: bool,
+    pub type_modifier: i32,
+    pub deterministic_collation: bool,
 }
 
 /// `pg_attribute` of `schema.table` (empty if the table does not exist).
@@ -369,6 +375,7 @@ pub async fn table_columns(
     conn: &PgConn,
     schema_name: &str,
     table: &str,
+    columns: &[String],
 ) -> std::result::Result<Vec<TableColumn>, tokio_postgres::Error> {
     let regclass = format!(
         "{}.{}",
@@ -378,11 +385,12 @@ pub async fn table_columns(
     let rows = conn
         .client
         .query(
-            "SELECT a.attname::pg_catalog.text, a.atttypid::pg_catalog.int8, a.attnotnull \
+            "SELECT a.attname::pg_catalog.text, a.atttypid::pg_catalog.int8, a.attnotnull, a.atttypmod, COALESCE(c.collisdeterministic, true) \
              FROM pg_catalog.pg_attribute a \
+             LEFT JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation \
              WHERE a.attrelid = pg_catalog.to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped \
-             ORDER BY a.attnum LIMIT 1601",
-            &[&regclass],
+             AND a.attname::pg_catalog.text = ANY($2::pg_catalog.text[]) ORDER BY a.attnum LIMIT 65",
+            &[&regclass, &columns],
         )
         .await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -394,6 +402,8 @@ pub async fn table_columns(
             name,
             kind: u32::try_from(oid).ok().and_then(PgKind::from_oid),
             not_null,
+            type_modifier: row.try_get(3)?,
+            deterministic_collation: row.try_get(4)?,
         });
     }
     Ok(out)
@@ -433,6 +443,9 @@ struct Compiled {
     not_null: Vec<bool>,
     /// Positions (in `columns`) of the conflict key.
     key_pos: Vec<usize>,
+    /// Server coercion/equality can collapse distinct encoded keys. Keep
+    /// one row per statement in that case, still one transaction per batch.
+    single_row_conflicts: bool,
 }
 
 struct Session {
@@ -457,11 +470,33 @@ impl Chunk {
         self.arrays.iter().map(ArrayParam::wire_len).sum()
     }
 
-    fn capacity_charge(&self, extra: &[usize], key: usize) -> usize {
-        let mut caps = 0usize;
-        for (a, e) in self.arrays.iter().zip(extra) {
-            caps = caps.saturating_add(grown(a.data.capacity(), a.data.len().saturating_add(*e)));
+    fn capacities(&self, extra: &[usize], limit: usize) -> Option<Vec<usize>> {
+        let header = ARRAY_HEADER.checked_mul(self.arrays.len())?;
+        let fits = |caps: &[usize]| {
+            caps.iter()
+                .try_fold(header, |n, c| n.checked_add(*c))
+                .is_some_and(|n| n <= limit)
+        };
+        let exact: Vec<usize> = self
+            .arrays
+            .iter()
+            .zip(extra)
+            .map(|(a, e)| a.data.capacity().max(a.data.len().saturating_add(*e)))
+            .collect();
+        if !fits(&exact) {
+            return None;
         }
+        let geometric: Vec<usize> = self
+            .arrays
+            .iter()
+            .zip(extra)
+            .map(|(a, e)| grown(a.data.capacity(), a.data.len().saturating_add(*e)))
+            .collect();
+        Some(if fits(&geometric) { geometric } else { exact })
+    }
+
+    fn capacity_charge(&self, capacities: &[usize], key: usize) -> usize {
+        let caps = capacities.iter().fold(0usize, |n, c| n.saturating_add(*c));
         // Our arrays plus the client's copy of the encoded statement.
         caps.saturating_add(ARRAY_HEADER * self.arrays.len())
             .saturating_mul(2)
@@ -655,11 +690,11 @@ impl PgSink {
             self.diag
                 .postgres_sink_dropped_bad
                 .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-            self.diag.observation.health(
-                false,
-                HealthState::Failed,
+            self.fatal(
+                state,
+                cancel,
                 "postgres_reliable_output_rejected",
-                Some(ErrorCode::UnsupportedRestore),
+                ErrorCode::UnsupportedRestore,
             );
             return;
         }
@@ -671,6 +706,11 @@ impl PgSink {
         let mut attempt = 0u32;
         let mut checked: Option<Vec<bool>> = None;
         loop {
+            if cancel.is_cancelled() {
+                state
+                    .deadline
+                    .get_or_insert_with(|| Instant::now() + self.config.flush_timeout);
+            }
             if state.fatal || state.deadline.is_some_and(|d| Instant::now() >= d) {
                 self.diag
                     .postgres_sink_discarded_on_close
@@ -767,11 +807,12 @@ impl PgSink {
                     self.diag
                         .postgres_sink_unknown_outcome
                         .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-                    self.diag.observation.health(
-                        false,
-                        HealthState::Failed,
+                    state.session = None;
+                    self.fatal(
+                        state,
+                        cancel,
                         "postgres_unknown_outcome_not_retried",
-                        Some(ErrorCode::Internal),
+                        ErrorCode::Internal,
                     );
                     let _ = reason;
                     return;
@@ -818,7 +859,11 @@ impl PgSink {
     }
 
     /// Connect (if needed) and read the table's columns.
-    async fn session(&self, slot: &mut Option<Session>) -> std::result::Result<(), Attempt> {
+    async fn session(
+        &self,
+        slot: &mut Option<Session>,
+        schema: &Schema,
+    ) -> std::result::Result<(), Attempt> {
         if slot.as_ref().is_some_and(|s| s.conn.is_closed()) {
             *slot = None;
         }
@@ -839,7 +884,20 @@ impl PgSink {
             .postgres_sink_connects
             .fetch_add(1, Ordering::Relaxed);
         let guard = CancelOnDrop::new(&conn, &self.target);
-        let table = table_columns(&conn, &self.config.schema_name, &self.config.table).await;
+        let columns = self
+            .config
+            .compile_schema(schema)
+            .map_err(|_| Attempt::Schema("postgres_schema_does_not_fit_sink"))?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        let table = table_columns(
+            &conn,
+            &self.config.schema_name,
+            &self.config.table,
+            &columns,
+        )
+        .await;
         guard.disarm();
         let table = table.map_err(|e| classify(&e, false))?;
         if table.is_empty() {
@@ -874,6 +932,21 @@ impl PgSink {
             .compile_schema(schema)
             .map_err(|_| Attempt::Schema("postgres_schema_does_not_fit_sink"))?;
         let names: Vec<String> = columns.iter().map(|(n, _)| n.clone()).collect();
+        if names
+            .iter()
+            .any(|name| !session.table.iter().any(|c| &c.name == name))
+        {
+            let guard = CancelOnDrop::new(&session.conn, &self.target);
+            let table = table_columns(
+                &session.conn,
+                &self.config.schema_name,
+                &self.config.table,
+                &names,
+            )
+            .await;
+            guard.disarm();
+            session.table = table.map_err(|e| classify(&e, false))?;
+        }
         let (kinds, not_null) = match_table(&session.table, &names).map_err(Attempt::Schema)?;
         for ((_, index), kind) in columns.iter().zip(&kinds) {
             if !kind.maps_to(&schema.fields[*index].data_type) {
@@ -889,19 +962,31 @@ impl PgSink {
         let statement = session.conn.client.prepare(&sql).await;
         guard.disarm();
         let statement = statement.map_err(|e| classify(&e, false))?;
-        let key_pos = match &self.config.mode {
+        let key_pos: Vec<usize> = match &self.config.mode {
             PgWriteMode::Upsert { conflict_key, .. } => conflict_key
                 .iter()
                 .map(|k| names.iter().position(|n| n == k).expect("compiled"))
                 .collect(),
             PgWriteMode::Insert => Vec::new(),
         };
+        let single_row_conflicts = key_pos.iter().any(|&p| {
+            let column = session
+                .table
+                .iter()
+                .find(|c| c.name == names[p])
+                .expect("matched table");
+            !column.deterministic_collation
+                || matches!(kinds[p], PgKind::Numeric | PgKind::Bpchar | PgKind::Jsonb)
+                || (matches!(kinds[p], PgKind::Timestamp | PgKind::Timestamptz)
+                    && (0..6).contains(&column.type_modifier))
+        });
         let compiled = Arc::new(Compiled {
             schema: schema.clone(),
             columns,
             kinds,
             not_null,
             key_pos,
+            single_row_conflicts,
         });
         session.compiled = Some(compiled.clone());
         session.statement = Some(statement.clone());
@@ -909,9 +994,20 @@ impl PgSink {
     }
 
     /// Per-row pre-check (once per batch): `true` = writable.
-    fn check_rows(&self, batch: &RowBatch, compiled: &Compiled) -> Vec<bool> {
+    fn check_rows(
+        &self,
+        batch: &RowBatch,
+        compiled: &Compiled,
+        previous: Option<&[bool]>,
+    ) -> Vec<bool> {
         let mut good = Vec::with_capacity(batch.num_rows());
-        for row in batch.rows() {
+        for (i, row) in batch.rows().iter().enumerate() {
+            if previous.is_some_and(|p| !p[i]) {
+                // Already dropped: don't recount it or resurrect it after a
+                // reconnect to a table with wider/different column types.
+                good.push(false);
+                continue;
+            }
             let verdict = self.check_row(row, compiled);
             if let Err(oversize) = verdict {
                 let counter = if oversize {
@@ -947,6 +1043,15 @@ impl PgSink {
             out.push(len);
         }
         if total.saturating_add(ARRAY_HEADER * compiled.columns.len()) > self.config.chunk_bytes {
+            return Err(true);
+        }
+        if self.config.dedupe_keys()
+            && compiled
+                .key_pos
+                .iter()
+                .fold(0usize, |n, &p| n.saturating_add(out[p]))
+                > MAX_CONFLICT_KEY_BYTES
+        {
             return Err(true);
         }
         Ok(())
@@ -986,7 +1091,8 @@ impl PgSink {
         checked: &mut Option<Vec<bool>>,
         commit_sent: &AtomicBool,
     ) -> Attempt {
-        if let Err(a) = self.session(slot).await {
+        let new_session = slot.as_ref().is_none_or(|s| s.conn.is_closed());
+        if let Err(a) = self.session(slot, batch.schema()).await {
             return a;
         }
         let session = slot.as_mut().expect("session");
@@ -995,7 +1101,11 @@ impl PgSink {
             Ok(c) => c,
             Err(a) => return a,
         };
-        let good = checked.get_or_insert_with(|| self.check_rows(batch, &compiled));
+        if checked.is_none() || new_session {
+            let next = self.check_rows(batch, &compiled, checked.as_deref());
+            *checked = Some(next);
+        }
+        let good = checked.as_ref().expect("rows checked for this session");
         if !good.iter().any(|g| *g) {
             return Attempt::Rejected("postgres_no_writable_rows");
         }
@@ -1020,16 +1130,38 @@ impl PgSink {
             if self.row_lens(row, &compiled, &mut lens).is_err() {
                 continue;
             }
+            let key_len = if dedupe {
+                compiled
+                    .key_pos
+                    .iter()
+                    .fold(0usize, |n, &p| n.saturating_add(lens[p]))
+            } else {
+                0
+            };
+            let _key_scratch = match self.owner.acquire(CreditKind::Reservation, key_len) {
+                Ok(lease) => lease,
+                Err(_) => {
+                    drop(tx);
+                    guard.disarm();
+                    self.diag
+                        .postgres_sink_budget_waits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Attempt::Retry("postgres_sink_key_budget_wait");
+                }
+            };
             let key = if dedupe {
                 let mut key = Vec::new();
+                if key.try_reserve_exact(key_len).is_err() || key.capacity() > key_len {
+                    drop(tx);
+                    guard.disarm();
+                    return Attempt::Retry("postgres_sink_key_alloc_failed");
+                }
                 for &p in &compiled.key_pos {
-                    let mut tmp = Vec::new();
                     write_element(
                         compiled.kinds[p],
                         &row.values[compiled.columns[p].1],
-                        &mut tmp,
+                        &mut key,
                     );
-                    key.extend_from_slice(&tmp);
                 }
                 Some(key)
             } else {
@@ -1037,7 +1169,9 @@ impl PgSink {
             };
             let row_bytes: usize = lens.iter().sum();
             let full = chunk.rows >= self.config.chunk_rows
+                || (dedupe && compiled.single_row_conflicts && chunk.rows > 0)
                 || chunk.bytes().saturating_add(row_bytes) > self.config.chunk_bytes
+                || chunk.capacities(&lens, self.config.chunk_bytes).is_none()
                 || key.as_ref().is_some_and(|k| chunk.keys.contains(k));
             if full && chunk.rows > 0 {
                 if let Err(e) = tx.execute(&statement, &params(&chunk)).await {
@@ -1050,8 +1184,23 @@ impl PgSink {
                     .fetch_add(1, Ordering::Relaxed);
                 chunk.clear();
             }
+            let capacities = match chunk.capacities(&lens, self.config.chunk_bytes) {
+                Some(caps) => caps,
+                None => {
+                    // Empty chunk retained wide buffers for other columns.
+                    // Free them before admitting new capacities; do not let
+                    // geometric growth double the claimed chunk bound.
+                    debug_assert_eq!(chunk.rows, 0);
+                    for array in &mut chunk.arrays {
+                        array.data = Vec::new();
+                    }
+                    chunk
+                        .capacities(&lens, self.config.chunk_bytes)
+                        .expect("validated row fits empty chunk")
+                }
+            };
             let key_charge = key.as_ref().map_or(0, |k| k.len() + KEY_SLOT);
-            let need = chunk.capacity_charge(&lens, key_charge);
+            let need = chunk.capacity_charge(&capacities, key_charge);
             if chunk.lease.grow_to(need).is_err() {
                 chunk.credit.resize(chunk.lease.bytes());
                 drop(tx);
@@ -1063,11 +1212,14 @@ impl PgSink {
             }
             chunk.credit.resize(chunk.lease.bytes());
             let mut alloc_failed = false;
-            for (a, l) in chunk.arrays.iter_mut().zip(&lens) {
-                let want = grown(a.data.capacity(), a.data.len() + l);
+            for (a, &want) in chunk.arrays.iter_mut().zip(&capacities) {
                 if want > a.data.capacity()
                     && a.data.try_reserve_exact(want - a.data.len()).is_err()
                 {
+                    alloc_failed = true;
+                    break;
+                }
+                if a.data.capacity() > want {
                     alloc_failed = true;
                     break;
                 }
@@ -1169,15 +1321,27 @@ async fn bounded<F: std::future::Future>(
 ) -> Option<F::Output> {
     tokio::pin!(fut);
     loop {
+        if cancel.is_cancelled() {
+            deadline.get_or_insert_with(|| Instant::now() + flush_timeout);
+        }
         match *deadline {
-            Some(at) => return tokio::time::timeout_at(at, fut.as_mut()).await.ok(),
+            Some(at) => {
+                if Instant::now() >= at {
+                    return None;
+                }
+                return tokio::time::timeout_at(at, fut.as_mut()).await.ok();
+            }
             None => tokio::select! {
                 biased;
-                out = fut.as_mut() => return Some(out),
                 _ = cancel.cancelled() => {
                     *deadline = Some(Instant::now() + flush_timeout);
                 }
+                out = fut.as_mut() => return Some(out),
             },
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sink_contract_tests.rs"]
+mod contract_tests;
