@@ -76,6 +76,9 @@ pub struct SourceSpec {
     pub plugin: Option<sparrow_expr::plugins::extension::Binding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jetstream: Option<JetStreamSpec>,
+    /// Required exclusively for `kind = "http_poll"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_poll: Option<HttpPollSpec>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -181,6 +184,119 @@ impl JetStreamSpec {
             pull_messages: self.pull_messages,
             pull_bytes: self.pull_bytes,
         }
+    }
+}
+
+/// HTTP Poll Source options. Credentials are named secret references only;
+/// the stored revision never contains a credential value.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPollSpec {
+    pub url: String,
+    pub interval_ms: u64,
+    #[serde(default = "http_poll_timeout")]
+    pub timeout_ms: u64,
+    /// Failure backoff ceiling; defaults to max(interval_ms, 60000) and may not
+    /// exceed max(interval_ms, 3600000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_max_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<HttpPollAuthSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HttpPollHeaderSpec>,
+    /// `json` (object or array of objects) or `ndjson`.
+    #[serde(default = "http_poll_format")]
+    pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<usize>,
+    /// Opt-in ETag / Last-Modified conditional GET.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub conditional: bool,
+    /// Decoded-row Queue credit for the inbox; default 256 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_bytes: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HttpPollAuthSpec {
+    Bearer {
+        token_secret: String,
+    },
+    Basic {
+        username_secret: String,
+        password_secret: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPollHeaderSpec {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_secret: Option<String>,
+}
+
+fn http_poll_timeout() -> u64 {
+    5_000
+}
+fn http_poll_format() -> String {
+    "json".into()
+}
+
+impl HttpPollSpec {
+    /// Connector config for one Source. Static/secret/policy validation is
+    /// the connector's `validate`; this only maps the wire shape.
+    pub fn connector_config(
+        &self,
+        schema: sparrow_model::Schema,
+        inbox_capacity: usize,
+        fail_on_decode: bool,
+    ) -> Result<sparrow_connectors::HttpPollSourceConfig> {
+        use sparrow_connectors::{HttpPollAuth, HttpPollFormat, HttpPollHeader};
+        let mut config = sparrow_connectors::HttpPollSourceConfig::new(self.url.clone(), schema);
+        config.interval = std::time::Duration::from_millis(self.interval_ms);
+        config.timeout = std::time::Duration::from_millis(self.timeout_ms);
+        config.backoff_max = std::time::Duration::from_millis(
+            self.backoff_max_ms
+                .unwrap_or_else(|| self.interval_ms.max(60_000)),
+        );
+        config.auth = match &self.auth {
+            None => HttpPollAuth::None,
+            Some(HttpPollAuthSpec::Bearer { token_secret }) => HttpPollAuth::Bearer {
+                token_secret: token_secret.clone(),
+            },
+            Some(HttpPollAuthSpec::Basic {
+                username_secret,
+                password_secret,
+            }) => HttpPollAuth::Basic {
+                username_secret: username_secret.clone(),
+                password_secret: password_secret.clone(),
+            },
+        };
+        config.headers = self
+            .headers
+            .iter()
+            .map(|h| HttpPollHeader {
+                name: h.name.clone(),
+                value: h.value.clone(),
+                value_secret: h.value_secret.clone(),
+            })
+            .collect();
+        config.format = HttpPollFormat::parse(&self.format).map_err(SparrowError::from)?;
+        if let Some(bytes) = self.max_response_bytes {
+            config.max_response_bytes = bytes;
+        }
+        config.conditional = self.conditional;
+        if let Some(bytes) = self.inbox_bytes {
+            config.inbox_bytes = bytes;
+        }
+        config.inbox_capacity = inbox_capacity;
+        config.restore = RestoreClaim::None;
+        config.fail_on_decode = fail_on_decode;
+        Ok(config)
     }
 }
 
@@ -527,6 +643,47 @@ impl PipelineSpec {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
                 "source.jetstream is required exclusively for kind=jetstream",
+            ));
+        }
+        if self.source.http_poll.is_some() != (self.source.kind == "http_poll") {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "source.http_poll is required exclusively for kind=http_poll",
+            ));
+        }
+        if self.source.kind == "http_poll"
+            && (self.source.jetstream.is_some()
+                || self.source.plugin.is_some()
+                || self.source.host.is_some()
+                || self.source.port.is_some()
+                || self.source.path.is_some()
+                || self.source.bind.is_some()
+                || self.source.client_id.is_some()
+                || self.source.username_secret.is_some()
+                || self.source.password_secret.is_some()
+                || self.source.use_demo_io
+                || self.source.tls
+                || self.source.skip_verify
+                || self.source.file_contract.is_some()
+                || self.source.qos != 0
+                || !self.source.clean_session
+                || self.source.topic != default_topic())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "HTTP poll options belong in source.http_poll (TLS follows the https:// URL); mixed connector fields refused",
+            ));
+        }
+        if self.source.kind == "http_poll"
+            && (self.delivery != "live_best_effort"
+                || self.recovery != "restart_fresh"
+                || self.restore.is_some()
+                || self.checkpoint.is_some()
+                || self.checkpoint_dir.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "HTTP poll is live_best_effort/restart_fresh only (replay=unsupported); no checkpoint or restore",
             ));
         }
         if self

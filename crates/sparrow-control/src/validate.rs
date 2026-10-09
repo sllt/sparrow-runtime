@@ -293,7 +293,7 @@ pub fn replay_label_for_source(kind: &str) -> &'static str {
     match kind {
         "file" | "file_replay" | "replay" => "replayable",
         "jetstream" if cfg!(feature = "jetstream") => "replayable",
-        "mqtt" | "mqtt_source" | "http_push" | "http" | "plugin" => "unsupported",
+        "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "http" | "plugin" => "unsupported",
         _ => sparrow_plan::REPLAY_UNBOUND,
     }
 }
@@ -459,6 +459,12 @@ fn validate_source_io(
             let push = http_push_config(source, schema.clone())?;
             push.validate(secrets, policy).map_err(io)?;
         }
+        "http_poll" => {
+            refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
+            http_poll_config(source, schema.clone(), spec.effective_fail_on_decode())?
+                .validate(secrets, policy)
+                .map_err(io)?;
+        }
         "file" | "file_replay" | "replay" => {
             let path = source.path.clone().ok_or_else(|| {
                 SparrowError::new(
@@ -483,7 +489,7 @@ fn validate_source_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("source kind `{other}` is not supported (mqtt|http_push|file)"),
+                format!("source kind `{other}` is not supported (mqtt|http_push|http_poll|file)"),
             ));
         }
     }
@@ -750,6 +756,23 @@ pub fn http_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<Http
     };
     cfg.restore = RestoreClaim::None;
     Ok(cfg)
+}
+
+pub fn http_poll_config(
+    source: &SourceSpec,
+    schema: Schema,
+    fail_on_decode: bool,
+) -> Result<sparrow_connectors::HttpPollSourceConfig> {
+    source
+        .http_poll
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "HTTP poll source requires source.http_poll",
+            )
+        })?
+        .connector_config(schema, source.inbox_capacity, fail_on_decode)
 }
 
 pub fn http_push_config(source: &SourceSpec, schema: Schema) -> Result<HttpPushSourceConfig> {
@@ -1439,6 +1462,7 @@ pub fn capabilities_json() -> serde_json::Value {
     let mqtt = ConnectorCapabilities::MQTT_SOURCE;
     let http = ConnectorCapabilities::HTTP_SINK;
     let push = ConnectorCapabilities::HTTP_PUSH;
+    let poll = ConnectorCapabilities::HTTP_POLL;
     let mqtt_sink = ConnectorCapabilities::MQTT_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
     serde_json::json!({
@@ -1467,6 +1491,15 @@ pub fn capabilities_json() -> serde_json::Value {
                 "replay": push.replay.as_str(),
                 "delivery": push.delivery.as_str(),
                 "recovery": push.recovery.as_str(),
+            },
+            {
+                "kind": poll.kind,
+                "roles": ["source"],
+                "replay": poll.replay.as_str(),
+                "delivery": poll.delivery.as_str(),
+                "recovery": poll.recovery.as_str(),
+                "maturity": "preview",
+                "contract": "single_inflight_GET; next_poll_after_admission; skipped_ticks_counted; bounded_response; failure_backoff",
             },
             {
                 "kind": mqtt_sink.kind,
@@ -2148,6 +2181,7 @@ mod tests {
             source: SourceSpec {
                 plugin: None,
                 jetstream: None,
+                http_poll: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
                 port: Some(1883),
@@ -2231,6 +2265,7 @@ mod tests {
         let src = SourceSpec {
                 plugin: None,
             jetstream: None,
+            http_poll: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),
@@ -2275,6 +2310,7 @@ mod tests {
         let mut src = SourceSpec {
                 plugin: None,
             jetstream: None,
+            http_poll: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),

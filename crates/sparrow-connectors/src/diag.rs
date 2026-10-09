@@ -40,6 +40,23 @@ pub struct IoDiagnostics {
     pub http_dropped: AtomicU64,
     pub http_retries: AtomicU64,
     pub http_inflight: AtomicU64,
+    pub http_poll_requests: AtomicU64,
+    pub http_poll_ok: AtomicU64,
+    pub http_poll_not_modified: AtomicU64,
+    pub http_poll_failed: AtomicU64,
+    pub http_poll_timeouts: AtomicU64,
+    pub http_poll_status_errors: AtomicU64,
+    pub http_poll_oversize: AtomicU64,
+    pub http_poll_bad_responses: AtomicU64,
+    pub http_poll_rows: AtomicU64,
+    pub http_poll_dropped_bad: AtomicU64,
+    pub http_poll_dropped_oversize: AtomicU64,
+    pub http_poll_dropped_budget: AtomicU64,
+    pub http_poll_skipped_ticks: AtomicU64,
+    pub http_poll_backpressure_waits: AtomicU64,
+    pub http_poll_inflight: AtomicU64,
+    /// Admitted HTTP poll rows still in the inbox (byte-accounted).
+    pub http_poll_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub log_written: AtomicU64,
     pub decode_errors: AtomicU64,
     pub file_written: AtomicU64,
@@ -93,6 +110,23 @@ impl IoDiagnostics {
             http_dropped: self.http_dropped.load(Ordering::Relaxed),
             http_retries: self.http_retries.load(Ordering::Relaxed),
             http_inflight: self.http_inflight.load(Ordering::Relaxed),
+            http_poll_requests: self.http_poll_requests.load(Ordering::Relaxed),
+            http_poll_ok: self.http_poll_ok.load(Ordering::Relaxed),
+            http_poll_not_modified: self.http_poll_not_modified.load(Ordering::Relaxed),
+            http_poll_failed: self.http_poll_failed.load(Ordering::Relaxed),
+            http_poll_timeouts: self.http_poll_timeouts.load(Ordering::Relaxed),
+            http_poll_status_errors: self.http_poll_status_errors.load(Ordering::Relaxed),
+            http_poll_oversize: self.http_poll_oversize.load(Ordering::Relaxed),
+            http_poll_bad_responses: self.http_poll_bad_responses.load(Ordering::Relaxed),
+            http_poll_rows: self.http_poll_rows.load(Ordering::Relaxed),
+            http_poll_dropped_bad: self.http_poll_dropped_bad.load(Ordering::Relaxed),
+            http_poll_dropped_oversize: self.http_poll_dropped_oversize.load(Ordering::Relaxed),
+            http_poll_dropped_budget: self.http_poll_dropped_budget.load(Ordering::Relaxed),
+            http_poll_skipped_ticks: self.http_poll_skipped_ticks.load(Ordering::Relaxed),
+            http_poll_backpressure_waits: self.http_poll_backpressure_waits.load(Ordering::Relaxed),
+            http_poll_inflight: self.http_poll_inflight.load(Ordering::Relaxed),
+            http_poll_inbox_items: self.http_poll_inbox.items.load(Ordering::Relaxed),
+            http_poll_inbox_bytes: self.http_poll_inbox.bytes.load(Ordering::Relaxed),
             log_written: self.log_written.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             file_written: self.file_written.load(Ordering::Relaxed),
@@ -141,6 +175,23 @@ pub struct IoSnapshot {
     pub http_dropped: u64,
     pub http_retries: u64,
     pub http_inflight: u64,
+    pub http_poll_requests: u64,
+    pub http_poll_ok: u64,
+    pub http_poll_not_modified: u64,
+    pub http_poll_failed: u64,
+    pub http_poll_timeouts: u64,
+    pub http_poll_status_errors: u64,
+    pub http_poll_oversize: u64,
+    pub http_poll_bad_responses: u64,
+    pub http_poll_rows: u64,
+    pub http_poll_dropped_bad: u64,
+    pub http_poll_dropped_oversize: u64,
+    pub http_poll_dropped_budget: u64,
+    pub http_poll_skipped_ticks: u64,
+    pub http_poll_backpressure_waits: u64,
+    pub http_poll_inflight: u64,
+    pub http_poll_inbox_items: u64,
+    pub http_poll_inbox_bytes: u64,
     pub log_written: u64,
     pub decode_errors: u64,
     pub file_written: u64,
@@ -210,6 +261,23 @@ impl IoSnapshot {
         self.http_dropped += other.http_dropped;
         self.http_retries += other.http_retries;
         self.http_inflight += other.http_inflight;
+        self.http_poll_requests += other.http_poll_requests;
+        self.http_poll_ok += other.http_poll_ok;
+        self.http_poll_not_modified += other.http_poll_not_modified;
+        self.http_poll_failed += other.http_poll_failed;
+        self.http_poll_timeouts += other.http_poll_timeouts;
+        self.http_poll_status_errors += other.http_poll_status_errors;
+        self.http_poll_oversize += other.http_poll_oversize;
+        self.http_poll_bad_responses += other.http_poll_bad_responses;
+        self.http_poll_rows += other.http_poll_rows;
+        self.http_poll_dropped_bad += other.http_poll_dropped_bad;
+        self.http_poll_dropped_oversize += other.http_poll_dropped_oversize;
+        self.http_poll_dropped_budget += other.http_poll_dropped_budget;
+        self.http_poll_skipped_ticks += other.http_poll_skipped_ticks;
+        self.http_poll_backpressure_waits += other.http_poll_backpressure_waits;
+        self.http_poll_inflight += other.http_poll_inflight;
+        self.http_poll_inbox_items += other.http_poll_inbox_items;
+        self.http_poll_inbox_bytes += other.http_poll_inbox_bytes;
         self.log_written += other.log_written;
         self.decode_errors += other.decode_errors;
         self.file_written += other.file_written;
