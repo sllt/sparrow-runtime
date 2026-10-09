@@ -2,10 +2,11 @@
 use crate::barrier::{EncodedFreeze, RuntimeAligned};
 use crate::checkpoint::CheckpointRetention;
 use crate::pipeline_checkpoint::{StoredSnapshot, FILE_JETSTREAM_SINK_SNAPSHOT_VERSION};
+use crate::window::WindowOperator;
 use crate::{
     AlignedAcks, AlignedJob, CheckpointStore, IngressEvent, JobRequest, Kernel, KernelOptions,
     MailboxConfig, ParticipantAcks, PipelineRestore, PipelineSnapshot, SharedCapture,
-    SinkRestoreBinding, StreamControl, WindowOperator,
+    SinkRestoreBinding, StreamControl,
 };
 use sparrow_io::{OwnedSinkIdentity, SinkIdentity, SourceIdentity, SourcePosition};
 use sparrow_model::{
