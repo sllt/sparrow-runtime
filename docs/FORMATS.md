@@ -77,6 +77,8 @@
 | `jetstream` | ✓ | ✓ | 同上 |
 | `http_push` | ✓ | — | 每个请求一条记录 |
 | `websocket` | ✓ | ✓ | 每条文本帧一条记录（同 MQTT）；`framing: ndjson`、`binary_frames: decode` 与 Sink `frame: binary` 都拒绝 CSV |
+| `tcp`（`lines`） | ✓ | ✓ | 每个连接是一份文档：`header: true` 时连接后第一行是表头（Sink 每个新连接重写表头），之后一行一条记录；`multiline` 拒绝 |
+| `tcp`（`length_prefixed`） | ✓ | ✓ | 每帧一条记录，`header: true` 时前面带表头（同 MQTT） |
 | `http` | — | ✓ | 一个请求体 = 表头 + 多条记录，`Content-Type: text/csv; charset=utf-8` |
 | `http_poll` | ✓ | — | 每个响应是一份文档：表头 + 多条记录，请求带 `Accept: text/csv` |
 | `file` / `file_replay` / `replay` | ✓ | ✓（`file`） | 文件或段文件是一份文档 |

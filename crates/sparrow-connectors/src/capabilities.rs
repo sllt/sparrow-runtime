@@ -79,6 +79,46 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// Redis commands (SET/HSET/XADD/PUBLISH/LPUSH/RPUSH) acknowledged by
+    /// their reply. Checkpoints/replay are refused (the target is not bound
+    /// into checkpoints), so restarts start fresh.
+    pub const REDIS_SINK: Self = Self {
+        kind: "redis_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// PostgreSQL periodic query by a tracking column. The tracking value is
+    /// not a replay point (later commits may carry smaller values), so the
+    /// Source is live-only.
+    pub const POSTGRES_SOURCE: Self = Self {
+        kind: "postgres",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// PostgreSQL INSERT/UPSERT, one transaction per batch, acked after
+    /// COMMIT. Checkpoints/replay are refused (the target is not bound into
+    /// checkpoints), so restarts start fresh.
+    pub const POSTGRES_SINK: Self = Self {
+        kind: "postgres_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// InfluxDB v2 `/api/v2/write`. A batch is acknowledged after HTTP 204;
+    /// checkpoints/replay are refused (target identity is not bound into
+    /// checkpoints), so restarts start fresh.
+    pub const INFLUXDB_SINK: Self = Self {
+        kind: "influxdb_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     /// NATS Core publish. Handed to the client; no server receipt.
     pub const NATS_SINK: Self = Self {
         kind: "nats_sink",
@@ -111,6 +151,24 @@ impl ConnectorCapabilities {
     /// is no application receipt.
     pub const WEBSOCKET_SINK: Self = Self {
         kind: "websocket_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// TCP client Source (`lines` / `length_prefixed`): live, no ack, no
+    /// replay.
+    pub const TCP_SOURCE: Self = Self {
+        kind: "tcp",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// TCP client Sink. A sent frame is written to the socket; there is no
+    /// application receipt.
+    pub const TCP_SINK: Self = Self {
+        kind: "tcp_sink",
         replay: ReplaySupport::Unsupported,
         delivery: DeliveryGuarantee::LiveBestEffort,
         recovery: RecoveryPolicy::RestartFresh,

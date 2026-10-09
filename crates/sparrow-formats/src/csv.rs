@@ -962,6 +962,18 @@ impl CsvFormat {
         Ok(out.0)
     }
 
+    /// Header under a hard capacity bound; `admit` runs before each growth.
+    pub fn encode_header_bounded(
+        &self,
+        schema: &Schema,
+        limit: usize,
+        admit: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<u8>> {
+        let mut out = Bounded { bytes: Vec::new(), limit, admit };
+        self.put_header(schema, &mut out)?;
+        Ok(out.bytes)
+    }
+
     /// One record line (`\n`-terminated), never a header.
     pub fn encode_record(&self, schema: &Schema, row: &Row) -> Result<Vec<u8>> {
         let mut out = Vec::new();

@@ -1011,6 +1011,11 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "semantics":"live_best_effort_at_most_once; done=offered_to_every_matching_subscriber",
             "scope":"this_attempt; deliveries=subscriber_buffer_accepts"});
     }
+    if s.sink_kind == "influxdb" {
+        value["influxdb_sink"] = json!({"rows_written":io.influxdb_sink_rows_written,"requests_ok":io.influxdb_sink_requests_ok,"bytes_sent":io.influxdb_sink_bytes_sent,"gzip_fallbacks":io.influxdb_sink_gzip_fallbacks,"retries":io.influxdb_sink_retries,"retry_after_waits":io.influxdb_sink_retry_after_waits,"retry_after_capped":io.influxdb_sink_retry_after_capped,"dropped_bad":io.influxdb_sink_dropped_bad,"dropped_oversize":io.influxdb_sink_dropped_oversize,"dropped_budget":io.influxdb_sink_dropped_budget,"rejected_requests":io.influxdb_sink_rejected_requests,"rejected_rows":io.influxdb_sink_rejected_rows,"partial_writes":io.influxdb_sink_partial_writes,"discarded_on_close":io.influxdb_sink_discarded_on_close,"fatal":io.influxdb_sink_fatal,
+            "semantics":"live_best_effort; batch_acked_after_http_204; 422_partial_write_fails_batch",
+            "scope":"this_attempt"});
+    }
     if s.source_kind == "websocket" {
         value["websocket_source"] = json!({"received":io.websocket_source_received,"rows":io.websocket_source_rows,"dropped_bad":io.websocket_source_dropped_bad,
             "dropped_oversize":io.websocket_source_dropped_oversize,"dropped_binary":io.websocket_source_dropped_binary,"dropped_budget":io.websocket_source_dropped_budget,"dropped_overflow":io.websocket_source_dropped_overflow,
@@ -1030,6 +1035,42 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "queue_items":io.websocket_sink_queue_items,
             "semantics":"live_best_effort_at_most_once_no_application_ack",
             "scope":"this_attempt; sent=written_to_socket_not_peer_receipt"});
+    }
+    if s.sink_kind == "redis" {
+        value["redis_sink"] = json!({"commands_ok":io.redis_sink_commands_ok,"pipelines":io.redis_sink_pipelines,"bytes_sent":io.redis_sink_bytes_sent,"command_errors":io.redis_sink_command_errors,"publish_no_receivers":io.redis_sink_publish_no_receivers,"dropped_bad":io.redis_sink_dropped_bad,"dropped_oversize":io.redis_sink_dropped_oversize,"dropped_budget":io.redis_sink_dropped_budget,"retries":io.redis_sink_retries,"connects":io.redis_sink_connects,"connect_failures":io.redis_sink_connect_failures,"unknown_outcome":io.redis_sink_unknown_outcome,"discarded_on_close":io.redis_sink_discarded_on_close,"fatal":io.redis_sink_fatal,
+            "semantics":"live_best_effort; batch_acked_after_every_command_reply; unknown_outcome=non_idempotent_command_sent_without_reply_not_resent",
+            "scope":"this_attempt"});
+    }
+    if s.source_kind == "postgres" {
+        value["postgres_source"] = json!({"rows":io.postgres_source_rows,"queries":io.postgres_source_queries,"dropped_bad":io.postgres_source_dropped_bad,"dropped_oversize":io.postgres_source_dropped_oversize,"backpressure_waits":io.postgres_source_backpressure_waits,"budget_waits":io.postgres_source_budget_waits,"connects":io.postgres_source_connects,"connect_failures":io.postgres_source_connect_failures,"query_failures":io.postgres_source_query_failures,"timeouts":io.postgres_source_timeouts,
+            "tracking_value":(io.postgres_source_tracking_set > 0).then_some(io.postgres_source_tracking_value),
+            "inbox_items":io.postgres_source_inbox_items,"inbox_bytes":io.postgres_source_inbox_bytes,
+            "semantics":"live_best_effort; tracking_value_advanced_after_whole_page_admitted; not_a_replay_point; late_rows_with_smaller_values_skipped",
+            "scope":"this_attempt"});
+    }
+    if s.sink_kind == "postgres" {
+        value["postgres_sink"] = json!({"rows":io.postgres_sink_rows,"transactions":io.postgres_sink_transactions,"statements":io.postgres_sink_statements,"batch_errors":io.postgres_sink_batch_errors,"dropped_bad":io.postgres_sink_dropped_bad,"dropped_oversize":io.postgres_sink_dropped_oversize,"budget_waits":io.postgres_sink_budget_waits,"retries":io.postgres_sink_retries,"connects":io.postgres_sink_connects,"connect_failures":io.postgres_sink_connect_failures,"timeouts":io.postgres_sink_timeouts,"unknown_outcome":io.postgres_sink_unknown_outcome,"discarded_on_close":io.postgres_sink_discarded_on_close,"fatal":io.postgres_sink_fatal,
+            "semantics":"live_best_effort; batch_acked_after_commit; unknown_outcome=insert_commit_sent_without_reply_not_retried",
+            "scope":"this_attempt"});
+    }
+    if s.source_kind == "tcp" {
+        value["tcp_source"] = json!({"received":io.tcp_source_received,"rows":io.tcp_source_rows,"bytes_read":io.tcp_source_bytes_read,
+            "dropped_bad":io.tcp_source_dropped_bad,"dropped_oversize":io.tcp_source_dropped_oversize,"dropped_partial":io.tcp_source_dropped_partial,
+            "dropped_budget":io.tcp_source_dropped_budget,"backpressure_waits":io.tcp_source_backpressure_waits,"connects":io.tcp_source_connects,
+            "reconnects":io.tcp_source_reconnects,"disconnects":io.tcp_source_disconnects,"connect_failures":io.tcp_source_connect_failures,
+            "idle_timeouts":io.tcp_source_idle_timeouts,"inbox_items":io.tcp_source_inbox_items,"inbox_bytes":io.tcp_source_inbox_bytes,
+            "semantics":"live_best_effort_at_most_once_no_replay_no_ack",
+            "scope":"this_attempt; dropped_partial=unterminated_record_at_disconnect"});
+    }
+    if s.sink_kind == "tcp" {
+        value["tcp_sink"] = json!({"sent":io.tcp_sink_sent,"bytes_written":io.tcp_sink_bytes_written,"dropped_bad":io.tcp_sink_dropped_bad,
+            "dropped_oversize":io.tcp_sink_dropped_oversize,"dropped_budget":io.tcp_sink_dropped_budget,"dropped_overflow":io.tcp_sink_dropped_overflow,"backpressure_waits":io.tcp_sink_backpressure_waits,
+            "send_failed":io.tcp_sink_send_failed,"send_timeouts":io.tcp_sink_send_timeouts,"discarded_on_close":io.tcp_sink_discarded_on_close,
+            "connects":io.tcp_sink_connects,"reconnects":io.tcp_sink_reconnects,"disconnects":io.tcp_sink_disconnects,
+            "connect_failures":io.tcp_sink_connect_failures,"ignored_bytes":io.tcp_sink_ignored_bytes,"closes":io.tcp_sink_closes,
+            "close_failed":io.tcp_sink_close_failed,"fatal":io.tcp_sink_fatal,"queue_items":io.tcp_sink_queue_items,
+            "semantics":"live_best_effort_at_most_once_no_application_ack",
+            "scope":"this_attempt; sent=frame_written_to_socket_not_peer_receipt"});
     }
     if s.sink_kind == "jetstream" {
         value["jetstream_sink"] = json!({"acked":io.jetstream_sink_acked,
@@ -1322,6 +1363,48 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         ),
         ("databus_sink_batches", io.databus_sink_batches),
         ("databus_sink_fatal", io.databus_sink_fatal),
+        ("influxdb_sink_rows_written", io.influxdb_sink_rows_written),
+        ("influxdb_sink_requests_ok", io.influxdb_sink_requests_ok),
+        ("influxdb_sink_bytes_sent", io.influxdb_sink_bytes_sent),
+        (
+            "influxdb_sink_gzip_fallbacks",
+            io.influxdb_sink_gzip_fallbacks,
+        ),
+        ("influxdb_sink_retries", io.influxdb_sink_retries),
+        (
+            "influxdb_sink_retry_after_waits",
+            io.influxdb_sink_retry_after_waits,
+        ),
+        (
+            "influxdb_sink_retry_after_capped",
+            io.influxdb_sink_retry_after_capped,
+        ),
+        ("influxdb_sink_dropped_bad", io.influxdb_sink_dropped_bad),
+        (
+            "influxdb_sink_dropped_oversize",
+            io.influxdb_sink_dropped_oversize,
+        ),
+        (
+            "influxdb_sink_dropped_budget",
+            io.influxdb_sink_dropped_budget,
+        ),
+        (
+            "influxdb_sink_rejected_requests",
+            io.influxdb_sink_rejected_requests,
+        ),
+        (
+            "influxdb_sink_rejected_rows",
+            io.influxdb_sink_rejected_rows,
+        ),
+        (
+            "influxdb_sink_partial_writes",
+            io.influxdb_sink_partial_writes,
+        ),
+        (
+            "influxdb_sink_discarded_on_close",
+            io.influxdb_sink_discarded_on_close,
+        ),
+        ("influxdb_sink_fatal", io.influxdb_sink_fatal),
         ("csv_malformed", io.csv_malformed),
         ("csv_oversize", io.csv_oversize),
         ("csv_type_errors", io.csv_type_errors),
@@ -1434,6 +1517,143 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "websocket_source_inbox_bytes",
             io.websocket_source_inbox_bytes,
         ),
+        ("redis_sink_commands_ok", io.redis_sink_commands_ok),
+        ("redis_sink_pipelines", io.redis_sink_pipelines),
+        ("redis_sink_bytes_sent", io.redis_sink_bytes_sent),
+        ("redis_sink_command_errors", io.redis_sink_command_errors),
+        (
+            "redis_sink_publish_no_receivers",
+            io.redis_sink_publish_no_receivers,
+        ),
+        ("redis_sink_dropped_bad", io.redis_sink_dropped_bad),
+        (
+            "redis_sink_dropped_oversize",
+            io.redis_sink_dropped_oversize,
+        ),
+        ("redis_sink_dropped_budget", io.redis_sink_dropped_budget),
+        ("redis_sink_retries", io.redis_sink_retries),
+        ("redis_sink_connects", io.redis_sink_connects),
+        (
+            "redis_sink_connect_failures",
+            io.redis_sink_connect_failures,
+        ),
+        ("redis_sink_unknown_outcome", io.redis_sink_unknown_outcome),
+        (
+            "redis_sink_discarded_on_close",
+            io.redis_sink_discarded_on_close,
+        ),
+        ("redis_sink_fatal", io.redis_sink_fatal),
+        ("postgres_source_rows", io.postgres_source_rows),
+        ("postgres_source_queries", io.postgres_source_queries),
+        (
+            "postgres_source_dropped_bad",
+            io.postgres_source_dropped_bad,
+        ),
+        (
+            "postgres_source_dropped_oversize",
+            io.postgres_source_dropped_oversize,
+        ),
+        (
+            "postgres_source_backpressure_waits",
+            io.postgres_source_backpressure_waits,
+        ),
+        (
+            "postgres_source_budget_waits",
+            io.postgres_source_budget_waits,
+        ),
+        ("postgres_source_connects", io.postgres_source_connects),
+        (
+            "postgres_source_connect_failures",
+            io.postgres_source_connect_failures,
+        ),
+        (
+            "postgres_source_query_failures",
+            io.postgres_source_query_failures,
+        ),
+        ("postgres_source_timeouts", io.postgres_source_timeouts),
+        (
+            "postgres_source_inbox_items",
+            io.postgres_source_inbox_items,
+        ),
+        (
+            "postgres_source_inbox_bytes",
+            io.postgres_source_inbox_bytes,
+        ),
+        ("postgres_sink_rows", io.postgres_sink_rows),
+        ("postgres_sink_transactions", io.postgres_sink_transactions),
+        ("postgres_sink_statements", io.postgres_sink_statements),
+        ("postgres_sink_batch_errors", io.postgres_sink_batch_errors),
+        ("postgres_sink_dropped_bad", io.postgres_sink_dropped_bad),
+        (
+            "postgres_sink_dropped_oversize",
+            io.postgres_sink_dropped_oversize,
+        ),
+        ("postgres_sink_budget_waits", io.postgres_sink_budget_waits),
+        ("postgres_sink_retries", io.postgres_sink_retries),
+        ("postgres_sink_connects", io.postgres_sink_connects),
+        (
+            "postgres_sink_connect_failures",
+            io.postgres_sink_connect_failures,
+        ),
+        ("postgres_sink_timeouts", io.postgres_sink_timeouts),
+        (
+            "postgres_sink_unknown_outcome",
+            io.postgres_sink_unknown_outcome,
+        ),
+        (
+            "postgres_sink_discarded_on_close",
+            io.postgres_sink_discarded_on_close,
+        ),
+        ("postgres_sink_fatal", io.postgres_sink_fatal),
+        ("tcp_source_received", io.tcp_source_received),
+        ("tcp_source_rows", io.tcp_source_rows),
+        ("tcp_source_bytes_read", io.tcp_source_bytes_read),
+        ("tcp_source_dropped_bad", io.tcp_source_dropped_bad),
+        (
+            "tcp_source_dropped_oversize",
+            io.tcp_source_dropped_oversize,
+        ),
+        ("tcp_source_dropped_partial", io.tcp_source_dropped_partial),
+        ("tcp_source_dropped_budget", io.tcp_source_dropped_budget),
+        (
+            "tcp_source_backpressure_waits",
+            io.tcp_source_backpressure_waits,
+        ),
+        ("tcp_source_connects", io.tcp_source_connects),
+        ("tcp_source_reconnects", io.tcp_source_reconnects),
+        ("tcp_source_disconnects", io.tcp_source_disconnects),
+        (
+            "tcp_source_connect_failures",
+            io.tcp_source_connect_failures,
+        ),
+        ("tcp_source_idle_timeouts", io.tcp_source_idle_timeouts),
+        ("tcp_sink_sent", io.tcp_sink_sent),
+        ("tcp_sink_bytes_written", io.tcp_sink_bytes_written),
+        ("tcp_sink_dropped_bad", io.tcp_sink_dropped_bad),
+        ("tcp_sink_dropped_oversize", io.tcp_sink_dropped_oversize),
+        ("tcp_sink_dropped_budget", io.tcp_sink_dropped_budget),
+        ("tcp_sink_dropped_overflow", io.tcp_sink_dropped_overflow),
+        (
+            "tcp_sink_backpressure_waits",
+            io.tcp_sink_backpressure_waits,
+        ),
+        ("tcp_sink_send_failed", io.tcp_sink_send_failed),
+        ("tcp_sink_send_timeouts", io.tcp_sink_send_timeouts),
+        (
+            "tcp_sink_discarded_on_close",
+            io.tcp_sink_discarded_on_close,
+        ),
+        ("tcp_sink_connects", io.tcp_sink_connects),
+        ("tcp_sink_reconnects", io.tcp_sink_reconnects),
+        ("tcp_sink_disconnects", io.tcp_sink_disconnects),
+        ("tcp_sink_connect_failures", io.tcp_sink_connect_failures),
+        ("tcp_sink_ignored_bytes", io.tcp_sink_ignored_bytes),
+        ("tcp_sink_closes", io.tcp_sink_closes),
+        ("tcp_sink_close_failed", io.tcp_sink_close_failed),
+        ("tcp_sink_fatal", io.tcp_sink_fatal),
+        ("tcp_sink_queue_items", io.tcp_sink_queue_items),
+        ("tcp_source_inbox_items", io.tcp_source_inbox_items),
+        ("tcp_source_inbox_bytes", io.tcp_source_inbox_bytes),
     ] {
         io_fields[name] = json!(value);
     }

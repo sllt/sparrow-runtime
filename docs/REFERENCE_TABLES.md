@@ -33,7 +33,7 @@ CLI：`tables`、`table NAME [REVISION]`、`table-revisions NAME`、`put-table N
 
 head倒退、缺失、加载到的内容损坏、schema/key改变或构建预算不足都会使Job失败并取消；没有无限沿用旧值的stale fallback。head未变化时不重复解码或重算内容摘要，因此不承诺持续检测绕过API的磁盘篡改。旧snapshot只随在途reader保留，其retention credit直到最后reader释放才归还；替换必须容得下构建峰值和新旧重叠。历史baseline仍由管道revision保守pin；运行时观察过的其他版本不构成checkpoint pin，GC后不承诺历史重现。
 
-### 外部 HTTP Lookup
+### 外部 Lookup（HTTP / Redis / PostgreSQL）
 
 复用SQL静态表JOIN的Lookup路径或Graph的 `kind:"lookup"`，无需新造SQL函数。通过 `external_lookups` 声明远端schema/keys及连接：
 
@@ -51,13 +51,15 @@ head倒退、缺失、加载到的内容损坏、schema/key改变或构建预算
 }
 ```
 
+每个绑定恰好选择一个provider：`url`（HTTP，下文）、`redis`（GET/HMGET，见 [REDIS.md](REDIS.md)）或 `postgres`（一批key一条SELECT，需 feature `postgres`，见 [POSTGRES.md](POSTGRES.md)）。三者实现同一个runtime `ExternalLookup` 接口，共用Lookup算子、缓存、`options` 与 `on_error` 合同；Redis与PostgreSQL额外支持 `options.batch_keys`（1～64，默认1）把最多该数量的miss放进一个请求，HTTP始终一次一个key，`batch_keys>1` 校验拒绝。新增选项省略时序列化与旧版完全一致。
+
 URL固定，不从输入拼地址；需原有TargetPolicy allowlist，凭据通过命名Secret显式解析且只允许HTTPS。禁止userinfo/fragment、重复query key、重定向、环境proxy和隐式/应用重试。共用HTTP Client的隐式协议重试也关闭，原HttpSink显式max_retries策略不变。TLS校验仍启用，没有skip_verify。
 
 Wire为 `POST {"keys":{"device_id":"a"}}`；仅 `200 {"row":{"device_id":"a","threshold":20}}` 或 `200 {"row":null}`。必须返回完整声明字段，拒绝未知/重复字段、错误类型、非有限浮点、错主键、超限数据；204/404不是隐式miss。最多16列、8个非NULL稳定主键列，不接受Float key/Dynamic/Array；Bytes为base64，Int64/UInt64/TimestampMicrosUTC精确保留。流的NULL key直接产生miss，不请求远端。请求/响应wire和返回row resident各≤64KiB。
 
 每个**物理Lookup算子**最多1～16并发（默认4），timeout10～5000ms，按输入顺序产出，控制消息不能超越请求；整批完成类型/key验证及输出计费后才发布。不是整个服务或同名provider所有引用合计的并发上限。每请求窗口先取应用scratch credit（HTTP provider声明512KiB，runtime另计key/返回row/输出等），额度不足在请求前拒绝，不自动扩大Job预算。Client/pool/TLS内部metadata不冒充全部纳入应用frame额度或进程RSS硬上限。
 
-每算子cache最多1MiB、1024项、TTL≤60s（默认64KiB/1s），typed key、正负缓存、单调时钟过期和有界淘汰；TTL=0或cache_bytes<256禁用。缓存按算子独立，任务重启清空；TTL内业务变化可能暂不可见，不当历史快照。错误不进cache。默认 `on_error:"fail"`；显式 `"null"` 只将transport/status/timeout错误降为NULL，不吞类型/key/协议/策略/预算错误，也不把cancel当成功。超限或未读完的响应不复用连接；有界响应体读完后HTTP连接可复用，业务JSON校验失败仍使本次Lookup失败。失败/取消会终止并join在途任务，未join响应仍持有内存credit。
+每算子cache最多1MiB、1024项、TTL≤60s（默认64KiB/1s），typed key、正负缓存（`cache_negative:false` 只缓存命中，miss每次请求远端）、单调时钟过期和有界淘汰；TTL=0或cache_bytes<256禁用。缓存按算子独立，任务重启清空；TTL内业务变化可能暂不可见，不当历史快照。错误不进cache。默认 `on_error:"fail"`；显式 `"null"` 只将transport/status/timeout错误降为NULL，`"drop"` 则丢弃该输入行（计 `error_drops`），批量请求失败时作用于该批每个key；两者都不吞类型/key/协议/策略/预算错误，也不把cancel当成功。超限或未读完的响应不复用连接；有界响应体读完后HTTP连接可复用，业务JSON校验失败仍使本次Lookup失败。失败/取消会终止并join在途任务，未join响应仍持有内存credit。
 
 ### 恢复、诊断与边界
 
