@@ -242,3 +242,16 @@ Control crate：
 | 关闭 | `flush_timeout_ms` 内确认已排队批次；剩余计 `discarded_on_close` 并使 job 失败 |
 | 指标 | `jetstream_sink_*`，pipeline status 的 `jetstream_sink` 对象 |
 
+## 附：Local DataBus Source/Sink（`kind: "databus"`）
+
+说明见 [DATABUS.md](DATABUS.md)，决策见 [ADR-006](adr/006-local-databus.md)。无需 feature。
+
+| 合同项 | Local DataBus 的实现 |
+|---|---|
+| 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`，即 at-most-once、进程内、无历史；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
+| 内存 | 订阅缓冲上限 `buffer_bytes + buffer_capacity × 64 B` 在订阅时记入 job reservation（≤ reservation/2），与 NATS/JetStream 缓冲合计 ≤ 3/4；inbox 按 `inbox_bytes` 计入 queue 账本 |
+| 背压 / 慢消费者 | 每个订阅有界；`drop_oldest`（默认）/ `drop_newest` 从不阻塞发布方；`block` 最多等 `block_timeout_ms`，超时只对该订阅者丢弃；阻塞订阅者排在最后等待，不拖慢其他订阅者 |
+| 完成 | 批次中的每一行都投给所有匹配订阅后才回执 outbox；无订阅者时计 `no_subscribers` 并丢弃 |
+| 校验 | topic 语法（订阅可用 `*` / 末尾 `>`，发布必须是字面 topic）、边界、同一 pipeline 内的自反馈环；Sink 注册失败 fail closed（`databus_sink_fatal`） |
+| 关闭 | 订阅 / 发布注册为 RAII，job 结束即注销，topic 不泄漏；未消费缓冲计 `discarded_on_close`；Sink 在 `flush_timeout_ms` 内投完已排队批次 |
+| 指标 | `databus_source_*` / `databus_sink_*`，pipeline status 中的 `databus_source` / `databus_sink` 对象 |
