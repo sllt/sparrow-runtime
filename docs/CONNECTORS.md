@@ -256,6 +256,23 @@ Control crate：
 | 关闭 | 订阅 / 发布注册为 RAII，job 结束即注销，topic 不泄漏；未消费缓冲计 `discarded_on_close`；Sink 在 `flush_timeout_ms` 内投完已排队批次 |
 | 指标 | `databus_source_*` / `databus_sink_*`，pipeline status 中的 `databus_source` / `databus_sink` 对象 |
 
+## 附：WebSocket Source / Sink（`kind: "websocket"`，feature `websocket`）
+
+说明见 [WEBSOCKET.md](WEBSOCKET.md)。只做客户端模式（`ws://` / `wss://`）；不提供 listen 模式。
+
+| 合同项 | WebSocket 的实现 |
+|---|---|
+| 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`，at-most-once、无应用层确认；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
+| 内存 | 每连接 128 KiB + 2 × `max_message_bytes`（1 KiB..1 MiB，默认 64 KiB），Sink 加 `queue_capacity × max_message_bytes`；在 bind 时记入 job reservation（单个 ≤ 1/2，与 NATS/JetStream/DataBus 合计 ≤ 3/4）；Source inbox 按 `inbox_bytes` 计入 queue 账本 |
+| 大小上限 | 帧/消息上限在帧头处拒绝，不先缓冲；超大消息计 `dropped_oversize` 并重连；单条记录另受 64 KiB 解码上限 |
+| 背压 | Source inbox 满时停止读 socket（TCP 背压）；Sink 有界发送队列，`block` / `drop_newest`，`send_timeout_ms` 超时断开重连 |
+| 心跳 / 重连 | Ping 每 `ping_interval_ms`，`idle_timeout_ms` 无帧即重连；指数退避（100 ms → `reconnect_max_ms`，抖动取 [d/2, d]），每次断线 ≤ `reconnect_attempts`（拒绝 0）；耗尽后 Source 可重试失败，Sink fail closed（`websocket_sink_fatal`） |
+| 认证 / TLS | bearer / basic / 自定义头，仅 secret 引用且需 `wss://`；保留头和重复头拒绝；rustls 强制校验，`tls_ca_pem` 替换信任根；错误中不出现 URL、头值、凭据 |
+| 白名单 | host:port 经 `TargetPolicy`（默认端口 80/443），与 HTTP 相同 |
+| 格式 | JSON 文本帧（或 `binary_frames: decode`）、NDJSON 文本帧；CSV 只走文本帧且一条消息一条记录，与 ndjson / 二进制帧组合拒绝 |
+| 关闭 | Sink 在 `flush_timeout_ms` 内发完 outbox 与队列并发送 Close，剩余计 `discarded_on_close` |
+| 指标 | `websocket_source_*` / `websocket_sink_*`，pipeline status 中的 `websocket_source` / `websocket_sink` 对象 |
+
 ## 附：负载格式矩阵（`source.format` / `sink.format`）
 
 详见 [FORMATS.md](FORMATS.md)。默认是 `json`，未写 `format` 的 spec 行为不变。不支持的组合在校验阶段拒绝。
@@ -267,6 +284,7 @@ Control crate：
 | `http` Sink | ✓ | — | ✓ | 请求体 = 表头 + 多条记录；不能与 `body` / `single`、JetStream 源或 aligned 一起使用 |
 | `http_poll` | ✓ | ✓ | — | 一个响应 = 一份文档；`http_poll.format` 必须为空 |
 | `file` / `file_replay` / `replay` | ✓ | ✓ | ✓（`file`） | 文件或段文件 = 一份文档；表头在恢复时重建；段文件为 `part-N.csv` |
+| `websocket` | ✓ | ✓ | ✓ | 一条文本帧 = （表头 +）一条记录；CSV 拒绝 `ndjson` 分帧和二进制帧 |
 | `databus` | ✓（内部） | ✗ | ✗ | 进程内传递行 |
 | `log` / plugin | ✓ | — | ✗ | — |
 
