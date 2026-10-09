@@ -5,8 +5,10 @@
 # Usage:
 #   SPARROW_NATS_SERVER=... SPARROW_AGG_TEST_BIN=frozen/sparrow_runtime-HASH \
 #   bash scripts/production-agg-recovery-validate.sh NEW_ART SERVER_BIN [OLD_SERVER_BIN] [ROUNDS]
-# SERVER_BIN must be built with --features jetstream; OLD_SERVER_BIN is a
-# pre-v29 server (e.g. 424cf95) for rollback/upgrade checks.
+# SERVER_BIN must be built with --features jetstream,process-fault-pause (the
+# pause feature is harness-only and never packaged); OLD_SERVER_BIN is a
+# pre-v29 server (e.g. 424cf95) for rollback/upgrade checks. Optional
+# CASES (space-separated source:shape:cut) overrides the case list.
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd); cd "$root"
 art=${1:?new evidence directory}; server=${2:?jetstream-enabled sparrow-server}
@@ -37,10 +39,13 @@ for ((r=1;r<=rounds;r++)); do
     printf 'unit\text_agg_tests\t%s\t%s\n' "$r" "$code" >> "$results"; [[ $code == 0 ]] || fail=$((fail+1))
 done
 # 2. Confirmable SIGKILL cut points.
-cases=(file:count:input_after file:count:output_after file:count:commit_before file:count:commit_after
-       file:et:input_after file:et:output_after file:et:commit_before file:et:commit_after
-       jetstream:count:input_after jetstream:count:output_after jetstream:count:commit_before
-       jetstream:count:commit_after jetstream:count:ack_lost)
+cuts="input_after output_after output_inflight commit_before manifest_renamed commit_after restore_kill"
+cases=()
+for c in $cuts; do cases+=("file:count:$c"); done
+for c in $cuts; do cases+=("file:et:$c"); done
+for c in $cuts; do cases+=("file:hop:$c"); done
+for c in $cuts ack_lost; do cases+=("jetstream:count:$c"); done
+[[ -n "${CASES:-}" ]] && read -r -a cases <<< "$CASES"
 for c in "${cases[@]}"; do
     IFS=: read -r source shape cut <<< "$c"
     for ((r=1;r<=rounds;r++)); do
@@ -52,6 +57,8 @@ done
 # 3. Compatibility: upgrade/rollback with the old binary and profile/semantic mismatch.
 timeout 300 "$driver" --server-bin "$server" ${old:+--old-server-bin "$old"} --cut compat --out "$art/compat" > "$art/compat.log" 2>&1; code=$?
 printf 'compat\tupgrade_rollback\t1\t%s\n' "$code" >> "$results"; [[ $code == 0 ]] || fail=$((fail+1))
+awk -F'\t' 'NR>1{k=$1"\t"$2; n[k]++; if($4==0)p[k]++; else f[k]=f[k]" r"$3"("$4")"} END{for(k in n) printf "%s\t%d\t%d\t%d\t%s\n",k,n[k],p[k]+0,n[k]-p[k],f[k]}' "$results" \
+    | sort | { printf 'kind\tcase\trounds\tpass\tfail\tfailed_rounds(exit)\n'; cat; } > "$art/summary-table.tsv"
 total=$(($(wc -l < "$results")-1))
 printf 'AGG_RECOVERY_VALIDATE rounds=%s entries=%s failed=%s (SIGKILL, not power-loss)\n' "$rounds" "$total" "$fail" | tee "$art/summary.txt"
 [[ $fail == 0 ]]

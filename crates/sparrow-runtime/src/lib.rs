@@ -39,6 +39,8 @@ pub mod metrics;
 pub mod observed_cut;
 pub mod pipeline_checkpoint;
 pub mod processing_cut;
+#[doc(hidden)]
+pub mod process_fault;
 pub mod state;
 pub mod timer;
 pub mod transform;

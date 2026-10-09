@@ -615,6 +615,7 @@ impl WindowOperator {
                 out.pending_close = Some(out.pending_close.map(|p| p.max(wm)).unwrap_or(wm));
             }
         }
+        crate::process_fault::window_rows_applied(batch.num_rows());
         Ok(out)
     }
 

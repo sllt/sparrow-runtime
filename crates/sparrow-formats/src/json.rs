@@ -1086,6 +1086,21 @@ mod tests {
     }
 
     #[test]
+    fn float_input_is_correctly_rounded() {
+        let s = schema();
+        for text in ["10.209999999999999", "9.47", "0.30000000000000004", "2.2250738585072014e-308", "1.7976931348623157e308"] {
+            let bytes = format!(r#"{{"device_id":"a","temperature":{text}}}"#);
+            let row = decode_json_row(&s, bytes.as_bytes(), &JsonLimits::default()).unwrap();
+            let want: f64 = text.parse().unwrap();
+            assert_eq!(row.values[1], Scalar::Float64(want), "{text}");
+            match &row.values[1] {
+                Scalar::Float64(v) => assert_eq!(v.to_bits(), want.to_bits(), "{text}"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn round_trip_and_limits() {
         let s = schema();
         let bytes = br#"{"device_id":"edge-a","temperature":26.2,"payload":{"temp":26.2}}"#;

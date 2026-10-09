@@ -11,6 +11,7 @@ demo-io = ["sparrow-connectors/demo-io"]
 nats = ["sparrow-connectors/nats"]
 jetstream = ["nats", "sparrow-connectors/jetstream"]
 websocket = ["sparrow-connectors/websocket"]
+process-fault-pause = ["sparrow-runtime/process-fault-pause"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }

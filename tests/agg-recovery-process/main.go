@@ -1,5 +1,8 @@
-// Sub-batch 1 process oracle: File/JetStream -> Count/ET window with
-// FIRST/LAST/VAR_*/STDDEV_* -> required HTTP JSON. Standard library only.
+// Sub-batch 1 process oracle: File/JetStream -> Count/ET tumbling/ET hopping
+// window with FIRST/LAST/VAR_*/STDDEV_* -> required HTTP JSON. Standard
+// library only. Cuts that need an in-process stop use the server built with
+// the off-by-default `process-fault-pause` feature: the driver arms a marker
+// file, waits for `<point>.reached`, then SIGKILLs (no timed sleep-then-kill).
 // Expected rows are computed here independently (Go float64 Welford in the
 // same per-key arrival order, plus a math/big two-pass cross-check) and
 // compared bit-for-bit. Each run SIGKILLs the real server at one confirmable
@@ -225,6 +228,29 @@ func oracle(shape string, n int) []expected {
 		}
 		return out
 	}
+	if shape == "hop" {
+		// HOP(size 600, slide 300), lateness 0, single key: window [s,s+600)
+		// with s a multiple of 300 (negative starts included) closes when the
+		// first event with ts > s+600 arrives; at most one closes per event
+		// because ts advances by 100 and never lands on a boundary.
+		open := map[int64]*acc{}
+		for i := 1; i <= n; i++ {
+			r := row(i, shape)
+			for _, s := range []int64{floorDiv(r.Ts, 300)*300 - 600, floorDiv(r.Ts, 300)*300 - 300} {
+				if a, ok := open[s]; ok && r.Ts > s+600 {
+					out = append(out, finish("d0", a))
+					delete(open, s)
+				}
+			}
+			for _, s := range []int64{floorDiv(r.Ts, 300)*300 - 300, floorDiv(r.Ts, 300) * 300} {
+				if open[s] == nil {
+					open[s] = &acc{}
+				}
+				open[s].add(r)
+			}
+		}
+		return out
+	}
 	var cur *acc
 	var curStart int64 = -1
 	for i := 1; i <= n; i++ {
@@ -241,6 +267,14 @@ func oracle(shape string, n int) []expected {
 		cur.add(r)
 	}
 	return out
+}
+
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && (a < 0) != (b < 0) {
+		q--
+	}
+	return q
 }
 
 func intText(v *int64) string {
@@ -289,6 +323,9 @@ func render(data map[string]any) string {
 type capture struct {
 	mu       sync.Mutex
 	raw      [][]byte
+	held     [][]byte // bodies of requests left unanswered (in flight at SIGKILL)
+	hold     atomic.Bool
+	release  chan struct{}
 	listener net.Listener
 	server   *http.Server
 }
@@ -296,7 +333,7 @@ type capture struct {
 func newCapture() *capture {
 	l, e := net.Listen("tcp", "127.0.0.1:0")
 	must(e)
-	c := &capture{listener: l}
+	c := &capture{listener: l, release: make(chan struct{})}
 	c.server = &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 		body, e := io.ReadAll(io.LimitReader(r.Body, 1024*1024+1))
@@ -307,6 +344,18 @@ func newCapture() *capture {
 		var rows []json.RawMessage
 		if json.Unmarshal(body, &rows) != nil {
 			w.WriteHeader(400)
+			return
+		}
+		if c.hold.Load() {
+			// Never acknowledged: the request stays in flight until the
+			// server is SIGKILLed, then the driver releases it with 503.
+			c.mu.Lock()
+			for _, r := range rows {
+				c.held = append(c.held, append([]byte(nil), r...))
+			}
+			c.mu.Unlock()
+			<-c.release
+			w.WriteHeader(503)
 			return
 		}
 		c.mu.Lock()
@@ -324,6 +373,11 @@ func (c *capture) rows() [][]byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([][]byte(nil), c.raw...)
+}
+func (c *capture) heldRows() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]byte(nil), c.held...)
 }
 func (c *capture) port() int { return c.listener.Addr().(*net.TCPAddr).Port }
 
@@ -567,11 +621,6 @@ func graph(shape string, ext bool) map[string]any {
 	window := map[string]any{"kind": "count", "size": 3}
 	source := map[string]any{"id": 1, "kind": "memory_source", "table": "sensors", "out": []int{10}}
 	node := map[string]any{"id": 10, "kind": "window_agg", "keys": []string{"device_id"}, "out": []int{20}}
-	if shape == "et" {
-		window = map[string]any{"kind": "event_time", "size_micros": 300, "event_time_field": "ts", "lateness_micros": 0}
-		source["event_time_field"] = "ts"
-		node["event_time_field"] = "ts"
-	}
 	node["window"] = window
 	if ext {
 		node["aggs"] = aggs()
@@ -592,13 +641,56 @@ type env struct {
 	broker                   *child
 	file                     string
 	checkpoint               string
+	faults                   string
 }
 
 func (v *env) start(binary string) {
-	v.server = launch(binary, filepath.Join(v.root, "server.log"), []string{"SPARROW_TOKEN=" + token, "SPARROW_SECRETS_KEY=0123456789abcdef0123456789abcdef", "SPARROW_REQUIRE_SECRETS_KEY=1", "SPARROW_DATA_ROOTS=" + v.root},
+	v.server = launch(binary, filepath.Join(v.root, "server.log"), []string{"SPARROW_TOKEN=" + token, "SPARROW_SECRETS_KEY=0123456789abcdef0123456789abcdef", "SPARROW_REQUIRE_SECRETS_KEY=1", "SPARROW_DATA_ROOTS=" + v.root, "SPARROW_FAULT_MARKER_DIR=" + v.faults},
 		"--bind", fmt.Sprintf("127.0.0.1:%d", v.serverPort), "--catalog", filepath.Join(v.root, "catalog.db"), "--max-jobs", "1", "--safe-mode")
 	eventually("server health", func() bool { _, s := v.a.call("GET", "/v1/health", nil); return s == 200 })
 }
+
+// arm makes the next arrival at `point` park the server; waitReached
+// confirms the cut from the `.reached` marker the parked thread wrote.
+func (v *env) arm(point, content string) {
+	must(os.WriteFile(filepath.Join(v.faults, point+".arm"), []byte(content), 0600))
+}
+func (v *env) disarm(point string) {
+	must(os.Remove(filepath.Join(v.faults, point+".arm")))
+	_ = os.Remove(filepath.Join(v.faults, point+".reached"))
+}
+func (v *env) waitReached(point string) string {
+	var pid string
+	eventually("fault point reached: "+point, func() bool {
+		b, e := os.ReadFile(filepath.Join(v.faults, point+".reached"))
+		pid = strings.TrimSpace(string(b))
+		return e == nil && pid != ""
+	})
+	require(pid == strconv.Itoa(v.server.cmd.Process.Pid), "fault marker written by a different process")
+	return pid
+}
+
+// generations lists checkpoint generation directories and whether each has
+// a published MANIFEST (independent of the server's own inventory).
+func generations(dir string) map[string]bool {
+	out := map[string]bool{}
+	entries, e := os.ReadDir(dir)
+	must(e)
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasSuffix(entry.Name(), ".tmp") {
+			continue
+		}
+		_, e := os.Stat(filepath.Join(dir, entry.Name(), "MANIFEST"))
+		out[entry.Name()] = e == nil
+	}
+	return out
+}
+func currentName(dir string) string {
+	b, e := os.ReadFile(filepath.Join(dir, "CURRENT"))
+	must(e)
+	return strings.TrimSpace(string(b))
+}
+
 func (v *env) status() map[string]any { return v.a.ok("GET", "/v1/pipelines/check/status", nil) }
 func (v *env) publish(from, to int, shape string) {
 	for i := from; i <= to; i++ {
@@ -616,10 +708,23 @@ func (v *env) publish(from, to int, shape string) {
 	}
 }
 func (v *env) spec(source, shape string, ext bool) map[string]any {
-	spec := map[string]any{"stream": "sensors", "graph": graph(shape, ext),
+	spec := map[string]any{"stream": "sensors",
 		"sink":     map[string]any{"kind": "http", "url": fmt.Sprintf("http://127.0.0.1:%d/output", v.sink.port()), "batch_rows": 8, "linger_ms": 2},
 		"recovery": "aligned", "checkpoint_dir": v.checkpoint,
 		"checkpoint": map[string]any{"interval_ms": 86400000, "timeout_ms": 3000, "resume_latest": true}}
+	if shape == "count" {
+		spec["graph"] = graph(shape, ext)
+	} else {
+		// Event-time windows go through the SQL front end (single-source
+		// linear graphs with an event-time source binding are DAG-only).
+		require(ext, "plain ET spec not used")
+		window := "TUMBLE(ts, 300)"
+		if shape == "hop" {
+			window = "HOP(ts, 300, 600)" // slide 300us, size 600us, lateness 0
+		}
+		spec["sql"] = "SELECT device_id, COUNT(*) AS c, FIRST(v) AS f, LAST(v) AS l, VAR_POP(x) AS vp, VAR_SAMP(x) AS vs, " +
+			"STDDEV_POP(x) AS sp, STDDEV_SAMP(x) AS ss FROM sensors GROUP BY device_id, " + window
+	}
 	if source == "jetstream" {
 		spec["delivery"] = "checkpointed_at_least_once"
 		spec["source"] = map[string]any{"kind": "jetstream", "jetstream": map[string]any{
@@ -633,7 +738,8 @@ func (v *env) spec(source, shape string, ext bool) map[string]any {
 func setup(root, source, serverBin, natsBin string) *env {
 	must(os.MkdirAll(root, 0700))
 	v := &env{root: root, serverBin: serverBin, natsBin: natsBin, serverPort: port(), sink: newCapture(),
-		file: filepath.Join(root, "input.ndjson"), checkpoint: filepath.Join(root, "checkpoint")}
+		file: filepath.Join(root, "input.ndjson"), checkpoint: filepath.Join(root, "checkpoint"), faults: filepath.Join(root, "faults")}
+	must(os.MkdirAll(v.faults, 0700))
 	v.a = api{fmt.Sprintf("http://127.0.0.1:%d", v.serverPort), &http.Client{Timeout: 5 * time.Second}}
 	if source == "jetstream" {
 		np := port()
@@ -729,50 +835,105 @@ func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
 	committedRows := p1
 	p2 := 18
 	if cut == "input_after" {
-		p2 = 14 // each key +1 row, no window completes (ET: 1450 < 1500)
+		// Rows applied to window state, no window completes: Count +2 rows
+		// per key (one short of 3); ET/HOP ts 1450 < next end 1500.
+		p2 = 16
+		if shape != "count" {
+			p2 = 14
+		}
+		require(outputsAt(p2) == outputsAt(p1), "input_after must not complete a window")
 	}
-	v.publish(p1+1, p2, shape)
-	eventually("phase-2 input applied", func() bool {
-		return number(v.status(), "observation", "runtime_progress", "ingested_rows") == float64(p2)
-	})
-	eventually("phase-2 outputs", func() bool { return v.sink.count() == outputsAt(p2) })
 	var oldReader string
+	detail := map[string]any{}
+	currentPath := filepath.Join(v.checkpoint, "CURRENT")
+	switch cut {
+	case "input_after":
+		// Confirmable: the window stage parks after applying row p2 (absolute
+		// count of rows applied in this process).
+		v.arm("window_rows_applied", strconv.Itoa(p2))
+		v.publish(p1+1, p2, shape)
+		detail["paused_pid"] = v.waitReached("window_rows_applied")
+		require(v.sink.count() == outputsAt(p1), "input_after produced output")
+	case "output_inflight":
+		v.sink.hold.Store(true)
+		v.publish(p1+1, p2, shape)
+		// Confirmable: at least one output request is held unanswered.
+		eventually("phase-2 output request in flight", func() bool { return len(v.sink.heldRows()) >= 1 })
+		require(v.sink.count() == outputsAt(p1), "held output was acknowledged")
+	default:
+		v.publish(p1+1, p2, shape)
+		eventually("phase-2 input applied", func() bool {
+			return number(v.status(), "observation", "runtime_progress", "ingested_rows") == float64(p2)
+		})
+		// Confirmable: every phase-2 output was acknowledged by the HTTP peer.
+		eventually("phase-2 outputs", func() bool { return v.sink.count() == outputsAt(p2) })
+	}
 	if reliable {
+		// Consumer listing goes to the broker, not the (possibly parked) server.
 		oldReader = v.readerName()
 	}
-	detail := map[string]any{}
 	switch cut {
-	case "input_after", "output_after":
-		require(hash(filepath.Join(v.checkpoint, "CURRENT")) == c1, "no commit expected before this cut")
+	case "input_after", "output_after", "output_inflight", "restore_kill":
+		require(hash(currentPath) == c1, "no commit expected before this cut")
 	case "commit_before":
 		must(os.Mkdir(filepath.Join(v.checkpoint, "CURRENT.tmp"), 0700))
 		failed, code := v.a.call("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
 		require(code >= 400, "injected CURRENT publication failure unexpectedly succeeded")
 		detail["failed_commit"] = failed
-		require(hash(filepath.Join(v.checkpoint, "CURRENT")) == c1, "failed commit changed CURRENT")
+		require(hash(currentPath) == c1, "failed commit changed CURRENT")
+	case "manifest_renamed":
+		before := generations(v.checkpoint)
+		v.arm("checkpoint_after_manifest_rename", "")
+		go func() { _, _ = v.a.call("POST", "/v1/pipelines/check/checkpoint", map[string]any{}) }()
+		detail["paused_pid"] = v.waitReached("checkpoint_after_manifest_rename")
+		after := generations(v.checkpoint)
+		var orphans []string
+		for name, published := range after {
+			if _, old := before[name]; !old && published && name != currentName(v.checkpoint) {
+				orphans = append(orphans, name)
+			}
+		}
+		require(len(orphans) == 1, fmt.Sprintf("expected exactly one renamed-but-unpublished MANIFEST, got %v", orphans))
+		require(hash(currentPath) == c1, "CURRENT moved before the cut")
+		detail["orphan_generation"] = orphans[0]
 	case "commit_after":
 		v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
-		require(hash(filepath.Join(v.checkpoint, "CURRENT")) != c1, "commit did not publish CURRENT")
+		require(hash(currentPath) != c1, "commit did not publish CURRENT")
 		committedRows = p2
 	case "ack_lost":
 		require(reliable, "ack_lost is JetStream-only")
 		v.proxy.drop.Store(true)
 		v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
 		eventually("actual dropped post-commit ACK", func() bool { return v.proxy.dropped.Load() > 0 })
-		require(hash(filepath.Join(v.checkpoint, "CURRENT")) != c1, "commit did not publish CURRENT")
+		require(hash(currentPath) != c1, "commit did not publish CURRENT")
 		committedRows = p2
 	default:
 		panic("unknown cut " + cut)
 	}
 	preKill := v.sink.count()
-	currentBeforeKill := hash(filepath.Join(v.checkpoint, "CURRENT"))
+	currentBeforeKill := hash(currentPath)
 	v.server.stop(syscall.SIGKILL)
-	if cut == "commit_before" {
-		must(os.Remove(filepath.Join(v.checkpoint, "CURRENT.tmp")))
+	var held [][]byte
+	if cut == "output_inflight" {
+		held = v.sink.heldRows()
+		v.sink.hold.Store(false)
+		close(v.sink.release)
+		detail["inflight_rows"] = len(held)
 	}
-	if reliable {
+	switch cut {
+	case "commit_before":
+		must(os.Remove(filepath.Join(v.checkpoint, "CURRENT.tmp")))
+	case "input_after":
+		v.disarm("window_rows_applied")
+	case "manifest_renamed":
+		v.disarm("checkpoint_after_manifest_rename")
+	}
+	checkBroker := func(label string) {
+		if !reliable {
+			return
+		}
 		info := v.producer.request("$JS.API.CONSUMER.INFO.INPUT."+oldReader, []byte("{}"))
-		detail["broker_after_kill"] = info
+		detail[label] = info
 		floor := number(info, "ack_floor", "stream_seq")
 		// ACK never passes the durable cut: C1 rows were committed+ACKed;
 		// later rows may be ACKed only after their own commit.
@@ -780,9 +941,26 @@ func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
 		if cut == "ack_lost" {
 			require(floor < float64(committedRows), "ACK for the last commit was not actually lost")
 		}
+	}
+	checkBroker("broker_after_kill")
+	if reliable {
 		v.proxy.drop.Store(false)
 	}
-	require(hash(filepath.Join(v.checkpoint, "CURRENT")) == currentBeforeKill, "SIGKILL changed CURRENT")
+	require(hash(currentPath) == currentBeforeKill, "SIGKILL changed CURRENT")
+	if cut == "restore_kill" {
+		// Second crash inside owned restore: payload/header/participant
+		// credit charged, materialize not yet done.
+		v.arm("restore_after_credit", "")
+		v.start(serverBin)
+		go func() { _, _ = v.a.call("POST", "/v1/pipelines/check/start", map[string]any{}) }()
+		detail["paused_pid"] = v.waitReached("restore_after_credit")
+		require(v.sink.count() == preKill, "output emitted during interrupted restore")
+		require(hash(currentPath) == currentBeforeKill, "interrupted restore changed CURRENT")
+		v.server.stop(syscall.SIGKILL)
+		v.disarm("restore_after_credit")
+		require(hash(currentPath) == currentBeforeKill, "SIGKILL during restore changed CURRENT")
+		checkBroker("broker_after_restore_kill")
+	}
 	v.start(serverBin)
 	v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
 	if reliable {
@@ -840,10 +1018,38 @@ func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
 			require(ids[preKill+k] == ids[replayFrom+k], "replayed output changed ID")
 		}
 	}
+	if cut == "output_inflight" {
+		// The unacknowledged request carried oracle rows of the uncommitted
+		// suffix, and every one of them was replayed (same content and ID).
+		require(len(held) >= 1, "no in-flight output captured")
+		for k, r := range held {
+			text, id := decode(r, reliable)
+			require(replayFrom+k < len(wantText) && text == wantText[replayFrom+k], "in-flight output differs from oracle")
+			require(got[preKill+k] == text, "in-flight output was not replayed in order")
+			if reliable {
+				require(ids[preKill+k] == id, "replayed in-flight output changed ID")
+			}
+		}
+	}
+	if cut == "manifest_renamed" {
+		orphan := detail["orphan_generation"].(string)
+		require(currentName(v.checkpoint) != orphan, "renamed-but-unpublished MANIFEST was promoted")
+	}
 	finalStatus := v.status()
 	save(filepath.Join(root, "final-status.json"), finalStatus)
 	save(filepath.Join(root, "inventory.json"), v.a.ok("GET", "/v1/pipelines/check/checkpoints", nil))
 	save(filepath.Join(root, "outputs.json"), got)
+	// Resource release: stop the job; tracked credits must drain to zero.
+	v.a.ok("POST", "/v1/pipelines/check/stop", map[string]any{})
+	var metrics map[string]any
+	eventually("job credits released after stop", func() bool {
+		metrics = v.a.ok("GET", "/v1/metrics", nil)
+		return number(metrics, "process_credits", "reservation_bytes") == 0 &&
+			number(metrics, "process_credits", "physical_bytes") == 0 &&
+			number(metrics, "process_credits", "live_handles") == 0
+	})
+	require(number(metrics, "state_accounting_errors_total") == 0, "state accounting errors after recovery")
+	save(filepath.Join(root, "metrics-after-stop.json"), metrics)
 	v.server.stop(syscall.SIGTERM)
 	log, _ := os.ReadFile(filepath.Join(root, "server.log"))
 	require(!bytes.Contains(log, []byte("accounting_error")), "memory accounting error logged")
@@ -903,7 +1109,9 @@ func compat(root, serverBin, oldBin string) map[string]any {
 		v.a.ok("PUT", "/v1/pipelines/check", plain)
 		v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
 		eventually("old v3 outputs", func() bool { return v.sink.count() == outputs+12 })
-		eventually("old applied", func() bool { return number(v.status(), "observation", "runtime_progress", "ingested_rows") == 36-24 || v.sink.count() == outputs+12 })
+		eventually("old applied", func() bool {
+			return number(v.status(), "observation", "runtime_progress", "ingested_rows") == 36-24 || v.sink.count() == outputs+12
+		})
 		v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
 		require(snapshotVersion(v.checkpoint) == 3, "old binary should write v3")
 		v3Current := hash(filepath.Join(v.checkpoint, "CURRENT"))
@@ -979,8 +1187,8 @@ func main() {
 	oldBin := flag.String("old-server-bin", "", "pre-v29 server for rollback/upgrade")
 	out := flag.String("out", "", "new evidence directory")
 	source := flag.String("source", "file", "file or jetstream")
-	shape := flag.String("shape", "count", "count or et")
-	cut := flag.String("cut", "", "input_after|output_after|commit_before|commit_after|ack_lost|compat")
+	shape := flag.String("shape", "count", "count, et (tumbling) or hop")
+	cut := flag.String("cut", "", "input_after|output_after|output_inflight|commit_before|manifest_renamed|commit_after|restore_kill|ack_lost|compat")
 	flag.Parse()
 	require(*server != "" && *out != "" && *cut != "", "server-bin, out and cut required")
 	root, e := filepath.Abs(*out)
@@ -999,7 +1207,7 @@ func main() {
 		return
 	}
 	require(*source == "file" || *source == "jetstream", "source")
-	require(*shape == "count" || (*shape == "et" && *source == "file"), "shape")
+	require(*shape == "count" || ((*shape == "et" || *shape == "hop") && *source == "file"), "shape")
 	s := run(filepath.Join(root, "run"), *source, *shape, *cut, *server, *natsBin)
 	fmt.Println("AGG_RECOVERY_PROCESS_OK", *source, *shape, *cut, s["outputs"])
 }

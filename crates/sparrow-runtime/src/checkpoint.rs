@@ -1003,6 +1003,7 @@ impl CheckpointStore {
         }
         fs::rename(&man_tmp, &man).map_err(io_err)?;
         fsync_dir(&chk)?;
+        crate::process_fault::pause("checkpoint_after_manifest_rename");
         if self.fault.point == FaultPoint::AfterManifestRename {
             return Err(cut("AfterManifestRename", id));
         }
@@ -1284,6 +1285,7 @@ impl CheckpointStore {
                     participants.push((participant, charge(*bytes)?));
                 }
                 meter.planned = Some(planned);
+                crate::process_fault::pause("restore_after_credit");
                 let snapshot = StoredSnapshot::decode_metered(&payload, self.max_state_keys, true, &mut meter)?;
                 (
                     snapshot,

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Sparrow in-process kernel: ExecutionChain, bounded mailboxes, job supervisor"
 
+[features]
+# Process-level SIGKILL harness only (confirmable crash cuts); never packaged.
+process-fault-pause = []
+
 [dependencies]
 sparrow-model.workspace = true
 sparrow-expr.workspace = true
