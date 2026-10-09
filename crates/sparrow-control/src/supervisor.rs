@@ -49,6 +49,7 @@ mod live_silence;
 mod observed_time_log;
 mod graph_time;
 mod graph_time_log;
+mod prepared_sink;
 
 /// Per-pipeline backoff, capped at 32 seconds; never sleep in converge.
 /// A successful launch is not a stable recovery: reset after 30s running.
@@ -1667,13 +1668,30 @@ impl Supervisor {
         let max_keys = self.kernel.job_budget().max_state_keys;
         let iot_profile = plan.has_iot();
         let reference_profile = prepared_references.is_some();
-        let profile_specific = reference_profile || layout.has_hysteresis();
+        let diag = IoDiagnostics::new();
+        // A required durable target must be resolved before opening/advancing
+        // source history. Reuse this admitted session for the running Sink.
+        let mut prepared_sink = prepared_sink::PreparedSink::prepare(
+            self, spec, &plan, target_policy, Arc::clone(&diag),
+        ).await?;
+        let sink_identity = prepared_sink.identity();
+        let restore_sink = sink_identity.clone();
+        let restore_guard = prepared_sink.lifecycle_guard();
+        let profile_specific = reference_profile || layout.has_hysteresis() || sink_identity.is_some();
         // Fingerprinting, bounded snapshot reads and cursor verification are
         // cold filesystem work; never block a Tokio executor worker on them.
-        let (source, store, restore_freeze, restore_iot, ingested0, restored_from, inventory, state_generation, downstream_changed) = self
+        let restored = self
             .store
             .run_blocking(move || {
-                let mut store = if profile_specific {
+                // Dropping the awaiting start future cannot release the Job
+                // slot while this non-cancellable restore still holds credit.
+                let _restore_guard = restore_guard;
+                let mut store = if let Some(sink) = &restore_sink {
+                    CheckpointStore::open_file_jetstream_sink_exclusive(
+                        std::path::Path::new(&chk), max_keys, restore_policy.retention(),
+                        &restore_layout, Arc::clone(sink),
+                    )?
+                } else if profile_specific {
                     CheckpointStore::open_for_plan_exclusive(
                         std::path::Path::new(&chk),
                         max_keys,
@@ -1706,7 +1724,9 @@ impl Supervisor {
                     && (inventory.current.is_some() || inventory.current_error.is_some()
                         || !inventory.generations.is_empty())
                 {
-                    let message = if reference_profile {
+                    let message = if restore_sink.is_some() {
+                        "required sink checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
+                    } else if reference_profile {
                         "reference checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else {
                         "hysteresis checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
@@ -1722,7 +1742,7 @@ impl Supervisor {
                         "checkpoint history exists without CURRENT; refusing automatic fresh start",
                     ));
                 }
-                let (restore_freeze, restore_iot, ingested0, restored_from, state_generation, downstream_changed) = if restore {
+                let (restore_freeze, restore_iot, ingested0, restored_from, state_generation, downstream_changed, saved_plan, saved_sink) = if restore {
                     let requested = selected
                         .as_ref()
                         .and_then(|s| s.snapshot_id.as_deref())
@@ -1737,7 +1757,16 @@ impl Supervisor {
                     } else {
                         store.recover_pipeline_required()?
                     };
-                    snap.check_compatible(&restore_layout)?;
+                    let saved_sink = if let Some(sink) = &restore_sink {
+                        snap.check_compatible_with_sink(&restore_layout, sink.identity())?;
+                        Some(sparrow_io::OwnedSinkIdentity::new(
+                            snap.sink_identity.clone().expect("checked required sink identity"),
+                            sink.owner(),
+                        )?)
+                    } else {
+                        snap.check_compatible(&restore_layout)?;
+                        None
+                    };
                     source.seek(&snap.source)?;
                     if requested.is_some() {
                         store.pin_recovery_point(snap.checkpoint_id)?;
@@ -1749,12 +1778,14 @@ impl Supervisor {
                         Some(snap.checkpoint_id),
                         snap.generation,
                         snap.plan.semantics != restore_layout.semantics,
+                        Arc::new(snap.plan),
+                        saved_sink,
                     )
                 } else {
                     use ring::rand::{SecureRandom,SystemRandom};
                     let mut generation=[0u8;16];
                     SystemRandom::new().fill(&mut generation).map_err(|_|SparrowError::new(sparrow_model::ErrorCode::Internal,"state generation randomness unavailable"))?;
-                    (None, Vec::new(), 0, None, generation, false)
+                    (None, Vec::new(), 0, None, generation, false, Arc::clone(&restore_layout), None)
                 };
                 // Durable before Kernel/source activation. Fresh/reset gets a new
                 // random 128-bit identity; compatible recovery preserves its ID.
@@ -1770,9 +1801,16 @@ impl Supervisor {
                     inventory,
                     state_generation,
                     downstream_changed,
+                    saved_plan,
+                    saved_sink,
                 ))
             })
-            .await?;
+            .await;
+        let (source, store, restore_freeze, restore_iot, ingested0, restored_from, inventory, state_generation, downstream_changed, saved_plan, saved_sink) =
+            match restored {
+                Ok(restored) => restored,
+                Err(error) => return Err(prepared_sink.cleanup_error(error).await),
+            };
         let mut source = source;
         let next_chk = store.next_checkpoint_id();
         let ingested = Arc::new(std::sync::atomic::AtomicU64::new(ingested0));
@@ -1785,7 +1823,6 @@ impl Supervisor {
         let acks = AlignedAcks::default();
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<AlignedCmd>(1);
         let outbox = Arc::new(InflightCounter::new());
-        let diag = IoDiagnostics::new();
         diag.observe_source(&tx_ev);
         diag.observe_sink(&tx_out);
         let diag_src = Arc::clone(&diag);
@@ -1796,7 +1833,16 @@ impl Supervisor {
             .with_live_out(tx_out)
             .with_aligned(AlignedJob {
                 restore: None,
-                pipeline: Some(PipelineRestore {plan:layout.clone(),generation:state_generation,restore:restore_freeze,iot:restore_iot}),
+                pipeline: Some(PipelineRestore {
+                    // v27 independently verifies the saved full semantics at
+                    // Kernel admission, rather than comparing live to itself.
+                    plan: if sink_identity.is_some() { saved_plan } else { layout.clone() },
+                    generation:state_generation,restore:restore_freeze,iot:restore_iot,
+                    sink: sink_identity.as_ref().map(|live| match saved_sink {
+                        Some(saved) => sparrow_runtime::SinkRestoreBinding::restored(Arc::clone(live), saved),
+                        None => sparrow_runtime::SinkRestoreBinding::fresh(Arc::clone(live)),
+                    }),
+                }),
                 acks: acks.clone(),
                 outbox: Arc::clone(&outbox),
             });
@@ -1805,7 +1851,13 @@ impl Supervisor {
                 .with_tables(prepared.tables)
                 .with_source_admission(admission);
         }
-        let job = self.kernel.submit(request)?;
+        if let Some(admission) = prepared_sink.take_admission() {
+            request = request.with_source_admission(admission);
+        }
+        let job = match self.kernel.submit(request) {
+            Ok(job) => job,
+            Err(error) => return Err(prepared_sink.cleanup_error(error).await),
+        };
         let cancel = job.cancellation();
         let child = cancel.clone();
         let ingested_r = Arc::clone(&ingested);
@@ -1898,6 +1950,7 @@ impl Supervisor {
                         let layout = Arc::clone(&layout_r);
                         let store = Arc::clone(&store_r);
                         let owner = checkpoint_owner.clone();
+                        let sink_identity = sink_identity.clone();
                         let metrics = metrics.clone();
                         let checkpoint_cancel = checkpoint_cancel.clone();
                         // Cut and barrier publication above remain inline and
@@ -1923,8 +1976,14 @@ impl Supervisor {
                         let committed = tokio::task::spawn_blocking(move || {
                             let started = std::time::Instant::now();
                             let mut store = store.lock().expect("store");
-                            let payload = PipelineSnapshot::encode_frozen(
-                                id, &cut_source, cut_ingested, checkpoint_revision, &layout, acks, &owner, max_keys)?;
+                            let payload = if let Some(sink) = &sink_identity {
+                                PipelineSnapshot::encode_frozen_with_sink(
+                                    id, &cut_source, cut_ingested, checkpoint_revision, &layout,
+                                    sink.identity(), acks, &owner, max_keys)?
+                            } else {
+                                PipelineSnapshot::encode_frozen(
+                                    id, &cut_source, cut_ingested, checkpoint_revision, &layout, acks, &owner, max_keys)?
+                            };
                             let payload_len = payload.bytes().len() as u64;
                             let id = store.commit_prepared(&payload)?;
                             let storage = store.inventory().ok();
@@ -2003,16 +2062,19 @@ impl Supervisor {
             }
             source_result
         });
-       let sink_result = self.spawn_sink(
+       let mut rx_out = Some(rx_out);
+       let sink_result = if let Some(sink) = prepared_sink.spawn(&self.kernel, &mut rx_out, cancel.clone(), Arc::clone(&outbox)) {
+           Ok(sink)
+       } else { self.spawn_sink(
             job.memory_owner(),
            spec,
-            rx_out,
+            rx_out.take().expect("unprepared sink input"),
             cancel.clone(),
             Arc::clone(&diag),
             self.demo_endpoints().as_ref(),
             target_policy,
             Some(Arc::clone(&outbox)),
-        );
+        ) };
         let sink = match sink_result {
             Ok(sink) => sink,
             Err(error) => {

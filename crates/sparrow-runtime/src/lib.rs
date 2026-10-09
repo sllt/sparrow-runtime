@@ -45,7 +45,9 @@ pub mod window;
 #[cfg(test)]
 mod window_completion_tests;
 pub use iot::{IotFreeze, IotOperator};
-pub use pipeline_checkpoint::{snapshot_version_for, PipelineSnapshot};
+pub use pipeline_checkpoint::{sink_snapshot_version_for, snapshot_version_for, PipelineSnapshot};
+#[cfg(test)]
+mod sink_checkpoint_tests;
 #[cfg(test)]
 mod alarm_tests;
 #[cfg(test)]
@@ -78,7 +80,7 @@ mod time_graph_tests;
 pub use aligned::{run_until, AlignedSession};
 pub use barrier::{
     wait_aligned_acks, wait_outbox, AlignedAck, AlignedAcks, AlignedJob, BarrierAcks,
-    CheckpointAcks, FlushOutcome, ParticipantAcks, ParticipantOutcome, PipelineRestore,
+    CheckpointAcks, FlushOutcome, ParticipantAcks, ParticipantOutcome, PipelineRestore, SinkRestoreBinding,
 };
 pub use capture::{CaptureMode, SharedCapture, StallGate};
 pub use checkpoint::{

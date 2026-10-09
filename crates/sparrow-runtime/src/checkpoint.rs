@@ -311,6 +311,7 @@ pub struct CheckpointStore {
     pinned: Option<u64>,
     read_only: bool,
     pipeline_version: Option<u16>,
+    pipeline_sink: Option<std::sync::Arc<sparrow_io::OwnedSinkIdentity>>,
     // Diagnostic headers only. Never used by validation, recovery or GC.
     metadata_cache: std::sync::Mutex<std::collections::BTreeMap<u64, SnapshotMetadata>>,
 }
@@ -410,6 +411,7 @@ impl CheckpointStore {
             pinned: None,
             read_only: !create,
             pipeline_version: None,
+            pipeline_sink: None,
             metadata_cache: Default::default(),
         })
     }
@@ -575,6 +577,55 @@ impl CheckpointStore {
         Self::open_profile_exclusive(dir, max_keys, retention, version)
     }
 
+    /// Explicit v27 writer. The fixed target and its Job credit live through
+    /// every blocking commit; neither fresh writes nor recovery may change it.
+    pub fn open_file_jetstream_sink_exclusive(
+        dir: impl Into<PathBuf>,
+        max_keys: usize,
+        retention: CheckpointRetention,
+        plan: &sparrow_plan::CheckpointPlan,
+        sink: std::sync::Arc<sparrow_io::OwnedSinkIdentity>,
+    ) -> Result<Self> {
+        let version = crate::pipeline_checkpoint::sink_snapshot_version_for(plan, "file", sink.identity())?;
+        let mut store = Self::open_profile_exclusive(dir, max_keys, retention, version)?;
+        store.pipeline_sink = Some(sink);
+        // Valid foreign-target history is incompatibility, not a damaged
+        // generation to skip. Preserve it even when CURRENT is corrupt or a
+        // caller requested a fresh start rather than recovery.
+        let current = read_current(&store.dir).ok().flatten();
+        for id in list_generation_ids(&store.dir)? {
+            if store.was_published(id) || current == Some(id) {
+                if let Err(error) = store.load_generation_mode(id, false) {
+                    if store.nonfallback_error(&error) { return Err(error); }
+                }
+            }
+        }
+        Ok(store)
+    }
+
+    fn nonfallback_error(&self, error: &SparrowError) -> bool {
+        sink_profile_mismatch(error)
+            || (self.pipeline_sink.is_some() && error.code == ErrorCode::ResourceExhausted)
+    }
+
+    fn check_sink_payload(&self, payload: &[u8]) -> Result<()> {
+        let Some(expected) = &self.pipeline_sink else { return Ok(()); };
+        if payload.get(4..6) != Some(crate::pipeline_checkpoint::FILE_JETSTREAM_SINK_SNAPSHOT_VERSION.to_le_bytes().as_slice()) {
+            return Err(sink_mismatch("JetStream sink store cannot adopt another checkpoint profile"));
+        }
+        // The target-only parser is bounded, including temporary canonical
+        // endpoint strings. It never re-materializes a prepared state frame.
+        let _scratch = expected.owner().acquire(
+            sparrow_model::CreditKind::Reservation,
+            3 * sparrow_io::sink_identity::MAX_SINK_IDENTITY_BYTES,
+        )?;
+        let actual = PipelineSnapshot::encoded_sink_identity(payload)?;
+        if &actual != expected.identity() {
+            return Err(sink_mismatch("JetStream sink checkpoint target differs from the fixed store binding"));
+        }
+        Ok(())
+    }
+
     fn open_profile_exclusive(dir: impl Into<PathBuf>, max_keys: usize, retention: CheckpointRetention, version:u16) -> Result<Self> {
         let mut store = Self::open_exclusive(dir, max_keys, retention)?;
         for id in list_generation_ids(&store.dir)? {
@@ -625,7 +676,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26) {
+        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {
@@ -753,6 +804,10 @@ impl CheckpointStore {
     }
 
     pub fn commit_prepared(&mut self, snapshot: &EncodedSnapshot) -> Result<u64> {
+        if self.pipeline_sink.as_ref().is_some_and(|sink| !std::sync::Arc::ptr_eq(sink.owner(), snapshot.lease.owner())) {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                "JetStream sink prepared snapshot belongs to another Job memory owner"));
+        }
         if snapshot.entries > self.max_state_keys {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -781,6 +836,7 @@ impl CheckpointStore {
         if self.pipeline_version.is_some_and(|version|payload.get(4..6)!=Some(version.to_le_bytes().as_slice())) {
             return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "profile writer cannot publish legacy or foreign source snapshots"));
         }
+        self.check_sink_payload(payload)?;
         let disk_next = list_generation_ids(&self.dir)?
             .into_iter()
             .max()
@@ -832,8 +888,9 @@ impl CheckpointStore {
                         }
                         Some(current)
                     }
+                    Err(error) if self.nonfallback_error(&error) => return Err(error),
                     Err(error) => Some(
-                        self.load_latest_valid_except(Some(current))
+                        self.load_latest_valid_except(Some(current))?
                             .ok_or(error)?
                             .id(),
                     ),
@@ -841,7 +898,7 @@ impl CheckpointStore {
             }
             Ok(None) => None,
             Err(error) => Some(
-                self.load_latest_valid_except(None)
+                self.load_latest_valid_except(None)?
                     .ok_or(error)?
                     .id(),
             ),
@@ -945,7 +1002,8 @@ impl CheckpointStore {
             Ok(Some(id)) => match self.load_generation(id) {
                 Ok(snap) => Ok(Some(snap)),
                 Err(e) => {
-                    if let Some(snap) = self.load_latest_valid_except(Some(id)) {
+                    if self.nonfallback_error(&e) { return Err(e); }
+                    if let Some(snap) = self.load_latest_valid_except(Some(id))? {
                         return Ok(Some(snap));
                     }
                     Err(e)
@@ -955,7 +1013,7 @@ impl CheckpointStore {
             // promote an unpublished MANIFEST (crash after rename, before CURRENT).
             Ok(None) => Ok(None),
             Err(e) => {
-                if let Some(snap) = self.load_latest_valid_except(None) {
+                if let Some(snap) = self.load_latest_valid_except(None)? {
                     Ok(Some(snap))
                 } else {
                     Err(e)
@@ -964,8 +1022,11 @@ impl CheckpointStore {
         }
     }
 
-    fn load_latest_valid_except(&self, skip: Option<u64>) -> Option<StoredSnapshot> {
-        let mut ids = list_generation_ids(&self.dir).ok()?;
+    fn load_latest_valid_except(&self, skip: Option<u64>) -> Result<Option<StoredSnapshot>> {
+        let mut ids = match list_generation_ids(&self.dir) {
+            Ok(ids) => ids,
+            Err(_) => return Ok(None),
+        };
         ids.sort_unstable();
         ids.reverse();
         for id in ids {
@@ -977,11 +1038,13 @@ impl CheckpointStore {
             if !self.was_published(id) {
                 continue;
             }
-            if let Ok(snap) = self.load_generation(id) {
-                return Some(snap);
+            match self.load_generation(id) {
+                Ok(snap) => return Ok(Some(snap)),
+                Err(error) if self.nonfallback_error(&error) => return Err(error),
+                Err(_) => {}
             }
         }
-        None
+        Ok(None)
     }
 
     fn load_generation(&self, id: u64) -> Result<StoredSnapshot> {
@@ -1070,6 +1133,7 @@ impl CheckpointStore {
                 ),
             ));
         }
+        self.check_sink_payload(&payload)?;
         let snapshot = StoredSnapshot::decode(&payload, self.max_state_keys, materialize)?;
         if snapshot.id() != id {
             return Err(SparrowError::new(
@@ -1154,6 +1218,15 @@ impl CheckpointStore {
     pub fn has_committed(&self) -> bool {
         matches!(self.recover_any_committed(), Ok(Some(_)))
     }
+}
+
+fn sink_mismatch(message: &str) -> SparrowError {
+    SparrowError::new(ErrorCode::UnsupportedRestore, message)
+        .context("checkpoint_guard", "sink_profile_mismatch")
+}
+
+fn sink_profile_mismatch(error: &SparrowError) -> bool {
+    error.context.iter().any(|(key, value)| key == "checkpoint_guard" && value == "sink_profile_mismatch")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2985,6 +3058,66 @@ mod tests {
             got.checkpoint_id, 2,
             "must fall back to a verified generation"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v27_validation_credit_pressure_is_not_corruption_fallback() {
+        let dir = tmp();
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let target = sparrow_io::OwnedSinkIdentity::new(
+            sparrow_io::SinkIdentity::jetstream(
+                &["nats://localhost".into()], None, "OUT", 1, "out.rows", None,
+            ).unwrap(),
+            &owner,
+        ).unwrap();
+        let schema = Schema::new(1, vec![Field::new(1, "v", DataType::Int64, false)]).unwrap();
+        let physical = sparrow_plan::PhysicalPlan {
+            pipeline: 1.into(), revision: 1.into(), edges: None,
+            side_outputs: vec![], source_times: vec![],
+            stages: vec![
+                sparrow_plan::PhysicalStage::MemorySource {
+                    operator: 1.into(), name: "sensors".into(), schema: schema.clone(),
+                },
+                sparrow_plan::PhysicalStage::CaptureSink {
+                    operator: 2.into(), name: "out".into(), schema,
+                },
+            ],
+        };
+        let plan = sparrow_plan::CheckpointPlan::from_physical(&physical).unwrap();
+        let position = SourcePosition::start(SourceIdentity {
+            kind: "file".into(), path: "fixture.ndjson".into(), size: 0, fingerprint: 0,
+        });
+        let encode = |id| PipelineSnapshot::encode_frozen_with_sink(
+            id, &position, 0, 1, &plan, target.identity(),
+            crate::ParticipantAcks {
+                attempt: 1, generation: [7; 16], freezes: vec![], next_output: None,
+            }, &owner, 16,
+        ).unwrap();
+        let mut store = CheckpointStore::open_file_jetstream_sink_exclusive(
+            &dir, 16, Default::default(), &plan, target.clone(),
+        ).unwrap();
+        store.commit_prepared(&encode(1)).unwrap();
+        store.commit_prepared(&encode(2)).unwrap();
+        let candidate = encode(3);
+        let current = fs::read(dir.join("CURRENT")).unwrap();
+        let available = owner.budget().reservation_bytes - owner.usage().reservation_bytes;
+        let pressure = owner.acquire(CreditKind::Reservation, available - 1024).unwrap();
+        assert_eq!(store.recover_pipeline_required().unwrap_err().code, ErrorCode::ResourceExhausted);
+        // Previously this path swallowed each ResourceExhausted and returned
+        // Ok(None), classifying validation pressure as damaged history.
+        assert_eq!(store.load_latest_valid_except(Some(2)).err().unwrap().code, ErrorCode::ResourceExhausted);
+        assert_eq!(store.commit_prepared(&candidate).unwrap_err().code, ErrorCode::ResourceExhausted);
+        assert_eq!(fs::read(dir.join("CURRENT")).unwrap(), current);
+        assert!(!dir.join("chk-00000003").exists());
+        drop(pressure);
+        assert_eq!(store.recover_pipeline_required().unwrap().checkpoint_id, 2);
+        assert_eq!(store.load_latest_valid_except(Some(2)).unwrap().unwrap().id(), 1);
+        drop(candidate);
+        drop(store);
+        drop(target);
+        assert_eq!(owner.usage().physical_bytes, 0);
+        assert_eq!(owner.accounting_errors_total(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -12,19 +12,25 @@
 //! - Anything that cannot be confirmed (retries exhausted, non-retriable
 //!   publish error, encode/oversize, stream missing at start) fails the job
 //!   instead of silently dropping: `jetstream_sink_fatal`.
-//! - The stream is verified at start (exists, not sealed or a mirror, binds
-//!   the subject). The sink never creates or edits streams.
+//! - The stream is verified at start (exists, not sealed or a mirror, enables
+//!   PubAcks and binds the subject). Every publish names the expected stream.
+//!   The sink never creates or edits streams.
 
+use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_nats::jetstream::context::{GetStreamErrorKind, PublishErrorKind};
+use async_nats::jetstream::context::{PublishError, PublishErrorKind};
 use async_nats::jetstream::message::PublishMessage;
+use async_nats::jetstream::stream::{
+    Config as StreamConfig, Info as StreamInfo, RetentionPolicy, StorageType,
+};
 use async_nats::jetstream::{Context, ContextBuilder, ErrorCode as JsErrorCode};
 use futures_util::stream::{self, StreamExt};
-use sparrow_formats::encode_json_row;
+use sparrow_formats::encode_json_batch_bounded;
 use sparrow_io::observed::Receiver as ObservedReceiver;
+use sparrow_io::{OwnedSinkIdentity, SinkIdentity};
 use sparrow_model::observation::{HealthState, Latency};
 use sparrow_model::{
     CreditKind, ErrorCode, InflightCounter, MemoryLease, MemoryOwner, Result, Row, RowBatch,
@@ -45,11 +51,12 @@ pub const DEFAULT_INFLIGHT_ACKS: usize = 8;
 pub const MAX_RETRIES: u32 = 20;
 pub const DEFAULT_RETRIES: u32 = 5;
 pub const MAX_MSG_ID_BYTES: usize = 128;
-/// Header block (`NATS/1.0`, `Nats-Msg-Id:`, CRLFs) beyond the id itself.
-const HEADER_OVERHEAD: usize = 64;
 /// Retained per in-flight message besides its payload (subject, headers,
 /// SDK request state).
 const RETAINED_OVERHEAD: usize = 8 * 1024;
+/// JSON fallback objects, escaped/base64 values and bounded header state.
+const ENCODE_SCRATCH_OVERHEAD: usize = 8 * 1024;
+const MAX_PREPARED_CONFIG_BYTES: usize = 64 * 1024;
 const FIRST_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn err(code: ErrorCode, message: impl Into<String>) -> SparrowError {
@@ -69,20 +76,25 @@ pub struct JetStreamSinkConfig {
     pub max_inflight_acks: usize,
     /// Extra attempts per message (0 = no retry).
     pub max_retries: u32,
-    /// Stop/EOF budget for publishing and confirming already queued batches.
+    /// Stop budget shared by the active batch and already queued batches;
+    /// EOF uses the same budget for the remaining queue.
     pub flush_timeout: Duration,
     /// Output column (utf8 or integer) used as `Nats-Msg-Id`.
     pub msg_id_column: Option<String>,
 }
 
 impl JetStreamSinkConfig {
+    /// Command queue plus the SDK writer batch share the job reservation.
+    /// Keep this separate from the default number of pending PubAcks.
+    pub const DEFAULT_CLIENT_CAPACITY: usize = 4;
+
     pub fn new(
         servers: Vec<String>,
         stream: impl Into<String>,
         subject: impl Into<String>,
     ) -> Self {
         let mut client = NatsClientConfig::new(servers);
-        client.capacity = DEFAULT_INFLIGHT_ACKS;
+        client.capacity = Self::DEFAULT_CLIENT_CAPACITY;
         Self {
             client,
             stream: stream.into(),
@@ -127,21 +139,24 @@ impl JetStreamSinkConfig {
 
     /// SDK buffers plus payloads retained for retry while awaiting PubAcks.
     pub fn sdk_reservation(&self) -> usize {
-        self.client.sdk_reservation().saturating_add(
-            self.max_inflight_acks
-                .saturating_mul(self.client.max_payload_bytes + RETAINED_OVERHEAD),
-        )
+        self.client
+            .sdk_reservation()
+            .saturating_add(self.retained_reservation())
     }
 
     fn retained_reservation(&self) -> usize {
-        self.sdk_reservation() - self.client.sdk_reservation()
+        self.max_inflight_acks.saturating_mul(
+            self.client
+                .max_payload_bytes
+                .saturating_add(RETAINED_OVERHEAD),
+        )
     }
 
     pub fn check_reservation_budget(&self, reservation_budget: usize) -> Result<()> {
         if self.sdk_reservation() > reservation_budget / 2 {
             return Err(err(
                 ErrorCode::BoundExceeded,
-                "JetStream sink buffers ((client_capacity + max_inflight_acks) x max_payload_bytes) exceed half the job reservation budget",
+                "JetStream sink SDK command/writer buffers and retained PubAck payloads exceed half the job reservation budget",
             ));
         }
         Ok(())
@@ -207,7 +222,81 @@ impl Drop for BatchReceipt {
 struct Session {
     core: CoreClient,
     context: Context,
+    target: Option<PreparedTarget>,
     _retained: MemoryLease,
+}
+
+struct PreparedTarget {
+    identity: Arc<OwnedSinkIdentity>,
+    config: StreamConfig,
+    _config_credit: MemoryLease,
+}
+
+/// The v27 sink has already connected and captured its exact target before
+/// the controller opens/seeks/activates the replay source. No second session
+/// or independently owned budget is created by `run`.
+pub struct PreparedJetStreamSink {
+    sink: JetStreamSink,
+    session: Session,
+}
+
+impl std::fmt::Debug for PreparedJetStreamSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedJetStreamSink")
+            .field("sink", &self.sink)
+            .field("identity", self.identity().identity())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedJetStreamSink {
+    pub fn identity(&self) -> Arc<OwnedSinkIdentity> {
+        self.session
+            .target
+            .as_ref()
+            .expect("prepared target")
+            .identity
+            .clone()
+    }
+
+    pub async fn run(
+        self,
+        rx: impl Into<ObservedReceiver<RowBatch>>,
+        cancel: CancellationToken,
+        outbox: Option<Arc<InflightCounter>>,
+    ) {
+        let Self { sink, session } = self;
+        let _lifecycle = sink.diag.observation.lifecycle(false);
+        sink.run_session(session, rx.into(), cancel, outbox).await;
+    }
+
+    /// Explicit cleanup for failed restore/admission. SDK credit and the
+    /// controller's lifecycle guard remain owned until actual SDK exit.
+    pub async fn close(self) -> Result<()> {
+        self.session.core.close(false).await.map(|_| ())
+    }
+}
+
+enum AttemptFailure {
+    Target(SparrowError),
+    Publish(PublishError),
+}
+
+/// Count borrowed config serialization before retaining it. Unlike a Vec,
+/// this never grows an uncharged intermediate metadata allocation.
+struct ConfigSize(usize);
+impl std::io::Write for ConfigSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|bytes| *bytes <= MAX_PREPARED_CONFIG_BYTES)
+            .ok_or_else(|| std::io::Error::other("prepared stream config exceeds byte bound"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 struct InflightGuard<'a>(&'a IoDiagnostics);
@@ -256,10 +345,18 @@ impl JetStreamSink {
     ) {
         let mut rx = rx.into();
         let _lifecycle = self.diag.observation.lifecycle(false);
-        let session = match self.connect(&cancel).await {
+        let session = match self.connect(&cancel, None, false).await {
             Ok(Some(session)) => session,
             Ok(None) => {
-                self.discard(&mut rx, outbox.as_ref(), false);
+                if self.discard(&mut rx, outbox.as_ref(), false) > 0 {
+                    self.fatal(
+                        &err(
+                            ErrorCode::JobFailed,
+                            "JetStream stopped before queued rows could be confirmed",
+                        ),
+                        &cancel,
+                    );
+                }
                 return;
             }
             Err(e) => {
@@ -268,30 +365,88 @@ impl JetStreamSink {
                 return;
             }
         };
+        self.run_session(session, rx, cancel, outbox).await;
+    }
+
+    pub async fn prepare_aligned(
+        self,
+        cancel: CancellationToken,
+        guard: Arc<dyn Send + Sync>,
+    ) -> Result<Option<PreparedJetStreamSink>> {
+        match self.connect(&cancel, Some(guard), true).await {
+            Ok(Some(session)) => Ok(Some(PreparedJetStreamSink {
+                sink: self,
+                session,
+            })),
+            Ok(None) => Ok(None),
+            Err(error) => {
+                self.fatal(&error, &cancel);
+                Err(error)
+            }
+        }
+    }
+
+    async fn run_session(
+        &self,
+        session: Session,
+        mut rx: ObservedReceiver<RowBatch>,
+        cancel: CancellationToken,
+        outbox: Option<Arc<InflightCounter>>,
+    ) {
+        let mut flush_deadline = None;
         loop {
             let batch = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => break,
+                _ = cancel.cancelled() => {
+                    flush_deadline.get_or_insert_with(|| Instant::now() + self.config.flush_timeout);
+                    break;
+                },
                 batch = rx.recv() => batch,
             };
             let Some(batch) = batch else { break };
-            if let Err(e) = self
-                .publish_batch(&session, &batch, outbox.as_ref(), None)
-                .await
-            {
+            let result = {
+                let publishing = self.publish_batch(&session, &batch, outbox.as_ref(), None);
+                tokio::pin!(publishing);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        // Keep the current receipt/futures alive for a bounded
+                        // flush, then fail them on timeout. The queue uses this
+                        // same deadline, not a fresh budget after this batch.
+                        let deadline = *flush_deadline.get_or_insert_with(|| Instant::now() + self.config.flush_timeout);
+                        rx.close();
+                        tokio::time::timeout_at(deadline, &mut publishing)
+                            .await
+                            .unwrap_or_else(|_| {
+                                self.diag.jetstream_sink_failed.fetch_add(1, Ordering::Relaxed);
+                                Err(err(ErrorCode::JobFailed, "JetStream in-flight batch was not confirmed within flush_timeout"))
+                            })
+                    },
+                    result = &mut publishing => result,
+                }
+            };
+            // The batch future (and its receipt) is dropped before closing
+            // the SDK; unresolved batches must never be reported as acked.
+            if let Err(e) = result {
                 self.fatal(&e, &cancel);
                 self.discard(&mut rx, outbox.as_ref(), true);
                 let _ = session.core.close(false).await;
                 return;
             }
         }
-        self.shutdown(session, &mut rx, outbox.as_ref(), &cancel)
+        let deadline = flush_deadline.unwrap_or_else(|| Instant::now() + self.config.flush_timeout);
+        self.shutdown(session, &mut rx, outbox.as_ref(), &cancel, deadline)
             .await;
     }
 
     /// Connect and verify the stream, retrying transient failures within
     /// the same bounded budget as publishes. `Ok(None)` = cancelled.
-    async fn connect(&self, cancel: &CancellationToken) -> Result<Option<Session>> {
+    async fn connect(
+        &self,
+        cancel: &CancellationToken,
+        guard: Option<Arc<dyn Send + Sync>>,
+        aligned: bool,
+    ) -> Result<Option<Session>> {
         let mut delay = FIRST_RETRY_DELAY;
         let mut last = err(ErrorCode::JobFailed, "JetStream sink not connected");
         for attempt in 0..=self.config.max_retries {
@@ -311,7 +466,7 @@ impl JetStreamSink {
             let opened = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Ok(None),
-                c = CoreClient::open(&self.config.client, self.token.as_ref(), &self.owner, &self.diag, Role::JetStreamSink) => c,
+                c = CoreClient::open_with_guard(&self.config.client, self.token.as_ref(), &self.owner, &self.diag, Role::JetStreamSink, guard.clone()) => c,
             };
             let core = match opened {
                 Ok(core) => core,
@@ -337,7 +492,18 @@ impl JetStreamSink {
                 v = self.verify_stream(&context) => v,
             };
             match verified {
-                Ok(()) => {
+                Ok(info) => {
+                    let target = if aligned {
+                        match self.prepare_target(info) {
+                            Ok(target) => Some(target),
+                            Err(error) => {
+                                let _ = core.close(false).await;
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let retained = match self
                         .owner
                         .acquire(CreditKind::Reservation, self.config.retained_reservation())
@@ -348,6 +514,10 @@ impl JetStreamSink {
                             return Err(e);
                         }
                     };
+                    if cancel.is_cancelled() {
+                        let _ = core.close(false).await;
+                        return Ok(None);
+                    }
                     self.diag
                         .jetstream_sink_sessions
                         .fetch_add(1, Ordering::Relaxed);
@@ -360,6 +530,7 @@ impl JetStreamSink {
                     return Ok(Some(Session {
                         core,
                         context,
+                        target,
                         _retained: retained,
                     }));
                 }
@@ -383,34 +554,43 @@ impl JetStreamSink {
     }
 
     /// The stream must already exist, accept publishes and bind the subject.
-    async fn verify_stream(&self, context: &Context) -> Result<()> {
+    async fn verify_stream(&self, context: &Context) -> Result<StreamInfo> {
+        // No-info constructs a local handle; get_info returns an owned fresh
+        // response. Do not overwrite or clone the prepared baseline cache.
         let stream = context
-            .get_stream(&self.config.stream)
+            .get_stream_no_info(&self.config.stream)
             .await
-            .map_err(|e| match e.kind() {
-                GetStreamErrorKind::JetStream(js)
-                    if js.error_code() == JsErrorCode::STREAM_NOT_FOUND =>
-                {
-                    err(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "JetStream stream `{}` does not exist; this sink never creates streams",
-                            self.config.stream
-                        ),
-                    )
-                }
-                GetStreamErrorKind::JetStream(_) => err(
+            .map_err(|_| err(ErrorCode::InvalidArgument, "invalid JetStream stream name"))?;
+        let info = stream.get_info().await.map_err(|e| {
+            match std::error::Error::source(&e)
+                .and_then(|cause| cause.downcast_ref::<async_nats::jetstream::Error>())
+            {
+                Some(js) if js.error_code() == JsErrorCode::STREAM_NOT_FOUND => err(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "JetStream stream `{}` does not exist; this sink never creates streams",
+                        self.config.stream
+                    ),
+                ),
+                Some(_) => err(
                     ErrorCode::JobFailed,
                     "JetStream stream info request was rejected",
                 ),
-                _ => err(ErrorCode::JobFailed, "JetStream stream info request failed")
+                None => err(ErrorCode::JobFailed, "JetStream stream info request failed")
                     .retryable(true),
-            })?;
-        let config = &stream.cached_info().config;
-        if config.sealed || config.mirror.is_some() {
+            }
+        })?;
+        let config = &info.config;
+        if config.name != self.config.stream {
             return Err(err(
                 ErrorCode::InvalidArgument,
-                "JetStream stream is sealed or a mirror and does not accept publishes",
+                "JetStream stream info returned a different name",
+            ));
+        }
+        if config.sealed || config.mirror.is_some() || config.no_ack {
+            return Err(err(
+                ErrorCode::InvalidArgument,
+                "JetStream stream is sealed, a mirror or has no_ack; confirmed publishes require PubAcks",
             ));
         }
         if !config
@@ -432,7 +612,99 @@ impl JetStreamSink {
                 "msg_id_column requires a stream duplicate_window > 0",
             ));
         }
+        Ok(info)
+    }
+
+    fn check_aligned_storage(config: &StreamConfig) -> Result<()> {
+        if config.storage != StorageType::File
+            || config.retention != RetentionPolicy::Limits
+            || config.no_ack
+            || config.sealed
+            || config.mirror.is_some()
+        {
+            return Err(err(ErrorCode::UnsupportedRestore, "aligned JetStream output requires an existing writable File/Limits stream with PubAcks"));
+        }
         Ok(())
+    }
+
+    fn prepare_target(&self, info: StreamInfo) -> Result<PreparedTarget> {
+        Self::check_aligned_storage(&info.config)?;
+        let mut size = ConfigSize(0);
+        serde_json::to_writer(&mut size, &info.config).map_err(|_| {
+            err(
+                ErrorCode::BoundExceeded,
+                "prepared stream configuration exceeds its bounded metadata contract",
+            )
+        })?;
+        // Config strings/vectors/maps are now retained as one owned baseline.
+        // Include metadata overhead and the bounded temporary identity copy.
+        let config_credit = self.owner.acquire(
+            CreditKind::Reservation,
+            size.0
+                .saturating_mul(16)
+                .saturating_add(sparrow_io::sink_identity::MAX_SINK_IDENTITY_BYTES),
+        )?;
+        let identity = SinkIdentity::jetstream(
+            &self.config.client.servers,
+            self.config.client.token_secret.as_deref(),
+            &self.config.stream,
+            info.created.unix_timestamp_nanos(),
+            &self.config.subject,
+            self.config.msg_id_column.as_deref(),
+        )?;
+        let identity = OwnedSinkIdentity::new(identity, &self.owner)?;
+        Ok(PreparedTarget {
+            identity,
+            config: info.config,
+            _config_credit: config_credit,
+        })
+    }
+
+    async fn verify_prepared(&self, context: &Context, target: &PreparedTarget) -> Result<()> {
+        let info = self.verify_stream(context).await?;
+        Self::check_aligned_storage(&info.config)?;
+        if info.created.unix_timestamp_nanos() != target.identity.identity().created_nanos
+            || info.config != target.config
+        {
+            return Err(err(
+                ErrorCode::UnsupportedRestore,
+                "prepared JetStream stream incarnation or configuration changed",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn verify_prepared_at(
+        &self,
+        context: &Context,
+        target: &PreparedTarget,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let budget = deadline.map_or(self.config.ack_timeout, |at| {
+            at.saturating_duration_since(Instant::now())
+                .min(self.config.ack_timeout)
+        });
+        let result = if budget.is_zero() {
+            Err(err(
+                ErrorCode::JobFailed,
+                "prepared JetStream target verification exceeded the flush deadline",
+            ))
+        } else {
+            tokio::time::timeout(budget, self.verify_prepared(context, target))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(err(
+                        ErrorCode::JobFailed,
+                        "prepared JetStream target verification timed out",
+                    )
+                    .retryable(true))
+                })
+        };
+        result.inspect_err(|_| {
+            self.diag
+                .jetstream_sink_failed
+                .fetch_add(1, Ordering::Relaxed);
+        })
     }
 
     fn msg_id_index(&self, schema: &Schema) -> Result<Option<usize>> {
@@ -448,9 +720,9 @@ impl JetStreamSink {
     fn msg_id(&self, row: &Row, index: Option<usize>) -> Result<Option<String>> {
         let Some(index) = index else { return Ok(None) };
         let id = match row.values.get(index) {
-            Some(Scalar::Utf8(s)) => s.to_string(),
-            Some(Scalar::Int64(v)) => v.to_string(),
-            Some(Scalar::UInt64(v)) => v.to_string(),
+            Some(Scalar::Utf8(s)) => Cow::Borrowed(s.as_ref()),
+            Some(Scalar::Int64(v)) => Cow::Owned(v.to_string()),
+            Some(Scalar::UInt64(v)) => Cow::Owned(v.to_string()),
             Some(Scalar::Null) | None => {
                 self.diag
                     .jetstream_sink_msg_id_missing
@@ -474,10 +746,23 @@ impl JetStreamSink {
                 "Nats-Msg-Id must be 1..=128 printable ASCII bytes",
             ));
         }
-        Ok(Some(id))
+        Ok(Some(id.into_owned()))
     }
 
-    fn encode(
+    /// Use exactly the same bounded header block for size admission and send.
+    fn publish_headers(&self, id: Option<&str>) -> async_nats::HeaderMap {
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(
+            async_nats::header::NATS_EXPECTED_STREAM,
+            self.config.stream.as_str(),
+        );
+        if let Some(id) = id {
+            headers.insert(async_nats::header::NATS_MESSAGE_ID, id);
+        }
+        headers
+    }
+
+    pub(super) fn encode(
         &self,
         schema: &Schema,
         row: &Row,
@@ -485,26 +770,71 @@ impl JetStreamSink {
         limit: usize,
     ) -> Result<(bytes::Bytes, Option<String>)> {
         let started = std::time::Instant::now();
-        let body = encode_json_row(schema, row).inspect_err(|_| {
-            self.diag
-                .jetstream_sink_dropped_bad
-                .fetch_add(1, Ordering::Relaxed);
-        })?;
+        // The bounded writer limits the final Vec, but wide/Bytes/Dynamic
+        // rows can also build temporary serde Values. Admit conservative
+        // scratch before cloning even the id/header or entering the codec.
+        let names = schema.fields.iter().fold(0usize, |bytes, field| {
+            bytes.saturating_add(
+                field
+                    .name
+                    .capacity()
+                    .saturating_add(std::mem::size_of::<String>())
+                    .saturating_add(32),
+            )
+        });
+        let scratch_bytes = row
+            .resident_bytes()
+            .saturating_mul(8)
+            .saturating_add(names.saturating_mul(4))
+            .saturating_add(ENCODE_SCRATCH_OVERHEAD);
+        let _scratch = self.owner.acquire(CreditKind::Reservation, scratch_bytes)?;
+        let id = self.msg_id(row, index)?;
+        let headers = self.publish_headers(id.as_deref());
+        // Mirrors async-nats 0.50 HeaderMap serialization. Its wire_len helper
+        // is private, so count the actual public entries without allocating.
+        let header_bytes =
+            headers
+                .iter()
+                .fold(b"NATS/1.0\r\n\r\n".len(), |total, (name, values)| {
+                    let name: &str = name.as_ref();
+                    values.iter().fold(total, |total, value| {
+                        total
+                            .saturating_add(name.len())
+                            .saturating_add(b": ".len())
+                            .saturating_add(value.as_str().len())
+                            .saturating_add(b"\r\n".len())
+                    })
+                });
+        let body_limit = limit.saturating_sub(header_bytes);
+        // The existing writer checks the bound before buffer growth, including
+        // JSON escaping. Strip the one-row array with a zero-copy Bytes slice;
+        // its two framing bytes remain covered by RETAINED_OVERHEAD.
+        let encoded = encode_json_batch_bounded(
+            schema,
+            std::slice::from_ref(row),
+            body_limit.saturating_add(2),
+        );
         self.diag
             .observation
             .record(Latency::Encode, started.elapsed());
-        let id = self.msg_id(row, index)?;
-        let header = id.as_ref().map_or(0, |id| id.len() + HEADER_OVERHEAD);
-        if body.len() + header > limit {
-            self.diag
-                .jetstream_sink_dropped_oversize
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(err(
-                ErrorCode::MaxRecordSize,
-                "encoded row exceeds max_payload_bytes / server max_payload",
-            ));
-        }
-        Ok((body.into(), id))
+        let body = encoded.map_err(|e| {
+            if e.code == ErrorCode::BoundExceeded {
+                self.diag
+                    .jetstream_sink_dropped_oversize
+                    .fetch_add(1, Ordering::Relaxed);
+                err(
+                    ErrorCode::MaxRecordSize,
+                    "encoded row and headers exceed max_payload_bytes / server max_payload",
+                )
+            } else {
+                self.diag
+                    .jetstream_sink_dropped_bad
+                    .fetch_add(1, Ordering::Relaxed);
+                e
+            }
+        })?;
+        let end = body.len() - 1;
+        Ok((bytes::Bytes::from(body).slice(1..end), id))
     }
 
     /// Publish every row of `batch` with bounded in-flight PubAcks. The
@@ -522,6 +852,18 @@ impl JetStreamSink {
             batch.tracked_bytes(),
             batch.origin(),
         );
+        if let Some(target) = &session.target {
+            if !target.identity.belongs_to(&self.owner)
+                || !Arc::ptr_eq(batch.lease().owner(), &self.owner)
+            {
+                return Err(err(
+                    ErrorCode::PolicyDenied,
+                    "prepared sink and output batch must share the admitted Job memory owner",
+                ));
+            }
+            self.verify_prepared_at(&session.context, target, deadline)
+                .await?;
+        }
         let schema = batch.schema();
         let index = self.msg_id_index(schema)?;
         let limit = self
@@ -535,12 +877,24 @@ impl JetStreamSink {
         let mut acks = stream::iter(0..rows.len())
             .map(|i| async move {
                 let (body, id) = self.encode(schema, &rows[i], index, limit)?;
-                self.publish_with_retry(&session.context, body, id, deadline)
-                    .await
+                self.publish_with_retry(
+                    &session.context,
+                    body,
+                    id,
+                    deadline,
+                    session.target.as_ref(),
+                )
+                .await
             })
             .buffer_unordered(self.config.max_inflight_acks);
         while let Some(result) = acks.next().await {
             result?;
+        }
+        if let Some(target) = &session.target {
+            // A stream recreated or reconfigured while PubAcks were pending
+            // must not authorize this batch's aligned outbox receipt.
+            self.verify_prepared_at(&session.context, target, deadline)
+                .await?;
         }
         self.diag
             .jetstream_sink_batches
@@ -557,6 +911,7 @@ impl JetStreamSink {
         body: bytes::Bytes,
         id: Option<String>,
         deadline: Option<Instant>,
+        target: Option<&PreparedTarget>,
     ) -> Result<()> {
         let _inflight = InflightGuard::new(&self.diag);
         let mut delay = FIRST_RETRY_DELAY;
@@ -577,24 +932,47 @@ impl JetStreamSink {
                 tokio::time::sleep(pause).await;
                 delay = next_delay(delay);
             }
-            let budget = deadline.map_or(self.config.ack_timeout * 2, |at| {
+            let attempt_budget = self.config.ack_timeout.saturating_mul(2);
+            let budget = deadline.map_or(attempt_budget, |at| {
                 at.saturating_duration_since(Instant::now())
+                    .min(attempt_budget)
             });
             if budget.is_zero() {
                 break;
             }
-            let mut message = PublishMessage::build().payload(body.clone());
-            if let Some(id) = &id {
-                message = message.message_id(id);
-            }
+            let message = PublishMessage::build()
+                .payload(body.clone())
+                .headers(self.publish_headers(id.as_deref()));
             let attempt = async {
-                context
+                if attempt > 0 {
+                    if let Some(target) = target {
+                        // First attempts are covered by the batch's before /
+                        // after INFO checks. Revalidate before every retry: a
+                        // reconnect may reach a different stream incarnation.
+                        self.verify_prepared_at(context, target, deadline)
+                            .await
+                            .map_err(AttemptFailure::Target)?;
+                    }
+                }
+                let ack = context
                     .send_publish(self.config.subject.clone(), message)
-                    .await?
                     .await
+                    .map_err(AttemptFailure::Publish)?
+                    .await
+                    .map_err(AttemptFailure::Publish)?;
+                Ok::<_, AttemptFailure>(ack)
             };
             match tokio::time::timeout(budget, attempt).await {
                 Ok(Ok(ack)) => {
+                    if ack.stream != self.config.stream {
+                        self.diag
+                            .jetstream_sink_failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(err(
+                            ErrorCode::JobFailed,
+                            "JetStream PubAck came from a different stream",
+                        ));
+                    }
                     self.diag
                         .jetstream_sink_acked
                         .fetch_add(1, Ordering::Relaxed);
@@ -605,7 +983,23 @@ impl JetStreamSink {
                     }
                     return Ok(());
                 }
-                Ok(Err(e)) => match e.kind() {
+                Ok(Err(AttemptFailure::Target(error))) => return Err(error),
+                Ok(Err(AttemptFailure::Publish(e))) => match e.kind() {
+                    // async-nats 0.50 maps this server rejection to Other.
+                    // It is a target mismatch, never a transient retry.
+                    PublishErrorKind::Other
+                        if std::error::Error::source(&e)
+                            .and_then(|cause| cause.downcast_ref::<async_nats::jetstream::Error>())
+                            .is_some_and(|js| js.error_code() == JsErrorCode::STREAM_NOT_MATCH) =>
+                    {
+                        self.diag
+                            .jetstream_sink_failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(err(
+                            ErrorCode::JobFailed,
+                            "JetStream rejected the publish: expected stream does not match",
+                        ));
+                    }
                     PublishErrorKind::MaxPayloadExceeded => {
                         self.diag
                             .jetstream_sink_dropped_oversize
@@ -654,7 +1048,7 @@ impl JetStreamSink {
         .retryable(true))
     }
 
-    /// Stop/EOF: confirm batches already queued within `flush_timeout`.
+    /// Stop/EOF: confirm queued batches within the original flush deadline.
     /// Anything left unconfirmed is a delivery failure, not a quiet drop.
     async fn shutdown(
         &self,
@@ -662,8 +1056,8 @@ impl JetStreamSink {
         rx: &mut ObservedReceiver<RowBatch>,
         outbox: Option<&Arc<InflightCounter>>,
         cancel: &CancellationToken,
+        deadline: Instant,
     ) {
-        let deadline = Instant::now() + self.config.flush_timeout;
         rx.close();
         let mut failed = None;
         while let Ok(batch) = rx.try_recv() {

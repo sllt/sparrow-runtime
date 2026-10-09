@@ -498,6 +498,7 @@ impl Supervisor {
             request = request.with_aligned(AlignedJob {
                 restore: None,
                 pipeline: Some(PipelineRestore {
+                    sink: None,
                     plan: manifest.clone(),
                     generation,
                     restore,

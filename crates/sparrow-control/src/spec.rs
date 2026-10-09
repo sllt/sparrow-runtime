@@ -261,7 +261,7 @@ pub struct JetStreamSinkSpec {
     pub connect_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_payload_bytes: Option<usize>,
-    /// SDK command buffer in messages (default 8).
+    /// SDK command buffer in messages (default 4, separate from pending PubAcks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_capacity: Option<usize>,
     /// Per attempt: send plus PubAck wait (default 2000).
@@ -293,7 +293,8 @@ impl JetStreamSinkSpec {
             self.client_capacity,
         );
         if self.client_capacity.is_none() {
-            client.capacity = sparrow_connectors::jetstream::DEFAULT_INFLIGHT_ACKS;
+            client.capacity =
+                sparrow_connectors::jetstream::JetStreamSinkConfig::DEFAULT_CLIENT_CAPACITY;
         }
         client
     }
