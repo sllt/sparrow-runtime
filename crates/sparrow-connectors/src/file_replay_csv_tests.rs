@@ -267,3 +267,83 @@ fn csv_config_checks_schema_layout() {
     assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::InvalidArgument);
     fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn csv_checkpoint_identity_binds_format_and_options() {
+    for contract in [FileContract::Sealed, FileContract::AppendOnly] {
+        let path = tmp("identity");
+        fs::write(&path, b"device_id,v\na,1\nb,2\n").unwrap();
+        let cfg = config(&path, CsvOptions::default(), contract);
+        let mut src = FileReplaySource::open(&cfg).unwrap();
+        assert!(matches!(src.poll_decoded().unwrap(), FilePoll::Row(_)));
+        let cut = src.checkpoint_position().unwrap();
+        // Same format and options: the cut restores.
+        let mut same = FileReplaySource::open(&cfg).unwrap();
+        same.seek(&cut).unwrap();
+        assert!(matches!(same.poll_decoded().unwrap(), FilePoll::Row(_)));
+        let mut json = FileReplayConfig::new(&path, schema());
+        json.contract = contract;
+        let others = [
+            json,
+            config(
+                &path,
+                CsvOptions {
+                    trim: true,
+                    ..Default::default()
+                },
+                contract,
+            ),
+            config(
+                &path,
+                CsvOptions {
+                    null_value: "NULL".into(),
+                    ..Default::default()
+                },
+                contract,
+            ),
+            config(
+                &path,
+                CsvOptions {
+                    max_fields: Some(16),
+                    ..Default::default()
+                },
+                contract,
+            ),
+            config(
+                &path,
+                CsvOptions {
+                    delimiter: ";".into(),
+                    ..Default::default()
+                },
+                contract,
+            ),
+        ];
+        for other in &others {
+            let mut src = FileReplaySource::open(other).unwrap();
+            let refused = src.seek(&cut).unwrap_err();
+            assert_eq!(refused.code, ErrorCode::UnsupportedRestore, "{contract:?}");
+            assert!(
+                refused.message.contains("CSV options"),
+                "{}",
+                refused.message
+            );
+        }
+        // An NDJSON cut is not adopted by a CSV reader either; JSON identities
+        // are unchanged by this binding.
+        let json = &others[0];
+        let src = FileReplaySource::open(json).unwrap();
+        let json_cut = src.checkpoint_position().unwrap();
+        assert_eq!(
+            FileReplaySource::open(&cfg)
+                .unwrap()
+                .seek(&json_cut)
+                .unwrap_err()
+                .code,
+            ErrorCode::UnsupportedRestore
+        );
+        let mut probe = File::open(&path).unwrap();
+        let content = content_fingerprint(&mut probe, json_cut.identity.size).unwrap();
+        assert_eq!(json_cut.identity.fingerprint, content);
+        fs::remove_file(path).unwrap();
+    }
+}

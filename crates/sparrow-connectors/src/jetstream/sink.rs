@@ -816,8 +816,7 @@ impl JetStreamSink {
         // The writer checks the bound before buffer growth, including JSON
         // escaping / CSV quoting. JSON's one-row array envelope is removed in
         // place; its two spare bytes remain covered by RETAINED_OVERHEAD.
-        let encoded =
-            format.encode_row_bounded_with_capacity(schema, row, body_limit, |_| Ok(()));
+        let encoded = format.encode_row_bounded_with_capacity(schema, row, body_limit, |_| Ok(()));
         self.diag
             .observation
             .record(Latency::Encode, started.elapsed());

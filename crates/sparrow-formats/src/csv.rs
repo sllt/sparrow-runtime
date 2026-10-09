@@ -367,6 +367,18 @@ pub fn strip_terminator(mut record: &[u8]) -> &[u8] {
     record
 }
 
+/// `trim: true` strips spaces and tabs only (the characters the encoder
+/// quotes at a field edge); other ASCII whitespace is data.
+fn trim_blanks(mut text: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = text {
+        text = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = text {
+        text = rest;
+    }
+    text
+}
+
 fn strip_bom(bytes: &[u8]) -> &[u8] {
     bytes.strip_prefix(BOM).unwrap_or(bytes)
 }
@@ -544,7 +556,7 @@ impl CsvFormat {
         let mut names = Vec::with_capacity(fields.len());
         for (raw, quoted) in &fields {
             let raw = if self.options.trim && !quoted {
-                raw.trim_ascii()
+                trim_blanks(raw)
             } else {
                 raw
             };
@@ -787,7 +799,7 @@ impl CsvFormat {
         owner: Option<&MemoryOwner>,
     ) -> Result<Scalar> {
         let text = if self.options.trim && !quoted {
-            raw.trim_ascii()
+            trim_blanks(raw)
         } else {
             raw
         };
@@ -934,6 +946,13 @@ impl CsvFormat {
         Ok(out)
     }
 
+    /// Byte length of [`Self::encode_header`], computed without allocating.
+    pub fn header_len(&self, schema: &Schema) -> Result<usize> {
+        let mut out = Count(0);
+        self.put_header(schema, &mut out)?;
+        Ok(out.0)
+    }
+
     /// One record line (`\n`-terminated), never a header.
     pub fn encode_record(&self, schema: &Schema, row: &Row) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -1005,6 +1024,43 @@ impl CsvFormat {
         self.encode_rows_bounded_with_capacity(schema, std::slice::from_ref(row), limit, admit)
     }
 
+    /// Canonical bytes of every option that changes which rows a document
+    /// decodes to (dialect, header/columns, NULL text, trim, multiline,
+    /// column policies and effective limits). Durable sources bind this into
+    /// their checkpoint identity so a restore under other options is refused.
+    pub fn identity_bytes(&self) -> Vec<u8> {
+        fn put(out: &mut Vec<u8>, bytes: &[u8]) {
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        let o = &self.options;
+        let mut out = b"sparrow-csv-v1".to_vec();
+        out.extend_from_slice(&[
+            self.delimiter,
+            self.quote,
+            u8::from(o.header),
+            u8::from(o.trim),
+            u8::from(o.multiline),
+            o.missing_columns as u8,
+            o.extra_columns as u8,
+        ]);
+        put(&mut out, o.null_value.as_bytes());
+        match &o.columns {
+            None => out.push(0),
+            Some(columns) => {
+                out.push(1);
+                out.extend_from_slice(&(columns.len() as u64).to_le_bytes());
+                for column in columns {
+                    put(&mut out, column.as_bytes());
+                }
+            }
+        }
+        out.extend_from_slice(&(self.limits.max_record_bytes as u64).to_le_bytes());
+        out.extend_from_slice(&(self.limits.max_fields as u64).to_le_bytes());
+        out.extend_from_slice(&(self.limits.max_json_depth as u64).to_le_bytes());
+        out
+    }
+
     /// Conservative decode working set for one CSV message or record of
     /// `len` wire bytes, to be charged before decoding. Callers reject
     /// `len` over the record limit first, without allocating.
@@ -1033,7 +1089,8 @@ impl CsvFormat {
             n.saturating_add(f.name.len())
                 .saturating_add(std::mem::size_of::<String>())
         });
-        let per_schema_field = 2 * std::mem::size_of::<Scalar>() + std::mem::size_of::<Option<usize>>();
+        let per_schema_field =
+            2 * std::mem::size_of::<Scalar>() + std::mem::size_of::<Option<usize>>();
         len.saturating_mul(per_byte)
             .saturating_add(fields.saturating_mul(per_field).saturating_mul(2))
             .saturating_add(schema.fields.len().saturating_mul(per_schema_field))
@@ -1077,6 +1134,16 @@ trait Out {
 impl Out for Vec<u8> {
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
         self.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// Length-only sink (no allocation).
+struct Count(usize);
+
+impl Out for Count {
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        self.0 = self.0.saturating_add(bytes.len());
         Ok(())
     }
 }
@@ -1206,6 +1273,12 @@ impl PayloadFormat {
                 format.encode_message_bounded_with_capacity(schema, row, limit, admit)
             }
         }
+    }
+
+    /// Format identity for durable checkpoints: `None` for JSON (so existing
+    /// JSON checkpoints keep their identity), canonical CSV options otherwise.
+    pub fn identity_bytes(&self) -> Option<Vec<u8>> {
+        self.as_csv().map(CsvFormat::identity_bytes)
     }
 
     /// Largest message payload this format may decode under `json`: the

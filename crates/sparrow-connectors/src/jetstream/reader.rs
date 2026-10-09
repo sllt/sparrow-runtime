@@ -142,6 +142,11 @@ impl InputRecord {
                     "JetStream decode scratch overflow",
                 )
             })?;
+        // CSV has its own (smaller, flat-column) working-set estimator.
+        let estimate = match self.format.as_csv() {
+            Some(csv) => csv.decode_scratch(schema, self.payload().len()),
+            None => estimate,
+        };
         let _scratch = owner.acquire(CreditKind::Reservation, estimate)?;
         let row = self.format.decode_row(
             schema,

@@ -207,6 +207,11 @@ fn strict_typed_parsing() {
         ok_rows(&trimmed, &t, b"id,name,t\n1,\"  keep  \",1\n")[0][1],
         Scalar::utf8("  keep  ")
     );
+    // Only spaces and tabs are trimmed; other ASCII whitespace is data.
+    assert_eq!(
+        ok_rows(&trimmed, &t, b"id,name,t\n1,\t x\x0c\x0b ,1\n")[0][1],
+        Scalar::utf8("x\x0c\x0b")
+    );
 }
 
 #[test]
@@ -667,4 +672,83 @@ fn framer_tracks_quotes_across_chunks() {
     framer.reset();
     let mut plain = format(CsvOptions::default()).framer();
     assert_eq!(plain.find_terminator(b"1,\"a\nb\"\n"), Some(4));
+}
+
+#[test]
+fn decode_scratch_is_csv_specific_and_saturates() {
+    let flat = telemetry();
+    let f = format(CsvOptions::default());
+    let csv = f.decode_scratch(&flat, 1000);
+    // Flat columns: a few times the wire size plus fixed overhead, well under
+    // the JSON parse-tree estimate.
+    assert!(csv >= 4 * 1000 + 8 * 1024, "{csv}");
+    assert!(
+        csv < PayloadFormat::Json.decode_scratch(&flat, 1000),
+        "{csv}"
+    );
+    assert_eq!(f.decode_scratch(&flat, usize::MAX), usize::MAX);
+    // Field-proportional terms are bounded by max_fields, not by the length.
+    let small = format(CsvOptions {
+        max_fields: Some(2),
+        ..Default::default()
+    });
+    assert!(small.decode_scratch(&flat, 60_000) < f.decode_scratch(&flat, 60_000));
+    // A nested/Dynamic column parses JSON text, so it uses the JSON factor.
+    let nested = schema(&[("d", DataType::Dynamic, true)]);
+    assert!(f.decode_scratch(&nested, 1000) >= 64 * 1000);
+    let csv_format = PayloadFormat::csv(CsvOptions::default().compile(CsvRole::Decode).unwrap());
+    assert_eq!(csv_format.decode_scratch(&flat, 1000), csv);
+}
+
+#[test]
+fn bounded_message_encode_admits_before_growth_and_caps_length() {
+    let s = telemetry();
+    let f = PayloadFormat::csv(CsvOptions::default().compile(CsvRole::Encode).unwrap());
+    let row = Row {
+        values: vec![Scalar::Int64(1), Scalar::utf8("a,b"), Scalar::Float64(2.5)],
+    };
+    let plain = f.encode_row(&s, &row).unwrap();
+    let mut admitted = Vec::new();
+    let bounded = f
+        .encode_row_bounded_with_capacity(&s, &row, 1024, |cap| {
+            admitted.push(cap);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(bounded, plain);
+    assert!(!admitted.is_empty() && admitted.iter().all(|c| *c <= 1024));
+    assert!(bounded.capacity() <= *admitted.last().unwrap());
+    assert_eq!(
+        f.encode_row_bounded_with_capacity(&s, &row, plain.len() - 1, |_| Ok(()))
+            .unwrap_err()
+            .code,
+        ErrorCode::BoundExceeded
+    );
+    let refused = f
+        .encode_row_bounded_with_capacity(&s, &row, 1024, |_| {
+            Err(SparrowError::new(ErrorCode::ResourceExhausted, "no credit"))
+        })
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::ResourceExhausted);
+    // JSON: the same API bounds the object (envelope removed).
+    let json = PayloadFormat::Json
+        .encode_row_bounded_with_capacity(&s, &row, 1024, |_| Ok(()))
+        .unwrap();
+    assert_eq!(json, PayloadFormat::Json.encode_row(&s, &row).unwrap());
+    assert_eq!(
+        PayloadFormat::Json
+            .encode_row_bounded_with_capacity(&s, &row, json.len() - 1, |_| Ok(()))
+            .unwrap_err()
+            .code,
+        ErrorCode::BoundExceeded
+    );
+    assert_eq!(
+        f.encode_scratch(&s, &row),
+        f.as_csv().unwrap().encode_scratch(&row)
+    );
+    let csv = f.as_csv().unwrap();
+    assert_eq!(
+        csv.header_len(&s).unwrap(),
+        csv.encode_header(&s).unwrap().len()
+    );
 }

@@ -1290,3 +1290,54 @@ fn csv_refuses_ndjson_framing_and_unfit_schema() {
     .unwrap();
     assert!(c.validate(&secrets(), &allow(url)).is_err());
 }
+
+#[tokio::test]
+async fn csv_insufficient_decode_credit_skips_decode_and_refunds_all_credit() {
+    // A valid CSV document whose record would fail the job if decoded.
+    let server = Server::start(Arc::new(|_, _| {
+        Reply::json("device_id,v\nunbilled,invalid\n")
+    }))
+    .await;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let pressure = owner
+        .acquire(
+            CreditKind::Reservation,
+            owner.budget().reservation_bytes - 2048,
+        )
+        .unwrap();
+    let mut c = csv_cfg(&server.url, Default::default());
+    c.fail_on_decode = true;
+    let mut run = start_with_owner(c, None, owner.clone());
+    until(Duration::from_secs(3), || {
+        run.diag.snapshot().http_poll_dropped_budget >= 2
+    })
+    .await;
+    let snap = run.diag.snapshot();
+    assert_eq!(
+        (
+            snap.decode_errors,
+            snap.http_poll_dropped_bad,
+            snap.csv_type_errors,
+            snap.http_poll_rows,
+            snap.http_poll_ok
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    assert!(
+        !run.task.is_finished(),
+        "unfunded CSV must not reach fail_on_decode"
+    );
+    assert!(run.rx.try_recv().is_err());
+    run.stop().await.unwrap();
+    drop(pressure);
+    let usage = owner.usage();
+    assert_eq!(
+        (
+            usage.reservation_bytes,
+            usage.queue_bytes,
+            usage.physical_bytes,
+            usage.live_handles
+        ),
+        (0, 0, 0, 0)
+    );
+}
