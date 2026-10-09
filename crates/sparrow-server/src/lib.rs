@@ -984,6 +984,32 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "semantics":"live_best_effort_at_most_once_no_broker_ack",
             "scope":"this_attempt; published=handed_to_client_not_broker_ack"});
     }
+    if s.source_kind == "databus" {
+        value["databus_source"] = json!({"received":io.databus_source_received,
+            "rows":io.databus_source_rows,"dropped_bad":io.databus_source_dropped_bad,
+            "dropped_oversize":io.databus_source_dropped_oversize,
+            "dropped_budget":io.databus_source_dropped_budget,
+            "dropped_oldest":io.databus_source_dropped_oldest,
+            "dropped_newest":io.databus_source_dropped_newest,
+            "block_timeouts":io.databus_source_block_timeouts,
+            "backpressure_waits":io.databus_source_backpressure_waits,
+            "discarded_on_close":io.databus_source_discarded_on_close,
+            "buffer_items":io.databus_source_buffer_items,"buffer_bytes":io.databus_source_buffer_bytes,
+            "subscriptions":io.databus_source_subscriptions,
+            "inbox_items":io.databus_source_inbox_items,"inbox_bytes":io.databus_source_inbox_bytes,
+            "semantics":"live_best_effort_at_most_once_in_process_no_replay",
+            "scope":"this_attempt; only_messages_published_after_attach"});
+    }
+    if s.sink_kind == "databus" {
+        value["databus_sink"] = json!({"published":io.databus_sink_published,
+            "deliveries":io.databus_sink_deliveries,"no_subscribers":io.databus_sink_no_subscribers,
+            "dropped_bad":io.databus_sink_dropped_bad,"dropped_oversize":io.databus_sink_dropped_oversize,
+            "blocked_publishes":io.databus_sink_blocked_publishes,
+            "discarded_on_close":io.databus_sink_discarded_on_close,
+            "batches":io.databus_sink_batches,"fatal":io.databus_sink_fatal,
+            "semantics":"live_best_effort_at_most_once; done=offered_to_every_matching_subscriber",
+            "scope":"this_attempt; deliveries=subscriber_buffer_accepts"});
+    }
     if s.sink_kind == "jetstream" {
         value["jetstream_sink"] = json!({"acked":io.jetstream_sink_acked,
             "duplicates":io.jetstream_sink_duplicates,"retries":io.jetstream_sink_retries,
@@ -1205,6 +1231,72 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         ("jetstream_sink_sessions", io.jetstream_sink_sessions),
         ("jetstream_sink_fatal", io.jetstream_sink_fatal),
         ("jetstream_sink_inflight", io.jetstream_sink_inflight),
+        ("databus_source_received", io.databus_source_received),
+        ("databus_source_rows", io.databus_source_rows),
+        ("databus_source_dropped_bad", io.databus_source_dropped_bad),
+        (
+            "databus_source_dropped_oversize",
+            io.databus_source_dropped_oversize,
+        ),
+        (
+            "databus_source_dropped_budget",
+            io.databus_source_dropped_budget,
+        ),
+        (
+            "databus_source_dropped_oldest",
+            io.databus_source_dropped_oldest,
+        ),
+        (
+            "databus_source_dropped_newest",
+            io.databus_source_dropped_newest,
+        ),
+        (
+            "databus_source_block_timeouts",
+            io.databus_source_block_timeouts,
+        ),
+        (
+            "databus_source_backpressure_waits",
+            io.databus_source_backpressure_waits,
+        ),
+        (
+            "databus_source_discarded_on_close",
+            io.databus_source_discarded_on_close,
+        ),
+        (
+            "databus_source_buffer_items",
+            io.databus_source_buffer_items,
+        ),
+        (
+            "databus_source_buffer_bytes",
+            io.databus_source_buffer_bytes,
+        ),
+        (
+            "databus_source_subscriptions",
+            io.databus_source_subscriptions,
+        ),
+        ("databus_source_inbox_items", io.databus_source_inbox_items),
+        ("databus_source_inbox_bytes", io.databus_source_inbox_bytes),
+        ("databus_sink_published", io.databus_sink_published),
+        ("databus_sink_deliveries", io.databus_sink_deliveries),
+        (
+            "databus_sink_no_subscribers",
+            io.databus_sink_no_subscribers,
+        ),
+        ("databus_sink_dropped_bad", io.databus_sink_dropped_bad),
+        (
+            "databus_sink_dropped_oversize",
+            io.databus_sink_dropped_oversize,
+        ),
+        (
+            "databus_sink_blocked_publishes",
+            io.databus_sink_blocked_publishes,
+        ),
+        (
+            "databus_sink_discarded_on_close",
+            io.databus_sink_discarded_on_close,
+        ),
+        ("databus_sink_batches", io.databus_sink_batches),
+        ("databus_sink_fatal", io.databus_sink_fatal),
     ] {
         io_fields[name] = json!(value);
     }

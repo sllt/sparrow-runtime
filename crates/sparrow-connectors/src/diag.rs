@@ -98,6 +98,29 @@ pub struct IoDiagnostics {
     pub jetstream_sink_sessions: AtomicU64,
     pub jetstream_sink_fatal: AtomicU64,
     pub jetstream_sink_inflight: AtomicU64,
+    pub databus_source_received: AtomicU64,
+    pub databus_source_rows: AtomicU64,
+    pub databus_source_dropped_bad: AtomicU64,
+    pub databus_source_dropped_oversize: AtomicU64,
+    pub databus_source_dropped_budget: AtomicU64,
+    pub databus_source_dropped_oldest: AtomicU64,
+    pub databus_source_dropped_newest: AtomicU64,
+    pub databus_source_block_timeouts: AtomicU64,
+    pub databus_source_backpressure_waits: AtomicU64,
+    pub databus_source_discarded_on_close: AtomicU64,
+    pub databus_source_buffer_items: AtomicU64,
+    pub databus_source_buffer_bytes: AtomicU64,
+    pub databus_source_subscriptions: AtomicU64,
+    pub databus_sink_published: AtomicU64,
+    pub databus_sink_deliveries: AtomicU64,
+    pub databus_sink_no_subscribers: AtomicU64,
+    pub databus_sink_dropped_bad: AtomicU64,
+    pub databus_sink_dropped_oversize: AtomicU64,
+    pub databus_sink_blocked_publishes: AtomicU64,
+    pub databus_sink_discarded_on_close: AtomicU64,
+    pub databus_sink_batches: AtomicU64,
+    pub databus_sink_fatal: AtomicU64,
+    pub databus_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub nats_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub log_written: AtomicU64,
     pub decode_errors: AtomicU64,
@@ -214,6 +237,50 @@ impl IoDiagnostics {
             jetstream_sink_sessions: self.jetstream_sink_sessions.load(Ordering::Relaxed),
             jetstream_sink_fatal: self.jetstream_sink_fatal.load(Ordering::Relaxed),
             jetstream_sink_inflight: self.jetstream_sink_inflight.load(Ordering::Relaxed),
+            databus_source_received: self.databus_source_received.load(Ordering::Relaxed),
+            databus_source_rows: self.databus_source_rows.load(Ordering::Relaxed),
+            databus_source_dropped_bad: self.databus_source_dropped_bad.load(Ordering::Relaxed),
+            databus_source_dropped_oversize: self
+                .databus_source_dropped_oversize
+                .load(Ordering::Relaxed),
+            databus_source_dropped_budget: self
+                .databus_source_dropped_budget
+                .load(Ordering::Relaxed),
+            databus_source_dropped_oldest: self
+                .databus_source_dropped_oldest
+                .load(Ordering::Relaxed),
+            databus_source_dropped_newest: self
+                .databus_source_dropped_newest
+                .load(Ordering::Relaxed),
+            databus_source_block_timeouts: self
+                .databus_source_block_timeouts
+                .load(Ordering::Relaxed),
+            databus_source_backpressure_waits: self
+                .databus_source_backpressure_waits
+                .load(Ordering::Relaxed),
+            databus_source_discarded_on_close: self
+                .databus_source_discarded_on_close
+                .load(Ordering::Relaxed),
+            databus_source_buffer_items: self.databus_source_buffer_items.load(Ordering::Relaxed),
+            databus_source_buffer_bytes: self.databus_source_buffer_bytes.load(Ordering::Relaxed),
+            databus_source_subscriptions: self.databus_source_subscriptions.load(Ordering::Relaxed),
+            databus_sink_published: self.databus_sink_published.load(Ordering::Relaxed),
+            databus_sink_deliveries: self.databus_sink_deliveries.load(Ordering::Relaxed),
+            databus_sink_no_subscribers: self.databus_sink_no_subscribers.load(Ordering::Relaxed),
+            databus_sink_dropped_bad: self.databus_sink_dropped_bad.load(Ordering::Relaxed),
+            databus_sink_dropped_oversize: self
+                .databus_sink_dropped_oversize
+                .load(Ordering::Relaxed),
+            databus_sink_blocked_publishes: self
+                .databus_sink_blocked_publishes
+                .load(Ordering::Relaxed),
+            databus_sink_discarded_on_close: self
+                .databus_sink_discarded_on_close
+                .load(Ordering::Relaxed),
+            databus_sink_batches: self.databus_sink_batches.load(Ordering::Relaxed),
+            databus_sink_fatal: self.databus_sink_fatal.load(Ordering::Relaxed),
+            databus_source_inbox_items: self.databus_source_inbox.items.load(Ordering::Relaxed),
+            databus_source_inbox_bytes: self.databus_source_inbox.bytes.load(Ordering::Relaxed),
             nats_source_inbox_items: self.nats_source_inbox.items.load(Ordering::Relaxed),
             nats_source_inbox_bytes: self.nats_source_inbox.bytes.load(Ordering::Relaxed),
             log_written: self.log_written.load(Ordering::Relaxed),
@@ -318,6 +385,30 @@ pub struct IoSnapshot {
     pub jetstream_sink_sessions: u64,
     pub jetstream_sink_fatal: u64,
     pub jetstream_sink_inflight: u64,
+    pub databus_source_received: u64,
+    pub databus_source_rows: u64,
+    pub databus_source_dropped_bad: u64,
+    pub databus_source_dropped_oversize: u64,
+    pub databus_source_dropped_budget: u64,
+    pub databus_source_dropped_oldest: u64,
+    pub databus_source_dropped_newest: u64,
+    pub databus_source_block_timeouts: u64,
+    pub databus_source_backpressure_waits: u64,
+    pub databus_source_discarded_on_close: u64,
+    pub databus_source_buffer_items: u64,
+    pub databus_source_buffer_bytes: u64,
+    pub databus_source_subscriptions: u64,
+    pub databus_sink_published: u64,
+    pub databus_sink_deliveries: u64,
+    pub databus_sink_no_subscribers: u64,
+    pub databus_sink_dropped_bad: u64,
+    pub databus_sink_dropped_oversize: u64,
+    pub databus_sink_blocked_publishes: u64,
+    pub databus_sink_discarded_on_close: u64,
+    pub databus_sink_batches: u64,
+    pub databus_sink_fatal: u64,
+    pub databus_source_inbox_items: u64,
+    pub databus_source_inbox_bytes: u64,
     pub nats_source_inbox_items: u64,
     pub nats_source_inbox_bytes: u64,
     pub log_written: u64,
@@ -443,6 +534,30 @@ impl IoSnapshot {
         self.jetstream_sink_sessions += other.jetstream_sink_sessions;
         self.jetstream_sink_fatal += other.jetstream_sink_fatal;
         self.jetstream_sink_inflight += other.jetstream_sink_inflight;
+        self.databus_source_received += other.databus_source_received;
+        self.databus_source_rows += other.databus_source_rows;
+        self.databus_source_dropped_bad += other.databus_source_dropped_bad;
+        self.databus_source_dropped_oversize += other.databus_source_dropped_oversize;
+        self.databus_source_dropped_budget += other.databus_source_dropped_budget;
+        self.databus_source_dropped_oldest += other.databus_source_dropped_oldest;
+        self.databus_source_dropped_newest += other.databus_source_dropped_newest;
+        self.databus_source_block_timeouts += other.databus_source_block_timeouts;
+        self.databus_source_backpressure_waits += other.databus_source_backpressure_waits;
+        self.databus_source_discarded_on_close += other.databus_source_discarded_on_close;
+        self.databus_source_buffer_items += other.databus_source_buffer_items;
+        self.databus_source_buffer_bytes += other.databus_source_buffer_bytes;
+        self.databus_source_subscriptions += other.databus_source_subscriptions;
+        self.databus_sink_published += other.databus_sink_published;
+        self.databus_sink_deliveries += other.databus_sink_deliveries;
+        self.databus_sink_no_subscribers += other.databus_sink_no_subscribers;
+        self.databus_sink_dropped_bad += other.databus_sink_dropped_bad;
+        self.databus_sink_dropped_oversize += other.databus_sink_dropped_oversize;
+        self.databus_sink_blocked_publishes += other.databus_sink_blocked_publishes;
+        self.databus_sink_discarded_on_close += other.databus_sink_discarded_on_close;
+        self.databus_sink_batches += other.databus_sink_batches;
+        self.databus_sink_fatal += other.databus_sink_fatal;
+        self.databus_source_inbox_items += other.databus_source_inbox_items;
+        self.databus_source_inbox_bytes += other.databus_source_inbox_bytes;
         self.nats_source_inbox_items += other.nats_source_inbox_items;
         self.nats_source_inbox_bytes += other.nats_source_inbox_bytes;
         self.log_written += other.log_written;

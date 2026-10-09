@@ -61,6 +61,24 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// In-process DataBus subscribe. At-most-once: bounded buffer with an
+    /// explicit overflow policy, no persistence, no replay.
+    pub const DATABUS_SOURCE: Self = Self {
+        kind: "databus",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// In-process DataBus publish. Done once the bus has offered the row to
+    /// every matching subscriber; not a downstream processing receipt.
+    pub const DATABUS_SINK: Self = Self {
+        kind: "databus_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     /// NATS Core publish. Handed to the client; no server receipt.
     pub const NATS_SINK: Self = Self {
         kind: "nats_sink",

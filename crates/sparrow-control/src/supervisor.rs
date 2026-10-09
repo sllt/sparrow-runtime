@@ -344,8 +344,9 @@ pub struct PipelineCheckpointInventory {
     pub storage_sample: &'static str,
     pub storage: sparrow_runtime::checkpoint::CheckpointInventory,
 }
-/// A JetStream Sink that could not confirm a row fails the job (fail closed).
-fn jetstream_sink_failed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
+/// A JetStream Sink that could not confirm a row, or a DataBus Sink that
+/// could not attach, fails the job (fail closed).
+fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
     if diags.iter().any(|d| {
         d.jetstream_sink_fatal
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -354,6 +355,16 @@ fn jetstream_sink_failed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
         return Err(SparrowError::new(
             sparrow_model::ErrorCode::JobFailed,
             "JetStream Sink failed closed (stream validation or an unconfirmed PubAck); inspect sink health and jetstream_sink_*; aligned restore replays from the last checkpoint",
+        ));
+    }
+    if diags.iter().any(|d| {
+        d.databus_sink_fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }) {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "DataBus Sink could not register its publisher (runtime publisher limit); inspect databus_sink_fatal",
         ));
     }
     Ok(())
@@ -365,6 +376,7 @@ fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
         "mqtt" => "mqtt",
         "nats" => "nats",
         "jetstream" => "jetstream",
+        "databus" => "databus",
         "file" => "file",
         "plugin" => "plugin",
         _ => "http",
@@ -424,6 +436,8 @@ pub struct Supervisor {
     #[cfg(feature = "demo-io")]
     demo: Option<Arc<DemoHarness>>,
     secrets: StoreSecrets,
+    /// In-process topic bus shared by every pipeline of this runtime.
+    databus: Arc<sparrow_connectors::DataBus>,
 }
 
 /// Demo handle passed into [`Supervisor::new`]. `()` when built without `demo-io`.
@@ -458,7 +472,13 @@ impl Supervisor {
             #[cfg(feature = "demo-io")]
             demo,
             secrets,
+            databus: sparrow_connectors::DataBus::new(),
         }))
+    }
+
+    /// The runtime's Local DataBus (live registrations, for status/tests).
+    pub fn databus(&self) -> &Arc<sparrow_connectors::DataBus> {
+        &self.databus
     }
 
     #[cfg(feature = "demo-io")]
@@ -1340,7 +1360,7 @@ impl Supervisor {
             request=request.with_live_events(rx).with_live_out(tx_out);
             tx_plugin=Some(tx);
             (None,None)
-        } else if kind == "mqtt" || kind == "http_poll" || kind == "nats" {
+        } else if kind == "mqtt" || kind == "http_poll" || kind == "nats" || kind == "databus" {
             let (tx, rx) = observed::channel(inbox);
             diag.observe_source(&tx);
             request = request.with_budgeted_live_io(rx, tx_out);
@@ -1433,6 +1453,37 @@ impl Supervisor {
                         r
                     })
                 }
+                "databus" => {
+                    let cfg = crate::validate::databus_source_config(
+                        &spec.source,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source = sparrow_connectors::DataBusSource::bind(
+                        cfg,
+                        self.databus.clone(),
+                        Arc::clone(&diag),
+                    )?;
+                    let cancel_job = cancel.clone();
+                    let owner = job.memory_owner();
+                    let max_row_bytes = self.kernel.ingress_row_limit();
+                    self.kernel.handle().spawn(async move {
+                        let r = source
+                            .run_budgeted(
+                                tx_budgeted.expect("DataBus ingress"),
+                                cancel_job.clone(),
+                                owner,
+                                max_row_bytes,
+                            )
+                            .await;
+                        if r.is_err() {
+                            cancel_job.cancel();
+                        }
+                        r
+                    })
+                }
                 "mqtt" => {
                     let mut mqtt_cfg = mqtt_config(&spec.source, schema, demo.as_ref(), name)?;
                     mqtt_cfg.fail_on_decode = spec.effective_fail_on_decode();
@@ -1497,7 +1548,7 @@ impl Supervisor {
         };
         Ok(RunningJob {
             graph_ports: None,
-            source_kind: match kind {"mqtt"=>"mqtt","plugin"=>"plugin","http_poll"=>"http_poll","nats"=>"nats",_=>"http_push"},
+            source_kind: match kind {"mqtt"=>"mqtt","plugin"=>"plugin","http_poll"=>"http_poll","nats"=>"nats","databus"=>"databus",_=>"http_push"},
             sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
             stable: false,
@@ -2092,6 +2143,11 @@ impl Supervisor {
                 )?;
                 self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
+            "databus" => {
+                let cfg = crate::validate::databus_sink_config(&spec.sink)?;
+                let sink = sparrow_connectors::DataBusSink::bind(cfg, self.databus.clone(), diag)?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
             "mqtt" => {
                 let cfg = mqtt_sink_config(&spec.sink, demo)?;
                 let sink =
@@ -2166,7 +2222,7 @@ impl Supervisor {
                 if file_diag.as_ref().is_some_and(|d|d.file_failed.load(std::sync::atomic::Ordering::Relaxed)>0) {
                     return Err(SparrowError::new(sparrow_model::ErrorCode::JobFailed,"File Sink failed; inspect sink health and file_failed; no automatic rollback or replay"));
                 }
-                jetstream_sink_failed(&plugin_diags)?;
+                sink_failed_closed(&plugin_diags)?;
                 match (r, src) {
                     (_, Err(e)) => Err(e),
                     (Err(e), _) => Err(e),
@@ -2210,7 +2266,7 @@ impl Supervisor {
                 }
                 // An unconfirmed JetStream publish cancels the job; report it
                 // instead of the consequential Cancelled.
-                jetstream_sink_failed(&plugin_diags)?;
+                sink_failed_closed(&plugin_diags)?;
                 // Source failures may cancel Kernel to unblock its bounded
                 // inbox. Preserve that root cause instead of replacing poison,
                 // retention or ACK errors with consequential Cancelled.

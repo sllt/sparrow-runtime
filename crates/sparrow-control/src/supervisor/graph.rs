@@ -46,6 +46,10 @@ enum Input {
         source: sparrow_connectors::NatsSource,
         tx: observed::Sender<sparrow_model::QueuedRow>,
     },
+    DataBus {
+        source: sparrow_connectors::DataBusSource,
+        tx: observed::Sender<sparrow_model::QueuedRow>,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -456,6 +460,24 @@ impl Supervisor {
                     binding.budgeted = Some(rx);
                     Input::Nats { source, tx }
                 }
+                "databus" => {
+                    let cfg = crate::validate::databus_source_config(
+                        source_spec,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source = sparrow_connectors::DataBusSource::bind(
+                        cfg,
+                        self.databus().clone(),
+                        diag.clone(),
+                    )?;
+                    let (tx, rx) = observed::channel(source_spec.inbox_capacity);
+                    diag.observe_source(&tx);
+                    binding.budgeted = Some(rx);
+                    Input::DataBus { source, tx }
+                }
                 _ => {
                     return Err(SparrowError::new(
                         ErrorCode::FeatureUnavailable,
@@ -593,6 +615,11 @@ impl Supervisor {
                             .map_err(SparrowError::from),
                         #[cfg(feature = "nats")]
                         Input::Nats { source, tx } => {
+                            source
+                                .run_budgeted(tx, child.clone(), owner, max_row_bytes)
+                                .await
+                        }
+                        Input::DataBus { source, tx } => {
                             source
                                 .run_budgeted(tx, child.clone(), owner, max_row_bytes)
                                 .await

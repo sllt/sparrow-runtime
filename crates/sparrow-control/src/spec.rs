@@ -82,6 +82,9 @@ pub struct SourceSpec {
     /// Required exclusively for `kind = "nats"` (NATS Core, not JetStream).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nats: Option<NatsSourceSpec>,
+    /// Required exclusively for `kind = "databus"` (in-process topic bus).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub databus: Option<DataBusSourceSpec>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -242,6 +245,92 @@ pub struct NatsSinkSpec {
     /// Shutdown budget for queued batches plus the final flush.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flush_timeout_ms: Option<u64>,
+}
+
+/// Local DataBus subscription: another pipeline's `databus` Sink in the
+/// same runtime publishes JSON rows decoded with this stream's schema.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataBusSourceSpec {
+    /// Topic pattern; `*` = one token, trailing `>` = one or more.
+    pub topic: String,
+    /// Subscriber buffer in messages (default 1024).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_capacity: Option<usize>,
+    /// Subscriber buffer payload bytes, charged to the job reservation
+    /// (default 256 KiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_bytes: Option<usize>,
+    /// `drop_oldest` (default), `drop_newest` or `block`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overflow: Option<String>,
+    /// `block` only: longest publisher wait per message (default 1000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_timeout_ms: Option<u64>,
+    /// Decoded-row Queue credit for the inbox; default 256 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_bytes: Option<usize>,
+}
+
+impl DataBusSourceSpec {
+    pub fn subscription(&self) -> Result<sparrow_connectors::databus::SubscriptionConfig> {
+        use sparrow_connectors::databus::{source, Overflow, SubscriptionConfig};
+        Ok(SubscriptionConfig {
+            pattern: self.topic.clone(),
+            capacity: self
+                .buffer_capacity
+                .unwrap_or(source::DEFAULT_BUFFER_MESSAGES),
+            max_bytes: self.buffer_bytes.unwrap_or(source::DEFAULT_BUFFER_BYTES),
+            overflow: match &self.overflow {
+                Some(policy) => Overflow::parse(policy)?,
+                None => Overflow::default(),
+            },
+            block_timeout: self.block_timeout_ms.map_or(
+                source::DEFAULT_BLOCK_TIMEOUT,
+                std::time::Duration::from_millis,
+            ),
+        })
+    }
+
+    pub fn connector_config(
+        &self,
+        schema: sparrow_model::Schema,
+        inbox_capacity: usize,
+        fail_on_decode: bool,
+    ) -> Result<sparrow_connectors::DataBusSourceConfig> {
+        let mut c = sparrow_connectors::DataBusSourceConfig::new(self.topic.clone(), schema);
+        c.subscription = self.subscription()?;
+        if let Some(n) = self.inbox_bytes {
+            c.inbox_bytes = n;
+        }
+        c.inbox_capacity = inbox_capacity;
+        c.fail_on_decode = fail_on_decode;
+        Ok(c)
+    }
+}
+
+/// Local DataBus publish to one literal topic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataBusSinkSpec {
+    pub topic: String,
+    /// Stop/EOF budget for publishing queued batches (default 1000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+}
+
+impl DataBusSinkSpec {
+    pub fn connector_config(
+        &self,
+        outbox_capacity: usize,
+    ) -> sparrow_connectors::DataBusSinkConfig {
+        let mut c = sparrow_connectors::DataBusSinkConfig::new(self.topic.clone());
+        if let Some(ms) = self.flush_timeout_ms {
+            c.flush_timeout = std::time::Duration::from_millis(ms);
+        }
+        c.outbox_capacity = outbox_capacity;
+        c
+    }
 }
 
 /// JetStream publish Sink: PubAck-confirmed, at-least-once into an existing
@@ -539,6 +628,9 @@ pub struct SinkSpec {
     /// Required exclusively for `kind = "jetstream"` (PubAck-confirmed publish).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jetstream: Option<JetStreamSinkSpec>,
+    /// Required exclusively for `kind = "databus"` (in-process topic bus).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub databus: Option<DataBusSinkSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -922,6 +1014,7 @@ impl PipelineSpec {
         }
         self.check_nats()?;
         self.check_jetstream_sink()?;
+        self.check_databus()?;
         if self
             .source
             .jetstream
@@ -1100,25 +1193,7 @@ impl PipelineSpec {
                 "NATS Core support requires the nats build feature",
             ));
         }
-        if source
-            && (self.source.jetstream.is_some()
-                || self.source.http_poll.is_some()
-                || self.source.plugin.is_some()
-                || self.source.host.is_some()
-                || self.source.port.is_some()
-                || self.source.path.is_some()
-                || self.source.bind.is_some()
-                || self.source.client_id.is_some()
-                || self.source.username_secret.is_some()
-                || self.source.password_secret.is_some()
-                || self.source.use_demo_io
-                || self.source.tls
-                || self.source.skip_verify
-                || self.source.file_contract.is_some()
-                || self.source.qos != 0
-                || !self.source.clean_session
-                || self.source.topic != default_topic())
-        {
+        if source && (self.source_has_foreign_fields() || self.source.databus.is_some()) {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
                 "NATS options belong in source.nats (TLS follows tls:// servers); mixed connector fields refused",
@@ -1140,6 +1215,91 @@ impl PipelineSpec {
                 ErrorCode::UnsupportedRestore,
                 "NATS Core is live_best_effort/restart_fresh, at-most-once (no ack, no replay); use the JetStream profile for checkpointed delivery",
             ));
+        }
+        Ok(())
+    }
+
+    /// MQTT/HTTP/File/plugin/JetStream fields on a NATS Core or DataBus source.
+    fn source_has_foreign_fields(&self) -> bool {
+        self.source.jetstream.is_some()
+            || self.source.http_poll.is_some()
+            || self.source.plugin.is_some()
+            || self.source.host.is_some()
+            || self.source.port.is_some()
+            || self.source.path.is_some()
+            || self.source.bind.is_some()
+            || self.source.client_id.is_some()
+            || self.source.username_secret.is_some()
+            || self.source.password_secret.is_some()
+            || self.source.use_demo_io
+            || self.source.tls
+            || self.source.skip_verify
+            || self.source.file_contract.is_some()
+            || self.source.qos != 0
+            || !self.source.clean_session
+            || self.source.topic != default_topic()
+    }
+
+    /// Local DataBus is live, at-most-once and in-process only: no replay
+    /// point exists, so durable claims are refused; mixed fields refused; a
+    /// pipeline may not subscribe to a topic it publishes itself.
+    fn check_databus(&self) -> Result<()> {
+        if self.source.databus.is_some() != (self.source.kind == "databus")
+            || self.sink.databus.is_some() != (self.sink.kind == "databus")
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "source.databus / sink.databus are required exclusively for kind=databus",
+            ));
+        }
+        let source = self.source.kind == "databus";
+        let sink = self.sink.kind == "databus";
+        if !source && !sink {
+            return Ok(());
+        }
+        if source && (self.source_has_foreign_fields() || self.source.nats.is_some()) {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "DataBus options belong in source.databus; mixed connector fields refused",
+            ));
+        }
+        if sink
+            && (self.sink_has_foreign_fields()
+                || self.sink.nats.is_some()
+                || self.sink.jetstream.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "DataBus options belong in sink.databus (static topic, no actions); mixed connector fields refused",
+            ));
+        }
+        if self.delivery != "live_best_effort"
+            || self.recovery != "restart_fresh"
+            || self.restore.is_some()
+            || self.checkpoint.is_some()
+            || self.checkpoint_dir.is_some()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "Local DataBus is live_best_effort/restart_fresh, at-most-once (in-memory, no replay point); no checkpoint or restore",
+            ));
+        }
+        let (sources, sinks): (Vec<&SourceSpec>, Vec<&SinkSpec>) = match &self.graph_io {
+            Some(io) => (io.sources.values().collect(), io.sinks.values().collect()),
+            None => (vec![&self.source], vec![&self.sink]),
+        };
+        for pattern in sources.iter().filter_map(|s| s.databus.as_ref()) {
+            for topic in sinks.iter().filter_map(|s| s.databus.as_ref()) {
+                if sparrow_connectors::databus::patterns_overlap(&pattern.topic, &topic.topic) {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "DataBus source `{}` would receive this pipeline's own sink topic `{}` (feedback loop)",
+                            pattern.topic, topic.topic
+                        ),
+                    ));
+                }
+            }
         }
         Ok(())
     }
