@@ -22,8 +22,10 @@ pub mod log;
 pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
+pub(crate) mod net;
 pub mod policy;
 pub mod secret;
+pub mod tcp;
 pub mod tls;
 #[cfg(feature = "websocket")]
 pub mod websocket;
@@ -55,6 +57,7 @@ pub use policy::{
     default_data_root, default_data_roots, ensure_default_data_root, AllowedTarget, TargetPolicy,
 };
 pub use secret::{MapSecretResolver, SecretResolver};
+pub use tcp::{TcpSink, TcpSinkConfig, TcpSource, TcpSourceConfig};
 pub use tls::TlsConfig;
 #[cfg(feature = "websocket")]
 pub use websocket::{WebSocketSink, WebSocketSinkConfig, WebSocketSource, WebSocketSourceConfig};

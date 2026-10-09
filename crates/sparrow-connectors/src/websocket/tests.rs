@@ -63,7 +63,7 @@ async fn until(deadline: Duration, mut f: impl FnMut() -> bool) {
 
 // ------------------------------------------------------------- servers
 
-type ServerWs = tokio_tungstenite::WebSocketStream<std::pin::Pin<Box<dyn client::WsIo>>>;
+type ServerWs = tokio_tungstenite::WebSocketStream<std::pin::Pin<Box<dyn crate::net::NetIo>>>;
 
 struct Listener {
     listener: TcpListener,
@@ -123,7 +123,7 @@ impl Listener {
         check: impl FnOnce(&Request, Response) -> Result<Response, ErrorResponse> + Unpin,
     ) -> Option<ServerWs> {
         let (tcp, _) = self.listener.accept().await.unwrap();
-        let io: std::pin::Pin<Box<dyn client::WsIo>> = match &self.tls {
+        let io: std::pin::Pin<Box<dyn crate::net::NetIo>> = match &self.tls {
             None => Box::pin(tcp),
             Some(acceptor) => Box::pin(acceptor.accept(tcp).await.ok()?),
         };

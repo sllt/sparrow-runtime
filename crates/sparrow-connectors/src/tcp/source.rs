@@ -1,73 +1,54 @@
-//! WebSocket client Source: live, at-most-once, no ack, no replay.
+//! TCP client Source: live, at-most-once, no ack, no replay.
 //!
-//! - Each text message is one record (JSON object or CSV record with its
-//!   header) or, with `framing = ndjson`, newline-delimited JSON objects.
-//!   Binary messages are dropped and counted unless `binary_frames = decode`
-//!   (JSON only; CSV is text and refuses binary decoding).
-//! - The protocol layer rejects a frame/message above `max_message_bytes`
-//!   from its header, before buffering or decoding the payload; the
-//!   connection is then closed (counted `dropped_oversize`) and reconnected.
-//!   Records above the 64 KiB decode limit inside an accepted NDJSON message
-//!   are dropped and counted the same way.
+//! - `lines`: one record per `\n`-terminated line (`\r\n` accepted, blank
+//!   lines skipped). JSON objects, or CSV records where each connection is
+//!   one CSV document: with `header: true` the first line after connecting
+//!   is the header. `multiline` CSV is refused (a record is one line).
+//! - `length_prefixed`: one record per frame (JSON object, or CSV header +
+//!   record like an MQTT message).
+//! - Limits are checked by the framer before decoding: oversize records are
+//!   counted `dropped_oversize` and skipped (`resync`) or close the
+//!   connection (`disconnect`). A record cut off by EOF is counted
+//!   `dropped_partial`, never decoded.
 //! - Rows enter the byte-accounted Kernel ingress one at a time; while the
-//!   bounded inbox is full the Source stops reading the socket (TCP
-//!   backpressure on the server). Time blocked on our own ingress does not
-//!   count as connection idleness.
-//! - A Ping is sent every `ping_interval`; no frame within `idle_timeout`
-//!   while waiting to read closes the connection. Reconnect uses capped,
-//!   jittered backoff; `reconnect_attempts` consecutive failures fail the
-//!   Source retryably and the supervisor restart policy applies.
+//!   inbox is full the Source stops reading (TCP backpressure on the peer).
+//!   No bytes within `idle_timeout` while waiting to read closes the
+//!   connection; time blocked on our own ingress does not count.
+//! - Reconnect uses capped, jittered backoff; `reconnect_attempts`
+//!   consecutive failures fail the Source retryably.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use sparrow_formats::{JsonLimits, PayloadFormat};
+use sparrow_formats::{CsvMapping, JsonLimits, PayloadFormat};
 use sparrow_io::observed::Sender as ObservedSender;
 use sparrow_model::observation::{HealthState, Latency, OriginSpan};
 use sparrow_model::{
     CreditKind, ErrorCode, MemoryOwner, QueuedRow, RestoreClaim, Result, Row, Schema,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_util::sync::CancellationToken;
 
-use super::client::{error, reconnect_delay, BoundClient, WebSocketClientConfig, WsStream};
+use super::client::{error, BoundTcp, TcpClientConfig};
+use super::framing::{Frame, OversizePolicy, TcpFraming};
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
-use crate::{SecretResolver, TargetPolicy};
+use crate::net::{reconnect_delay, NetStream};
+use crate::TargetPolicy;
 
 pub const DEFAULT_INBOX_BYTES: usize = 256 * 1024;
 const MAX_INBOX: usize = 4096;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How one WebSocket message maps to records.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum WebSocketFraming {
-    /// One record per message (JSON object, or CSV header + record).
-    #[default]
-    Message,
-    /// Newline-delimited JSON objects; blank lines skipped (JSON only).
-    Ndjson,
-}
-
-/// What a Source does with binary messages.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BinaryFrames {
-    /// Count (`dropped_binary`) and skip.
-    #[default]
-    Drop,
-    /// Decode like a text message (JSON only; strict UTF-8 JSON parsing).
-    Decode,
-}
-
 #[derive(Clone, Debug)]
-pub struct WebSocketSourceConfig {
-    pub client: WebSocketClientConfig,
-    pub framing: WebSocketFraming,
-    pub binary_frames: BinaryFrames,
+pub struct TcpSourceConfig {
+    pub client: TcpClientConfig,
+    pub oversize: OversizePolicy,
+    /// No bytes received for this long while waiting to read = dead peer.
+    pub idle_timeout: Duration,
     pub inbox_capacity: usize,
     /// Decoded-row Queue credit for the inbox.
     pub inbox_bytes: usize,
@@ -78,12 +59,12 @@ pub struct WebSocketSourceConfig {
     pub payload_format: PayloadFormat,
 }
 
-impl WebSocketSourceConfig {
-    pub fn new(url: impl Into<String>, schema: Schema) -> Self {
+impl TcpSourceConfig {
+    pub fn new(host: impl Into<String>, port: u16, schema: Schema) -> Self {
         Self {
-            client: WebSocketClientConfig::new(url),
-            framing: WebSocketFraming::Message,
-            binary_frames: BinaryFrames::Drop,
+            client: TcpClientConfig::new(host, port),
+            oversize: OversizePolicy::Resync,
+            idle_timeout: Duration::from_secs(60),
             inbox_capacity: 16,
             inbox_bytes: DEFAULT_INBOX_BYTES,
             schema,
@@ -95,27 +76,27 @@ impl WebSocketSourceConfig {
     }
 
     pub fn capabilities() -> ConnectorCapabilities {
-        ConnectorCapabilities::WEBSOCKET_SOURCE
+        ConnectorCapabilities::TCP_SOURCE
     }
 
-    /// Static validation; credentials are resolved by `bind`.
     pub fn validate(&self, policy: &TargetPolicy) -> Result<()> {
         refuse_durable_recovery(&self.restore)?;
         if let Some(csv) = self.payload_format.as_csv() {
-            if self.framing != WebSocketFraming::Message || self.binary_frames != BinaryFrames::Drop
-            {
+            if self.client.framing == TcpFraming::Lines && csv.options().multiline {
                 return Err(error(
                     ErrorCode::InvalidArgument,
-                    "WebSocket CSV takes one record per text message: framing=ndjson and binary_frames=decode are JSON-only",
+                    "TCP lines framing takes one CSV record per line; csv.multiline is refused (use length_prefixed)",
                 ));
             }
             csv.check_schema(&self.schema)?;
         }
-        if !(1..=MAX_INBOX).contains(&self.inbox_capacity) || self.json_limits.max_bytes > 64 * 1024
+        if !(1..=MAX_INBOX).contains(&self.inbox_capacity)
+            || self.json_limits.max_bytes > 64 * 1024
+            || !(100..=86_400_000).contains(&self.idle_timeout.as_millis())
         {
             return Err(error(
                 ErrorCode::BoundExceeded,
-                "WebSocket inbox_capacity must be 1..=4096; records remain <=64KiB",
+                "TCP source bounds: inbox_capacity 1..=4096, idle_timeout_ms 100..=86400000; records remain <=64KiB",
             ));
         }
         self.check_inbox_budget(sparrow_model::ResourceBudget::compact().queue_bytes)?;
@@ -134,7 +115,7 @@ impl WebSocketSourceConfig {
         {
             return Err(error(
                 ErrorCode::BoundExceeded,
-                "WebSocket inbox_bytes plus channel metadata must fit the job queue budget and 4MiB",
+                "TCP inbox_bytes plus channel metadata must fit the job queue budget and 4MiB",
             ));
         }
         Ok(())
@@ -149,22 +130,22 @@ impl WebSocketSourceConfig {
         if self.reservation() > reservation_budget / 2 {
             return Err(error(
                 ErrorCode::BoundExceeded,
-                "WebSocket connection buffers (2 x max_message_bytes + 128 KiB) exceed half the job reservation budget; lower max_message_bytes",
+                "TCP connection buffers exceed half the job reservation budget",
             ));
         }
         Ok(())
     }
 }
 
-pub struct WebSocketSource {
-    pub config: WebSocketSourceConfig,
+pub struct TcpSource {
+    pub config: TcpSourceConfig,
     pub diag: Arc<IoDiagnostics>,
-    client: BoundClient,
+    client: BoundTcp,
 }
 
-impl std::fmt::Debug for WebSocketSource {
+impl std::fmt::Debug for TcpSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WebSocketSource")
+        f.debug_struct("TcpSource")
             .field("client", &self.client)
             .finish_non_exhaustive()
     }
@@ -177,23 +158,27 @@ struct Ingress<'a> {
     max_row_bytes: usize,
 }
 
-/// How a connected session ended.
 enum SessionEnd {
-    /// Cancelled or the inbox closed: stop.
     Stop,
-    /// Connection lost (closed, protocol error, oversize, idle).
     Lost(&'static str),
 }
 
-impl WebSocketSource {
+/// Outcome of one record.
+enum Ingested {
+    Continue,
+    Stop,
+    /// The connection's CSV header is unusable: reconnect for a new one.
+    BadHeader,
+}
+
+impl TcpSource {
     pub fn bind(
-        config: WebSocketSourceConfig,
-        secrets: &dyn SecretResolver,
+        config: TcpSourceConfig,
         policy: &TargetPolicy,
         diag: Arc<IoDiagnostics>,
     ) -> Result<Self> {
         config.validate(policy)?;
-        let client = config.client.bind(secrets, policy)?;
+        let client = config.client.bind(policy)?;
         Ok(Self {
             config,
             diag,
@@ -201,8 +186,7 @@ impl WebSocketSource {
         })
     }
 
-    /// Read until cancelled. Requires the byte-accounted ingress
-    /// (`JobRequest::with_budgeted_live_io` / graph `budgeted`).
+    /// Read until cancelled. Requires the byte-accounted ingress.
     pub async fn run_budgeted(
         self,
         tx: impl Into<ObservedSender<QueuedRow>>,
@@ -214,7 +198,7 @@ impl WebSocketSource {
         if tx.max_capacity() != self.config.inbox_capacity {
             return Err(error(
                 ErrorCode::InvalidArgument,
-                "WebSocket inbox_capacity does not match channel",
+                "TCP inbox_capacity does not match channel",
             ));
         }
         self.config.check_inbox_budget(owner.budget().queue_bytes)?;
@@ -223,7 +207,7 @@ impl WebSocketSource {
         let _connection = owner.acquire(CreditKind::Reservation, self.config.reservation())?;
         let mut budget = owner.budget();
         budget.queue_bytes = self.config.inbox_bytes;
-        let queue = MemoryOwner::child(owner.clone(), budget, "websocket-inbox");
+        let queue = MemoryOwner::child(owner.clone(), budget, "tcp-inbox");
         let ingress = Ingress {
             tx: &tx,
             owner: &owner,
@@ -233,28 +217,25 @@ impl WebSocketSource {
         let _lifecycle = self.diag.observation.lifecycle(true);
         let mut connected_before = false;
         loop {
-            let Some(ws) = self.connect(&cancel, connected_before).await? else {
+            let Some(stream) = self.connect(&cancel, connected_before).await? else {
                 return Ok(());
             };
             if connected_before {
                 self.diag
-                    .websocket_source_reconnects
+                    .tcp_source_reconnects
                     .fetch_add(1, Ordering::Relaxed);
             }
             connected_before = true;
-            match self.session(ws, &ingress, &cancel).await? {
+            match self.session(stream, &ingress, &cancel).await? {
                 SessionEnd::Stop => {
-                    self.diag.observation.health(
-                        true,
-                        HealthState::Stopped,
-                        "websocket_stopped",
-                        None,
-                    );
+                    self.diag
+                        .observation
+                        .health(true, HealthState::Stopped, "tcp_stopped", None);
                     return Ok(());
                 }
                 SessionEnd::Lost(reason) => {
                     self.diag
-                        .websocket_source_disconnects
+                        .tcp_source_disconnects
                         .fetch_add(1, Ordering::Relaxed);
                     self.diag
                         .observation
@@ -269,12 +250,12 @@ impl WebSocketSource {
         &self,
         cancel: &CancellationToken,
         reconnecting: bool,
-    ) -> Result<Option<WsStream>> {
+    ) -> Result<Option<NetStream>> {
         let mut attempt = 0usize;
         loop {
             if reconnecting || attempt > 0 {
                 // Back off before every reconnect, including the first one
-                // after a lost session (a flapping server is rate limited).
+                // after a lost session (a flapping peer is rate limited).
                 let delay = reconnect_delay(attempt + 1, self.client.config.reconnect_max);
                 tokio::select! {
                     biased;
@@ -289,7 +270,7 @@ impl WebSocketSource {
                 } else {
                     HealthState::Connecting
                 },
-                "websocket_connecting",
+                "tcp_connecting",
                 None,
             );
             let attempted = tokio::select! {
@@ -298,35 +279,32 @@ impl WebSocketSource {
                 c = self.client.connect() => c,
             };
             match attempted {
-                Ok(ws) => {
+                Ok(stream) => {
                     self.diag
-                        .websocket_source_connects
+                        .tcp_source_connects
                         .fetch_add(1, Ordering::Relaxed);
-                    self.diag.observation.health(
-                        true,
-                        HealthState::Ready,
-                        "websocket_connected",
-                        None,
-                    );
-                    return Ok(Some(ws));
+                    self.diag
+                        .observation
+                        .health(true, HealthState::Ready, "tcp_connected", None);
+                    return Ok(Some(stream));
                 }
                 Err(failure) => {
                     self.diag
-                        .websocket_source_connect_failures
+                        .tcp_source_connect_failures
                         .fetch_add(1, Ordering::Relaxed);
                     attempt += 1;
                     if attempt >= self.client.config.reconnect_attempts {
                         self.diag.observation.health(
                             true,
                             HealthState::Failed,
-                            "websocket_connect_exhausted",
+                            "tcp_connect_exhausted",
                             Some(ErrorCode::JobFailed),
                         );
                         return Err(error(
                             ErrorCode::JobFailed,
                             format!(
                                 "{} ({attempt} consecutive attempts); the supervisor restart policy applies",
-                                failure.reason("WebSocket")
+                                failure.reason("TCP")
                             ),
                         )
                         .retryable(true));
@@ -338,190 +316,194 @@ impl WebSocketSource {
 
     async fn session(
         &self,
-        mut ws: WsStream,
+        mut stream: NetStream,
         ingress: &Ingress<'_>,
         cancel: &CancellationToken,
     ) -> Result<SessionEnd> {
         enum Event {
             Stop,
             Idle,
-            Ping,
-            Frame(Option<std::result::Result<Message, tungstenite::Error>>),
+            Read(std::io::Result<usize>),
         }
-        let cfg = &self.client.config;
-        let mut ping =
-            tokio::time::interval_at(Instant::now() + cfg.ping_interval, cfg.ping_interval);
-        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last_frame = Instant::now();
+        let mut reader = self.client.reader(self.config.oversize);
+        // Lines + CSV: each connection is one document.
+        let mut mapping: Option<CsvMapping> = match self.config.payload_format.as_csv() {
+            Some(csv) if self.client.config.framing == TcpFraming::Lines && !csv.header() => {
+                Some(csv.positional_mapping(&self.config.schema)?)
+            }
+            _ => None,
+        };
+        let mut last_read = Instant::now();
         loop {
+            let mut drained = false;
+            while let Some(frame) = reader.next_frame() {
+                drained = true;
+                let range = match frame {
+                    Frame::Oversize => {
+                        self.diag
+                            .tcp_source_dropped_oversize
+                            .fetch_add(1, Ordering::Relaxed);
+                        if self.config.oversize == OversizePolicy::Disconnect {
+                            return Ok(SessionEnd::Lost("tcp_frame_too_big"));
+                        }
+                        continue;
+                    }
+                    Frame::Record(range) => range,
+                };
+                self.diag
+                    .tcp_source_received
+                    .fetch_add(1, Ordering::Relaxed);
+                let received_at = std::time::Instant::now();
+                match self
+                    .ingest(
+                        reader.bytes(range),
+                        &mut mapping,
+                        ingress,
+                        cancel,
+                        received_at,
+                    )
+                    .await?
+                {
+                    Ingested::Continue => {}
+                    Ingested::Stop => {
+                        let _ = tokio::time::timeout(CLOSE_TIMEOUT, stream.shutdown()).await;
+                        return Ok(SessionEnd::Stop);
+                    }
+                    Ingested::BadHeader => return Ok(SessionEnd::Lost("tcp_csv_header_invalid")),
+                }
+            }
+            // Time spent blocked on our own bounded ingress is not idleness.
+            if drained {
+                last_read = Instant::now();
+            }
             let event = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => Event::Stop,
-                _ = tokio::time::sleep_until(last_frame + cfg.idle_timeout) => Event::Idle,
-                _ = ping.tick() => Event::Ping,
-                frame = ws.next() => Event::Frame(frame),
+                _ = tokio::time::sleep_until(last_read + self.config.idle_timeout) => Event::Idle,
+                n = reader.fill(&mut stream) => Event::Read(n),
             };
-            let message = match event {
+            match event {
                 Event::Stop => {
-                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, ws.close(None)).await;
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, stream.shutdown()).await;
                     return Ok(SessionEnd::Stop);
                 }
                 Event::Idle => {
                     self.diag
-                        .websocket_source_heartbeat_timeouts
+                        .tcp_source_idle_timeouts
                         .fetch_add(1, Ordering::Relaxed);
-                    return Ok(SessionEnd::Lost("websocket_heartbeat_timeout"));
+                    return Ok(SessionEnd::Lost("tcp_idle_timeout"));
                 }
-                Event::Ping => {
-                    match tokio::time::timeout(
-                        cfg.connect_timeout,
-                        ws.send(Message::Ping(Default::default())),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {
-                            self.diag
-                                .websocket_source_pings_sent
-                                .fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        _ => return Ok(SessionEnd::Lost("websocket_ping_failed")),
-                    }
-                }
-                Event::Frame(None) => return Ok(SessionEnd::Lost("websocket_closed")),
-                Event::Frame(Some(Err(tungstenite::Error::Capacity(_)))) => {
-                    // Rejected from the frame header / running message size,
-                    // before the payload was buffered or decoded.
-                    self.diag
-                        .websocket_source_dropped_oversize
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(SessionEnd::Lost("websocket_message_too_big"));
-                }
-                Event::Frame(Some(Err(_))) => {
-                    return Ok(SessionEnd::Lost("websocket_protocol_error"))
-                }
-                Event::Frame(Some(Ok(message))) => message,
-            };
-            let received_at = std::time::Instant::now();
-            let admitted = match message {
-                Message::Text(text) => {
-                    self.diag
-                        .websocket_source_received
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.ingest(text.as_bytes(), ingress, cancel, received_at)
-                        .await?
-                }
-                Message::Binary(bytes) => {
-                    self.diag
-                        .websocket_source_received
-                        .fetch_add(1, Ordering::Relaxed);
-                    if self.config.binary_frames == BinaryFrames::Drop {
+                Event::Read(Ok(0)) => {
+                    if reader.has_partial() {
                         self.diag
-                            .websocket_source_dropped_binary
+                            .tcp_source_dropped_partial
                             .fetch_add(1, Ordering::Relaxed);
-                        true
-                    } else {
-                        self.ingest(&bytes, ingress, cancel, received_at).await?
                     }
+                    return Ok(SessionEnd::Lost("tcp_peer_closed"));
                 }
-                Message::Close(_) => return Ok(SessionEnd::Lost("websocket_server_closed")),
-                // Pings are answered by the protocol layer; Pongs only prove
-                // liveness.
-                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => true,
-            };
-            if !admitted {
-                let _ = tokio::time::timeout(CLOSE_TIMEOUT, ws.close(None)).await;
-                return Ok(SessionEnd::Stop);
+                Event::Read(Ok(n)) => {
+                    self.diag
+                        .tcp_source_bytes_read
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                    last_read = Instant::now();
+                }
+                Event::Read(Err(_)) => {
+                    if reader.has_partial() {
+                        self.diag
+                            .tcp_source_dropped_partial
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(SessionEnd::Lost("tcp_read_failed"));
+                }
             }
-            // Time spent blocked on our own bounded ingress is not idleness.
-            last_frame = Instant::now();
         }
     }
 
-    /// Decode one message into rows and admit them. `Ok(false)` = stop.
     async fn ingest(
         &self,
-        payload: &[u8],
-        ingress: &Ingress<'_>,
-        cancel: &CancellationToken,
-        received_at: std::time::Instant,
-    ) -> Result<bool> {
-        match self.config.framing {
-            WebSocketFraming::Message => {
-                self.ingest_record(payload, ingress, cancel, received_at)
-                    .await
-            }
-            WebSocketFraming::Ndjson => {
-                for line in payload.split(|&b| b == b'\n') {
-                    let line = line.strip_suffix(b"\r").unwrap_or(line);
-                    if line.iter().all(u8::is_ascii_whitespace) {
-                        continue;
-                    }
-                    if !self
-                        .ingest_record(line, ingress, cancel, received_at)
-                        .await?
-                    {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-        }
-    }
-
-    async fn ingest_record(
-        &self,
         record: &[u8],
+        mapping: &mut Option<CsvMapping>,
         ingress: &Ingress<'_>,
         cancel: &CancellationToken,
         received_at: std::time::Instant,
-    ) -> Result<bool> {
+    ) -> Result<Ingested> {
         if record.len() > self.config.json_limits.max_bytes {
             self.diag
-                .websocket_source_dropped_oversize
+                .tcp_source_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(true);
+            return Ok(Ingested::Continue);
         }
         let started = std::time::Instant::now();
-        let decoded = self.config.payload_format.decode_row(
-            &self.config.schema,
-            record,
-            &self.config.json_limits,
-            None,
-        );
+        let lines_csv = match self.config.payload_format.as_csv() {
+            Some(csv) if self.client.config.framing == TcpFraming::Lines => Some(csv),
+            _ => None,
+        };
+        let decoded = match (lines_csv, mapping.as_ref()) {
+            (Some(csv), None) => {
+                // First line of the connection: the CSV header.
+                match csv.header_mapping(&self.config.schema, record) {
+                    Ok(m) => {
+                        *mapping = Some(m);
+                        return Ok(Ingested::Continue);
+                    }
+                    Err(e) => {
+                        self.bad(&e)?;
+                        return Ok(Ingested::BadHeader);
+                    }
+                }
+            }
+            (Some(csv), Some(m)) => csv.decode_record(&self.config.schema, m, record, None),
+            (None, _) => self.config.payload_format.decode_row(
+                &self.config.schema,
+                record,
+                &self.config.json_limits,
+                None,
+            ),
+        };
         self.diag
             .observation
             .record(Latency::Decode, started.elapsed());
         let row = match decoded {
             Ok(row) => row,
             Err(e) => {
-                self.diag.csv_decode_error(&self.config.payload_format, &e);
-                self.diag
-                    .websocket_source_dropped_bad
-                    .fetch_add(1, Ordering::Relaxed);
-                self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
-                if self.config.fail_on_decode {
-                    self.diag.observation.health(
-                        true,
-                        HealthState::Failed,
-                        "websocket_decode_failed",
-                        Some(e.code),
-                    );
-                    return Err(error(
-                        e.code,
-                        "WebSocket record decode failed (fail_on_decode)",
-                    ));
-                }
-                return Ok(true);
+                self.bad(&e)?;
+                return Ok(Ingested::Continue);
             }
         };
         self.diag.observation.progress(true, 1);
-        self.admit(row, ingress, cancel, OriginSpan::at(received_at))
-            .await
+        Ok(
+            if self
+                .admit(row, ingress, cancel, OriginSpan::at(received_at))
+                .await?
+            {
+                Ingested::Continue
+            } else {
+                Ingested::Stop
+            },
+        )
+    }
+
+    /// Count a decode failure; `fail_on_decode` turns it into a job error.
+    fn bad(&self, e: &sparrow_model::SparrowError) -> Result<()> {
+        self.diag.csv_decode_error(&self.config.payload_format, e);
+        self.diag
+            .tcp_source_dropped_bad
+            .fetch_add(1, Ordering::Relaxed);
+        self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
+        if self.config.fail_on_decode {
+            self.diag.observation.health(
+                true,
+                HealthState::Failed,
+                "tcp_decode_failed",
+                Some(e.code),
+            );
+            return Err(error(e.code, "TCP record decode failed (fail_on_decode)"));
+        }
+        Ok(())
     }
 
     /// Cancel-aware wait for a channel slot and Queue credit, holding one
-    /// Reservation-charged working row (same contract as NATS / MQTT).
+    /// Reservation-charged working row (same contract as NATS / WebSocket).
     async fn admit(
         &self,
         row: Row,
@@ -539,13 +521,13 @@ impl WebSocketSource {
                 .min(ingress.max_row_bytes)
         {
             self.diag
-                .websocket_source_dropped_oversize
+                .tcp_source_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
         let Ok(_working) = ingress.owner.acquire(CreditKind::Reservation, bytes) else {
             self.diag
-                .websocket_source_dropped_budget
+                .tcp_source_dropped_budget
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         };
@@ -559,16 +541,14 @@ impl WebSocketSource {
                 Ok(permit) => match QueuedRow::try_new(
                     row.take().expect("pending row"),
                     ingress.queue,
-                    &self.diag.websocket_source_inbox,
+                    &self.diag.tcp_source_inbox,
                 ) {
                     Ok(queued) => {
                         if let Some(wait) = &mut observed_wait {
                             wait.finish();
                         }
                         permit.send_with_origin(queued, origin);
-                        self.diag
-                            .websocket_source_rows
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.diag.tcp_source_rows.fetch_add(1, Ordering::Relaxed);
                         return Ok(true);
                     }
                     Err((r, _)) => {
@@ -582,7 +562,7 @@ impl WebSocketSource {
             if observed_wait.is_none() {
                 observed_wait = Some(ingress.tx.observe_wait());
                 self.diag
-                    .websocket_source_backpressure_waits
+                    .tcp_source_backpressure_waits
                     .fetch_add(1, Ordering::Relaxed);
             }
             tokio::select! {

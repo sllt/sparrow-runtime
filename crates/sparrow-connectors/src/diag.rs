@@ -158,6 +158,38 @@ pub struct IoDiagnostics {
     pub websocket_sink_fatal: AtomicU64,
     pub websocket_sink_queue_items: AtomicU64,
     pub websocket_source_inbox: Arc<sparrow_model::QueueOccupancy>,
+    pub tcp_source_received: AtomicU64,
+    pub tcp_source_rows: AtomicU64,
+    pub tcp_source_bytes_read: AtomicU64,
+    pub tcp_source_dropped_bad: AtomicU64,
+    pub tcp_source_dropped_oversize: AtomicU64,
+    pub tcp_source_dropped_partial: AtomicU64,
+    pub tcp_source_dropped_budget: AtomicU64,
+    pub tcp_source_backpressure_waits: AtomicU64,
+    pub tcp_source_connects: AtomicU64,
+    pub tcp_source_reconnects: AtomicU64,
+    pub tcp_source_disconnects: AtomicU64,
+    pub tcp_source_connect_failures: AtomicU64,
+    pub tcp_source_idle_timeouts: AtomicU64,
+    pub tcp_sink_sent: AtomicU64,
+    pub tcp_sink_bytes_written: AtomicU64,
+    pub tcp_sink_dropped_bad: AtomicU64,
+    pub tcp_sink_dropped_oversize: AtomicU64,
+    pub tcp_sink_dropped_overflow: AtomicU64,
+    pub tcp_sink_backpressure_waits: AtomicU64,
+    pub tcp_sink_send_failed: AtomicU64,
+    pub tcp_sink_send_timeouts: AtomicU64,
+    pub tcp_sink_discarded_on_close: AtomicU64,
+    pub tcp_sink_connects: AtomicU64,
+    pub tcp_sink_reconnects: AtomicU64,
+    pub tcp_sink_disconnects: AtomicU64,
+    pub tcp_sink_connect_failures: AtomicU64,
+    pub tcp_sink_ignored_bytes: AtomicU64,
+    pub tcp_sink_closes: AtomicU64,
+    pub tcp_sink_close_failed: AtomicU64,
+    pub tcp_sink_fatal: AtomicU64,
+    pub tcp_sink_queue_items: AtomicU64,
+    pub tcp_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub databus_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub nats_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub log_written: AtomicU64,
@@ -409,6 +441,41 @@ impl IoDiagnostics {
             websocket_sink_queue_items: self.websocket_sink_queue_items.load(Ordering::Relaxed),
             websocket_source_inbox_items: self.websocket_source_inbox.items.load(Ordering::Relaxed),
             websocket_source_inbox_bytes: self.websocket_source_inbox.bytes.load(Ordering::Relaxed),
+            tcp_source_received: self.tcp_source_received.load(Ordering::Relaxed),
+            tcp_source_rows: self.tcp_source_rows.load(Ordering::Relaxed),
+            tcp_source_bytes_read: self.tcp_source_bytes_read.load(Ordering::Relaxed),
+            tcp_source_dropped_bad: self.tcp_source_dropped_bad.load(Ordering::Relaxed),
+            tcp_source_dropped_oversize: self.tcp_source_dropped_oversize.load(Ordering::Relaxed),
+            tcp_source_dropped_partial: self.tcp_source_dropped_partial.load(Ordering::Relaxed),
+            tcp_source_dropped_budget: self.tcp_source_dropped_budget.load(Ordering::Relaxed),
+            tcp_source_backpressure_waits: self
+                .tcp_source_backpressure_waits
+                .load(Ordering::Relaxed),
+            tcp_source_connects: self.tcp_source_connects.load(Ordering::Relaxed),
+            tcp_source_reconnects: self.tcp_source_reconnects.load(Ordering::Relaxed),
+            tcp_source_disconnects: self.tcp_source_disconnects.load(Ordering::Relaxed),
+            tcp_source_connect_failures: self.tcp_source_connect_failures.load(Ordering::Relaxed),
+            tcp_source_idle_timeouts: self.tcp_source_idle_timeouts.load(Ordering::Relaxed),
+            tcp_sink_sent: self.tcp_sink_sent.load(Ordering::Relaxed),
+            tcp_sink_bytes_written: self.tcp_sink_bytes_written.load(Ordering::Relaxed),
+            tcp_sink_dropped_bad: self.tcp_sink_dropped_bad.load(Ordering::Relaxed),
+            tcp_sink_dropped_oversize: self.tcp_sink_dropped_oversize.load(Ordering::Relaxed),
+            tcp_sink_dropped_overflow: self.tcp_sink_dropped_overflow.load(Ordering::Relaxed),
+            tcp_sink_backpressure_waits: self.tcp_sink_backpressure_waits.load(Ordering::Relaxed),
+            tcp_sink_send_failed: self.tcp_sink_send_failed.load(Ordering::Relaxed),
+            tcp_sink_send_timeouts: self.tcp_sink_send_timeouts.load(Ordering::Relaxed),
+            tcp_sink_discarded_on_close: self.tcp_sink_discarded_on_close.load(Ordering::Relaxed),
+            tcp_sink_connects: self.tcp_sink_connects.load(Ordering::Relaxed),
+            tcp_sink_reconnects: self.tcp_sink_reconnects.load(Ordering::Relaxed),
+            tcp_sink_disconnects: self.tcp_sink_disconnects.load(Ordering::Relaxed),
+            tcp_sink_connect_failures: self.tcp_sink_connect_failures.load(Ordering::Relaxed),
+            tcp_sink_ignored_bytes: self.tcp_sink_ignored_bytes.load(Ordering::Relaxed),
+            tcp_sink_closes: self.tcp_sink_closes.load(Ordering::Relaxed),
+            tcp_sink_close_failed: self.tcp_sink_close_failed.load(Ordering::Relaxed),
+            tcp_sink_fatal: self.tcp_sink_fatal.load(Ordering::Relaxed),
+            tcp_sink_queue_items: self.tcp_sink_queue_items.load(Ordering::Relaxed),
+            tcp_source_inbox_items: self.tcp_source_inbox.items.load(Ordering::Relaxed),
+            tcp_source_inbox_bytes: self.tcp_source_inbox.bytes.load(Ordering::Relaxed),
             databus_source_inbox_items: self.databus_source_inbox.items.load(Ordering::Relaxed),
             databus_source_inbox_bytes: self.databus_source_inbox.bytes.load(Ordering::Relaxed),
             nats_source_inbox_items: self.nats_source_inbox.items.load(Ordering::Relaxed),
@@ -576,6 +643,39 @@ pub struct IoSnapshot {
     pub websocket_sink_queue_items: u64,
     pub websocket_source_inbox_items: u64,
     pub websocket_source_inbox_bytes: u64,
+    pub tcp_source_received: u64,
+    pub tcp_source_rows: u64,
+    pub tcp_source_bytes_read: u64,
+    pub tcp_source_dropped_bad: u64,
+    pub tcp_source_dropped_oversize: u64,
+    pub tcp_source_dropped_partial: u64,
+    pub tcp_source_dropped_budget: u64,
+    pub tcp_source_backpressure_waits: u64,
+    pub tcp_source_connects: u64,
+    pub tcp_source_reconnects: u64,
+    pub tcp_source_disconnects: u64,
+    pub tcp_source_connect_failures: u64,
+    pub tcp_source_idle_timeouts: u64,
+    pub tcp_sink_sent: u64,
+    pub tcp_sink_bytes_written: u64,
+    pub tcp_sink_dropped_bad: u64,
+    pub tcp_sink_dropped_oversize: u64,
+    pub tcp_sink_dropped_overflow: u64,
+    pub tcp_sink_backpressure_waits: u64,
+    pub tcp_sink_send_failed: u64,
+    pub tcp_sink_send_timeouts: u64,
+    pub tcp_sink_discarded_on_close: u64,
+    pub tcp_sink_connects: u64,
+    pub tcp_sink_reconnects: u64,
+    pub tcp_sink_disconnects: u64,
+    pub tcp_sink_connect_failures: u64,
+    pub tcp_sink_ignored_bytes: u64,
+    pub tcp_sink_closes: u64,
+    pub tcp_sink_close_failed: u64,
+    pub tcp_sink_fatal: u64,
+    pub tcp_sink_queue_items: u64,
+    pub tcp_source_inbox_items: u64,
+    pub tcp_source_inbox_bytes: u64,
     pub databus_source_inbox_items: u64,
     pub databus_source_inbox_bytes: u64,
     pub nats_source_inbox_items: u64,
@@ -764,6 +864,39 @@ impl IoSnapshot {
         self.websocket_sink_queue_items += other.websocket_sink_queue_items;
         self.websocket_source_inbox_items += other.websocket_source_inbox_items;
         self.websocket_source_inbox_bytes += other.websocket_source_inbox_bytes;
+        self.tcp_source_received += other.tcp_source_received;
+        self.tcp_source_rows += other.tcp_source_rows;
+        self.tcp_source_bytes_read += other.tcp_source_bytes_read;
+        self.tcp_source_dropped_bad += other.tcp_source_dropped_bad;
+        self.tcp_source_dropped_oversize += other.tcp_source_dropped_oversize;
+        self.tcp_source_dropped_partial += other.tcp_source_dropped_partial;
+        self.tcp_source_dropped_budget += other.tcp_source_dropped_budget;
+        self.tcp_source_backpressure_waits += other.tcp_source_backpressure_waits;
+        self.tcp_source_connects += other.tcp_source_connects;
+        self.tcp_source_reconnects += other.tcp_source_reconnects;
+        self.tcp_source_disconnects += other.tcp_source_disconnects;
+        self.tcp_source_connect_failures += other.tcp_source_connect_failures;
+        self.tcp_source_idle_timeouts += other.tcp_source_idle_timeouts;
+        self.tcp_sink_sent += other.tcp_sink_sent;
+        self.tcp_sink_bytes_written += other.tcp_sink_bytes_written;
+        self.tcp_sink_dropped_bad += other.tcp_sink_dropped_bad;
+        self.tcp_sink_dropped_oversize += other.tcp_sink_dropped_oversize;
+        self.tcp_sink_dropped_overflow += other.tcp_sink_dropped_overflow;
+        self.tcp_sink_backpressure_waits += other.tcp_sink_backpressure_waits;
+        self.tcp_sink_send_failed += other.tcp_sink_send_failed;
+        self.tcp_sink_send_timeouts += other.tcp_sink_send_timeouts;
+        self.tcp_sink_discarded_on_close += other.tcp_sink_discarded_on_close;
+        self.tcp_sink_connects += other.tcp_sink_connects;
+        self.tcp_sink_reconnects += other.tcp_sink_reconnects;
+        self.tcp_sink_disconnects += other.tcp_sink_disconnects;
+        self.tcp_sink_connect_failures += other.tcp_sink_connect_failures;
+        self.tcp_sink_ignored_bytes += other.tcp_sink_ignored_bytes;
+        self.tcp_sink_closes += other.tcp_sink_closes;
+        self.tcp_sink_close_failed += other.tcp_sink_close_failed;
+        self.tcp_sink_fatal += other.tcp_sink_fatal;
+        self.tcp_sink_queue_items += other.tcp_sink_queue_items;
+        self.tcp_source_inbox_items += other.tcp_source_inbox_items;
+        self.tcp_source_inbox_bytes += other.tcp_source_inbox_bytes;
         self.databus_source_inbox_items += other.databus_source_inbox_items;
         self.databus_source_inbox_bytes += other.databus_source_inbox_bytes;
         self.nats_source_inbox_items += other.nats_source_inbox_items;

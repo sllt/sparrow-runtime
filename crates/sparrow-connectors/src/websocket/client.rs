@@ -6,46 +6,32 @@
 //! Errors never echo the URL (its path/query may carry tokens), header
 //! values or credentials; handshake failures report the HTTP status only.
 
-use std::hash::{BuildHasher, Hasher};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, ServerName};
 use sparrow_model::{ErrorCode, Result, SparrowError};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::WebSocketStream;
 
+pub(crate) use crate::net::ConnectFailure;
+use crate::net::{connect_stream, root_store, Endpoint, NetStream, TlsClient};
+pub use crate::net::{reconnect_delay, DEFAULT_RECONNECT_ATTEMPTS, MAX_RECONNECT_ATTEMPTS};
 use crate::{SecretResolver, TargetPolicy};
 
 pub const MIN_MESSAGE_BYTES: usize = 1024;
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MESSAGE_BYTES: usize = 64 * 1024;
-pub const MAX_RECONNECT_ATTEMPTS: usize = 1000;
-pub const DEFAULT_RECONNECT_ATTEMPTS: usize = 10;
 pub const MAX_HEADERS: usize = 16;
 pub const MAX_SUBPROTOCOLS: usize = 8;
 const MAX_URL_BYTES: usize = 4096;
 const MAX_SECRET_BYTES: usize = 4096;
-const MAX_CA_PEM_BYTES: usize = 64 * 1024;
-const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const READ_BUFFER_BYTES: usize = 16 * 1024;
 /// Ledger estimate of the per-connection fixed state (TLS records, handshake,
 /// read buffer, task state). Accounting, not an RSS guarantee.
 const CONNECTION_FIXED_RESERVATION: usize = 128 * 1024;
-
-fn install_rustls_provider() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
 
 pub(crate) fn error(code: ErrorCode, message: impl Into<String>) -> SparrowError {
     SparrowError::new(code, message.into())
@@ -174,12 +160,12 @@ impl WebSocketClientConfig {
             }
         }
         if let Some(pem) = &self.tls_ca_pem {
-            root_store(Some(pem))?;
+            root_store(Some(pem), "WebSocket")?;
         }
         Ok(())
     }
 
-    fn target(&self) -> Result<Target> {
+    fn target(&self) -> Result<Endpoint> {
         let invalid = || {
             error(
                 ErrorCode::InvalidArgument,
@@ -205,7 +191,7 @@ impl WebSocketClientConfig {
             .trim_end_matches(']')
             .to_string();
         let port = url.port().unwrap_or(if tls { 443 } else { 80 });
-        Ok(Target { host, port, tls })
+        Ok(Endpoint { host, port, tls })
     }
 
     /// Per-connection ledger charge: fixed state, one assembling message,
@@ -229,17 +215,11 @@ impl WebSocketClientConfig {
         let target = self.target()?;
         let headers = build_headers(self, secrets)?;
         let tls = if target.tls {
-            install_rustls_provider();
-            let config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store(self.tls_ca_pem.as_deref())?)
-                .with_no_client_auth();
-            let name = ServerName::try_from(target.host.clone()).map_err(|_| {
-                error(
-                    ErrorCode::InvalidArgument,
-                    "WebSocket TLS server name invalid",
-                )
-            })?;
-            Some((tokio_rustls::TlsConnector::from(Arc::new(config)), name))
+            Some(TlsClient::new(
+                &target.host,
+                self.tls_ca_pem.as_deref(),
+                "WebSocket",
+            )?)
         } else {
             None
         };
@@ -250,41 +230,6 @@ impl WebSocketClientConfig {
             tls,
         })
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Target {
-    host: String,
-    port: u16,
-    tls: bool,
-}
-
-fn root_store(pem: Option<&str>) -> Result<rustls::RootCertStore> {
-    let mut roots = rustls::RootCertStore::empty();
-    match pem {
-        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-        Some(pem) => {
-            let invalid = || {
-                error(
-                    ErrorCode::InvalidArgument,
-                    "WebSocket tls_ca_pem must hold 1..=16 PEM CA certificates within 64 KiB",
-                )
-            };
-            if pem.len() > MAX_CA_PEM_BYTES {
-                return Err(invalid());
-            }
-            let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|_| invalid())?;
-            if !(1..=16).contains(&certs.len()) {
-                return Err(invalid());
-            }
-            for cert in certs {
-                roots.add(cert).map_err(|_| invalid())?;
-            }
-        }
-    }
-    Ok(roots)
 }
 
 fn reserved_header(name: &HeaderName) -> bool {
@@ -414,17 +359,15 @@ fn build_headers(
     Ok(out)
 }
 
-pub(crate) trait WsIo: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T> WsIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
-pub(crate) type WsStream = WebSocketStream<Pin<Box<dyn WsIo>>>;
+pub(crate) type WsStream = WebSocketStream<NetStream>;
 
 /// A validated client with credentials resolved into redacted header values.
 #[derive(Clone)]
 pub struct BoundClient {
     pub(crate) config: WebSocketClientConfig,
-    target: Target,
+    target: Endpoint,
     headers: Arc<Vec<(HeaderName, HeaderValue)>>,
-    tls: Option<(tokio_rustls::TlsConnector, ServerName<'static>)>,
+    tls: Option<TlsClient>,
 }
 
 impl std::fmt::Debug for BoundClient {
@@ -438,54 +381,11 @@ impl std::fmt::Debug for BoundClient {
     }
 }
 
-/// Why one connect attempt failed (counted, then retried with backoff).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ConnectFailure {
-    Tcp,
-    Tls,
-    Handshake,
-    /// The server answered the upgrade with this HTTP status.
-    Rejected(u16),
-    Timeout,
-}
-
-impl ConnectFailure {
-    pub(crate) fn reason(self) -> String {
-        match self {
-            Self::Tcp => "WebSocket TCP connect failed".into(),
-            Self::Tls => {
-                "WebSocket TLS handshake failed (certificate verification is mandatory)".into()
-            }
-            Self::Handshake => {
-                "WebSocket upgrade handshake failed (protocol/subprotocol mismatch)".into()
-            }
-            Self::Rejected(status) => format!("WebSocket upgrade rejected with HTTP {status}"),
-            Self::Timeout => "WebSocket connect timed out".into(),
-        }
-    }
-}
-
 impl BoundClient {
     /// One bounded connect attempt: TCP, TLS (wss), HTTP upgrade.
     pub(crate) async fn connect(&self) -> std::result::Result<WsStream, ConnectFailure> {
         let timeout = self.config.connect_timeout;
-        let tcp = tokio::time::timeout(
-            timeout,
-            TcpStream::connect((self.target.host.as_str(), self.target.port)),
-        )
-        .await
-        .map_err(|_| ConnectFailure::Timeout)?
-        .map_err(|_| ConnectFailure::Tcp)?;
-        let _ = tcp.set_nodelay(true);
-        let io: Pin<Box<dyn WsIo>> = match &self.tls {
-            None => Box::pin(tcp),
-            Some((connector, name)) => Box::pin(
-                tokio::time::timeout(timeout, connector.connect(name.clone(), tcp))
-                    .await
-                    .map_err(|_| ConnectFailure::Timeout)?
-                    .map_err(|_| ConnectFailure::Tls)?,
-            ),
-        };
+        let io = connect_stream(&self.target, self.tls.as_ref(), timeout, None).await?;
         let mut request = self
             .config
             .url
@@ -520,20 +420,6 @@ impl BoundClient {
         })?;
         Ok(ws)
     }
-}
-
-/// Exponential from 100 ms, capped at `max`, with "equal" jitter in
-/// `[delay/2, delay]` so a fleet of clients does not reconnect in lockstep.
-pub fn reconnect_delay(attempt: usize, max: Duration) -> Duration {
-    let exp = attempt.saturating_sub(1).min(16) as u32;
-    let delay = INITIAL_RECONNECT_DELAY
-        .saturating_mul(1u32 << exp)
-        .min(max)
-        .max(Duration::from_millis(1));
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_usize(attempt);
-    let half = delay.as_nanos() as u64 / 2;
-    Duration::from_nanos(half + hasher.finish() % (half + 1))
 }
 
 #[cfg(test)]
@@ -669,18 +555,5 @@ mod tests {
         );
         ca.tls_ca_pem = Some(String::from_utf8(super::super::tls_fixture::CA.to_vec()).unwrap());
         ca.validate(&p).unwrap();
-    }
-
-    #[test]
-    fn websocket_reconnect_delay_is_capped_and_jittered() {
-        let max = Duration::from_millis(800);
-        for attempt in 1..=40 {
-            let d = reconnect_delay(attempt, max);
-            let full = Duration::from_millis(100 * (1u64 << (attempt - 1).min(16))).min(max);
-            assert!(d >= full / 2 && d <= full, "attempt {attempt}: {d:?}");
-        }
-        let spread: std::collections::HashSet<_> =
-            (0..32).map(|_| reconnect_delay(6, max)).collect();
-        assert!(spread.len() > 1, "jitter must vary the delay");
     }
 }

@@ -88,6 +88,9 @@ pub struct SourceSpec {
     /// Required exclusively for `kind = "websocket"` (client mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket: Option<WebSocketSourceSpec>,
+    /// Required exclusively for `kind = "tcp"` (client mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<TcpSourceSpec>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -148,12 +151,21 @@ pub const CSV_SOURCE_KINDS: &[&str] = &[
     "nats",
     "jetstream",
     "websocket",
+    "tcp",
     "file",
     "file_replay",
     "replay",
 ];
 /// Sink kinds whose bytes carry a selectable record format.
-pub const CSV_SINK_KINDS: &[&str] = &["mqtt", "http", "nats", "jetstream", "websocket", "file"];
+pub const CSV_SINK_KINDS: &[&str] = &[
+    "mqtt",
+    "http",
+    "nats",
+    "jetstream",
+    "websocket",
+    "tcp",
+    "file",
+];
 
 fn payload_format(
     side: &str,
@@ -850,6 +862,232 @@ impl WebSocketSinkSpec {
     }
 }
 
+/// TCP record framing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpFramingSpec {
+    /// `\n`-terminated records (`\r\n` accepted).
+    #[default]
+    Lines,
+    /// Big-endian length prefix (`length_bytes` 2 or 4), then the record.
+    LengthPrefixed,
+}
+
+/// What a TCP Source does with a record over `max_frame_bytes`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpOversizeSpec {
+    #[default]
+    Resync,
+    Disconnect,
+}
+
+/// What a TCP Sink does when its send queue is full.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpOverflowSpec {
+    #[default]
+    Block,
+    DropNewest,
+}
+
+/// TCP client Source, live and at-most-once. Optional TLS (`tls: true`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpSourceSpec {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub tls: bool,
+    /// PEM CA bundle replacing the built-in roots (private CA / self-signed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    /// TCP keepalive idle time; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_max_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub framing: TcpFramingSpec,
+    /// Length prefix width for `length_prefixed`: 2 or 4 (default 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_bytes: Option<u8>,
+    /// Largest record (default and maximum 65536).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_frame_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub oversize: TcpOversizeSpec,
+    /// No bytes for this long = dead peer (default 60000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+    /// Decoded-row Queue credit for the inbox; default 256 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_bytes: Option<usize>,
+}
+
+/// TCP client Sink: one framed record per row, live and at-most-once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpSinkSpec {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub tls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_max_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub framing: TcpFramingSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_bytes: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_frame_bytes: Option<usize>,
+    /// Bounded send queue in frames (default 16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_capacity: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub overflow: TcpOverflowSpec,
+    /// Bound on writing one frame, partial writes included (default 5000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_timeout_ms: Option<u64>,
+    /// Shutdown budget for queued rows (default 2000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tcp_client(
+    host: &str,
+    port: u16,
+    tls: bool,
+    tls_ca_pem: &Option<String>,
+    connect_timeout_ms: Option<u64>,
+    keepalive_ms: Option<u64>,
+    reconnect_max_ms: Option<u64>,
+    reconnect_attempts: Option<usize>,
+    framing: TcpFramingSpec,
+    length_bytes: Option<u8>,
+    max_frame_bytes: Option<usize>,
+) -> sparrow_connectors::tcp::TcpClientConfig {
+    use sparrow_connectors::tcp::{PrefixWidth, TcpFraming};
+    use std::time::Duration;
+    let mut c = sparrow_connectors::tcp::TcpClientConfig::new(host, port);
+    c.tls = tls;
+    c.tls_ca_pem = tls_ca_pem.clone();
+    if let Some(ms) = connect_timeout_ms {
+        c.connect_timeout = Duration::from_millis(ms);
+    }
+    c.keepalive = keepalive_ms.map(Duration::from_millis);
+    if let Some(ms) = reconnect_max_ms {
+        c.reconnect_max = Duration::from_millis(ms);
+    }
+    if let Some(n) = reconnect_attempts {
+        c.reconnect_attempts = n;
+    }
+    c.framing = match framing {
+        TcpFramingSpec::Lines => TcpFraming::Lines,
+        TcpFramingSpec::LengthPrefixed => TcpFraming::LengthPrefixed,
+    };
+    // Other widths are refused by `check_tcp`.
+    c.prefix_width = match length_bytes {
+        Some(2) => PrefixWidth::U16,
+        _ => PrefixWidth::U32,
+    };
+    if let Some(n) = max_frame_bytes {
+        c.max_frame_bytes = n;
+    }
+    c
+}
+
+impl TcpSourceSpec {
+    pub fn client_config(&self) -> sparrow_connectors::tcp::TcpClientConfig {
+        tcp_client(
+            &self.host,
+            self.port,
+            self.tls,
+            &self.tls_ca_pem,
+            self.connect_timeout_ms,
+            self.keepalive_ms,
+            self.reconnect_max_ms,
+            self.reconnect_attempts,
+            self.framing,
+            self.length_bytes,
+            self.max_frame_bytes,
+        )
+    }
+
+    pub fn connector_config(
+        &self,
+        schema: sparrow_model::Schema,
+        inbox_capacity: usize,
+        fail_on_decode: bool,
+    ) -> sparrow_connectors::TcpSourceConfig {
+        use sparrow_connectors::tcp::OversizePolicy;
+        let mut c = sparrow_connectors::TcpSourceConfig::new(self.host.clone(), self.port, schema);
+        c.client = self.client_config();
+        c.oversize = match self.oversize {
+            TcpOversizeSpec::Resync => OversizePolicy::Resync,
+            TcpOversizeSpec::Disconnect => OversizePolicy::Disconnect,
+        };
+        if let Some(ms) = self.idle_timeout_ms {
+            c.idle_timeout = std::time::Duration::from_millis(ms);
+        }
+        if let Some(n) = self.inbox_bytes {
+            c.inbox_bytes = n;
+        }
+        c.inbox_capacity = inbox_capacity;
+        c.fail_on_decode = fail_on_decode;
+        c
+    }
+}
+
+impl TcpSinkSpec {
+    pub fn connector_config(&self, outbox_capacity: usize) -> sparrow_connectors::TcpSinkConfig {
+        use sparrow_connectors::tcp::TcpOverflow;
+        use std::time::Duration;
+        let mut c = sparrow_connectors::TcpSinkConfig::new(self.host.clone(), self.port);
+        c.client = tcp_client(
+            &self.host,
+            self.port,
+            self.tls,
+            &self.tls_ca_pem,
+            self.connect_timeout_ms,
+            self.keepalive_ms,
+            self.reconnect_max_ms,
+            self.reconnect_attempts,
+            self.framing,
+            self.length_bytes,
+            self.max_frame_bytes,
+        );
+        c.overflow = match self.overflow {
+            TcpOverflowSpec::Block => TcpOverflow::Block,
+            TcpOverflowSpec::DropNewest => TcpOverflow::DropNewest,
+        };
+        if let Some(n) = self.queue_capacity {
+            c.queue_capacity = n;
+        }
+        if let Some(ms) = self.send_timeout_ms {
+            c.send_timeout = Duration::from_millis(ms);
+        }
+        if let Some(ms) = self.flush_timeout_ms {
+            c.flush_timeout = Duration::from_millis(ms);
+        }
+        c.outbox_capacity = outbox_capacity;
+        c
+    }
+}
+
 /// HTTP Poll Source options. Credentials are named secret references only;
 /// the stored revision never contains a credential value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -980,6 +1218,9 @@ pub struct SinkSpec {
     /// Required exclusively for `kind = "websocket"` (client mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket: Option<WebSocketSinkSpec>,
+    /// Required exclusively for `kind = "tcp"` (client mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<TcpSinkSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1385,6 +1626,7 @@ impl PipelineSpec {
         self.check_jetstream_sink()?;
         self.check_databus()?;
         self.check_websocket()?;
+        self.check_tcp()?;
         if self
             .source
             .jetstream
@@ -1726,6 +1968,62 @@ impl PipelineSpec {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
                 "WebSocket is live_best_effort/restart_fresh, at-most-once (no ack, no replay); no checkpoint or restore",
+            ));
+        }
+        Ok(())
+    }
+
+    /// TCP (client mode) is live, at-most-once: no replay point, so durable
+    /// claims are refused; connector fields must not be mixed.
+    fn check_tcp(&self) -> Result<()> {
+        if self.source.tcp.is_some() != (self.source.kind == "tcp")
+            || self.sink.tcp.is_some() != (self.sink.kind == "tcp")
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "source.tcp / sink.tcp are required exclusively for kind=tcp",
+            ));
+        }
+        let source = self.source.tcp.as_ref();
+        let sink = self.sink.tcp.as_ref();
+        if source.is_none() && sink.is_none() {
+            return Ok(());
+        }
+        if source.is_some() && self.source_has_foreign_fields() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "TCP options (host, port, tls) belong in source.tcp; mixed connector fields refused",
+            ));
+        }
+        if sink.is_some() && self.sink_has_foreign_fields() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "TCP options (host, port, tls) belong in sink.tcp (one record per row, no actions); mixed connector fields refused",
+            ));
+        }
+        let widths = [
+            source.map(|s| (s.framing, s.length_bytes)),
+            sink.map(|s| (s.framing, s.length_bytes)),
+        ];
+        for (framing, length_bytes) in widths.into_iter().flatten() {
+            if let Some(n) = length_bytes {
+                if framing != TcpFramingSpec::LengthPrefixed || !(n == 2 || n == 4) {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        "TCP length_bytes is 2 or 4 and only applies to framing=length_prefixed",
+                    ));
+                }
+            }
+        }
+        if self.delivery != "live_best_effort"
+            || self.recovery != "restart_fresh"
+            || self.restore.is_some()
+            || self.checkpoint.is_some()
+            || self.checkpoint_dir.is_some()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "TCP is live_best_effort/restart_fresh, at-most-once (no ack, no replay); no checkpoint or restore",
             ));
         }
         Ok(())

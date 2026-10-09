@@ -1030,6 +1030,25 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "semantics":"live_best_effort_at_most_once_no_application_ack",
             "scope":"this_attempt; sent=written_to_socket_not_peer_receipt"});
     }
+    if s.source_kind == "tcp" {
+        value["tcp_source"] = json!({"received":io.tcp_source_received,"rows":io.tcp_source_rows,"bytes_read":io.tcp_source_bytes_read,
+            "dropped_bad":io.tcp_source_dropped_bad,"dropped_oversize":io.tcp_source_dropped_oversize,"dropped_partial":io.tcp_source_dropped_partial,
+            "dropped_budget":io.tcp_source_dropped_budget,"backpressure_waits":io.tcp_source_backpressure_waits,"connects":io.tcp_source_connects,
+            "reconnects":io.tcp_source_reconnects,"disconnects":io.tcp_source_disconnects,"connect_failures":io.tcp_source_connect_failures,
+            "idle_timeouts":io.tcp_source_idle_timeouts,"inbox_items":io.tcp_source_inbox_items,"inbox_bytes":io.tcp_source_inbox_bytes,
+            "semantics":"live_best_effort_at_most_once_no_replay_no_ack",
+            "scope":"this_attempt; dropped_partial=unterminated_record_at_disconnect"});
+    }
+    if s.sink_kind == "tcp" {
+        value["tcp_sink"] = json!({"sent":io.tcp_sink_sent,"bytes_written":io.tcp_sink_bytes_written,"dropped_bad":io.tcp_sink_dropped_bad,
+            "dropped_oversize":io.tcp_sink_dropped_oversize,"dropped_overflow":io.tcp_sink_dropped_overflow,"backpressure_waits":io.tcp_sink_backpressure_waits,
+            "send_failed":io.tcp_sink_send_failed,"send_timeouts":io.tcp_sink_send_timeouts,"discarded_on_close":io.tcp_sink_discarded_on_close,
+            "connects":io.tcp_sink_connects,"reconnects":io.tcp_sink_reconnects,"disconnects":io.tcp_sink_disconnects,
+            "connect_failures":io.tcp_sink_connect_failures,"ignored_bytes":io.tcp_sink_ignored_bytes,"closes":io.tcp_sink_closes,
+            "close_failed":io.tcp_sink_close_failed,"fatal":io.tcp_sink_fatal,"queue_items":io.tcp_sink_queue_items,
+            "semantics":"live_best_effort_at_most_once_no_application_ack",
+            "scope":"this_attempt; sent=frame_written_to_socket_not_peer_receipt"});
+    }
     if s.sink_kind == "jetstream" {
         value["jetstream_sink"] = json!({"acked":io.jetstream_sink_acked,
             "duplicates":io.jetstream_sink_duplicates,"retries":io.jetstream_sink_retries,
@@ -1419,6 +1438,54 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "websocket_source_inbox_bytes",
             io.websocket_source_inbox_bytes,
         ),
+        ("tcp_source_received", io.tcp_source_received),
+        ("tcp_source_rows", io.tcp_source_rows),
+        ("tcp_source_bytes_read", io.tcp_source_bytes_read),
+        ("tcp_source_dropped_bad", io.tcp_source_dropped_bad),
+        (
+            "tcp_source_dropped_oversize",
+            io.tcp_source_dropped_oversize,
+        ),
+        ("tcp_source_dropped_partial", io.tcp_source_dropped_partial),
+        ("tcp_source_dropped_budget", io.tcp_source_dropped_budget),
+        (
+            "tcp_source_backpressure_waits",
+            io.tcp_source_backpressure_waits,
+        ),
+        ("tcp_source_connects", io.tcp_source_connects),
+        ("tcp_source_reconnects", io.tcp_source_reconnects),
+        ("tcp_source_disconnects", io.tcp_source_disconnects),
+        (
+            "tcp_source_connect_failures",
+            io.tcp_source_connect_failures,
+        ),
+        ("tcp_source_idle_timeouts", io.tcp_source_idle_timeouts),
+        ("tcp_sink_sent", io.tcp_sink_sent),
+        ("tcp_sink_bytes_written", io.tcp_sink_bytes_written),
+        ("tcp_sink_dropped_bad", io.tcp_sink_dropped_bad),
+        ("tcp_sink_dropped_oversize", io.tcp_sink_dropped_oversize),
+        ("tcp_sink_dropped_overflow", io.tcp_sink_dropped_overflow),
+        (
+            "tcp_sink_backpressure_waits",
+            io.tcp_sink_backpressure_waits,
+        ),
+        ("tcp_sink_send_failed", io.tcp_sink_send_failed),
+        ("tcp_sink_send_timeouts", io.tcp_sink_send_timeouts),
+        (
+            "tcp_sink_discarded_on_close",
+            io.tcp_sink_discarded_on_close,
+        ),
+        ("tcp_sink_connects", io.tcp_sink_connects),
+        ("tcp_sink_reconnects", io.tcp_sink_reconnects),
+        ("tcp_sink_disconnects", io.tcp_sink_disconnects),
+        ("tcp_sink_connect_failures", io.tcp_sink_connect_failures),
+        ("tcp_sink_ignored_bytes", io.tcp_sink_ignored_bytes),
+        ("tcp_sink_closes", io.tcp_sink_closes),
+        ("tcp_sink_close_failed", io.tcp_sink_close_failed),
+        ("tcp_sink_fatal", io.tcp_sink_fatal),
+        ("tcp_sink_queue_items", io.tcp_sink_queue_items),
+        ("tcp_source_inbox_items", io.tcp_source_inbox_items),
+        ("tcp_source_inbox_bytes", io.tcp_source_inbox_bytes),
     ] {
         io_fields[name] = json!(value);
     }

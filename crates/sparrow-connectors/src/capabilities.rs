@@ -116,6 +116,24 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// TCP client Source (`lines` / `length_prefixed`): live, no ack, no
+    /// replay.
+    pub const TCP_SOURCE: Self = Self {
+        kind: "tcp",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// TCP client Sink. A sent frame is written to the socket; there is no
+    /// application receipt.
+    pub const TCP_SINK: Self = Self {
+        kind: "tcp_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     pub const MQTT_SINK: Self = Self {
         kind: "mqtt_sink",
         replay: ReplaySupport::Unsupported,
