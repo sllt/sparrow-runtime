@@ -34,6 +34,9 @@ pub struct HttpPushSourceConfig {
     pub json_limits: JsonLimits,
     pub read_timeout: Duration,
     pub max_concurrent: usize,
+    /// Request body format: one JSON object, or one CSV record (optionally
+    /// preceded by its header line).
+    pub payload_format: sparrow_formats::PayloadFormat,
 }
 
 impl HttpPushSourceConfig {
@@ -51,6 +54,7 @@ impl HttpPushSourceConfig {
             json_limits: JsonLimits::default(),
             read_timeout: DEFAULT_READ_TIMEOUT,
             max_concurrent: MAX_CONCURRENT,
+            payload_format: Default::default(),
         }
     }
 
@@ -103,6 +107,7 @@ impl HttpPushSource {
             limits: config.json_limits,
             policy: sparrow_formats::BadRecordPolicy::Drop,
             owner: None,
+            format: config.payload_format.clone(),
         };
         Ok(Self {
             config,
@@ -288,7 +293,7 @@ async fn handle_push(
     let received_at=std::time::Instant::now();
     diag.observation.progress(true,1);
     let frame = SourceFrame::new(body, 0);
-    let decoded=codec.decode_frame(&frame);
+    let decoded=codec.decode_frame_with(&frame, |e| diag.csv_decode_error(&codec.format, e));
     diag.observation.record(Latency::Decode,received_at.elapsed());
     match decoded {
         Ok(Some(row)) => match tx.try_send_with_origin(row,OriginSpan::at(received_at)) {
@@ -305,7 +310,12 @@ async fn handle_push(
         },
         Ok(None) | Err(_) => {
             diag.http_dropped.fetch_add(1, Ordering::Relaxed);
-            let _ = write_status(stream, 422, b"bad json").await;
+            let reason: &[u8] = if codec.format.as_csv().is_some() {
+                b"bad csv"
+            } else {
+                b"bad json"
+            };
+            let _ = write_status(stream, 422, reason).await;
         }
     }
     Ok(())
@@ -344,6 +354,7 @@ mod tests {
             json_limits: JsonLimits::default(),
             read_timeout: Duration::from_millis(200),
             max_concurrent: 4,
+            payload_format: Default::default(),
         };
         let secrets = MapSecretResolver::default();
         let policy = TargetPolicy::deny_all();
@@ -393,6 +404,7 @@ mod tests {
             json_limits: JsonLimits::default(),
             read_timeout: Duration::from_millis(200),
             max_concurrent: 4,
+            payload_format: Default::default(),
         };
         let secrets = MapSecretResolver::default();
         let policy = TargetPolicy::deny_all();

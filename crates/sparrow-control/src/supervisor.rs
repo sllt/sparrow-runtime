@@ -138,6 +138,15 @@ async fn request_checkpoint(
         ));
     }
     let admission = control.begin(trigger)?;
+    request_checkpoint_with_admission(cmd, control, cancel, admission).await
+}
+
+async fn request_checkpoint_with_admission(
+    cmd: &tokio::sync::mpsc::Sender<AlignedCmd>,
+    control: &Arc<CheckpointControl>,
+    cancel: &CancellationToken,
+    admission: CheckpointAdmission,
+) -> Result<u64> {
     let deadline = admission.deadline;
     let (reply, wait) = tokio::sync::oneshot::channel();
     cmd.try_send(AlignedCmd::Checkpoint { reply, admission })
@@ -1588,6 +1597,7 @@ impl Supervisor {
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.contract = contract;
         cfg.fail_on_decode = fail_on_decode;
+        cfg.format = spec.source.payload_format()?;
         let src = self
             .store
             .run_blocking(move || {
@@ -1709,6 +1719,7 @@ impl Supervisor {
         cfg.recovery = RecoveryPolicy::Aligned;
         cfg.restore = spec.restore_claim()?;
         cfg.fail_on_decode = fail_on_decode;
+        cfg.format = spec.source.payload_format()?;
         // Aligned growing files default to AppendOnly (N5): EOF polls, no
         // terminal MAX watermark. Finite fixtures set source.file_contract=sealed.
         let contract = crate::validate::resolve_file_contract(spec, RecoveryPolicy::Aligned)?;
@@ -1886,7 +1897,7 @@ impl Supervisor {
             .with_aligned(AlignedJob {
                 restore: None,
                 pipeline: Some(PipelineRestore {
-                    // v27 independently verifies the saved full semantics at
+                    // v27/v28 independently verify the saved full semantics at
                     // Kernel admission, rather than comparing live to itself.
                     plan: if sink_identity.is_some() { saved_plan } else { layout.clone() },
                     generation:state_generation,restore:restore_freeze,iot:restore_iot,
@@ -1932,6 +1943,7 @@ impl Supervisor {
         let source_task = self.kernel.handle().spawn(async move {
             let _lifecycle=diag_src.observation.lifecycle(true);
             diag_src.observation.health(true,HealthState::Ready,"file_open",None);
+            source.set_diagnostics(diag_src.clone());
             let mut terminal_sent = false;
             let mut next_file_poll = None;
             // Independent polling is important: publishing a file batch may
@@ -2376,6 +2388,42 @@ impl Supervisor {
             }
         };
         request_checkpoint(&cmd, &control, &cancel, "manual").await
+    }
+
+    /// Exercise a real coordinator timeout without shortening the running
+    /// attempt's policy (including its subsequent checkpoint requests).
+    #[cfg(all(test, feature = "demo-io"))]
+    pub(crate) async fn checkpoint_named_with_timeout_for_test(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<u64> {
+        let (cmd, control, cancel) = {
+            let jobs = self.running.lock().await;
+            match jobs.get(name).map(|job| &job.kind) {
+                Some(RunningKind::Aligned {
+                    cmd,
+                    checkpoint,
+                    cancel,
+                    ..
+                }) => (cmd.clone(), checkpoint.clone(), cancel.clone()),
+                _ => {
+                    return Err(SparrowError::new(
+                        sparrow_model::ErrorCode::InvalidArgument,
+                        format!("pipeline `{name}` is not a running aligned job"),
+                    ));
+                }
+            }
+        };
+        if cancel.is_cancelled() {
+            return Err(SparrowError::new(
+                sparrow_model::ErrorCode::Cancelled,
+                "job stopping",
+            ));
+        }
+        let mut admission = control.begin("manual")?;
+        admission.deadline = tokio::time::Instant::now() + timeout;
+        request_checkpoint_with_admission(&cmd, &control, &cancel, admission).await
     }
 
     pub async fn kill_named(self: &Arc<Self>, name: &str) -> Result<()> {

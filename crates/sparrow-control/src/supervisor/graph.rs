@@ -367,6 +367,7 @@ impl Supervisor {
                     config.contract = contract;
                     config.fail_on_decode = spec.effective_fail_on_decode();
                     config.recovery = RecoveryPolicy::parse(&spec.recovery)?;
+                    config.format = source_spec.payload_format()?;
                     let position = restored_positions.remove(id);
                     let source = self
                         .store
@@ -745,6 +746,7 @@ async fn file_actor(
     let _lifecycle = diag.observation.lifecycle(true);
     diag.observation
         .health(true, HealthState::Ready, "file_open", None);
+    source.set_diagnostics(diag.clone());
     let mut terminal = false;
     let mut next_poll = None;
     loop {

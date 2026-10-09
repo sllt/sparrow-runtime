@@ -256,6 +256,7 @@ async fn k2_reader_refuses_expiring_or_evicting_ownership_and_runtime_policy_cha
                 pending_bytes: 262144,
                 pull_messages: 4,
                 pull_bytes: 73728,
+                payload_format: Default::default(),
             },
             owner.clone(),
             [7; 32],
@@ -558,6 +559,7 @@ async fn k2_reader_buffer_survives_control_cancellation_and_long_mailbox_stall()
         pending_bytes: 256 * 1024,
         pull_messages: 4,
         pull_bytes: 72 * 1024,
+        payload_format: Default::default(),
     };
     let mut reader = Reader::open(
         connection,
@@ -682,6 +684,7 @@ async fn k2_headers_and_retained_sdk_bytes_keep_credit_after_reader_close() {
         pending_bytes: 256 * 1024,
         pull_messages: 4,
         pull_bytes: 72 * 1024,
+        payload_format: Default::default(),
     };
     let mut reader = Reader::open(connection, config, owner.clone(), [4; 32], [4; 16], None)
         .await
@@ -717,5 +720,214 @@ async fn k2_headers_and_retained_sdk_bytes_keep_credit_after_reader_close() {
         sparrow_model::Scalar::Int64(1)
     );
     drop(record);
+    assert_eq!(owner.usage().physical_bytes, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; payload format bound into the cut"]
+async fn k2_restore_refuses_changed_payload_format_or_csv_options() {
+    use sparrow_formats::{CsvOptions, CsvRole, PayloadFormat};
+    let broker = Broker::start().await;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let connection = broker.connect(&owner).await;
+    let js = async_nats::jetstream::new(connection.client.clone());
+    js.create_stream(stream_config("INPUT")).await.unwrap();
+    js.create_key_value(async_nats::jetstream::kv::Config {
+        bucket: "OWNERS".into(),
+        history: 1,
+        max_bytes: 1024 * 1024,
+        max_value_size: 1024,
+        storage: stream::StorageType::File,
+        num_replicas: 1,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    for n in 1..=4 {
+        js.publish("INPUT.rows", format!("id,v\na,{n}\n").into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    drop(js);
+    connection.close().await.unwrap();
+    let csv = |options: CsvOptions| PayloadFormat::csv(options.compile(CsvRole::Decode).unwrap());
+    let config = |consumer: &str, payload_format: PayloadFormat| ReaderConfig {
+        namespace: "test_account".into(),
+        stream: "INPUT".into(),
+        consumer: consumer.into(),
+        ownership_bucket: "OWNERS".into(),
+        max_pending: 8,
+        pending_bytes: 256 * 1024,
+        pull_messages: 4,
+        pull_bytes: 72 * 1024,
+        payload_format,
+    };
+    let schema = Arc::new(
+        sparrow_model::Schema::new(
+            1,
+            vec![
+                sparrow_model::Field::new(1, "id", sparrow_model::DataType::Utf8, false),
+                sparrow_model::Field::new(2, "v", sparrow_model::DataType::Int64, false),
+            ],
+        )
+        .unwrap(),
+    );
+    // Read `upto` records with `cfg`, publish them and return the cut.
+    async fn cut_after(
+        broker: &Broker,
+        owner: &Arc<MemoryOwner>,
+        cfg: ReaderConfig,
+        schema: &Arc<sparrow_model::Schema>,
+        upto: u64,
+    ) -> sparrow_io::SourcePosition {
+        let csv = cfg.payload_format.as_csv().is_some();
+        let mut reader = Reader::open(
+            broker.connect(owner).await,
+            cfg,
+            owner.clone(),
+            [7; 32],
+            [1; 16],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(reader.prepare_pull().await.unwrap());
+        for n in 1..=upto {
+            let ReaderPoll::Record(record) = reader.next().await.unwrap() else {
+                panic!("record {n}")
+            };
+            assert_eq!(record.sequence(), n);
+            if csv {
+                let batch = record.decode(schema, owner, 4096).unwrap();
+                assert_eq!(
+                    batch.rows()[0].values[1],
+                    sparrow_model::Scalar::Int64(n as i64)
+                );
+            }
+            drop(record);
+            reader.published(n).unwrap();
+        }
+        let cut = reader.position(upto);
+        reader.close().await.unwrap();
+        cut
+    }
+    async fn reopen(
+        broker: &Broker,
+        owner: &Arc<MemoryOwner>,
+        cfg: ReaderConfig,
+        cut: &sparrow_io::SourcePosition,
+        nonce: u8,
+    ) -> sparrow_model::Result<Reader> {
+        Reader::open(
+            broker.connect(owner).await,
+            cfg,
+            owner.clone(),
+            [7; 32],
+            [nonce; 16],
+            Some(cut),
+        )
+        .await
+    }
+
+    // JSON cut -> CSV reader: refused. JSON keeps its historical identity.
+    let json_cut = cut_after(
+        &broker,
+        &owner,
+        config("json", PayloadFormat::Json),
+        &schema,
+        1,
+    )
+    .await;
+    assert_eq!(json_cut.identity.fingerprint, 0, "JSON identity unchanged");
+    let refused = reopen(
+        &broker,
+        &owner,
+        config("json", csv(Default::default())),
+        &json_cut,
+        2,
+    )
+    .await
+    .err()
+    .expect("JSON cut must not restore as CSV");
+    assert_eq!(refused.code, sparrow_model::ErrorCode::UnsupportedRestore);
+    assert!(
+        refused.message.contains("payload format"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(owner.usage().physical_bytes, 0);
+
+    // CSV cut -> JSON reader or other CSV options: refused.
+    let cut = cut_after(
+        &broker,
+        &owner,
+        config("csv", csv(Default::default())),
+        &schema,
+        2,
+    )
+    .await;
+    assert_ne!(cut.identity.fingerprint, 0);
+    for (nonce, other) in [
+        (3, PayloadFormat::Json),
+        (
+            4,
+            csv(CsvOptions {
+                trim: true,
+                ..Default::default()
+            }),
+        ),
+        (
+            5,
+            csv(CsvOptions {
+                null_value: "NULL".into(),
+                ..Default::default()
+            }),
+        ),
+        (
+            6,
+            csv(CsvOptions {
+                max_record_bytes: Some(1024),
+                ..Default::default()
+            }),
+        ),
+    ] {
+        let refused = reopen(&broker, &owner, config("csv", other.clone()), &cut, nonce)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{other:?} must be refused"));
+        assert_eq!(refused.code, sparrow_model::ErrorCode::UnsupportedRestore);
+        assert!(
+            refused.message.contains("payload format"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    // The same options, spelled with explicit defaults, restore exactly after
+    // the cut.
+    let explicit = csv(CsvOptions {
+        max_record_bytes: Some(65536),
+        max_fields: Some(256),
+        ..Default::default()
+    });
+    let mut restored = reopen(&broker, &owner, config("csv", explicit), &cut, 7)
+        .await
+        .unwrap();
+    assert!(restored.prepare_pull().await.unwrap());
+    for n in 3..=4 {
+        let ReaderPoll::Record(record) = restored.next().await.unwrap() else {
+            panic!("suffix record {n}")
+        };
+        assert_eq!(record.sequence(), n);
+        let batch = record.decode(&schema, &owner, 4096).unwrap();
+        assert_eq!(
+            batch.rows()[0].values[1],
+            sparrow_model::Scalar::Int64(n as i64)
+        );
+    }
+    restored.close().await.unwrap();
     assert_eq!(owner.usage().physical_bytes, 0);
 }

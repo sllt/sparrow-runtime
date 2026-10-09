@@ -27,6 +27,17 @@ impl StreamIdentity {
         self
     }
     pub fn position(&self, sequence: u64, records: u64) -> sparrow_io::SourcePosition {
+        self.position_bound(sequence, records, 0)
+    }
+    /// [`Self::position`] with the payload format bound into the identity
+    /// fingerprint (see [`format_fingerprint`]; 0 for JSON, so existing JSON
+    /// cuts are unchanged).
+    pub fn position_bound(
+        &self,
+        sequence: u64,
+        records: u64,
+        format: u64,
+    ) -> sparrow_io::SourcePosition {
         sparrow_io::SourcePosition {
             offset_bytes: sequence,
             record_index: records,
@@ -40,22 +51,49 @@ impl StreamIdentity {
                     None => format!("{}:{}:{}", self.namespace, self.stream, self.created_nanos),
                 },
                 size: 0,
-                fingerprint: 0,
+                fingerprint: format,
             },
         }
     }
     pub fn check_position(&self, position: &sparrow_io::SourcePosition) -> Result<()> {
-        if self
-            .position(position.offset_bytes, position.record_index)
-            .identity
-            != position.identity
+        self.check_position_bound(position, 0)
+    }
+    /// Strict in both directions: a JSON cut (fingerprint 0) is refused by a
+    /// CSV reader, a CSV cut by a JSON reader or one with other CSV options.
+    pub fn check_position_bound(
+        &self,
+        position: &sparrow_io::SourcePosition,
+        format: u64,
+    ) -> Result<()> {
+        let live = self
+            .position_bound(position.offset_bytes, position.record_index, format)
+            .identity;
+        if live.kind != position.identity.kind
+            || live.path != position.identity.path
+            || live.size != position.identity.size
         {
             return Err(error(
                 ErrorCode::UnsupportedRestore,
                 "JetStream account/stream generation differs from checkpoint",
             ));
         }
+        if live.fingerprint != position.identity.fingerprint {
+            return Err(error(
+                ErrorCode::UnsupportedRestore,
+                "JetStream checkpoint was taken with a different payload format / CSV options",
+            ));
+        }
         Ok(())
+    }
+}
+
+/// Checkpoint fingerprint of a payload format: 0 for JSON (the identity every
+/// existing JetStream cut carries), otherwise a non-zero hash of the
+/// canonical CSV decode options and effective limits.
+pub fn format_fingerprint(format: &sparrow_formats::PayloadFormat) -> u64 {
+    match format.identity_bytes() {
+        None => 0,
+        Some(bytes) => sparrow_io::fnv1a64(&bytes).max(1),
     }
 }
 

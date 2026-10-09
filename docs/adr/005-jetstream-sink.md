@@ -8,9 +8,11 @@ server PubAck. Retries are bounded, so duplicates are possible
 (at-least-once *into the stream*); an optional `msg_id_column` sets
 `Nats-Msg-Id` so the server deduplicates within the stream's
 `duplicate_window`. The sink never creates streams. It joins aligned
-checkpoints only in the independent linear File **v27** profile: the snapshot
-binds the exact `JSI1` target and full computation, and restores never adopt
-v3 or other source-only history. Aligned output requires File/Limits storage;
+checkpoints only in the independent linear File **JSON/v27** or **CSV/v28**
+profile: `JSI1` binds the JSON target, while `JSI2` also binds the effective CSV
+delimiter, quote, header and NULL spelling. Both preserve full computation;
+restores never reinterpret v3/source-only or another encoding's history.
+Aligned output requires File/Limits storage;
 other checkpoint profiles stay HTTP-only. Validation remains Preview, not a
 production or device-power-loss certification.
 
@@ -24,7 +26,7 @@ NATS Core Sink（见 [NATS.md](../NATS.md)）是 at-most-once：发布即交给�
 1. **确认点 = PubAck**。每行一条消息；`max_inflight_acks`（1..=256，默认 8）个消息
    同时等待 PubAck（SDK `max_ack_inflight` + 背压，以及 `buffer_unordered` 两层上限）。
    每次发布指定 `Nats-Expected-Stream`，并核对 PubAck 的 stream。
-   批次全部行拿到 PubAck 才回执 outbox（`InflightCounter::ack`）；v27 还必须
+   批次全部行拿到 PubAck 才回执 outbox（`InflightCounter::ack`）；v27/v28 还必须
    在全部 PubAck 后成功复验目标 incarnation/配置。
 2. **有界重试**。每次尝试的时限为 `2 × ack_timeout_ms`（send + PubAck），超时和
    传输类错误按 100 ms→2 s 退避重试至多 `max_retries` 次（≤20）。
@@ -47,16 +49,17 @@ NATS Core Sink（见 [NATS.md](../NATS.md)）是 at-most-once：发布即交给�
    stream 不存在是不可重试错误；临时请求失败在 `max_retries` 内重试。
    fresh PubAck-only 允许 Memory/其他 retention，但不承诺 broker 重启后保留；
    aligned 的 prepared probe 另外要求 `storage=File`、`retention=Limits`。
-7. **Aligned checkpoint：独立线性 File v27 profile**。不能借用旧 v3/CPL1 的下游
+7. **Aligned checkpoint：独立线性 File JSON v27 / CSV v28 profile**。不能借用旧 v3/CPL1 的下游
    prefix 兼容授权输出恢复。v27 外层保存 File cut、原参与者 manifest 与独立 `JSI1`：
    canonical endpoints、token SecretRef（不保存 secret 值）、stream 的精确 created nanos、
-   subject 和 msg-id 策略。恢复严格比较目标与**完整**计划，包括最后一个状态之后的
+   subject 和 msg-id 策略。CSV v28 的 `JSI2` 另保存四项生效编码选项：delimiter、quote、header、null_value；显式默认值与省略等价。
+   恢复严格比较目标、编码与**完整**计划，包括最后一个状态之后的
    Filter/Project、输出 schema 和 sink；任何变化都要求独立新历史，不自动 fork/迁移。
-   v1..v26 的旧 codec/兼容规则不改；v27 与它们拒绝混用目录，HTTP↔JetStream、
-   stream/subject/id 策略变化不能绕过校验。
+   v1..v26 的旧 codec/兼容规则不改；v27/v28 与它们及彼此拒绝混用目录，HTTP↔JetStream、
+   JSON↔CSV、任一 CSV 编码项、stream/subject/id 策略变化不能绕过校验。
 
    启动先在同一 SourceAdmission/MemoryOwner 上 probe 目标、取得 prepared session，
-   再验证历史、打开/seek File 和激活状态；probe/恢复失败不推进 CURRENT，也不启动
+   再验证历史、打开/seek File 和激活状态；probe/恢复失败不推进 CURRENT/STATE_GENERATION、不发布新行，也不启动
    Source。运行复用这个 session，不另开连接/owner；失败清理显式 await close，SDK
    回调持有生命周期 guard，退出未完成时 slot/SDK 信用不能提前释放。
 
@@ -77,7 +80,8 @@ NATS Core Sink（见 [NATS.md](../NATS.md)）是 at-most-once：发布即交给�
    超出同 job 预算则拒绝。默认 Sink 预留 1,441,792 B（payload=64 KiB）。
    编码前另取同 owner 的短期 scratch 信用：`row.resident_bytes × 8 + 字段名 resident 合计 × 4 + 8 KiB`，
    覆盖 wide/Bytes/Dynamic 的临时 serde Value 与编码；返回时释放，预算不足直接失败。
-   JSON writer 在缓冲增长前检查限额，包含 Expected-Stream 与 msg-id 的真实 header 字节。
+   CSV 按格式取 `row.resident_bytes × 2`（含 Dynamic 时 ×8）加每列 64 B 与 4 KiB 的 scratch；
+   JSON/CSV writer 均在缓冲增长前检查限额，包含 Expected-Stream 与 msg-id 的真实 header 字节。
    prepared identity/配置基线也记入同 owner，配置序列化上限 64 KiB。
    INFO 响应仍由 SDK 先解码，64 KiB 限制针对后续保留的配置基线；这些是保守信用额度，
    不是敌对 broker 或 SDK 临时分配的进程 RSS 硬上限。
@@ -93,7 +97,7 @@ NATS Core Sink（见 [NATS.md](../NATS.md)）是 at-most-once：发布即交给�
 
 ## 后果与限制
 
-- 只有 JSON、静态 subject；不支持 action、subject 模板、自定义 header。
+- 支持 JSON（默认）或 CSV-v1，一行一条消息，CSV 每条消息各带可选表头；只有静态 subject，不支持 action、subject 模板、自定义 header。
 - `delivery` 字段仍按 File profile 规则填写（`live_best_effort`）；可靠性来自
   `recovery: aligned` 与 PubAck，`check_delivery` 不为 File source 开放
   `checkpointed_at_least_once` 标签（后续可统一）。

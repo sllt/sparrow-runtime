@@ -128,6 +128,78 @@ pub struct SourceSpec {
     /// emit final ET windows and then complete.
     #[serde(default)]
     pub file_contract: Option<String>,
+    /// Payload/record format: `json` (default; NDJSON for File) or `csv`.
+    /// See docs/FORMATS.md for the per-kind matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// CSV options; accepted only with `format = "csv"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csv: Option<sparrow_formats::CsvOptions>,
+}
+
+/// Source kinds whose bytes carry a selectable record format.
+pub const CSV_SOURCE_KINDS: &[&str] = &[
+    "mqtt",
+    "http_push",
+    "http_poll",
+    "nats",
+    "jetstream",
+    "file",
+    "file_replay",
+    "replay",
+];
+/// Sink kinds whose bytes carry a selectable record format.
+pub const CSV_SINK_KINDS: &[&str] = &["mqtt", "http", "nats", "jetstream", "file"];
+
+fn payload_format(
+    side: &str,
+    kind: &str,
+    format: Option<&str>,
+    csv: Option<&sparrow_formats::CsvOptions>,
+    role: sparrow_formats::CsvRole,
+) -> Result<sparrow_formats::PayloadFormat> {
+    let invalid = |message: String| SparrowError::new(ErrorCode::InvalidArgument, message);
+    match format {
+        None | Some("json") => match csv {
+            Some(_) => Err(invalid(format!(
+                "{side}.csv requires {side}.format = \"csv\""
+            ))),
+            None => Ok(sparrow_formats::PayloadFormat::Json),
+        },
+        Some("csv") => {
+            let supported = match role {
+                sparrow_formats::CsvRole::Decode => CSV_SOURCE_KINDS,
+                sparrow_formats::CsvRole::Encode => CSV_SINK_KINDS,
+            };
+            if !supported.contains(&kind) {
+                return Err(SparrowError::new(
+                    ErrorCode::FeatureUnavailable,
+                    format!(
+                        "{side} kind `{kind}` has no CSV format ({})",
+                        supported.join("|")
+                    ),
+                ));
+            }
+            let options = csv.cloned().unwrap_or_default();
+            Ok(sparrow_formats::PayloadFormat::csv(options.compile(role)?))
+        }
+        Some(other) => Err(invalid(format!(
+            "{side}.format `{other}` is not supported (json|csv)"
+        ))),
+    }
+}
+
+impl SourceSpec {
+    /// The validated record format of this source (JSON unless `format=csv`).
+    pub fn payload_format(&self) -> Result<sparrow_formats::PayloadFormat> {
+        payload_format(
+            "source",
+            &self.kind,
+            self.format.as_deref(),
+            self.csv.as_ref(),
+            sparrow_formats::CsvRole::Decode,
+        )
+    }
 }
 
 /// K2 is opt-in and intentionally narrower than File aligned recovery. The
@@ -189,6 +261,8 @@ impl JetStreamSpec {
             pending_bytes: self.pending_bytes,
             pull_messages: self.pull_messages,
             pull_bytes: self.pull_bytes,
+            // The pipeline sets `source.format` on top (SourceSpec owns it).
+            payload_format: sparrow_formats::PayloadFormat::Json,
         }
     }
 }
@@ -669,6 +743,26 @@ pub struct SinkSpec {
     pub clean_session: bool,
     #[serde(default)]
     pub tls: bool,
+    /// Payload/record format: `json` (default; NDJSON for File) or `csv`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// CSV options; accepted only with `format = "csv"`. Decode-only options
+    /// (trim, multiline, columns, ...) are refused on a sink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csv: Option<sparrow_formats::CsvOptions>,
+}
+
+impl SinkSpec {
+    /// The validated record format of this sink (JSON unless `format=csv`).
+    pub fn payload_format(&self) -> Result<sparrow_formats::PayloadFormat> {
+        payload_format(
+            "sink",
+            &self.kind,
+            self.format.as_deref(),
+            self.csv.as_ref(),
+            sparrow_formats::CsvRole::Encode,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

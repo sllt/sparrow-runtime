@@ -193,6 +193,7 @@ impl Supervisor {
             config.contract = contract;
             config.recovery = RecoveryPolicy::Aligned;
             config.fail_on_decode = true;
+            config.format = source_spec.payload_format()?;
             let (schema_copy, owner_copy, row_limit) = (
                 schema.clone(),
                 owner.clone(),

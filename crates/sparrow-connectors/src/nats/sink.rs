@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sparrow_formats::{encode_json_batch_bounded_with_capacity, JsonLimits};
+use sparrow_formats::{JsonLimits, PayloadFormat};
 use sparrow_io::observed::Receiver as ObservedReceiver;
 use sparrow_model::observation::{HealthState, Latency};
 use sparrow_model::{CreditKind, ErrorCode, InflightCounter, RestoreClaim, Result, RowBatch};
@@ -36,6 +36,8 @@ pub struct NatsSinkConfig {
     /// Shutdown budget: publish batches already queued, then flush.
     pub flush_timeout: Duration,
     pub restore: RestoreClaim,
+    /// Message payload format: one JSON object (default) or one CSV record.
+    pub payload_format: PayloadFormat,
 }
 
 impl NatsSinkConfig {
@@ -47,6 +49,7 @@ impl NatsSinkConfig {
             publish_timeout: Duration::from_secs(2),
             flush_timeout: Duration::from_secs(2),
             restore: RestoreClaim::None,
+            payload_format: PayloadFormat::Json,
         }
     }
 
@@ -271,34 +274,19 @@ impl NatsSink {
                 return true; // Receipt/delivery guards fail this partial batch.
             }
             let started = std::time::Instant::now();
-            // Bound the writer before allocating output. Its single-row array
-            // envelope is removed in place; no second body allocation exists.
-            // Legacy structured-value scratch is also pre-admitted.
-            let scratch = row
-                .resident_bytes()
-                .saturating_mul(8)
-                .saturating_add(
-                    schema
-                        .fields
-                        .iter()
-                        .fold(0usize, |n, f| n.saturating_add(f.name.capacity()))
-                        .saturating_mul(4),
-                )
-                .saturating_add(8192);
+            // Bound the writer before allocating output (JSON: the single-row
+            // array envelope is removed in place; CSV: header + record).
+            // Format-specific encoder scratch is also pre-admitted.
+            let format = &self.config.payload_format;
+            let scratch = format.encode_scratch(schema, row);
             let encoded = (|| {
                 let mut lease = self.owner.acquire(CreditKind::Reservation, scratch)?;
-                let mut body = encode_json_batch_bounded_with_capacity(
-                    schema,
-                    std::slice::from_ref(row),
-                    limit.saturating_add(2),
-                    |capacity| lease.grow_to(scratch.saturating_add(capacity)),
-                )?;
-                body.remove(0);
-                body.pop();
                 // The SDK reservation already covers the bounded working
                 // payload plus command/writer overlap. Synchronous encoder
                 // tree scratch must not consume credit while publish waits.
-                Ok::<_, sparrow_model::SparrowError>(body)
+                format.encode_row_bounded_with_capacity(schema, row, limit, |capacity| {
+                    lease.grow_to(scratch.saturating_add(capacity))
+                })
             })();
             self.diag
                 .observation
@@ -317,6 +305,7 @@ impl NatsSink {
                     if e.code == ErrorCode::ResourceExhausted {
                         self.diag.nats_sink_failed.fetch_add(1, Ordering::Relaxed);
                     } else {
+                        self.diag.csv_encode_error(&self.config.payload_format);
                         self.diag
                             .nats_sink_dropped_bad
                             .fetch_add(1, Ordering::Relaxed);

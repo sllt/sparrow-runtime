@@ -37,6 +37,8 @@ pub struct JsonCodec {
     pub policy: BadRecordPolicy,
     /// When set, Utf8/Bytes scalars use tracked constructors (A2 leftover).
     pub owner: Option<Arc<MemoryOwner>>,
+    /// Payload format; JSON unless a connector selects CSV.
+    pub format: crate::csv::PayloadFormat,
 }
 
 impl JsonCodec {
@@ -46,7 +48,13 @@ impl JsonCodec {
             limits: JsonLimits::default(),
             policy: BadRecordPolicy::Drop,
             owner: None,
+            format: crate::csv::PayloadFormat::Json,
         }
+    }
+
+    pub fn with_format(mut self, format: crate::csv::PayloadFormat) -> Self {
+        self.format = format;
+        self
     }
 
     pub fn with_owner(mut self, owner: Arc<MemoryOwner>) -> Self {
@@ -64,22 +72,35 @@ impl JsonCodec {
     }
 
     pub fn decode_frame(&self, frame: &SourceFrame) -> Result<Option<Row>> {
-        match decode_json_row_on(
+        self.decode_frame_with(frame, |_| {})
+    }
+
+    /// [`Self::decode_frame`], reporting every decode error to `on_error`
+    /// before the policy is applied (CSV fault counters).
+    pub fn decode_frame_with(
+        &self,
+        frame: &SourceFrame,
+        on_error: impl FnOnce(&SparrowError),
+    ) -> Result<Option<Row>> {
+        match self.format.decode_row(
             &self.schema,
             &frame.payload,
             &self.limits,
             self.owner.as_deref(),
         ) {
             Ok(row) => Ok(Some(row)),
-            Err(err) => match self.policy {
-                BadRecordPolicy::Drop => Ok(None),
-                BadRecordPolicy::FailJob => Err(err),
-            },
+            Err(err) => {
+                on_error(&err);
+                match self.policy {
+                    BadRecordPolicy::Drop => Ok(None),
+                    BadRecordPolicy::FailJob => Err(err),
+                }
+            }
         }
     }
 
     pub fn encode_row(&self, row: &Row) -> Result<Vec<u8>> {
-        encode_json_row(&self.schema, row)
+        self.format.encode_row(&self.schema, row)
     }
 }
 
@@ -828,6 +849,42 @@ fn parse_strict_json(bytes: &[u8], max_depth: usize) -> Result<JsonVal> {
     Ok(value)
 }
 
+/// One JSON value typed by `ty` (a CSV cell carrying a Dynamic or nested
+/// column). Same byte/depth pre-checks as a JSON record.
+pub(crate) fn decode_json_value(
+    bytes: &[u8],
+    ty: &DataType,
+    nullable: bool,
+    limits: &JsonLimits,
+    owner: Option<&MemoryOwner>,
+) -> Result<Scalar> {
+    if bytes.len() > limits.max_bytes {
+        return Err(SparrowError::new(
+            ErrorCode::MaxRecordSize,
+            format!(
+                "JSON value {}B exceeds max_bytes {}",
+                bytes.len(),
+                limits.max_bytes
+            ),
+        ));
+    }
+    let depth = json_byte_depth(bytes);
+    if depth > limits.max_depth {
+        return Err(SparrowError::new(
+            ErrorCode::BoundExceeded,
+            format!("JSON depth {depth} exceeds max_depth {}", limits.max_depth),
+        ));
+    }
+    let value = parse_strict_json(bytes, limits.max_depth)?;
+    json_val_to_scalar(&value, ty, nullable, owner)
+}
+
+/// Compact JSON text of one value (CSV cell for Dynamic/nested values).
+pub(crate) fn scalar_json_text(value: &Scalar) -> Result<String> {
+    serde_json::to_string(&scalar_to_json(value))
+        .map_err(|e| SparrowError::new(ErrorCode::CodecViolation, format!("JSON encode: {e}")))
+}
+
 fn map_json_de_error(err: serde_json::Error, max_depth: usize) -> SparrowError {
     let msg = err.to_string();
     if msg.contains("duplicate keys") {
@@ -1069,6 +1126,7 @@ mod tests {
             limits: JsonLimits::default(),
             policy: BadRecordPolicy::Drop,
             owner: None,
+            format: Default::default(),
         };
         let frame = SourceFrame::new(b"not-json".to_vec(), 0);
         assert!(codec.decode_frame(&frame).unwrap().is_none());
@@ -1078,6 +1136,7 @@ mod tests {
             limits: JsonLimits::default(),
             policy: BadRecordPolicy::FailJob,
             owner: None,
+            format: Default::default(),
         };
         assert_eq!(
             fail.decode_frame(&frame).unwrap_err().code,

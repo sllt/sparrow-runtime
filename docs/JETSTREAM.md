@@ -157,18 +157,19 @@ stream，并等待服务器 PubAck；决策与取舍见 [ADR-005](adr/005-jetstr
 - **从不创建 stream**：由运维按保留/配额策略预先创建。
 - **发布目标**：启动拒绝 `no_ack`，每次发布带 Expected-Stream 并核对 ack.stream；wrong-stream
   不盲重试。fresh-only 可接纳 Memory stream，但不承诺它在 broker 重启后保留。
-- **Aligned v27**：仅独立线性 File 源 profile（`recovery: aligned` + `checkpoint_dir`），
+- **Aligned JSON v27 / CSV v28**：仅独立线性 File 源 profile（`recovery: aligned` + `checkpoint_dir`），
   prepared 目标必须是可写的 **File/Limits** stream。先在同一 job owner/slot 上验证目标，
   再打开/seek File、激活状态；运行复用该 session，失败显式 close 并等待真实 SDK 退出。
-  snapshot 用 `JSI1` 保存 canonical endpoints、token SecretRef、stream 精确 created nanos、
-  subject、msg-id 策略；恢复严格比较**完整**计划，不能沿用 v3 的 downstream-prefix 宽松规则。
-  旧 v1..v26 与 v27 不混写、不自动升级；HTTP↔JetStream、目标/策略/下游表达式变化
-  必须用独立新历史。checkpoint 只在全部前置 PubAck 和批后目标复验成功后提交。
+  JSON snapshot 用 `JSI1` 保存 canonical endpoints、token SecretRef、stream 精确 created nanos、
+  subject、msg-id 策略；CSV 用 `JSI2` 另绑定编译后的 delimiter、quote、header、null_value。
+  显式默认 CSV 选项与省略等价；每行消息各带可选表头。恢复严格比较**完整**计划，不能沿用 v3 的 downstream-prefix 宽松规则。
+  v1..v26、JSON v27 与 CSV v28 不混写、不自动升级；HTTP↔JetStream、JSON↔CSV、任一 CSV 编码选项、目标/策略/下游表达式变化
+  必须用独立新历史。拒绝不推进 CURRENT/STATE_GENERATION，也不发布新行。checkpoint 只在全部前置 PubAck 和批后目标复验成功后提交。
   每批前/后及 retry 前做实时 INFO 检查；同名重建/配置变化拒绝 receipt/CURRENT。
   恢复后从最后 checkpoint 重放 File 输入，msg-id 仅在 duplicate_window 内去重。
   NATS/MQTT/HTTP 等 live 源与 graph/IoT/引用表/JetStream source 的 checkpoint profile
   返回 `UnsupportedRestore`（这些 profile 依赖 HTTP 稳定输出 ID）。
-- **预算**：SDK command queue 与 writer batch 双缓冲、在途 payload、bounded JSON codec
+- **预算**：SDK command queue 与 writer batch 双缓冲、在途 payload、bounded JSON/CSV codec
   scratch 和 prepared identity/config 都记入同一 owner，超出额度失败，不增大预算或暗中钳制配置。
 - **顺序**：`max_inflight_acks > 1` 不保证输入行入 stream 的顺序。
 - **可信边界**：管理员不能在检查之间修改又恢复目标/策略来绕过检查；保留/淘汰归运维。
@@ -188,7 +189,7 @@ SPARROW_NATS_SERVER=/path/to/nats-server \
 覆盖：PubAck 后才回执、stream 缺失/subject 未绑定且不创建、ack 超时重试与去重后
 fail closed、broker 重启（无 msg id：不丢、重复计数；有 msg id：无重复）、stop 时刷新、
 超限行失败、NATS → SQL 过滤 → JetStream 的精确 stream 计数、aligned checkpoint 等待
-PubAck 且恢复去重、aligned job 在 stream 缺失时失败。
+PubAck 且恢复去重、aligned job 在 stream 缺失时失败；新增 CSV v28 checkpoint/恢复与显式默认等价、JSON↔CSV 和四项编码选项变化拒绝（原历史/发布数量不变）。这些 v28 回归须由当前候选单独执行，不沿用旧测试结果。
 
 ## 构建和验证
 

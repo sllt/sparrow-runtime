@@ -29,6 +29,7 @@ fn feed_config(consumer: &str) -> ReaderConfig {
         pending_bytes: 256 * 1024,
         pull_messages: 4,
         pull_bytes: 72 * 1024,
+        payload_format: Default::default(),
     }
 }
 

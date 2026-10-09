@@ -234,7 +234,7 @@ Control crate：
 | 合同项 | JetStream Sink 的实现 |
 |---|---|
 | 语义 | capability `jetstream_sink`：delivery `checkpointed_at_least_once`、recovery `aligned`、replay `unsupported`；每行等 PubAck，批次全部确认才回执 outbox；重试可能重复，`msg_id_column` 在 `duplicate_window` 内去重 |
-| Aligned | 独立线性 File v27，JSI1 精确目标 + 完整计划兼容；不沿用 v3 下游宽松规则，不与 v1..v26 混写/自动迁移；其他 checkpoint profile 拒绝（`UnsupportedRestore`） |
+| Aligned | 独立线性 File：JSON v27/JSI1 或 CSV v28/JSI2，精确目标与编码 + 完整计划兼容；不沿用 v3 下游宽松规则，不跨 profile 混写/自动迁移；其他 checkpoint profile 拒绝（`UnsupportedRestore`） |
 | 内存 | SDK 命令队列与 writer 双缓冲 + `max_inflight_acks × (max_payload_bytes + 8 KiB)` 在途保留记入 job reservation（≤ reservation/2），与其他 NATS 端点合计 ≤ 3/4；默认 client_capacity=4、max_inflight_acks=8，显式值不暗中钳制；编码 scratch 与 prepared metadata 另取同 owner 信用 |
 | 背压 | outbox 有界；在途 PubAck ≤ `max_inflight_acks`（SDK `max_ack_inflight` + 背压） |
 | 重试 | 每次 `2 × ack_timeout_ms`，100 ms→2 s 退避，≤ `max_retries`；耗尽、超限、非法 msg id → job 失败（fail closed） |
@@ -243,7 +243,8 @@ Control crate：
 | 指标 | `jetstream_sink_*`，pipeline status 的 `jetstream_sink` 对象 |
 
 JSI1 绑定端点、token SecretRef（不保存值）、stream 精确 created nanos、subject 和 msg-id 策略；
-旧目录/目标/下游语义变化不能静默继承历史。去重只在窗口内且要求稳定唯一 id，空值仍可能重复。
+CSV 的 JSI2 另绑定生效的 delimiter、quote、header、null_value，显式默认值与省略等价。
+旧目录/目标/下游语义或 JSON↔CSV/CSV 编码选项变化不能静默继承历史；拒绝不推进 CURRENT/状态代际，也不发布新行。去重只在窗口内且要求稳定唯一 id，空值仍可能重复。
 配置管理员不得在检查之间修改又恢复策略；PubAck/File 不等于消费者业务提交或设备掉电/fsync、HA、
 exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/20k 压测未执行。
 
@@ -260,3 +261,19 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | 校验 | topic 语法（订阅可用 `*` / 末尾 `>`，发布必须是字面 topic）、边界、同一 pipeline 内的自反馈环；Sink 注册失败 fail closed（`databus_sink_fatal`） |
 | 关闭 | 订阅 / 发布注册为 RAII，job 结束即注销，topic 不泄漏；未消费缓冲计 `discarded_on_close`；Sink 停止时在途与已排队批次共用一个 `flush_timeout_ms` 截止时间（不受 `block_timeout_ms` 延长） |
 | 指标 | `databus_source_*` / `databus_sink_*`，pipeline status 中的 `databus_source` / `databus_sink` 对象 |
+
+## 附：负载格式矩阵（`source.format` / `sink.format`）
+
+详见 [FORMATS.md](FORMATS.md)。默认是 `json`，未写 `format` 的 spec 行为不变。不支持的组合在校验阶段拒绝。
+
+| kind | JSON | CSV Source | CSV Sink | CSV 单位 |
+|---|---|---|---|---|
+| `mqtt` / `nats` / `jetstream` | ✓ | ✓ | ✓ | 一条消息 = （表头 +）一条记录；JetStream Source 的 cut 身份绑定格式与 CSV 选项（JSON 身份不变）；JetStream Sink 独立 File aligned 输出为 JSON v27 或 CSV v28 |
+| `http_push` | ✓ | ✓ | — | 一个请求 = （表头 +）一条记录 |
+| `http` Sink | ✓ | — | ✓ | 请求体 = 表头 + 多条记录；不能与 `body` / `single`、JetStream 源或 aligned 一起使用 |
+| `http_poll` | ✓ | ✓ | — | 一个响应 = 一份文档；`http_poll.format` 必须为空 |
+| `file` / `file_replay` / `replay` | ✓ | ✓ | ✓（`file`） | 文件或段文件 = 一份文档；表头在恢复时重建；段文件为 `part-N.csv`；checkpoint 身份绑定格式与 CSV 选项，Sink 目录标记绑定编码选项 |
+| `databus` | ✓（内部） | ✗ | ✗ | 进程内传递行 |
+| `log` / plugin | ✓ | — | ✗ | — |
+
+新增字节型 connector 时，应通过 `PayloadFormat` 编解码，并加入 `CSV_SOURCE_KINDS` / `CSV_SINK_KINDS`，不要自带解析器。先按长度拒绝（`max_message_bytes`），再按 `decode_scratch` / `encode_scratch` 记账，最后用 `encode_row_bounded_with_capacity` 等有界接口编解码。

@@ -484,6 +484,7 @@ async fn jetstream_sink_prepared_probe_close_joins_the_original_sdk_and_guard() 
     assert!(identity.belongs_to(&owner));
     assert_eq!(identity.identity().stream, "OUT");
     assert_eq!(identity.identity().subject, "out.rows");
+    assert_eq!(identity.identity().encoding, sparrow_io::SinkEncoding::Json);
     assert_eq!(
         identity.identity().created_nanos,
         context
@@ -515,6 +516,71 @@ async fn jetstream_sink_prepared_probe_close_joins_the_original_sdk_and_guard() 
     .await;
     assert!(released.load(Ordering::SeqCst));
     assert_eq!(owner.accounting_errors_total(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_prepared_csv_identity_binds_effective_encode_options() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    for (options, expected) in [
+        (
+            sparrow_formats::CsvOptions::default(),
+            sparrow_io::CsvEncodeIdentity::new(b',', b'"', true, "").unwrap(),
+        ),
+        (
+            sparrow_formats::CsvOptions {
+                delimiter: ";".into(),
+                quote: "'".into(),
+                header: false,
+                null_value: "NIL".into(),
+                ..Default::default()
+            },
+            sparrow_io::CsvEncodeIdentity::new(b';', b'\'', false, "NIL").unwrap(),
+        ),
+    ] {
+        let (sink, owner, diag) = bound_sink(&broker, |config| {
+            config.payload_format = sparrow_formats::PayloadFormat::csv(
+                options.compile(sparrow_formats::CsvRole::Encode).unwrap(),
+            );
+        });
+        let prepared = sink
+            .prepare_aligned(CancellationToken::new(), Arc::new(()))
+            .await
+            .unwrap()
+            .unwrap();
+        let identity = prepared.identity();
+        assert!(identity.belongs_to(&owner));
+        assert_eq!(
+            identity.identity().encoding,
+            sparrow_io::SinkEncoding::Csv(expected)
+        );
+        assert_eq!(identity.identity().stream, "OUT");
+        assert_eq!(identity.identity().subject, "out.rows");
+        assert_eq!(
+            identity.identity().created_nanos,
+            context
+                .get_stream("OUT")
+                .await
+                .unwrap()
+                .cached_info()
+                .created
+                .unix_timestamp_nanos()
+        );
+        assert_eq!(
+            diag.snapshot().jetstream_sink_acked,
+            0,
+            "identity probe must not publish"
+        );
+        assert_eq!(stream_rows(&context, "OUT").await.1, 0);
+        prepared.close().await.unwrap();
+        drop(identity);
+        until(Duration::from_secs(10), || {
+            owner.usage().physical_bytes == 0
+        })
+        .await;
+        assert_eq!(owner.accounting_errors_total(), 0);
+    }
 }
 
 #[tokio::test]
@@ -1108,4 +1174,31 @@ async fn jetstream_sink_oversize_row_fails_closed() {
         (s.jetstream_sink_dropped_oversize, s.jetstream_sink_fatal),
         (1, 1)
     );
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_csv_stores_one_record_per_message() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    let sink = start(&broker, |c| {
+        c.payload_format = sparrow_formats::PayloadFormat::csv(
+            sparrow_formats::CsvOptions::default()
+                .compile(sparrow_formats::CsvRole::Encode)
+                .unwrap(),
+        );
+    });
+    sink.ready().await;
+    sink.send(1, 2).await;
+    sink.settled(1).await;
+    let (diag, outbox, _) = sink.finish().await;
+    assert_eq!((outbox.acked(), outbox.failed()), (1, 0));
+    let stream = context.get_stream("OUT").await.unwrap();
+    let mut payloads = Vec::new();
+    for seq in 1..=2 {
+        let m = stream.get_raw_message(seq).await.unwrap();
+        payloads.push(String::from_utf8(m.payload.to_vec()).unwrap());
+    }
+    assert_eq!(payloads, ["event_id,v\ne-1,1\n", "event_id,v\ne-2,2\n"]);
+    assert_eq!(diag.snapshot().csv_encode_errors, 0);
 }

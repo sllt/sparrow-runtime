@@ -41,7 +41,7 @@ jobs:
           SPARROW_TEST_ARTIFACTS: ${{ github.workspace }}/artifacts/brokers
         run: |
           set -euo pipefail
-          mkdir -p artifacts
+          mkdir -p artifacts/brokers
           git rev-parse HEAD > artifacts/commit.txt
           if ! cargo test --locked --release --quiet --message-format=json \
             -p sparrow-connectors -p sparrow-control -p sparrow-server \
@@ -71,6 +71,12 @@ jobs:
             fi
             tail -n 3 "artifacts/$label.log"
           }
+          # This checkpoint regression used to infer HTTP completion from
+          # sleeps and race a 100ms success deadline under CI load. Repeat
+          # its real progress/late-ACK contract without rebuilding the binary.
+          for round in $(seq 1 10); do
+            run_contracts "$control" 'review_tests::n4_stale_barrier_ack_not_used_for_next_checkpoint' "late-checkpoint-ack-$round"
+          done
           for round in 1 2; do
             run_contracts "$connector" 'nats::' "nats-connector-$round"
             run_contracts "$control" 'nats_tests::' "nats-control-$round"

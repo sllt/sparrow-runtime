@@ -4,37 +4,14 @@
 //! charge the parser/encoder working set to the job reservation, then decode
 //! or encode. The estimates are the ones the NATS and HTTP Poll paths use.
 
-use sparrow_formats::encode_json_batch_bounded_with_capacity;
+use sparrow_formats::PayloadFormat;
 use sparrow_model::{CreditKind, ErrorCode, MemoryLease, MemoryOwner, Row, Schema, SparrowError};
 use std::sync::Arc;
 
 /// Conservative JSON parse tree + Row expansion for one record of
 /// `payload_len` bytes (same formula as the NATS / HTTP Poll Sources).
 pub(crate) fn json_decode_scratch(payload_len: usize, schema: &Schema) -> usize {
-    payload_len
-        .saturating_mul(64)
-        .saturating_add(
-            schema
-                .fields
-                .len()
-                .saturating_mul(std::mem::size_of::<sparrow_model::Scalar>())
-                .saturating_mul(2),
-        )
-        .saturating_add(4096)
-}
-
-/// Encoder scratch for one row (same formula as the NATS Sink).
-pub(crate) fn json_encode_scratch(row: &Row, schema: &Schema) -> usize {
-    row.resident_bytes()
-        .saturating_mul(8)
-        .saturating_add(
-            schema
-                .fields
-                .iter()
-                .fold(0usize, |n, f| n.saturating_add(f.name.capacity()))
-                .saturating_mul(4),
-        )
-        .saturating_add(8192)
+    PayloadFormat::Json.decode_scratch(schema, payload_len)
 }
 
 /// Why a row was not encoded.
@@ -57,23 +34,26 @@ pub(crate) fn encode_json_row_charged(
     row: &Row,
     limit: usize,
 ) -> std::result::Result<(Vec<u8>, MemoryLease), EncodeRejected> {
-    let scratch = json_encode_scratch(row, schema);
+    encode_row_charged(owner, &PayloadFormat::Json, schema, row, limit)
+}
+
+/// [`encode_json_row_charged`] for any payload format: the format's encoder
+/// scratch is charged first, then every output capacity growth.
+pub(crate) fn encode_row_charged(
+    owner: &Arc<MemoryOwner>,
+    format: &PayloadFormat,
+    schema: &Schema,
+    row: &Row,
+    limit: usize,
+) -> std::result::Result<(Vec<u8>, MemoryLease), EncodeRejected> {
+    let scratch = format.encode_scratch(schema, row);
     let mut lease = owner
         .acquire(CreditKind::Reservation, scratch)
         .map_err(|_| EncodeRejected::Budget)?;
-    // Single-row array envelope `[...]`, removed in place below.
-    let encoded = encode_json_batch_bounded_with_capacity(
-        schema,
-        std::slice::from_ref(row),
-        limit.saturating_add(2),
-        |capacity| lease.grow_to(scratch.saturating_add(capacity)),
-    );
-    match encoded {
-        Ok(mut body) => {
-            body.remove(0);
-            body.pop();
-            Ok((body, lease))
-        }
+    match format.encode_row_bounded_with_capacity(schema, row, limit, |capacity| {
+        lease.grow_to(scratch.saturating_add(capacity))
+    }) {
+        Ok(body) => Ok((body, lease)),
         Err(e) => Err(classify(&e)),
     }
 }

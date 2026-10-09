@@ -192,9 +192,11 @@ impl Supervisor {
             shutdown_guard,
         )
         .await?;
+        let mut reader_config = config.reader();
+        reader_config.payload_format = spec.source.payload_format()?;
         let reader = Reader::open(
             connection,
-            config.reader(),
+            reader_config,
             owner.clone(),
             binding,
             nonce,
@@ -466,6 +468,7 @@ impl Actor {
                 let added = next
                     .decode_into(&self.schema, &self.owner, &mut builder, self.row_limit)
                     .map_err(|e| {
+                        self.diag.csv_decode_error(next.payload_format(), &e);
                         self.diag
                             .decode_errors
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

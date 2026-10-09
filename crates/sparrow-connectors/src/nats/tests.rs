@@ -1023,3 +1023,92 @@ async fn nats_core_sink_flush_is_only_a_local_socket_flush_without_server_pong()
     done_tx.send(()).unwrap();
     peer.await.unwrap();
 }
+
+fn csv_format(role: sparrow_formats::CsvRole) -> sparrow_formats::PayloadFormat {
+    sparrow_formats::PayloadFormat::csv(
+        sparrow_formats::CsvOptions::default()
+            .compile(role)
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn nats_core_csv_source_and_sink_round_trip_through_the_broker() {
+    let broker = NatsSandbox::start().await;
+    let mut run = start_source(&broker, |c| {
+        c.payload_format = csv_format(sparrow_formats::CsvRole::Decode);
+    });
+    run.ready().await;
+    let client = raw_client(&broker).await;
+    for payload in [
+        "device_id,v\nd,1\n",
+        // Reordered header, quoted delimiter, CRLF, BOM.
+        "\u{feff}v,device_id\r\n2,\"x,y\"\r\n",
+        // Missing header: the record is read as a header and refused.
+        "d,3\n",
+        // Two records in one message are malformed.
+        "device_id,v\nd,4\nd,5\n",
+        // Type error.
+        "device_id,v\nd,six\n",
+    ] {
+        client.publish("in.csv", payload.into()).await.unwrap();
+    }
+    client.flush().await.unwrap();
+    // Sink: one CSV message per row, header first, through the same broker
+    // into the CSV source.
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let diag = IoDiagnostics::new();
+    let mut config = NatsSinkConfig::new(vec![broker.url()], "in.sink");
+    config.payload_format = csv_format(sparrow_formats::CsvRole::Encode);
+    let mut sub = client.subscribe("in.sink").await.unwrap();
+    client.flush().await.unwrap();
+    let sink = NatsSink::bind(
+        config,
+        &secrets(),
+        &policy(&broker),
+        owner.clone(),
+        diag.clone(),
+    )
+    .unwrap();
+    let (tx, rx) = sparrow_io::observed::channel(8);
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(sink.run(rx, cancel.clone(), None));
+    until(Duration::from_secs(5), || {
+        diag.snapshot().nats_sink_sessions == 1
+    })
+    .await;
+    tx.send(batch(&owner, 7, 8)).await.unwrap();
+    let raw = tokio::time::timeout(Duration::from_secs(5), sub.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&raw.payload[..], b"device_id,v\ns,7\n");
+    let rows = run.take(4).await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Scalar::utf8("d"), Scalar::Int64(1)],
+            vec![Scalar::utf8("x,y"), Scalar::Int64(2)],
+            vec![Scalar::utf8("s"), Scalar::Int64(7)],
+            vec![Scalar::utf8("s"), Scalar::Int64(8)],
+        ]
+    );
+    let snap = run.diag.snapshot();
+    assert_eq!(snap.nats_source_dropped_bad, 3, "{snap:?}");
+    assert_eq!(
+        (
+            snap.csv_header_errors,
+            snap.csv_malformed,
+            snap.csv_type_errors
+        ),
+        (1, 1, 1)
+    );
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(tx);
+    run.stop().await.unwrap();
+}
