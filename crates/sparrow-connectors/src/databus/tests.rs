@@ -1,0 +1,849 @@
+//! DataBus unit tests: topic grammar, overflow policies, fan-out, slow
+//! subscriber isolation, lifecycle cleanup, memory refusal, and a real
+//! Sink -> bus -> Source run through the actors.
+
+use super::*;
+use sparrow_model::{
+    CreditKind, DataType, Field, FieldId, QueuedRow, ResourceBudget, Row, RowBatch,
+    RowBatchBuilder, Scalar, Schema, SchemaId,
+};
+use std::future::{poll_fn, Future};
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
+
+fn owner() -> Arc<MemoryOwner> {
+    MemoryOwner::new(ResourceBudget::compact())
+}
+
+fn sub_config(pattern: &str, capacity: usize, overflow: Overflow) -> SubscriptionConfig {
+    SubscriptionConfig {
+        pattern: pattern.into(),
+        capacity,
+        max_bytes: 64 * 1024,
+        overflow,
+        block_timeout: Duration::from_millis(50),
+    }
+}
+
+fn msg(i: i64) -> Arc<[u8]> {
+    Arc::from(format!(r#"{{"v":{i}}}"#).into_bytes())
+}
+
+fn value(m: &[u8]) -> i64 {
+    serde_json::from_slice::<serde_json::Value>(m).unwrap()["v"]
+        .as_i64()
+        .unwrap()
+}
+
+async fn drain(sub: &Subscriber) -> Vec<i64> {
+    let mut out = Vec::new();
+    while let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(20), sub.recv()).await {
+        out.push(value(&m));
+    }
+    out
+}
+
+#[test]
+fn databus_topic_grammar_matching_and_overlap() {
+    for ok in ["a", "a.b", "sensor-1.temp_c", "A.B.C"] {
+        check_topic(ok, false).unwrap();
+    }
+    for bad in [
+        "",
+        "a..b",
+        ".a",
+        "a.",
+        "a b",
+        "a/b",
+        "a.*",
+        "a.>",
+        &"x".repeat(129),
+    ] {
+        assert!(check_topic(bad, false).is_err(), "{bad:?}");
+    }
+    let deep = vec!["t"; 17].join(".");
+    assert!(check_topic(&deep, true).is_err());
+    for ok in ["a.*", "a.>", "*", ">", "*.b.>"] {
+        check_topic(ok, true).unwrap();
+    }
+    for bad in ["a.>.b", "a.b*", "a.>x"] {
+        assert!(check_topic(bad, true).is_err(), "{bad:?}");
+    }
+    assert!(topic_matches("a.*", "a.b"));
+    assert!(!topic_matches("a.*", "a.b.c"));
+    assert!(topic_matches("a.>", "a.b.c"));
+    assert!(!topic_matches("a.>", "a"));
+    assert!(topic_matches("a.b", "a.b"));
+    assert!(!topic_matches("a.b", "a.c"));
+    assert!(patterns_overlap("a.*", "a.b"));
+    assert!(patterns_overlap("a.>", "*.x.y"));
+    assert!(!patterns_overlap("a.*", "b.c"));
+    assert!(!patterns_overlap("a.b", "a.b.c"));
+    assert_eq!(Overflow::parse("block").unwrap(), Overflow::Block);
+    assert!(Overflow::parse("drop").is_err());
+    assert_eq!(Overflow::default().as_str(), "drop_oldest");
+    let mut c = sub_config("a", 0, Overflow::Block);
+    assert_eq!(c.validate().unwrap_err().code, ErrorCode::BoundExceeded);
+    c.capacity = 1;
+    c.block_timeout = Duration::ZERO;
+    assert_eq!(c.validate().unwrap_err().code, ErrorCode::BoundExceeded);
+}
+
+#[tokio::test]
+async fn databus_fan_out_preserves_order_and_no_subscriber_is_counted() {
+    let bus = DataBus::new();
+    let owner = owner();
+    let publisher = bus.publisher("plant.line1").unwrap();
+    // Nobody listening: offered to zero subscribers, nothing retained.
+    assert_eq!(publisher.publish(msg(0)).await.matched, 0);
+    let (da, db) = (IoDiagnostics::new(), IoDiagnostics::new());
+    let a = bus
+        .subscribe(
+            sub_config("plant.line1", 64, Overflow::DropOldest),
+            &owner,
+            da.clone(),
+        )
+        .unwrap();
+    let b = bus
+        .subscribe(
+            sub_config("plant.>", 64, Overflow::DropNewest),
+            &owner,
+            db.clone(),
+        )
+        .unwrap();
+    let other = bus
+        .subscribe(
+            sub_config("other.*", 64, Overflow::Block),
+            &owner,
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+    for i in 1..=20 {
+        let out = publisher.publish(msg(i)).await;
+        assert_eq!((out.matched, out.accepted, out.blocked), (2, 2, false));
+    }
+    let expected: Vec<i64> = (1..=20).collect();
+    assert_eq!(drain(&a).await, expected);
+    assert_eq!(drain(&b).await, expected);
+    assert!(drain(&other).await.is_empty());
+    assert_eq!(da.snapshot().databus_source_received, 20);
+    assert_eq!(db.snapshot().databus_source_dropped_newest, 0);
+}
+
+#[tokio::test]
+async fn databus_overflow_policies_count_and_bound_buffers() {
+    let bus = DataBus::new();
+    let owner = owner();
+    let publisher = bus.publisher("t").unwrap();
+    let (d_old, d_new, d_block) = (
+        IoDiagnostics::new(),
+        IoDiagnostics::new(),
+        IoDiagnostics::new(),
+    );
+    let oldest = bus
+        .subscribe(
+            sub_config("t", 4, Overflow::DropOldest),
+            &owner,
+            d_old.clone(),
+        )
+        .unwrap();
+    let newest = bus
+        .subscribe(
+            sub_config("t", 4, Overflow::DropNewest),
+            &owner,
+            d_new.clone(),
+        )
+        .unwrap();
+    let block = bus
+        .subscribe(sub_config("t", 4, Overflow::Block), &owner, d_block.clone())
+        .unwrap();
+    for i in 1..=10 {
+        publisher.publish(msg(i)).await;
+    }
+    let s = d_old.snapshot();
+    assert_eq!(
+        (
+            s.databus_source_buffer_items,
+            s.databus_source_dropped_oldest
+        ),
+        (4, 6)
+    );
+    assert_eq!(drain(&oldest).await, vec![7, 8, 9, 10], "freshest kept");
+    assert_eq!(d_new.snapshot().databus_source_dropped_newest, 6);
+    assert_eq!(drain(&newest).await, vec![1, 2, 3, 4], "first kept");
+    // Block: the publisher waited 50ms per overflowing message, then dropped
+    // it for this subscriber only.
+    assert_eq!(d_block.snapshot().databus_source_block_timeouts, 6);
+    assert_eq!(drain(&block).await, vec![1, 2, 3, 4]);
+    assert_eq!(d_old.snapshot().databus_source_buffer_items, 0);
+    assert_eq!(d_old.snapshot().databus_source_buffer_bytes, 0);
+
+    // Byte bound: 1 KiB buffer holds two ~400 B messages.
+    let d_bytes = IoDiagnostics::new();
+    let mut cfg = sub_config("t", 100, Overflow::DropNewest);
+    cfg.max_bytes = 1024;
+    let small = bus.subscribe(cfg, &owner, d_bytes.clone()).unwrap();
+    let big: Arc<[u8]> = Arc::from(vec![b' '; 400]);
+    for _ in 0..3 {
+        publisher.publish(big.clone()).await;
+    }
+    let s = d_bytes.snapshot();
+    assert_eq!(
+        (s.databus_source_buffer_items, s.databus_source_buffer_bytes),
+        (2, 800)
+    );
+    assert_eq!(s.databus_source_dropped_newest, 1);
+    publisher.publish(Arc::from(vec![b' '; 2048])).await;
+    assert_eq!(d_bytes.snapshot().databus_source_dropped_oversize, 1);
+    drop(small);
+}
+
+#[tokio::test]
+async fn databus_block_policy_backpressures_without_loss_while_consumed() {
+    let bus = DataBus::new();
+    let owner = owner();
+    let publisher = bus.publisher("t").unwrap();
+    let diag = IoDiagnostics::new();
+    let mut cfg = sub_config("t", 2, Overflow::Block);
+    cfg.block_timeout = Duration::from_secs(5);
+    let sub = Arc::new(bus.subscribe(cfg, &owner, diag.clone()).unwrap());
+    let reader = {
+        let sub = sub.clone();
+        tokio::spawn(async move {
+            let mut got = Vec::new();
+            while got.len() < 200 {
+                got.push(value(&sub.recv().await.unwrap()));
+                if got.len() % 10 == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+            got
+        })
+    };
+    let mut blocked = 0;
+    for i in 0..200 {
+        let out = publisher.publish(msg(i)).await;
+        assert_eq!(out.accepted, 1);
+        blocked += out.blocked as usize;
+    }
+    assert_eq!(reader.await.unwrap(), (0..200).collect::<Vec<_>>());
+    assert!(
+        blocked > 0,
+        "a 2-slot buffer must have made the publisher wait"
+    );
+    let s = diag.snapshot();
+    assert_eq!(
+        (s.databus_source_block_timeouts, s.databus_source_received),
+        (0, 200)
+    );
+}
+
+#[tokio::test]
+async fn databus_slow_subscriber_only_stalls_publishers_under_block() {
+    let bus = DataBus::new();
+    let owner = owner();
+    let publisher = bus.publisher("t").unwrap();
+    let fast_diag = IoDiagnostics::new();
+    let fast = bus
+        .subscribe(
+            sub_config("t", 1024, Overflow::DropNewest),
+            &owner,
+            fast_diag.clone(),
+        )
+        .unwrap();
+    // A subscriber that never reads, with a drop policy.
+    let slow = bus
+        .subscribe(
+            sub_config("t", 2, Overflow::DropOldest),
+            &owner,
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+    let started = Instant::now();
+    for i in 0..500 {
+        assert!(!publisher.publish(msg(i)).await.blocked);
+    }
+    assert!(started.elapsed() < Duration::from_secs(2), "never stalled");
+    assert_eq!(
+        drain(&fast).await.len(),
+        500,
+        "fast subscriber got everything"
+    );
+    drop(slow);
+    // Same with a block subscriber: the publisher (only) is slowed by its
+    // timeout, other subscribers still get every message, first.
+    let mut cfg = sub_config("t", 1, Overflow::Block);
+    cfg.block_timeout = Duration::from_millis(20);
+    let _stuck = bus.subscribe(cfg, &owner, IoDiagnostics::new()).unwrap();
+    let started = Instant::now();
+    for i in 0..5 {
+        publisher.publish(msg(i)).await;
+    }
+    assert!(started.elapsed() >= Duration::from_millis(80));
+    assert_eq!(drain(&fast).await, vec![0, 1, 2, 3, 4]);
+    assert_eq!(fast_diag.snapshot().databus_source_dropped_newest, 0);
+}
+
+#[tokio::test]
+async fn databus_lifecycle_releases_topics_memory_and_wakes_blocked_publishers() {
+    let bus = DataBus::new();
+    let owner = owner();
+    let diag = IoDiagnostics::new();
+    let publisher = bus.publisher("x.y").unwrap();
+    let second = bus.publisher("x.y").unwrap();
+    let mut cfg = sub_config("x.*", 2, Overflow::Block);
+    cfg.block_timeout = Duration::from_secs(10);
+    let sub = bus.subscribe(cfg.clone(), &owner, diag.clone()).unwrap();
+    assert_eq!(owner.usage().reservation_bytes, cfg.reservation());
+    let snapshot = bus.snapshot();
+    assert_eq!(snapshot.topics.len(), 2);
+    let find = |t: &str| {
+        snapshot
+            .topics
+            .iter()
+            .find(|x| x.topic == t)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(find("x.y").publishers, 2);
+    assert_eq!(find("x.*").subscribers, 1);
+    publisher.publish(msg(1)).await;
+    publisher.publish(msg(2)).await;
+    // The third publish blocks; detaching the subscriber must release it.
+    let blocked = tokio::spawn(async move {
+        let out = second.publish(msg(3)).await;
+        drop(second);
+        out
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!blocked.is_finished());
+    drop(sub);
+    let out = tokio::time::timeout(Duration::from_secs(1), blocked)
+        .await
+        .expect("detach wakes blocked publishers")
+        .unwrap();
+    assert_eq!(out.accepted, 0);
+    assert_eq!(diag.snapshot().databus_source_discarded_on_close, 2);
+    assert_eq!(owner.usage().reservation_bytes, 0, "buffer credit released");
+    drop(publisher);
+    assert!(bus.snapshot().topics.is_empty(), "no leaked topics");
+    // Re-attach after restart: a new subscriber sees only new messages.
+    let publisher = bus.publisher("x.y").unwrap();
+    let sub = bus
+        .subscribe(
+            sub_config("x.y", 8, Overflow::DropOldest),
+            &owner,
+            diag.clone(),
+        )
+        .unwrap();
+    publisher.publish(msg(9)).await;
+    assert_eq!(drain(&sub).await, vec![9]);
+}
+
+#[tokio::test]
+async fn databus_closed_buffer_keeps_credit_until_pending_snapshot_releases_backing() {
+    let bus = DataBus::new();
+    let owner_a = owner();
+    let owner_b = owner();
+    let publisher = bus.publisher("t").unwrap();
+    let cfg = sub_config("t", MAX_BUFFER_MESSAGES, Overflow::DropOldest);
+    let reservation = cfg.reservation();
+    let a = bus.subscribe(cfg, &owner_a, IoDiagnostics::new()).unwrap();
+    for i in 0..MAX_BUFFER_MESSAGES {
+        publisher.publish(msg(i as i64)).await;
+    }
+    let retained = a.subscription.clone();
+    assert!(retained.buffer.lock().unwrap().queue.capacity() >= MAX_BUFFER_MESSAGES);
+    let mut cfg = sub_config("t", 1, Overflow::Block);
+    cfg.block_timeout = Duration::from_secs(30);
+    let b = bus.subscribe(cfg, &owner_b, IoDiagnostics::new()).unwrap();
+    publisher.publish(msg(10000)).await;
+    let mut pending = Box::pin(publisher.publish(msg(10001)));
+    poll_fn(|cx| {
+        assert!(
+            pending.as_mut().poll(cx).is_pending(),
+            "B must hold the publish snapshot pending"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    drop(a);
+    assert_eq!(retained.buffer.lock().unwrap().queue.len(), 0);
+    assert!(retained.buffer.lock().unwrap().queue.capacity() >= MAX_BUFFER_MESSAGES);
+    assert_eq!(
+        owner_a.usage().reservation_bytes,
+        reservation,
+        "closed snapshot still owns a real queue allocation"
+    );
+    drop(b);
+    let outcome = pending.await;
+    assert_eq!(
+        outcome.accepted, 1,
+        "A accepted before closing; B's waiter was closed"
+    );
+    assert_eq!(owner_b.usage().reservation_bytes, 0);
+    assert_eq!(
+        owner_a.usage().reservation_bytes,
+        reservation,
+        "last inspection snapshot is still live"
+    );
+    drop(retained);
+    assert_eq!(owner_a.usage().reservation_bytes, 0);
+    assert_eq!(owner_a.accounting_errors_total(), 0);
+    assert_eq!(owner_b.accounting_errors_total(), 0);
+    drop(publisher);
+    assert!(bus.snapshot().topics.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn databus_block_subscribers_progress_independently_with_their_own_deadlines() {
+    let bus = DataBus::new();
+    let owner = owner();
+    let publisher = bus.publisher("t").unwrap();
+    let mut cfg = sub_config("t", 1, Overflow::Block);
+    cfg.block_timeout = Duration::from_secs(30);
+    let a = bus
+        .subscribe(cfg.clone(), &owner, IoDiagnostics::new())
+        .unwrap();
+    cfg.block_timeout = Duration::from_millis(100);
+    let diag = IoDiagnostics::new();
+    let b = bus.subscribe(cfg, &owner, diag.clone()).unwrap();
+    publisher.publish(msg(1)).await;
+    let mut pending = Box::pin(publisher.publish(msg(2)));
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::advance(Duration::from_millis(50)).await;
+    assert_eq!(value(&b.recv().await.unwrap()), 1);
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending(), "A remains blocked");
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(
+        b.subscription.buffer.lock().unwrap().queue.len(),
+        1,
+        "B is delivered at 50ms without waiting 30s for A"
+    );
+    assert_eq!(value(&b.recv().await.unwrap()), 2);
+    assert_eq!(diag.snapshot().databus_source_block_timeouts, 0);
+    drop(a);
+    assert_eq!(pending.await.accepted, 1);
+    drop(b);
+    assert_eq!(owner.usage().reservation_bytes, 0);
+    assert_eq!(owner.accounting_errors_total(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn databus_expired_block_wait_cannot_accept_a_late_free_slot() {
+    let bus = DataBus::new();
+    let owner = owner();
+    let publisher = bus.publisher("t").unwrap();
+    let mut cfg = sub_config("t", 1, Overflow::Block);
+    cfg.block_timeout = Duration::from_secs(30);
+    let a = bus
+        .subscribe(cfg.clone(), &owner, IoDiagnostics::new())
+        .unwrap();
+    cfg.block_timeout = Duration::from_millis(100);
+    let diag = IoDiagnostics::new();
+    let b = bus.subscribe(cfg, &owner, diag.clone()).unwrap();
+    publisher.publish(msg(1)).await;
+    let mut pending = Box::pin(publisher.publish(msg(2)));
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::advance(Duration::from_millis(101)).await;
+    assert_eq!(value(&b.recv().await.unwrap()), 1); // space arrived after B's deadline
+    drop(a);
+    assert_eq!(
+        pending.await.accepted,
+        0,
+        "expired B may not accept even though its slot is now free"
+    );
+    assert_eq!(diag.snapshot().databus_source_block_timeouts, 1);
+    assert!(b.subscription.buffer.lock().unwrap().queue.is_empty());
+    drop(b);
+    assert_eq!(owner.usage().reservation_bytes, 0);
+    assert_eq!(owner.accounting_errors_total(), 0);
+}
+
+#[test]
+fn databus_buffer_reservation_is_refused_when_it_does_not_fit() {
+    let bus = DataBus::new();
+    let mut budget = ResourceBudget::compact();
+    budget.reservation_bytes = 128 * 1024;
+    let small = MemoryOwner::new(budget);
+    let mut cfg = sub_config("t", 16, Overflow::DropOldest);
+    cfg.max_bytes = 256 * 1024;
+    let e = bus
+        .subscribe(cfg.clone(), &small, IoDiagnostics::new())
+        .err()
+        .unwrap();
+    assert_eq!(e.code, ErrorCode::BoundExceeded);
+    assert!(bus.snapshot().topics.is_empty());
+    assert_eq!(small.usage().reservation_bytes, 0);
+    let mut source = DataBusSourceConfig::new("t", schema());
+    source.subscription = cfg;
+    assert_eq!(
+        source
+            .check_reservation_budget(budget.reservation_bytes)
+            .unwrap_err()
+            .code,
+        ErrorCode::BoundExceeded
+    );
+    source.subscription.max_bytes = 8 * 1024 * 1024;
+    assert_eq!(
+        source.validate().unwrap_err().code,
+        ErrorCode::BoundExceeded
+    );
+    let mut sink = DataBusSinkConfig::new("t.*");
+    assert!(sink.validate().is_err(), "sink topic is literal");
+    sink.topic = "t".into();
+    sink.validate().unwrap();
+    source.subscription.max_bytes = 64 * 1024;
+    source.restore = sparrow_model::RestoreClaim::Checkpoint {
+        snapshot_id: "1".into(),
+    };
+    assert!(source.validate().is_err(), "no durable restore");
+    assert_eq!(DataBusSourceConfig::capabilities().kind, "databus");
+    assert_eq!(DataBusSinkConfig::capabilities().kind, "databus_sink");
+}
+
+fn schema() -> Schema {
+    Schema::new(
+        SchemaId::new(1),
+        vec![
+            Field::new(FieldId::new(1), "device_id", DataType::Utf8, false),
+            Field::new(FieldId::new(2), "v", DataType::Int64, false),
+        ],
+    )
+    .unwrap()
+}
+
+fn batch(owner: &Arc<MemoryOwner>, from: i64, to: i64) -> RowBatch {
+    let mut builder = RowBatchBuilder::new(
+        Arc::new(schema()),
+        owner.clone(),
+        CreditKind::Reservation,
+        (to - from + 1) as usize,
+        1 << 16,
+    )
+    .unwrap();
+    for v in from..=to {
+        builder
+            .push(Row {
+                values: vec![Scalar::utf8("d"), Scalar::Int64(v)],
+            })
+            .unwrap();
+    }
+    builder.finish().unwrap()
+}
+
+#[tokio::test]
+async fn databus_sink_to_source_actors_exact_rows_and_cleanup() {
+    let bus = DataBus::new();
+    let source_owner = owner();
+    let source_diag = IoDiagnostics::new();
+    source_diag.observation.initialize(&source_owner).unwrap();
+    // Observation state holds its own fixed credit.
+    let baseline = source_owner.usage();
+    let config = DataBusSourceConfig::new("rows.*", schema());
+    let source = DataBusSource::bind(config, bus.clone(), source_diag.clone()).unwrap();
+    let (tx, mut rx) = sparrow_io::observed::channel::<QueuedRow>(16);
+    let source_cancel = CancellationToken::new();
+    let source_task = tokio::spawn(source.run_budgeted(
+        tx,
+        source_cancel.clone(),
+        source_owner.clone(),
+        64 * 1024,
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while bus.snapshot().topics.is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let sink_owner = owner();
+    let sink_diag = IoDiagnostics::new();
+    let sink = DataBusSink::bind(
+        DataBusSinkConfig::new("rows.a"),
+        bus.clone(),
+        sink_owner.clone(),
+        sink_diag.clone(),
+    )
+    .unwrap();
+    let (out_tx, out_rx) = sparrow_io::observed::channel(4);
+    let sink_cancel = CancellationToken::new();
+    let outbox = Arc::new(sparrow_model::InflightCounter::new());
+    let sink_task = tokio::spawn(sink.run(out_rx, sink_cancel.clone(), Some(outbox.clone())));
+    for (from, to) in [(1, 10), (11, 50), (51, 100)] {
+        outbox.enqueue();
+        out_tx.send(batch(&sink_owner, from, to)).await.unwrap();
+    }
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while got.len() < 100 {
+            got.push(rx.recv().await.unwrap());
+        }
+    })
+    .await
+    .expect("100 rows through the bus");
+    assert_eq!(got.len(), 100);
+    drop(out_tx);
+    tokio::time::timeout(Duration::from_secs(2), sink_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        outbox.pending(),
+        0,
+        "every batch acked after the bus accepted it"
+    );
+    let s = sink_diag.snapshot();
+    assert_eq!(
+        (s.databus_sink_published, s.databus_sink_deliveries),
+        (100, 100)
+    );
+    assert_eq!(
+        (s.databus_sink_batches, s.databus_sink_no_subscribers),
+        (3, 0)
+    );
+    let s = source_diag.snapshot();
+    assert_eq!(
+        (s.databus_source_received, s.databus_source_rows),
+        (100, 100)
+    );
+    source_cancel.cancel();
+    source_task.await.unwrap().unwrap();
+    drop(got);
+    assert!(
+        bus.snapshot().topics.is_empty(),
+        "stop detaches publisher and subscriber"
+    );
+    assert_eq!(
+        source_owner.usage().reservation_bytes,
+        baseline.reservation_bytes
+    );
+    assert_eq!(source_owner.usage().queue_bytes, baseline.queue_bytes);
+}
+
+#[tokio::test]
+async fn databus_sink_registration_failure_is_fatal() {
+    let bus = DataBus::new();
+    let held: Vec<_> = (0..MAX_PUBLISHERS)
+        .map(|i| bus.publisher(&format!("p.{i}")).unwrap())
+        .collect();
+    let diag = IoDiagnostics::new();
+    let sink = DataBusSink::bind(
+        DataBusSinkConfig::new("p.x"),
+        bus.clone(),
+        owner(),
+        diag.clone(),
+    )
+    .unwrap();
+    let (_tx, rx) = sparrow_io::observed::channel::<RowBatch>(4);
+    let cancel = CancellationToken::new();
+    sink.run(rx, cancel.clone(), None).await;
+    assert_eq!(diag.snapshot().databus_sink_fatal, 1);
+    assert!(cancel.is_cancelled(), "fatal cancels the job");
+    drop(held);
+    assert!(bus.snapshot().topics.is_empty());
+}
+
+/// The decoder working set is charged before decoding: without credit the
+/// message is counted `dropped_budget` and never parsed; with credit again
+/// the next message decodes normally.
+#[tokio::test]
+async fn databus_source_charges_decode_scratch_before_parsing() {
+    let bus = DataBus::new();
+    let mut budget = ResourceBudget::compact();
+    budget.reservation_bytes = 16 * 1024;
+    let source_owner = MemoryOwner::new(budget);
+    let diag = IoDiagnostics::new();
+    let mut config = DataBusSourceConfig::new("rows.a", schema());
+    config.subscription.capacity = 4;
+    config.subscription.max_bytes = 4 * 1024;
+    let source = DataBusSource::bind(config, bus.clone(), diag.clone()).unwrap();
+    let (tx, mut rx) = sparrow_io::observed::channel::<QueuedRow>(16);
+    let cancel = CancellationToken::new();
+    let task =
+        tokio::spawn(source.run_budgeted(tx, cancel.clone(), source_owner.clone(), 64 * 1024));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while bus.snapshot().topics.is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let publisher = bus.publisher("rows.a").unwrap();
+    // 2 KiB payload: 2 KiB x 64 scratch does not fit 16 KiB minus the
+    // subscriber buffer; a short one does.
+    let long = format!(r#"{{"device_id":"{}","v":1}}"#, "x".repeat(2048));
+    publisher.publish(Arc::from(long.into_bytes())).await;
+    publisher
+        .publish(Arc::from(br#"{"device_id":"d","v":2}"#.to_vec()))
+        .await;
+    let row = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap();
+    assert!(row.is_some(), "the short message decodes");
+    let s = diag.snapshot();
+    assert_eq!(s.databus_source_dropped_budget, 1, "{s:?}");
+    assert_eq!(s.databus_source_dropped_bad, 0, "never parsed");
+    assert_eq!(s.decode_errors, 0);
+    assert_eq!(s.databus_source_rows, 1);
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn databus_source_fail_on_decode_preserves_failed_health_and_exact_error() {
+    let bus = DataBus::new();
+    let owner = owner();
+    let diag = IoDiagnostics::new();
+    diag.observation.initialize(&owner).unwrap();
+    let mut config = DataBusSourceConfig::new("rows.a", schema());
+    config.fail_on_decode = true;
+    let source = DataBusSource::bind(config, bus.clone(), diag.clone()).unwrap();
+    let (tx, mut rx) = sparrow_io::observed::channel::<QueuedRow>(16);
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(source.run_budgeted(tx, cancel, owner.clone(), 64 * 1024));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while diag.observation.endpoints().unwrap().0.state
+            != sparrow_model::observation::HealthState::Ready
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let publisher = bus.publisher("rows.a").unwrap();
+    publisher.publish(Arc::from(b"not json".as_slice())).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.unwrap_err().code, ErrorCode::CodecViolation);
+    let state = diag.observation.endpoints().unwrap().0;
+    assert_eq!(state.state, sparrow_model::observation::HealthState::Failed);
+    assert_eq!(state.reason, "databus_decode_failed");
+    assert_eq!(state.last_error_code, Some(ErrorCode::CodecViolation));
+    assert_eq!(
+        state.failures, 1,
+        "cleanup must not reset or double-report the failure"
+    );
+    assert_eq!(diag.snapshot().decode_errors, 1);
+    assert_eq!(diag.snapshot().databus_source_rows, 0);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(owner.usage().reservation_bytes, 0);
+    assert_eq!(owner.accounting_errors_total(), 0);
+}
+
+/// A stop while a publish waits on a `block` subscriber is bounded by the
+/// sink's `flush_timeout`, not the subscriber's `block_timeout`; the rest of
+/// the batch and the queued batches are counted and their receipts fail.
+#[tokio::test]
+async fn databus_sink_stop_bounds_a_publish_blocked_in_flight() {
+    let bus = DataBus::new();
+    let sub_owner = owner();
+    let mut blocking = sub_config("rows.a", 1, Overflow::Block);
+    blocking.block_timeout = Duration::from_secs(30);
+    let _sub = bus
+        .subscribe(blocking, &sub_owner, IoDiagnostics::new())
+        .unwrap();
+    let sink_owner = owner();
+    let diag = IoDiagnostics::new();
+    let mut config = DataBusSinkConfig::new("rows.a");
+    config.flush_timeout = Duration::from_millis(100);
+    let sink = DataBusSink::bind(config, bus.clone(), sink_owner.clone(), diag.clone()).unwrap();
+    let (out_tx, out_rx) = sparrow_io::observed::channel(4);
+    let cancel = CancellationToken::new();
+    let outbox = Arc::new(sparrow_model::InflightCounter::new());
+    let task = tokio::spawn(sink.run(out_rx, cancel.clone(), Some(outbox.clone())));
+    for (from, to) in [(1, 5), (6, 8)] {
+        outbox.enqueue();
+        out_tx.send(batch(&sink_owner, from, to)).await.unwrap();
+    }
+    // Row 1 fills the subscriber, row 2 blocks.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while diag.snapshot().databus_sink_published < 1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stopped = Instant::now();
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("stop is bounded by flush_timeout")
+        .unwrap();
+    assert!(
+        stopped.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        stopped.elapsed()
+    );
+    let s = diag.snapshot();
+    assert_eq!(s.databus_sink_published, 1, "{s:?}");
+    assert_eq!(s.databus_sink_discarded_on_close, 4 + 3, "{s:?}");
+    assert_eq!((outbox.acked(), outbox.failed()), (0, 2));
+    assert_eq!(outbox.pending(), 0);
+    drop(out_tx);
+    assert_eq!(
+        sink_owner.usage().reservation_bytes,
+        0,
+        "encode leases released"
+    );
+}
+
+/// Encoding is bounded by the record limit and charged to the sink's job:
+/// without credit the row is counted `dropped_budget`, not encoded.
+#[tokio::test]
+async fn databus_sink_encode_is_charged_and_bounded() {
+    let bus = DataBus::new();
+    let sub_owner = owner();
+    let sub = bus
+        .subscribe(
+            sub_config("rows.a", 64, Overflow::DropNewest),
+            &sub_owner,
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+    let mut tiny = ResourceBudget::compact();
+    tiny.reservation_bytes = 1024;
+    let sink_owner = MemoryOwner::new(tiny);
+    let rows_owner = owner();
+    let diag = IoDiagnostics::new();
+    let sink = DataBusSink::bind(
+        DataBusSinkConfig::new("rows.a"),
+        bus.clone(),
+        sink_owner,
+        diag.clone(),
+    )
+    .unwrap();
+    let (out_tx, out_rx) = sparrow_io::observed::channel(4);
+    let outbox = Arc::new(sparrow_model::InflightCounter::new());
+    let task = tokio::spawn(sink.run(out_rx, CancellationToken::new(), Some(outbox.clone())));
+    outbox.enqueue();
+    out_tx.send(batch(&rows_owner, 1, 3)).await.unwrap();
+    drop(out_tx);
+    task.await.unwrap();
+    let s = diag.snapshot();
+    assert_eq!(s.databus_sink_dropped_budget, 3, "{s:?}");
+    assert_eq!(s.databus_sink_published, 0);
+    assert_eq!(
+        (outbox.acked(), outbox.failed()),
+        (0, 1),
+        "incomplete batch is not acked"
+    );
+    assert!(drain(&sub).await.is_empty());
+}

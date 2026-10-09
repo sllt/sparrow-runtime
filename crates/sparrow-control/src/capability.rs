@@ -13,13 +13,14 @@ pub fn inventory() -> Value {
     } else {
         &[]
     };
-    let sinks: Vec<&str> = ["http", "mqtt", "log"]
+    // The in-process Local DataBus is always built (no SDK).
+    let sinks: Vec<&str> = ["http", "mqtt", "log", "databus"]
         .iter()
         .chain(nats)
         .chain(jetstream_sink)
         .copied()
         .collect();
-    let mut combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file"]
+    let mut combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file", "databus"]
         .iter()
         .chain(nats)
         .copied()
@@ -208,15 +209,16 @@ mod tests {
     #[test]
     fn production_inventory_does_not_claim_unimplemented_backends_or_certification() {
         let value = super::inventory();
-        // 4 live/file sources (mqtt, http_push, http_poll, file) x 3 sinks, plus NATS Core
-        // as both a source and a sink when the `nats` feature is built, plus the
-        // JetStream Sink (live matrix + one aligned File profile) with `jetstream`.
+        // 5 live/file sources (mqtt, http_push, http_poll, file, databus) x 4 sinks
+        // (http, mqtt, log, databus), plus NATS Core as both a source and a sink
+        // when the `nats` feature is built, plus the JetStream Sink (live matrix +
+        // one aligned File profile) with `jetstream`.
         let expected = if cfg!(feature = "jetstream") {
-            5 * 5 + 1
+            6 * 6 + 1
         } else if cfg!(feature = "nats") {
-            5 * 4
+            6 * 5
         } else {
-            4 * 3
+            5 * 4
         };
         assert_eq!(value["combinations"].as_array().unwrap().len(), expected);
         assert!(value["combinations"]
@@ -225,6 +227,8 @@ mod tests {
             .iter()
             .filter(|c| c["source"] == "nats"
                 || c["sink"] == "nats"
+                || c["source"] == "databus"
+                || c["sink"] == "databus"
                 || (c["sink"] == "jetstream" && c["source"] != "file"))
             .all(|c| c["delivery"] == "live_best_effort" && c["recovery"] == "restart_fresh"));
         assert!(value["combinations"]

@@ -246,3 +246,17 @@ JSI1 绑定端点、token SecretRef（不保存值）、stream 精确 created na
 旧目录/目标/下游语义变化不能静默继承历史。去重只在窗口内且要求稳定唯一 id，空值仍可能重复。
 配置管理员不得在检查之间修改又恢复策略；PubAck/File 不等于消费者业务提交或设备掉电/fsync、HA、
 exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/20k 压测未执行。
+
+## 附：Local DataBus Source/Sink（`kind: "databus"`）
+
+说明见 [DATABUS.md](DATABUS.md)，决策见 [ADR-006](adr/006-local-databus.md)。无需 feature。
+
+| 合同项 | Local DataBus 的实现 |
+|---|---|
+| 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`，即 at-most-once、进程内、无历史；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
+| 内存 | 订阅缓冲上限 `buffer_bytes + buffer_capacity × 64 B` 在订阅时记入 job reservation（≤ reservation/2），与 NATS/JetStream 缓冲合计 ≤ 3/4（饱和算术）；inbox 按 `inbox_bytes` 计入 queue 账本；Source 解码与 Sink 编码前先预扣临时额度（不足计 `dropped_budget`，不解析 / 不编码） |
+| 背压 / 慢消费者 | 每个订阅有界；`drop_oldest`（默认）/ `drop_newest` 从不阻塞发布方；`block` 最多等 `block_timeout_ms`，超时只对该订阅者丢弃；阻塞订阅者排在最后等待，不拖慢其他订阅者 |
+| 完成 | 批次中的每一行都投给所有匹配订阅后才回执 outbox；无订阅者时计 `no_subscribers` 并丢弃 |
+| 校验 | topic 语法（订阅可用 `*` / 末尾 `>`，发布必须是字面 topic）、边界、同一 pipeline 内的自反馈环；Sink 注册失败 fail closed（`databus_sink_fatal`） |
+| 关闭 | 订阅 / 发布注册为 RAII，job 结束即注销，topic 不泄漏；未消费缓冲计 `discarded_on_close`；Sink 停止时在途与已排队批次共用一个 `flush_timeout_ms` 截止时间（不受 `block_timeout_ms` 延长） |
+| 指标 | `databus_source_*` / `databus_sink_*`，pipeline status 中的 `databus_source` / `databus_sink` 对象 |

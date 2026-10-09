@@ -69,6 +69,8 @@ pub use validate::{
 #[cfg(test)]
 mod core_b_binding_tests;
 #[cfg(test)]
+mod databus_tests;
+#[cfg(test)]
 mod reference_tests;
 #[cfg(test)]
 mod live_lookup_tests;

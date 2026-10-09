@@ -7,6 +7,7 @@
 //! then drops if capacity does not recover before its configured deadline.
 
 pub mod capabilities;
+pub mod databus;
 pub mod diag;
 pub mod error;
 pub mod file_replay;
@@ -22,6 +23,7 @@ pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
 pub mod policy;
+pub(crate) mod scratch;
 pub mod secret;
 pub mod tls;
 
@@ -29,6 +31,7 @@ pub use capabilities::{
     refuse_delivery_name, refuse_durable_recovery, refuse_qos_durable, refuse_unsupported_recovery,
     ConnectorCapabilities, ReplaySupport,
 };
+pub use databus::{DataBus, DataBusSink, DataBusSinkConfig, DataBusSource, DataBusSourceConfig};
 pub use diag::{IoDiagnostics, IoSnapshot};
 pub use error::{ConnectorError, Result};
 pub use file_replay::{FileContract, FilePoll, FileReplayConfig, FileReplaySource};
