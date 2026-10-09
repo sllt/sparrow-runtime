@@ -1,4 +1,77 @@
-# 不可变参考表与 Lookup
+# 不可变参考表、动态更新与外部 Lookup
+
+## 第9批：动态表与 HTTP Lookup（2026-10-05 Preview）
+
+以下是新增的明确选项，不改变旧的静态revision绑定与v8～v11恢复合同。是否验证通过及匹配构建以 [PRODUCTION](PRODUCTION.md) 的本批证据为准；后文B1/B2历史成绩不能替代本批结果。
+
+### 增量发布及回退
+
+表仍保存不可变revision。初始schema/主键通过 `put-table` 发布；此后 `POST /v1/tables/{name}/mutate` 接受：
+
+```json
+{"expected_revision":1,"operations":[
+  {"op":"upsert","row":["a",20]},
+  {"op":"delete","key":["b"]}
+]}
+```
+
+`row`是完整表字段顺序，`key`按表的keys顺序。一次1～256操作、完整JSON≤64KiB；同批重复主键、缺失delete、NULL/错误key、非法row或最终容量超限导致整批回滚。更新保持原row顺序，新key按操作顺序追加。成功只生成一个新revision；重试旧expected_revision会CAS失败，响应丢失时先查看head再决定后续操作，不隐式重复执行。
+
+`POST /v1/tables/{name}/rollback`：`{"expected_revision":2,"target_revision":1}` 将保留的历史内容发布为revision3，**不倒退head**；target必须还存在，schema/keys必须与当前相同。`GET /v1/tables/{name}/revisions`只返回有限metadata。原128版本/名称、8MiB/名称、32MiB目录逻辑配额不放宽；没有自动删除仍被历史管道引用的数据。GC可回收非latest且无持久引用的版本。SQLite提交失败执行ROLLBACK，不保留半提交head。
+
+CLI：`tables`、`table NAME [REVISION]`、`table-revisions NAME`、`put-table NAME JSON`（含expected_revision/table）、`mutate-table NAME JSON`、`rollback-table NAME EXPECTED TARGET`、`gc-table NAME`。API沿用Bearer、drain/body/并发限制、CAS与不含业务值的审计错误。
+
+### 显式在线跟随
+
+```json
+"reference_tables": {
+  "limits": {"revision":1,"sha256":"APPROVED_INITIAL_SHA256","follow_latest":true}
+}
+```
+
+不写 `follow_latest` 时仍为false，旧JSON身份不变，发布新表不影响旧静态Job。开启后仍需初始revision/hash，它是持久baseline pin和schema/key约束。启动先验证baseline，再在任何来源I/O前解析兼容的最新内容；运行时由Supervisor约200ms的converge轮询metadata，仅变化时解码并构造新的Job-owned snapshot。切换发生在**每个Lookup算子处理下一批时**，在途批保持旧Arc；不承诺多个算子、多个表或一整条规则同时观察同一版本，也不是ET as-of重放。
+
+head倒退、缺失、加载到的内容损坏、schema/key改变或构建预算不足都会使Job失败并取消；没有无限沿用旧值的stale fallback。head未变化时不重复解码或重算内容摘要，因此不承诺持续检测绕过API的磁盘篡改。旧snapshot只随在途reader保留，其retention credit直到最后reader释放才归还；替换必须容得下构建峰值和新旧重叠。历史baseline仍由管道revision保守pin；运行时观察过的其他版本不构成checkpoint pin，GC后不承诺历史重现。
+
+### 外部 HTTP Lookup
+
+复用SQL静态表JOIN的Lookup路径或Graph的 `kind:"lookup"`，无需新造SQL函数。通过 `external_lookups` 声明远端schema/keys及连接：
+
+```json
+"external_lookups": {
+  "limits": {
+    "url":"https://business.example/lookup",
+    "header_secret":"lookup_token",
+    "fields":[{"name":"device_id","type":"utf8","nullable":false},
+              {"name":"threshold","type":"int64","nullable":false}],
+    "keys":["device_id"],
+    "options":{"max_inflight":4,"timeout_ms":1000,"cache_ttl_ms":1000,
+               "cache_bytes":65536,"on_error":"fail"}
+  }
+}
+```
+
+URL固定，不从输入拼地址；需原有TargetPolicy allowlist，凭据通过命名Secret显式解析且只允许HTTPS。禁止userinfo/fragment、重复query key、重定向、环境proxy和隐式/应用重试。共用HTTP Client的隐式协议重试也关闭，原HttpSink显式max_retries策略不变。TLS校验仍启用，没有skip_verify。
+
+Wire为 `POST {"keys":{"device_id":"a"}}`；仅 `200 {"row":{"device_id":"a","threshold":20}}` 或 `200 {"row":null}`。必须返回完整声明字段，拒绝未知/重复字段、错误类型、非有限浮点、错主键、超限数据；204/404不是隐式miss。最多16列、8个非NULL稳定主键列，不接受Float key/Dynamic/Array；Bytes为base64，Int64/UInt64/TimestampMicrosUTC精确保留。流的NULL key直接产生miss，不请求远端。请求/响应wire和返回row resident各≤64KiB。
+
+每个**物理Lookup算子**最多1～16并发（默认4），timeout10～5000ms，按输入顺序产出，控制消息不能超越请求；整批完成类型/key验证及输出计费后才发布。不是整个服务或同名provider所有引用合计的并发上限。每请求窗口先取应用scratch credit（HTTP provider声明512KiB，runtime另计key/返回row/输出等），额度不足在请求前拒绝，不自动扩大Job预算。Client/pool/TLS内部metadata不冒充全部纳入应用frame额度或进程RSS硬上限。
+
+每算子cache最多1MiB、1024项、TTL≤60s（默认64KiB/1s），typed key、正负缓存、单调时钟过期和有界淘汰；TTL=0或cache_bytes<256禁用。缓存按算子独立，任务重启清空；TTL内业务变化可能暂不可见，不当历史快照。错误不进cache。默认 `on_error:"fail"`；显式 `"null"` 只将transport/status/timeout错误降为NULL，不吞类型/key/协议/策略/预算错误，也不把cancel当成功。超限或未读完的响应不复用连接；有界响应体读完后HTTP连接可复用，业务JSON校验失败仍使本次Lookup失败。失败/取消会终止并join在途任务，未join响应仍持有内存credit。
+
+### 恢复、诊断与边界
+
+`follow_latest`或external绑定只接受 **live_best_effort + restart_fresh**，拒绝任何restore/checkpoint配置、managed temporal或专用paused-time/feed-observation profile；有限查询不接外部I/O。失败或Server重启后需要显式start，不自动用今天的数据重放旧来源。不是aligned/exactly-once、CDC消费位置提交或历史请求结果日志；远端API必须是只读查询，不能把有副作用的POST塞进Lookup。
+
+`status.lookup_runtime`区分实际attempt、live表observed_revision/SHA/failed与external请求、miss、NULL key、缓存、超时/失败、inflight/peak等计数。原 `reference_tables.stored_latest/running_actual.bindings` 是管道声明，不再被误读为热跟随当前内容。指标不包含行或Secret；同provider多算子计数合并，瞬时inflight可能超过单算子配置。
+
+`timeouts`精确计数runtime外层请求deadline触发；provider自身的连接/读超时可能先返回，计入`failures`，不保证同时增加`timeouts`。判断超时策略是否执行不能只看该子计数；所有这些错误都按同一个`on_error`合同处理。
+
+catalog仍为v4，新增选项省略时不改变旧静态表示及checkpoint codec。旧二进制不认识新配置，应保留配套catalog/配置备份再回退；不能把follow_latest改成静态、或把当下远端返回当旧快照以绕过恢复校验。下一步批量CDC接入、外部数据库专用provider、持久响应日志/恢复、目标容量与长期soak均需独立验证，不由本批Preview泛化。
+
+---
+
+## 以下为静态参考表历史合同与验收
 
 状态：核心增强 B1 和 B2-A 均已在下述限定范围完成实现、交叉 Review、匹配构建、专项/真实进程与相关全局回归；各自三组 File ABBA 的全样本合并通过原门槛，单组失败样本保留。B2-A 有独立证据，不继承 B1 测试结论。未 commit/push/tag，不是生产放行声明。
 

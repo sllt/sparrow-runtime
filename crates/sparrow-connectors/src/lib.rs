@@ -12,6 +12,7 @@ pub mod error;
 pub mod file_replay;
 pub mod file_sink;
 pub mod http;
+pub mod http_lookup;
 pub mod http_push;
 #[cfg(feature = "jetstream")]
 pub mod jetstream;
@@ -31,6 +32,7 @@ pub use file_replay::{FileContract, FilePoll, FileReplayConfig, FileReplaySource
 #[cfg(feature = "demo-io")]
 pub use http::{CapturedRequest, HttpCapture};
 pub use http::{HttpSink, HttpSinkConfig};
+pub use http_lookup::{HttpLookup, HttpLookupConfig};
 pub use http_push::{HttpPushSource, HttpPushSourceConfig};
 pub use log::{LogSink, LogSinkConfig};
 #[cfg(feature = "demo-io")]

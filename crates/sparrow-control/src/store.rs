@@ -22,6 +22,8 @@ use crate::status::PipelineStatus;
 pub const CATALOG_SCHEMA_VERSION: u32 = 4;
 #[path="store_plugins.rs"]
 mod plugin_catalog;
+#[path = "store_reference_mutations.rs"]
+mod reference_mutations;
 pub const FORMAT_VERSION: u32 = 1;
 const AUDIT_CAP: usize = 200;
 const ATTEMPT_CAP: usize = 100;
@@ -230,183 +232,197 @@ impl Store {
             ));
         }
         let payload = table.encoded_bytes()?;
-        let payload_bytes = payload.len() as u64;
         self.write(|c| {
-            let current: Option<i64> = c
-                .query_row(
-                    "SELECT latest_revision FROM reference_table_heads WHERE name=?1",
-                    [name],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(db)?;
-            let current_u64 = match current {
-                None => 0,
-                Some(value) if value > 0 => value as u64,
-                Some(_) => {
-                    return Err(SparrowError::new(
-                        ErrorCode::CodecViolation,
-                        "reference table head revision is invalid",
-                    ));
-                }
-            };
-            if current_u64 != 0 {
-                // A head is an immutable revision pointer, not merely a CAS
-                // counter.  Refuse to publish over a dangling/corrupt head.
-                load_reference_table_metadata(c, name, current_u64)?;
-            }
-            if current_u64 != expected_revision {
-                return Err(SparrowError::new(
-                    ErrorCode::InvalidArgument,
-                    format!(
-                        "reference table `{name}` expected revision {expected_revision}, current {current_u64}"
-                    ),
-                )
-                .context("expected_revision", expected_revision.to_string())
-                .context("current_revision", current_u64.to_string()));
-            }
-            let revision = expected_revision.checked_add(1).ok_or_else(|| {
-                SparrowError::new(
-                    ErrorCode::BoundExceeded,
-                    "reference table revision exhausted",
-                )
-            })?;
-            if revision > i64::MAX as u64 {
-                return Err(SparrowError::new(
-                    ErrorCode::BoundExceeded,
-                    "reference table revision exceeds SQLite integer range",
-                ));
-            }
-            let versions: i64 = c
-                .query_row(
-                    "SELECT COUNT(*) FROM reference_table_revisions WHERE name=?1",
-                    [name],
-                    |r| r.get(0),
-                )
-                .map_err(db)?;
-            if versions as usize >= MAX_REFERENCE_TABLE_VERSIONS {
-                return Err(SparrowError::new(
-                    ErrorCode::BoundExceeded,
-                    format!(
-                        "reference table `{name}` exceeds {MAX_REFERENCE_TABLE_VERSIONS} revisions"
-                    ),
-                ));
-            }
-            if current.is_none() {
-                let names: i64 = c
-                    .query_row(
-                        "SELECT COUNT(*) FROM reference_table_heads",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map_err(db)?;
-                if names as usize >= MAX_REFERENCE_TABLE_NAMES {
-                    return Err(SparrowError::new(
-                        ErrorCode::BoundExceeded,
-                        format!(
-                            "reference table catalog exceeds {MAX_REFERENCE_TABLE_NAMES} names"
-                        ),
-                    ));
-                }
-            }
-            let table_bytes: i64 = c
-                .query_row(
-                    "SELECT COALESCE(SUM(payload_bytes + ?2),0) FROM reference_table_revisions WHERE name=?1",
-                    params![name, REFERENCE_TABLE_METADATA_BYTES as i64],
-                    |r| r.get(0),
-                )
-                .map_err(db)?;
-            if table_bytes < 0 {
+            self.publish_reference_table_locked(c, name, expected_revision, table, &payload)
+        })
+    }
+
+    /// The caller already holds Store::write's SQLite transaction.  Sharing
+    /// this path makes full publication, mutations and rollback enforce the
+    /// same CAS, quota, canonical digest and head integrity contract.
+    fn publish_reference_table_locked(
+        &self,
+        c: &Connection,
+        name: &str,
+        expected_revision: u64,
+        table: &ReferenceTableSpec,
+        payload: &[u8],
+    ) -> Result<ReferenceTableRow> {
+        let payload_bytes = payload.len() as u64;
+        let current: Option<i64> = c
+            .query_row(
+                "SELECT latest_revision FROM reference_table_heads WHERE name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db)?;
+        let current_u64 = match current {
+            None => 0,
+            Some(value) if value > 0 => value as u64,
+            Some(_) => {
                 return Err(SparrowError::new(
                     ErrorCode::CodecViolation,
-                    "reference table byte metadata is invalid",
+                    "reference table head revision is invalid",
                 ));
             }
-            if (table_bytes.max(0) as u64)
-                .saturating_add(payload_bytes)
-                .saturating_add(REFERENCE_TABLE_METADATA_BYTES)
-                > MAX_REFERENCE_TABLE_BYTES_PER_NAME
-            {
-                return Err(SparrowError::new(
-                    ErrorCode::BoundExceeded,
-                    format!(
-                        "reference table `{name}` exceeds {MAX_REFERENCE_TABLE_BYTES_PER_NAME}B across revisions"
-                    ),
-                ));
-            }
-            let catalog_bytes: i64 = c
-                .query_row(
-                    "SELECT COALESCE(SUM(payload_bytes + ?1),0) FROM reference_table_revisions",
-                    [REFERENCE_TABLE_METADATA_BYTES as i64],
-                    |r| r.get(0),
-                )
-                .map_err(db)?;
-            if catalog_bytes < 0 {
-                return Err(SparrowError::new(
-                    ErrorCode::CodecViolation,
-                    "reference table catalog byte metadata is invalid",
-                ));
-            }
-            if (catalog_bytes.max(0) as u64)
-                .saturating_add(payload_bytes)
-                .saturating_add(REFERENCE_TABLE_METADATA_BYTES)
-                > MAX_REFERENCE_TABLE_CATALOG_BYTES
-            {
-                return Err(SparrowError::new(
-                    ErrorCode::BoundExceeded,
-                    format!(
-                        "reference table catalog exceeds {MAX_REFERENCE_TABLE_CATALOG_BYTES}B"
-                    ),
-                ));
-            }
-            let sha256 = reference_table_sha256(name, revision, table)?;
-            let table_json = String::from_utf8(payload.clone()).map_err(|_| {
-                SparrowError::new(
-                    ErrorCode::InvalidSchema,
-                    "reference table JSON is not UTF-8",
-                )
-            })?;
-            let created_at_ms = now_ms();
-            c.execute(
-                "INSERT INTO reference_table_revisions
-                    (name, revision, table_json, sha256, payload_bytes, row_count, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    name,
-                    revision as i64,
-                    table_json,
-                    sha256,
-                    payload_bytes as i64,
-                    table.rows.len() as i64,
-                    created_at_ms,
-                ],
+        };
+        if current_u64 != 0 {
+            // A head is an immutable revision pointer, not merely a CAS
+            // counter.  Refuse to publish over a dangling/corrupt head.
+            load_reference_table_metadata(c, name, current_u64)?;
+        }
+        if current_u64 != expected_revision {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "reference table `{name}` expected revision {expected_revision}, current {current_u64}"
+                ),
+            )
+            .context("expected_revision", expected_revision.to_string())
+            .context("current_revision", current_u64.to_string()));
+        }
+        let revision = expected_revision.checked_add(1).ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "reference table revision exhausted",
+            )
+        })?;
+        if revision > i64::MAX as u64 {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "reference table revision exceeds SQLite integer range",
+            ));
+        }
+        let versions: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM reference_table_revisions WHERE name=?1",
+                [name],
+                |r| r.get(0),
             )
             .map_err(db)?;
-            if current.is_some() {
-                c.execute(
-                    "UPDATE reference_table_heads SET latest_revision=?1 WHERE name=?2",
-                    params![revision as i64, name],
+        if versions as usize >= MAX_REFERENCE_TABLE_VERSIONS {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "reference table `{name}` exceeds {MAX_REFERENCE_TABLE_VERSIONS} revisions"
+                ),
+            ));
+        }
+        if current.is_none() {
+            let names: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM reference_table_heads",
+                    [],
+                    |r| r.get(0),
                 )
                 .map_err(db)?;
-            } else {
-                c.execute(
-                    "INSERT INTO reference_table_heads(name, latest_revision) VALUES (?1, ?2)",
-                    params![name, revision as i64],
-                )
-                .map_err(db)?;
+            if names as usize >= MAX_REFERENCE_TABLE_NAMES {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    format!(
+                        "reference table catalog exceeds {MAX_REFERENCE_TABLE_NAMES} names"
+                    ),
+                ));
             }
-            // A failed transaction may cause an extra status-cache miss, but
-            // must never leave a stale successful answer after a commit.
-            self.inner.reference_epoch.fetch_add(1, Ordering::Relaxed);
-            Ok(ReferenceTableRow {
-                name: name.to_string(),
-                revision,
+        }
+        let table_bytes: i64 = c
+            .query_row(
+                "SELECT COALESCE(SUM(payload_bytes + ?2),0) FROM reference_table_revisions WHERE name=?1",
+                params![name, REFERENCE_TABLE_METADATA_BYTES as i64],
+                |r| r.get(0),
+            )
+            .map_err(db)?;
+        if table_bytes < 0 {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "reference table byte metadata is invalid",
+            ));
+        }
+        if (table_bytes.max(0) as u64)
+            .saturating_add(payload_bytes)
+            .saturating_add(REFERENCE_TABLE_METADATA_BYTES)
+            > MAX_REFERENCE_TABLE_BYTES_PER_NAME
+        {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "reference table `{name}` exceeds {MAX_REFERENCE_TABLE_BYTES_PER_NAME}B across revisions"
+                ),
+            ));
+        }
+        let catalog_bytes: i64 = c
+            .query_row(
+                "SELECT COALESCE(SUM(payload_bytes + ?1),0) FROM reference_table_revisions",
+                [REFERENCE_TABLE_METADATA_BYTES as i64],
+                |r| r.get(0),
+            )
+            .map_err(db)?;
+        if catalog_bytes < 0 {
+            return Err(SparrowError::new(
+                ErrorCode::CodecViolation,
+                "reference table catalog byte metadata is invalid",
+            ));
+        }
+        if (catalog_bytes.max(0) as u64)
+            .saturating_add(payload_bytes)
+            .saturating_add(REFERENCE_TABLE_METADATA_BYTES)
+            > MAX_REFERENCE_TABLE_CATALOG_BYTES
+        {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "reference table catalog exceeds {MAX_REFERENCE_TABLE_CATALOG_BYTES}B"
+                ),
+            ));
+        }
+        let sha256 = reference_table_sha256(name, revision, table)?;
+        let table_json = String::from_utf8(payload.to_vec()).map_err(|_| {
+            SparrowError::new(
+                ErrorCode::InvalidSchema,
+                "reference table JSON is not UTF-8",
+            )
+        })?;
+        let created_at_ms = now_ms();
+        c.execute(
+            "INSERT INTO reference_table_revisions
+                (name, revision, table_json, sha256, payload_bytes, row_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                name,
+                revision as i64,
+                table_json,
                 sha256,
-                table: table.clone(),
-                payload_bytes,
-                row_count: table.rows.len() as u64,
+                payload_bytes as i64,
+                table.rows.len() as i64,
                 created_at_ms,
-            })
+            ],
+        )
+        .map_err(db)?;
+        if current.is_some() {
+            c.execute(
+                "UPDATE reference_table_heads SET latest_revision=?1 WHERE name=?2",
+                params![revision as i64, name],
+            )
+            .map_err(db)?;
+        } else {
+            c.execute(
+                "INSERT INTO reference_table_heads(name, latest_revision) VALUES (?1, ?2)",
+                params![name, revision as i64],
+            )
+            .map_err(db)?;
+        }
+        // A failed transaction may cause an extra status-cache miss, but
+        // must never leave a stale successful answer after a commit.
+        self.inner.reference_epoch.fetch_add(1, Ordering::Relaxed);
+        Ok(ReferenceTableRow {
+            name: name.to_string(),
+            revision,
+            sha256,
+            table: table.clone(),
+            payload_bytes,
+            row_count: table.rows.len() as u64,
+            created_at_ms,
         })
     }
 
@@ -1467,8 +1483,17 @@ impl Store {
                         "injected catalog crash before COMMIT",
                     ));
                 }
-                g.execute_batch("COMMIT").map_err(db)?;
-                Ok(v)
+                match g.execute_batch("COMMIT") {
+                    Ok(()) => Ok(v),
+                    Err(error) => {
+                        // In rollback-journal mode a concurrent read snapshot
+                        // may make COMMIT return SQLITE_BUSY while keeping this
+                        // transaction open. Never expose its uncommitted head
+                        // or poison the next BEGIN after reporting failure.
+                        let _ = g.execute_batch("ROLLBACK");
+                        Err(db(error).context("catalog_stage", "commit"))
+                    }
+                }
             }
             Err(e) => {
                 let _ = g.execute_batch("ROLLBACK");
@@ -1620,16 +1645,22 @@ fn load_reference_table_revision(
     let (stored_name, stored_revision, table_json, stored_sha, payload_bytes, row_count, created_at): (
         String,
         i64,
-        String,
+        Option<String>,
         String,
         i64,
         i64,
         i64,
     ) = c
         .query_row(
-            "SELECT name, revision, table_json, sha256, payload_bytes, row_count, created_at
+            "SELECT name, revision,
+                    CASE WHEN length(CAST(table_json AS BLOB)) <= ?3 THEN table_json ELSE NULL END,
+                    sha256, payload_bytes, row_count, created_at
              FROM reference_table_revisions WHERE name=?1 AND revision=?2",
-            params![name, revision as i64],
+            params![
+                name,
+                revision as i64,
+                crate::reference_table::MAX_REFERENCE_TABLE_BYTES as i64,
+            ],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -1662,6 +1693,12 @@ fn load_reference_table_revision(
             "reference table metadata contains a negative value",
         ));
     }
+    let table_json = table_json.ok_or_else(|| {
+        SparrowError::new(
+            ErrorCode::MaxRecordSize,
+            "stored reference table payload exceeds the catalog bound",
+        )
+    })?;
     let table = ReferenceTableSpec::from_json(table_json.as_bytes())?;
     let encoded = table.encoded_bytes()?;
     if encoded.len() as u64 != payload_bytes as u64
@@ -2576,6 +2613,7 @@ mod tests {
             version: 1,
             stream: "sensors".into(),
             reference_tables: Default::default(),
+            external_lookups: Default::default(),
             sql: Some("SELECT device_id FROM sensors".into()),
             graph: None,
             source: SourceSpec {

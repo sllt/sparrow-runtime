@@ -42,6 +42,8 @@ pub fn http_client(timeout: std::time::Duration, connect_timeout: std::time::Dur
         .timeout(timeout)
         .connect_timeout(connect_timeout)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .retry(reqwest::retry::never())
         .tls_built_in_root_certs(true)
         .https_only(false)
         .build()

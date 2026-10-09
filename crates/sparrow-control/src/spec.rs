@@ -18,6 +18,8 @@ pub struct PipelineSpec {
     /// the data observed by this pipeline revision.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub reference_tables: std::collections::BTreeMap<String, ReferenceBinding>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub external_lookups: std::collections::BTreeMap<String, crate::lookup::ExternalLookupSpec>,
     #[serde(default)]
     pub sql: Option<String>,
     #[serde(default)]
@@ -48,6 +50,11 @@ pub struct PipelineSpec {
 pub struct ReferenceBinding {
     pub revision: u64,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub follow_latest: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -276,13 +283,17 @@ pub fn fail_on_decode_from_env() -> bool {
 }
 
 impl PipelineSpec {
+    pub fn has_live_lookups(&self) -> bool {
+        !self.external_lookups.is_empty()
+            || self.reference_tables.values().any(|r| r.follow_latest)
+    }
     pub fn has_external_plugins(&self) -> bool {
         self.source.plugin.is_some() || self.sink.plugin.is_some()
             || self.graph.as_ref().is_some_and(|g|g.nodes.iter().any(|n|n.plugin.is_some()))
             || self.graph_io.as_ref().is_some_and(|io|io.sources.values().any(|s|s.plugin.is_some())||io.sinks.values().any(|s|s.plugin.is_some()))
     }
     pub fn requires_explicit_restart(&self) -> bool {
-        self.fixed_snapshot_id().is_some() || self.has_external_plugins()
+        self.fixed_snapshot_id().is_some() || self.has_external_plugins() || self.has_live_lookups()
     }
     /// A numeric restore is an explicit replay operation, never an implicit
     /// request to replay the same history after failure/process restart.
@@ -298,6 +309,9 @@ impl PipelineSpec {
 
     pub fn checkpoint_warnings(&self) -> Vec<&'static str> {
         let mut warnings = Vec::new();
+        if self.has_live_lookups() {
+            warnings.push("live_lookup_requires_explicit_start_after_failure_or_process_restart; updates_are_observed_not_replayed");
+        }
         if self.has_external_plugins() {warnings.push("external_plugin_requires_explicit_start_after_failure_or_process_restart");}
         if self.fixed_snapshot_id().is_some() {
             warnings
@@ -346,6 +360,34 @@ impl PipelineSpec {
     }
 
     pub fn basic_check(&self) -> Result<()> {
+        if self.reference_tables.len() + self.external_lookups.len() > 8 {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "at most eight managed/external lookup bindings are allowed",
+            ));
+        }
+        for (name, external) in &self.external_lookups {
+            crate::store::check_name(name)?;
+            external.validate(name)?;
+            if name == &self.stream || self.reference_tables.contains_key(name) {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    "external Lookup must not shadow a stream/reference binding",
+                ));
+            }
+        }
+        if self.has_live_lookups()
+            && (self.delivery != "live_best_effort"
+                || self.recovery != "restart_fresh"
+                || self.restore.is_some()
+                || self.checkpoint.is_some()
+                || self.checkpoint_dir.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "live/remote Lookup is restart_fresh only; responses and update boundaries are not a replay log",
+            ));
+        }
         for (kind, binding) in [(&self.source.kind, &self.source.plugin), (&self.sink.kind, &self.sink.plugin)] {
             if (kind == "plugin") != binding.is_some() {
                 return Err(SparrowError::new(ErrorCode::InvalidArgument, "plugin binding is required exclusively for kind=plugin"));
@@ -409,7 +451,10 @@ impl PipelineSpec {
                     && node
                         .table
                         .as_ref()
-                        .is_some_and(|table| self.reference_tables.contains_key(table))
+                        .is_some_and(|table| {
+                            self.reference_tables.contains_key(table)
+                                || self.external_lookups.contains_key(table)
+                        })
                 {
                     return Err(SparrowError::new(
                         ErrorCode::InvalidSchema,

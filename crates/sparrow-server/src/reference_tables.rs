@@ -13,7 +13,9 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sparrow_control::{ReferenceTableMetadata, ReferenceTableRow, ReferenceTableSpec};
+use sparrow_control::{
+    MutationSpec, ReferenceTableMetadata, ReferenceTableRow, ReferenceTableSpec, RollbackSpec,
+};
 use sparrow_model::{ErrorCode, SparrowError};
 
 use crate::{blocking_api, require_auth, ApiError, ApiResult, AppState};
@@ -48,6 +50,106 @@ impl TableBody {
             fields: self.fields,
             keys: self.keys,
             rows: self.rows,
+        }
+    }
+}
+
+fn parse_table_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> ApiResult<T> {
+    if body.len() > MAX_TABLE_BODY {
+        return Err(table_error(SparrowError::new(
+            ErrorCode::MaxRecordSize,
+            "reference table request exceeds the management body limit",
+        )));
+    }
+    serde_json::from_slice(body).map_err(|_| {
+        table_error(SparrowError::new(
+            ErrorCode::InvalidArgument,
+            "invalid reference table request JSON",
+        ))
+    })
+}
+
+/// POST `/v1/tables/{name}/mutate`.  The body is the exact bounded catalog
+/// batch shape, not arbitrary SQL or a remote CDC command.
+pub(crate) async fn mutate_table(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    let actor = require_auth(&state, &headers)?;
+    let mutation: MutationSpec = parse_table_request(&body)?;
+    blocking_api(move || {
+        let result = state.store.mutate_reference_table(&name, &mutation);
+        audit_table_change(
+            &state,
+            &actor,
+            &name,
+            "mutate_reference_table",
+            &format!(
+                "based_on_revision={};operations={}",
+                mutation.expected_revision,
+                mutation.operations.len()
+            ),
+            result,
+        )
+    })
+    .await
+}
+
+/// POST `/v1/tables/{name}/rollback`.  Rollback publishes a new revision
+/// containing retained historical rows; it never decrements latest_revision.
+pub(crate) async fn rollback_table(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    let actor = require_auth(&state, &headers)?;
+    let rollback: RollbackSpec = parse_table_request(&body)?;
+    blocking_api(move || {
+        let result = state.store.rollback_reference_table(&name, &rollback);
+        audit_table_change(
+            &state,
+            &actor,
+            &name,
+            "rollback_reference_table",
+            &format!(
+                "based_on_revision={};target_revision={}",
+                rollback.expected_revision, rollback.target_revision
+            ),
+            result,
+        )
+    })
+    .await
+}
+
+fn audit_table_change(
+    state: &AppState,
+    actor: &str,
+    name: &str,
+    action: &str,
+    operation_detail: &str,
+    result: sparrow_model::Result<ReferenceTableRow>,
+) -> ApiResult<Json<Value>> {
+    match result {
+        Ok(record) => {
+            let detail = format!(
+                "{operation_detail};revision={};sha256={}",
+                record.revision, record.sha256
+            );
+            state
+                .store
+                .audit(actor, action, Some(name), Some(&detail), "ok")
+                .map_err(table_error)?;
+            Ok(Json(metadata_value(ReferenceTableMetadata::from(&record))?))
+        }
+        Err(error) => {
+            let detail = format!("error_code={}", error.code.as_str());
+            let _ = state
+                .store
+                .audit(actor, action, Some(name), Some(&detail), "failed");
+            Err(table_error(error))
         }
     }
 }
@@ -173,6 +275,33 @@ pub(crate) async fn get_table_revision(
             .get_reference_table_revision(&name, revision)
             .map_err(table_error)?;
         Ok(Json(table_response(&name, row_value(record)?)))
+    })
+    .await
+}
+
+/// GET `/v1/tables/{name}/revisions` — finite retained history, metadata only.
+pub(crate) async fn list_table_revisions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_auth(&state, &headers)?;
+    blocking_api(move || {
+        let revisions = state
+            .store
+            .list_reference_table_revisions(&name)
+            .map_err(table_error)?;
+        if revisions.is_empty() {
+            return Err(table_error(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "unknown reference table",
+            )));
+        }
+        let records = revisions
+            .into_iter()
+            .map(metadata_value)
+            .collect::<ApiResult<Vec<_>>>()?;
+        Ok(Json(json!({"name": name, "revisions": records})))
     })
     .await
 }

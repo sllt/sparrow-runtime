@@ -12,6 +12,7 @@ mod extension_tests;
 pub mod capability;
 pub mod checkpoint;
 pub mod query;
+pub mod lookup;
 pub mod plugins;
 pub mod reference_table;
 pub mod spec;
@@ -24,7 +25,8 @@ mod file_source;
 mod plugin_io;
 
 pub use reference_table::{
-    reference_table_sha256, ReferenceTableMetadata, ReferenceTableRow, ReferenceTableSpec,
+    reference_table_sha256, MutationSpec, ReferenceTableMetadata, ReferenceTableRow,
+    ReferenceTableSpec, RollbackSpec, TableMutation, MAX_REFERENCE_TABLE_MUTATIONS,
     MAX_REFERENCE_TABLE_BYTES, MAX_REFERENCE_TABLE_BYTES_PER_NAME,
     MAX_REFERENCE_TABLE_CATALOG_BYTES, MAX_REFERENCE_TABLE_NAMES, MAX_REFERENCE_TABLE_PREVIEW_PINS,
     MAX_REFERENCE_TABLE_ROWS, MAX_REFERENCE_TABLE_VERSIONS, REFERENCE_TABLE_METADATA_BYTES,
@@ -65,6 +67,10 @@ pub use validate::{
 mod core_b_binding_tests;
 #[cfg(test)]
 mod reference_tests;
+#[cfg(test)]
+mod live_lookup_tests;
+#[cfg(test)]
+mod reference_mutation_tests;
 
 #[cfg(test)]
 mod review_tests;

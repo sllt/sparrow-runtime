@@ -219,6 +219,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
 
 fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> PipelineSpec {
     PipelineSpec {
+        external_lookups:Default::default(),
         reference_tables: Default::default(),
         graph_io: None,
         version: 1,
@@ -374,6 +375,7 @@ fn r23_start_named_uses_desired_revision_not_latest() {
 #[test]
 fn mqtt_aligned_still_rejected() {
     let spec = PipelineSpec {
+        external_lookups:Default::default(),
         reference_tables: Default::default(),
         graph_io: None,
         version: 1,

@@ -13,6 +13,7 @@ sparrow-io = { workspace = true, features = ["observation"] }
 tokio.workspace = true
 tokio-util.workspace = true
 tracing = { version = "0.1.44", default-features = false }
+serde = { version = "1", features = ["derive"] }
 # No Axum, SQLite, MQTT, or SQL parser.
 
 [dev-dependencies]

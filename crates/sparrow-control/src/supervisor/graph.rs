@@ -308,6 +308,7 @@ impl Supervisor {
         if let Some(prepared) = prepared_references {
             request = request.with_tables(prepared.tables);
         }
+        request=self.attach_lookup_bindings(spec,request)?;
         let mut inputs = Vec::new();
         let mut ports = GraphPortDiagnostics {
             sources: BTreeMap::new(),

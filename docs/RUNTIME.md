@@ -1,5 +1,7 @@
 # Runtime ownership (A3 / A4)
 
+2026-10-05 Lookup扩展：可选follow_latest保持不可变baseline目录pin，来源开放前加载兼容head；Supervisor有限converge在blocking worker读取一致SQLite快照并构造Job-owned新表，无分离后台actor。每算子批次捕获一个Arc，构建/新旧重叠/旧reader保留都计费；schema/key/版本倒退/预算失败停止Job，无无限stale fallback，失败/进程重启显式start。外部HTTP固定URL、Client连接复用、完整有界body、无代理/redirect/隐式重试；core通过不依赖网络crate的async provider接口，有限window并发、按输入顺序返回整批，控制消息不能越过未完成请求。缓存固定额度、typed正负key、TTL，错误不缓存，取消abort＋join；pending及已完成未join结果持scratch lease。冷async续行与context/map副本必须先预留信用，默认无Lookup路径不分配新后台资源。两个公开IO校验入口和aligned门禁一致；旧静态codec不变。见 [合同](REFERENCE_TABLES.md)；未因本批开放任意实时查询的持久重放。
+
 2026-09-29 外部扩展：版本化copy-only IPC接入Source/Sink及Graph Pure Transform，各session固定一个阻塞actor和独立进程，不逐行创建脱离生命周期的任务。先取得Job scratch credit，再Open/编码/解码；Source Poll行数收紧到Kernel ingress批次，数据、水位、EOF有序背压，Accepted只表示易失准入。Transform完整校验并取得输出credit后发布，保留origin/source_operator；输入关闭/取消后join worker再释放计费及pin。Sink Flush/Close错误不能被记成completed；歧义失败不重发，失败和进程重启要求显式start。8个external进程槽、每IPC 1s、子进程128MiB地址空间，kill进程组＋wait后返还槽；清空环境/继承FD、no_new_privs不构成多租户OS沙箱。配置JSON的保守内存估计包含小容器开销，不只按wire bytes计费。完整合同见 [EXTENSIONS](EXTENSIONS.md)，验收证据单列。
 
 2026-09-29 包生命周期：可选/强制Ed25519策略、不可变format2依赖图在进入任何插件代码前完成预检；所有开启后端的依赖必须先获批准并启用。catalog v4随不可变revision原子保存SQL/Graph包引用，受管卸载按catalog→registry锁序和SQLite写事务检查历史引用；停止不等于可卸载，显式ETag退休仅清理无checkpoint的停止态fresh历史。原生format1身份不变，metadata可跨目标签名但native激活仍核验本机；ELF未知依赖/搜索路径拒绝，平台库不是包内hash闭包。1005/48、包4×5、三后端CLI及签名/撤销/迁移验证见[证据](PRODUCTION.md#package-lifecycle-validation)。旧v3二进制回退须配套catalog备份。

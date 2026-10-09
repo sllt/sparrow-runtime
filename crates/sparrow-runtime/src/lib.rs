@@ -23,6 +23,9 @@ pub use resample_iot::ResampleStats;
 mod analysis_tests;
 mod bounded_join;
 mod buffered_window;
+pub mod external_lookup;
+#[cfg(test)]
+mod external_lookup_tests;
 pub mod finite;
 pub mod graph_cut;
 pub mod kernel;
@@ -84,12 +87,16 @@ pub use checkpoint::{
 };
 pub use clock::RuntimeClock;
 pub use coordinator::{CheckpointCoordinator, CheckpointPhase};
+pub use external_lookup::{
+    ExternalLookup, ExternalLookupBinding, ExternalLookupOptions, LookupDiagnostics,
+    LookupDiagnosticsSnapshot, LookupErrorPolicy,
+};
 pub use kernel::{
     GraphInput, GraphOutput, IngressEvent, JobHandle, JobRequest, JobStats, Kernel, KernelOptions,
     SourceAdmission,
 };
 pub use linear::{drain, LinearExecutor, RuntimeConfig};
-pub use lookup::{ReferenceTable, VersionedReferenceTable};
+pub use lookup::{LiveReferenceTable, ReferenceTable, VersionedReferenceTable};
 pub use mailbox::{MailboxConfig, StreamControl};
 pub use metrics::{MetricsSnapshot, RuntimeMetrics};
 pub use state::{MemoryState, StateKey};

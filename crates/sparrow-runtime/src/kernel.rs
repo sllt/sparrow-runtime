@@ -20,7 +20,8 @@ use crate::barrier::AlignedJob;
 use crate::capture::SharedCapture;
 use crate::clock::RuntimeClock;
 use crate::dedup::DedupOperator;
-use crate::lookup::{LookupOperator, ReferenceTable, VersionedReferenceTable};
+use crate::external_lookup::{ExternalLookupBinding, ExternalLookupOperator, LookupDiagnostics};
+use crate::lookup::{LiveReferenceTable, LookupOperator, ReferenceTable, VersionedReferenceTable};
 use crate::mailbox::{channel_observed, MailboxConfig, MailboxRx, MailboxTx, StreamControl};
 use crate::mailbox_observe::{JobMailboxObserver, JobMailboxSnapshot};
 use crate::metrics::RuntimeMetrics;
@@ -78,6 +79,10 @@ pub struct JobRequest {
     pub tables: HashMap<String, std::sync::Arc<ReferenceTable>>,
     /// V0.3 versioned tables (as-of event time). Running jobs share the handle.
     pub versioned_tables: HashMap<String, VersionedReferenceTable>,
+    /// Hot-follow snapshots: one revision per batch, restart-fresh only.
+    pub live_tables: HashMap<String, LiveReferenceTable>,
+    /// Bounded read-only external providers, restart-fresh only.
+    pub external_lookups: HashMap<String, ExternalLookupBinding>,
     /// Punctuation sent after memory-source rows (watermarks / idle / active).
     pub trailing_controls: Vec<StreamControl>,
     /// Live watermark / idle marks (optional; alongside `live_in`).
@@ -176,6 +181,8 @@ impl JobRequest {
             clock: RuntimeClock::wall(),
             tables: HashMap::new(),
             versioned_tables: HashMap::new(),
+            live_tables: HashMap::new(),
+            external_lookups: HashMap::new(),
             trailing_controls: Vec::new(),
             live_ctrl: None,
             live_events: None,
@@ -236,6 +243,19 @@ impl JobRequest {
         tables: HashMap<String, VersionedReferenceTable>,
     ) -> Self {
         self.versioned_tables = tables;
+        self
+    }
+
+    pub fn with_live_tables(mut self, tables: HashMap<String, LiveReferenceTable>) -> Self {
+        self.live_tables = tables;
+        self
+    }
+
+    pub fn with_external_lookups(
+        mut self,
+        lookups: HashMap<String, ExternalLookupBinding>,
+    ) -> Self {
+        self.external_lookups = lookups;
         self
     }
 
@@ -345,6 +365,202 @@ fn validate_static_lookup_bindings(
         }
     }
     Ok(())
+}
+
+/// Resolve the same physical Lookup contract for every table family BEFORE
+/// starting any task or connector I/O. A same-name fallback is never allowed.
+fn validate_lookup_request(req: &JobRequest, owner: &Arc<MemoryOwner>) -> Result<()> {
+    if req.aligned.is_some()
+        && (!req.live_tables.is_empty()
+            || !req.external_lookups.is_empty()
+            || !req.versioned_tables.is_empty())
+    {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "hot-follow, versioned and external lookups require restart_fresh",
+        ));
+    }
+    let invalid = if req.aligned.is_some() {
+        ErrorCode::UnsupportedRestore
+    } else {
+        ErrorCode::InvalidArgument
+    };
+    let attachments = req
+        .tables
+        .len()
+        .saturating_add(req.versioned_tables.len())
+        .saturating_add(req.live_tables.len())
+        .saturating_add(req.external_lookups.len());
+    if attachments > 16 {
+        return Err(SparrowError::new(
+            ErrorCode::BoundExceeded,
+            "Job exceeds 16 reference attachments",
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    for name in req
+        .tables
+        .keys()
+        .chain(req.versioned_tables.keys())
+        .chain(req.live_tables.keys())
+        .chain(req.external_lookups.keys())
+    {
+        if name.is_empty() || name.len() > 128 || !names.insert(name.as_str()) {
+            return Err(SparrowError::new(
+                invalid,
+                "reference attachments require unique bounded names across all table families",
+            ));
+        }
+    }
+    for (name, table) in &req.tables {
+        if name != &table.name {
+            return Err(SparrowError::new(
+                invalid,
+                "static reference attachment name mismatch",
+            ));
+        }
+    }
+    for (name, table) in &req.versioned_tables {
+        if name != table.name() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "versioned reference attachment name mismatch",
+            ));
+        }
+    }
+    for (name, table) in &req.live_tables {
+        if name != table.name() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "hot-follow reference attachment name mismatch",
+            ));
+        }
+    }
+    for stage in &req.plan.stages {
+        let PhysicalStage::Lookup {
+            operator,
+            spec,
+            input,
+            output,
+        } = stage
+        else {
+            continue;
+        };
+        let resolved = if let Some(binding) = req.external_lookups.get(&spec.table) {
+            ExternalLookupOperator::validate_binding(spec, binding, input)
+                .map(|(_, _, _, schema)| schema)
+        } else if let Some(table) = req.live_tables.get(&spec.table) {
+            if spec.temporal || spec.as_of_field.is_some() {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "hot-follow lookup cannot use temporal/as-of semantics",
+                )
+                .at_operator(*operator));
+            }
+            // Ownership is checked against the admitting Job owner below.
+            LookupOperator::new(
+                spec.clone(),
+                table.snapshot()?,
+                input.clone(),
+                Arc::clone(owner),
+            )
+            .map(|op| op.output_schema().clone())
+        } else if let Some(table) = req.versioned_tables.get(&spec.table) {
+            LookupOperator::new_versioned(
+                spec.clone(),
+                table.clone(),
+                input.clone(),
+                Arc::clone(owner),
+            )
+            .map(|op| op.output_schema().clone())
+        } else if let Some(table) = req.tables.get(&spec.table) {
+            LookupOperator::new(
+                spec.clone(),
+                Arc::clone(table),
+                input.clone(),
+                Arc::clone(owner),
+            )
+            .map(|op| op.output_schema().clone())
+        } else {
+            return Err(
+                SparrowError::new(invalid, "Lookup has no declared reference attachment")
+                    .at_operator(*operator),
+            );
+        }?;
+        if &resolved != output {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidSchema,
+                "Lookup attachment does not match the physical output schema",
+            )
+            .at_operator(*operator));
+        }
+    }
+    Ok(())
+}
+
+/// One shared lease covers request/context/handle Lookup map clones, including
+/// their names, bucket capacity and diagnostics. The default path allocates
+/// nothing: an empty optional attachment is not a new per-job memory tax.
+pub(crate) fn lookup_metadata_bytes(req: &JobRequest) -> usize {
+    if req.live_tables.is_empty() && req.external_lookups.is_empty() {
+        return 0;
+    }
+    fn buckets<V>(capacity: usize) -> usize {
+        capacity
+            .saturating_mul(std::mem::size_of::<(String, V)>().saturating_add(64))
+            .saturating_mul(2)
+            .saturating_add(128)
+    }
+    fn map<V>(values: &HashMap<String, V>) -> usize {
+        if values.is_empty() {
+            return 0;
+        }
+        values
+            .keys()
+            .fold(buckets::<V>(values.capacity()), |n, name| {
+                n.saturating_add(name.capacity())
+            })
+    }
+    let diag_map = if req.external_lookups.is_empty() {
+        0
+    } else {
+        req.external_lookups.keys().fold(
+            buckets::<Arc<LookupDiagnostics>>(req.external_lookups.capacity()),
+            |n, name| n.saturating_add(name.capacity()),
+        )
+    };
+    let maps = map(&req.live_tables)
+        .saturating_add(map(&req.external_lookups))
+        .saturating_add(diag_map)
+        .saturating_add(std::mem::size_of::<JobCtx>())
+        .saturating_add(256);
+    let descriptors = req.external_lookups.values().fold(0usize, |n, binding| {
+        binding.provider.keys().iter().fold(
+            n.saturating_add(crate::lookup::schema_resident_bytes(
+                binding.provider.schema(),
+            ))
+            .saturating_add(std::mem::size_of::<LookupDiagnostics>())
+            .saturating_add(512),
+            |n, key| {
+                n.saturating_add(std::mem::size_of::<String>())
+                    .saturating_add(key.capacity())
+            },
+        )
+    });
+    maps.saturating_mul(req.plan.stages.len().saturating_add(4))
+        .saturating_add(descriptors.saturating_mul(2))
+        .saturating_add(graph::metadata_bytes(&req.plan))
+        .saturating_add(1024)
+}
+
+fn clone_lookup_map<V: Clone>(values: &HashMap<String, V>) -> HashMap<String, V> {
+    // An embedding caller can provide an empty map with spare capacity; do
+    // not clone that allocation while taking the no-dynamic-lookup fast path.
+    if values.is_empty() {
+        HashMap::new()
+    } else {
+        values.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -605,6 +821,7 @@ impl Kernel {
     }
 
     pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
+        validate_lookup_request(&req, &self.process_owner)?;
         let mut plugin_count = 0usize;
         req.plan.visit_plugins(&mut |_| plugin_count += 1);
         if plugin_count > 64 {
@@ -949,6 +1166,34 @@ impl Kernel {
         let attempt = admission.attempt;
         let cancel = CancellationToken::new();
         let owner = admission.owner;
+        for table in req.live_tables.values() {
+            if !table.is_owned_by(&owner) {
+                return Err(SparrowError::new(
+                    ErrorCode::PolicyDenied,
+                    "hot-follow reference table is not retained by this Job owner",
+                ));
+            }
+        }
+        let lookup_memory = match lookup_metadata_bytes(&req) {
+            0 => None,
+            bytes => Some(Arc::new(
+                owner.acquire(sparrow_model::CreditKind::Reservation, bytes)?,
+            )),
+        };
+        let lookup_diagnostics: HashMap<String, Arc<LookupDiagnostics>> = req
+            .external_lookups
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    Arc::new(LookupDiagnostics::owned(Arc::clone(
+                        lookup_memory
+                            .as_ref()
+                            .expect("dynamic lookup has metadata lease"),
+                    ))),
+                )
+            })
+            .collect();
         if req
             .aligned
             .as_ref()
@@ -1027,6 +1272,9 @@ impl Kernel {
             clock: req.clock.clone(),
             tables: req.tables.clone(),
             versioned_tables: req.versioned_tables.clone(),
+            live_tables: clone_lookup_map(&req.live_tables),
+            external_lookups: clone_lookup_map(&req.external_lookups),
+            lookup_diagnostics: clone_lookup_map(&lookup_diagnostics),
             max_state_keys: self.job_budget.max_state_keys,
             max_timers: self.job_budget.max_timers,
             timers: Arc::new(JobTimers::default()),
@@ -1061,6 +1309,7 @@ impl Kernel {
                 })
                 .transpose()?,
             observation: req.observation.clone(),
+            _lookup_memory: lookup_memory.clone(),
         };
         let plugin_pins = if plugin_count > 0 {
             let credit = owner.acquire(
@@ -1072,6 +1321,7 @@ impl Kernel {
             None
         };
         self.metrics.jobs_started.fetch_add(1, Ordering::Relaxed);
+        let live_tables = clone_lookup_map(&req.live_tables);
         let handle = self
             .rt
             .as_ref()
@@ -1088,6 +1338,9 @@ impl Kernel {
             handle,
             live: Arc::clone(&self.live_tasks),
             metrics: Arc::clone(&self.metrics),
+            live_tables,
+            lookup_diagnostics,
+            _lookup_memory: lookup_memory,
         })
     }
 
@@ -1194,10 +1447,15 @@ struct JobCtx {
     clock: RuntimeClock,
     tables: HashMap<String, std::sync::Arc<ReferenceTable>>,
     versioned_tables: HashMap<String, VersionedReferenceTable>,
+    live_tables: HashMap<String, LiveReferenceTable>,
+    external_lookups: HashMap<String, ExternalLookupBinding>,
+    lookup_diagnostics: HashMap<String, Arc<LookupDiagnostics>>,
     max_state_keys: usize,
     max_timers: usize,
     metrics: Arc<RuntimeMetrics>,
     aligned: Option<Arc<crate::barrier::RuntimeAligned>>,
+    // Declared after maps: refund only after all owned map/context fields drop.
+    _lookup_memory: Option<Arc<sparrow_model::MemoryLease>>,
 }
 
 pub struct JobHandle {
@@ -1208,9 +1466,19 @@ pub struct JobHandle {
     handle: JoinHandle<Result<JobStats>>,
     live: Arc<AtomicUsize>,
     metrics: Arc<RuntimeMetrics>,
+    live_tables: HashMap<String, LiveReferenceTable>,
+    lookup_diagnostics: HashMap<String, Arc<LookupDiagnostics>>,
+    _lookup_memory: Option<Arc<sparrow_model::MemoryLease>>,
 }
 
 impl JobHandle {
+    pub fn live_reference_tables(&self) -> HashMap<String, LiveReferenceTable> {
+        clone_lookup_map(&self.live_tables)
+    }
+
+    pub fn external_lookup_diagnostics(&self) -> HashMap<String, Arc<LookupDiagnostics>> {
+        clone_lookup_map(&self.lookup_diagnostics)
+    }
     pub fn mailbox_snapshot(&self) -> JobMailboxSnapshot {
         self.mailboxes.snapshot()
     }
@@ -1294,6 +1562,8 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
         clock: _,
         tables: _,
         versioned_tables: _,
+        live_tables: _,
+        external_lookups: _,
         trailing_controls,
         mut live_ctrl,
         mut live_events,
@@ -1422,10 +1692,14 @@ fn clone_ctx(ctx: &JobCtx) -> JobCtx {
         clock: ctx.clock.clone(),
         tables: ctx.tables.clone(),
         versioned_tables: ctx.versioned_tables.clone(),
+        live_tables: clone_lookup_map(&ctx.live_tables),
+        external_lookups: clone_lookup_map(&ctx.external_lookups),
+        lookup_diagnostics: clone_lookup_map(&ctx.lookup_diagnostics),
         max_state_keys: ctx.max_state_keys,
         max_timers: ctx.max_timers,
         metrics: Arc::clone(&ctx.metrics),
         aligned: ctx.aligned.clone(),
+        _lookup_memory: ctx._lookup_memory.clone(),
     }
 }
 
@@ -1956,8 +2230,42 @@ async fn stage_loop(
             let rx = rx
                 .as_mut()
                 .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "lookup missing rx"))?;
-            let op = if let Some(ver) = ctx.versioned_tables.get(&spec.table).cloned() {
-                LookupOperator::new_versioned(spec, ver, input, Arc::clone(&ctx.owner))?
+            let mut external = if let Some(binding) = ctx.external_lookups.get(&spec.table).cloned()
+            {
+                Some(ExternalLookupOperator::with_diagnostics(
+                    spec.clone(),
+                    binding,
+                    input.clone(),
+                    Arc::clone(&ctx.owner),
+                    ctx.lookup_diagnostics
+                        .get(&spec.table)
+                        .cloned()
+                        .ok_or_else(|| {
+                            SparrowError::new(
+                                ErrorCode::Internal,
+                                "external lookup diagnostics missing",
+                            )
+                        })?,
+                )?)
+            } else {
+                None
+            };
+            let op = if external.is_some() {
+                None
+            } else if let Some(table) = ctx.live_tables.get(&spec.table).cloned() {
+                Some(LookupOperator::new_live(
+                    spec,
+                    table,
+                    input,
+                    Arc::clone(&ctx.owner),
+                )?)
+            } else if let Some(ver) = ctx.versioned_tables.get(&spec.table).cloned() {
+                Some(LookupOperator::new_versioned(
+                    spec,
+                    ver,
+                    input,
+                    Arc::clone(&ctx.owner),
+                )?)
             } else {
                 let table = ctx.tables.get(&spec.table).cloned().ok_or_else(|| {
                     SparrowError::new(
@@ -1968,19 +2276,26 @@ async fn stage_loop(
                         ),
                     )
                 })?;
-                LookupOperator::new(spec, table, input, Arc::clone(&ctx.owner))?
+                Some(LookupOperator::new(
+                    spec,
+                    table,
+                    input,
+                    Arc::clone(&ctx.owner),
+                )?)
             };
             while let Some(mut env) = rx.recv().await? {
                 let (batch, ctrl) = env.take();
-                if let Some(ctrl) = ctrl {
-                    if !tx.send_control(ctrl).await? {
-                        break;
-                    }
-                }
                 if let Some(batch) = batch {
                     consume_work(&ctx, batch.num_rows() as u64).await?;
                     let started = std::time::Instant::now();
-                    let result = op.on_batch_into(&batch);
+                    let result = if let Some(external) = &mut external {
+                        external_lookup_batch(&ctx.owner, external, &batch, ctx.cancel.clone())?
+                            .await
+                    } else {
+                        op.as_ref()
+                            .expect("resolved local lookup")
+                            .on_batch_into(&batch)
+                    };
                     if let Some(obs) = &ctx.observation {
                         obs.record(Latency::Lookup, started.elapsed());
                     }
@@ -1994,6 +2309,26 @@ async fn stage_loop(
                         {
                             break;
                         }
+                    }
+                }
+                if let Some(ctrl) = ctrl {
+                    if (external.is_some() || !ctx.live_tables.is_empty())
+                        && matches!(
+                            ctrl,
+                            StreamControl::CheckpointBarrier { .. }
+                                | StreamControl::ProcessingTime { .. }
+                                | StreamControl::FeedObservation { .. }
+                                | StreamControl::GraphProgress { .. }
+                                | StreamControl::GraphRoundEnd { .. }
+                        )
+                    {
+                        return Err(SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "hot-follow and external lookups reject durable/checkpoint controls",
+                        ));
+                    }
+                    if !tx.send_control(ctrl).await? {
+                        break;
                     }
                 }
             }
@@ -2584,6 +2919,52 @@ impl<F: std::future::Future> std::future::Future for ChargedWindowFuture<F> {
     ) -> std::task::Poll<Self::Output> {
         self.get_mut().future.as_mut().poll(cx)
     }
+}
+
+/// Keep the external request/timeout/reorder continuation off every legacy
+/// stage's generator. Acquire exact frame credit BEFORE allocating its Box;
+/// field order keeps that credit through cancellation and future destruction.
+#[cold]
+#[inline(never)]
+fn external_lookup_batch<'a>(
+    owner: &Arc<MemoryOwner>,
+    op: &'a mut ExternalLookupOperator,
+    batch: &'a RowBatch,
+    cancel: CancellationToken,
+) -> Result<ChargedWindowFuture<impl std::future::Future<Output = Result<Option<RowBatch>>> + 'a>> {
+    let future = op.on_batch_into(batch, cancel);
+    let credit = owner.acquire(
+        sparrow_model::CreditKind::Reservation,
+        std::mem::size_of_val(&future).saturating_add(64),
+    )?;
+    Ok(ChargedWindowFuture {
+        future: Box::pin(future),
+        _credit: credit,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn external_lookup_future_sizes() -> (usize, usize) {
+    fn bytes<F>(
+        _: impl FnOnce(&'static mut ExternalLookupOperator, &'static RowBatch, CancellationToken) -> F,
+    ) -> (usize, usize) {
+        (
+            std::mem::size_of::<F>(),
+            std::mem::size_of::<ChargedWindowFuture<F>>(),
+        )
+    }
+    // Type inspection only: do not create fake references or execute requests.
+    bytes(ExternalLookupOperator::on_batch_into)
+}
+
+#[cfg(test)]
+pub(crate) fn external_lookup_charged_for_test<'a>(
+    owner: &Arc<MemoryOwner>,
+    op: &'a mut ExternalLookupOperator,
+    batch: &'a RowBatch,
+    cancel: CancellationToken,
+) -> Result<impl std::future::Future<Output = Result<Option<RowBatch>>> + 'a> {
+    external_lookup_batch(owner, op, batch, cancel)
 }
 
 #[cold]

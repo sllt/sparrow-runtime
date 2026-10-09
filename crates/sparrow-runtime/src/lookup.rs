@@ -26,7 +26,7 @@ fn unsupported_key(message: impl Into<String>) -> SparrowError {
     SparrowError::new(ErrorCode::FeatureUnavailable, message)
 }
 
-fn deterministic_key_type(ty: &DataType) -> bool {
+pub(crate) fn deterministic_key_type(ty: &DataType) -> bool {
     matches!(
         ty,
         DataType::Bool
@@ -52,7 +52,7 @@ fn deterministic_key_scalar(value: &Scalar) -> bool {
     }
 }
 
-fn validate_row(schema: &Schema, row: &Row, row_number: usize) -> Result<()> {
+pub(crate) fn validate_row(schema: &Schema, row: &Row, row_number: usize) -> Result<()> {
     if row.values.len() != schema.fields.len() {
         return Err(invalid_table(format!(
             "reference row {row_number} has {} values, schema has {} fields",
@@ -86,7 +86,11 @@ fn validate_row(schema: &Schema, row: &Row, row_number: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_key_schema(schema: &Schema, key_fields: &[String], key_idx: &[usize]) -> Result<()> {
+pub(crate) fn validate_key_schema(
+    schema: &Schema,
+    key_fields: &[String],
+    key_idx: &[usize],
+) -> Result<()> {
     if key_fields.is_empty() || key_idx.len() != key_fields.len() {
         return Err(invalid_table(
             "reference table requires at least one key field",
@@ -120,7 +124,7 @@ fn validate_key_schema(schema: &Schema, key_fields: &[String], key_idx: &[usize]
     Ok(())
 }
 
-fn validate_key_values(
+pub(crate) fn validate_key_values(
     schema: &Schema,
     key_idx: &[usize],
     row: &Row,
@@ -214,7 +218,7 @@ fn encode_schema(out: &mut Vec<u8>, schema: &Schema) {
     }
 }
 
-fn scalar_key_len(value: &Scalar) -> usize {
+pub(crate) fn scalar_key_len(value: &Scalar) -> usize {
     match value {
         Scalar::Null => 1,
         Scalar::Bool(_) => 2,
@@ -253,7 +257,7 @@ fn field_resident_bytes(field: &Field) -> usize {
         .saturating_add(data_type_resident_bytes(&field.data_type))
 }
 
-fn schema_resident_bytes(schema: &Schema) -> usize {
+pub(crate) fn schema_resident_bytes(schema: &Schema) -> usize {
     std::mem::size_of::<Schema>()
         .saturating_add(
             schema
@@ -526,6 +530,12 @@ impl ReferenceTable {
         self.checksum
     }
 
+    /// Already-verified control-plane digest for bounded status rendering.
+    /// This getter is not a replacement for `verified_dependency` admission.
+    pub fn canonical_sha256(&self) -> Option<[u8; 32]> {
+        self.canonical_sha256
+    }
+
     /// B2 aligned recovery requires the retention lease to belong to the
     /// admitting Job owner. The historical unowned constructor deliberately
     /// returns false here so it remains usable for restart-fresh embedding but
@@ -680,13 +690,135 @@ fn table_crc(
     crate::checkpoint::crc32(&buf)
 }
 
-fn encode_scalars(key: &[Scalar]) -> Vec<u8> {
+pub(crate) fn encode_scalars(key: &[Scalar]) -> Vec<u8> {
     let mut out = Vec::new();
     for s in key {
         s.encode_key(&mut out);
         out.push(0xff);
     }
     out
+}
+
+/// Hot-follow handle retaining only its current snapshot. Each batch captures
+/// one Arc, so a concurrent publish cannot split that batch across revisions.
+/// Old snapshots survive only while an in-flight reader holds an Arc; their
+/// original owner retention leases remain charged until the last reader drops.
+#[derive(Clone, Debug)]
+pub struct LiveReferenceTable {
+    name: Arc<str>,
+    inner: Arc<RwLock<LiveTableState>>,
+    _metadata: Arc<MemoryLease>,
+}
+
+#[derive(Debug)]
+struct LiveTableState {
+    current: Arc<ReferenceTable>,
+    failure: Option<ErrorCode>,
+}
+
+impl LiveReferenceTable {
+    pub fn new(initial: Arc<ReferenceTable>) -> Result<Self> {
+        initial.verify()?;
+        if initial.name.is_empty() || initial.version == 0 {
+            return Err(invalid_table(
+                "live reference table requires a name and positive revision",
+            ));
+        }
+        let owner = initial
+            .owned_lease
+            .as_ref()
+            .ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::PolicyDenied,
+                    "live reference tables must retain owner credits",
+                )
+            })?
+            .owner();
+        let metadata = owner.acquire(
+            CreditKind::Retention,
+            std::mem::size_of::<Self>()
+                .saturating_add(initial.name.len())
+                .saturating_add(128),
+        )?;
+        Ok(Self {
+            name: Arc::from(initial.name.as_str()),
+            inner: Arc::new(RwLock::new(LiveTableState {
+                current: initial,
+                failure: None,
+            })),
+            _metadata: Arc::new(metadata),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn current(&self) -> Arc<ReferenceTable> {
+        Arc::clone(&self.inner.read().expect("live reference table").current)
+    }
+
+    /// Stop further enrichment after a refresh failure. This is sticky until
+    /// a new Job/handle is explicitly created; a later publish cannot silently
+    /// revive a failed data-freshness contract. Keep only the bounded error code.
+    pub fn fail(&self, error: SparrowError) {
+        let mut state = self.inner.write().expect("live reference table");
+        state.failure.get_or_insert(error.code);
+    }
+
+    pub fn snapshot(&self) -> Result<Arc<ReferenceTable>> {
+        let state = self.inner.read().expect("live reference table");
+        if let Some(code) = state.failure {
+            return Err(SparrowError::new(
+                code,
+                "live reference table refresh failed; explicit restart required",
+            ));
+        }
+        Ok(Arc::clone(&state.current))
+    }
+
+    pub fn is_owned_by(&self, owner: &Arc<MemoryOwner>) -> bool {
+        self.current().is_owned_by(owner)
+    }
+
+    pub fn publish(&self, next: Arc<ReferenceTable>) -> Result<()> {
+        next.verify()?;
+        let mut state = self.inner.write().expect("live reference table");
+        if state.failure.is_some() {
+            return Err(SparrowError::new(
+                ErrorCode::JobFailed,
+                "cannot publish into a failed live reference handle",
+            ));
+        }
+        let current = &state.current;
+        if next.name != current.name
+            || next.schema != current.schema
+            || next.key_fields != current.key_fields
+        {
+            return Err(invalid_table(
+                "live reference revisions must preserve name, schema and key fields",
+            ));
+        }
+        let owner = current
+            .owned_lease
+            .as_ref()
+            .expect("live table has retention owner")
+            .owner();
+        if !next.is_owned_by(owner) {
+            return Err(SparrowError::new(
+                ErrorCode::PolicyDenied,
+                "live reference revision belongs to a different memory owner",
+            ));
+        }
+        if next.version <= current.version {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "live reference revision must strictly increase",
+            ));
+        }
+        state.current = next;
+        Ok(())
+    }
 }
 
 /// One temporal version of a reference table: valid on `[valid_from, valid_to)`.
@@ -824,6 +956,7 @@ impl VersionedReferenceTable {
 enum LookupSource {
     Static(Arc<ReferenceTable>),
     Versioned(VersionedReferenceTable),
+    Live(LiveReferenceTable),
 }
 
 pub struct LookupOperator {
@@ -862,6 +995,27 @@ impl LookupOperator {
         Self::from_source(spec, LookupSource::Versioned(table), input, owner)
     }
 
+    pub fn new_live(
+        spec: LookupSpec,
+        table: LiveReferenceTable,
+        input: Schema,
+        owner: Arc<MemoryOwner>,
+    ) -> Result<Self> {
+        if spec.temporal || spec.as_of_field.is_some() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "hot-follow reference lookup cannot use temporal/as-of semantics",
+            ));
+        }
+        if !table.is_owned_by(&owner) {
+            return Err(SparrowError::new(
+                ErrorCode::PolicyDenied,
+                "hot-follow reference table belongs to a different Job owner",
+            ));
+        }
+        Self::from_source(spec, LookupSource::Live(table), input, owner)
+    }
+
     fn from_source(
         spec: LookupSpec,
         source: LookupSource,
@@ -872,6 +1026,14 @@ impl LookupOperator {
         input.validate()?;
         let (name, schema, key_fields) = match &source {
             LookupSource::Static(t) => (t.name.clone(), t.schema.clone(), t.key_fields.clone()),
+            LookupSource::Live(t) => {
+                let current = t.snapshot()?;
+                (
+                    current.name.clone(),
+                    current.schema.clone(),
+                    current.key_fields.clone(),
+                )
+            }
             LookupSource::Versioned(t) => {
                 let latest = t.latest().ok_or_else(|| {
                     SparrowError::new(
@@ -894,6 +1056,7 @@ impl LookupOperator {
         }
         match &source {
             LookupSource::Static(t) => t.verify()?,
+            LookupSource::Live(t) => t.snapshot()?.verify()?,
             LookupSource::Versioned(t) => {
                 let versions = t.inner.read().expect("versioned table");
                 for version in versions.iter() {
@@ -974,6 +1137,7 @@ impl LookupOperator {
     pub fn table_version(&self) -> u64 {
         match &self.source {
             LookupSource::Static(t) => t.version,
+            LookupSource::Live(t) => t.current().version,
             LookupSource::Versioned(t) => t.latest().map(|x| x.version).unwrap_or(0),
         }
     }
@@ -1016,6 +1180,7 @@ impl LookupOperator {
     fn select_table(&self, row: &Row) -> Result<Option<Arc<ReferenceTable>>> {
         match &self.source {
             LookupSource::Static(table) => Ok(Some(Arc::clone(table))),
+            LookupSource::Live(table) => Ok(Some(table.snapshot()?)),
             LookupSource::Versioned(table) => {
                 let as_of = if let Some(index) = self.as_of_idx {
                     row.values[index].as_event_time_micros().ok_or_else(|| {
@@ -1033,6 +1198,12 @@ impl LookupOperator {
     }
 
     fn select_tables(&self, batch: &RowBatch) -> Result<Vec<Option<Arc<ReferenceTable>>>> {
+        if let LookupSource::Live(table) = &self.source {
+            let current = table.snapshot()?;
+            return Ok((0..batch.num_rows())
+                .map(|_| Some(Arc::clone(&current)))
+                .collect());
+        }
         batch
             .rows()
             .iter()
@@ -1116,7 +1287,9 @@ impl LookupOperator {
         // change the payload after the scratch reservation was admitted.
         let _selection_lease = self.owner.acquire(
             CreditKind::Reservation,
-            batch.num_rows().saturating_mul(std::mem::size_of::<Option<Arc<ReferenceTable>>>())
+            batch
+                .num_rows()
+                .saturating_mul(std::mem::size_of::<Option<Arc<ReferenceTable>>>())
                 .saturating_add(64),
         )?;
         let selected = self.select_tables(batch)?;
@@ -1180,7 +1353,9 @@ pub fn lookup_output_schema(stream: &Schema, table: &Schema, keep: &[String]) ->
                 ),
             ));
         }
-        id += 1;
+        id = id
+            .checked_add(1)
+            .ok_or_else(|| invalid_table("lookup output field id space is exhausted"))?;
         fields.push(Field::new(
             FieldId::new(id),
             f.name.clone(),
@@ -1293,6 +1468,219 @@ mod tests {
             vec!["device_id".into()],
             vec!["site".into()],
         )
+    }
+
+    fn owned_sites(owner: &Arc<MemoryOwner>, revision: u64, label: &str) -> Arc<ReferenceTable> {
+        let schema = sites(owner).schema.clone();
+        ReferenceTable::snapshot_owned(
+            "sites",
+            revision,
+            schema,
+            vec!["device_id".into()],
+            vec![Row {
+                values: vec![Scalar::utf8("a"), Scalar::utf8(label)],
+            }],
+            8,
+            64 * 1024,
+            owner,
+        )
+        .unwrap()
+    }
+
+    fn stream_batch(owner: &Arc<MemoryOwner>, count: usize) -> RowBatch {
+        let mut builder = RowBatchBuilder::new(
+            Arc::new(stream_schema()),
+            Arc::clone(owner),
+            CreditKind::Reservation,
+            count,
+            64 * 1024,
+        )
+        .unwrap();
+        for _ in 0..count {
+            builder
+                .push(Row {
+                    values: vec![Scalar::utf8("a"), Scalar::Float64(23.5)],
+                })
+                .unwrap();
+        }
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn tab09_live_reference_batch_snapshot_survives_publish_and_releases_old_owner_credit() {
+        let owner = owner();
+        let initial = owned_sites(&owner, 1, "old");
+        let old = Arc::downgrade(&initial);
+        let live = LiveReferenceTable::new(initial).unwrap();
+        let op =
+            LookupOperator::new_live(spec(), live.clone(), stream_schema(), Arc::clone(&owner))
+                .unwrap();
+        let batch = stream_batch(&owner, 3);
+        let selected = op.select_tables(&batch).unwrap();
+        live.publish(owned_sites(&owner, 2, "new")).unwrap();
+        assert!(
+            old.upgrade().is_some(),
+            "an in-flight batch retains its own old snapshot"
+        );
+        let rows: Vec<Row> = batch
+            .rows()
+            .iter()
+            .zip(&selected)
+            .map(|(row, table)| op.output_row(row, table.as_deref()).unwrap())
+            .collect();
+        assert!(rows.iter().all(|row| row.values[2] == Scalar::utf8("old")));
+        let fresh = op.on_batch_into(&batch).unwrap().unwrap();
+        assert!(fresh
+            .rows()
+            .iter()
+            .all(|row| row.values[2] == Scalar::utf8("new")));
+        drop(selected);
+        assert!(
+            old.upgrade().is_none(),
+            "the handle does not retain revision history"
+        );
+        drop(rows);
+        drop(fresh);
+        drop(batch);
+        drop(op);
+        drop(live);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    #[test]
+    fn tab09_live_reference_failed_publication_is_atomic_and_refresh_failure_is_sticky() {
+        let owner = owner();
+        let live = LiveReferenceTable::new(owned_sites(&owner, 1, "old")).unwrap();
+        let mut bad = owned_sites(&owner, 2, "new").with_corrupted_first_row();
+        assert_eq!(
+            live.publish(Arc::new(bad)).unwrap_err().code,
+            ErrorCode::CodecViolation
+        );
+        assert_eq!(live.current().version, 1);
+        assert_eq!(
+            live.publish(owned_sites(&owner, 1, "same"))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+        let foreign = MemoryOwner::new(ResourceBudget::compact());
+        assert_eq!(
+            live.publish(owned_sites(&foreign, 2, "foreign"))
+                .unwrap_err()
+                .code,
+            ErrorCode::PolicyDenied
+        );
+        bad = owned_sites(&owner, 2, "new").with_stored_checksum(0);
+        assert!(live.publish(Arc::new(bad)).is_err());
+        live.fail(SparrowError::new(
+            ErrorCode::ResourceExhausted,
+            "unbounded detail must not be retained",
+        ));
+        assert_eq!(
+            live.snapshot().unwrap_err().code,
+            ErrorCode::ResourceExhausted
+        );
+        assert_eq!(
+            live.publish(owned_sites(&owner, 3, "recovered"))
+                .unwrap_err()
+                .code,
+            ErrorCode::JobFailed
+        );
+        assert_eq!(live.current().version, 1);
+    }
+
+    #[test]
+    fn tab09_live_reference_schema_key_name_owner_and_temporal_contracts_are_strict() {
+        let owner = owner();
+        assert_eq!(
+            LiveReferenceTable::new(sites(&owner)).unwrap_err().code,
+            ErrorCode::PolicyDenied
+        );
+        let live = LiveReferenceTable::new(owned_sites(&owner, 1, "old")).unwrap();
+        for alteration in 0..3 {
+            let mut schema = sites(&owner).schema.clone();
+            let mut name = "sites";
+            let mut keys = vec!["device_id".to_string()];
+            let mut values = vec![Scalar::utf8("a"), Scalar::utf8("new")];
+            if alteration == 0 {
+                name = "elsewhere";
+            }
+            if alteration == 1 {
+                schema.fields[1].data_type = DataType::Int64;
+                values[1] = Scalar::Int64(5);
+            }
+            if alteration == 2 {
+                keys = vec!["site".into()];
+                schema.fields[1].nullable = false;
+            }
+            let next = ReferenceTable::snapshot_owned(
+                name,
+                2,
+                schema,
+                keys,
+                vec![Row { values }],
+                8,
+                64 * 1024,
+                &owner,
+            )
+            .unwrap();
+            assert_eq!(
+                live.publish(next).unwrap_err().code,
+                ErrorCode::InvalidSchema
+            );
+            assert_eq!(live.current().version, 1);
+        }
+        let mut temporal = spec();
+        temporal.temporal = true;
+        temporal.as_of_field = Some("temp".into());
+        assert!(LookupOperator::new_live(
+            temporal,
+            live.clone(),
+            stream_schema(),
+            Arc::clone(&owner)
+        )
+        .is_err());
+        let other = MemoryOwner::new(ResourceBudget::compact());
+        assert!(LookupOperator::new_live(spec(), live, stream_schema(), other).is_err());
+    }
+
+    #[test]
+    fn tab09_live_reference_current_plus_readers_cannot_bypass_owner_budget() {
+        let owner = MemoryOwner::new(ResourceBudget {
+            retention_bytes: 16 * 1024,
+            ..ResourceBudget::compact()
+        });
+        let live = LiveReferenceTable::new(owned_sites(&owner, 1, "initial")).unwrap();
+        let mut readers = Vec::new();
+        let mut exhausted = false;
+        for revision in 2..100 {
+            readers.push(live.current());
+            let next = ReferenceTable::snapshot_owned(
+                "sites",
+                revision,
+                sites(&owner).schema.clone(),
+                vec!["device_id".into()],
+                vec![Row {
+                    values: vec![Scalar::utf8("a"), Scalar::utf8("x".repeat(512))],
+                }],
+                8,
+                64 * 1024,
+                &owner,
+            );
+            match next {
+                Ok(next) => live.publish(next).unwrap(),
+                Err(error) => {
+                    assert_eq!(error.code, ErrorCode::ResourceExhausted);
+                    exhausted = true;
+                    break;
+                }
+            }
+        }
+        assert!(exhausted);
+        assert!(owner.usage().retention_bytes <= owner.budget().retention_bytes);
+        drop(readers);
+        drop(live);
+        assert_eq!(owner.usage().physical_bytes, 0);
     }
 
     #[test]

@@ -593,7 +593,20 @@ impl Supervisor {
         let g = self.running.lock().await;
         let mut acc = sparrow_connectors::IoSnapshot::default();
         for j in g.values() {
-            acc.add_assign(&j.graph_ports.as_ref().map_or_else(||j.diag.snapshot(),|ports|ports.snapshot()));
+            let snapshot = if let Some(ports) = &j.graph_ports {
+                let mut snapshot = ports.snapshot();
+                // Refresh failures belong to the root Job, not a connector
+                // port. Merge only that counter: adding the complete root
+                // snapshot would duplicate graph connector accounting.
+                snapshot.lookup_update_failed += j
+                    .diag
+                    .lookup_update_failed
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                snapshot
+            } else {
+                j.diag.snapshot()
+            };
+            acc.add_assign(&snapshot);
         }
         acc
     }
@@ -738,6 +751,7 @@ impl Supervisor {
             return Ok(());
         }
         self.reap_finished().await;
+        self.refresh_live_lookups().await?;
         let stable_names: Vec<String> = {
             let mut jobs = self.running.lock().await;
             jobs.iter_mut()
@@ -904,6 +918,53 @@ impl Supervisor {
         }
     }
 
+    /// No detached refresh loop or database I/O under the running registry.
+    /// The transition worker owns this bounded operation through completion.
+    async fn refresh_live_lookups(&self)->Result<()> {
+        let updates={
+            let jobs=self.running.lock().await;
+            jobs.values().filter(|job|!job.is_finished()).filter_map(|job| {
+                let tables=job.handle().live_reference_tables();
+                (!tables.is_empty()).then(||(tables,job.handle().memory_owner(),job.handle().cancellation(),job.diag.clone()))
+            }).collect::<Vec<_>>()
+        };
+        if updates.is_empty(){return Ok(());}
+        let store=self.store.clone();
+        self.store.run_blocking(move || {
+            for (tables,owner,cancel,diag) in updates {
+                for (name,live) in tables {
+                    if cancel.is_cancelled(){break;}
+                    let current=live.current();
+                    let update:Result<()>=(|| {
+                        if let Some(next)=store.reference_update_after(&name,current.version)? {
+                            let next=crate::lookup::prepare_update(next,&current,&owner)?;
+                            if !cancel.is_cancelled(){live.publish(next)?;}
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error)=update {
+                        diag.lookup_update_failed.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                        diag.observation.health(false,HealthState::Failed,"lookup_refresh_failed",Some(error.code));
+                        live.fail(error);cancel.cancel();break;
+                    }
+                }
+            }
+            Ok(())
+        }).await
+    }
+
+    pub fn lookup_snapshot(&self,name:&str)->Result<serde_json::Value> {
+        let jobs=self.running.try_lock().map_err(|_|SparrowError::new(sparrow_model::ErrorCode::ResourceExhausted,"runtime lookup registry busy"))?;
+        let Some(job)=jobs.get(name) else{return Ok(serde_json::json!({"available":false}));};
+        let tables=job.handle().live_reference_tables().into_iter().map(|(name,live)| {
+            let table=live.current();
+            let digest=table.canonical_sha256().map(|d|d.iter().map(|b|format!("{b:02x}")).collect::<String>());
+            (name,serde_json::json!({"observed_revision":table.version,"sha256":digest,"failed":live.snapshot().is_err()}))
+        }).collect::<std::collections::BTreeMap<_,_>>();
+        let external=job.handle().external_lookup_diagnostics().into_iter().map(|(name,diag)|(name,diag.snapshot())).collect::<std::collections::BTreeMap<_,_>>();
+        Ok(serde_json::json!({"available":true,"attempt":job.handle().attempt.raw(),"live_tables":tables,"external":external,"replay":"unsupported"}))
+    }
+
     async fn retry_is_due(&self, name: &str, consecutive_failures: u64) -> bool {
         let mut map = self.next_retry_at.lock().await;
         if consecutive_failures == 0 && !map.contains_key(name) {
@@ -954,7 +1015,7 @@ impl Supervisor {
                 let fixed=desired.revision.map(|r|s.get_pipeline_revision(&name,r))
                     .transpose()?.is_some_and(|r|r.spec.requires_explicit_restart());
                 if fixed {
-                    let msg = "held: fixed snapshot or external plugin requires explicit start after failure or process restart";
+                    let msg = "held: fixed snapshot, external plugin or live Lookup requires explicit start after failure or process restart";
                     if !a.last_error.as_deref().unwrap_or("").starts_with("held:") {
                         s.set_last_error(&name, Some(&format!("{msg}; last: {}", a.last_error.as_deref().unwrap_or("unknown"))))?;
                     }
@@ -1109,14 +1170,32 @@ impl Supervisor {
         request: JobRequest,
     ) -> Result<JobRequest> {
         if spec.reference_tables.is_empty() {
-            return Ok(request);
+            return self.attach_lookup_bindings(spec,request);
         }
         let (admission, prepared) = self
             .prepare_reference_tables(spec, request.plan.pipeline)
             .await?;
-        Ok(request
+        self.attach_lookup_bindings(spec,request
             .with_tables(prepared.tables)
             .with_source_admission(admission))
+    }
+
+    /// Live content is resolved before source activation, never in the hot
+    /// expression evaluator. The initial immutable catalog pin stays intact.
+    pub(super) fn attach_lookup_bindings(&self,spec:&crate::PipelineSpec,mut request:JobRequest)->Result<JobRequest> {
+        let mut live=HashMap::new();
+        for (name,binding) in &spec.reference_tables {
+            if binding.follow_latest {
+                let table=request.tables.remove(name).ok_or_else(||SparrowError::new(sparrow_model::ErrorCode::InvalidArgument,"live Lookup initial snapshot missing"))?;
+                live.insert(name.clone(),sparrow_runtime::lookup::LiveReferenceTable::new(table)?);
+            }
+        }
+        let mut external=HashMap::new();
+        if !spec.external_lookups.is_empty() {
+            let policy=store_policy(&self.store,self.demo_endpoints().as_ref())?;
+            for (name,binding) in &spec.external_lookups {external.insert(name.clone(),binding.provider(name,&self.secrets,&policy)?);}
+        }
+        Ok(request.with_live_tables(live).with_external_lookups(external))
     }
 
     /// Resolve immutable catalog revisions and build verified, job-owned
@@ -1137,7 +1216,7 @@ impl Supervisor {
     /// admission.  Graph and JetStream startup acquire their admission before
     /// this helper because their source/bootstrap code also needs the same
     /// owner; acquiring a second token here would double-count one Job.
-    pub(super) async fn prepare_reference_tables_with_admission(
+    async fn prepare_reference_tables_with_admission(
         &self,
         spec: &crate::spec::PipelineSpec,
         admission: SourceAdmission,
@@ -1193,6 +1272,17 @@ impl Supervisor {
                     dependencies.push(dependency);
                 }
                 crate::validate::validate_reference_dependencies(&spec, &dependencies)?;
+                // Fail before I/O if the latest live revision changed schema,
+                // is corrupt or cannot fit beside the current owned snapshot.
+                for (name,binding) in &spec.reference_tables {
+                    if binding.follow_latest {
+                        if let Some(next)=store.reference_update_after(name,binding.revision)? {
+                            let old=tables.get(name).expect("resolved initial table");
+                            let next=crate::lookup::prepare_update(next,old,&owner)?;
+                            tables.insert(name.clone(),next);
+                        }
+                    }
+                }
                 // Cancellation of the waiter does not stop a blocking worker.
                 // Keep its admission slot through construction and through
                 // the returned snapshots until the waiter takes the result.
@@ -1950,6 +2040,7 @@ impl Supervisor {
     }
 
     async fn join_job(&self, job: RunningJob) -> Result<()> {
+        let lookup_diag=job.diag.clone();
         let file_diag=(job.graph_ports.is_none() && job.sink_kind=="file").then(||job.diag.clone());
         let plugin_diags=job.graph_ports.as_ref().map_or_else(||vec![job.diag.clone()],|ports|ports.sources.values().chain(ports.sinks.values()).cloned().collect::<Vec<_>>());
         match job.kind {
@@ -1968,6 +2059,9 @@ impl Supervisor {
                     )),
                 };
                 if sink.await.is_err() {return Err(SparrowError::new(sparrow_model::ErrorCode::JobFailed,"sink actor panicked"));}
+                if lookup_diag.lookup_update_failed.load(std::sync::atomic::Ordering::Relaxed)>0 {
+                    return Err(SparrowError::new(sparrow_model::ErrorCode::JobFailed,"live Lookup refresh failed; no stale fallback or automatic restart"));
+                }
                 if plugin_diags.iter().any(|d|d.plugin_failed.load(std::sync::atomic::Ordering::Relaxed)>0) {
                     return Err(SparrowError::new(sparrow_model::ErrorCode::JobFailed,"external plugin failed; inspect connector health; no automatic replay"));
                 }

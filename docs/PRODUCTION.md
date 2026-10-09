@@ -4,6 +4,22 @@
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 
+<a id="live-lookup-validation"></a>
+## 动态参考表与 HTTP Lookup：2026-10-05
+
+基线 `1b86706`，服务器 `box@100.64.0.19`，Linux x86_64 GNU / Rust **1.98.0** / locked Release。证据根 `/workspace/bench-compare/lookup-core-20261005-mwdbLw`。新增范围是管理面CAS增量发布/回退、显式`follow_latest`和HTTP异步查询，不是数据库CDC位置恢复或任意外部查询的aligned认证；合同见 [REFERENCE_TABLES](REFERENCE_TABLES.md)。未在本机运行Cargo/Go/C编译，也未恢复JetStream高负载专题。
+
+- 默认**16成员**＋JetStream feature：`full-r5.log/.exit=0`，**1061 passed / 30 ignored**。不是包含两个实验包的全workspace，也不把ignored计入通过。
+- 精确Cargo JSON artifact路径冻结到`frozen-final-tests/`，`new-tests-final.list`为**53项**：Catalog13、Control集成/门禁4、Runtime19、HTTP transport14、Server API2、CLI1。每项**5轮，共265 passed / 0 ignored**，`repeat-final-*.log/.exit=0`。覆盖真实SQLite COMMIT BUSY后的回滚/同CAS重试、head倒退、schema/key/owner/恢复拒绝、并发顺序/缓存/超时/取消、cold future与逃逸诊断信用、HTTP连接复用/严格协议/坏TLS/环境proxy隔离，以及实际DAG刷新故障指标不漏记、不重复合并connector计数。
+- 独立no-default-feature **Control＋Server：162 passed / 5 ignored**，`no-demo.log/.exit=0`。这5个既有外部插件fixture未在本批显式重跑，不借用前批的执行结果充当本批结果。
+- 实际no-demo候选包`production-package/`的六个binary及依赖/feature隔离检查通过，`production.log/.exit=0`；`package-verify.log`校验通过。`SHA256SUMS`自身SHA-256为`8543b90571019828b54c0ac14b357887f0f69d82e53f43597956cf3ad92df867`。包标识为基线commit加源码指纹的candidate，不冒充正式release/tag。
+- 同一生产包、独立Go标准库fixture及修正后的`lookup-process-runner-r2.sh`，**3个全新catalog/进程基线**：`process-r2/r3/r4`全部通过，每轮**20行独立golden、12次Lookup请求、峰值在途2**。真实API/CLI验证增删/CAS412/新revision回退、静态pin不变、热跟随实际revision/hash、schema故障hold/兼容发布不自动复活/显式start与Server重启门禁；SQL/Graph的hit/miss/NULL key、正负缓存/TTL、503降NULL且不缓存、协议/超限硬失败、并发顺序和停止取消均通过。每轮末尾在服务尚运行时确认五项`process_credits`均为0，fixture inflight为0；进程TERM及wait正常，不以进程退出替代Job信用回收。
+- 首个`process`仅因测试脚本把API的`error.context`数组误当对象而停止，API实际已返回正确412及expected/current revision；修脚本为`from_entries`，并补全末尾信用oracle，不重编Rust。原失败目录、`lookup-process-runner-r1.sh`保留；修正runner独立归档，不把生产构建当时的源码指纹改写为包含后补harness。
+- 最终**510个代码/构建/测试文件**与服务器`source/`一致，`source-delivery.sha256`自身SHA-256为`82748d69b3c15e4fb465f443844ba545c286195ea4469a78074ab07f3e0fb9b8`，`delivery-verify.exit=0`。构建时源码另存`source-built/`并对生产包源码清单复核，`build-source-verify.exit=0`；构建时清单`source-final.sha256`摘要为`9df95544943fc6cf7bcdf75e88f7bb71f6cd8892e546041ce346e901ab352aa0`，与最终交付仅runner不同，Rust内容不变。编排`lookup-validation.sh`/`lookup-validation-r5.sh`、定向复验、每轮进程日志和退出码均保留；正式文档的后补验收说明不修改已冻结包。
+- 保留所有失败：R1/R2是扩展JSON宏达到递归上限，拆分对象构造修复，没有提高全局递归限额；R3的1060项通过后补了DAG根诊断合并反例。R4出现一次既有Hysteresis v12测试的`checkpoint wait timed out`；不改代码、不放宽期限，同一编译产物定向**5轮**及原参数完整R5重跑通过，日志为`hysteresis-recheck-*`。**该偶发超时根因尚未确认**，发行验收需进一步跟踪，不能将成功重跑当作根因已经修复。
+
+这是限定Preview的功能/故障验证，不是24/72h soak、WAN容量/p99、aarch64或完整生产放行。保守scratch、同key请求合并、缓存查找与刷新成本另列 [OPT-019](OPTIMIZATION_BACKLOG.md#opt-019)；不以增大预算、弱化取消或使用今天的数据替代历史依赖来“修复”性能。
+
 <a id="external-plugins-validation"></a>
 ## 外部 SDK 与插件核心整体验收：2026-09-29
 

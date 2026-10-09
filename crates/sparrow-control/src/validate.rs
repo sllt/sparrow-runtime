@@ -102,8 +102,17 @@ pub fn bind_plan_with_store(
         }
         catalog.insert(table.name.clone(), table.table.schema(&table.name)?);
     }
+    for (name, remote) in &spec.external_lookups {
+        if catalog.get(name).is_ok() || spec.graph.as_ref().is_some_and(|g|g.catalog.iter().any(|t|&t.name==name)) {
+            return Err(SparrowError::new(ErrorCode::InvalidSchema,"external Lookup must not shadow a stream or inline catalog"));
+        }
+        catalog.insert(name.clone(),remote.schema(name)?);
+    }
     let plan = bind_plan(spec, &catalog, name, revision)?;
     validate_external_bindings(store, spec, &plan)?;
+    if spec.has_live_lookups() && (plan.has_silence()||plan.has_timed_iot()) {
+        return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"live/remote Lookup has no observed-feed or paused-time control profile"));
+    }
     let mut used = std::collections::BTreeSet::new();
     for stage in &plan.stages {
         let sparrow_plan::PhysicalStage::Lookup {
@@ -116,29 +125,26 @@ pub fn bind_plan_with_store(
         };
         let table = references
             .iter()
-            .find(|t| t.name == lookup.table)
-            .ok_or_else(|| {
-                SparrowError::new(
-                    ErrorCode::InvalidArgument,
-                    format!(
-                        "Lookup '{}' requires an explicit immutable reference_tables binding",
-                        lookup.table
-                    ),
-                )
-            })?;
+            .find(|t| t.name == lookup.table);
+        let (schema,keys)=if let Some(table)=table {
+            (table.table.schema(&table.name)?,&table.table.keys)
+        } else if let Some(remote)=spec.external_lookups.get(&lookup.table) {
+            (remote.schema(&lookup.table)?,&remote.keys)
+        } else {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,"Lookup requires an explicit managed reference_tables or external_lookups binding"));
+        };
         if lookup.temporal || lookup.as_of_field.is_some() {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
                 "managed temporal Lookup requires a pinned version timeline and is not yet enabled",
             ));
         }
-        if lookup.table_keys != table.table.keys {
+        if &lookup.table_keys != keys {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
                 "Lookup table keys must exactly match the immutable table key order",
             ));
         }
-        let schema = table.table.schema(&table.name)?;
         for (stream_key, table_key) in lookup.stream_keys.iter().zip(&lookup.table_keys) {
             let source = input.field_by_name(stream_key).ok_or_else(|| {
                 SparrowError::new(ErrorCode::InvalidSchema, "Lookup stream key is absent")
@@ -153,12 +159,12 @@ pub fn bind_plan_with_store(
                 ));
             }
         }
-        used.insert(table.name.as_str());
+        used.insert(lookup.table.as_str());
     }
-    if used.len() != spec.reference_tables.len() {
+    if used.len() != spec.reference_tables.len()+spec.external_lookups.len() {
         return Err(SparrowError::new(
             ErrorCode::InvalidArgument,
-            "reference_tables contains a binding not used by any Lookup",
+            "reference_tables/external_lookups contains a binding not used by any Lookup",
         ));
     }
     Ok(plan)
@@ -392,6 +398,7 @@ pub fn validate_io(
     policy: &TargetPolicy,
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
+    validate_lookup_io(spec,secrets,policy)?;
     spec.check_delivery()?;
     if let Some(io) = &spec.graph_io {
         for (operator, source) in &io.sources {
@@ -407,6 +414,12 @@ pub fn validate_io(
 
     validate_source_io(spec, &spec.source, schema, secrets, policy, demo)?;
     validate_sink_io(&spec.sink, secrets, policy, demo)
+}
+
+fn validate_lookup_io(spec:&PipelineSpec,secrets:&dyn SecretResolver,policy:&TargetPolicy)->Result<()> {
+    if spec.has_live_lookups(){spec.basic_check()?;}
+    for (name,remote) in &spec.external_lookups {let _=remote.provider(name,secrets,policy)?;}
+    Ok(())
 }
 
 fn validate_source_io(
@@ -575,6 +588,7 @@ pub fn validate_io_with_plan(
         return Ok(());
     };
 
+    validate_lookup_io(spec,secrets,policy)?;
     for (operator, source) in &io.sources {
         let actual = graph_endpoint_schema(plan, *operator, true)?;
         validate_source_io(spec, source, &actual, secrets, policy, demo)
@@ -1098,6 +1112,9 @@ fn validate_aligned_plan_inner(
     dependencies: Option<&[sparrow_plan::ReferenceTableDependency]>,
 ) -> sparrow_model::Result<()> {
     let recovery = RecoveryPolicy::parse(&spec.recovery)?;
+    if spec.has_live_lookups() && (recovery.is_aligned()||spec.restore.is_some()||spec.checkpoint.is_some()||spec.checkpoint_dir.is_some()) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"live/remote Lookup observations cannot enter aligned checkpoint profiles"));
+    }
     if plan.has_plugins() && (recovery.is_aligned()||spec.restore.is_some()||spec.checkpoint.is_some()||spec.checkpoint_dir.is_some()) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"native functions require restart_fresh without checkpoint or restore"));
     }
@@ -1555,6 +1572,12 @@ pub fn effective_guarantees_with_plan(
     plan: &PhysicalPlan,
 ) -> serde_json::Value {
     let mut value = effective_guarantees(spec);
+    if spec.has_live_lookups() {
+        value["aligned_eligible"]=serde_json::json!(false);
+        value["aligned_eligibility_reason"]=serde_json::json!("live table observations and external responses are not a replay log");
+        value["lookup"]=serde_json::json!({"mode":"live_best_effort","recovery":"restart_fresh_only","automatic_restart":false,"table_switch":"per_operator_batch","remote_order":"input_order","cached_results":"ttl_bounded_not_historical_snapshots"});
+        return value;
+    }
     let external=plan.has_external_plugins() || spec.source.plugin.is_some() || spec.sink.plugin.is_some()
         || spec.graph_io.as_ref().is_some_and(|io|io.sources.values().any(|s|s.plugin.is_some())||io.sinks.values().any(|s|s.plugin.is_some()));
     if plan.has_plugins() || external {
@@ -2115,6 +2138,7 @@ mod tests {
     #[test]
     fn rejects_checkpoint_and_at_least_once() {
         let mut spec = PipelineSpec {
+            external_lookups:Default::default(),
             reference_tables: Default::default(),
             graph_io: None,
             version: 1,

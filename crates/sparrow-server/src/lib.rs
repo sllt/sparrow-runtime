@@ -59,6 +59,10 @@ pub fn router(state: AppState) -> Router {
             put(reference_tables::put_table).get(reference_tables::get_latest_table),
         )
         .route(
+            "/v1/tables/{name}/revisions",
+            get(reference_tables::list_table_revisions),
+        )
+        .route(
             "/v1/tables/{name}/revisions/{revision}",
             get(reference_tables::get_table_revision),
         )
@@ -67,6 +71,8 @@ pub fn router(state: AppState) -> Router {
             get(reference_tables::table_dependencies),
         )
         .route("/v1/tables/{name}/gc", post(reference_tables::gc_table))
+        .route("/v1/tables/{name}/mutate", post(reference_tables::mutate_table))
+        .route("/v1/tables/{name}/rollback", post(reference_tables::rollback_table))
         .route("/v1/pipelines", get(list_pipelines))
         .route("/v1/pipelines/{name}", put(put_pipeline).get(get_pipeline))
         .route("/v1/pipelines/{name}/status", get(pipeline_status))
@@ -799,6 +805,7 @@ fn status_body(state: &AppState, name: &str) -> ApiResult<Value> {
         "etag": row.etag,
         "spec": row.spec,
         "reference_tables": reference_tables,
+        "lookup_runtime": state.supervisor.lookup_snapshot(name).unwrap_or_else(|_|json!({"available":false,"reason":"registry_busy"})),
         "safe_mode": state.safe_mode,
         "desired": desired.map(|d| json!({"revision": d.revision, "status": d.status})),
         "actual": actual.map(|a| json!({
@@ -1031,7 +1038,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
     let credits = state.supervisor.kernel().process_owner().usage();
     let mailbox_jobs = state.supervisor.mailbox_snapshots().await;
     let flow_jobs = state.supervisor.flow_snapshots().await;
-    let io_fields = json!({
+    let mut io_fields = json!({
             "mqtt_received": io.mqtt_received,
             "mqtt_pending_bytes": io.mqtt_pending_bytes,
             "mqtt_dropped_budget": io.mqtt_dropped_budget,
@@ -1072,6 +1079,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "plugin_polls":io.plugin_polls,"plugin_failed":io.plugin_failed,
             "decode_errors": io.decode_errors,
     });
+    io_fields["lookup_update_failed"]=json!(io.lookup_update_failed);
     let mut value = json!({
         "jobs_started": snap.jobs_started,
         "state_accounting_errors_total": state.supervisor.kernel().process_owner().accounting_errors_total(),

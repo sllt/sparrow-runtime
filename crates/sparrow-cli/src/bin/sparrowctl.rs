@@ -131,6 +131,47 @@ fn parse(args: &[String]) -> Result<Command> {
         ["capabilities"] => (Method::GET, vec!["capabilities".into()], None),
         ["pipelines"] => (Method::GET, vec!["pipelines".into()], None),
         ["streams"] => (Method::GET, vec!["streams".into()], None),
+        ["tables"] => (Method::GET, vec!["tables".into()], None),
+        ["table", id] => (Method::GET, vec!["tables".into(), name(id)?], None),
+        ["table", id, revision] => {
+            let revision = table_revision(revision)?;
+            (
+                Method::GET,
+                vec!["tables".into(), name(id)?, "revisions".into(), revision.to_string()],
+                None,
+            )
+        }
+        ["table-revisions", id] | ["table-dependencies", id] => (
+            Method::GET,
+            vec![
+                "tables".into(), name(id)?,
+                positional[0].trim_start_matches("table-").into(),
+            ],
+            None,
+        ),
+        ["put-table", id, file] => (
+            Method::PUT,
+            vec!["tables".into(), name(id)?],
+            Some(read_input(file)?),
+        ),
+        ["mutate-table", id, file] => (
+            Method::POST,
+            vec!["tables".into(), name(id)?, "mutate".into()],
+            Some(read_input(file)?),
+        ),
+        ["rollback-table", id, expected, target] => (
+            Method::POST,
+            vec!["tables".into(), name(id)?, "rollback".into()],
+            Some(json!({
+                "expected_revision": table_revision(expected)?,
+                "target_revision": table_revision(target)?,
+            })),
+        ),
+        ["gc-table", id] => (
+            Method::POST,
+            vec!["tables".into(), name(id)?, "gc".into()],
+            Some(json!({})),
+        ),
         ["validate", file] | ["explain", file] | ["query", file] => (
             Method::POST,
             vec![positional[0].into()],
@@ -184,6 +225,13 @@ fn parse(args: &[String]) -> Result<Command> {
         etag,
         output,
     })
+}
+fn table_revision(value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| *revision > 0 && *revision <= i64::MAX as u64)
+        .ok_or_else(|| "table revision must be a positive SQLite-range integer".into())
 }
 async fn execute(command: Command, token: &str) -> Result<(Value, bool)> {
     let mut url = command.base;
@@ -262,6 +310,9 @@ fn help() {
     println!(
         "sparrowctl — authenticated JSON management client\n\
 commands: health | capabilities | streams | pipelines\n\
+  tables | table NAME [REVISION] | table-revisions NAME | table-dependencies NAME\n\
+  put-table NAME FILE | mutate-table NAME FILE (expected_revision CAS in JSON)\n\
+  rollback-table NAME EXPECTED_REVISION TARGET_REVISION | gc-table NAME\n\
   plugins | plugin-install MANIFEST_JSON ARTIFACT [SIGNATURE_JSON]\n\
   plugin-attest MANIFEST_SHA256 SIGNATURE_JSON | plugin-references MANIFEST_SHA256\n\
   retire-pipeline NAME CURRENT_ETAG (deletes stopped fresh catalog history, not data files)\n\
@@ -392,6 +443,31 @@ mod tests {
         }
         assert!(parse(&args(&["status", "p", "--url", "http://127.0.0.1:43180"])).is_ok());
         assert!(parse(&args(&["restore", "p", "--snapshot-id", "3"])).is_ok());
+    }
+    #[test]
+    fn tab02_cli_table_routes_and_explicit_revision_cas() {
+        for (arguments, method, route) in [
+            (vec!["tables"], Method::GET, vec!["tables"]),
+            (vec!["table", "sites"], Method::GET, vec!["tables", "sites"]),
+            (vec!["table", "sites", "3"], Method::GET, vec!["tables", "sites", "revisions", "3"]),
+            (vec!["table-revisions", "sites"], Method::GET, vec!["tables", "sites", "revisions"]),
+            (vec!["table-dependencies", "sites"], Method::GET, vec!["tables", "sites", "dependencies"]),
+            (vec!["rollback-table", "sites", "3", "1"], Method::POST, vec!["tables", "sites", "rollback"]),
+            (vec!["gc-table", "sites"], Method::POST, vec!["tables", "sites", "gc"]),
+        ] {
+            let command = parse(&args(&arguments)).unwrap();
+            assert_eq!(command.method, method);
+            assert_eq!(command.segments, route);
+        }
+        let command = parse(&args(&["rollback-table", "sites", "3", "1"])).unwrap();
+        assert_eq!(command.body.unwrap(), json!({"expected_revision":3,"target_revision":1}));
+        for bad in ["0", "-1", "latest", "18446744073709551615"] {
+            assert!(parse(&args(&["table", "sites", bad])).is_err());
+            assert!(parse(&args(&["rollback-table", "sites", bad, "1"])).is_err());
+            assert!(parse(&args(&["rollback-table", "sites", "3", bad])).is_err());
+        }
+        assert!(parse(&args(&["table", "../secret"])).is_err());
+        assert!(parse(&args(&["table", "sites", "--revision", "3"])).is_err());
     }
     #[test]
     fn plugins_cli_explicit_digest_and_management_routes(){
