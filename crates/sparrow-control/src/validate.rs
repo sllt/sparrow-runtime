@@ -402,6 +402,7 @@ pub fn validate_io(
     validate_lookup_io(spec,secrets,policy)?;
     spec.check_delivery()?;
     check_nats_reservation_total(spec)?;
+    check_csv_reliability(spec)?;
     if let Some(io) = &spec.graph_io {
         for (operator, source) in &io.sources {
             validate_source_io(spec, source, schema, secrets, policy, demo)
@@ -482,6 +483,39 @@ fn jetstream_sink_reservation(sink: &SinkSpec) -> Option<usize> {
     }
 }
 
+/// CSV bodies carry rows only. A reliable pipeline (JetStream source or
+/// aligned recovery) hands the HTTP sink an output identity that only the
+/// JSON envelope can carry, so that combination is refused up front.
+fn check_csv_reliability(spec: &PipelineSpec) -> Result<()> {
+    let sinks: Vec<&SinkSpec> = match &spec.graph_io {
+        Some(io) => io.sinks.values().collect(),
+        None => vec![&spec.sink],
+    };
+    let jetstream_source = match &spec.graph_io {
+        Some(io) => io.sources.values().any(|s| s.kind == "jetstream"),
+        None => spec.source.kind == "jetstream",
+    };
+    let reliable =
+        jetstream_source || RecoveryPolicy::parse(&spec.recovery).is_ok_and(|r| r.is_aligned());
+    for sink in sinks {
+        if reliable && sink.kind == "http" && sink.payload_format()?.as_csv().is_some() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "HTTP CSV bodies cannot carry reliable output identity; use format=json for checkpointed delivery",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// CSV needs a schema it can lay out (columns, NULL spelling).
+fn validate_sink_format(sink: &SinkSpec, schema: &Schema) -> Result<()> {
+    if let Some(csv) = sink.payload_format()?.as_csv() {
+        csv.check_schema(schema)?;
+    }
+    Ok(())
+}
+
 /// `msg_id_column` must be a utf8/integer column of the sink's input.
 fn validate_sink_schema(sink: &SinkSpec, schema: &Schema) -> Result<()> {
     #[cfg(feature = "jetstream")]
@@ -507,6 +541,9 @@ fn validate_source_io(
     policy: &TargetPolicy,
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
+    if let Some(csv) = source.payload_format()?.as_csv() {
+        csv.check_schema(schema)?;
+    }
     match source.kind.as_str() {
         "plugin" => source.plugin.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"plugin Source binding required"))?.validate()?,
         #[cfg(feature = "jetstream")]
@@ -575,6 +612,7 @@ fn validate_source_io(
             source_spec.graph_io = None;
             source_spec.source = source.clone();
             cfg.contract = resolve_file_contract(&source_spec, recovery)?;
+            cfg.format = source.payload_format()?;
             cfg.validate().map_err(io)?;
         }
         other => {
@@ -600,6 +638,15 @@ fn validate_sink_io(
             ErrorCode::InvalidArgument,
             "file options require a File Sink",
         ));
+    }
+    let csv = sink.payload_format()?.as_csv().is_some();
+    if let Some(action) = sink.action.as_ref().filter(|_| csv) {
+        if sink.kind == "file" || action.body.is_some() || action.single {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "a CSV sink writes each row as one CSV record: no action.body/single, and no action on a File Sink",
+            ));
+        }
     }
     if let Some(action) = &sink.action {
         if (action.topic.is_some() && sink.kind != "mqtt")
@@ -716,6 +763,21 @@ pub fn validate_io_with_plan(
                 })?;
             validate_sink_schema(&spec.sink, output)?;
         }
+        if spec.sink.format.is_some() {
+            let output = plan
+                .stages
+                .iter()
+                .rev()
+                .find_map(|stage| match stage {
+                    sparrow_plan::PhysicalStage::CaptureSink { schema, .. }
+                    | sparrow_plan::PhysicalStage::BestEffortSink { schema, .. } => Some(schema),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    SparrowError::new(ErrorCode::InvalidSchema, "sink requires a typed schema")
+                })?;
+            validate_sink_format(&spec.sink, output)?;
+        }
         return Ok(());
     };
 
@@ -730,6 +792,7 @@ pub fn validate_io_with_plan(
         let actual = graph_endpoint_schema(plan, *operator, false)?;
         validate_action_schema(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
         validate_sink_schema(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
+        validate_sink_format(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
         validate_sink_io(sink, secrets, policy, demo)
             .map_err(|e| e.at_operator((*operator).into()))?;
     }
@@ -833,6 +896,7 @@ pub fn mqtt_config(
         cfg.inbox_wait_timeout = std::time::Duration::from_millis(ms);
     }
     cfg.restore = RestoreClaim::None;
+    cfg.payload_format = source.payload_format()?;
     Ok(cfg)
 }
 
@@ -882,6 +946,7 @@ pub fn http_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<Http
         skip_verify: sink.skip_verify,
     };
     cfg.restore = RestoreClaim::None;
+    cfg.payload_format = sink.payload_format()?;
     Ok(cfg)
 }
 
@@ -900,6 +965,10 @@ pub fn http_poll_config(
             )
         })?
         .connector_config(schema, source.inbox_capacity, fail_on_decode)
+        .and_then(|mut config| {
+            config.payload_format = source.payload_format()?;
+            Ok(config)
+        })
 }
 
 pub fn databus_source_config(
@@ -938,7 +1007,7 @@ pub fn nats_source_config(
     schema: Schema,
     fail_on_decode: bool,
 ) -> Result<sparrow_connectors::NatsSourceConfig> {
-    Ok(source
+    let mut config = source
         .nats
         .as_ref()
         .ok_or_else(|| {
@@ -947,14 +1016,16 @@ pub fn nats_source_config(
                 "NATS source requires source.nats",
             )
         })?
-        .connector_config(schema, source.inbox_capacity, fail_on_decode))
+        .connector_config(schema, source.inbox_capacity, fail_on_decode);
+    config.payload_format = source.payload_format()?;
+    Ok(config)
 }
 
 #[cfg(feature = "jetstream")]
 pub fn jetstream_sink_config(
     sink: &SinkSpec,
 ) -> Result<sparrow_connectors::jetstream::JetStreamSinkConfig> {
-    Ok(sink
+    let mut config = sink
         .jetstream
         .as_ref()
         .ok_or_else(|| {
@@ -963,18 +1034,22 @@ pub fn jetstream_sink_config(
                 "JetStream sink requires sink.jetstream",
             )
         })?
-        .connector_config(sink.outbox_capacity))
+        .connector_config(sink.outbox_capacity);
+    config.payload_format = sink.payload_format()?;
+    Ok(config)
 }
 
 #[cfg(feature = "nats")]
 pub fn nats_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::NatsSinkConfig> {
-    Ok(sink
+    let mut config = sink
         .nats
         .as_ref()
         .ok_or_else(|| {
             SparrowError::new(ErrorCode::InvalidArgument, "NATS sink requires sink.nats")
         })?
-        .connector_config(sink.outbox_capacity))
+        .connector_config(sink.outbox_capacity);
+    config.payload_format = sink.payload_format()?;
+    Ok(config)
 }
 
 pub fn http_push_config(source: &SourceSpec, schema: Schema) -> Result<HttpPushSourceConfig> {
@@ -987,6 +1062,7 @@ pub fn http_push_config(source: &SourceSpec, schema: Schema) -> Result<HttpPushS
     }
     cfg.inbox_capacity = source.inbox_capacity;
     cfg.restore = RestoreClaim::None;
+    cfg.payload_format = source.payload_format()?;
     Ok(cfg)
 }
 
@@ -1035,6 +1111,7 @@ pub(crate) fn file_sink_config(
         max_files: config.max_files,
         row_bytes: config.row_bytes,
         sync_data: config.sync_data,
+        format: sink.payload_format()?,
     })
 }
 
@@ -1071,6 +1148,7 @@ pub fn mqtt_sink_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result
         skip_verify: false,
     };
     cfg.restore = RestoreClaim::None;
+    cfg.payload_format = sink.payload_format()?;
     Ok(cfg)
 }
 
@@ -1679,6 +1757,14 @@ pub fn capabilities_json() -> serde_json::Value {
         "recovery_pt_window": RecoveryPolicy::RestartFresh.none_label(),
         "recovery_aligned": RecoveryPolicy::Aligned.as_str(),
         "exactly_once": "rejected",
+        "formats": {
+            "default": "json",
+            "available": ["json", "csv"],
+            "csv_sources": crate::spec::CSV_SOURCE_KINDS,
+            "csv_sinks": crate::spec::CSV_SINK_KINDS,
+            "csv_contract": "strict_rfc4180_subset; header_or_positional; typed_per_schema; one_record_per_message; file_header_per_segment; no_reliable_http_identity",
+            "docs": "docs/FORMATS.md",
+        },
         "connectors": [
             {"kind":"plugin","roles":["source","sink"],"replay":"unsupported","delivery":"live_best_effort","recovery":"restart_fresh","default_enabled":false},
             {
@@ -2488,6 +2574,8 @@ mod tests {
                 path: None,
                 tls: false,
                 file_contract: None,
+                format: None,
+                csv: None,
             },
             sink: crate::spec::SinkSpec {
                 nats: None,
@@ -2513,6 +2601,8 @@ mod tests {
                 qos: 0,
                 clean_session: true,
                 tls: false,
+                format: None,
+                csv: None,
             },
             delivery: "at_least_once".into(),
             recovery: "restart_fresh".into(),
@@ -2577,6 +2667,8 @@ mod tests {
             path: None,
             tls: false,
             file_contract: None,
+            format: None,
+            csv: None,
         };
         let schema = Schema::new(
             SchemaId::new(1),
@@ -2624,6 +2716,8 @@ mod tests {
             path: None,
             tls: false,
             file_contract: None,
+            format: None,
+            csv: None,
         };
         let schema = Schema::new(
             SchemaId::new(1),
@@ -2668,6 +2762,8 @@ mod tests {
             qos: 0,
             clean_session: true,
             tls: false,
+            format: None,
+            csv: None,
         };
         let err = http_config(&sink, None).unwrap_err();
         assert_eq!(err.code, ErrorCode::PolicyDenied);

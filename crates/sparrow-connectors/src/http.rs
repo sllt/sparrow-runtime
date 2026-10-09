@@ -59,6 +59,9 @@ pub struct HttpSinkConfig {
     pub linger: Duration,
     /// >1 explicitly permits request completion/delivery reordering.
     pub max_inflight: usize,
+    /// Request body format: a JSON array (default) or a CSV document
+    /// (header line when set, then one record per row).
+    pub payload_format: sparrow_formats::PayloadFormat,
 }
 
 impl HttpSinkConfig {
@@ -81,6 +84,7 @@ impl HttpSinkConfig {
             batch_bytes: 256 * 1024,
             linger: Duration::ZERO,
             max_inflight: 1,
+            payload_format: sparrow_formats::PayloadFormat::Json,
         }
     }
 
@@ -187,6 +191,9 @@ struct Delivery {
     rows: usize,
     receipts: Receipts,
     first: tokio::time::Instant,
+    /// CSV only: byte length of the leading header line (0 without one).
+    /// A merge keeps the first body's header and drops the next one's.
+    csv_header: Option<usize>,
 }
 enum MergeFailure {
     Separate(Delivery),
@@ -199,9 +206,13 @@ impl Delivery {
         cap: usize,
         target_rows: usize,
     ) -> std::result::Result<(), MergeFailure> {
-        let comma = usize::from(self.rows > 0 && next.rows > 0);
-        let size = self.bytes.len() + next.bytes.len() - 2 + comma;
+        let comma = usize::from(self.csv_header.is_none() && self.rows > 0 && next.rows > 0);
+        let size = match next.csv_header {
+            Some(header) => self.bytes.len() + next.bytes.len() - header,
+            None => self.bytes.len() + next.bytes.len() - 2 + comma,
+        };
         if size > cap
+            || self.csv_header != next.csv_header
             || self.rows.saturating_add(next.rows) > target_rows
             || self.schema != next.schema
             || !Arc::ptr_eq(self.lease.owner(), next.lease.owner())
@@ -241,13 +252,17 @@ impl Delivery {
             }
             self.encoded_credit.resize(self.lease.bytes());
         }
-        self.bytes.pop();
-        if comma != 0 {
-            self.bytes.push(b',');
+        if let Some(header) = next.csv_header {
+            self.bytes.extend_from_slice(&next.bytes[header..]);
+        } else {
+            self.bytes.pop();
+            if comma != 0 {
+                self.bytes.push(b',');
+            }
+            self.bytes
+                .extend_from_slice(&next.bytes[1..next.bytes.len() - 1]);
+            self.bytes.push(b']');
         }
-        self.bytes
-            .extend_from_slice(&next.bytes[1..next.bytes.len() - 1]);
-        self.bytes.push(b']');
         self.rows += next.rows;
         self.receipts.batches += next.receipts.batches;
         if let (Some(guard),Some(other))=(&mut self.receipts.observation,next.receipts.observation.take()){guard.merge(other);}
@@ -272,6 +287,12 @@ impl HttpSink {
         }
         if action.topic.is_some() || (action.per_row_http() && (config.max_inflight!=1 || config.batch_rows!=1 || !config.linger.is_zero())) {
             return Err(ConnectorError::new(ErrorCode::InvalidArgument,"HTTP action options: no topic; per-row requires serial/no linger/no coalescing"));
+        }
+        if config.payload_format.as_csv().is_some() && (action.body.is_some() || action.single) {
+            return Err(ConnectorError::new(
+                ErrorCode::InvalidArgument,
+                "HTTP CSV bodies take no action.body or action.single (the row is the CSV record)",
+            ));
         }
         Ok(())
     }
@@ -301,7 +322,10 @@ impl HttpSink {
                 let encoded=(||->sparrow_model::Result<_>{
                     if batch.output_sequence().is_some(){return Err(sparrow_model::SparrowError::new(ErrorCode::UnsupportedRestore,"HTTP actions are live-only"));}
                     let mut lease=batch.lease().owner().acquire(CreditKind::Reservation,32*1024)?;
-                    let bytes=action.encode(batch.schema(),std::slice::from_ref(row),!action.single,self.config.batch_bytes,|cap|lease.grow_to(cap+32*1024))?;
+                    let bytes=match self.config.payload_format.as_csv() {
+                        Some(csv)=>csv.encode_rows_bounded_with_capacity(batch.schema(),std::slice::from_ref(row),self.config.batch_bytes,|cap|lease.grow_to(cap+32*1024)),
+                        None=>action.encode(batch.schema(),std::slice::from_ref(row),!action.single,self.config.batch_bytes,|cap|lease.grow_to(cap+32*1024)),
+                    }.inspect_err(|_|self.diag.csv_encode_error(&self.config.payload_format))?;
                     let mut url=url::Url::parse(&self.config.url).map_err(|_|sparrow_model::SparrowError::new(ErrorCode::InvalidArgument,"invalid action base URL"))?;
                     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
                         return Err(sparrow_model::SparrowError::new(ErrorCode::PolicyDenied,"action URL forbids userinfo and fragments"));
@@ -495,7 +519,27 @@ impl HttpSink {
             })
             .ok()?;
         let mut encoded_credit=self.diag.observation.encoded_credit(lease.bytes());
-        let encoded = if let Some(action)=&self.action {
+        let csv = self.config.payload_format.as_csv();
+        let encoded = if let Some(csv) = csv {
+            if batch.output_sequence().is_some() {
+                Err(sparrow_model::SparrowError::new(
+                    ErrorCode::UnsupportedRestore,
+                    "CSV bodies cannot carry reliable output identity",
+                ))
+            } else {
+                csv.encode_rows_bounded_with_capacity(
+                    batch.schema(),
+                    batch.rows(),
+                    self.config.batch_bytes,
+                    |capacity| {
+                        lease.grow_to(capacity + DELIVERY_OVERHEAD)?;
+                        encoded_credit.resize(lease.bytes());
+                        Ok(())
+                    },
+                )
+            }
+            .inspect_err(|_| self.diag.csv_encode_error(&self.config.payload_format))
+        } else if let Some(action)=&self.action {
             if batch.output_sequence().is_some() {Err(sparrow_model::SparrowError::new(ErrorCode::UnsupportedRestore,"action payloads cannot inherit reliable output identity"))}
             else {action.encode(batch.schema(),batch.rows(),true,self.config.batch_bytes,
                 |capacity|{lease.grow_to(capacity+DELIVERY_OVERHEAD)?;encoded_credit.resize(lease.bytes());Ok(())})}
@@ -517,6 +561,15 @@ impl HttpSink {
             error
         })
         .ok()?;
+        let csv_header = match csv {
+            // Column names may be quoted and contain line breaks, so the
+            // header length comes from the encoder, not a newline search.
+            Some(csv) if csv.header() => {
+                Some(csv.encode_header(batch.schema()).map_or(0, |h| h.len()))
+            }
+            Some(_) => Some(0),
+            None => None,
+        };
         Some(Delivery {
             encoded_credit,
             bytes,
@@ -525,6 +578,7 @@ impl HttpSink {
             rows: batch.num_rows(),
             receipts,
             first,
+            csv_header,
         })
     }
 
@@ -543,7 +597,7 @@ impl HttpSink {
         let mut template = self
             .client
             .post(url)
-            .header("content-type", "application/json")
+            .header("content-type", self.config.payload_format.content_type())
             .body(body);
         if let Some(token) = &self.auth {
             template = template.header("authorization", format!("Bearer {token}"));
@@ -862,6 +916,10 @@ async fn handle_http(
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
+
+#[cfg(test)]
+#[path = "http_csv_tests.rs"]
+mod csv_tests;
 
 #[cfg(test)]
 mod tests {

@@ -237,6 +237,7 @@ pub(crate) async fn run_file_source(
     let _lifecycle = diag.observation.lifecycle(true);
     diag.observation
         .health(true, HealthState::Ready, "file_open", None);
+    source.set_diagnostics(diag.clone());
     let mut terminal_sent = false;
     let mut next_poll = None;
     loop {

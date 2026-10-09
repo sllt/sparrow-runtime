@@ -1587,6 +1587,7 @@ impl Supervisor {
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.contract = contract;
         cfg.fail_on_decode = fail_on_decode;
+        cfg.format = spec.source.payload_format()?;
         let src = self
             .store
             .run_blocking(move || {
@@ -1708,6 +1709,7 @@ impl Supervisor {
         cfg.recovery = RecoveryPolicy::Aligned;
         cfg.restore = spec.restore_claim()?;
         cfg.fail_on_decode = fail_on_decode;
+        cfg.format = spec.source.payload_format()?;
         // Aligned growing files default to AppendOnly (N5): EOF polls, no
         // terminal MAX watermark. Finite fixtures set source.file_contract=sealed.
         let contract = crate::validate::resolve_file_contract(spec, RecoveryPolicy::Aligned)?;
@@ -1879,6 +1881,7 @@ impl Supervisor {
         let source_task = self.kernel.handle().spawn(async move {
             let _lifecycle=diag_src.observation.lifecycle(true);
             diag_src.observation.health(true,HealthState::Ready,"file_open",None);
+            source.set_diagnostics(diag_src.clone());
             let mut terminal_sent = false;
             let mut next_file_poll = None;
             // Independent polling is important: publishing a file batch may

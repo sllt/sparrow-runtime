@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sparrow_formats::{encode_json_row, JsonLimits};
+use sparrow_formats::JsonLimits;
 use sparrow_model::{ErrorCode, InflightCounter, RestoreClaim, RowBatch};
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +36,8 @@ pub struct MqttSinkConfig {
     pub keepalive: Duration,
     pub outbox_capacity: usize,
     pub restore: RestoreClaim,
+    /// Message payload format (JSON default, or one CSV record).
+    pub payload_format: sparrow_formats::PayloadFormat,
 }
 
 impl MqttSinkConfig {
@@ -56,6 +58,7 @@ impl MqttSinkConfig {
             keepalive: Duration::from_secs(30),
             outbox_capacity: 32,
             restore: RestoreClaim::None,
+            payload_format: Default::default(),
         }
     }
 
@@ -166,7 +169,16 @@ impl MqttSink {
         let prepared=(||->sparrow_model::Result<_>{
             if batch.output_sequence().is_some(){return Err(sparrow_model::SparrowError::new(ErrorCode::UnsupportedRestore,"MQTT action has no reliable receipt"));}
             let mut lease=batch.lease().owner().acquire(sparrow_model::CreditKind::Reservation,8192)?;
-            let body=action.encode(batch.schema(),std::slice::from_ref(row),false,JsonLimits::default().max_bytes,|cap|lease.grow_to(cap+8192))?;
+            // CSV sinks accept only `action.topic` (validated); the body is the CSV message.
+            let body=match self.config.payload_format.as_csv() {
+                Some(csv)=>{
+                    let body=csv.encode_message(batch.schema(),row).inspect_err(|_|self.diag.csv_encode_error(&self.config.payload_format))?;
+                    lease.grow_to(body.capacity().saturating_add(8192))?;
+                    if body.len()>JsonLimits::default().max_bytes {return Err(sparrow_model::SparrowError::new(ErrorCode::BoundExceeded,"CSV message exceeds 64KiB"));}
+                    body
+                }
+                None=>action.encode(batch.schema(),std::slice::from_ref(row),false,JsonLimits::default().max_bytes,|cap|lease.grow_to(cap+8192))?,
+            };
             let topic=if let Some(parts)=&action.topic {
                 // A variable occupies one topic level; only configured literals
                 // may introduce separators. No data-controlled wildcard routing.
@@ -317,7 +329,7 @@ impl MqttSink {
                                     continue;
                                 }
                                 let started=std::time::Instant::now();
-                                let encoded=encode_json_row(schema,row);
+                                let encoded=self.config.payload_format.encode_row(schema,row).inspect_err(|_|self.diag.csv_encode_error(&self.config.payload_format));
                                 self.diag.observation.record(Latency::Encode,started.elapsed());
                                 let body = match encoded {
                                     Ok(b) if b.len() <= limits.max_bytes => b,

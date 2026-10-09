@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use reqwest::header::{HeaderName, HeaderValue};
-use sparrow_formats::{decode_json_row, JsonLimits};
+use sparrow_formats::{decode_json_row, JsonLimits, PayloadFormat};
 use sparrow_io::observed::Sender as ObservedSender;
 use sparrow_model::observation::{HealthState, Latency, OriginSpan};
 use sparrow_model::{
@@ -115,6 +115,9 @@ pub struct HttpPollSourceConfig {
     /// Per-record JSON limits (each element / line).
     pub json_limits: JsonLimits,
     pub fail_on_decode: bool,
+    /// Body format. CSV bodies are one document (optional header plus
+    /// records); `format` then must stay `Json` (it only frames JSON).
+    pub payload_format: PayloadFormat,
 }
 
 impl HttpPollSourceConfig {
@@ -139,6 +142,7 @@ impl HttpPollSourceConfig {
             schema,
             json_limits: JsonLimits::default(),
             fail_on_decode: false,
+            payload_format: PayloadFormat::Json,
         }
     }
 
@@ -192,6 +196,16 @@ impl HttpPollSourceConfig {
             ));
         }
         self.check_inbox_budget(ResourceBudget::compact().queue_bytes)?;
+        if let Some(csv) = self.payload_format.as_csv() {
+            if self.format != HttpPollFormat::Json {
+                return Err(error(
+                    ErrorCode::InvalidArgument,
+                    "HTTP poll http_poll.format frames JSON bodies; leave it unset with a CSV source format",
+                ));
+            }
+            csv.check_schema(&self.schema)
+                .map_err(|e| error(e.code, e.message))?;
+        }
         if self.uses_credentials() && url.scheme() != "https" {
             return Err(error(
                 ErrorCode::PolicyDenied,
@@ -327,9 +341,10 @@ fn build_headers(
     let mut out = Vec::with_capacity(config.headers.len() + 2);
     out.push((
         reqwest::header::ACCEPT,
-        HeaderValue::from_static(match config.format {
-            HttpPollFormat::Json => "application/json",
-            HttpPollFormat::Ndjson => "application/x-ndjson, application/json;q=0.5",
+        HeaderValue::from_static(match (&config.payload_format, config.format) {
+            (PayloadFormat::Csv(_), _) => "text/csv",
+            (_, HttpPollFormat::Json) => "application/json",
+            (_, HttpPollFormat::Ndjson) => "application/x-ndjson, application/json;q=0.5",
         }),
     ));
     match &config.auth {
@@ -732,6 +747,11 @@ impl HttpPollSource {
         received_at: std::time::Instant,
     ) -> std::result::Result<bool, PollFailure> {
         let bytes = body.bytes.as_slice();
+        if let Some(csv) = self.config.payload_format.as_csv() {
+            return self
+                .ingest_csv(csv, bytes, ingress, cancel, received_at)
+                .await;
+        }
         let mut records = Records::new(bytes, self.config.format);
         while let Some(span) = records.next_span() {
             let (start, end) = match span {
@@ -781,6 +801,65 @@ impl HttpPollSource {
             }
         }
         Ok(true)
+    }
+
+    /// CSV body: one document. A header error rejects the whole response
+    /// (like a JSON framing error); record errors drop that record.
+    async fn ingest_csv(
+        &self,
+        csv: &sparrow_formats::CsvFormat,
+        bytes: &[u8],
+        ingress: &Ingress<'_>,
+        cancel: &CancellationToken,
+        received_at: std::time::Instant,
+    ) -> std::result::Result<bool, PollFailure> {
+        let mut document = match csv.document(&self.config.schema, bytes) {
+            Ok(document) => document,
+            Err(e) => {
+                self.diag.csv_decode_error(&self.config.payload_format, &e);
+                self.diag
+                    .http_poll_bad_responses
+                    .fetch_add(1, Ordering::Relaxed);
+                self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(PollFailure {
+                    error: error(e.code, e.message),
+                    fatal: self.config.fail_on_decode,
+                });
+            }
+        };
+        loop {
+            let decode_started = std::time::Instant::now();
+            let Some(decoded) = document.next_row(None) else {
+                return Ok(true);
+            };
+            self.diag
+                .observation
+                .record(Latency::Decode, decode_started.elapsed());
+            let row = match decoded {
+                Ok(row) => row,
+                Err(e) => {
+                    self.diag.csv_decode_error(&self.config.payload_format, &e);
+                    self.diag
+                        .http_poll_dropped_bad
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
+                    if self.config.fail_on_decode {
+                        return Err(PollFailure {
+                            error: error(e.code, "HTTP poll record decode failed (fail_on_decode)"),
+                            fatal: true,
+                        });
+                    }
+                    continue;
+                }
+            };
+            self.diag.observation.progress(true, 1);
+            if !self
+                .admit(row, ingress, cancel, OriginSpan::at(received_at))
+                .await?
+            {
+                return Ok(false);
+            }
+        }
     }
 
     /// Wait (cancel-aware, no deadline) for a channel slot and Queue credit.

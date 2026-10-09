@@ -1297,6 +1297,11 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         ),
         ("databus_sink_batches", io.databus_sink_batches),
         ("databus_sink_fatal", io.databus_sink_fatal),
+        ("csv_malformed", io.csv_malformed),
+        ("csv_oversize", io.csv_oversize),
+        ("csv_type_errors", io.csv_type_errors),
+        ("csv_header_errors", io.csv_header_errors),
+        ("csv_encode_errors", io.csv_encode_errors),
     ] {
         io_fields[name] = json!(value);
     }

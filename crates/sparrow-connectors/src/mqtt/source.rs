@@ -54,6 +54,8 @@ pub struct MqttSourceConfig {
     /// When true, a decode error fails the source (and the job) instead of
     /// only incrementing [`IoDiagnostics::decode_errors`] (P1-17).
     pub fail_on_decode: bool,
+    /// Message payload format (JSON default, or one CSV record).
+    pub payload_format: sparrow_formats::PayloadFormat,
 }
 
 impl MqttSourceConfig {
@@ -182,6 +184,7 @@ impl MqttSourceConfig {
             schema,
             json_limits: JsonLimits::default(),
             fail_on_decode: false,
+            payload_format: Default::default(),
         }
     }
 }
@@ -241,6 +244,7 @@ impl MqttSource {
                 sparrow_formats::BadRecordPolicy::Drop
             },
             owner: None,
+            format: config.payload_format.clone(),
         };
         Ok(Self {
             config,
@@ -451,7 +455,9 @@ impl MqttSource {
                             self.diag.observation.progress(true,1);
                             self.diag.mqtt_received.fetch_add(1, Ordering::Relaxed);
                             let frame = SourceFrame::new(payload, 0);
-                            let decoded = self.codec.decode_frame(&frame);
+                            let decoded = self.codec.decode_frame_with(&frame, |e| {
+                                self.diag.csv_decode_error(&self.codec.format, e)
+                            });
                             self.diag.observation.record(Latency::Decode,received_at.elapsed());
                             drop(frame);
                             match decoded {

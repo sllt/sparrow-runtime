@@ -120,6 +120,11 @@ pub struct IoDiagnostics {
     pub databus_sink_discarded_on_close: AtomicU64,
     pub databus_sink_batches: AtomicU64,
     pub databus_sink_fatal: AtomicU64,
+    pub csv_malformed: AtomicU64,
+    pub csv_oversize: AtomicU64,
+    pub csv_type_errors: AtomicU64,
+    pub csv_header_errors: AtomicU64,
+    pub csv_encode_errors: AtomicU64,
     pub databus_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub nats_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub log_written: AtomicU64,
@@ -136,6 +141,33 @@ impl IoDiagnostics {
     pub fn observe_sink<T>(&self, tx: &sparrow_io::observed::Sender<T>) { if let Some(q)=tx.observer(){let _=self.sink_queue.set(q);} }
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Count one CSV decode failure by kind (oversize, malformed, type,
+    /// header). JSON failures are not counted here. The connector's own
+    /// `*_dropped_bad` / `decode_errors` accounting is unchanged.
+    pub fn csv_decode_error(
+        &self,
+        format: &sparrow_formats::PayloadFormat,
+        error: &sparrow_model::SparrowError,
+    ) {
+        if format.as_csv().is_none() {
+            return;
+        }
+        let counter = match sparrow_formats::CsvFault::of(error) {
+            sparrow_formats::CsvFault::Oversize => &self.csv_oversize,
+            sparrow_formats::CsvFault::Malformed => &self.csv_malformed,
+            sparrow_formats::CsvFault::Type => &self.csv_type_errors,
+            sparrow_formats::CsvFault::Header => &self.csv_header_errors,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one CSV encode failure (sinks).
+    pub fn csv_encode_error(&self, format: &sparrow_formats::PayloadFormat) {
+        if format.as_csv().is_some() {
+            self.csv_encode_errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn snapshot(&self) -> IoSnapshot {
@@ -279,6 +311,11 @@ impl IoDiagnostics {
                 .load(Ordering::Relaxed),
             databus_sink_batches: self.databus_sink_batches.load(Ordering::Relaxed),
             databus_sink_fatal: self.databus_sink_fatal.load(Ordering::Relaxed),
+            csv_malformed: self.csv_malformed.load(Ordering::Relaxed),
+            csv_oversize: self.csv_oversize.load(Ordering::Relaxed),
+            csv_type_errors: self.csv_type_errors.load(Ordering::Relaxed),
+            csv_header_errors: self.csv_header_errors.load(Ordering::Relaxed),
+            csv_encode_errors: self.csv_encode_errors.load(Ordering::Relaxed),
             databus_source_inbox_items: self.databus_source_inbox.items.load(Ordering::Relaxed),
             databus_source_inbox_bytes: self.databus_source_inbox.bytes.load(Ordering::Relaxed),
             nats_source_inbox_items: self.nats_source_inbox.items.load(Ordering::Relaxed),
@@ -407,6 +444,11 @@ pub struct IoSnapshot {
     pub databus_sink_discarded_on_close: u64,
     pub databus_sink_batches: u64,
     pub databus_sink_fatal: u64,
+    pub csv_malformed: u64,
+    pub csv_oversize: u64,
+    pub csv_type_errors: u64,
+    pub csv_header_errors: u64,
+    pub csv_encode_errors: u64,
     pub databus_source_inbox_items: u64,
     pub databus_source_inbox_bytes: u64,
     pub nats_source_inbox_items: u64,
@@ -556,6 +598,11 @@ impl IoSnapshot {
         self.databus_sink_discarded_on_close += other.databus_sink_discarded_on_close;
         self.databus_sink_batches += other.databus_sink_batches;
         self.databus_sink_fatal += other.databus_sink_fatal;
+        self.csv_malformed += other.csv_malformed;
+        self.csv_oversize += other.csv_oversize;
+        self.csv_type_errors += other.csv_type_errors;
+        self.csv_header_errors += other.csv_header_errors;
+        self.csv_encode_errors += other.csv_encode_errors;
         self.databus_source_inbox_items += other.databus_source_inbox_items;
         self.databus_source_inbox_bytes += other.databus_source_inbox_bytes;
         self.nats_source_inbox_items += other.nats_source_inbox_items;

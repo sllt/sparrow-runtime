@@ -23,7 +23,6 @@ use async_nats::jetstream::context::{GetStreamErrorKind, PublishErrorKind};
 use async_nats::jetstream::message::PublishMessage;
 use async_nats::jetstream::{Context, ContextBuilder, ErrorCode as JsErrorCode};
 use futures_util::stream::{self, StreamExt};
-use sparrow_formats::encode_json_row;
 use sparrow_io::observed::Receiver as ObservedReceiver;
 use sparrow_model::observation::{HealthState, Latency};
 use sparrow_model::{
@@ -73,6 +72,8 @@ pub struct JetStreamSinkConfig {
     pub flush_timeout: Duration,
     /// Output column (utf8 or integer) used as `Nats-Msg-Id`.
     pub msg_id_column: Option<String>,
+    /// Message payload format: one JSON object (default) or one CSV record.
+    pub payload_format: sparrow_formats::PayloadFormat,
 }
 
 impl JetStreamSinkConfig {
@@ -93,6 +94,7 @@ impl JetStreamSinkConfig {
             max_retries: DEFAULT_RETRIES,
             flush_timeout: Duration::from_secs(5),
             msg_id_column: None,
+            payload_format: sparrow_formats::PayloadFormat::Json,
         }
     }
 
@@ -485,7 +487,9 @@ impl JetStreamSink {
         limit: usize,
     ) -> Result<(bytes::Bytes, Option<String>)> {
         let started = std::time::Instant::now();
-        let body = encode_json_row(schema, row).inspect_err(|_| {
+        let format = &self.config.payload_format;
+        let body = format.encode_row(schema, row).inspect_err(|_| {
+            self.diag.csv_encode_error(format);
             self.diag
                 .jetstream_sink_dropped_bad
                 .fetch_add(1, Ordering::Relaxed);

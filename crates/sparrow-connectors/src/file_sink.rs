@@ -1,5 +1,7 @@
-//! Bounded append-only NDJSON segments. Linux directory-FD anchoring, a
-//! cooperative writer lock, no overwrite, no automatic deletion or replay.
+//! Bounded append-only NDJSON (or CSV) segments. Linux directory-FD
+//! anchoring, a cooperative writer lock, no overwrite, no automatic deletion
+//! or replay. CSV segments are `part-N.csv`, each starting with its own
+//! header line (when `csv.header` is set) so every segment is self-describing.
 use crate::{ConnectorError, IoDiagnostics, Result};
 use sparrow_formats::action::ActionSpec;
 use sparrow_io::{fs_lock::FileLock, observed::Receiver};
@@ -14,6 +16,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 const MARKER: &[u8] = b"SPARROW_NDJSON_SINK_V1\n";
+const CSV_MARKER: &[u8] = b"SPARROW_CSV_SINK_V1\n";
 const LOCK: &str = "WRITER_LOCK";
 const FORMAT: &str = "FORMAT";
 
@@ -25,8 +28,22 @@ pub struct FileSinkConfig {
     pub max_files: usize,
     pub row_bytes: usize,
     pub sync_data: bool,
+    /// Segment format: NDJSON (default, rows via the sink action) or CSV.
+    pub format: sparrow_formats::PayloadFormat,
 }
 impl FileSinkConfig {
+    fn marker(&self) -> &'static [u8] {
+        match self.format {
+            sparrow_formats::PayloadFormat::Json => MARKER,
+            sparrow_formats::PayloadFormat::Csv(_) => CSV_MARKER,
+        }
+    }
+    fn extension(&self) -> &'static str {
+        match self.format {
+            sparrow_formats::PayloadFormat::Json => ".ndjson",
+            sparrow_formats::PayloadFormat::Csv(_) => ".csv",
+        }
+    }
     pub fn validate(&self) -> Result<()> {
         if !cfg!(target_os = "linux") {
             return Err(ConnectorError::new(
@@ -108,6 +125,8 @@ struct Writer {
     current_bytes: u64,
     files: usize,
     next: u64,
+    /// CSV header line for the current schema (empty without a header).
+    header: Vec<u8>,
 }
 impl Writer {
     fn open(config: FileSinkConfig) -> Result<Self> {
@@ -140,7 +159,7 @@ impl Writer {
         let (bytes, files, next, marked) = Self::scan(&anchored, &config, true)?;
         if !marked {
             let mut marker = create(&anchored.join(FORMAT))?;
-            marker.write_all(MARKER).map_err(io)?;
+            marker.write_all(config.marker()).map_err(io)?;
             marker.sync_all().map_err(io)?;
             directory.sync_all().map_err(io)?;
         }
@@ -154,6 +173,7 @@ impl Writer {
             current_bytes: 0,
             files,
             next,
+            header: Vec::new(),
         })
     }
     fn scan(
@@ -179,11 +199,11 @@ impl Writer {
                 continue;
             }
             if name == FORMAT {
-                if meta.len() != MARKER.len() as u64 {
+                if meta.len() != config.marker().len() as u64 {
                     return Err(denied("invalid File Sink FORMAT size"));
                 }
                 let raw = std::fs::read(&path).map_err(io)?;
-                if raw != MARKER {
+                if raw != config.marker() {
                     return Err(denied("foreign or incomplete File Sink FORMAT"));
                 }
                 marked = true;
@@ -191,7 +211,7 @@ impl Writer {
             }
             let text = name
                 .strip_prefix("part-")
-                .and_then(|s| s.strip_suffix(".ndjson"))
+                .and_then(|s| s.strip_suffix(config.extension()))
                 .filter(|s| s.len() == 20 && s.bytes().all(|b| b.is_ascii_digit()))
                 .ok_or_else(|| denied("foreign file in File Sink directory"))?;
             let id = text
@@ -237,15 +257,19 @@ impl Writer {
         let size = (bytes.len() as u64)
             .checked_add(1)
             .ok_or_else(|| exhausted("File Sink row overflow"))?;
-        if size > self.config.segment_bytes
+        let rotate = self.file.is_none() || self.current_bytes + size > self.config.segment_bytes;
+        // A new CSV segment starts with its header; the header and the row
+        // must fit that segment and the directory quota together.
+        let header = if rotate { self.header.len() as u64 } else { 0 };
+        if size + header > self.config.segment_bytes
             || self
                 .bytes
-                .checked_add(size)
+                .checked_add(size + header)
                 .is_none_or(|n| n > self.config.max_bytes)
         {
             return Err(exhausted("File Sink capacity reached; no data was deleted"));
         }
-        if self.file.is_none() || self.current_bytes + size > self.config.segment_bytes {
+        if rotate {
             if self.files >= self.config.max_files {
                 return Err(exhausted(
                     "File Sink file limit reached; no data was deleted",
@@ -256,7 +280,8 @@ impl Writer {
                 .next
                 .checked_add(1)
                 .ok_or_else(|| exhausted("File Sink segment sequence exhausted"))?;
-            let file = create(&self.anchored.join(format!("part-{:020}.ndjson", self.next)))?;
+            let name = format!("part-{:020}{}", self.next, self.config.extension());
+            let file = create(&self.anchored.join(name))?;
             if self.config.sync_data {
                 self.directory.sync_all().map_err(io)?;
             }
@@ -265,6 +290,13 @@ impl Writer {
             self.files += 1;
             self.current_bytes = 0;
             diag.file_segments.fetch_add(1, Ordering::Relaxed);
+            if header > 0 {
+                let file = self.file.as_mut().expect("created segment");
+                file.write_all(&self.header).map_err(io)?;
+                self.current_bytes += header;
+                self.bytes += header;
+                diag.file_bytes.fetch_add(header, Ordering::Relaxed);
+            }
         }
         let file = self.file.as_mut().expect("created segment");
         // A failed/partial write is never retried in place or counted as an
@@ -301,6 +333,17 @@ impl Writer {
             ));
         }
         let owner = batch.lease().owner();
+        let csv = self.config.format.as_csv().cloned();
+        if let Some(csv) = csv.as_ref().filter(|csv| csv.header()) {
+            let header = csv.encode_header(batch.schema()).map_err(model)?;
+            if self.file.is_some() && header != self.header {
+                // A segment never mixes layouts: a different header (schema)
+                // starts a new segment.
+                self.flush(diag)?;
+                self.file = None;
+            }
+            self.header = header;
+        }
         for row in batch.rows() {
             if cancel.is_cancelled() {
                 return Err(ConnectorError::new(
@@ -311,15 +354,32 @@ impl Writer {
             let mut credit = owner
                 .acquire(CreditKind::Reservation, 8192)
                 .map_err(model)?;
-            let bytes = action
-                .encode(
-                    batch.schema(),
-                    std::slice::from_ref(row),
-                    false,
-                    self.config.row_bytes,
-                    |cap| credit.grow_to(cap + 8192),
-                )
-                .map_err(model)?;
+            let bytes = match &csv {
+                Some(csv) => {
+                    let mut bytes = csv
+                        .encode_record_bounded(
+                            batch.schema(),
+                            row,
+                            self.config.row_bytes + 1,
+                            |cap| credit.grow_to(cap + 8192),
+                        )
+                        .map_err(|e| {
+                            diag.csv_encode_error(&self.config.format);
+                            model(e)
+                        })?;
+                    bytes.pop(); // `row` writes the newline terminator
+                    bytes
+                }
+                None => action
+                    .encode(
+                        batch.schema(),
+                        std::slice::from_ref(row),
+                        false,
+                        self.config.row_bytes,
+                        |cap| credit.grow_to(cap + 8192),
+                    )
+                    .map_err(model)?,
+            };
             self.row(&bytes, diag)?; // bytes drops before its credit
         }
         self.flush(diag)
@@ -467,6 +527,7 @@ mod tests {
             max_files: 4,
             row_bytes: 1000,
             sync_data: true,
+            format: Default::default(),
         }
     }
     fn batch(owner: &Arc<MemoryOwner>, text: &str) -> RowBatch {
@@ -641,6 +702,108 @@ mod tests {
         drop(held);
         assert_eq!(limited.usage().physical_bytes, 0);
         assert!(!dir2.0.join("part-00000000000000000001.ndjson").exists());
+    }
+    fn csv_config(dir: &Dir, header: bool) -> FileSinkConfig {
+        let options = sparrow_formats::CsvOptions {
+            header,
+            ..Default::default()
+        };
+        let format = options.compile(sparrow_formats::CsvRole::Encode).unwrap();
+        FileSinkConfig {
+            format: sparrow_formats::PayloadFormat::csv(format),
+            ..config(dir)
+        }
+    }
+    fn csv_batch(owner: &Arc<MemoryOwner>, text: &str) -> RowBatch {
+        let schema = batch(owner, "").schema_arc();
+        let mut builder =
+            RowBatchBuilder::new(schema, owner.clone(), CreditKind::Reservation, 1, 8192).unwrap();
+        builder
+            .push(Row {
+                values: vec![Scalar::utf8(text)],
+            })
+            .unwrap();
+        builder.finish().unwrap()
+    }
+    #[test]
+    fn csv_file_segments_have_one_header_each_and_quote_minimally() {
+        let dir = directory();
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let diag = IoDiagnostics::new();
+        let cancel = CancellationToken::new();
+        let action = ActionSpec::default();
+        let mut writer = Writer::open(csv_config(&dir, true)).unwrap();
+        let (a, b) = ("a".repeat(600), "b".repeat(600));
+        for text in [a.as_str(), "x,\"y\"\n", b.as_str()] {
+            writer
+                .batch(&csv_batch(&owner, text), &action, &diag, &cancel)
+                .unwrap();
+        }
+        drop(writer);
+        // Restart: never appends to an old segment, starts a new one with its
+        // own header.
+        let mut writer = Writer::open(csv_config(&dir, true)).unwrap();
+        writer
+            .batch(&csv_batch(&owner, " pad "), &action, &diag, &cancel)
+            .unwrap();
+        drop(writer);
+        let read =
+            |n: u64| std::fs::read_to_string(dir.0.join(format!("part-{n:020}.csv"))).unwrap();
+        assert_eq!(read(1), format!("value\n{a}\n\"x,\"\"y\"\"\n\"\n"));
+        assert_eq!(read(2), format!("value\n{b}\n"));
+        assert_eq!(read(3), "value\n\" pad \"\n");
+        assert_eq!(std::fs::read(dir.0.join(FORMAT)).unwrap(), CSV_MARKER);
+        let snap = diag.snapshot();
+        assert_eq!((snap.file_written, snap.file_segments), (4, 3));
+        let total: usize = (1..=3).map(|n| read(n).len()).sum();
+        assert_eq!(snap.file_bytes, total as u64, "headers are counted bytes");
+        // A row larger than row_bytes fails without touching the segment.
+        let mut writer = Writer::open(csv_config(&dir, true)).unwrap();
+        let huge = "z".repeat(1200);
+        assert!(writer
+            .batch(&csv_batch(&owner, &huge), &action, &diag, &cancel)
+            .is_err());
+        assert_eq!(diag.snapshot().csv_encode_errors, 1);
+        drop(writer);
+        // NDJSON and CSV directories never adopt each other.
+        assert!(Writer::open(config(&dir)).is_err());
+        let ndjson = directory();
+        Writer::open(config(&ndjson))
+            .unwrap()
+            .row(b"{}", &diag)
+            .unwrap();
+        assert!(Writer::open(csv_config(&ndjson, true)).is_err());
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+    #[test]
+    fn csv_file_header_and_row_must_fit_one_segment() {
+        let dir = directory();
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let diag = IoDiagnostics::new();
+        let cancel = CancellationToken::new();
+        let mut writer = Writer::open(csv_config(&dir, true)).unwrap();
+        // 1018 + newline fits row_bytes and a bare segment, not with "value\n".
+        let text = "q".repeat(1018);
+        assert!(writer
+            .batch(
+                &csv_batch(&owner, &text),
+                &ActionSpec::default(),
+                &diag,
+                &cancel
+            )
+            .is_err());
+        assert!(!dir.0.join("part-00000000000000000001.csv").exists());
+        let other = directory();
+        let mut headerless = Writer::open(csv_config(&other, false)).unwrap();
+        let text = "q".repeat(999);
+        headerless
+            .batch(
+                &csv_batch(&owner, &text),
+                &ActionSpec::default(),
+                &diag,
+                &cancel,
+            )
+            .unwrap();
     }
     #[tokio::test]
     async fn actions_file_cancel_drains_and_releases_writer() {

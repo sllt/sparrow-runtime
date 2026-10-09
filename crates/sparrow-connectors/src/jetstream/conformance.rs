@@ -256,6 +256,7 @@ async fn k2_reader_refuses_expiring_or_evicting_ownership_and_runtime_policy_cha
                 pending_bytes: 262144,
                 pull_messages: 4,
                 pull_bytes: 73728,
+                payload_format: Default::default(),
             },
             owner.clone(),
             [7; 32],
@@ -558,6 +559,7 @@ async fn k2_reader_buffer_survives_control_cancellation_and_long_mailbox_stall()
         pending_bytes: 256 * 1024,
         pull_messages: 4,
         pull_bytes: 72 * 1024,
+        payload_format: Default::default(),
     };
     let mut reader = Reader::open(
         connection,
@@ -682,6 +684,7 @@ async fn k2_headers_and_retained_sdk_bytes_keep_credit_after_reader_close() {
         pending_bytes: 256 * 1024,
         pull_messages: 4,
         pull_bytes: 72 * 1024,
+        payload_format: Default::default(),
     };
     let mut reader = Reader::open(connection, config, owner.clone(), [4; 32], [4; 16], None)
         .await

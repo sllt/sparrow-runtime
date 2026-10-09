@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use sparrow_formats::{decode_json_row, JsonLimits};
+use sparrow_formats::{JsonLimits, PayloadFormat};
 use sparrow_io::observed::Sender as ObservedSender;
 use sparrow_model::observation::{HealthState, Latency, OriginSpan};
 use sparrow_model::{
@@ -48,6 +48,8 @@ pub struct NatsSourceConfig {
     pub json_limits: JsonLimits,
     pub fail_on_decode: bool,
     pub restore: RestoreClaim,
+    /// Message payload format: one JSON object (default) or one CSV record.
+    pub payload_format: PayloadFormat,
 }
 
 impl NatsSourceConfig {
@@ -62,6 +64,7 @@ impl NatsSourceConfig {
             json_limits: JsonLimits::default(),
             fail_on_decode: false,
             restore: RestoreClaim::None,
+            payload_format: PayloadFormat::Json,
         }
     }
 
@@ -279,13 +282,19 @@ impl NatsSource {
             return Ok(true);
         }
         let started = std::time::Instant::now();
-        let decoded = decode_json_row(&self.config.schema, payload, &self.config.json_limits);
+        let decoded = self.config.payload_format.decode_row(
+            &self.config.schema,
+            payload,
+            &self.config.json_limits,
+            None,
+        );
         self.diag
             .observation
             .record(Latency::Decode, started.elapsed());
         let row = match decoded {
             Ok(row) => row,
             Err(e) => {
+                self.diag.csv_decode_error(&self.config.payload_format, &e);
                 self.diag
                     .nats_source_dropped_bad
                     .fetch_add(1, Ordering::Relaxed);

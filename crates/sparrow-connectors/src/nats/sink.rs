@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sparrow_formats::{encode_json_row, JsonLimits};
+use sparrow_formats::{JsonLimits, PayloadFormat};
 use sparrow_io::observed::Receiver as ObservedReceiver;
 use sparrow_model::observation::{HealthState, Latency};
 use sparrow_model::{ErrorCode, InflightCounter, RestoreClaim, Result, RowBatch};
@@ -36,6 +36,8 @@ pub struct NatsSinkConfig {
     /// Shutdown budget: publish batches already queued, then flush.
     pub flush_timeout: Duration,
     pub restore: RestoreClaim,
+    /// Message payload format: one JSON object (default) or one CSV record.
+    pub payload_format: PayloadFormat,
 }
 
 impl NatsSinkConfig {
@@ -47,6 +49,7 @@ impl NatsSinkConfig {
             publish_timeout: Duration::from_secs(2),
             flush_timeout: Duration::from_secs(2),
             restore: RestoreClaim::None,
+            payload_format: PayloadFormat::Json,
         }
     }
 
@@ -253,7 +256,7 @@ impl NatsSink {
         let mut all = true;
         for (i, row) in batch.rows().iter().enumerate() {
             let started = std::time::Instant::now();
-            let encoded = encode_json_row(schema, row);
+            let encoded = self.config.payload_format.encode_row(schema, row);
             self.diag
                 .observation
                 .record(Latency::Encode, started.elapsed());
@@ -268,6 +271,7 @@ impl NatsSink {
                 }
                 Err(_) => {
                     all = false;
+                    self.diag.csv_encode_error(&self.config.payload_format);
                     self.diag
                         .nats_sink_dropped_bad
                         .fetch_add(1, Ordering::Relaxed);

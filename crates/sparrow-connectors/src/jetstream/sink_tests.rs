@@ -536,3 +536,30 @@ async fn jetstream_sink_oversize_row_fails_closed() {
         (1, 1)
     );
 }
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_csv_stores_one_record_per_message() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    let sink = start(&broker, |c| {
+        c.payload_format = sparrow_formats::PayloadFormat::csv(
+            sparrow_formats::CsvOptions::default()
+                .compile(sparrow_formats::CsvRole::Encode)
+                .unwrap(),
+        );
+    });
+    sink.ready().await;
+    sink.send(1, 2).await;
+    sink.settled(1).await;
+    let (diag, outbox, _) = sink.finish().await;
+    assert_eq!((outbox.acked(), outbox.failed()), (1, 0));
+    let stream = context.get_stream("OUT").await.unwrap();
+    let mut payloads = Vec::new();
+    for seq in 1..=2 {
+        let m = stream.get_raw_message(seq).await.unwrap();
+        payloads.push(String::from_utf8(m.payload.to_vec()).unwrap());
+    }
+    assert_eq!(payloads, ["event_id,v\ne-1,1\n", "event_id,v\ne-2,2\n"]);
+    assert_eq!(diag.snapshot().csv_encode_errors, 0);
+}
