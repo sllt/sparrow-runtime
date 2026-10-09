@@ -89,6 +89,8 @@ mod core_b2_tests;
 mod http_poll_tests;
 #[cfg(all(test, feature = "demo-io"))]
 mod hysteresis_completion_tests;
+#[cfg(test)]
+mod jetstream_sink_tests;
 #[cfg(all(test, feature = "jetstream", feature = "demo-io"))]
 mod k2_tests;
 #[cfg(test)]

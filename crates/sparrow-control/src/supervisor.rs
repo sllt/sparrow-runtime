@@ -344,11 +344,27 @@ pub struct PipelineCheckpointInventory {
     pub storage_sample: &'static str,
     pub storage: sparrow_runtime::checkpoint::CheckpointInventory,
 }
+/// A JetStream Sink that could not confirm a row fails the job (fail closed).
+fn jetstream_sink_failed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
+    if diags.iter().any(|d| {
+        d.jetstream_sink_fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }) {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "JetStream Sink failed closed (stream validation or an unconfirmed PubAck); inspect sink health and jetstream_sink_*; aligned restore replays from the last checkpoint",
+        ));
+    }
+    Ok(())
+}
+
 fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
     match spec.sink.kind.as_str() {
         "log" => "log",
         "mqtt" => "mqtt",
         "nats" => "nats",
+        "jetstream" => "jetstream",
         "file" => "file",
         "plugin" => "plugin",
         _ => "http",
@@ -2063,6 +2079,19 @@ impl Supervisor {
                     sparrow_connectors::NatsSink::bind(cfg, &self.secrets, policy, owner, diag)?;
                 self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
+            #[cfg(feature = "jetstream")]
+            "jetstream" => {
+                let cfg = crate::validate::jetstream_sink_config(&spec.sink)?;
+                cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                let sink = sparrow_connectors::jetstream::JetStreamSink::bind(
+                    cfg,
+                    &self.secrets,
+                    policy,
+                    owner,
+                    diag,
+                )?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
             "mqtt" => {
                 let cfg = mqtt_sink_config(&spec.sink, demo)?;
                 let sink =
@@ -2137,6 +2166,7 @@ impl Supervisor {
                 if file_diag.as_ref().is_some_and(|d|d.file_failed.load(std::sync::atomic::Ordering::Relaxed)>0) {
                     return Err(SparrowError::new(sparrow_model::ErrorCode::JobFailed,"File Sink failed; inspect sink health and file_failed; no automatic rollback or replay"));
                 }
+                jetstream_sink_failed(&plugin_diags)?;
                 match (r, src) {
                     (_, Err(e)) => Err(e),
                     (Err(e), _) => Err(e),
@@ -2178,6 +2208,9 @@ impl Supervisor {
                         )
                     })?;
                 }
+                // An unconfirmed JetStream publish cancels the job; report it
+                // instead of the consequential Cancelled.
+                jetstream_sink_failed(&plugin_diags)?;
                 // Source failures may cancel Kernel to unblock its bounded
                 // inbox. Preserve that root cause instead of replacing poison,
                 // retention or ACK errors with consequential Cancelled.

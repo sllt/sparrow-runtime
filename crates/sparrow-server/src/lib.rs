@@ -984,6 +984,19 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "semantics":"live_best_effort_at_most_once_no_broker_ack",
             "scope":"this_attempt; published=handed_to_client_not_broker_ack"});
     }
+    if s.sink_kind == "jetstream" {
+        value["jetstream_sink"] = json!({"acked":io.jetstream_sink_acked,
+            "duplicates":io.jetstream_sink_duplicates,"retries":io.jetstream_sink_retries,
+            "ack_timeouts":io.jetstream_sink_ack_timeouts,"failed":io.jetstream_sink_failed,
+            "batches":io.jetstream_sink_batches,"discarded_on_close":io.jetstream_sink_discarded_on_close,
+            "dropped_bad":io.jetstream_sink_dropped_bad,"dropped_oversize":io.jetstream_sink_dropped_oversize,
+            "msg_id_missing":io.jetstream_sink_msg_id_missing,"disconnects":io.jetstream_sink_disconnects,
+            "reconnects":io.jetstream_sink_reconnects,"client_errors":io.jetstream_sink_client_errors,
+            "sessions":io.jetstream_sink_sessions,"fatal":io.jetstream_sink_fatal,
+            "inflight":io.jetstream_sink_inflight,
+            "semantics":"at_least_once_into_stream_pub_ack_confirmed; duplicates_possible_on_retry",
+            "scope":"this_attempt; duplicates=server_reported_msg_id_duplicates"});
+    }
     if let Some(ports) = &s.graph_ports {
         value["graph_ports"] = json!({"sources":ports.sources.iter().map(|(id,diag)|graph_port_json(*id,true,diag)).collect::<Vec<_>>(),"sinks":ports.sinks.iter().map(|(id,diag)|graph_port_json(*id,false,diag)).collect::<Vec<_>>()});
         value["source"] = json!({"available":false,"reason":"multiple_ports_see_graph_ports"});
@@ -1161,6 +1174,37 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         ("nats_sink_reconnects", io.nats_sink_reconnects),
         ("nats_sink_client_errors", io.nats_sink_client_errors),
         ("nats_sink_sessions", io.nats_sink_sessions),
+        ("jetstream_sink_acked", io.jetstream_sink_acked),
+        ("jetstream_sink_duplicates", io.jetstream_sink_duplicates),
+        ("jetstream_sink_retries", io.jetstream_sink_retries),
+        (
+            "jetstream_sink_ack_timeouts",
+            io.jetstream_sink_ack_timeouts,
+        ),
+        ("jetstream_sink_failed", io.jetstream_sink_failed),
+        ("jetstream_sink_batches", io.jetstream_sink_batches),
+        (
+            "jetstream_sink_discarded_on_close",
+            io.jetstream_sink_discarded_on_close,
+        ),
+        ("jetstream_sink_dropped_bad", io.jetstream_sink_dropped_bad),
+        (
+            "jetstream_sink_dropped_oversize",
+            io.jetstream_sink_dropped_oversize,
+        ),
+        (
+            "jetstream_sink_msg_id_missing",
+            io.jetstream_sink_msg_id_missing,
+        ),
+        ("jetstream_sink_disconnects", io.jetstream_sink_disconnects),
+        ("jetstream_sink_reconnects", io.jetstream_sink_reconnects),
+        (
+            "jetstream_sink_client_errors",
+            io.jetstream_sink_client_errors,
+        ),
+        ("jetstream_sink_sessions", io.jetstream_sink_sessions),
+        ("jetstream_sink_fatal", io.jetstream_sink_fatal),
+        ("jetstream_sink_inflight", io.jetstream_sink_inflight),
     ] {
         io_fields[name] = json!(value);
     }

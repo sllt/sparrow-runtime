@@ -36,6 +36,9 @@ const PER_MESSAGE_OVERHEAD: usize = 4096;
 pub enum Role {
     Source,
     Sink,
+    /// JetStream publish Sink (`jetstream_sink_*` counters).
+    #[cfg(feature = "jetstream")]
+    JetStreamSink,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +171,12 @@ impl EventState {
             (Role::Sink, "disconnect") => &d.nats_sink_disconnects,
             (Role::Sink, "reconnect") => &d.nats_sink_reconnects,
             (Role::Sink, _) => &d.nats_sink_client_errors,
+            #[cfg(feature = "jetstream")]
+            (Role::JetStreamSink, "disconnect") => &d.jetstream_sink_disconnects,
+            #[cfg(feature = "jetstream")]
+            (Role::JetStreamSink, "reconnect") => &d.jetstream_sink_reconnects,
+            #[cfg(feature = "jetstream")]
+            (Role::JetStreamSink, _) => &d.jetstream_sink_client_errors,
         }
     }
 

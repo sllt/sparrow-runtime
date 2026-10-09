@@ -244,6 +244,88 @@ pub struct NatsSinkSpec {
     pub flush_timeout_ms: Option<u64>,
 }
 
+/// JetStream publish Sink: PubAck-confirmed, at-least-once into an existing
+/// stream that binds `subject`. Never creates streams.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JetStreamSinkSpec {
+    pub servers: Vec<String>,
+    pub stream: String,
+    /// Literal subject bound by `stream`.
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_payload_bytes: Option<usize>,
+    /// SDK command buffer in messages (default 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_capacity: Option<usize>,
+    /// Per attempt: send plus PubAck wait (default 2000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_timeout_ms: Option<u64>,
+    /// Messages awaiting a PubAck at once (default 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_acks: Option<usize>,
+    /// Extra attempts per message (default 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    /// Stop/EOF budget for confirming already queued batches (default 5000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+    /// Output column (utf8/int64/uint64) sent as `Nats-Msg-Id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_id_column: Option<String>,
+}
+
+#[cfg(feature = "jetstream")]
+impl JetStreamSinkSpec {
+    pub fn client_config(&self) -> sparrow_connectors::NatsClientConfig {
+        let mut client = nats_client(
+            &self.servers,
+            &self.token_secret,
+            self.reconnect_attempts,
+            self.connect_timeout_ms,
+            self.max_payload_bytes,
+            self.client_capacity,
+        );
+        if self.client_capacity.is_none() {
+            client.capacity = sparrow_connectors::jetstream::DEFAULT_INFLIGHT_ACKS;
+        }
+        client
+    }
+
+    pub fn connector_config(
+        &self,
+        outbox_capacity: usize,
+    ) -> sparrow_connectors::jetstream::JetStreamSinkConfig {
+        let mut c = sparrow_connectors::jetstream::JetStreamSinkConfig::new(
+            self.servers.clone(),
+            self.stream.clone(),
+            self.subject.clone(),
+        );
+        c.client = self.client_config();
+        if let Some(ms) = self.ack_timeout_ms {
+            c.ack_timeout = std::time::Duration::from_millis(ms);
+        }
+        if let Some(n) = self.max_inflight_acks {
+            c.max_inflight_acks = n;
+        }
+        if let Some(n) = self.max_retries {
+            c.max_retries = n;
+        }
+        if let Some(ms) = self.flush_timeout_ms {
+            c.flush_timeout = std::time::Duration::from_millis(ms);
+        }
+        c.msg_id_column = self.msg_id_column.clone();
+        c.outbox_capacity = outbox_capacity;
+        c
+    }
+}
+
 #[cfg(feature = "nats")]
 fn nats_client(
     servers: &[String],
@@ -454,6 +536,9 @@ pub struct SinkSpec {
     /// Required exclusively for `kind = "nats"` (NATS Core publish).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nats: Option<NatsSinkSpec>,
+    /// Required exclusively for `kind = "jetstream"` (PubAck-confirmed publish).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jetstream: Option<JetStreamSinkSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -836,6 +921,7 @@ impl PipelineSpec {
             ));
         }
         self.check_nats()?;
+        self.check_jetstream_sink()?;
         if self
             .source
             .jetstream
@@ -1038,22 +1124,7 @@ impl PipelineSpec {
                 "NATS options belong in source.nats (TLS follows tls:// servers); mixed connector fields refused",
             ));
         }
-        if sink
-            && (self.sink.plugin.is_some()
-                || self.sink.action.is_some()
-                || self.sink.file.is_some()
-                || self.sink.url.is_some()
-                || self.sink.skip_verify
-                || self.sink.use_demo_io
-                || self.sink.header_secret.is_some()
-                || self.sink.host.is_some()
-                || self.sink.port.is_some()
-                || self.sink.topic.is_some()
-                || self.sink.client_id.is_some()
-                || self.sink.qos != 0
-                || !self.sink.clean_session
-                || self.sink.tls)
-        {
+        if sink && self.sink_has_foreign_fields() {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
                 "NATS options belong in sink.nats (static subject, no actions); mixed connector fields refused",
@@ -1068,6 +1139,65 @@ impl PipelineSpec {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
                 "NATS Core is live_best_effort/restart_fresh, at-most-once (no ack, no replay); use the JetStream profile for checkpointed delivery",
+            ));
+        }
+        Ok(())
+    }
+
+    /// HTTP/MQTT/File/plugin/action fields on a NATS-family sink.
+    fn sink_has_foreign_fields(&self) -> bool {
+        self.sink.plugin.is_some()
+            || self.sink.action.is_some()
+            || self.sink.file.is_some()
+            || self.sink.url.is_some()
+            || self.sink.skip_verify
+            || self.sink.use_demo_io
+            || self.sink.header_secret.is_some()
+            || self.sink.host.is_some()
+            || self.sink.port.is_some()
+            || self.sink.topic.is_some()
+            || self.sink.client_id.is_some()
+            || self.sink.qos != 0
+            || !self.sink.clean_session
+            || self.sink.tls
+    }
+
+    /// JetStream Sink: PubAck-confirmed, at-least-once into the stream. It
+    /// may join an aligned checkpoint only on the linear File profile, whose
+    /// barrier waits for the Sink outbox receipts (acked after PubAcks).
+    fn check_jetstream_sink(&self) -> Result<()> {
+        if self.sink.jetstream.is_some() != (self.sink.kind == "jetstream") {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "sink.jetstream is required exclusively for sink kind=jetstream",
+            ));
+        }
+        if self.sink.kind != "jetstream" {
+            return Ok(());
+        }
+        if !cfg!(feature = "jetstream") {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "JetStream Sink requires the jetstream build feature",
+            ));
+        }
+        if self.sink.nats.is_some() || self.sink_has_foreign_fields() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "JetStream Sink options belong in sink.jetstream (static subject, no actions); mixed connector fields refused",
+            ));
+        }
+        let durable = self.recovery != "restart_fresh"
+            || self.restore.is_some()
+            || self.checkpoint.is_some()
+            || self.checkpoint_dir.is_some();
+        if durable
+            && (self.graph_io.is_some()
+                || !matches!(self.source.kind.as_str(), "file" | "file_replay" | "replay"))
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "JetStream Sink joins aligned checkpoints only in the linear File profile; other checkpoint profiles require the HTTP sink",
             ));
         }
         Ok(())

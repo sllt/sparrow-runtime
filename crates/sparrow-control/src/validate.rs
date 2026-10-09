@@ -440,6 +440,7 @@ fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
                     .filter_map(|s| s.nats.as_ref())
                     .map(|n| n.client_config().sdk_reservation()),
             )
+            .chain(sinks.iter().filter_map(|s| jetstream_sink_reservation(s)))
             .fold(0usize, usize::saturating_add);
         let budget = sparrow_model::ResourceBudget::compact().reservation_bytes;
         if total > budget / 4 * 3 {
@@ -453,6 +454,33 @@ fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
     }
     #[cfg(not(feature = "nats"))]
     let _ = spec;
+    Ok(())
+}
+
+/// SDK buffers plus payloads retained for PubAck retries.
+#[cfg(feature = "nats")]
+fn jetstream_sink_reservation(sink: &SinkSpec) -> Option<usize> {
+    #[cfg(feature = "jetstream")]
+    {
+        sink.jetstream
+            .as_ref()
+            .map(|js| js.connector_config(sink.outbox_capacity).sdk_reservation())
+    }
+    #[cfg(not(feature = "jetstream"))]
+    {
+        let _ = sink;
+        None
+    }
+}
+
+/// `msg_id_column` must be a utf8/integer column of the sink's input.
+fn validate_sink_schema(sink: &SinkSpec, schema: &Schema) -> Result<()> {
+    #[cfg(feature = "jetstream")]
+    if let Some(js) = &sink.jetstream {
+        js.connector_config(sink.outbox_capacity)
+            .check_schema(schema)?;
+    }
+    let _ = (sink, schema);
     Ok(())
 }
 
@@ -593,6 +621,14 @@ fn validate_sink_io(
             }
         }
         "log" => {}
+        #[cfg(feature = "jetstream")]
+        "jetstream" => {
+            let js = jetstream_sink_config(sink)?;
+            js.validate(secrets, policy)?;
+            js.check_reservation_budget(
+                sparrow_model::ResourceBudget::compact().reservation_bytes,
+            )?;
+        }
         #[cfg(feature = "nats")]
         "nats" => {
             let nats = nats_sink_config(sink)?;
@@ -616,7 +652,7 @@ fn validate_sink_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|file)"),
+                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|file)"),
             ));
         }
     }
@@ -650,6 +686,21 @@ pub fn validate_io_with_plan(
             };
             validate_action_schema(&spec.sink, output)?;
         }
+        if spec.sink.jetstream.is_some() {
+            let output = plan
+                .stages
+                .iter()
+                .rev()
+                .find_map(|stage| match stage {
+                    sparrow_plan::PhysicalStage::CaptureSink { schema, .. }
+                    | sparrow_plan::PhysicalStage::BestEffortSink { schema, .. } => Some(schema),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    SparrowError::new(ErrorCode::InvalidSchema, "sink requires a typed schema")
+                })?;
+            validate_sink_schema(&spec.sink, output)?;
+        }
         return Ok(());
     };
 
@@ -663,6 +714,7 @@ pub fn validate_io_with_plan(
     for (operator, sink) in &io.sinks {
         let actual = graph_endpoint_schema(plan, *operator, false)?;
         validate_action_schema(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
+        validate_sink_schema(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
         validate_sink_io(sink, secrets, policy, demo)
             .map_err(|e| e.at_operator((*operator).into()))?;
     }
@@ -851,6 +903,22 @@ pub fn nats_source_config(
             )
         })?
         .connector_config(schema, source.inbox_capacity, fail_on_decode))
+}
+
+#[cfg(feature = "jetstream")]
+pub fn jetstream_sink_config(
+    sink: &SinkSpec,
+) -> Result<sparrow_connectors::jetstream::JetStreamSinkConfig> {
+    Ok(sink
+        .jetstream
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "JetStream sink requires sink.jetstream",
+            )
+        })?
+        .connector_config(sink.outbox_capacity))
 }
 
 #[cfg(feature = "nats")]
@@ -1555,6 +1623,7 @@ pub fn capabilities_json() -> serde_json::Value {
     let mqtt_sink = ConnectorCapabilities::MQTT_SINK;
     let nats = ConnectorCapabilities::NATS_SOURCE;
     let nats_sink = ConnectorCapabilities::NATS_SINK;
+    let js_sink = ConnectorCapabilities::JETSTREAM_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
     serde_json::json!({
         "inventory":crate::capability::inventory(),
@@ -1615,6 +1684,20 @@ pub fn capabilities_json() -> serde_json::Value {
                 "contract": "nats_core_at_most_once; static_subject; published_means_handed_to_client; flush_on_stop; not_jetstream",
             },
             {
+                "kind": js_sink.kind,
+                "roles": ["sink"],
+                "enabled_by_build": cfg!(feature = "jetstream"),
+                "replay": js_sink.replay.as_str(),
+                "delivery": js_sink.delivery.as_str(),
+                "recovery": js_sink.recovery.as_str(),
+                "acknowledgement": "jetstream_pub_ack_per_message",
+                "duplicates": "possible_on_retry; deduplicated_within_stream_duplicate_window_when_msg_id_column_set",
+                "aligned_checkpoint": "linear_file_profile_only; outbox_acked_after_all_pub_acks",
+                "stream_management": "existing_stream_required; never_auto_created",
+                "maturity": "preview",
+                "contract": "at_least_once_into_stream; bounded_inflight_acks; bounded_retry_backoff; fail_closed_on_unconfirmed; ordering_not_guaranteed_under_retry",
+            },
+            {
                 "kind": mqtt_sink.kind,
                 "replay": mqtt_sink.replay.as_str(),
                 "delivery": mqtt_sink.delivery.as_str(),
@@ -1661,7 +1744,7 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
     } else {
         "no_durable_restore; live_best_effort_drops_ok"
     };
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "delivery": if reliable {DeliveryGuarantee::CheckpointedAtLeastOnce.as_str()} else {DeliveryGuarantee::LiveBestEffort.as_str()},
         "recovery": recovery.as_str(),
         "replay": replay,
@@ -1670,7 +1753,22 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
         "aligned_eligible": if replayable { serde_json::Value::Null } else { serde_json::json!(false) },
         "aligned_eligibility_reason": if replayable { "requires_bound_plan" } else { "source_not_replayable" },
         "honesty": HONESTY,
-    })
+    });
+    if spec.sink.jetstream.is_some() {
+        // Output side only: PubAck before the outbox receipt; with aligned
+        // File recovery the uncheckpointed tail is re-published on restore.
+        value["sink_delivery"] = serde_json::json!({
+            "kind": "jetstream",
+            "acknowledgement": "pub_ack_per_message",
+            "into_stream": "at_least_once",
+            "duplicates": if spec.sink.jetstream.as_ref().is_some_and(|j| j.msg_id_column.is_some()) {
+                "deduplicated_within_stream_duplicate_window"
+            } else {
+                "possible_on_retry_or_restore"
+            },
+        });
+    }
+    value
 }
 
 fn iot_ttls(plan: &PhysicalPlan) -> Vec<i64> {
@@ -2318,6 +2416,7 @@ mod tests {
             },
             sink: crate::spec::SinkSpec {
                 nats: None,
+                jetstream: None,
                 plugin: None,
                 action: None,
                 file: None,
@@ -2469,6 +2568,7 @@ mod tests {
     fn n16_http_header_secret_requires_https() {
         let mut sink = crate::spec::SinkSpec {
                 nats: None,
+                jetstream: None,
                 plugin: None,
             action: None,
             file: None,
