@@ -79,6 +79,16 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// Redis commands (SET/HSET/XADD/PUBLISH/LPUSH/RPUSH) acknowledged by
+    /// their reply. Checkpoints/replay are refused (the target is not bound
+    /// into checkpoints), so restarts start fresh.
+    pub const REDIS_SINK: Self = Self {
+        kind: "redis_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     /// NATS Core publish. Handed to the client; no server receipt.
     pub const NATS_SINK: Self = Self {
         kind: "nats_sink",

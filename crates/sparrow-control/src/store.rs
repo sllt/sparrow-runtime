@@ -2649,6 +2649,7 @@ mod tests {
                 nats: None,
                 databus: None,
                 websocket: None,
+                redis: None,
                 jetstream: None,
                 plugin: None,
                 action: None,

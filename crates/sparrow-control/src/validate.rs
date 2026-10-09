@@ -542,6 +542,9 @@ fn validate_sink_format(sink: &SinkSpec, schema: &Schema) -> Result<()> {
 
 /// `msg_id_column` must be a utf8/integer column of the sink's input.
 fn validate_sink_schema(sink: &SinkSpec, schema: &Schema) -> Result<()> {
+    if sink.redis.is_some() {
+        redis_sink_config(sink)?.command.compile(schema)?;
+    }
     #[cfg(feature = "jetstream")]
     if let Some(js) = &sink.jetstream {
         js.connector_config(sink.outbox_capacity)
@@ -725,6 +728,14 @@ fn validate_sink_io(
             )?;
         }
         "databus" => databus_sink_config(sink)?.validate()?,
+        "redis" => {
+            let config = redis_sink_config(sink)?;
+            config.validate()?;
+            config.check_reservation_budget(
+                sparrow_model::ResourceBudget::compact().reservation_bytes,
+            )?;
+            config.target.bind(secrets, policy)?;
+        }
         #[cfg(feature = "websocket")]
         "websocket" => {
             let ws = websocket_sink_config(sink)?;
@@ -754,7 +765,7 @@ fn validate_sink_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|websocket|databus|file)"),
+                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|websocket|databus|redis|file)"),
             ));
         }
     }
@@ -788,7 +799,7 @@ pub fn validate_io_with_plan(
             };
             validate_action_schema(&spec.sink, output)?;
         }
-        if spec.sink.jetstream.is_some() {
+        if spec.sink.jetstream.is_some() || spec.sink.redis.is_some() {
             let output = plan
                 .stages
                 .iter()
@@ -1026,6 +1037,15 @@ pub fn databus_source_config(
             )
         })?
         .connector_config(schema, source.inbox_capacity, fail_on_decode)
+}
+
+pub fn redis_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::RedisSinkConfig> {
+    sink.redis
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidArgument, "Redis sink requires sink.redis")
+        })?
+        .connector_config(sink.outbox_capacity)
 }
 
 pub fn databus_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::DataBusSinkConfig> {
@@ -1853,6 +1873,7 @@ pub fn capabilities_json() -> serde_json::Value {
     let ws = ConnectorCapabilities::WEBSOCKET_SOURCE;
     let ws_sink = ConnectorCapabilities::WEBSOCKET_SINK;
     let bus_sink = ConnectorCapabilities::DATABUS_SINK;
+    let redis_sink = ConnectorCapabilities::REDIS_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
     serde_json::json!({
         "inventory":crate::capability::inventory(),
@@ -1974,6 +1995,21 @@ pub fn capabilities_json() -> serde_json::Value {
                 "no_subscribers": "counted_and_discarded",
                 "maturity": "preview",
                 "contract": "at_most_once; literal_topic; json_row_per_message; self_feedback_loop_refused",
+            },
+            {
+                "kind": redis_sink.kind,
+                "roles": ["sink"],
+                "enabled_by_build": true,
+                "replay": redis_sink.replay.as_str(),
+                "delivery": redis_sink.delivery.as_str(),
+                "recovery": redis_sink.recovery.as_str(),
+                "protocol": "resp2_own_client; redis_6_2_and_7_tested; cluster_and_sentinel_unsupported",
+                "commands": ["set", "hset", "xadd", "publish", "lpush", "rpush"],
+                "acknowledgement": "batch_acked_after_every_command_reply",
+                "error_reply": "command_counted_batch_failed_not_retried; auth_acl_cluster_readonly_fail_job",
+                "duplicates": "set_hset_resent_after_lost_connection; xadd_publish_push_never_resent_after_send_unknown_outcome_counted",
+                "maturity": "preview",
+                "contract": "tls_required_for_credentials; one_pipeline_in_flight; bounded_rows_bytes_interval; templated_keys_from_columns; stop_deadline_covers_in_flight",
             },
             {
                 "kind": js_sink.kind,
@@ -2747,6 +2783,7 @@ mod tests {
                 nats: None,
                 databus: None,
                 websocket: None,
+                redis: None,
                 jetstream: None,
                 plugin: None,
                 action: None,
@@ -2911,6 +2948,7 @@ mod tests {
                 nats: None,
                 databus: None,
                 websocket: None,
+                redis: None,
                 jetstream: None,
                 plugin: None,
             action: None,

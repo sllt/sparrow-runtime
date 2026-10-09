@@ -23,6 +23,7 @@ pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
 pub mod policy;
+pub mod redis;
 pub(crate) mod scratch;
 pub mod secret;
 pub mod tls;
@@ -55,6 +56,7 @@ pub use policy::{
     check_bind_addr, check_data_path, check_data_path_in, configured_data_roots, data_roots,
     default_data_root, default_data_roots, ensure_default_data_root, AllowedTarget, TargetPolicy,
 };
+pub use redis::{RedisLookup, RedisLookupConfig, RedisSink, RedisSinkConfig};
 pub use secret::{MapSecretResolver, SecretResolver};
 pub use tls::TlsConfig;
 #[cfg(feature = "websocket")]

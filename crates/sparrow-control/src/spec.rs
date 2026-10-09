@@ -977,6 +977,202 @@ impl HttpPollSpec {
     }
 }
 
+/// Redis Sink (one command per row, pipelined), live-only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisSinkSpec {
+    /// `redis://host[:port][/db]` or `rediss://...` (TLS).
+    pub url: String,
+    /// ACL user name secret reference (requires `password_secret`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username_secret: Option<String>,
+    /// Password secret reference (requires `rediss://`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_secret: Option<String>,
+    /// PEM bundle that replaces the built-in roots (verification stays on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    /// `set | hset | xadd | publish | lpush | rpush`.
+    pub command: String,
+    /// Key template (`{column}` placeholders); every command but `publish`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Channel template; `publish` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Column whose text is the value (set/publish/lpush/rpush, hset with
+    /// `field`); default: the row as a JSON object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_column: Option<String>,
+    /// `set` only: `PX` expiry in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// `hset` (one hash field per column) or `xadd` (stream entry fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+    /// `hset` only: one templated hash field holding the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// `xadd` only: `MAXLEN` trim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxlen: Option<u64>,
+    /// `xadd` with `maxlen`: `MAXLEN ~` instead of exact `MAXLEN =`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approximate: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_initial_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_ms: Option<u64>,
+    /// Stop budget shared by the pipeline in flight and queued rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+}
+
+impl RedisSinkSpec {
+    pub fn command(&self) -> Result<sparrow_connectors::redis::RedisCommand> {
+        use sparrow_connectors::redis::{HashFields, RedisCommand, RedisValue, Template};
+        let invalid = |m: &str| SparrowError::new(ErrorCode::InvalidArgument, m.to_string());
+        let template = |t: &str| Template::parse(t);
+        let value = || match &self.value_column {
+            Some(c) => RedisValue::Column(c.clone()),
+            None => RedisValue::Json,
+        };
+        let command = self.command.as_str();
+        let key = match (command, &self.key, &self.channel) {
+            ("publish", None, Some(c)) => template(c)?,
+            ("publish", _, _) => {
+                return Err(invalid("sink.redis publish needs channel (and no key)"))
+            }
+            (_, Some(k), None) => template(k)?,
+            _ => {
+                return Err(invalid(
+                    "sink.redis needs key (channel is for publish only)",
+                ))
+            }
+        };
+        let only = |allowed: bool, what: &str| {
+            if allowed {
+                Ok(())
+            } else {
+                Err(invalid(&format!(
+                    "sink.redis {what} does not apply to command {command}"
+                )))
+            }
+        };
+        only(self.ttl_ms.is_none() || command == "set", "ttl_ms")?;
+        only(self.field.is_none() || command == "hset", "field")?;
+        only(
+            self.fields.is_none() || matches!(command, "hset" | "xadd"),
+            "fields",
+        )?;
+        only(self.maxlen.is_none() || command == "xadd", "maxlen")?;
+        only(
+            !self.approximate || self.maxlen.is_some(),
+            "approximate (without maxlen)",
+        )?;
+        only(
+            self.value_column.is_none() || command != "xadd",
+            "value_column",
+        )?;
+        Ok(match command {
+            "set" => RedisCommand::Set {
+                key,
+                value: value(),
+                ttl: self.ttl_ms.map(std::time::Duration::from_millis),
+            },
+            "hset" => RedisCommand::Hset {
+                key,
+                fields: match (&self.fields, &self.field) {
+                    (Some(columns), None) if self.value_column.is_none() => {
+                        HashFields::Columns(columns.clone())
+                    }
+                    (None, Some(field)) => HashFields::Field {
+                        field: template(field)?,
+                        value: value(),
+                    },
+                    _ => {
+                        return Err(invalid(
+                            "sink.redis hset needs either fields, or field with an optional value_column",
+                        ))
+                    }
+                },
+            },
+            "xadd" => RedisCommand::Xadd {
+                key,
+                fields: self
+                    .fields
+                    .clone()
+                    .ok_or_else(|| invalid("sink.redis xadd needs fields"))?,
+                maxlen: self.maxlen,
+                approximate: self.approximate,
+            },
+            "publish" => RedisCommand::Publish {
+                channel: key,
+                value: value(),
+            },
+            "lpush" | "rpush" => RedisCommand::Push {
+                key,
+                value: value(),
+                left: command == "lpush",
+            },
+            _ => {
+                return Err(invalid(
+                    "sink.redis command must be set, hset, xadd, publish, lpush or rpush",
+                ))
+            }
+        })
+    }
+
+    pub fn connector_config(
+        &self,
+        outbox_capacity: usize,
+    ) -> Result<sparrow_connectors::RedisSinkConfig> {
+        use std::time::Duration;
+        let mut target = sparrow_connectors::redis::RedisTarget::new(self.url.clone());
+        target.username_secret = self.username_secret.clone();
+        target.password_secret = self.password_secret.clone();
+        target.ca_pem = self.ca_pem.clone();
+        if let Some(ms) = self.connect_timeout_ms {
+            target.connect_timeout = Duration::from_millis(ms);
+        }
+        let mut c = sparrow_connectors::RedisSinkConfig::new(target, self.command()?);
+        c.outbox_capacity = outbox_capacity;
+        if let Some(n) = self.pipeline_rows {
+            c.pipeline_rows = n;
+        }
+        if let Some(n) = self.pipeline_bytes {
+            c.pipeline_bytes = n;
+        }
+        if let Some(n) = self.max_retries {
+            c.max_retries = n;
+        }
+        for (value, slot) in [
+            (self.flush_interval_ms, &mut c.flush_interval),
+            (self.timeout_ms, &mut c.timeout),
+            (self.retry_initial_ms, &mut c.retry_initial),
+            (self.retry_max_ms, &mut c.retry_max),
+            (self.flush_timeout_ms, &mut c.flush_timeout),
+        ] {
+            if let Some(ms) = value {
+                *slot = Duration::from_millis(ms);
+            }
+        }
+        Ok(c)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SinkSpec {
@@ -994,6 +1190,9 @@ pub struct SinkSpec {
     /// Required exclusively for `kind = "websocket"` (client mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket: Option<WebSocketSinkSpec>,
+    /// Required exclusively for `kind = "redis"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis: Option<Box<RedisSinkSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1050,6 +1249,26 @@ impl SinkSpec {
             self.csv.as_ref(),
             sparrow_formats::CsvRole::Encode,
         )
+    }
+}
+
+impl SinkSpec {
+    /// HTTP/MQTT/File/plugin/action fields (on a sink of another kind).
+    pub(crate) fn has_foreign_fields(&self) -> bool {
+        self.plugin.is_some()
+            || self.action.is_some()
+            || self.file.is_some()
+            || self.url.is_some()
+            || self.skip_verify
+            || self.use_demo_io
+            || self.header_secret.is_some()
+            || self.host.is_some()
+            || self.port.is_some()
+            || self.topic.is_some()
+            || self.client_id.is_some()
+            || self.qos != 0
+            || !self.clean_session
+            || self.tls
     }
 }
 
@@ -1399,6 +1618,7 @@ impl PipelineSpec {
         self.check_jetstream_sink()?;
         self.check_databus()?;
         self.check_websocket()?;
+        self.check_redis()?;
         if self
             .source
             .jetstream
@@ -1752,20 +1972,61 @@ impl PipelineSpec {
 
     /// HTTP/MQTT/File/plugin/action fields on a NATS-family sink.
     fn sink_has_foreign_fields(&self) -> bool {
-        self.sink.plugin.is_some()
-            || self.sink.action.is_some()
-            || self.sink.file.is_some()
-            || self.sink.url.is_some()
-            || self.sink.skip_verify
-            || self.sink.use_demo_io
-            || self.sink.header_secret.is_some()
-            || self.sink.host.is_some()
-            || self.sink.port.is_some()
-            || self.sink.topic.is_some()
-            || self.sink.client_id.is_some()
-            || self.sink.qos != 0
-            || !self.sink.clean_session
-            || self.sink.tls
+        self.sink.has_foreign_fields()
+    }
+
+    /// Redis Sink: live-only. Neither the target nor the command is bound
+    /// into checkpoints, and XADD/PUBLISH/LPUSH/RPUSH are not idempotent, so
+    /// every durable claim is refused, for the legacy and graph sinks alike.
+    fn check_redis(&self) -> Result<()> {
+        let graph: Vec<&SinkSpec> = self
+            .graph_io
+            .as_ref()
+            .map(|io| io.sinks.values().collect())
+            .unwrap_or_default();
+        let mut any = false;
+        for sink in std::iter::once(&self.sink).chain(graph) {
+            if sink.redis.is_some() != (sink.kind == "redis") {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "sink.redis is required exclusively for sink kind=redis",
+                ));
+            }
+            if sink.kind != "redis" {
+                continue;
+            }
+            any = true;
+            if sink.has_foreign_fields()
+                || sink.nats.is_some()
+                || sink.jetstream.is_some()
+                || sink.databus.is_some()
+                || sink.websocket.is_some()
+                || sink.batch_rows.is_some()
+                || sink.batch_bytes.is_some()
+                || sink.linger_ms.is_some()
+                || sink.max_inflight.is_some()
+                || sink.format.is_some()
+                || sink.csv.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "Redis options belong in sink.redis (no actions); mixed connector fields refused",
+                ));
+            }
+        }
+        if any
+            && (self.delivery != "live_best_effort"
+                || self.recovery != "restart_fresh"
+                || self.restore.is_some()
+                || self.checkpoint.is_some()
+                || self.checkpoint_dir.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "Redis Sink is live_best_effort/restart_fresh (no checkpoint binds the target; XADD/PUBLISH/LPUSH/RPUSH are not idempotent); no checkpoint or restore",
+            ));
+        }
+        Ok(())
     }
 
     /// JetStream Sink: PubAck-confirmed, at-least-once into the stream. It
@@ -1832,6 +2093,7 @@ impl PipelineSpec {
         // Public IO validators accept typed/serde-created specs too, so they
         // must not rely solely on from_json/basic_check for the DataBus gate.
         self.check_databus()?;
+        self.check_redis()?;
         let g = DeliveryGuarantee::parse(&self.delivery)?;
         if (g == DeliveryGuarantee::CheckpointedAtLeastOnce)
             != (cfg!(feature = "jetstream") && self.source.kind == "jetstream")

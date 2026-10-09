@@ -2,6 +2,12 @@
 //! never detach background work, and bound their encoding/frame/decoding memory
 //! by `scratch_bytes`. The operator reserves that credit BEFORE calling them.
 //! This is restart-fresh only: caches/external answers are not replay journals.
+//!
+//! This is the one Lookup interface for remote stores (HTTP, Redis, ...): a
+//! provider answers typed keys with at most one typed row each. Providers that
+//! can answer several keys in one round trip report `max_batch_keys > 1` and
+//! implement `lookup_batch`; the operator only batches when the binding's
+//! `batch_keys` option asks for it, so single-key providers are unchanged.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,6 +34,11 @@ use crate::window::resolve_keys;
 pub const EXTERNAL_LOOKUP_MAX_ROW_BYTES: usize = 64 * 1024;
 const MAX_CACHE_ENTRIES: usize = 1024;
 const MAX_PROVIDER_SCRATCH: usize = 2 * 1024 * 1024;
+pub const MAX_BATCH_KEYS: usize = 64;
+
+/// Future returned by [`ExternalLookup::lookup_batch`].
+pub type LookupBatchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<Option<Row>>>> + Send + 'a>>;
 
 pub trait ExternalLookup: Send + Sync {
     /// Descriptor/keys/scratch remain immutable for the binding lifetime.
@@ -50,6 +61,31 @@ pub trait ExternalLookup: Send + Sync {
         key: Vec<Scalar>,
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Row>>> + Send + 'a>>;
+
+    /// Most keys one `lookup_batch` call may carry (1 = no batching).
+    fn max_batch_keys(&self) -> usize {
+        1
+    }
+
+    /// Answer several keys in one request, one entry per key in key order.
+    /// Same contract as `lookup`; `scratch_bytes` is charged once per key.
+    /// The default serves exactly one key through `lookup`.
+    fn lookup_batch<'a>(
+        &'a self,
+        keys: Vec<Vec<Scalar>>,
+        cancel: CancellationToken,
+    ) -> LookupBatchFuture<'a> {
+        Box::pin(async move {
+            let mut keys = keys;
+            match (keys.pop(), keys.is_empty()) {
+                (Some(key), true) => Ok(vec![self.lookup(key, cancel).await?]),
+                _ => Err(SparrowError::new(
+                    ErrorCode::Internal,
+                    "external lookup provider does not batch keys",
+                )),
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +94,8 @@ pub enum LookupErrorPolicy {
     #[default]
     Fail,
     Null,
+    /// Drop the input row (transport/status/timeout errors only).
+    Drop,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +106,20 @@ pub struct ExternalLookupOptions {
     pub cache_ttl_ms: u64,
     pub cache_bytes: usize,
     pub on_error: LookupErrorPolicy,
+    /// Keys per provider request (1..=64; >1 needs a batching provider).
+    #[serde(skip_serializing_if = "is_one")]
+    pub batch_keys: usize,
+    /// Cache misses (`None`) as well as hits.
+    #[serde(skip_serializing_if = "is_true")]
+    pub cache_negative: bool,
+}
+
+fn is_one(n: &usize) -> bool {
+    *n == 1
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 impl Default for ExternalLookupOptions {
@@ -78,6 +130,8 @@ impl Default for ExternalLookupOptions {
             cache_ttl_ms: 1000,
             cache_bytes: 64 * 1024,
             on_error: LookupErrorPolicy::Fail,
+            batch_keys: 1,
+            cache_negative: true,
         }
     }
 }
@@ -88,6 +142,7 @@ impl ExternalLookupOptions {
             || !(10..=5000).contains(&self.timeout_ms)
             || self.cache_ttl_ms > 60_000
             || self.cache_bytes > 1024 * 1024
+            || !(1..=MAX_BATCH_KEYS).contains(&self.batch_keys)
         {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -125,6 +180,7 @@ pub struct LookupDiagnostics {
     timeouts: AtomicU64,
     failures: AtomicU64,
     error_nulls: AtomicU64,
+    error_drops: AtomicU64,
     cancellations: AtomicU64,
     inflight: AtomicUsize,
     peak_inflight: AtomicUsize,
@@ -146,6 +202,8 @@ pub struct LookupDiagnosticsSnapshot {
     pub timeouts: u64,
     pub failures: u64,
     pub error_nulls: u64,
+    #[serde(default)]
+    pub error_drops: u64,
     pub cancellations: u64,
     pub inflight: usize,
     pub peak_inflight: usize,
@@ -172,6 +230,7 @@ impl LookupDiagnostics {
             timeouts: self.timeouts.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
             error_nulls: self.error_nulls.load(Ordering::Relaxed),
+            error_drops: self.error_drops.load(Ordering::Relaxed),
             cancellations: self.cancellations.load(Ordering::Relaxed),
             inflight: self.inflight.load(Ordering::Relaxed),
             peak_inflight: self.peak_inflight.load(Ordering::Relaxed),
@@ -367,6 +426,27 @@ impl ExternalLookupOperator {
             .saturating_add(schema_resident_bytes(&output))
             .saturating_add(schema_resident_bytes(binding.provider.schema()))
             .saturating_add(1024);
+        if binding.options.batch_keys > 1 {
+            // A batched window holds max_inflight * batch_keys keys at once;
+            // refuse a configuration whose window cannot fit half the job
+            // reservation instead of failing on the first batch.
+            let window = window_bytes(
+                binding.provider.scratch_bytes(),
+                binding
+                    .options
+                    .max_inflight
+                    .saturating_mul(binding.options.batch_keys),
+            );
+            if window > owner.budget().reservation_bytes / 2 {
+                return Err(SparrowError::new(
+                    ErrorCode::BoundExceeded,
+                    format!(
+                        "external lookup window of max_inflight*batch_keys keys needs {window} bytes, more than half of the {}-byte job reservation; lower max_inflight or batch_keys",
+                        owner.budget().reservation_bytes
+                    ),
+                ));
+            }
+        }
         let metadata = owner.acquire(CreditKind::Retention, metadata_bytes)?;
         let table = binding.provider.schema().clone();
         let cache = Cache::new(&binding.options, &owner, Arc::clone(&diagnostics))?;
@@ -417,6 +497,16 @@ impl ExternalLookupOperator {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
                 "external lookup requires bounded scratch and 1..16 scalar columns/1..8 keys",
+            ));
+        }
+        if binding.options.batch_keys > binding.provider.max_batch_keys() {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "external lookup batch_keys {} exceeds the provider's {} keys per request",
+                    binding.options.batch_keys,
+                    binding.provider.max_batch_keys()
+                ),
             ));
         }
         if spec.table_keys != binding.provider.keys() {
@@ -590,7 +680,12 @@ impl ExternalLookupOperator {
             batch.num_rows(),
             self.owner.budget().reservation_bytes,
         )?;
-        for inputs in batch.rows().chunks(self.binding.options.max_inflight) {
+        let batch_keys = self.binding.options.batch_keys;
+        let mut emitted = 0usize;
+        for inputs in batch
+            .rows()
+            .chunks(self.binding.options.max_inflight.saturating_mul(batch_keys))
+        {
             if cancel.is_cancelled() {
                 return Err(cancelled());
             }
@@ -601,15 +696,8 @@ impl ExternalLookupOperator {
                         .saturating_add(32)
                 })
             });
-            let window_bytes = self
-                .binding
-                .provider
-                .scratch_bytes()
-                .saturating_add(EXTERNAL_LOOKUP_MAX_ROW_BYTES)
-                .saturating_add(1024)
-                .saturating_mul(inputs.len())
-                .saturating_add(key_scratch)
-                .saturating_add(512);
+            let window_bytes = window_bytes(self.binding.provider.scratch_bytes(), inputs.len())
+                .saturating_add(key_scratch);
             let window_scratch =
                 Arc::new(self.owner.acquire(CreditKind::Reservation, window_bytes)?);
             let requests_cancel = cancel.child_token();
@@ -617,6 +705,8 @@ impl ExternalLookupOperator {
             let mut keys = Vec::with_capacity(inputs.len());
             let mut responses: Vec<Option<Option<Row>>> = (0..inputs.len()).map(|_| None).collect();
             let mut cacheable = vec![false; inputs.len()];
+            let mut dropped = vec![false; inputs.len()];
+            let mut misses = Vec::with_capacity(inputs.len());
             for (index, input) in inputs.iter().enumerate() {
                 let key: Vec<Scalar> = self
                     .stream_idx
@@ -630,39 +720,59 @@ impl ExternalLookupOperator {
                 } else if let Some(cached) = self.cache.get(&encoded) {
                     responses[index] = Some(cached);
                 } else {
-                    let provider = Arc::clone(&self.binding.provider);
-                    let request_cancel = requests_cancel.child_token();
-                    let timeout = Duration::from_millis(self.binding.options.timeout_ms);
-                    let gauge = RequestGauge::new(Arc::clone(&self.diagnostics));
-                    let diag = Arc::clone(&self.diagnostics);
-                    let request_scratch = Arc::clone(&window_scratch);
-                    let query_key = key.iter().map(Scalar::detach_copy).collect();
-                    set.spawn(async move {
-                        let _gauge = gauge;
-                        let result = tokio::select! {
-                            biased;
-                            _ = request_cancel.cancelled() => {
-                                diag.cancellations.fetch_add(1, Ordering::Relaxed);
-                                Err(cancelled())
-                            }
-                            result = tokio::time::timeout(timeout, provider.lookup(query_key, request_cancel.clone())) => {
-                                match result {
-                                    Ok(result) => result,
-                                    Err(_) => {
-                                        request_cancel.cancel();
-                                        diag.timeouts.fetch_add(1, Ordering::Relaxed);
-                                        Err(SparrowError::new(ErrorCode::JobFailed, "external lookup request timed out"))
-                                    }
-                                }
-                            }
-                        };
-                        // Also retain the lease in the completed result: if the
-                        // stage itself is aborted, queued/unjoined responses
-                        // cannot outlive their memory credits.
-                        (index, result, request_scratch)
-                    });
+                    misses.push(index);
                 }
                 keys.push((key, encoded));
+            }
+            // One request per miss (batch_keys = 1) or per group of up to
+            // batch_keys misses; at most max_inflight requests per window.
+            for group in misses.chunks(batch_keys) {
+                let provider = Arc::clone(&self.binding.provider);
+                let request_cancel = requests_cancel.child_token();
+                let timeout = Duration::from_millis(self.binding.options.timeout_ms);
+                let gauge = RequestGauge::new(Arc::clone(&self.diagnostics));
+                let diag = Arc::clone(&self.diagnostics);
+                let request_scratch = Arc::clone(&window_scratch);
+                let indices = group.to_vec();
+                let mut query: Vec<Vec<Scalar>> = group
+                    .iter()
+                    .map(|&i| keys[i].0.iter().map(Scalar::detach_copy).collect())
+                    .collect();
+                set.spawn(async move {
+                    let _gauge = gauge;
+                    let request = async {
+                        if batch_keys == 1 {
+                            let key = query.pop().unwrap_or_default();
+                            provider
+                                .lookup(key, request_cancel.clone())
+                                .await
+                                .map(|row| vec![row])
+                        } else {
+                            provider.lookup_batch(query, request_cancel.clone()).await
+                        }
+                    };
+                    let result = tokio::select! {
+                        biased;
+                        _ = request_cancel.cancelled() => {
+                            diag.cancellations.fetch_add(1, Ordering::Relaxed);
+                            Err(cancelled())
+                        }
+                        result = tokio::time::timeout(timeout, request) => {
+                            match result {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    request_cancel.cancel();
+                                    diag.timeouts.fetch_add(1, Ordering::Relaxed);
+                                    Err(SparrowError::new(ErrorCode::JobFailed, "external lookup request timed out"))
+                                }
+                            }
+                        }
+                    };
+                    // Also retain the lease in the completed result: if the
+                    // stage itself is aborted, queued/unjoined responses
+                    // cannot outlive their memory credits.
+                    (indices, result, request_scratch)
+                });
             }
             let mut failed = None;
             while !set.is_empty() {
@@ -672,24 +782,44 @@ impl ExternalLookupOperator {
                     next = set.join_next() => next,
                 };
                 match next {
-                    Some(Ok((index, Ok(row), _scratch))) => {
-                        if let Some(row) = &row {
-                            if let Err(error) = self.validate_response(&keys[index].0, row) {
-                                self.diagnostics.failures.fetch_add(1, Ordering::Relaxed);
-                                failed = Some(error);
-                                break;
-                            }
+                    Some(Ok((indices, Ok(rows), _scratch))) => {
+                        if rows.len() != indices.len() {
+                            self.diagnostics.failures.fetch_add(1, Ordering::Relaxed);
+                            failed = Some(SparrowError::new(
+                                ErrorCode::CodecViolation,
+                                "external lookup provider answered a different number of keys",
+                            ));
+                            break;
                         }
-                        cacheable[index] = true;
-                        responses[index] = Some(row);
+                        for (index, row) in indices.into_iter().zip(rows) {
+                            if let Some(row) = &row {
+                                if let Err(error) = self.validate_response(&keys[index].0, row) {
+                                    failed = Some(error);
+                                    break;
+                                }
+                            }
+                            cacheable[index] = true;
+                            responses[index] = Some(row);
+                        }
+                        if failed.is_some() {
+                            self.diagnostics.failures.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
                     }
-                    Some(Ok((index, Err(error), _scratch))) => {
+                    Some(Ok((indices, Err(error), _scratch))) => {
                         self.diagnostics.failures.fetch_add(1, Ordering::Relaxed);
-                        if error.code == ErrorCode::JobFailed
-                            && self.binding.options.on_error == LookupErrorPolicy::Null
-                        {
-                            self.diagnostics.error_nulls.fetch_add(1, Ordering::Relaxed);
-                            responses[index] = Some(None);
+                        let policy = self.binding.options.on_error;
+                        if error.code == ErrorCode::JobFailed && policy != LookupErrorPolicy::Fail {
+                            let counter = if policy == LookupErrorPolicy::Null {
+                                &self.diagnostics.error_nulls
+                            } else {
+                                &self.diagnostics.error_drops
+                            };
+                            counter.fetch_add(indices.len() as u64, Ordering::Relaxed);
+                            for index in indices {
+                                dropped[index] = policy == LookupErrorPolicy::Drop;
+                                responses[index] = Some(None);
+                            }
                         } else {
                             failed = Some(error);
                             break;
@@ -723,25 +853,43 @@ impl ExternalLookupOperator {
                         "external lookup missing ordered response",
                     )
                 })?;
+                if dropped[index] {
+                    continue;
+                }
                 if response.is_some() {
                     self.diagnostics.hits.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.diagnostics.misses.fetch_add(1, Ordering::Relaxed);
                 }
-                if cacheable[index] {
+                if cacheable[index] && (response.is_some() || self.binding.options.cache_negative) {
                     self.cache
                         .insert(std::mem::take(&mut keys[index].1), &response);
                 }
                 let output = self.output_row(input, response.as_ref());
                 let bytes = output.resident_bytes().saturating_add(64);
                 builder.push_accounted(output, bytes)?;
+                emitted += 1;
             }
         }
         if cancel.is_cancelled() {
             return Err(cancelled());
         }
+        if emitted == 0 {
+            // Every row was dropped by on_error = "drop".
+            return Ok(None);
+        }
         Ok(Some(builder.finish()?))
     }
+}
+
+/// Request window credit for `keys` concurrent keys: provider scratch, the
+/// returned row bound and bookkeeping per key.
+fn window_bytes(scratch: usize, keys: usize) -> usize {
+    scratch
+        .saturating_add(EXTERNAL_LOOKUP_MAX_ROW_BYTES)
+        .saturating_add(1024)
+        .saturating_mul(keys)
+        .saturating_add(512)
 }
 
 fn cancelled() -> SparrowError {
