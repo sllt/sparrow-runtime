@@ -100,6 +100,7 @@ SDK `read_buffer_capacity` 只是初始容量；不能把它或订阅条数当�
 本地 `WRITER_LOCK` 持有到 actor、blocking commit 和实际 SDK I/O 关闭。`drain()` 返回仅代表命令入队；SDK event-loop 生命周期哨兵负责关闭确认、资源与锁保留。即使关闭 waiter 超时，旧 SDK 仍持有锁，不能重叠接管同一目录。这是**协作式单节点独占，不是分布式 fencing/HA**；禁止复制相同 owner/catalog 后在第二节点并行运行。
 
 - snapshot v4 保存 Source cut、完整参与者状态、输出下一个 ordinal；File 仍写 v3。两种生产 writer 拒绝混写同一目录，旧格式不自动迁移。
+- **v30（第11批子批1）**：线性 JetStream → 1～2 个 Count 窗口（含 FIRST/LAST/VAR_*/STDDEV_*，participant codec 3）→ required HTTP JSON；next_output 与状态同切点、epoch 必须等于 generation。ET 窗口与新聚合的组合不在本子批范围，启动前拒绝。v30 目录不与 v4 等混写，不迁移。恢复解码先按 Job owner（`admission.owner()`）预留额度，额度不足不回退旧代。见 [恢复支持矩阵](PRODUCTION.md#recovery-support-matrix)。
 - v4 恢复要求完整计算语义及来源/reader 绑定匹配。当前拒绝 downstream 语义变更、固定历史点 replay/reset 和移动目录；不能为允许更新而在内存里临时换 epoch，制造崩溃后的 ID 冲突。
 - `sparrowctl checkpoints NAME`、`status NAME`、`diagnose NAME` 可检查恢复点/有效保证；列表不会改变 CURRENT。`checkpoint.reliable_source` 明确区分 published/committed cut、pending 条数/字节与采样年龄，pending 包含尚未确认的 ACK。
 - `sparrowctl checkpoint NAME` 与自动/source-full checkpoint 共用单请求仲裁；busy 是可重试冲突，不是已提交。HTTP waiter 超时不取消已经开始的 durable commit。
