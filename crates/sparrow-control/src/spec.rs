@@ -211,7 +211,7 @@ pub struct NatsSourceSpec {
     /// Largest server `max_payload` accepted (default 65536).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_payload_bytes: Option<usize>,
-    /// SDK subscription buffer in messages (default 16).
+    /// Source wire prefetch buffer in messages (default 8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_capacity: Option<usize>,
     /// Decoded-row Queue credit for the inbox; default 256 KiB.
@@ -234,7 +234,7 @@ pub struct NatsSinkSpec {
     /// Largest encoded row accepted (default 65536); larger rows are dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_payload_bytes: Option<usize>,
-    /// SDK command buffer in messages (default 16).
+    /// SDK command buffer in messages (default 8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_capacity: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

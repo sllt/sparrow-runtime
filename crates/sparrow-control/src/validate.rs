@@ -1693,7 +1693,7 @@ pub fn capabilities_json() -> serde_json::Value {
                 "recovery": nats.recovery.as_str(),
                 "acknowledgement": "none",
                 "maturity": "preview",
-                "contract": "nats_core_at_most_once; no_ack; no_replay; sdk_slow_consumer_drops_counted; bounded_reconnect_per_outage; not_jetstream",
+                "contract": "nats_core_at_most_once; no_ack; no_replay; bounded_wire_prefetch_drops_counted; subscribed_after_PONG; bounded_reconnect_per_outage; not_jetstream",
             },
             {
                 "kind": nats_sink.kind,

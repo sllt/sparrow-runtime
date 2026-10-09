@@ -2,18 +2,18 @@
 //! Live, at-most-once, no ack, no replay.
 //!
 //! `nats_sink_published` counts messages handed to the client, not server
-//! receipts (NATS Core has none). A successful `flush` on shutdown confirms
-//! the server received every earlier write on that connection. Rows whose
+//! receipts (NATS Core has none). A successful SDK `flush` on shutdown means
+//! pending writes reached the local socket, not that the broker received them. Rows whose
 //! publish fails or times out are counted and dropped, never retried.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sparrow_formats::{encode_json_row, JsonLimits};
+use sparrow_formats::{encode_json_batch_bounded_with_capacity, JsonLimits};
 use sparrow_io::observed::Receiver as ObservedReceiver;
 use sparrow_model::observation::{HealthState, Latency};
-use sparrow_model::{ErrorCode, InflightCounter, RestoreClaim, Result, RowBatch};
+use sparrow_model::{CreditKind, ErrorCode, InflightCounter, RestoreClaim, Result, RowBatch};
 use tokio_util::sync::CancellationToken;
 
 use super::client::{BoundToken, CoreClient, NatsClientConfig, Role, MAX_RECONNECT_DELAY};
@@ -111,7 +111,7 @@ impl Drop for BatchReceipt {
 
 enum Session {
     /// Input ended or the job stopped; flushed and closed.
-    Finished,
+    Finished(Option<tokio::time::Instant>),
     /// The SDK closed after its bounded reconnect attempts; open again.
     Lost,
 }
@@ -188,8 +188,9 @@ impl NatsSink {
                 .session(&client, &mut rx, &cancel, outbox.as_ref())
                 .await
             {
-                Session::Finished => {
-                    self.shutdown(client, &mut rx, outbox.as_ref()).await;
+                Session::Finished(deadline) => {
+                    self.shutdown(client, &mut rx, outbox.as_ref(), deadline)
+                        .await;
                     return;
                 }
                 Session::Lost => {
@@ -214,17 +215,24 @@ impl NatsSink {
         cancel: &CancellationToken,
         outbox: Option<&Arc<InflightCounter>>,
     ) -> Session {
+        let mut deadline = None;
         loop {
             let batch = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Session::Finished,
+                _ = cancel.cancelled() => return Session::Finished(Some(tokio::time::Instant::now() + self.config.flush_timeout)),
                 b = rx.recv() => b,
             };
             let Some(batch) = batch else {
-                return Session::Finished;
+                return Session::Finished(None);
             };
-            if !self.publish_batch(client, &batch, outbox, None).await {
+            if !self
+                .publish_batch(client, &batch, outbox, &mut deadline, Some(cancel))
+                .await
+            {
                 return Session::Lost;
+            }
+            if deadline.is_some() {
+                return Session::Finished(deadline);
             }
         }
     }
@@ -235,7 +243,8 @@ impl NatsSink {
         client: &CoreClient,
         batch: &RowBatch,
         outbox: Option<&Arc<InflightCounter>>,
-        deadline: Option<tokio::time::Instant>,
+        deadline: &mut Option<tokio::time::Instant>,
+        cancel: Option<&CancellationToken>,
     ) -> bool {
         let mut receipt = BatchReceipt(outbox.cloned());
         let mut delivered = self.diag.observation.delivery_guard(
@@ -252,41 +261,93 @@ impl NatsSink {
         let schema = batch.schema();
         let mut all = true;
         for (i, row) in batch.rows().iter().enumerate() {
+            if deadline.is_none() && cancel.is_some_and(CancellationToken::is_cancelled) {
+                *deadline = Some(tokio::time::Instant::now() + self.config.flush_timeout);
+            }
+            if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                self.diag
+                    .nats_sink_discarded_on_close
+                    .fetch_add((batch.num_rows() - i) as u64, Ordering::Relaxed);
+                return true; // Receipt/delivery guards fail this partial batch.
+            }
             let started = std::time::Instant::now();
-            let encoded = encode_json_row(schema, row);
+            // Bound the writer before allocating output. Its single-row array
+            // envelope is removed in place; no second body allocation exists.
+            // Legacy structured-value scratch is also pre-admitted.
+            let scratch = row
+                .resident_bytes()
+                .saturating_mul(8)
+                .saturating_add(
+                    schema
+                        .fields
+                        .iter()
+                        .fold(0usize, |n, f| n.saturating_add(f.name.capacity()))
+                        .saturating_mul(4),
+                )
+                .saturating_add(8192);
+            let encoded = (|| {
+                let mut lease = self.owner.acquire(CreditKind::Reservation, scratch)?;
+                let mut body = encode_json_batch_bounded_with_capacity(
+                    schema,
+                    std::slice::from_ref(row),
+                    limit.saturating_add(2),
+                    |capacity| lease.grow_to(scratch.saturating_add(capacity)),
+                )?;
+                body.remove(0);
+                body.pop();
+                // The SDK reservation already covers the bounded working
+                // payload plus command/writer overlap. Synchronous encoder
+                // tree scratch must not consume credit while publish waits.
+                Ok::<_, sparrow_model::SparrowError>(body)
+            })();
             self.diag
                 .observation
                 .record(Latency::Encode, started.elapsed());
             let body = match encoded {
-                Ok(body) if body.len() <= limit => body,
-                Ok(_) => {
+                Ok(encoded) => encoded,
+                Err(e) if e.code == ErrorCode::BoundExceeded => {
                     all = false;
                     self.diag
                         .nats_sink_dropped_oversize
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                Err(_) => {
+                Err(e) => {
                     all = false;
-                    self.diag
-                        .nats_sink_dropped_bad
-                        .fetch_add(1, Ordering::Relaxed);
+                    if e.code == ErrorCode::ResourceExhausted {
+                        self.diag.nats_sink_failed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.diag
+                            .nats_sink_dropped_bad
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     continue;
                 }
             };
-            let budget = match deadline {
-                Some(at) => at
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .min(self.config.publish_timeout),
-                None => self.config.publish_timeout,
+            let publish = client
+                .client
+                .publish(self.config.subject.clone(), body.into());
+            tokio::pin!(publish);
+            let published = loop {
+                let budget = deadline.map_or(self.config.publish_timeout, |at| {
+                    at.saturating_duration_since(tokio::time::Instant::now())
+                        .min(self.config.publish_timeout)
+                });
+                let wait = tokio::time::timeout(budget, publish.as_mut());
+                if let Some(cancel) = cancel.filter(|_| deadline.is_none()) {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            // Start exactly one shutdown deadline, even in the
+                            // middle of a publish blocked on the SDK queue.
+                            *deadline = Some(tokio::time::Instant::now() + self.config.flush_timeout);
+                        }
+                        result = wait => break result,
+                    }
+                } else {
+                    break wait.await;
+                }
             };
-            let published = tokio::time::timeout(
-                budget,
-                client
-                    .client
-                    .publish(self.config.subject.clone(), body.into()),
-            )
-            .await;
             match published {
                 Ok(Ok(())) => {
                     self.diag
@@ -321,32 +382,33 @@ impl NatsSink {
     }
 
     /// Flush on stop/EOF: publish batches already queued in the outbox
-    /// within `flush_timeout`, then a PING/PONG flush and drain.
+    /// within the shared `flush_timeout`, then a local socket flush and drain.
     async fn shutdown(
         &self,
         client: CoreClient,
         rx: &mut ObservedReceiver<RowBatch>,
         outbox: Option<&Arc<InflightCounter>>,
+        deadline: Option<tokio::time::Instant>,
     ) {
-        let deadline = tokio::time::Instant::now() + self.config.flush_timeout;
+        let mut deadline = Some(
+            deadline.unwrap_or_else(|| tokio::time::Instant::now() + self.config.flush_timeout),
+        );
         rx.close();
-        while tokio::time::Instant::now() < deadline {
+        while tokio::time::Instant::now() < deadline.expect("shutdown deadline") {
             let Ok(batch) = rx.try_recv() else { break };
             if !self
-                .publish_batch(&client, &batch, outbox, Some(deadline))
+                .publish_batch(&client, &batch, outbox, &mut deadline, None)
                 .await
             {
                 break;
             }
         }
         self.discard(rx, outbox);
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline
+            .expect("shutdown deadline")
+            .saturating_duration_since(tokio::time::Instant::now());
         let flushed = matches!(
-            tokio::time::timeout(
-                remaining.max(Duration::from_millis(10)),
-                client.client.flush()
-            )
-            .await,
+            tokio::time::timeout(remaining, client.client.flush()).await,
             Ok(Ok(()))
         );
         if flushed {
