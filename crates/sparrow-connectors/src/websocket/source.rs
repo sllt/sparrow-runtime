@@ -3,7 +3,8 @@
 //! - Each text message is one record (JSON object or CSV record with its
 //!   header) or, with `framing = ndjson`, newline-delimited JSON objects.
 //!   Binary messages are dropped and counted unless `binary_frames = decode`
-//!   (JSON only; CSV is text and refuses binary decoding).
+//!   (JSON only; CSV is text and refuses binary decoding). Protobuf takes
+//!   binary messages only: a text message is counted bad, never decoded.
 //! - The protocol layer rejects a frame above `max_message_bytes` from its
 //!   header, before reserving its payload, and a fragmented message once its
 //!   running size would pass the bound; the connection is then closed
@@ -32,6 +33,7 @@ use sparrow_io::observed::Sender as ObservedSender;
 use sparrow_model::observation::{HealthState, Latency, OriginSpan};
 use sparrow_model::{
     CreditKind, ErrorCode, MemoryLease, MemoryOwner, QueuedRow, RestoreClaim, Result, Row, Schema,
+    SparrowError,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -68,7 +70,8 @@ pub enum BinaryFrames {
     /// Count (`dropped_binary`) and skip.
     #[default]
     Drop,
-    /// Decode like a text message (JSON only; strict UTF-8 JSON parsing).
+    /// Decode like a text message (JSON: strict UTF-8 JSON parsing;
+    /// required for protobuf; refused for CSV).
     Decode,
 }
 
@@ -123,6 +126,16 @@ impl WebSocketSourceConfig {
                 ));
             }
             csv.check_schema(&self.schema)?;
+        }
+        if self.payload_format.as_protobuf().is_some() {
+            if self.framing != WebSocketFraming::Message || self.binary_frames != BinaryFrames::Decode
+            {
+                return Err(error(
+                    ErrorCode::InvalidArgument,
+                    "WebSocket protobuf takes one message per WebSocket message: set framing=message and binary_frames=decode",
+                ));
+            }
+            self.payload_format.check_schema(&self.schema)?;
         }
         if !(1..=MAX_INBOX).contains(&self.inbox_capacity)
             || !(1..=MAX_PREFETCH_CAPACITY).contains(&self.prefetch_capacity)
@@ -217,6 +230,8 @@ enum SessionEnd {
 /// receiving Wire while the transport actor is still closing its socket.
 pub(super) struct WireMessage {
     pub(super) payload: Box<[u8]>,
+    /// A text (not binary) WebSocket message.
+    pub(super) text: bool,
     pub(super) received_at: std::time::Instant,
     _reservation: Arc<MemoryLease>,
 }
@@ -363,7 +378,13 @@ impl WebSocketSource {
             };
             let Some(message) = message else { break Ok(()) };
             match source
-                .ingest(&message.payload, &ingress, &child, message.received_at)
+                .ingest(
+                    &message.payload,
+                    message.text,
+                    &ingress,
+                    &child,
+                    message.received_at,
+                )
                 .await
             {
                 Ok(true) => {}
@@ -563,12 +584,12 @@ impl WebSocketSource {
         messages: &mpsc::Sender<WireMessage>,
         reservation: &Arc<MemoryLease>,
     ) -> bool {
-        let payload = match frame {
+        let (payload, text) = match frame {
             Some(Ok(Message::Text(text))) => {
                 self.diag
                     .websocket_source_received
                     .fetch_add(1, Ordering::Relaxed);
-                text.into()
+                (text.into(), true)
             }
             Some(Ok(Message::Binary(bytes))) => {
                 self.diag
@@ -580,7 +601,7 @@ impl WebSocketSource {
                         .fetch_add(1, Ordering::Relaxed);
                     return true;
                 }
-                bytes
+                (bytes, false)
             }
             Some(Ok(Message::Close(_))) | None => return false,
             Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => return true,
@@ -599,6 +620,7 @@ impl WebSocketSource {
                 // Copy only after obtaining a slot, under its prepaid credit.
                 permit.send(WireMessage {
                     payload: payload.as_ref().to_vec().into_boxed_slice(),
+                    text,
                     received_at,
                     _reservation: reservation.clone(),
                 });
@@ -634,10 +656,19 @@ impl WebSocketSource {
     async fn ingest(
         &self,
         payload: &[u8],
+        text: bool,
         ingress: &Ingress<'_>,
         cancel: &CancellationToken,
         received_at: std::time::Instant,
     ) -> Result<bool> {
+        if text && self.config.payload_format.as_protobuf().is_some() {
+            // Protobuf is binary: a text message is a bad record, refused
+            // without charging credit or decoding.
+            return self.bad_record(error(
+                ErrorCode::CodecViolation,
+                "WebSocket protobuf takes binary messages; text message refused",
+            ));
+        }
         match self.config.framing {
             WebSocketFraming::Message => {
                 self.ingest_record(payload, ingress, cancel, received_at)
@@ -700,25 +731,28 @@ impl WebSocketSource {
             .record(Latency::Decode, started.elapsed());
         let row = match decoded {
             Ok(row) => row,
-            Err(e) => {
-                self.diag.csv_decode_error(&self.config.payload_format, &e);
-                self.diag
-                    .websocket_source_dropped_bad
-                    .fetch_add(1, Ordering::Relaxed);
-                self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
-                if self.config.fail_on_decode {
-                    self.fail_once("websocket_decode_failed", e.code);
-                    return Err(error(
-                        e.code,
-                        "WebSocket record decode failed (fail_on_decode)",
-                    ));
-                }
-                return Ok(true);
-            }
+            Err(e) => return self.bad_record(e),
         };
         self.diag.observation.progress(true, 1);
         self.admit(row, ingress, cancel, OriginSpan::at(received_at))
             .await
+    }
+
+    /// Count a record that cannot be decoded; fail only under `fail_on_decode`.
+    fn bad_record(&self, e: SparrowError) -> Result<bool> {
+        self.diag.format_decode_error(&self.config.payload_format, &e);
+        self.diag
+            .websocket_source_dropped_bad
+            .fetch_add(1, Ordering::Relaxed);
+        self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
+        if self.config.fail_on_decode {
+            self.fail_once("websocket_decode_failed", e.code);
+            return Err(error(
+                e.code,
+                "WebSocket record decode failed (fail_on_decode)",
+            ));
+        }
+        Ok(true)
     }
 
     /// Cancel-aware wait for a channel slot and Queue credit, holding one

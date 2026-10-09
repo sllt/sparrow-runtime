@@ -1202,3 +1202,42 @@ async fn jetstream_sink_csv_stores_one_record_per_message() {
     assert_eq!(payloads, ["event_id,v\ne-1,1\n", "event_id,v\ne-2,2\n"]);
     assert_eq!(diag.snapshot().csv_encode_errors, 0);
 }
+
+/// `event_id` (nullable) <- oneof `text` (presence), `v` <- `seq`.
+fn protobuf_format() -> sparrow_formats::PayloadFormat {
+    crate::protobuf_test_support::format(sparrow_formats::CsvRole::Encode, |o| {
+        o.fields = [("event_id", "text"), ("v", "seq")]
+            .iter()
+            .map(|(c, p)| (c.to_string(), p.to_string()))
+            .collect();
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_protobuf_stores_one_message_per_row_and_refuses_aligned() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    let (sink, _owner, _diag) = bound_sink(&broker, |c| c.payload_format = protobuf_format());
+    let err = sink
+        .prepare_aligned(CancellationToken::new(), Arc::new(()))
+        .await
+        .expect_err("aligned protobuf has no sink identity");
+    assert_eq!(err.code, ErrorCode::UnsupportedRestore);
+
+    let sink = start(&broker, |c| c.payload_format = protobuf_format());
+    sink.ready().await;
+    sink.send(1, 2).await;
+    sink.settled(1).await;
+    let (diag, outbox, _) = sink.finish().await;
+    assert_eq!((outbox.acked(), outbox.failed()), (1, 0));
+    let stream = context.get_stream("OUT").await.unwrap();
+    for seq in 1..=2u64 {
+        let m = stream.get_raw_message(seq).await.unwrap();
+        // text = 18 (tag 0x92 0x01), seq = 2 (tag 0x10).
+        let mut want = vec![0x10, seq as u8, 0x92, 0x01, 3];
+        want.extend_from_slice(format!("e-{seq}").as_bytes());
+        assert_eq!(m.payload.to_vec(), want);
+    }
+    assert_eq!(diag.snapshot().protobuf_encode_errors, 0);
+}

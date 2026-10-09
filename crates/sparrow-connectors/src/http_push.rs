@@ -1,11 +1,12 @@
-//! HTTP Push Source: POST JSON objects into a bounded kernel inbox.
+//! HTTP Push Source: POST JSON objects (or one CSV record / protobuf
+//! message) into a bounded kernel inbox.
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use sparrow_formats::{JsonCodec, JsonLimits};
-use sparrow_model::{ErrorCode, RestoreClaim, Row, Schema, SourceFrame};
+use sparrow_model::{CreditKind, ErrorCode, MemoryOwner, RestoreClaim, Row, Schema, SourceFrame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
@@ -86,6 +87,8 @@ pub struct HttpPushSource {
     pub addr: SocketAddr,
     listener: TcpListener,
     codec: JsonCodec,
+    /// Job reservation charged with the protobuf decode working set.
+    owner: Option<Arc<MemoryOwner>>,
 }
 
 impl HttpPushSource {
@@ -115,7 +118,17 @@ impl HttpPushSource {
             addr,
             listener,
             codec,
+            owner: None,
         })
+    }
+
+    /// Charge each protobuf body's decode working set
+    /// (`PayloadFormat::decode_scratch`) to `owner` before decoding, held
+    /// until the row is handed to the inbox. Without credit the request is
+    /// answered 503 and counted `http_dropped`, not decoded. JSON / CSV
+    /// bodies are not charged (unchanged).
+    pub fn charge_decode_to(&mut self, owner: Arc<MemoryOwner>) {
+        self.owner = Some(owner);
     }
 
     pub fn url(&self) -> String {
@@ -149,6 +162,7 @@ impl HttpPushSource {
                             let tx = tx.clone();
                             let diag = Arc::clone(&self.diag);
                             let codec = self.codec.clone();
+                            let owner = self.owner.clone();
                             let path = self.config.path.clone();
                             let read_timeout = self.config.read_timeout;
                             let child = cancel.clone();
@@ -159,6 +173,7 @@ impl HttpPushSource {
                                     tx,
                                     diag,
                                     codec,
+                                    owner,
                                     path,
                                     child,
                                     read_timeout,
@@ -195,11 +210,13 @@ async fn write_status(mut stream: TcpStream, code: u16, body: &[u8]) -> Result<(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_push(
     mut stream: TcpStream,
     tx: impl Into<ObservedSender<Row>>,
     diag: Arc<IoDiagnostics>,
     codec: JsonCodec,
+    owner: Option<Arc<MemoryOwner>>,
     path: String,
     cancel: CancellationToken,
     read_timeout: Duration,
@@ -292,8 +309,22 @@ async fn handle_push(
     diag.http_posted.fetch_add(1, Ordering::Relaxed);
     let received_at=std::time::Instant::now();
     diag.observation.progress(true,1);
+    let _scratch = match owner.filter(|_| codec.format.as_protobuf().is_some()) {
+        Some(owner) => {
+            let estimate = codec.format.decode_scratch(&codec.schema, body.len());
+            match owner.acquire(CreditKind::Reservation, estimate) {
+                Ok(lease) => Some(lease),
+                Err(_) => {
+                    diag.http_dropped.fetch_add(1, Ordering::Relaxed);
+                    let _ = write_status(stream, 503, b"no decode credit").await;
+                    return Ok(());
+                }
+            }
+        }
+        None => None,
+    };
     let frame = SourceFrame::new(body, 0);
-    let decoded=codec.decode_frame_with(&frame, |e| diag.csv_decode_error(&codec.format, e));
+    let decoded=codec.decode_frame_with(&frame, |e| diag.format_decode_error(&codec.format, e));
     diag.observation.record(Latency::Decode,received_at.elapsed());
     match decoded {
         Ok(Some(row)) => match tx.try_send_with_origin(row,OriginSpan::at(received_at)) {
@@ -310,10 +341,10 @@ async fn handle_push(
         },
         Ok(None) | Err(_) => {
             diag.http_dropped.fetch_add(1, Ordering::Relaxed);
-            let reason: &[u8] = if codec.format.as_csv().is_some() {
-                b"bad csv"
-            } else {
-                b"bad json"
+            let reason: &[u8] = match codec.format.name() {
+                "csv" => b"bad csv",
+                "protobuf" => b"bad protobuf",
+                _ => b"bad json",
             };
             let _ = write_status(stream, 422, reason).await;
         }
@@ -341,6 +372,64 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn protobuf_decode_scratch_is_charged_before_decoding() {
+        use crate::protobuf_test_support::{format, reading};
+        let cfg = HttpPushSourceConfig {
+            payload_format: format(sparrow_formats::CsvRole::Decode, |_| {}),
+            ..HttpPushSourceConfig::demo(schema())
+        };
+        let diag = IoDiagnostics::new();
+        let mut src = HttpPushSource::bind(
+            cfg,
+            &MapSecretResolver::default(),
+            &TargetPolicy::deny_all(),
+            diag.clone(),
+        )
+        .await
+        .unwrap();
+        let owner = MemoryOwner::new(sparrow_model::ResourceBudget::compact());
+        src.charge_decode_to(owner.clone());
+        let url = src.url();
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        tokio::spawn(src.run(tx, cancel.clone()));
+        let client = reqwest::Client::new();
+        let post = |body: Vec<u8>| {
+            client
+                .post(&url)
+                .header("content-type", "application/x-protobuf")
+                .body(body)
+                .send()
+        };
+        // Less credit left than the decode working set: refused, not decoded.
+        let held = owner
+            .acquire(
+                CreditKind::Reservation,
+                owner.budget().reservation_bytes - 1024,
+            )
+            .unwrap();
+        let resp = post(reading("a", 1)).await.unwrap();
+        assert_eq!(resp.status(), 503);
+        assert_eq!(diag.snapshot().http_dropped, 1);
+        assert_eq!(diag.snapshot().protobuf_malformed, 0);
+        assert!(rx.try_recv().is_err());
+        drop(held);
+        let resp = post(reading("b", 2)).await.unwrap();
+        assert_eq!(resp.status(), 202);
+        let row = rx.recv().await.unwrap();
+        assert_eq!(
+            row.values,
+            vec![sparrow_model::Scalar::utf8("b"), sparrow_model::Scalar::Int64(2)]
+        );
+        // A bad body is still decoded under credit and answered 422.
+        let resp = post(vec![0x0a, 0x09]).await.unwrap();
+        assert_eq!(resp.status(), 422);
+        assert_eq!(diag.snapshot().protobuf_malformed, 1);
+        assert_eq!(owner.usage().reservation_bytes, 0);
+        cancel.cancel();
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
-//! HTTP sink CSV bodies: header once per request, merge, content type and
-//! per-row action bodies.
+//! HTTP sink CSV and protobuf bodies: header once per request, merge,
+//! content type and per-row action bodies.
 use super::*;
 use crate::MapSecretResolver;
 use sparrow_formats::{CsvOptions, CsvRole, PayloadFormat};
@@ -223,6 +223,91 @@ async fn csv_per_row_query_action_posts_one_record_per_request() {
 fn csv_refuses_body_templates_and_single() {
     let mut cfg = HttpSinkConfig::demo("http://127.0.0.1:12345/");
     cfg.payload_format = csv(true);
+    for action in [
+        serde_json::json!({"single": true}),
+        serde_json::json!({"body": {"v": {"$field": "text"}}}),
+    ] {
+        let action: sparrow_formats::action::ActionSpec = serde_json::from_value(action).unwrap();
+        let error = HttpSink::validate_action(&cfg, &action).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+    }
+}
+
+/// Protobuf `telemetry.v1.Reading` with the `text` column on field 18.
+fn protobuf() -> PayloadFormat {
+    crate::protobuf_test_support::format(CsvRole::Encode, |o| o.fields.clear())
+}
+
+/// One delimited `Reading { text }` (field 18, wire type 2).
+fn delimited_text(text: &str) -> Vec<u8> {
+    let mut out = vec![(3 + text.len()) as u8, 0x92, 0x01, text.len() as u8];
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
+#[test]
+fn protobuf_merge_concatenates_delimited_messages() {
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let sink = sink("http://127.0.0.1:12345/", 12345, protobuf(), IoDiagnostics::new());
+    let mut left = sink.encode_delivery(texts(&owner, &["a"]), None).unwrap();
+    let right = sink
+        .encode_delivery(texts(&owner, &["bc", ""]), None)
+        .unwrap();
+    assert!(left
+        .merge(right, sink.config.batch_bytes, sink.config.batch_rows)
+        .is_ok());
+    assert_eq!(
+        left.bytes,
+        [delimited_text("a"), delimited_text("bc"), delimited_text("")].concat()
+    );
+    assert_eq!(left.rows, 3);
+    drop(left);
+    assert_eq!(owner.usage().physical_bytes, 0);
+}
+
+#[tokio::test]
+async fn protobuf_body_posts_a_delimited_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let got = request(&mut stream, &mut Vec::new()).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        got
+    });
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let diag = IoDiagnostics::new();
+    let sink = sink(&format!("http://127.0.0.1:{port}/in"), port, protobuf(), diag.clone());
+    let counter = Arc::new(InflightCounter::new());
+    counter.enqueue();
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(texts(&owner, &["x", "上海"])).await.unwrap();
+    drop(tx);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        sink.run(rx, CancellationToken::new(), Some(counter.clone())),
+    )
+    .await
+    .unwrap();
+    let (head, body) = server.await.unwrap();
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: application/x-protobuf"),
+        "{head}"
+    );
+    assert_eq!(body, [delimited_text("x"), delimited_text("上海")].concat());
+    assert_eq!((counter.acked(), counter.failed()), (1, 0));
+    assert_eq!(diag.snapshot().protobuf_encode_errors, 0);
+    assert_eq!(owner.usage().physical_bytes, 0);
+}
+
+#[test]
+fn protobuf_refuses_body_templates_and_single() {
+    let mut cfg = HttpSinkConfig::demo("http://127.0.0.1:12345/");
+    cfg.payload_format = protobuf();
     for action in [
         serde_json::json!({"single": true}),
         serde_json::json!({"body": {"v": {"$field": "text"}}}),

@@ -50,6 +50,28 @@ fn csv_format(
     sparrow_formats::PayloadFormat::csv(options.compile(role).unwrap())
 }
 
+#[test]
+fn tcp_direct_configs_refuse_protobuf_in_both_framings() {
+    use sparrow_formats::CsvRole;
+    let policy = TargetPolicy::allow("127.0.0.1", 9000);
+    for framing in [TcpFraming::Lines, TcpFraming::LengthPrefixed] {
+        let mut source = TcpSourceConfig::new("127.0.0.1", 9000, schema());
+        source.client.framing = framing;
+        source.payload_format = crate::protobuf_test_support::format(CsvRole::Decode, |_| {});
+        assert_eq!(
+            source.validate(&policy).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        let mut sink = TcpSinkConfig::new("127.0.0.1", 9000);
+        sink.client.framing = framing;
+        sink.payload_format = crate::protobuf_test_support::format(CsvRole::Encode, |_| {});
+        assert_eq!(
+            sink.validate(&policy).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+    }
+}
+
 async fn until(deadline: Duration, mut f: impl FnMut() -> bool) {
     tokio::time::timeout(deadline, async {
         while !f() {

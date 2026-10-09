@@ -468,7 +468,7 @@ impl Actor {
                 let added = next
                     .decode_into(&self.schema, &self.owner, &mut builder, self.row_limit)
                     .map_err(|e| {
-                        self.diag.csv_decode_error(next.payload_format(), &e);
+                        self.diag.format_decode_error(next.payload_format(), &e);
                         self.diag
                             .decode_errors
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

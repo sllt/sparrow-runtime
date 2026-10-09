@@ -1,0 +1,9 @@
+device: "dev-2"
+seq: 9
+count: 5
+samples: 1
+samples: 2
+samples: 300
+tags { key: "k" value: "v" }
+location { lat: 1.5 }
+at { seconds: -1 }

@@ -657,6 +657,14 @@ impl JetStreamSink {
         // The compiled format has already validated single-byte delimiter /
         // quote and encode-only options. Bind effective values, not whether a
         // default happened to be written explicitly in the stored spec.
+        if self.config.payload_format.as_protobuf().is_some() {
+            // The durable sink identity records CSV encode options only, so a
+            // protobuf restore could not be bound to its descriptor/mapping.
+            return Err(err(
+                ErrorCode::UnsupportedRestore,
+                "JetStream aligned output does not support protobuf payloads (no protobuf sink identity)",
+            ));
+        }
         let identity = if let Some(csv) = self.config.payload_format.as_csv() {
             let options = csv.options();
             identity.with_csv(CsvEncodeIdentity::new(
@@ -799,10 +807,13 @@ impl JetStreamSink {
             )
         });
         let format = &self.config.payload_format;
-        let scratch_bytes = match format.as_csv() {
-            // CSV keeps no serde tree for flat cells (see its estimator).
-            Some(csv) => csv.encode_scratch(row),
-            None => row
+        let scratch_bytes = match format {
+            // CSV keeps no serde tree for flat cells, protobuf borrows the
+            // row's strings (see their estimators).
+            sparrow_formats::PayloadFormat::Csv(_) | sparrow_formats::PayloadFormat::Protobuf(_) => {
+                format.encode_scratch(schema, row)
+            }
+            sparrow_formats::PayloadFormat::Json => row
                 .resident_bytes()
                 .saturating_mul(8)
                 .saturating_add(names.saturating_mul(4))
@@ -844,7 +855,7 @@ impl JetStreamSink {
                     "encoded row and headers exceed max_payload_bytes / server max_payload",
                 )
             } else {
-                self.diag.csv_encode_error(format);
+                self.diag.format_encode_error(format);
                 self.diag
                     .jetstream_sink_dropped_bad
                     .fetch_add(1, Ordering::Relaxed);

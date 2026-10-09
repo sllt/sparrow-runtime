@@ -931,3 +931,172 @@ async fn k2_restore_refuses_changed_payload_format_or_csv_options() {
     restored.close().await.unwrap();
     assert_eq!(owner.usage().physical_bytes, 0);
 }
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; protobuf identity bound into the cut"]
+async fn k2_restore_refuses_changed_protobuf_descriptor_message_mapping_or_policy() {
+    use base64::Engine;
+    use sparrow_formats::{CsvOptions, CsvRole, PayloadFormat, ProtobufOptions, UnknownFields};
+    const DESCRIPTOR: &[u8] =
+        include_bytes!("../../../sparrow-formats/tests/fixtures/protobuf/descriptor_set.pb");
+    let broker = Broker::start().await;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let connection = broker.connect(&owner).await;
+    let js = async_nats::jetstream::new(connection.client.clone());
+    js.create_stream(stream_config("INPUT")).await.unwrap();
+    js.create_key_value(async_nats::jetstream::kv::Config {
+        bucket: "OWNERS".into(),
+        history: 1,
+        max_bytes: 1024 * 1024,
+        max_value_size: 1024,
+        storage: stream::StorageType::File,
+        num_replicas: 1,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    for n in 1..=4u8 {
+        // telemetry.v1.Reading { device: "a", seq: n }
+        js.publish("INPUT.rows", vec![0x0a, 0x01, b'a', 0x10, n].into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    drop(js);
+    connection.close().await.unwrap();
+    let base = ProtobufOptions {
+        descriptor_set: base64::engine::general_purpose::STANDARD.encode(DESCRIPTOR),
+        message: "telemetry.v1.Reading".into(),
+        fields: [("id", "device"), ("v", "seq")]
+            .iter()
+            .map(|(c, p)| (c.to_string(), p.to_string()))
+            .collect(),
+        unknown_fields: UnknownFields::Ignore,
+        max_message_bytes: None,
+        max_depth: None,
+    };
+    let protobuf = |tune: &dyn Fn(&mut ProtobufOptions)| {
+        let mut options = base.clone();
+        tune(&mut options);
+        PayloadFormat::protobuf(options.compile(CsvRole::Decode).unwrap())
+    };
+    let config = |payload_format: PayloadFormat| ReaderConfig {
+        namespace: "test_account".into(),
+        stream: "INPUT".into(),
+        consumer: "pb".into(),
+        ownership_bucket: "OWNERS".into(),
+        max_pending: 8,
+        pending_bytes: 256 * 1024,
+        pull_messages: 4,
+        pull_bytes: 72 * 1024,
+        payload_format,
+    };
+    let schema = Arc::new(
+        sparrow_model::Schema::new(
+            1,
+            vec![
+                sparrow_model::Field::new(1, "id", sparrow_model::DataType::Utf8, false),
+                sparrow_model::Field::new(2, "v", sparrow_model::DataType::Int64, false),
+            ],
+        )
+        .unwrap(),
+    );
+    let mut reader = Reader::open(
+        broker.connect(&owner).await,
+        config(protobuf(&|_| {})),
+        owner.clone(),
+        [7; 32],
+        [1; 16],
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(reader.prepare_pull().await.unwrap());
+    for n in 1..=2u64 {
+        let ReaderPoll::Record(record) = reader.next().await.unwrap() else {
+            panic!("record {n}")
+        };
+        assert_eq!(record.sequence(), n);
+        let batch = record.decode(&schema, &owner, 4096).unwrap();
+        assert_eq!(
+            batch.rows()[0].values,
+            vec![
+                sparrow_model::Scalar::utf8("a"),
+                sparrow_model::Scalar::Int64(n as i64)
+            ]
+        );
+        drop(record);
+        reader.published(n).unwrap();
+    }
+    let cut = reader.position(2);
+    reader.close().await.unwrap();
+    assert_ne!(cut.identity.fingerprint, 0);
+
+    let others: Vec<(&str, PayloadFormat)> = vec![
+        ("json", PayloadFormat::Json),
+        (
+            "csv",
+            PayloadFormat::csv(CsvOptions::default().compile(CsvRole::Decode).unwrap()),
+        ),
+        ("message", protobuf(&|o| o.message = "telemetry.v1.Tree".into())),
+        ("mapping", protobuf(&|o| {
+            o.fields.insert("v".into(), "i32".into());
+        })),
+        ("unknown policy", protobuf(&|o| o.unknown_fields = UnknownFields::Error)),
+        ("max_depth", protobuf(&|o| o.max_depth = Some(31))),
+        ("max_message_bytes", protobuf(&|o| o.max_message_bytes = Some(1024))),
+        // Same message types, a descriptor set without legacy.proto.
+        ("descriptor bytes", protobuf(&|o| {
+            o.descriptor_set = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+                "../../../sparrow-formats/tests/fixtures/protobuf/descriptor_set_telemetry.pb"
+            ))
+        })),
+    ];
+    for (nonce, (what, other)) in others.into_iter().enumerate() {
+        let refused = Reader::open(
+            broker.connect(&owner).await,
+            config(other),
+            owner.clone(),
+            [7; 32],
+            [nonce as u8 + 2; 16],
+            Some(&cut),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{what} change must be refused"));
+        assert_eq!(refused.code, sparrow_model::ErrorCode::UnsupportedRestore, "{what}");
+        assert!(refused.message.contains("payload format"), "{what}: {}", refused.message);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    // Explicit defaults are the same identity (same-name mapping entries:
+    // sparrow-formats unit tests).
+    let explicit = protobuf(&|o| {
+        o.max_depth = Some(32);
+        o.max_message_bytes = Some(65536);
+    });
+    let mut restored = Reader::open(
+        broker.connect(&owner).await,
+        config(explicit),
+        owner.clone(),
+        [7; 32],
+        [42; 16],
+        Some(&cut),
+    )
+    .await
+    .unwrap();
+    assert!(restored.prepare_pull().await.unwrap());
+    for n in 3..=4u64 {
+        let ReaderPoll::Record(record) = restored.next().await.unwrap() else {
+            panic!("suffix record {n}")
+        };
+        assert_eq!(record.sequence(), n);
+        let batch = record.decode(&schema, &owner, 4096).unwrap();
+        assert_eq!(batch.rows()[0].values[1], sparrow_model::Scalar::Int64(n as i64));
+        drop(batch);
+        drop(record);
+    }
+    restored.close().await.unwrap();
+    assert_eq!(owner.usage().physical_bytes, 0);
+}

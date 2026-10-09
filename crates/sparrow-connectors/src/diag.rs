@@ -155,6 +155,11 @@ pub struct IoDiagnostics {
     pub csv_type_errors: AtomicU64,
     pub csv_header_errors: AtomicU64,
     pub csv_encode_errors: AtomicU64,
+    pub protobuf_malformed: AtomicU64,
+    pub protobuf_oversize: AtomicU64,
+    pub protobuf_type_errors: AtomicU64,
+    pub protobuf_unknown_fields: AtomicU64,
+    pub protobuf_encode_errors: AtomicU64,
     pub websocket_source_received: AtomicU64,
     pub websocket_source_rows: AtomicU64,
     pub websocket_source_dropped_bad: AtomicU64,
@@ -270,30 +275,44 @@ impl IoDiagnostics {
         Arc::new(Self::default())
     }
 
-    /// Count one CSV decode failure by kind (oversize, malformed, type,
-    /// header). JSON failures are not counted here. The connector's own
-    /// `*_dropped_bad` / `decode_errors` accounting is unchanged.
-    pub fn csv_decode_error(
+    /// Count one CSV or protobuf decode failure by kind (CSV: oversize,
+    /// malformed, type, header; protobuf: oversize, malformed, type,
+    /// unknown field). JSON failures are not counted here. The connector's
+    /// own `*_dropped_bad` / `decode_errors` accounting is unchanged.
+    pub fn format_decode_error(
         &self,
         format: &sparrow_formats::PayloadFormat,
         error: &sparrow_model::SparrowError,
     ) {
-        if format.as_csv().is_none() {
-            return;
-        }
-        let counter = match sparrow_formats::CsvFault::of(error) {
-            sparrow_formats::CsvFault::Oversize => &self.csv_oversize,
-            sparrow_formats::CsvFault::Malformed => &self.csv_malformed,
-            sparrow_formats::CsvFault::Type => &self.csv_type_errors,
-            sparrow_formats::CsvFault::Header => &self.csv_header_errors,
+        use sparrow_formats::{CsvFault, PayloadFormat, ProtobufFault};
+        let counter = match format {
+            PayloadFormat::Json => return,
+            PayloadFormat::Csv(_) => match CsvFault::of(error) {
+                CsvFault::Oversize => &self.csv_oversize,
+                CsvFault::Malformed => &self.csv_malformed,
+                CsvFault::Type => &self.csv_type_errors,
+                CsvFault::Header => &self.csv_header_errors,
+            },
+            PayloadFormat::Protobuf(_) => match ProtobufFault::of(error) {
+                ProtobufFault::Oversize => &self.protobuf_oversize,
+                ProtobufFault::Malformed => &self.protobuf_malformed,
+                ProtobufFault::Type => &self.protobuf_type_errors,
+                ProtobufFault::UnknownField => &self.protobuf_unknown_fields,
+            },
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count one CSV encode failure (sinks).
-    pub fn csv_encode_error(&self, format: &sparrow_formats::PayloadFormat) {
-        if format.as_csv().is_some() {
-            self.csv_encode_errors.fetch_add(1, Ordering::Relaxed);
+    /// Count one CSV or protobuf encode failure (sinks).
+    pub fn format_encode_error(&self, format: &sparrow_formats::PayloadFormat) {
+        match format {
+            sparrow_formats::PayloadFormat::Json => {}
+            sparrow_formats::PayloadFormat::Csv(_) => {
+                self.csv_encode_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            sparrow_formats::PayloadFormat::Protobuf(_) => {
+                self.protobuf_encode_errors.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -487,6 +506,11 @@ impl IoDiagnostics {
             csv_type_errors: self.csv_type_errors.load(Ordering::Relaxed),
             csv_header_errors: self.csv_header_errors.load(Ordering::Relaxed),
             csv_encode_errors: self.csv_encode_errors.load(Ordering::Relaxed),
+            protobuf_malformed: self.protobuf_malformed.load(Ordering::Relaxed),
+            protobuf_oversize: self.protobuf_oversize.load(Ordering::Relaxed),
+            protobuf_type_errors: self.protobuf_type_errors.load(Ordering::Relaxed),
+            protobuf_unknown_fields: self.protobuf_unknown_fields.load(Ordering::Relaxed),
+            protobuf_encode_errors: self.protobuf_encode_errors.load(Ordering::Relaxed),
             websocket_source_received: self.websocket_source_received.load(Ordering::Relaxed),
             websocket_source_rows: self.websocket_source_rows.load(Ordering::Relaxed),
             websocket_source_dropped_bad: self.websocket_source_dropped_bad.load(Ordering::Relaxed),
@@ -794,6 +818,11 @@ pub struct IoSnapshot {
     pub csv_type_errors: u64,
     pub csv_header_errors: u64,
     pub csv_encode_errors: u64,
+    pub protobuf_malformed: u64,
+    pub protobuf_oversize: u64,
+    pub protobuf_type_errors: u64,
+    pub protobuf_unknown_fields: u64,
+    pub protobuf_encode_errors: u64,
     pub websocket_source_received: u64,
     pub websocket_source_rows: u64,
     pub websocket_source_dropped_bad: u64,
@@ -1077,6 +1106,11 @@ impl IoSnapshot {
         self.csv_type_errors += other.csv_type_errors;
         self.csv_header_errors += other.csv_header_errors;
         self.csv_encode_errors += other.csv_encode_errors;
+        self.protobuf_malformed += other.protobuf_malformed;
+        self.protobuf_oversize += other.protobuf_oversize;
+        self.protobuf_type_errors += other.protobuf_type_errors;
+        self.protobuf_unknown_fields += other.protobuf_unknown_fields;
+        self.protobuf_encode_errors += other.protobuf_encode_errors;
         self.websocket_source_received += other.websocket_source_received;
         self.websocket_source_rows += other.websocket_source_rows;
         self.websocket_source_dropped_bad += other.websocket_source_dropped_bad;

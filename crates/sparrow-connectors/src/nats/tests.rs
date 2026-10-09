@@ -1112,3 +1112,114 @@ async fn nats_core_csv_source_and_sink_round_trip_through_the_broker() {
     drop(tx);
     run.stop().await.unwrap();
 }
+
+fn protobuf_format(
+    role: sparrow_formats::CsvRole,
+    tune: impl FnOnce(&mut sparrow_formats::ProtobufOptions),
+) -> sparrow_formats::PayloadFormat {
+    crate::protobuf_test_support::format(role, tune)
+}
+
+#[test]
+fn nats_protobuf_formats_resolve_the_schema() {
+    for role in [sparrow_formats::CsvRole::Decode, sparrow_formats::CsvRole::Encode] {
+        assert!(protobuf_format(role, |_| {}).check_schema(&schema()).is_ok());
+    }
+    // An unmapped schema column with no same-named field is refused.
+    let format = protobuf_format(sparrow_formats::CsvRole::Decode, |o| {
+        o.fields.remove("v");
+    });
+    assert_eq!(
+        format.check_schema(&schema()).unwrap_err().code,
+        ErrorCode::InvalidSchema
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn nats_core_protobuf_source_and_sink_round_trip_through_the_broker() {
+    let broker = NatsSandbox::start().await;
+    let mut run = start_source(&broker, |c| {
+        c.payload_format = protobuf_format(sparrow_formats::CsvRole::Decode, |o| {
+            o.unknown_fields = sparrow_formats::UnknownFields::Error;
+            o.max_message_bytes = Some(16);
+        });
+    });
+    run.ready().await;
+    let client = raw_client(&broker).await;
+    for payload in [
+        // device "d", seq 1.
+        vec![0x0a, 0x01, b'd', 0x10, 0x01],
+        // seq absent: proto3 implicit presence decodes to 0, not NULL.
+        vec![0x0a, 0x01, b'e'],
+        // Truncated string.
+        vec![0x0a, 0x05, b'd'],
+        // Unknown field 111 under unknown_fields=error.
+        vec![0x0a, 0x01, b'd', 0xf8, 0x06, 0x01],
+        // 17 bytes > max_message_bytes 16.
+        [vec![0x0a, 0x0f], vec![b'x'; 15]].concat(),
+        // Invalid UTF-8 in a declared string.
+        vec![0x0a, 0x01, 0xff],
+    ] {
+        client.publish("in.pb", payload.into()).await.unwrap();
+    }
+    client.flush().await.unwrap();
+    // Sink: one protobuf message per row, through the same broker into the
+    // protobuf source.
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let diag = IoDiagnostics::new();
+    let mut config = NatsSinkConfig::new(vec![broker.url()], "in.sink");
+    config.payload_format = protobuf_format(sparrow_formats::CsvRole::Encode, |_| {});
+    let mut sub = client.subscribe("in.sink").await.unwrap();
+    client.flush().await.unwrap();
+    let sink = NatsSink::bind(
+        config,
+        &secrets(),
+        &policy(&broker),
+        owner.clone(),
+        diag.clone(),
+    )
+    .unwrap();
+    let (tx, rx) = sparrow_io::observed::channel(8);
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(sink.run(rx, cancel.clone(), None));
+    until(Duration::from_secs(5), || {
+        diag.snapshot().nats_sink_sessions == 1
+    })
+    .await;
+    tx.send(batch(&owner, 0, 300)).await.unwrap();
+    let raw = tokio::time::timeout(Duration::from_secs(5), sub.next())
+        .await
+        .unwrap()
+        .unwrap();
+    // seq 0 is the implicit default and is omitted, like protoc.
+    assert_eq!(&raw.payload[..], [0x0a, 0x01, b's']);
+    let rows = run.take(2 + 301).await;
+    assert_eq!(rows[0], vec![Scalar::utf8("d"), Scalar::Int64(1)]);
+    assert_eq!(rows[1], vec![Scalar::utf8("e"), Scalar::Int64(0)]);
+    for (i, row) in rows[2..].iter().enumerate() {
+        assert_eq!(*row, vec![Scalar::utf8("s"), Scalar::Int64(i as i64)]);
+    }
+    let snap = run.diag.snapshot();
+    // Over max_message_bytes is refused by length before any charge/decode.
+    assert_eq!(snap.nats_source_dropped_oversize, 1, "{snap:?}");
+    assert_eq!(snap.nats_source_dropped_bad, 3, "{snap:?}");
+    assert_eq!(
+        (
+            snap.protobuf_malformed,
+            snap.protobuf_unknown_fields,
+            snap.protobuf_type_errors,
+        ),
+        (2, 1, 0),
+        "{snap:?}"
+    );
+    assert_eq!(snap.csv_malformed, 0);
+    assert_eq!(diag.snapshot().protobuf_encode_errors, 0);
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(tx);
+    run.stop().await.unwrap();
+}

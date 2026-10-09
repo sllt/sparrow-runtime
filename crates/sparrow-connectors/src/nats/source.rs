@@ -283,7 +283,7 @@ impl NatsSource {
         let row = match decoded {
             Ok(row) => row,
             Err(e) => {
-                self.diag.csv_decode_error(&self.config.payload_format, &e);
+                self.diag.format_decode_error(&self.config.payload_format, &e);
                 self.diag
                     .nats_source_dropped_bad
                     .fetch_add(1, Ordering::Relaxed);

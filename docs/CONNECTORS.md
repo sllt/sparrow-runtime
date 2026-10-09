@@ -365,4 +365,6 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | `databus` | ✓（内部） | ✗ | ✗ | 进程内传递行 |
 | `log` / plugin | ✓ | — | ✗ | — |
 
-新增字节型 connector 时，应通过 `PayloadFormat` 编解码，并加入 `CSV_SOURCE_KINDS` / `CSV_SINK_KINDS`，不要自带解析器。先按长度拒绝（`max_message_bytes`），再按 `decode_scratch` / `encode_scratch` 记账，最后用 `encode_row_bounded_with_capacity` 等有界接口编解码。
+`format: "protobuf"`：`mqtt` / `nats` / `jetstream` / `http_push` / `websocket`（二进制帧）一条消息一条记录；`http` Sink 与 `http_poll` 使用长度前缀消息流；`file` / `file_replay` / `replay` / `databus` 拒绝；JetStream Sink aligned、HTTP Sink 的 JetStream 源 / aligned 拒绝。详见 [FORMATS.md](FORMATS.md#protobuf)。
+
+新增字节型 connector 时，应通过 `PayloadFormat` 编解码，并加入 `CSV_SOURCE_KINDS` / `CSV_SINK_KINDS`（以及 `PROTOBUF_SOURCE_KINDS` / `PROTOBUF_SINK_KINDS`），不要自带解析器。先按长度拒绝（`max_message_bytes`），再按 `decode_scratch` / `encode_scratch` 记账，最后用 `encode_row_bounded_with_capacity` 等有界接口编解码。

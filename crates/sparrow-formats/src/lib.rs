@@ -3,6 +3,7 @@
 mod json;
 pub mod action;
 pub mod csv;
+pub mod protobuf;
 
 pub use json::{
     decode_json_row, decode_dynamic_json, encode_json_batch, encode_json_batch_bounded,
@@ -10,3 +11,6 @@ pub use json::{
     JsonCodec, JsonLimits,
 };
 pub use csv::{CsvFault, CsvFormat, CsvFramer, CsvMapping, CsvOptions, CsvRole, PayloadFormat};
+pub use protobuf::{
+    ProtobufDocument, ProtobufFault, ProtobufFormat, ProtobufLimits, ProtobufOptions, UnknownFields,
+};

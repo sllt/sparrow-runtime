@@ -232,7 +232,7 @@ impl<T: Payload + From<LiveFeedEvent> + Send> Feed<'_, T> {
                         }
                         let frame = SourceFrame::new(publish.payload, 0);
                         let decoded = self.source.codec.decode_frame_with(&frame, |e| {
-                            self.source.diag.csv_decode_error(&self.source.codec.format, e)
+                            self.source.diag.format_decode_error(&self.source.codec.format, e)
                         });
                         self.source.diag.observation.record(Latency::Decode, at.elapsed());
                         drop(frame);

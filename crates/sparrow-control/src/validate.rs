@@ -402,7 +402,7 @@ pub fn validate_io(
     validate_lookup_io(spec,secrets,policy)?;
     spec.check_delivery()?;
     check_nats_reservation_total(spec)?;
-    check_csv_reliability(spec)?;
+    check_format_reliability(spec)?;
     if let Some(io) = &spec.graph_io {
         for (operator, source) in &io.sources {
             validate_source_io(spec, source, schema, secrets, policy, demo)
@@ -523,10 +523,11 @@ fn jetstream_sink_reservation(sink: &SinkSpec) -> Option<usize> {
     }
 }
 
-/// CSV bodies carry rows only. A reliable pipeline (JetStream source or
-/// aligned recovery) hands the HTTP sink an output identity that only the
-/// JSON envelope can carry, so that combination is refused up front.
-fn check_csv_reliability(spec: &PipelineSpec) -> Result<()> {
+/// CSV and protobuf bodies carry rows only. A reliable pipeline (JetStream
+/// source or aligned recovery) hands the HTTP sink an output identity that
+/// only the JSON envelope can carry, so that combination is refused up
+/// front; so is aligned JetStream output in protobuf (see below).
+fn check_format_reliability(spec: &PipelineSpec) -> Result<()> {
     let sinks: Vec<&SinkSpec> = match &spec.graph_io {
         Some(io) => io.sinks.values().collect(),
         None => vec![&spec.sink],
@@ -535,25 +536,36 @@ fn check_csv_reliability(spec: &PipelineSpec) -> Result<()> {
         Some(io) => io.sources.values().any(|s| s.kind == "jetstream"),
         None => spec.source.kind == "jetstream",
     };
-    let reliable =
-        jetstream_source || RecoveryPolicy::parse(&spec.recovery).is_ok_and(|r| r.is_aligned());
+    let aligned = RecoveryPolicy::parse(&spec.recovery).is_ok_and(|r| r.is_aligned());
+    let reliable = jetstream_source || aligned;
     for sink in sinks {
-        if reliable && sink.kind == "http" && sink.payload_format()?.as_csv().is_some() {
+        let format = sink.payload_format()?;
+        if reliable && sink.kind == "http" && !format.is_json() {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                "HTTP CSV bodies cannot carry reliable output identity; use format=json for checkpointed delivery",
+                format!(
+                    "HTTP {} bodies cannot carry reliable output identity; use format=json for checkpointed delivery",
+                    format.name().to_uppercase()
+                ),
+            ));
+        }
+        // The aligned JetStream sink identity (JSI1/JSI2) binds JSON or the
+        // CSV dialect only; a protobuf descriptor/mapping could change
+        // across a restore unnoticed, so aligned protobuf output is refused.
+        if aligned && sink.kind == "jetstream" && format.as_protobuf().is_some() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "aligned JetStream output does not support format=protobuf (the sink identity cannot bind a descriptor); use json or csv, or recovery=restart_fresh",
             ));
         }
     }
     Ok(())
 }
 
-/// CSV needs a schema it can lay out (columns, NULL spelling).
+/// CSV needs a schema it can lay out (columns, NULL spelling); protobuf
+/// resolves every column to a field path of the message type.
 fn validate_sink_format(sink: &SinkSpec, schema: &Schema) -> Result<()> {
-    if let Some(csv) = sink.payload_format()?.as_csv() {
-        csv.check_schema(schema)?;
-    }
-    Ok(())
+    sink.payload_format()?.check_schema(schema)
 }
 
 /// `msg_id_column` must be a utf8/integer column of the sink's input.
@@ -595,9 +607,7 @@ fn validate_source_io(
     policy: &TargetPolicy,
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
-    if let Some(csv) = source.payload_format()?.as_csv() {
-        csv.check_schema(schema)?;
-    }
+    source.payload_format()?.check_schema(schema)?;
     match source.kind.as_str() {
         "plugin" => source.plugin.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"plugin Source binding required"))?.validate()?,
         #[cfg(feature = "jetstream")]
@@ -734,12 +744,15 @@ fn validate_sink_io(
             "file options require a File Sink",
         ));
     }
-    let csv = sink.payload_format()?.as_csv().is_some();
-    if let Some(action) = sink.action.as_ref().filter(|_| csv) {
+    let format = sink.payload_format()?;
+    if let Some(action) = sink.action.as_ref().filter(|_| !format.is_json()) {
         if sink.kind == "file" || action.body.is_some() || action.single {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
-                "a CSV sink writes each row as one CSV record: no action.body/single, and no action on a File Sink",
+                format!(
+                    "a {} sink writes each row as one record: no action.body/single, and no action on a File Sink",
+                    format.name().to_uppercase()
+                ),
             ));
         }
     }
@@ -919,6 +932,7 @@ pub fn validate_io_with_plan(
 
     validate_lookup_io(spec,secrets,policy)?;
     check_nats_reservation_total(spec)?;
+    check_format_reliability(spec)?;
     for (operator, source) in &io.sources {
         let actual = graph_endpoint_schema(plan, *operator, true)?;
         validate_source_io(spec, source, &actual, secrets, policy, demo)
@@ -2056,10 +2070,13 @@ pub fn capabilities_json() -> serde_json::Value {
         "exactly_once": "rejected",
         "formats": {
             "default": "json",
-            "available": ["json", "csv"],
+            "available": ["json", "csv", "protobuf"],
             "csv_sources": crate::spec::CSV_SOURCE_KINDS,
             "csv_sinks": crate::spec::CSV_SINK_KINDS,
             "csv_contract": "strict_rfc4180_subset; header_or_positional; typed_per_schema; one_record_per_message; file_header_per_segment; no_reliable_http_identity",
+            "protobuf_sources": crate::spec::PROTOBUF_SOURCE_KINDS,
+            "protobuf_sinks": crate::spec::PROTOBUF_SINK_KINDS,
+            "protobuf_contract": "proto2_proto3_FileDescriptorSet_no_editions; explicit_field_paths_singular_messages_only; repeated_map_group_refused; presence_null_implicit_default; one_message_per_message; http_length_delimited; no_file; no_aligned_jetstream_sink; no_reliable_http_identity",
             "docs": "docs/FORMATS.md",
         },
         "connectors": [
@@ -3026,6 +3043,7 @@ mod tests {
                 file_contract: None,
                 format: None,
                 csv: None,
+                protobuf: None,
             },
             sink: crate::spec::SinkSpec {
                 nats: None,
@@ -3058,6 +3076,7 @@ mod tests {
                 tls: false,
                 format: None,
                 csv: None,
+                protobuf: None,
             },
             delivery: "at_least_once".into(),
             recovery: "restart_fresh".into(),
@@ -3127,6 +3146,7 @@ mod tests {
             file_contract: None,
             format: None,
             csv: None,
+            protobuf: None,
         };
         let schema = Schema::new(
             SchemaId::new(1),
@@ -3179,6 +3199,7 @@ mod tests {
             file_contract: None,
             format: None,
             csv: None,
+            protobuf: None,
         };
         let schema = Schema::new(
             SchemaId::new(1),
@@ -3230,6 +3251,7 @@ mod tests {
             tls: false,
             format: None,
             csv: None,
+            protobuf: None,
         };
         let err = http_config(&sink, None).unwrap_err();
         assert_eq!(err.code, ErrorCode::PolicyDenied);

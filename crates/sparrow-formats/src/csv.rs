@@ -1217,6 +1217,7 @@ pub enum PayloadFormat {
     #[default]
     Json,
     Csv(std::sync::Arc<CsvFormat>),
+    Protobuf(std::sync::Arc<crate::protobuf::ProtobufFormat>),
 }
 
 impl PayloadFormat {
@@ -1224,25 +1225,54 @@ impl PayloadFormat {
         Self::Csv(std::sync::Arc::new(format))
     }
 
+    pub fn protobuf(format: crate::protobuf::ProtobufFormat) -> Self {
+        Self::Protobuf(std::sync::Arc::new(format))
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::Json => "json",
             Self::Csv(_) => "csv",
+            Self::Protobuf(_) => "protobuf",
         }
+    }
+
+    pub fn is_json(&self) -> bool {
+        matches!(self, Self::Json)
     }
 
     pub fn as_csv(&self) -> Option<&CsvFormat> {
         match self {
-            Self::Json => None,
             Self::Csv(format) => Some(format),
+            _ => None,
         }
     }
 
-    /// HTTP `content-type` for an encoded body.
+    pub fn as_protobuf(&self) -> Option<&crate::protobuf::ProtobufFormat> {
+        match self {
+            Self::Protobuf(format) => Some(format),
+            _ => None,
+        }
+    }
+
+    /// Check `schema` against the format before a job starts (CSV: column
+    /// layout and NULL spelling; protobuf: the field-path mapping and type
+    /// matrix; JSON maps by name at decode time).
+    pub fn check_schema(&self, schema: &Schema) -> Result<()> {
+        match self {
+            Self::Json => Ok(()),
+            Self::Csv(format) => format.check_schema(schema),
+            Self::Protobuf(format) => format.check_schema(schema),
+        }
+    }
+
+    /// HTTP `content-type` for an encoded body. A protobuf body is a
+    /// length-delimited stream of messages (see `docs/FORMATS.md`).
     pub fn content_type(&self) -> &'static str {
         match self {
             Self::Json => "application/json",
             Self::Csv(_) => "text/csv; charset=utf-8",
+            Self::Protobuf(_) => "application/x-protobuf",
         }
     }
 
@@ -1257,6 +1287,7 @@ impl PayloadFormat {
         match self {
             Self::Json => crate::json::decode_json_row_on(schema, bytes, json, owner),
             Self::Csv(format) => format.decode_message(schema, bytes, owner),
+            Self::Protobuf(format) => format.decode_message(schema, bytes, owner),
         }
     }
 
@@ -1265,6 +1296,7 @@ impl PayloadFormat {
         match self {
             Self::Json => crate::json::encode_json_row(schema, row),
             Self::Csv(format) => format.encode_message(schema, row),
+            Self::Protobuf(format) => format.encode_message(schema, row),
         }
     }
 
@@ -1293,13 +1325,21 @@ impl PayloadFormat {
             Self::Csv(format) => {
                 format.encode_message_bounded_with_capacity(schema, row, limit, admit)
             }
+            Self::Protobuf(format) => {
+                format.encode_message_bounded_with_capacity(schema, row, limit, admit)
+            }
         }
     }
 
     /// Format identity for durable checkpoints: `None` for JSON (so existing
-    /// JSON checkpoints keep their identity), canonical CSV options otherwise.
+    /// JSON checkpoints keep their identity), the canonical CSV options or
+    /// protobuf descriptor + message + mapping + policy otherwise.
     pub fn identity_bytes(&self) -> Option<Vec<u8>> {
-        self.as_csv().map(CsvFormat::identity_bytes)
+        match self {
+            Self::Json => None,
+            Self::Csv(format) => Some(format.identity_bytes()),
+            Self::Protobuf(format) => Some(format.identity_bytes()),
+        }
     }
 
     /// Largest message payload this format may decode under `json`: the
@@ -1312,6 +1352,7 @@ impl PayloadFormat {
             Self::Csv(format) => json
                 .max_bytes
                 .min(format.limits.max_record_bytes.saturating_mul(2)),
+            Self::Protobuf(format) => json.max_bytes.min(format.limits().max_message_bytes),
         }
     }
 
@@ -1331,6 +1372,7 @@ impl PayloadFormat {
                 )
                 .saturating_add(4096),
             Self::Csv(format) => format.decode_scratch(schema, len),
+            Self::Protobuf(format) => format.decode_scratch(schema, len),
         }
     }
 
@@ -1350,6 +1392,27 @@ impl PayloadFormat {
                 )
                 .saturating_add(8192),
             Self::Csv(format) => format.encode_scratch(row),
+            Self::Protobuf(format) => format.encode_scratch(row),
+        }
+    }
+
+    /// Rows -> one document body (HTTP Sink): a JSON array, CSV records
+    /// (header first when set) or a length-delimited protobuf stream.
+    pub fn encode_document_bounded_with_capacity(
+        &self,
+        schema: &Schema,
+        rows: &[Row],
+        limit: usize,
+        admit: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<u8>> {
+        match self {
+            Self::Json => {
+                crate::json::encode_json_batch_bounded_with_capacity(schema, rows, limit, admit)
+            }
+            Self::Csv(format) => format.encode_rows_bounded_with_capacity(schema, rows, limit, admit),
+            Self::Protobuf(format) => {
+                format.encode_rows_bounded_with_capacity(schema, rows, limit, admit)
+            }
         }
     }
 }

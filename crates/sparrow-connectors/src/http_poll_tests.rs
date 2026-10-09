@@ -1341,3 +1341,105 @@ async fn csv_insufficient_decode_credit_skips_decode_and_refunds_all_credit() {
         (0, 0, 0, 0)
     );
 }
+
+fn protobuf_cfg(url: &str) -> HttpPollSourceConfig {
+    let mut c = cfg(url);
+    c.payload_format =
+        crate::protobuf_test_support::format(sparrow_formats::CsvRole::Decode, |_| {});
+    c
+}
+
+/// Length-delimited stream of `messages`.
+fn delimited(messages: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for message in messages {
+        assert!(message.len() < 128);
+        out.push(message.len() as u8);
+        out.extend_from_slice(message);
+    }
+    out
+}
+
+#[tokio::test]
+async fn protobuf_delimited_documents_drop_bad_messages_and_reject_bad_framing() {
+    use crate::protobuf_test_support::reading;
+    let server = Server::start(Arc::new(|i, _| match i {
+        // Two messages, one malformed (truncated string) in between.
+        0 => Reply::json(delimited(&[
+            reading("a", 1),
+            vec![0x0a, 0x09, b'x'],
+            reading("b", 2),
+        ])),
+        // Empty body: no rows, not an error.
+        1 => Reply::json(Vec::new()),
+        // A message, then a length prefix that runs past the body: the
+        // first row is kept, the response is a bad response.
+        2 => Reply::json([delimited(&[reading("c", 3)]), vec![0x20, 0x0a]].concat()),
+        _ => Reply::json(delimited(&[reading("d", i as i64)])),
+    }))
+    .await;
+    let mut run = start(protobuf_cfg(&server.url), None);
+    let rows = run.take(4).await;
+    assert_eq!(rows, vec![row("a", 1), row("b", 2), row("c", 3), row("d", 3)]);
+    let snap = run.diag.snapshot();
+    assert_eq!(snap.http_poll_dropped_bad, 1, "{snap:?}");
+    assert_eq!(snap.http_poll_bad_responses, 1, "{snap:?}");
+    assert_eq!(snap.protobuf_malformed, 2, "{snap:?}");
+    assert!(server.requests.lock().unwrap()[0]
+        .to_ascii_lowercase()
+        .contains("accept: application/x-protobuf"));
+    run.stop().await.unwrap();
+}
+
+#[test]
+fn protobuf_refuses_ndjson_framing_and_unmapped_schema() {
+    let url = "https://api.example:8443/v1";
+    let mut c = protobuf_cfg(url);
+    c.validate(&secrets(), &allow(url)).unwrap();
+    c.format = HttpPollFormat::Ndjson;
+    assert_eq!(
+        c.validate(&secrets(), &allow(url)).unwrap_err().code(),
+        ErrorCode::InvalidArgument
+    );
+    let mut c = protobuf_cfg(url);
+    c.schema = Schema::new(
+        SchemaId::new(1),
+        vec![Field::new(FieldId::new(1), "nope", DataType::Int64, true)],
+    )
+    .unwrap();
+    assert_eq!(
+        c.validate(&secrets(), &allow(url)).unwrap_err().code(),
+        ErrorCode::InvalidSchema
+    );
+}
+
+#[tokio::test]
+async fn protobuf_insufficient_decode_credit_skips_decode_and_refunds_all_credit() {
+    // A message that would fail the job if decoded (truncated).
+    let server = Server::start(Arc::new(|_, _| Reply::json(delimited(&[vec![0x0a, 0x09]]))))
+        .await;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let pressure = owner
+        .acquire(
+            CreditKind::Reservation,
+            owner.budget().reservation_bytes - 2048,
+        )
+        .unwrap();
+    let mut c = protobuf_cfg(&server.url);
+    c.fail_on_decode = true;
+    let run = start_with_owner(c, None, owner.clone());
+    until(Duration::from_secs(3), || {
+        run.diag.snapshot().http_poll_dropped_budget >= 2
+    })
+    .await;
+    let snap = run.diag.snapshot();
+    assert_eq!(
+        (snap.decode_errors, snap.protobuf_malformed, snap.http_poll_rows),
+        (0, 0, 0)
+    );
+    assert!(!run.task.is_finished(), "unfunded protobuf must not reach fail_on_decode");
+    run.stop().await.unwrap();
+    drop(pressure);
+    let usage = owner.usage();
+    assert_eq!((usage.reservation_bytes, usage.physical_bytes), (0, 0));
+}
