@@ -49,6 +49,8 @@ pub use pipeline_checkpoint::{sink_snapshot_version_for, snapshot_version_for, P
 #[cfg(test)]
 mod sink_checkpoint_tests;
 #[cfg(test)]
+mod csv_sink_checkpoint_tests;
+#[cfg(test)]
 mod alarm_tests;
 #[cfg(test)]
 mod core_a_tests;

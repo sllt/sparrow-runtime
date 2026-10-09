@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sparrow_formats::{encode_json_row, JsonLimits};
+use sparrow_formats::JsonLimits;
 use sparrow_model::{ErrorCode, InflightCounter, RestoreClaim, RowBatch};
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +36,8 @@ pub struct MqttSinkConfig {
     pub keepalive: Duration,
     pub outbox_capacity: usize,
     pub restore: RestoreClaim,
+    /// Message payload format (JSON default, or one CSV record).
+    pub payload_format: sparrow_formats::PayloadFormat,
 }
 
 impl MqttSinkConfig {
@@ -56,6 +58,7 @@ impl MqttSinkConfig {
             keepalive: Duration::from_secs(30),
             outbox_capacity: 32,
             restore: RestoreClaim::None,
+            payload_format: Default::default(),
         }
     }
 
@@ -165,8 +168,16 @@ impl MqttSink {
         let action=self.action.as_ref().expect("action");
         let prepared=(||->sparrow_model::Result<_>{
             if batch.output_sequence().is_some(){return Err(sparrow_model::SparrowError::new(ErrorCode::UnsupportedRestore,"MQTT action has no reliable receipt"));}
-            let mut lease=batch.lease().owner().acquire(sparrow_model::CreditKind::Reservation,8192)?;
-            let body=action.encode(batch.schema(),std::slice::from_ref(row),false,JsonLimits::default().max_bytes,|cap|lease.grow_to(cap+8192))?;
+            // CSV: its encoder scratch, then every output growth, is charged
+            // before allocation; the message is bounded at 64KiB.
+            let scratch=self.config.payload_format.as_csv().map_or(8192,|csv|csv.encode_scratch(row).max(8192));
+            let mut lease=batch.lease().owner().acquire(sparrow_model::CreditKind::Reservation,scratch)?;
+            // CSV sinks accept only `action.topic` (validated); the body is the CSV message.
+            let body=match self.config.payload_format.as_csv() {
+                Some(csv)=>csv.encode_message_bounded_with_capacity(batch.schema(),row,JsonLimits::default().max_bytes,|cap|lease.grow_to(cap.saturating_add(scratch)))
+                    .inspect_err(|e|if e.code!=ErrorCode::ResourceExhausted {self.diag.csv_encode_error(&self.config.payload_format)})?,
+                None=>action.encode(batch.schema(),std::slice::from_ref(row),false,JsonLimits::default().max_bytes,|cap|lease.grow_to(cap+8192))?,
+            };
             let topic=if let Some(parts)=&action.topic {
                 // A variable occupies one topic level; only configured literals
                 // may introduce separators. No data-controlled wildcard routing.
@@ -317,13 +328,20 @@ impl MqttSink {
                                     continue;
                                 }
                                 let started=std::time::Instant::now();
-                                let encoded=encode_json_row(schema,row);
+                                // Encoder scratch and output are charged to the batch owner
+                                // before allocation and bounded by max_bytes; the lease
+                                // lives until this row's PUBLISH was written.
+                                let encoded=crate::scratch::encode_row_charged(batch.lease().owner(),&self.config.payload_format,schema,row,limits.max_bytes);
                                 self.diag.observation.record(Latency::Encode,started.elapsed());
-                                let body = match encoded {
-                                    Ok(b) if b.len() <= limits.max_bytes => b,
-                                    _ => {
+                                let (body, _encode_credit) = match encoded {
+                                    Ok(encoded) => encoded,
+                                    Err(rejected) => {
                                         all_encoded=false;
-                                        self.diag.observation.health(false,HealthState::Failed,"mqtt_sink_encode_failed",Some(ErrorCode::CodecViolation));
+                                        let code=if rejected==crate::scratch::EncodeRejected::Budget {ErrorCode::ResourceExhausted} else {
+                                            if rejected==crate::scratch::EncodeRejected::Bad {self.diag.csv_encode_error(&self.config.payload_format);}
+                                            ErrorCode::CodecViolation
+                                        };
+                                        self.diag.observation.health(false,HealthState::Failed,"mqtt_sink_encode_failed",Some(code));
                                         self.diag.mqtt_dropped_bad.fetch_add(1, Ordering::Relaxed);
                                         continue;
                                     }

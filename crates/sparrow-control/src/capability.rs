@@ -13,16 +13,26 @@ pub fn inventory() -> Value {
     } else {
         &[]
     };
-    // The in-process Local DataBus is always built (no SDK).
+    // The WebSocket client Source/Sink needs the `websocket` feature.
+    let websocket: &[&str] = if cfg!(feature = "websocket") {
+        &["websocket"]
+    } else {
+        &[]
+    };
+    // The in-process Local DataBus and the TCP client are always built.
     let sinks: Vec<&str> = ["http", "mqtt", "log", "databus", "influxdb"]
         .iter()
         .chain(nats)
         .chain(jetstream_sink)
+        .chain(websocket)
+        .chain(&["tcp"])
         .copied()
         .collect();
     let mut combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file", "databus"]
         .iter()
         .chain(nats)
+        .chain(websocket)
+        .chain(&["tcp"])
         .copied()
         .flat_map(|source| {
             sinks.clone().into_iter().map(move |sink| {
@@ -212,14 +222,15 @@ mod tests {
         // 5 live/file sources (mqtt, http_push, http_poll, file, databus) x 5 sinks
         // (http, mqtt, log, databus, influxdb), plus NATS Core as both a source and a sink
         // when the `nats` feature is built, plus the JetStream Sink (live matrix +
-        // one aligned File profile) with `jetstream`.
-        let expected = if cfg!(feature = "jetstream") {
-            6 * 7 + 1
-        } else if cfg!(feature = "nats") {
-            6 * 6
-        } else {
-            5 * 5
-        };
+        // one aligned File profile) with `jetstream`, plus WebSocket as both a
+        // source and a sink with `websocket`, plus TCP (always built) as both.
+        let (nats, jetstream, websocket) = (
+            usize::from(cfg!(feature = "nats")),
+            usize::from(cfg!(feature = "jetstream")),
+            usize::from(cfg!(feature = "websocket")),
+        );
+        let expected =
+            (5 + nats + websocket + 1) * (5 + nats + jetstream + websocket + 1) + jetstream;
         assert_eq!(value["combinations"].as_array().unwrap().len(), expected);
         assert!(value["combinations"]
             .as_array()
@@ -227,6 +238,10 @@ mod tests {
             .iter()
             .filter(|c| c["source"] == "nats"
                 || c["sink"] == "nats"
+                || c["source"] == "websocket"
+                || c["sink"] == "websocket"
+                || c["source"] == "tcp"
+                || c["sink"] == "tcp"
                 || c["source"] == "databus"
                 || c["sink"] == "databus"
                 || c["sink"] == "influxdb"

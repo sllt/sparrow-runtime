@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sparrow_formats::{decode_json_row, JsonLimits};
+use sparrow_formats::{JsonLimits, PayloadFormat};
 use sparrow_io::observed::Sender as ObservedSender;
 use sparrow_model::observation::{HealthState, Latency, OriginSpan};
 use sparrow_model::{
@@ -47,6 +47,8 @@ pub struct NatsSourceConfig {
     pub json_limits: JsonLimits,
     pub fail_on_decode: bool,
     pub restore: RestoreClaim,
+    /// Message payload format: one JSON object (default) or one CSV record.
+    pub payload_format: PayloadFormat,
 }
 
 impl NatsSourceConfig {
@@ -61,6 +63,7 @@ impl NatsSourceConfig {
             json_limits: JsonLimits::default(),
             fail_on_decode: false,
             restore: RestoreClaim::None,
+            payload_format: PayloadFormat::Json,
         }
     }
 
@@ -252,24 +255,15 @@ impl NatsSource {
         cancel: &CancellationToken,
         received_at: std::time::Instant,
     ) -> Result<bool> {
-        if payload.len() > self.config.json_limits.max_bytes {
+        let format = &self.config.payload_format;
+        if payload.len() > format.max_message_bytes(&self.config.json_limits) {
             self.diag
                 .nats_source_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
-        let estimate = payload
-            .len()
-            .saturating_mul(64)
-            .saturating_add(
-                self.config
-                    .schema
-                    .fields
-                    .len()
-                    .saturating_mul(std::mem::size_of::<sparrow_model::Scalar>())
-                    .saturating_mul(2),
-            )
-            .saturating_add(4096);
+        // Format-specific parser + Row working set, charged before decoding.
+        let estimate = format.decode_scratch(&self.config.schema, payload.len());
         let Ok(_scratch) = ingress.owner.acquire(CreditKind::Reservation, estimate) else {
             self.diag
                 .nats_source_dropped_budget
@@ -277,13 +271,19 @@ impl NatsSource {
             return Ok(true);
         };
         let started = std::time::Instant::now();
-        let decoded = decode_json_row(&self.config.schema, payload, &self.config.json_limits);
+        let decoded = self.config.payload_format.decode_row(
+            &self.config.schema,
+            payload,
+            &self.config.json_limits,
+            None,
+        );
         self.diag
             .observation
             .record(Latency::Decode, started.elapsed());
         let row = match decoded {
             Ok(row) => row,
             Err(e) => {
+                self.diag.csv_decode_error(&self.config.payload_format, &e);
                 self.diag
                     .nats_source_dropped_bad
                     .fetch_add(1, Ordering::Relaxed);

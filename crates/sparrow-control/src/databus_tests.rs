@@ -3,7 +3,9 @@
 //! HTTP), fan-out, overflow policies against a stalled consumer, and topic
 //! cleanup on stop/restart/revision change.
 
-use crate::{request_start, request_stop, PipelineSpec, Store, Supervisor};
+#[cfg(feature = "demo-io")]
+use crate::request_stop;
+use crate::{request_start, PipelineSpec, Store, Supervisor};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -101,6 +103,7 @@ fn capture(
     }
 }
 
+#[cfg(feature = "demo-io")]
 fn output(http: &sparrow_connectors::HttpCapture) -> Vec<Value> {
     http.bodies()
         .iter()
@@ -130,6 +133,7 @@ async fn converge_until(
     .unwrap_or_else(|_| panic!("deadline: {what}"));
 }
 
+#[cfg(feature = "demo-io")]
 fn subscribers(sup: &Supervisor, pattern: &str) -> usize {
     sup.databus()
         .snapshot()
@@ -141,6 +145,7 @@ fn subscribers(sup: &Supervisor, pattern: &str) -> usize {
 
 /// HTTP endpoint that accepts connections but never answers, so a sink
 /// pointed at it stalls and its pipeline stops draining the bus.
+#[cfg(feature = "demo-io")]
 async fn stalled_endpoint() -> (u16, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -465,6 +470,7 @@ fn databus_nonlegacy_graph_feedback_is_rejected_by_parse_bind_and_public_validat
 }
 
 #[test]
+#[cfg(feature = "demo-io")]
 fn databus_chains_two_pipelines_with_exact_counts_and_fan_out() {
     let kernel = Arc::new(crate::host_kernel().unwrap());
     kernel.block_on(async {
@@ -529,6 +535,7 @@ fn databus_chains_two_pipelines_with_exact_counts_and_fan_out() {
 }
 
 #[test]
+#[cfg(feature = "demo-io")]
 fn databus_overflow_policies_count_against_a_stalled_consumer() {
     for policy in ["drop_newest", "drop_oldest", "block"] {
         let kernel = Arc::new(crate::host_kernel().unwrap());
@@ -623,6 +630,7 @@ fn databus_overflow_policies_count_against_a_stalled_consumer() {
 }
 
 #[test]
+#[cfg(feature = "demo-io")]
 fn databus_stop_restart_and_revision_change_release_topics_and_reattach() {
     let kernel = Arc::new(crate::host_kernel().unwrap());
     kernel.block_on(async {
@@ -724,6 +732,7 @@ fn databus_sink_registration_failure_fails_the_job_closed() {
 }
 
 #[test]
+#[cfg(feature = "demo-io")]
 fn databus_graph_io_sources_are_budgeted_and_deliver() {
     let kernel = Arc::new(crate::host_kernel().unwrap());
     kernel.block_on(async {

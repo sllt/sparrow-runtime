@@ -138,6 +138,15 @@ async fn request_checkpoint(
         ));
     }
     let admission = control.begin(trigger)?;
+    request_checkpoint_with_admission(cmd, control, cancel, admission).await
+}
+
+async fn request_checkpoint_with_admission(
+    cmd: &tokio::sync::mpsc::Sender<AlignedCmd>,
+    control: &Arc<CheckpointControl>,
+    cancel: &CancellationToken,
+    admission: CheckpointAdmission,
+) -> Result<u64> {
     let deadline = admission.deadline;
     let (reply, wait) = tokio::sync::oneshot::channel();
     cmd.try_send(AlignedCmd::Checkpoint { reply, admission })
@@ -345,8 +354,9 @@ pub struct PipelineCheckpointInventory {
     pub storage_sample: &'static str,
     pub storage: sparrow_runtime::checkpoint::CheckpointInventory,
 }
-/// A JetStream Sink that could not confirm a row, or a DataBus Sink that
-/// could not attach, fails the job (fail closed).
+/// A JetStream Sink that could not confirm a row, a DataBus Sink that could
+/// not attach, or a WebSocket / TCP Sink out of reconnect attempts fails the job
+/// (fail closed).
 fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
     if diags.iter().any(|d| {
         d.jetstream_sink_fatal
@@ -378,6 +388,27 @@ fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
             "DataBus Sink could not register its publisher (runtime publisher limit); inspect databus_sink_fatal",
         ));
     }
+    if diags.iter().any(|d| {
+        d.websocket_sink_fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }) {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "WebSocket Sink exhausted its reconnect attempts; inspect sink health and websocket_sink_*",
+        )
+        .retryable(true));
+    }
+    if diags
+        .iter()
+        .any(|d| d.tcp_sink_fatal.load(std::sync::atomic::Ordering::Relaxed) > 0)
+    {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "TCP Sink exhausted its reconnect attempts; inspect sink health and tcp_sink_*",
+        )
+        .retryable(true));
+    }
     Ok(())
 }
 
@@ -386,6 +417,8 @@ fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
         "log" => "log",
         "mqtt" => "mqtt",
         "nats" => "nats",
+        "websocket" => "websocket",
+        "tcp" => "tcp",
         "jetstream" => "jetstream",
         "databus" => "databus",
         "influxdb" => "influxdb",
@@ -1372,7 +1405,10 @@ impl Supervisor {
             request=request.with_live_events(rx).with_live_out(tx_out);
             tx_plugin=Some(tx);
             (None,None)
-        } else if kind == "mqtt" || kind == "http_poll" || kind == "nats" || kind == "databus" {
+        } else if matches!(
+            kind,
+            "mqtt" | "http_poll" | "nats" | "databus" | "websocket" | "tcp"
+        ) {
             let (tx, rx) = observed::channel(inbox);
             diag.observe_source(&tx);
             request = request.with_budgeted_live_io(rx, tx_out);
@@ -1426,6 +1462,67 @@ impl Supervisor {
                             )
                             .await
                             .map_err(SparrowError::from);
+                        if r.is_err() {
+                            cancel_job.cancel();
+                        }
+                        r
+                    })
+                }
+                #[cfg(feature = "websocket")]
+                "websocket" => {
+                    let cfg = crate::validate::websocket_source_config(
+                        &spec.source,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source = sparrow_connectors::WebSocketSource::bind(
+                        cfg,
+                        &self.secrets,
+                        policy,
+                        Arc::clone(&diag),
+                    )?;
+                    let cancel_job = cancel.clone();
+                    let owner = job.memory_owner();
+                    let max_row_bytes = self.kernel.ingress_row_limit();
+                    self.kernel.handle().spawn(async move {
+                        let r = source
+                            .run_budgeted(
+                                tx_budgeted.expect("WebSocket ingress"),
+                                cancel_job.clone(),
+                                owner,
+                                max_row_bytes,
+                            )
+                            .await;
+                        if r.is_err() {
+                            cancel_job.cancel();
+                        }
+                        r
+                    })
+                }
+                "tcp" => {
+                    let cfg = crate::validate::tcp_source_config(
+                        &spec.source,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source =
+                        sparrow_connectors::TcpSource::bind(cfg, policy, Arc::clone(&diag))?;
+                    let cancel_job = cancel.clone();
+                    let owner = job.memory_owner();
+                    let max_row_bytes = self.kernel.ingress_row_limit();
+                    self.kernel.handle().spawn(async move {
+                        let r = source
+                            .run_budgeted(
+                                tx_budgeted.expect("TCP ingress"),
+                                cancel_job.clone(),
+                                owner,
+                                max_row_bytes,
+                            )
+                            .await;
                         if r.is_err() {
                             cancel_job.cancel();
                         }
@@ -1560,7 +1657,7 @@ impl Supervisor {
         };
         Ok(RunningJob {
             graph_ports: None,
-            source_kind: match kind {"mqtt"=>"mqtt","plugin"=>"plugin","http_poll"=>"http_poll","nats"=>"nats","databus"=>"databus",_=>"http_push"},
+            source_kind: match kind {"mqtt"=>"mqtt","plugin"=>"plugin","http_poll"=>"http_poll","nats"=>"nats","databus"=>"databus","websocket"=>"websocket","tcp"=>"tcp",_=>"http_push"},
             sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
             stable: false,
@@ -1599,6 +1696,7 @@ impl Supervisor {
         let mut cfg = FileReplayConfig::new(&path, schema.clone());
         cfg.contract = contract;
         cfg.fail_on_decode = fail_on_decode;
+        cfg.format = spec.source.payload_format()?;
         let src = self
             .store
             .run_blocking(move || {
@@ -1720,6 +1818,7 @@ impl Supervisor {
         cfg.recovery = RecoveryPolicy::Aligned;
         cfg.restore = spec.restore_claim()?;
         cfg.fail_on_decode = fail_on_decode;
+        cfg.format = spec.source.payload_format()?;
         // Aligned growing files default to AppendOnly (N5): EOF polls, no
         // terminal MAX watermark. Finite fixtures set source.file_contract=sealed.
         let contract = crate::validate::resolve_file_contract(spec, RecoveryPolicy::Aligned)?;
@@ -1897,7 +1996,7 @@ impl Supervisor {
             .with_aligned(AlignedJob {
                 restore: None,
                 pipeline: Some(PipelineRestore {
-                    // v27 independently verifies the saved full semantics at
+                    // v27/v28 independently verify the saved full semantics at
                     // Kernel admission, rather than comparing live to itself.
                     plan: if sink_identity.is_some() { saved_plan } else { layout.clone() },
                     generation:state_generation,restore:restore_freeze,iot:restore_iot,
@@ -1943,6 +2042,7 @@ impl Supervisor {
         let source_task = self.kernel.handle().spawn(async move {
             let _lifecycle=diag_src.observation.lifecycle(true);
             diag_src.observation.health(true,HealthState::Ready,"file_open",None);
+            source.set_diagnostics(diag_src.clone());
             let mut terminal_sent = false;
             let mut next_file_poll = None;
             // Independent polling is important: publishing a file batch may
@@ -2201,6 +2301,25 @@ impl Supervisor {
                 let log = LogSink::unbuffered(diag).with_action(spec.sink.action.clone());
                 self.kernel.handle().spawn(log.run(rx_out, cancel, outbox))
             }
+            #[cfg(feature = "websocket")]
+            "websocket" => {
+                let cfg = crate::validate::websocket_sink_config(&spec.sink)?;
+                cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                let sink = sparrow_connectors::WebSocketSink::bind(
+                    cfg,
+                    &self.secrets,
+                    policy,
+                    owner,
+                    diag,
+                )?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
+            "tcp" => {
+                let cfg = crate::validate::tcp_sink_config(&spec.sink)?;
+                cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                let sink = sparrow_connectors::TcpSink::bind(cfg, policy, owner, diag)?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
             #[cfg(feature = "nats")]
             "nats" => {
                 let cfg = crate::validate::nats_sink_config(&spec.sink)?;
@@ -2398,6 +2517,42 @@ impl Supervisor {
             }
         };
         request_checkpoint(&cmd, &control, &cancel, "manual").await
+    }
+
+    /// Exercise a real coordinator timeout without shortening the running
+    /// attempt's policy (including its subsequent checkpoint requests).
+    #[cfg(all(test, feature = "demo-io"))]
+    pub(crate) async fn checkpoint_named_with_timeout_for_test(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<u64> {
+        let (cmd, control, cancel) = {
+            let jobs = self.running.lock().await;
+            match jobs.get(name).map(|job| &job.kind) {
+                Some(RunningKind::Aligned {
+                    cmd,
+                    checkpoint,
+                    cancel,
+                    ..
+                }) => (cmd.clone(), checkpoint.clone(), cancel.clone()),
+                _ => {
+                    return Err(SparrowError::new(
+                        sparrow_model::ErrorCode::InvalidArgument,
+                        format!("pipeline `{name}` is not a running aligned job"),
+                    ));
+                }
+            }
+        };
+        if cancel.is_cancelled() {
+            return Err(SparrowError::new(
+                sparrow_model::ErrorCode::Cancelled,
+                "job stopping",
+            ));
+        }
+        let mut admission = control.begin("manual")?;
+        admission.deadline = tokio::time::Instant::now() + timeout;
+        request_checkpoint_with_admission(&cmd, &control, &cancel, admission).await
     }
 
     pub async fn kill_named(self: &Arc<Self>, name: &str) -> Result<()> {

@@ -10,6 +10,7 @@ default = ["demo-io"]
 demo-io = ["sparrow-connectors/demo-io"]
 nats = ["sparrow-connectors/nats"]
 jetstream = ["nats", "sparrow-connectors/jetstream"]
+websocket = ["sparrow-connectors/websocket"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }
@@ -35,3 +36,4 @@ sparrow-testkit = { path = "../sparrow-testkit", features = ["jetstream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }

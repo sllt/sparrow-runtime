@@ -28,9 +28,8 @@ use async_nats::jetstream::stream::{
 };
 use async_nats::jetstream::{Context, ContextBuilder, ErrorCode as JsErrorCode};
 use futures_util::stream::{self, StreamExt};
-use sparrow_formats::encode_json_batch_bounded;
 use sparrow_io::observed::Receiver as ObservedReceiver;
-use sparrow_io::{OwnedSinkIdentity, SinkIdentity};
+use sparrow_io::{CsvEncodeIdentity, OwnedSinkIdentity, SinkIdentity};
 use sparrow_model::observation::{HealthState, Latency};
 use sparrow_model::{
     CreditKind, ErrorCode, InflightCounter, MemoryLease, MemoryOwner, Result, Row, RowBatch,
@@ -81,6 +80,8 @@ pub struct JetStreamSinkConfig {
     pub flush_timeout: Duration,
     /// Output column (utf8 or integer) used as `Nats-Msg-Id`.
     pub msg_id_column: Option<String>,
+    /// Message payload format: one JSON object (default) or one CSV record.
+    pub payload_format: sparrow_formats::PayloadFormat,
 }
 
 impl JetStreamSinkConfig {
@@ -105,6 +106,7 @@ impl JetStreamSinkConfig {
             max_retries: DEFAULT_RETRIES,
             flush_timeout: Duration::from_secs(5),
             msg_id_column: None,
+            payload_format: sparrow_formats::PayloadFormat::Json,
         }
     }
 
@@ -232,7 +234,7 @@ struct PreparedTarget {
     _config_credit: MemoryLease,
 }
 
-/// The v27 sink has already connected and captured its exact target before
+/// The v27/v28 sink has already connected and captured its exact target before
 /// the controller opens/seeks/activates the replay source. No second session
 /// or independently owned budget is created by `run`.
 pub struct PreparedJetStreamSink {
@@ -652,6 +654,20 @@ impl JetStreamSink {
             &self.config.subject,
             self.config.msg_id_column.as_deref(),
         )?;
+        // The compiled format has already validated single-byte delimiter /
+        // quote and encode-only options. Bind effective values, not whether a
+        // default happened to be written explicitly in the stored spec.
+        let identity = if let Some(csv) = self.config.payload_format.as_csv() {
+            let options = csv.options();
+            identity.with_csv(CsvEncodeIdentity::new(
+                options.delimiter.as_bytes()[0],
+                options.quote.as_bytes()[0],
+                csv.header(),
+                &options.null_value,
+            )?)?
+        } else {
+            identity
+        };
         let identity = OwnedSinkIdentity::new(identity, &self.owner)?;
         Ok(PreparedTarget {
             identity,
@@ -782,11 +798,16 @@ impl JetStreamSink {
                     .saturating_add(32),
             )
         });
-        let scratch_bytes = row
-            .resident_bytes()
-            .saturating_mul(8)
-            .saturating_add(names.saturating_mul(4))
-            .saturating_add(ENCODE_SCRATCH_OVERHEAD);
+        let format = &self.config.payload_format;
+        let scratch_bytes = match format.as_csv() {
+            // CSV keeps no serde tree for flat cells (see its estimator).
+            Some(csv) => csv.encode_scratch(row),
+            None => row
+                .resident_bytes()
+                .saturating_mul(8)
+                .saturating_add(names.saturating_mul(4))
+                .saturating_add(ENCODE_SCRATCH_OVERHEAD),
+        };
         let _scratch = self.owner.acquire(CreditKind::Reservation, scratch_bytes)?;
         let id = self.msg_id(row, index)?;
         let headers = self.publish_headers(id.as_deref());
@@ -806,14 +827,10 @@ impl JetStreamSink {
                     })
                 });
         let body_limit = limit.saturating_sub(header_bytes);
-        // The existing writer checks the bound before buffer growth, including
-        // JSON escaping. Strip the one-row array with a zero-copy Bytes slice;
-        // its two framing bytes remain covered by RETAINED_OVERHEAD.
-        let encoded = encode_json_batch_bounded(
-            schema,
-            std::slice::from_ref(row),
-            body_limit.saturating_add(2),
-        );
+        // The writer checks the bound before buffer growth, including JSON
+        // escaping / CSV quoting. JSON's one-row array envelope is removed in
+        // place; its two spare bytes remain covered by RETAINED_OVERHEAD.
+        let encoded = format.encode_row_bounded_with_capacity(schema, row, body_limit, |_| Ok(()));
         self.diag
             .observation
             .record(Latency::Encode, started.elapsed());
@@ -827,14 +844,14 @@ impl JetStreamSink {
                     "encoded row and headers exceed max_payload_bytes / server max_payload",
                 )
             } else {
+                self.diag.csv_encode_error(format);
                 self.diag
                     .jetstream_sink_dropped_bad
                     .fetch_add(1, Ordering::Relaxed);
                 e
             }
         })?;
-        let end = body.len() - 1;
-        Ok((bytes::Bytes::from(body).slice(1..end), id))
+        Ok((bytes::Bytes::from(body), id))
     }
 
     /// Publish every row of `batch` with bounded in-flight PubAcks. The

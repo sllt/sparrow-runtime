@@ -1,6 +1,5 @@
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Once;
 use std::time::Duration;
 
 use rustls::pki_types::ServerName;
@@ -12,14 +11,8 @@ use tokio_rustls::TlsConnector;
 
 use super::codec::{decode, decode_remaining_length, encode, Packet, MAX_PACKET_BYTES};
 use crate::error::{ConnectorError, Result};
+use crate::net::install_rustls_provider;
 use crate::tls::TlsConfig;
-
-fn install_rustls_provider() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
 
 pub type MqttStream = Pin<Box<dyn MqttIo>>;
 

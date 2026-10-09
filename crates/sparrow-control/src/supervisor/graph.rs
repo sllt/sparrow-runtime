@@ -41,6 +41,15 @@ enum Input {
         source: HttpPollSource,
         tx: observed::Sender<sparrow_model::QueuedRow>,
     },
+    #[cfg(feature = "websocket")]
+    WebSocket {
+        source: sparrow_connectors::WebSocketSource,
+        tx: observed::Sender<sparrow_model::QueuedRow>,
+    },
+    Tcp {
+        source: sparrow_connectors::TcpSource,
+        tx: observed::Sender<sparrow_model::QueuedRow>,
+    },
     #[cfg(feature = "nats")]
     Nats {
         source: sparrow_connectors::NatsSource,
@@ -367,6 +376,7 @@ impl Supervisor {
                     config.contract = contract;
                     config.fail_on_decode = spec.effective_fail_on_decode();
                     config.recovery = RecoveryPolicy::parse(&spec.recovery)?;
+                    config.format = source_spec.payload_format()?;
                     let position = restored_positions.remove(id);
                     let source = self
                         .store
@@ -439,6 +449,40 @@ impl Supervisor {
                     diag.observe_source(&tx);
                     binding.budgeted = Some(rx);
                     Input::HttpPoll { source, tx }
+                }
+                #[cfg(feature = "websocket")]
+                "websocket" => {
+                    let cfg = crate::validate::websocket_source_config(
+                        source_spec,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source = sparrow_connectors::WebSocketSource::bind(
+                        cfg,
+                        &self.secrets,
+                        policy,
+                        diag.clone(),
+                    )?;
+                    let (tx, rx) = observed::channel(source_spec.inbox_capacity);
+                    diag.observe_source(&tx);
+                    binding.budgeted = Some(rx);
+                    Input::WebSocket { source, tx }
+                }
+                "tcp" => {
+                    let cfg = crate::validate::tcp_source_config(
+                        source_spec,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source = sparrow_connectors::TcpSource::bind(cfg, policy, diag.clone())?;
+                    let (tx, rx) = observed::channel(source_spec.inbox_capacity);
+                    diag.observe_source(&tx);
+                    binding.budgeted = Some(rx);
+                    Input::Tcp { source, tx }
                 }
                 #[cfg(feature = "nats")]
                 "nats" => {
@@ -614,6 +658,17 @@ impl Supervisor {
                             .run_budgeted(tx, child.clone(), owner, max_row_bytes)
                             .await
                             .map_err(SparrowError::from),
+                        #[cfg(feature = "websocket")]
+                        Input::WebSocket { source, tx } => {
+                            source
+                                .run_budgeted(tx, child.clone(), owner, max_row_bytes)
+                                .await
+                        }
+                        Input::Tcp { source, tx } => {
+                            source
+                                .run_budgeted(tx, child.clone(), owner, max_row_bytes)
+                                .await
+                        }
                         #[cfg(feature = "nats")]
                         Input::Nats { source, tx } => {
                             source
@@ -745,6 +800,7 @@ async fn file_actor(
     let _lifecycle = diag.observation.lifecycle(true);
     diag.observation
         .health(true, HealthState::Ready, "file_open", None);
+    source.set_diagnostics(diag.clone());
     let mut terminal = false;
     let mut next_poll = None;
     loop {

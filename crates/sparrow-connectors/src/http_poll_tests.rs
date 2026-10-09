@@ -1213,3 +1213,131 @@ async fn fail_on_decode_fails_the_source_instead_of_dropping() {
     assert_eq!(err.code(), ErrorCode::CodecViolation);
     assert_eq!(run.diag.snapshot().http_poll_bad_responses, 1);
 }
+
+fn csv_cfg(url: &str, options: sparrow_formats::CsvOptions) -> HttpPollSourceConfig {
+    let mut c = cfg(url);
+    c.payload_format =
+        PayloadFormat::csv(options.compile(sparrow_formats::CsvRole::Decode).unwrap());
+    c
+}
+
+#[tokio::test]
+async fn csv_documents_map_headers_drop_bad_records_and_reject_bad_headers() {
+    let server = Server::start(Arc::new(|i, _| match i {
+        // BOM, CRLF, reordered header, quoted delimiter, a bad record.
+        0 => Reply::json("\u{feff}v,device_id\r\n1,\"a,b\"\r\nnope,x\r\n2,c\r\n"),
+        // Empty body: no rows, not an error.
+        1 => Reply::json(""),
+        // A header missing a column rejects the whole response.
+        2 => Reply::json("device_id\nz\n"),
+        _ => Reply::json(format!("device_id,v\nd,{i}\n")),
+    }))
+    .await;
+    let mut run = start(csv_cfg(&server.url, Default::default()), None);
+    let rows = run.take(3).await;
+    assert_eq!(rows, vec![row("a,b", 1), row("c", 2), row("d", 3)]);
+    let snap = run.diag.snapshot();
+    assert_eq!(snap.http_poll_dropped_bad, 1, "{snap:?}");
+    assert_eq!(snap.csv_type_errors, 1);
+    assert_eq!(snap.csv_header_errors, 1);
+    assert_eq!(snap.http_poll_bad_responses, 1);
+    assert!(server.requests.lock().unwrap()[0]
+        .to_ascii_lowercase()
+        .contains("accept: text/csv"));
+    run.stop().await.unwrap();
+
+    // Headerless with explicit columns and a custom delimiter.
+    let server = Server::start(Arc::new(|_, _| Reply::json("q|7\n"))).await;
+    let options = sparrow_formats::CsvOptions {
+        header: false,
+        delimiter: "|".into(),
+        columns: Some(vec!["device_id".into(), "v".into()]),
+        ..Default::default()
+    };
+    let mut run = start(csv_cfg(&server.url, options), None);
+    assert_eq!(run.take(1).await, vec![row("q", 7)]);
+    run.stop().await.unwrap();
+
+    // fail_on_decode: a bad record or header fails the source.
+    for body in ["device_id,v\nd,bad\n", "x,y\n1,2\n"] {
+        let server = Server::start(Arc::new(move |_, _| Reply::json(body))).await;
+        let mut c = csv_cfg(&server.url, Default::default());
+        c.fail_on_decode = true;
+        let run = start(c, None);
+        let result = tokio::time::timeout(Duration::from_secs(3), run.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err(), "{body}");
+    }
+}
+
+#[test]
+fn csv_refuses_ndjson_framing_and_unfit_schema() {
+    let url = "https://api.example:8443/v1";
+    let mut c = csv_cfg(url, Default::default());
+    c.validate(&secrets(), &allow(url)).unwrap();
+    c.format = HttpPollFormat::Ndjson;
+    assert_eq!(
+        c.validate(&secrets(), &allow(url)).unwrap_err().code(),
+        ErrorCode::InvalidArgument
+    );
+    let mut c = csv_cfg(url, Default::default());
+    c.schema = Schema::new(
+        SchemaId::new(1),
+        vec![Field::new(FieldId::new(1), "v", DataType::Int64, true)],
+    )
+    .unwrap();
+    assert!(c.validate(&secrets(), &allow(url)).is_err());
+}
+
+#[tokio::test]
+async fn csv_insufficient_decode_credit_skips_decode_and_refunds_all_credit() {
+    // A valid CSV document whose record would fail the job if decoded.
+    let server = Server::start(Arc::new(|_, _| {
+        Reply::json("device_id,v\nunbilled,invalid\n")
+    }))
+    .await;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let pressure = owner
+        .acquire(
+            CreditKind::Reservation,
+            owner.budget().reservation_bytes - 2048,
+        )
+        .unwrap();
+    let mut c = csv_cfg(&server.url, Default::default());
+    c.fail_on_decode = true;
+    let mut run = start_with_owner(c, None, owner.clone());
+    until(Duration::from_secs(3), || {
+        run.diag.snapshot().http_poll_dropped_budget >= 2
+    })
+    .await;
+    let snap = run.diag.snapshot();
+    assert_eq!(
+        (
+            snap.decode_errors,
+            snap.http_poll_dropped_bad,
+            snap.csv_type_errors,
+            snap.http_poll_rows,
+            snap.http_poll_ok
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    assert!(
+        !run.task.is_finished(),
+        "unfunded CSV must not reach fail_on_decode"
+    );
+    assert!(run.rx.try_recv().is_err());
+    run.stop().await.unwrap();
+    drop(pressure);
+    let usage = owner.usage();
+    assert_eq!(
+        (
+            usage.reservation_bytes,
+            usage.queue_bytes,
+            usage.physical_bytes,
+            usage.live_handles
+        ),
+        (0, 0, 0, 0)
+    );
+}

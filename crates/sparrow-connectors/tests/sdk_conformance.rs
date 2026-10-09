@@ -68,6 +68,7 @@ fn file_source_declares_replayable_and_seeks() {
         recovery: RecoveryPolicy::Aligned,
         contract: FileContract::Immutable,
         fail_on_decode: false,
+        format: Default::default(),
     };
     cfg.validate().unwrap();
     let mut src = FileReplaySource::open(&cfg).unwrap();

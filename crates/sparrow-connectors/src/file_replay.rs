@@ -1,6 +1,6 @@
 //! File / replay test Source for V1 aligned recovery.
 //!
-//! NDJSON, message-boundary cuts, identity + rotation checks.
+//! NDJSON (default) or CSV, message-boundary cuts, identity + rotation checks.
 //! Declares `replay=replayable`. This is the only V1 source that may
 //! participate in production aligned checkpoint restore.
 
@@ -8,7 +8,9 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use sparrow_formats::JsonCodec;
+use std::sync::Arc;
+
+use sparrow_formats::{CsvFormat, CsvFramer, CsvMapping, JsonCodec, PayloadFormat};
 use sparrow_io::{
     fnv1a64, RecordSource, ReplayCapabilities, ReplayableSource, SourceIdentity, SourcePosition,
 };
@@ -18,11 +20,13 @@ use sparrow_model::{
 };
 
 use crate::capabilities::ConnectorCapabilities;
+use crate::diag::IoDiagnostics;
 use crate::error::{ConnectorError, Result};
 
 const PREFIX: usize = 4096;
 const MAX_RECORD: usize = 64 * 1024;
 const MAX_PENDING: usize = MAX_RECORD;
+const CSV_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 #[path = "file_feed.rs"]
 mod feed;
@@ -102,6 +106,8 @@ pub struct FileReplayConfig {
     pub contract: FileContract,
     /// P1-17: decode errors fail the source (and the job) instead of only counting.
     pub fail_on_decode: bool,
+    /// Record format: NDJSON (default) or CSV (see `docs/FORMATS.md`).
+    pub format: PayloadFormat,
 }
 
 impl FileReplayConfig {
@@ -113,6 +119,7 @@ impl FileReplayConfig {
             recovery: RecoveryPolicy::RestartFresh,
             contract: FileContract::Immutable,
             fail_on_decode: false,
+            format: PayloadFormat::Json,
         }
     }
 
@@ -124,8 +131,23 @@ impl FileReplayConfig {
         check_recovery_capabilities("file", true, self.recovery, &self.restore)
             .map_err(|e| ConnectorError::new(e.code, e.to_string()))?;
         crate::policy::check_data_path(&self.path)?;
+        if let Some(csv) = self.format.as_csv() {
+            csv.check_schema(&self.schema)
+                .map_err(|e| ConnectorError::new(e.code, e.message))?;
+        }
         Ok(())
     }
+}
+
+/// CSV reading state. The header is the first non-blank record of the file;
+/// it is consumed (never returned as a row) and rebuilt from the file start
+/// on a seek past it. With `multiline`, the framer's quote state spans reads,
+/// so offsets advance only at record ends and a cut never lands mid-record.
+struct CsvRead {
+    format: Arc<CsvFormat>,
+    framer: CsvFramer,
+    /// `None` until the header record was read (`header=true` only).
+    mapping: Option<CsvMapping>,
 }
 
 /// Bounded NDJSON file source. Offsets are message boundaries (`\n`).
@@ -140,6 +162,11 @@ pub struct FileReplaySource {
     discarding: bool,
     codec: JsonCodec,
     contract: FileContract,
+    csv: Option<CsvRead>,
+    diag: Option<Arc<IoDiagnostics>>,
+    /// Payload format identity mixed into the checkpoint fingerprint
+    /// (`None` for NDJSON, so JSON identities are unchanged).
+    format_identity: Option<Vec<u8>>,
 }
 
 impl FileReplaySource {
@@ -177,7 +204,25 @@ impl FileReplaySource {
                 format!("rewind {}: {e}", path.display()),
             )
         })?;
+        let format_identity = cfg.format.identity_bytes();
+        let fingerprint = bind_format(fingerprint, format_identity.as_deref());
         let identity = SourceIdentity::file(path.to_string_lossy().into_owned(), size, fingerprint);
+        let csv = match cfg.format.as_csv() {
+            Some(format) => Some(CsvRead {
+                framer: format.framer(),
+                mapping: if format.header() {
+                    None
+                } else {
+                    Some(
+                        format
+                            .positional_mapping(&cfg.schema)
+                            .map_err(|e| ConnectorError::new(e.code, e.message))?,
+                    )
+                },
+                format: Arc::new(format.clone()),
+            }),
+            None => None,
+        };
         Ok(Self {
             path,
             identity,
@@ -189,7 +234,21 @@ impl FileReplaySource {
             discarding: false,
             codec: JsonCodec::new(cfg.schema.clone()).with_fail_on_decode(cfg.fail_on_decode),
             contract: cfg.contract,
+            csv,
+            diag: None,
+            format_identity,
         })
+    }
+
+    /// Classify CSV record faults into these diagnostics (`csv_*` counters).
+    pub fn set_diagnostics(&mut self, diag: Arc<IoDiagnostics>) {
+        self.diag = Some(diag);
+    }
+
+    fn csv_fault(&self, error: &SparrowError) {
+        if let (Some(diag), Some(csv)) = (&self.diag, &self.csv) {
+            diag.csv_decode_error(&PayloadFormat::Csv(csv.format.clone()), error);
+        }
     }
 
     pub fn identity(&self) -> &SourceIdentity {
@@ -239,7 +298,10 @@ impl FileReplaySource {
         } else {
             meta.len()
         };
-        let fingerprint = content_fingerprint(&mut probe, size).map_err(io)?;
+        let fingerprint = bind_format(
+            content_fingerprint(&mut probe, size).map_err(io)?,
+            self.format_identity.as_deref(),
+        );
         Ok(SourcePosition {
             offset_bytes: self.offset,
             record_index: self.record_index,
@@ -252,7 +314,25 @@ impl FileReplaySource {
     }
 
     pub fn decode_frame(&self, frame: &SourceFrame) -> ModelResult<Option<Row>> {
-        self.codec.decode_frame(frame)
+        let Some(csv) = &self.csv else {
+            return self.codec.decode_frame(frame);
+        };
+        let mapping = csv.mapping.as_ref().ok_or_else(|| {
+            SparrowError::new(ErrorCode::Internal, "CSV record before its header")
+        })?;
+        match csv
+            .format
+            .decode_record(&self.codec.schema, mapping, &frame.payload, None)
+        {
+            Ok(row) => Ok(Some(row)),
+            Err(e) => {
+                self.csv_fault(&e);
+                match self.codec.policy {
+                    sparrow_formats::BadRecordPolicy::Drop => Ok(None),
+                    sparrow_formats::BadRecordPolicy::FailJob => Err(e),
+                }
+            }
+        }
     }
 
     /// One bounded scan for the serialized time profile. Decoder expansion is
@@ -268,10 +348,13 @@ impl FileReplaySource {
         row_limit:usize)->ModelResult<(Option<sparrow_model::RowBatch>,bool)> {
         match self.read_frame(2*MAX_RECORD)? {
             FramePoll::Frame(frame)=>{
-                let estimate=frame.payload.len().saturating_mul(64)
-                    .saturating_add(schema.fields.len()*std::mem::size_of::<sparrow_model::Scalar>()*2).saturating_add(4096);
+                // Format-specific: the CSV estimator for CSV records.
+                let estimate=match &self.csv {
+                    Some(csv)=>csv.format.decode_scratch(&schema,frame.payload.len()),
+                    None=>PayloadFormat::Json.decode_scratch(&schema,frame.payload.len()),
+                };
                 let _scratch=owner.acquire(sparrow_model::CreditKind::Reservation,estimate)?;
-                let row=self.codec.decode_frame(&frame)?.ok_or_else(||SparrowError::new(ErrorCode::CodecViolation,"File row decode failed"))?;
+                let row=self.decode_frame(&frame)?.ok_or_else(||SparrowError::new(ErrorCode::CodecViolation,"File row decode failed"))?;
                 let resident=row.resident_bytes();
                 let mut builder=sparrow_model::RowBatchBuilder::new(schema,owner,sparrow_model::CreditKind::Reservation,1,row_limit)?;
                 builder.push_accounted(row,resident)?;Ok((Some(builder.finish()?),false))
@@ -291,7 +374,10 @@ impl FileReplaySource {
             },
             Ok(FramePoll::Eof) => Ok(FilePoll::Eof),
             Ok(FramePoll::Pending) => Ok(FilePoll::Pending),
-            Err(e) if e.code == ErrorCode::MaxRecordSize => Ok(FilePoll::DecodeError),
+            Err(e) if e.code == ErrorCode::MaxRecordSize => {
+                self.csv_fault(&e);
+                Ok(FilePoll::DecodeError)
+            }
             Err(e) => Err(e),
         }
     }
@@ -350,6 +436,7 @@ impl FileReplaySource {
         let fingerprint = content_fingerprint(&mut f, size).map_err(|e| {
             ConnectorError::new(ErrorCode::UnsupportedRestore, format!("fingerprint: {e}"))
         })?;
+        let fingerprint = bind_format(fingerprint, self.format_identity.as_deref());
         Ok(SourceIdentity::file(
             self.path.to_string_lossy().into_owned(),
             size,
@@ -371,7 +458,7 @@ impl FileReplaySource {
                     return Err(ConnectorError::new(
                         ErrorCode::UnsupportedRestore,
                         format!(
-                            "file '{}' was replaced or rotated ({} contract)",
+                            "file '{}' was replaced or rotated, or its payload format / CSV options changed ({} contract)",
                             self.path.display(),
                             self.contract.as_str()
                         ),
@@ -399,11 +486,12 @@ impl FileReplaySource {
                         format!("cut fingerprint: {e}"),
                     )
                 })?;
+                let cut_fp = bind_format(cut_fp, self.format_identity.as_deref());
                 if cut_fp != stored.fingerprint {
                     return Err(ConnectorError::new(
                         ErrorCode::UnsupportedRestore,
                         format!(
-                            "file '{}' prefix before cut changed (append contract)",
+                            "file '{}' prefix before cut changed, or its payload format / CSV options changed (append contract)",
                             self.path.display()
                         ),
                     ));
@@ -411,6 +499,20 @@ impl FileReplaySource {
             }
         }
         Ok(())
+    }
+}
+
+/// Checkpoint fingerprint = content fingerprint, mixed with the canonical
+/// CSV options when the file is read as CSV. A cut taken as NDJSON, or under
+/// other CSV options, therefore never matches and restore is refused.
+fn bind_format(content: u64, format: Option<&[u8]>) -> u64 {
+    match format {
+        None => content,
+        Some(format) => {
+            let mut mix = content.to_le_bytes().to_vec();
+            mix.extend_from_slice(format);
+            fnv1a64(&mix)
+        }
     }
 }
 
@@ -440,25 +542,133 @@ impl FileReplaySource {
     // Complete a record before reporting an oversize decode error. A cut while
     // discarding stays at the previous boundary; restore safely replays it.
     fn finish_record(&mut self) -> ModelResult<Option<SourceFrame>> {
+        let start = self.offset;
         self.offset += self.record_bytes;
         self.record_index += 1;
         self.record_bytes = 0;
+        if let Some(csv) = &mut self.csv {
+            csv.framer.reset();
+        }
         if std::mem::take(&mut self.discarding) {
+            if self.csv.as_ref().is_some_and(|csv| csv.mapping.is_none()) {
+                let e = SparrowError::new(
+                    ErrorCode::InvalidSchema,
+                    format!("CSV header exceeds {MAX_RECORD}B"),
+                );
+                self.csv_fault(&e);
+                return Err(e);
+            }
             return Err(SparrowError::new(
                 ErrorCode::MaxRecordSize,
                 format!("record exceeds {MAX_RECORD}B; skipped to next boundary"),
             ));
         }
-        if self.pending.last() == Some(&b'\n') {
-            self.pending.pop();
+        if self.csv.is_some() {
+            let len = sparrow_formats::csv::strip_terminator(&self.pending).len();
+            self.pending.truncate(len);
+        } else {
+            // Preserve the established NDJSON framing contract.
+            if self.pending.last() == Some(&b'\n') {
+                self.pending.pop();
+            }
+            if self.pending.last() == Some(&b'\r') {
+                self.pending.pop();
+            }
         }
-        if self.pending.last() == Some(&b'\r') {
-            self.pending.pop();
+        if start == 0 && self.csv.is_some() && self.pending.starts_with(CSV_BOM) {
+            self.pending.drain(..CSV_BOM.len());
         }
         if self.pending.is_empty() {
             return Ok(None);
         }
+        if let Some(csv) = self.csv.as_mut().filter(|csv| csv.mapping.is_none()) {
+            // The first non-blank record is the header: consumed, never a row.
+            // A bad header fails the source whatever `fail_on_decode` says.
+            match csv.format.header_mapping(&self.codec.schema, &self.pending) {
+                Ok(mapping) => csv.mapping = Some(mapping),
+                Err(e) => {
+                    self.csv_fault(&e);
+                    return Err(e);
+                }
+            }
+            self.pending.clear();
+            return Ok(None);
+        }
         Ok(Some(SourceFrame::new(std::mem::take(&mut self.pending), 0)))
+    }
+
+    /// Header mapping valid at a resume `offset`, read from the file start.
+    /// With `multiline` the whole prefix is framed again so an offset inside
+    /// a quoted line break is rejected like any other mid-record cut.
+    fn csv_resume(&self, offset: u64, size: u64) -> ModelResult<Option<CsvMapping>> {
+        let Some(csv) = &self.csv else {
+            return Ok(None);
+        };
+        let multiline = csv.format.options().multiline;
+        if !csv.format.header() && !multiline {
+            return Ok(csv.mapping.clone());
+        }
+        let io = |e: std::io::Error| {
+            SparrowError::new(ErrorCode::Internal, format!("CSV resume probe: {e}"))
+        };
+        let mut file = BufReader::with_capacity(16 * 1024, File::open(&self.path).map_err(io)?);
+        let mut framer = csv.format.framer();
+        let mut mapping = if csv.format.header() {
+            None
+        } else {
+            csv.mapping.clone()
+        };
+        let (mut pos, mut record_start, mut boundary) = (0u64, 0u64, true);
+        let mut record = Vec::new();
+        while pos < offset {
+            let chunk = file.fill_buf().map_err(io)?;
+            if chunk.is_empty() {
+                break;
+            }
+            let left = usize::try_from(offset - pos).unwrap_or(usize::MAX);
+            let chunk = &chunk[..chunk.len().min(left)];
+            let end = framer.find_terminator(chunk);
+            let take = end.map_or(chunk.len(), |i| i + 1);
+            if mapping.is_none() {
+                if record.len() + take > MAX_PENDING + 2 {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidSchema,
+                        format!("CSV header exceeds {MAX_RECORD}B"),
+                    ));
+                }
+                record.extend_from_slice(&chunk[..take]);
+            }
+            file.consume(take);
+            pos += take as u64;
+            boundary = end.is_some();
+            if boundary {
+                framer.reset();
+                if mapping.is_none() {
+                    let bytes = sparrow_formats::csv::strip_terminator(&record);
+                    let bytes = match record_start {
+                        0 => bytes.strip_prefix(CSV_BOM).unwrap_or(bytes),
+                        _ => bytes,
+                    };
+                    if !bytes.is_empty() {
+                        mapping = Some(csv.format.header_mapping(&self.codec.schema, bytes)?);
+                        if !multiline {
+                            return Ok(mapping);
+                        }
+                    }
+                    record.clear();
+                    record_start = pos;
+                }
+            }
+        }
+        if !boundary && !(self.contract.eof_is_terminal() && offset == size) {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "seek offset {offset} is inside a quoted CSV record (mid-record cut rejected)"
+                ),
+            ));
+        }
+        Ok(mapping)
     }
 
     fn read_frame(&mut self, mut scan_budget: usize) -> ModelResult<FramePoll> {
@@ -481,7 +691,12 @@ impl FileReplaySource {
                     .map_or(FramePoll::Eof, FramePoll::Frame));
             }
             let available = &available[..available.len().min(scan_budget)];
-            let newline = available.iter().position(|&b| b == b'\n');
+            // CSV keeps quote parity across reads (multiline), even while
+            // discarding an oversize record, so framing never desynchronizes.
+            let newline = match &mut self.csv {
+                Some(csv) => csv.framer.find_terminator(available),
+                None => available.iter().position(|&b| b == b'\n'),
+            };
             let take = newline.map_or(available.len(), |i| i + 1);
             let payload_len = self
                 .pending
@@ -570,6 +785,7 @@ impl ReplayableSource for FileReplaySource {
                 ));
             }
         }
+        let mapping = self.csv_resume(pos.offset_bytes, live.size)?;
         self.file
             .seek(SeekFrom::Start(pos.offset_bytes))
             .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("seek: {e}")))?;
@@ -578,6 +794,10 @@ impl ReplayableSource for FileReplaySource {
         self.pending.clear();
         self.record_bytes = 0;
         self.discarding = false;
+        if let Some(csv) = &mut self.csv {
+            csv.framer.reset();
+            csv.mapping = mapping;
+        }
         Ok(())
     }
 }
@@ -602,6 +822,10 @@ pub fn write_ndjson(path: &Path, lines: &[&str]) -> Result<()> {
 pub fn file_replay_capabilities() -> ConnectorCapabilities {
     ConnectorCapabilities::FILE_REPLAY
 }
+
+#[cfg(test)]
+#[path = "file_replay_csv_tests.rs"]
+mod csv_tests;
 
 #[cfg(test)]
 mod tests {

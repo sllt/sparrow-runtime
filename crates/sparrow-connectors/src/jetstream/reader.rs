@@ -28,6 +28,8 @@ pub struct ReaderConfig {
     pub pending_bytes: usize,
     pub pull_messages: usize,
     pub pull_bytes: usize,
+    /// Message payload format: one JSON object (default) or one CSV record.
+    pub payload_format: sparrow_formats::PayloadFormat,
 }
 fn check_ownership_policy(kv: &jetstream::stream::Config) -> Result<()> {
     if kv.storage != jetstream::stream::StorageType::File
@@ -78,6 +80,7 @@ pub struct InputRecord {
     message: async_nats::Message,
     _lease: MemoryLease,
     sequence: u64,
+    format: sparrow_formats::PayloadFormat,
 }
 impl InputRecord {
     pub fn sequence(&self) -> u64 {
@@ -88,6 +91,9 @@ impl InputRecord {
     }
     pub fn subject(&self) -> &str {
         self.message.subject.as_str()
+    }
+    pub fn payload_format(&self) -> &sparrow_formats::PayloadFormat {
+        &self.format
     }
     pub fn decode(
         &self,
@@ -136,11 +142,17 @@ impl InputRecord {
                     "JetStream decode scratch overflow",
                 )
             })?;
+        // CSV has its own (smaller, flat-column) working-set estimator.
+        let estimate = match self.format.as_csv() {
+            Some(csv) => csv.decode_scratch(schema, self.payload().len()),
+            None => estimate,
+        };
         let _scratch = owner.acquire(CreditKind::Reservation, estimate)?;
-        let row = sparrow_formats::decode_json_row(
+        let row = self.format.decode_row(
             schema,
             self.payload(),
             &sparrow_formats::JsonLimits::default(),
+            None,
         )?;
         let resident = row.resident_bytes();
         if builder.num_rows() > 0
@@ -202,6 +214,8 @@ pub struct Reader {
     ownership_key: String,
     ownership_revision: u64,
     identity: StreamIdentity,
+    /// Payload format bound into every cut (0 = JSON).
+    format_fingerprint: u64,
     reader_name: String,
     config: ReaderConfig,
     owner: Arc<MemoryOwner>,
@@ -228,6 +242,7 @@ impl Reader {
         attempt_nonce: [u8; 16],
         restore: Option<&sparrow_io::SourcePosition>,
     ) -> Result<Self> {
+        let format_fingerprint = super::policy::format_fingerprint(&config.payload_format);
         let setup=async {
             config.validate()?;
             if config.pull_bytes>connection.pull_bytes || config.pull_messages+2>connection.subscription_capacity {
@@ -239,7 +254,7 @@ impl Reader {
             let mut stream=context.get_stream(&config.stream).await.map_err(|_|error(ErrorCode::JobFailed,"JetStream input stream unavailable").retryable(true))?;
             let info=stream.info().await.map_err(|_|error(ErrorCode::JobFailed,"JetStream stream info unavailable").retryable(true))?;
             let identity=StreamIdentity::from_info(&config.namespace,info)?.with_reader(&config.ownership_bucket,&config.consumer);
-            let cut=if let Some(position)=restore {identity.check_position(position)?;position.offset_bytes}else{0};
+            let cut=if let Some(position)=restore {identity.check_position_bound(position,format_fingerprint)?;position.offset_bytes}else{0};
             let next=cut.checked_add(1).ok_or_else(||error(ErrorCode::BoundExceeded,"JetStream source sequence exhausted"))?;
             check_stream(info,next)?;
             let mut ownership=context.get_key_value(&config.ownership_bucket).await.map_err(|_|error(ErrorCode::PolicyDenied,"JetStream ownership KV bucket must be provisioned"))?;
@@ -307,6 +322,7 @@ impl Reader {
                 ownership_key,
                 ownership_revision,
                 identity,
+                format_fingerprint,
                 reader_name,
                 config,
                 owner,
@@ -326,7 +342,8 @@ impl Reader {
     }
 
     pub fn position(&self, records: u64) -> sparrow_io::SourcePosition {
-        self.identity.position(self.ledger.published(), records)
+        self.identity
+            .position_bound(self.ledger.published(), records, self.format_fingerprint)
     }
     pub fn pending(&self) -> usize {
         self.ledger.pending()
@@ -604,6 +621,7 @@ impl Reader {
                 message,
                 _lease: lease,
                 sequence,
+                format: self.config.payload_format.clone(),
             })),
             Observation::PendingDuplicate => {
                 self.redeliveries = self.redeliveries.saturating_add(1);
@@ -707,6 +725,7 @@ mod tests {
                 description: None,
                 length: 2,
             },
+            format: Default::default(),
         };
         let schema = Arc::new(
             Schema::new(
@@ -734,6 +753,55 @@ mod tests {
             "sparse schema must be rejected at scratch admission, not after allocating the row"
         );
         drop(record);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    #[test]
+    fn k2_csv_payload_format_decodes_one_record_per_message() {
+        let owner = MemoryOwner::new(sparrow_model::ResourceBudget::compact());
+        let format = sparrow_formats::PayloadFormat::csv(
+            sparrow_formats::CsvOptions::default()
+                .compile(sparrow_formats::CsvRole::Decode)
+                .unwrap(),
+        );
+        let record = |payload: &'static str| InputRecord {
+            sequence: 1,
+            _lease: owner.acquire(CreditKind::Reservation, 64).unwrap(),
+            message: async_nats::Message {
+                subject: "test".into(),
+                payload: payload.into(),
+                reply: None,
+                headers: None,
+                status: None,
+                description: None,
+                length: payload.len(),
+            },
+            format: format.clone(),
+        };
+        let schema = Arc::new(
+            Schema::new(
+                1,
+                vec![
+                    sparrow_model::Field::new(1, "id", sparrow_model::DataType::Utf8, false),
+                    sparrow_model::Field::new(2, "v", sparrow_model::DataType::Int64, true),
+                ],
+            )
+            .unwrap(),
+        );
+        let batch = record("v,id\n,\"a\"\n")
+            .decode(&schema, &owner, 4096)
+            .unwrap();
+        assert_eq!(
+            batch.rows()[0].values,
+            vec![
+                sparrow_model::Scalar::utf8("a"),
+                sparrow_model::Scalar::Null
+            ]
+        );
+        drop(batch);
+        for bad in ["id,v\na,1\nb,2\n", "id,v\na,x\n", "{\"id\":\"a\"}"] {
+            assert!(record(bad).decode(&schema, &owner, 4096).is_err(), "{bad}");
+        }
         assert_eq!(owner.usage().physical_bytes, 0);
     }
 }

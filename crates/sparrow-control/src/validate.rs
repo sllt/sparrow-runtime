@@ -293,8 +293,8 @@ pub fn replay_label_for_source(kind: &str) -> &'static str {
     match kind {
         "file" | "file_replay" | "replay" => "replayable",
         "jetstream" if cfg!(feature = "jetstream") => "replayable",
-        "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "nats" | "databus" | "http"
-        | "plugin" => "unsupported",
+        "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "nats" | "databus" | "websocket"
+        | "tcp" | "http" | "plugin" => "unsupported",
         _ => sparrow_plan::REPLAY_UNBOUND,
     }
 }
@@ -402,6 +402,7 @@ pub fn validate_io(
     validate_lookup_io(spec,secrets,policy)?;
     spec.check_delivery()?;
     check_nats_reservation_total(spec)?;
+    check_csv_reliability(spec)?;
     if let Some(io) = &spec.graph_io {
         for (operator, source) in &io.sources {
             validate_source_io(spec, source, schema, secrets, policy, demo)
@@ -433,7 +434,9 @@ fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
         .filter_map(|s| s.databus.as_ref())
         .filter_map(|d| d.subscription().ok())
         .map(|c| c.reservation())
-        .fold(0usize, usize::saturating_add);
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(websocket_reservation(&sources, &sinks))
+        .saturating_add(tcp_reservation(&sources, &sinks));
     #[cfg(not(feature = "nats"))]
     let total = databus;
     #[cfg(feature = "nats")]
@@ -459,11 +462,49 @@ fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
         return Err(SparrowError::new(
             ErrorCode::BoundExceeded,
             format!(
-                "NATS SDK / DataBus buffers of all endpoints ({total} bytes) exceed 3/4 of the job reservation budget ({budget}); lower subscription_capacity/client_capacity/buffer_bytes or max_payload_bytes"
+                "NATS SDK / DataBus / WebSocket / TCP buffers of all endpoints ({total} bytes) exceed 3/4 of the job reservation budget ({budget}); lower subscription_capacity/client_capacity/buffer_bytes/queue_capacity or max_payload_bytes/max_message_bytes"
             ),
         ));
     }
     Ok(())
+}
+
+/// WebSocket connection buffers (plus the Sink send queue) of all endpoints.
+fn websocket_reservation(sources: &[&SourceSpec], sinks: &[&SinkSpec]) -> usize {
+    #[cfg(feature = "websocket")]
+    {
+        sources
+            .iter()
+            .filter_map(|s| s.websocket.as_ref())
+            .map(|w| w.reservation())
+            .chain(
+                sinks
+                    .iter()
+                    .filter_map(|s| s.websocket.as_ref())
+                    .map(|w| w.connector_config(1).reservation()),
+            )
+            .fold(0usize, usize::saturating_add)
+    }
+    #[cfg(not(feature = "websocket"))]
+    {
+        let _ = (sources, sinks);
+        0
+    }
+}
+
+/// Fixed frame buffers of every TCP connection plus each Sink's send queue.
+fn tcp_reservation(sources: &[&SourceSpec], sinks: &[&SinkSpec]) -> usize {
+    sources
+        .iter()
+        .filter_map(|s| s.tcp.as_ref())
+        .map(|t| t.client_config().connection_reservation())
+        .chain(
+            sinks
+                .iter()
+                .filter_map(|s| s.tcp.as_ref())
+                .map(|t| t.connector_config(1).reservation()),
+        )
+        .fold(0usize, usize::saturating_add)
 }
 
 /// SDK buffers plus payloads retained for PubAck retries.
@@ -482,8 +523,40 @@ fn jetstream_sink_reservation(sink: &SinkSpec) -> Option<usize> {
     }
 }
 
-/// `msg_id_column` must be a utf8/integer column of the sink's input; the
-/// InfluxDB mapping must name existing columns of line-protocol types.
+/// CSV bodies carry rows only. A reliable pipeline (JetStream source or
+/// aligned recovery) hands the HTTP sink an output identity that only the
+/// JSON envelope can carry, so that combination is refused up front.
+fn check_csv_reliability(spec: &PipelineSpec) -> Result<()> {
+    let sinks: Vec<&SinkSpec> = match &spec.graph_io {
+        Some(io) => io.sinks.values().collect(),
+        None => vec![&spec.sink],
+    };
+    let jetstream_source = match &spec.graph_io {
+        Some(io) => io.sources.values().any(|s| s.kind == "jetstream"),
+        None => spec.source.kind == "jetstream",
+    };
+    let reliable =
+        jetstream_source || RecoveryPolicy::parse(&spec.recovery).is_ok_and(|r| r.is_aligned());
+    for sink in sinks {
+        if reliable && sink.kind == "http" && sink.payload_format()?.as_csv().is_some() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "HTTP CSV bodies cannot carry reliable output identity; use format=json for checkpointed delivery",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// CSV needs a schema it can lay out (columns, NULL spelling).
+fn validate_sink_format(sink: &SinkSpec, schema: &Schema) -> Result<()> {
+    if let Some(csv) = sink.payload_format()?.as_csv() {
+        csv.check_schema(schema)?;
+    }
+    Ok(())
+}
+
+/// `msg_id_column` must be a utf8/integer column of the sink's input.
 fn validate_sink_schema(sink: &SinkSpec, schema: &Schema) -> Result<()> {
     if sink.influxdb.is_some() {
         influxdb_sink_config(sink)?.mapping.compile(schema)?;
@@ -511,6 +584,9 @@ fn validate_source_io(
     policy: &TargetPolicy,
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
+    if let Some(csv) = source.payload_format()?.as_csv() {
+        csv.check_schema(schema)?;
+    }
     match source.kind.as_str() {
         "plugin" => source.plugin.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"plugin Source binding required"))?.validate()?,
         #[cfg(feature = "jetstream")]
@@ -551,6 +627,25 @@ fn validate_source_io(
             databus_source_config(source, schema.clone(), spec.effective_fail_on_decode())?
                 .validate()?;
         }
+        #[cfg(feature = "websocket")]
+        "websocket" => {
+            refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
+            let ws =
+                websocket_source_config(source, schema.clone(), spec.effective_fail_on_decode())?;
+            ws.validate(policy)?;
+            ws.client.bind(secrets, policy)?;
+            let compact = sparrow_model::ResourceBudget::compact();
+            ws.check_inbox_budget(compact.queue_bytes)?;
+        }
+        "tcp" => {
+            refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
+            let tcp = tcp_source_config(source, schema.clone(), spec.effective_fail_on_decode())?;
+            tcp.validate(policy)?;
+            tcp.client.bind(policy)?;
+            let compact = sparrow_model::ResourceBudget::compact();
+            tcp.check_inbox_budget(compact.queue_bytes)?;
+            tcp.check_reservation_budget(compact.reservation_bytes)?;
+        }
         #[cfg(feature = "nats")]
         "nats" => {
             refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
@@ -579,13 +674,14 @@ fn validate_source_io(
             source_spec.graph_io = None;
             source_spec.source = source.clone();
             cfg.contract = resolve_file_contract(&source_spec, recovery)?;
+            cfg.format = source.payload_format()?;
             cfg.validate().map_err(io)?;
         }
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
                 format!(
-                    "source kind `{other}` is not supported (mqtt|http_push|http_poll|nats|databus|file)"
+                    "source kind `{other}` is not supported (mqtt|http_push|http_poll|nats|websocket|tcp|databus|file)"
                 ),
             ));
         }
@@ -604,6 +700,15 @@ fn validate_sink_io(
             ErrorCode::InvalidArgument,
             "file options require a File Sink",
         ));
+    }
+    let csv = sink.payload_format()?.as_csv().is_some();
+    if let Some(action) = sink.action.as_ref().filter(|_| csv) {
+        if sink.kind == "file" || action.body.is_some() || action.single {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "a CSV sink writes each row as one CSV record: no action.body/single, and no action on a File Sink",
+            ));
+        }
     }
     if let Some(action) = &sink.action {
         if (action.topic.is_some() && sink.kind != "mqtt")
@@ -656,6 +761,20 @@ fn validate_sink_io(
             )?;
             config.validate_target(secrets, policy)?;
         }
+        #[cfg(feature = "websocket")]
+        "websocket" => {
+            let ws = websocket_sink_config(sink)?;
+            ws.validate(policy)?;
+            ws.client.bind(secrets, policy)?;
+        }
+        "tcp" => {
+            let tcp = tcp_sink_config(sink)?;
+            tcp.validate(policy)?;
+            tcp.client.bind(policy)?;
+            tcp.check_reservation_budget(
+                sparrow_model::ResourceBudget::compact().reservation_bytes,
+            )?;
+        }
         #[cfg(feature = "nats")]
         "nats" => {
             let nats = nats_sink_config(sink)?;
@@ -679,7 +798,7 @@ fn validate_sink_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|databus|influxdb|file)"),
+                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|websocket|tcp|databus|influxdb|file)"),
             ));
         }
     }
@@ -728,6 +847,21 @@ pub fn validate_io_with_plan(
                 })?;
             validate_sink_schema(&spec.sink, output)?;
         }
+        if spec.sink.format.is_some() {
+            let output = plan
+                .stages
+                .iter()
+                .rev()
+                .find_map(|stage| match stage {
+                    sparrow_plan::PhysicalStage::CaptureSink { schema, .. }
+                    | sparrow_plan::PhysicalStage::BestEffortSink { schema, .. } => Some(schema),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    SparrowError::new(ErrorCode::InvalidSchema, "sink requires a typed schema")
+                })?;
+            validate_sink_format(&spec.sink, output)?;
+        }
         return Ok(());
     };
 
@@ -742,6 +876,7 @@ pub fn validate_io_with_plan(
         let actual = graph_endpoint_schema(plan, *operator, false)?;
         validate_action_schema(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
         validate_sink_schema(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
+        validate_sink_format(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
         validate_sink_io(sink, secrets, policy, demo)
             .map_err(|e| e.at_operator((*operator).into()))?;
     }
@@ -845,6 +980,7 @@ pub fn mqtt_config(
         cfg.inbox_wait_timeout = std::time::Duration::from_millis(ms);
     }
     cfg.restore = RestoreClaim::None;
+    cfg.payload_format = source.payload_format()?;
     Ok(cfg)
 }
 
@@ -894,6 +1030,7 @@ pub fn http_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result<Http
         skip_verify: sink.skip_verify,
     };
     cfg.restore = RestoreClaim::None;
+    cfg.payload_format = sink.payload_format()?;
     Ok(cfg)
 }
 
@@ -912,6 +1049,10 @@ pub fn http_poll_config(
             )
         })?
         .connector_config(schema, source.inbox_capacity, fail_on_decode)
+        .and_then(|mut config| {
+            config.payload_format = source.payload_format()?;
+            Ok(config)
+        })
 }
 
 pub fn databus_source_config(
@@ -962,7 +1103,7 @@ pub fn nats_source_config(
     schema: Schema,
     fail_on_decode: bool,
 ) -> Result<sparrow_connectors::NatsSourceConfig> {
-    Ok(source
+    let mut config = source
         .nats
         .as_ref()
         .ok_or_else(|| {
@@ -971,14 +1112,16 @@ pub fn nats_source_config(
                 "NATS source requires source.nats",
             )
         })?
-        .connector_config(schema, source.inbox_capacity, fail_on_decode))
+        .connector_config(schema, source.inbox_capacity, fail_on_decode);
+    config.payload_format = source.payload_format()?;
+    Ok(config)
 }
 
 #[cfg(feature = "jetstream")]
 pub fn jetstream_sink_config(
     sink: &SinkSpec,
 ) -> Result<sparrow_connectors::jetstream::JetStreamSinkConfig> {
-    Ok(sink
+    let mut config = sink
         .jetstream
         .as_ref()
         .ok_or_else(|| {
@@ -987,18 +1130,84 @@ pub fn jetstream_sink_config(
                 "JetStream sink requires sink.jetstream",
             )
         })?
-        .connector_config(sink.outbox_capacity))
+        .connector_config(sink.outbox_capacity);
+    config.payload_format = sink.payload_format()?;
+    Ok(config)
+}
+
+#[cfg(feature = "websocket")]
+pub fn websocket_source_config(
+    source: &SourceSpec,
+    schema: Schema,
+    fail_on_decode: bool,
+) -> Result<sparrow_connectors::WebSocketSourceConfig> {
+    let mut config = source
+        .websocket
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "WebSocket source requires source.websocket",
+            )
+        })?
+        .connector_config(schema, source.inbox_capacity, fail_on_decode);
+    config.payload_format = source.payload_format()?;
+    Ok(config)
+}
+
+#[cfg(feature = "websocket")]
+pub fn websocket_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::WebSocketSinkConfig> {
+    let mut config = sink
+        .websocket
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "WebSocket sink requires sink.websocket",
+            )
+        })?
+        .connector_config(sink.outbox_capacity);
+    config.payload_format = sink.payload_format()?;
+    Ok(config)
+}
+
+pub fn tcp_source_config(
+    source: &SourceSpec,
+    schema: Schema,
+    fail_on_decode: bool,
+) -> Result<sparrow_connectors::TcpSourceConfig> {
+    let mut config = source
+        .tcp
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidArgument, "TCP source requires source.tcp")
+        })?
+        .connector_config(schema, source.inbox_capacity, fail_on_decode);
+    config.payload_format = source.payload_format()?;
+    Ok(config)
+}
+
+pub fn tcp_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::TcpSinkConfig> {
+    let mut config = sink
+        .tcp
+        .as_ref()
+        .ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, "TCP sink requires sink.tcp"))?
+        .connector_config(sink.outbox_capacity);
+    config.payload_format = sink.payload_format()?;
+    Ok(config)
 }
 
 #[cfg(feature = "nats")]
 pub fn nats_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::NatsSinkConfig> {
-    Ok(sink
+    let mut config = sink
         .nats
         .as_ref()
         .ok_or_else(|| {
             SparrowError::new(ErrorCode::InvalidArgument, "NATS sink requires sink.nats")
         })?
-        .connector_config(sink.outbox_capacity))
+        .connector_config(sink.outbox_capacity);
+    config.payload_format = sink.payload_format()?;
+    Ok(config)
 }
 
 pub fn http_push_config(source: &SourceSpec, schema: Schema) -> Result<HttpPushSourceConfig> {
@@ -1011,6 +1220,7 @@ pub fn http_push_config(source: &SourceSpec, schema: Schema) -> Result<HttpPushS
     }
     cfg.inbox_capacity = source.inbox_capacity;
     cfg.restore = RestoreClaim::None;
+    cfg.payload_format = source.payload_format()?;
     Ok(cfg)
 }
 
@@ -1059,6 +1269,7 @@ pub(crate) fn file_sink_config(
         max_files: config.max_files,
         row_bytes: config.row_bytes,
         sync_data: config.sync_data,
+        format: sink.payload_format()?,
     })
 }
 
@@ -1095,6 +1306,7 @@ pub fn mqtt_sink_config(sink: &SinkSpec, demo: Option<&DemoEndpoints>) -> Result
         skip_verify: false,
     };
     cfg.restore = RestoreClaim::None;
+    cfg.payload_format = sink.payload_format()?;
     Ok(cfg)
 }
 
@@ -1498,14 +1710,17 @@ fn validate_file_jetstream_sink_profile(spec: &PipelineSpec, plan: &PhysicalPlan
         || !spec.reference_tables.is_empty()
     {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-            "JetStream Sink checkpoints require the enabled independent linear File/v27 profile"));
+            "JetStream Sink checkpoints require the enabled independent linear File profile (JSON/v27 or CSV/v28)"));
     }
+    // Typed callers must also compile the encoding before advertising a
+    // profile; invalid CSV must not fall through to JSON/v27 diagnostics.
+    spec.sink.payload_format()?;
     let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
     if sparrow_runtime::snapshot_version_for(&manifest, "file")?
         != sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION
     {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-            "File/JetStream Sink v27 excludes IoT, reference, paused/observed-time and graph profiles"));
+            "File/JetStream Sink v27/v28 excludes IoT, reference, paused/observed-time and graph profiles"));
     }
     Ok(())
 }
@@ -1717,6 +1932,10 @@ pub fn capabilities_json() -> serde_json::Value {
     let nats_sink = ConnectorCapabilities::NATS_SINK;
     let js_sink = ConnectorCapabilities::JETSTREAM_SINK;
     let bus_source = ConnectorCapabilities::DATABUS_SOURCE;
+    let ws = ConnectorCapabilities::WEBSOCKET_SOURCE;
+    let ws_sink = ConnectorCapabilities::WEBSOCKET_SINK;
+    let tcp = ConnectorCapabilities::TCP_SOURCE;
+    let tcp_sink = ConnectorCapabilities::TCP_SINK;
     let bus_sink = ConnectorCapabilities::DATABUS_SINK;
     let influx_sink = ConnectorCapabilities::INFLUXDB_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
@@ -1727,6 +1946,14 @@ pub fn capabilities_json() -> serde_json::Value {
         "recovery_pt_window": RecoveryPolicy::RestartFresh.none_label(),
         "recovery_aligned": RecoveryPolicy::Aligned.as_str(),
         "exactly_once": "rejected",
+        "formats": {
+            "default": "json",
+            "available": ["json", "csv"],
+            "csv_sources": crate::spec::CSV_SOURCE_KINDS,
+            "csv_sinks": crate::spec::CSV_SINK_KINDS,
+            "csv_contract": "strict_rfc4180_subset; header_or_positional; typed_per_schema; one_record_per_message; file_header_per_segment; no_reliable_http_identity",
+            "docs": "docs/FORMATS.md",
+        },
         "connectors": [
             {"kind":"plugin","roles":["source","sink"],"replay":"unsupported","delivery":"live_best_effort","recovery":"restart_fresh","default_enabled":false},
             {
@@ -1779,6 +2006,64 @@ pub fn capabilities_json() -> serde_json::Value {
                 "contract": "nats_core_at_most_once; static_subject; published_means_handed_to_client; flush_on_stop; not_jetstream",
             },
             {
+                "kind": ws.kind,
+                "roles": ["source"],
+                "enabled_by_build": cfg!(feature = "websocket"),
+                "replay": ws.replay.as_str(),
+                "delivery": ws.delivery.as_str(),
+                "recovery": ws.recovery.as_str(),
+                "acknowledgement": "none",
+                "mode": "client",
+                "framing": ["message", "ndjson"],
+                "binary_frames": ["drop", "decode"],
+                "maturity": "preview",
+                "contract": "websocket_client_at_most_once; no_ack; no_replay; size_limit_before_decode; ping_idle_timeout; capped_jittered_reconnect; allowlist; credentials_require_wss",
+            },
+            {
+                "kind": ws_sink.kind,
+                "roles": ["sink"],
+                "enabled_by_build": cfg!(feature = "websocket"),
+                "replay": ws_sink.replay.as_str(),
+                "delivery": ws_sink.delivery.as_str(),
+                "recovery": ws_sink.recovery.as_str(),
+                "acknowledgement": "none",
+                "mode": "client",
+                "overflow": ["block", "drop_newest"],
+                "default_overflow": "block",
+                "maturity": "preview",
+                "contract": "websocket_client_at_most_once; one_message_per_row; bounded_send_queue; sent_means_written_to_socket; flush_on_stop; fail_closed_after_reconnect_attempts",
+            },
+            {
+                "kind": tcp.kind,
+                "roles": ["source"],
+                "enabled_by_build": true,
+                "replay": tcp.replay.as_str(),
+                "delivery": tcp.delivery.as_str(),
+                "recovery": tcp.recovery.as_str(),
+                "acknowledgement": "none",
+                "mode": "client",
+                "framing": ["lines", "length_prefixed"],
+                "length_bytes": [2, 4],
+                "oversize": ["resync", "disconnect"],
+                "maturity": "preview",
+                "contract": "tcp_client_at_most_once; no_ack; no_replay; frame_limit_before_decode; prefix_rejected_before_allocation; idle_timeout; optional_keepalive; capped_jittered_reconnect; allowlist; optional_tls",
+            },
+            {
+                "kind": tcp_sink.kind,
+                "roles": ["sink"],
+                "enabled_by_build": true,
+                "replay": tcp_sink.replay.as_str(),
+                "delivery": tcp_sink.delivery.as_str(),
+                "recovery": tcp_sink.recovery.as_str(),
+                "acknowledgement": "none",
+                "mode": "client",
+                "framing": ["lines", "length_prefixed"],
+                "overflow": ["block", "drop_newest"],
+                "default_overflow": "block",
+                "maturity": "preview",
+                "contract": "tcp_client_at_most_once; one_frame_per_row; bounded_send_queue; partial_write_timeout_disconnects; sent_means_written_to_socket; flush_on_stop; fail_closed_after_reconnect_attempts",
+            },
+            {
                 "kind": bus_source.kind,
                 "roles": ["source"],
                 "enabled_by_build": true,
@@ -1828,7 +2113,7 @@ pub fn capabilities_json() -> serde_json::Value {
                 "recovery": js_sink.recovery.as_str(),
                 "acknowledgement": "jetstream_pub_ack_per_message",
                 "duplicates": "possible_on_retry; deduplicated_within_stream_duplicate_window_when_msg_id_column_set",
-                "aligned_checkpoint": "independent_linear_file_v27; exact_JSI1_target_and_full_plan; File_storage_and_Limits_retention; outbox_acked_after_all_pub_acks_and_target_recheck",
+                "aligned_checkpoint": "independent_linear_file_JSON_v27_JSI1_or_CSV_v28_JSI2; exact_target_encoding_and_full_plan; File_storage_and_Limits_retention; outbox_acked_after_all_pub_acks_and_target_recheck",
                 "stream_management": "existing_stream_required; never_auto_created",
                 "maturity": "preview",
                 "contract": "at_least_once_into_stream; bounded_inflight_acks; bounded_retry_backoff; fail_closed_on_unconfirmed; ordering_not_guaranteed_under_retry",
@@ -2396,15 +2681,31 @@ pub fn effective_guarantees_with_plan(
                         _=>unreachable!(),
                     }).collect::<Vec<_>>(),"profile":reference_version.map_or_else(|| format!("v{snapshot_version}"), |version| format!("reference_v{version}")),"scope":if reference_version.is_some() {"single_file_static_reference_required_http_linear_shapes"} else {"single_file_single_required_sink_tested_linear_shapes"},"certified":false});
                 if spec.sink.kind == "jetstream" {
-                    value["aligned_eligibility_reason"] = serde_json::json!("file_required_jetstream_v27; runtime_target_bootstrap_required");
+                    let csv = spec
+                        .sink
+                        .payload_format()
+                        .is_ok_and(|format| format.as_csv().is_some());
+                    let (version, codec) = if csv {
+                        (
+                            sparrow_runtime::pipeline_checkpoint::FILE_JETSTREAM_CSV_SINK_SNAPSHOT_VERSION,
+                            "JSI2",
+                        )
+                    } else {
+                        (
+                            sparrow_runtime::pipeline_checkpoint::FILE_JETSTREAM_SINK_SNAPSHOT_VERSION,
+                            "JSI1",
+                        )
+                    };
+                    value["aligned_eligibility_reason"] = serde_json::json!(format!("file_required_jetstream_v{version}; runtime_target_bootstrap_required"));
                     let participants = &mut value["checkpoint_participants"];
-                    participants["snapshot_version"] = serde_json::json!(sparrow_runtime::pipeline_checkpoint::FILE_JETSTREAM_SINK_SNAPSHOT_VERSION);
-                    participants["profile"] = serde_json::json!("file_jetstream_sink_v27");
+                    participants["snapshot_version"] = serde_json::json!(version);
+                    participants["profile"] = serde_json::json!(format!("file_jetstream_sink_v{version}"));
                     participants["scope"] = serde_json::json!("single_file_single_required_jetstream_sink");
-                    participants["semantics_version"] = serde_json::json!("CP01_full_plan_strict_with_JSI1_output_target");
-                    participants["restore_compatibility"] = serde_json::json!("exact_endpoints_token_SecretRef_stream_created_nanos_subject_msg_id_policy_and_full_plan; separate_v27_directory");
-                    participants["downstream_changes"] = serde_json::json!("rejected; old_v1_to_v26_history_cannot_be_adopted; external_outputs_are_not_rolled_back");
-                    participants["sink_identity_codec"] = serde_json::json!("JSI1");
+                    participants["semantics_version"] = serde_json::json!(format!("CP01_full_plan_strict_with_{codec}_output_target"));
+                    participants["restore_compatibility"] = serde_json::json!(format!("exact_endpoints_token_SecretRef_stream_created_nanos_subject_msg_id_policy_encoding_and_full_plan; separate_v{version}_directory"));
+                    participants["downstream_changes"] = serde_json::json!("rejected; other_snapshot_profiles_and_JSON_CSV_or_CSV_dialect_changes_cannot_be_adopted; external_outputs_are_not_rolled_back");
+                    participants["sink_identity_codec"] = serde_json::json!(codec);
+                    participants["sink_encoding"] = serde_json::json!(if csv {"csv_v1_delimiter_quote_header_null_value"} else {"json"});
                     participants["runtime_prerequisites"] = serde_json::json!("existing_File_storage_Limits_stream_with_PubAck_enabled; exact_incarnation_checked_before_input_and_after_batch");
                 }
                 if iot {
@@ -2548,6 +2849,8 @@ mod tests {
                 http_poll: None,
                 nats: None,
                 databus: None,
+                websocket: None,
+                tcp: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
                 port: Some(1883),
@@ -2567,11 +2870,15 @@ mod tests {
                 path: None,
                 tls: false,
                 file_contract: None,
+                format: None,
+                csv: None,
             },
             sink: crate::spec::SinkSpec {
                 nats: None,
                 databus: None,
                 influxdb: None,
+                websocket: None,
+                tcp: None,
                 jetstream: None,
                 plugin: None,
                 action: None,
@@ -2593,6 +2900,8 @@ mod tests {
                 qos: 0,
                 clean_session: true,
                 tls: false,
+                format: None,
+                csv: None,
             },
             delivery: "at_least_once".into(),
             recovery: "restart_fresh".into(),
@@ -2638,6 +2947,8 @@ mod tests {
             http_poll: None,
             nats: None,
             databus: None,
+            websocket: None,
+            tcp: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),
@@ -2657,6 +2968,8 @@ mod tests {
             path: None,
             tls: false,
             file_contract: None,
+            format: None,
+            csv: None,
         };
         let schema = Schema::new(
             SchemaId::new(1),
@@ -2685,6 +2998,8 @@ mod tests {
             http_poll: None,
             nats: None,
             databus: None,
+            websocket: None,
+            tcp: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),
@@ -2704,6 +3019,8 @@ mod tests {
             path: None,
             tls: false,
             file_contract: None,
+            format: None,
+            csv: None,
         };
         let schema = Schema::new(
             SchemaId::new(1),
@@ -2728,6 +3045,8 @@ mod tests {
                 nats: None,
                 databus: None,
                 influxdb: None,
+                websocket: None,
+                tcp: None,
                 jetstream: None,
                 plugin: None,
             action: None,
@@ -2749,6 +3068,8 @@ mod tests {
             qos: 0,
             clean_session: true,
             tls: false,
+            format: None,
+            csv: None,
         };
         let err = http_config(&sink, None).unwrap_err();
         assert_eq!(err.code, ErrorCode::PolicyDenied);

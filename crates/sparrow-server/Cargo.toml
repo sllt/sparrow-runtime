@@ -10,6 +10,7 @@ default = ["demo-io"]
 demo-io = ["sparrow-control/demo-io"]
 nats = ["sparrow-control/nats", "sparrow-connectors/nats"]
 jetstream = ["nats", "sparrow-control/jetstream", "sparrow-connectors/jetstream"]
+websocket = ["sparrow-control/websocket", "sparrow-connectors/websocket"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }

@@ -108,6 +108,42 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::Aligned,
     };
 
+    /// WebSocket client Source. Live, at-most-once: no ack, no replay;
+    /// messages sent while disconnected are lost.
+    pub const WEBSOCKET_SOURCE: Self = Self {
+        kind: "websocket",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// WebSocket client Sink. A sent frame is written to the socket; there
+    /// is no application receipt.
+    pub const WEBSOCKET_SINK: Self = Self {
+        kind: "websocket_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// TCP client Source (`lines` / `length_prefixed`): live, no ack, no
+    /// replay.
+    pub const TCP_SOURCE: Self = Self {
+        kind: "tcp",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// TCP client Sink. A sent frame is written to the socket; there is no
+    /// application receipt.
+    pub const TCP_SINK: Self = Self {
+        kind: "tcp_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     pub const MQTT_SINK: Self = Self {
         kind: "mqtt_sink",
         replay: ReplaySupport::Unsupported,

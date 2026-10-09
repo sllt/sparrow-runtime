@@ -156,6 +156,7 @@ impl Supervisor {
             cfg.recovery = RecoveryPolicy::Aligned;
             cfg.fail_on_decode = true;
             cfg.contract = sparrow_connectors::FileContract::AppendOnly;
+            cfg.format = spec.source.payload_format()?;
             let restored = restored_cut.clone();
             let (source, cut) = self
                 .store
@@ -195,6 +196,7 @@ impl Supervisor {
                 .await?;
                 let mut reader_config = config.reader();
                 reader_config.pull_messages = 1;
+                reader_config.payload_format = spec.source.payload_format()?;
                 let reader = Reader::open(
                     connection,
                     reader_config,

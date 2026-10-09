@@ -37,6 +37,8 @@ pub use spec::{
 };
 #[cfg(all(test, feature = "demo-io", target_os = "linux"))]
 mod actions_tests;
+#[cfg(all(test, feature = "demo-io", target_os = "linux"))]
+mod csv_tests;
 #[cfg(all(test, feature = "demo-io"))]
 mod k3_tests;
 #[cfg(all(test, feature = "demo-io"))]
@@ -101,3 +103,7 @@ mod k2_tests;
 mod nats_tests;
 #[cfg(test)]
 mod reference_completion_tests;
+#[cfg(test)]
+mod tcp_tests;
+#[cfg(test)]
+mod websocket_tests;
