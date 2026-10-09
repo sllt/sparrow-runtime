@@ -419,4 +419,104 @@ mod broker {
             sup.stop_all().await;
         });
     }
+
+    /// Reading { device: id, value: t } (fields 1 and 3), as protoc writes it.
+    fn reading(id: &str, temperature: f64) -> Vec<u8> {
+        let mut out = vec![0x0a, id.len() as u8];
+        out.extend_from_slice(id.as_bytes());
+        out.push(0x19);
+        out.extend_from_slice(&temperature.to_le_bytes());
+        out
+    }
+
+    #[test]
+    #[ignore = "requires SPARROW_NATS_SERVER (real nats-server binary)"]
+    fn nats_core_protobuf_pipeline_source_filter_sink_end_to_end() {
+        use base64::Engine;
+        let kernel = Arc::new(crate::host_kernel().unwrap());
+        kernel.block_on(async {
+            let fixture = NatsSandbox::start().await;
+            let store = Arc::new(Store::open_memory().unwrap());
+            store.put_stream("telemetry", TELEMETRY_SCHEMA).unwrap();
+            store.put_allow("127.0.0.1", fixture.port).unwrap();
+            let protobuf = json!({
+                "descriptor_set": base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+                    "../../sparrow-formats/tests/fixtures/protobuf/descriptor_set.pb"
+                )),
+                "message": "telemetry.v1.Reading",
+                "fields": {"device_id": "device", "temperature": "value"}
+            });
+            let mut value = linear_spec(&fixture.url());
+            for side in ["source", "sink"] {
+                value[side]["format"] = json!("protobuf");
+                value[side]["protobuf"] = protobuf.clone();
+            }
+            let spec = parse(&value).unwrap();
+            store.put_pipeline("nats-pb", &spec, None).unwrap();
+            request_start(&store, "nats-pb", "test").unwrap();
+            let oracle = async_nats::connect(fixture.url()).await.unwrap();
+            let mut out = oracle.subscribe("alerts.>").await.unwrap();
+            oracle.flush().await.unwrap();
+            let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+            sup.converge_once().await.unwrap();
+            // Core NATS has no replay: publish until the subscription is live.
+            let mut seq = 0u32;
+            let first = tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    seq += 1;
+                    for (subject, payload) in [
+                        ("telemetry.a", reading("cold", -1.0)),
+                        ("telemetry.b", reading("hot", f64::from(seq))),
+                        // Truncated: dropped, counted, the job keeps running.
+                        ("telemetry.c", vec![0x0a, 0x09, b'x']),
+                    ] {
+                        oracle.publish(subject, payload.into()).await.unwrap();
+                    }
+                    oracle.flush().await.unwrap();
+                    sup.converge_once().await.unwrap();
+                    assert_ne!(store.actual("nats-pb").unwrap().status, "failed");
+                    if let Ok(Some(msg)) =
+                        tokio::time::timeout(Duration::from_millis(100), out.next()).await
+                    {
+                        break msg.payload;
+                    }
+                }
+            })
+            .await
+            .expect("first filtered row");
+            assert_eq!(&first[..5], &[0x0a, 0x03, b'h', b'o', b't']);
+            // Steady state: the marker arrives byte-identical, cold never does.
+            oracle
+                .publish("telemetry.z", reading("cold", -9.0).into())
+                .await
+                .unwrap();
+            oracle
+                .publish("telemetry.z", reading("marker", 4242.0).into())
+                .await
+                .unwrap();
+            oracle.flush().await.unwrap();
+            loop {
+                let msg = tokio::time::timeout(Duration::from_secs(8), out.next())
+                    .await
+                    .expect("NATS output deadline")
+                    .expect("subscription open");
+                assert_ne!(&msg.payload[..6], &reading("cold", 0.0)[..6]);
+                if msg.payload[..] == reading("marker", 4242.0)[..] {
+                    break;
+                }
+            }
+            let snapshot = sup.flow_snapshot("nats-pb").unwrap().unwrap();
+            let io = snapshot.diagnostics.snapshot();
+            assert!(io.nats_source_dropped_bad >= 1, "{io:?}");
+            assert_eq!(io.protobuf_malformed, io.nats_source_dropped_bad, "{io:?}");
+            assert_eq!(
+                (io.protobuf_type_errors, io.protobuf_encode_errors),
+                (0, 0),
+                "{io:?}"
+            );
+            sup.stop_all().await;
+            let io = snapshot.diagnostics.snapshot();
+            assert_eq!(io.nats_sink_failed, 0, "{io:?}");
+        });
+    }
 }

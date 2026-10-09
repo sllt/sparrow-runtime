@@ -1,0 +1,18 @@
+// proto2 fixture: required fields, closed enums, groups.
+syntax = "proto2";
+
+package legacy.v1;
+
+enum Color {
+  RED = 0;
+  GREEN = 1;
+}
+
+message Legacy {
+  required int64 id = 1;
+  optional Color color = 2;
+  optional string name = 3;
+  optional group G = 4 {
+    optional int32 x = 5;
+  }
+}

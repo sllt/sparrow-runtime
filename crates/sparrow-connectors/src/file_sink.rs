@@ -49,15 +49,24 @@ impl FileSinkConfig {
                 marker.push(b'\n');
                 marker
             }
+            // Refused by `validate` (no length-delimited segment framing).
+            sparrow_formats::PayloadFormat::Protobuf(_) => b"SPARROW-FILE-SINK-PROTOBUF-UNSUPPORTED\n".to_vec(),
         }
     }
     fn extension(&self) -> &'static str {
         match self.format {
             sparrow_formats::PayloadFormat::Json => ".ndjson",
             sparrow_formats::PayloadFormat::Csv(_) => ".csv",
+            sparrow_formats::PayloadFormat::Protobuf(_) => ".unsupported",
         }
     }
     pub fn validate(&self) -> Result<()> {
+        if self.format.as_protobuf().is_some() {
+            return Err(ConnectorError::new(
+                ErrorCode::FeatureUnavailable,
+                "File Sink does not write protobuf (segments are line-oriented; no length-delimited framing)",
+            ));
+        }
         if !cfg!(target_os = "linux") {
             return Err(ConnectorError::new(
                 ErrorCode::FeatureUnavailable,
@@ -410,7 +419,7 @@ impl Writer {
                         )
                         .map_err(|e| {
                             if e.code != ErrorCode::ResourceExhausted {
-                                diag.csv_encode_error(&self.config.format);
+                                diag.format_encode_error(&self.config.format);
                             }
                             model(e)
                         })?;
@@ -760,6 +769,15 @@ mod tests {
             format: sparrow_formats::PayloadFormat::csv(format),
             ..config(dir)
         }
+    }
+    #[test]
+    fn protobuf_is_refused_by_the_file_sink() {
+        let dir = directory();
+        let cfg = FileSinkConfig {
+            format: crate::protobuf_test_support::format(sparrow_formats::CsvRole::Encode, |_| {}),
+            ..config(&dir)
+        };
+        assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::FeatureUnavailable);
     }
     fn csv_batch(owner: &Arc<MemoryOwner>, text: &str) -> RowBatch {
         let schema = batch(owner, "").schema_arc();

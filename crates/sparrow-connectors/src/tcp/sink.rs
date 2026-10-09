@@ -98,6 +98,12 @@ impl TcpSinkConfig {
 
     pub fn validate(&self, policy: &TargetPolicy) -> Result<()> {
         refuse_durable_recovery(&self.restore)?;
+        if self.payload_format.as_protobuf().is_some() {
+            return Err(error(
+                ErrorCode::InvalidArgument,
+                "TCP protobuf framing is not supported",
+            ));
+        }
         let window = Duration::from_millis(10)..=Duration::from_secs(60);
         if !(1..=MAX_OUTBOX).contains(&self.outbox_capacity)
             || !(1..=MAX_QUEUE).contains(&self.queue_capacity)
@@ -345,7 +351,7 @@ impl TcpSink {
         };
         let (encoded, mut lease) = encoded.map_err(|e| {
             if e == EncodeRejected::Bad {
-                self.diag.csv_encode_error(format);
+                self.diag.format_encode_error(format);
             }
             Rejected::from(e)
         })?;

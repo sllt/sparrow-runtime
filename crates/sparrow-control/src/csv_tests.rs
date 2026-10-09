@@ -384,7 +384,10 @@ fn csv_control_format_matrix_rejects_unknown_and_mismatched_options() {
     let text = serde_json::to_value(&spec.sink).unwrap();
     assert!(text.get("format").is_none() && text.get("csv").is_none());
     let capabilities = crate::validate::capabilities_json();
-    assert_eq!(capabilities["formats"]["available"], json!(["json", "csv"]));
+    assert_eq!(
+        capabilities["formats"]["available"],
+        json!(["json", "csv", "protobuf"])
+    );
     assert!(capabilities["formats"]["csv_sinks"]
         .as_array()
         .unwrap()

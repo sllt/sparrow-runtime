@@ -155,6 +155,11 @@ pub struct IoDiagnostics {
     pub csv_type_errors: AtomicU64,
     pub csv_header_errors: AtomicU64,
     pub csv_encode_errors: AtomicU64,
+    pub protobuf_malformed: AtomicU64,
+    pub protobuf_oversize: AtomicU64,
+    pub protobuf_type_errors: AtomicU64,
+    pub protobuf_unknown_fields: AtomicU64,
+    pub protobuf_encode_errors: AtomicU64,
     pub websocket_source_received: AtomicU64,
     pub websocket_source_rows: AtomicU64,
     pub websocket_source_dropped_bad: AtomicU64,
@@ -232,6 +237,35 @@ pub struct IoDiagnostics {
     pub file_segments: AtomicU64,
     pub file_syncs: AtomicU64,
     pub file_failed: AtomicU64,
+    pub postgres_source_rows: AtomicU64,
+    pub postgres_source_queries: AtomicU64,
+    pub postgres_source_dropped_bad: AtomicU64,
+    pub postgres_source_dropped_oversize: AtomicU64,
+    pub postgres_source_backpressure_waits: AtomicU64,
+    pub postgres_source_budget_waits: AtomicU64,
+    pub postgres_source_connects: AtomicU64,
+    pub postgres_source_connect_failures: AtomicU64,
+    pub postgres_source_query_failures: AtomicU64,
+    pub postgres_source_timeouts: AtomicU64,
+    pub postgres_sink_rows: AtomicU64,
+    pub postgres_sink_transactions: AtomicU64,
+    pub postgres_sink_statements: AtomicU64,
+    pub postgres_sink_batch_errors: AtomicU64,
+    pub postgres_sink_dropped_bad: AtomicU64,
+    pub postgres_sink_dropped_oversize: AtomicU64,
+    pub postgres_sink_budget_waits: AtomicU64,
+    pub postgres_sink_retries: AtomicU64,
+    pub postgres_sink_connects: AtomicU64,
+    pub postgres_sink_connect_failures: AtomicU64,
+    pub postgres_sink_timeouts: AtomicU64,
+    pub postgres_sink_unknown_outcome: AtomicU64,
+    pub postgres_sink_discarded_on_close: AtomicU64,
+    pub postgres_sink_fatal: AtomicU64,
+    /// Last tracking value the PostgreSQL Source advanced to (integer, or
+    /// microseconds since 1970 for timestamps); valid when `..._set` is 1.
+    pub postgres_source_tracking_value: std::sync::atomic::AtomicI64,
+    pub postgres_source_tracking_set: AtomicU64,
+    pub postgres_source_inbox: Arc<sparrow_model::QueueOccupancy>,
 }
 
 impl IoDiagnostics {
@@ -241,30 +275,44 @@ impl IoDiagnostics {
         Arc::new(Self::default())
     }
 
-    /// Count one CSV decode failure by kind (oversize, malformed, type,
-    /// header). JSON failures are not counted here. The connector's own
-    /// `*_dropped_bad` / `decode_errors` accounting is unchanged.
-    pub fn csv_decode_error(
+    /// Count one CSV or protobuf decode failure by kind (CSV: oversize,
+    /// malformed, type, header; protobuf: oversize, malformed, type,
+    /// unknown field). JSON failures are not counted here. The connector's
+    /// own `*_dropped_bad` / `decode_errors` accounting is unchanged.
+    pub fn format_decode_error(
         &self,
         format: &sparrow_formats::PayloadFormat,
         error: &sparrow_model::SparrowError,
     ) {
-        if format.as_csv().is_none() {
-            return;
-        }
-        let counter = match sparrow_formats::CsvFault::of(error) {
-            sparrow_formats::CsvFault::Oversize => &self.csv_oversize,
-            sparrow_formats::CsvFault::Malformed => &self.csv_malformed,
-            sparrow_formats::CsvFault::Type => &self.csv_type_errors,
-            sparrow_formats::CsvFault::Header => &self.csv_header_errors,
+        use sparrow_formats::{CsvFault, PayloadFormat, ProtobufFault};
+        let counter = match format {
+            PayloadFormat::Json => return,
+            PayloadFormat::Csv(_) => match CsvFault::of(error) {
+                CsvFault::Oversize => &self.csv_oversize,
+                CsvFault::Malformed => &self.csv_malformed,
+                CsvFault::Type => &self.csv_type_errors,
+                CsvFault::Header => &self.csv_header_errors,
+            },
+            PayloadFormat::Protobuf(_) => match ProtobufFault::of(error) {
+                ProtobufFault::Oversize => &self.protobuf_oversize,
+                ProtobufFault::Malformed => &self.protobuf_malformed,
+                ProtobufFault::Type => &self.protobuf_type_errors,
+                ProtobufFault::UnknownField => &self.protobuf_unknown_fields,
+            },
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count one CSV encode failure (sinks).
-    pub fn csv_encode_error(&self, format: &sparrow_formats::PayloadFormat) {
-        if format.as_csv().is_some() {
-            self.csv_encode_errors.fetch_add(1, Ordering::Relaxed);
+    /// Count one CSV or protobuf encode failure (sinks).
+    pub fn format_encode_error(&self, format: &sparrow_formats::PayloadFormat) {
+        match format {
+            sparrow_formats::PayloadFormat::Json => {}
+            sparrow_formats::PayloadFormat::Csv(_) => {
+                self.csv_encode_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            sparrow_formats::PayloadFormat::Protobuf(_) => {
+                self.protobuf_encode_errors.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -458,6 +506,11 @@ impl IoDiagnostics {
             csv_type_errors: self.csv_type_errors.load(Ordering::Relaxed),
             csv_header_errors: self.csv_header_errors.load(Ordering::Relaxed),
             csv_encode_errors: self.csv_encode_errors.load(Ordering::Relaxed),
+            protobuf_malformed: self.protobuf_malformed.load(Ordering::Relaxed),
+            protobuf_oversize: self.protobuf_oversize.load(Ordering::Relaxed),
+            protobuf_type_errors: self.protobuf_type_errors.load(Ordering::Relaxed),
+            protobuf_unknown_fields: self.protobuf_unknown_fields.load(Ordering::Relaxed),
+            protobuf_encode_errors: self.protobuf_encode_errors.load(Ordering::Relaxed),
             websocket_source_received: self.websocket_source_received.load(Ordering::Relaxed),
             websocket_source_rows: self.websocket_source_rows.load(Ordering::Relaxed),
             websocket_source_dropped_bad: self.websocket_source_dropped_bad.load(Ordering::Relaxed),
@@ -567,6 +620,52 @@ impl IoDiagnostics {
             file_segments: self.file_segments.load(Ordering::Relaxed),
             file_syncs: self.file_syncs.load(Ordering::Relaxed),
             file_failed: self.file_failed.load(Ordering::Relaxed),
+            postgres_source_rows: self.postgres_source_rows.load(Ordering::Relaxed),
+            postgres_source_queries: self.postgres_source_queries.load(Ordering::Relaxed),
+            postgres_source_dropped_bad: self.postgres_source_dropped_bad.load(Ordering::Relaxed),
+            postgres_source_dropped_oversize: self
+                .postgres_source_dropped_oversize
+                .load(Ordering::Relaxed),
+            postgres_source_backpressure_waits: self
+                .postgres_source_backpressure_waits
+                .load(Ordering::Relaxed),
+            postgres_source_budget_waits: self.postgres_source_budget_waits.load(Ordering::Relaxed),
+            postgres_source_connects: self.postgres_source_connects.load(Ordering::Relaxed),
+            postgres_source_connect_failures: self
+                .postgres_source_connect_failures
+                .load(Ordering::Relaxed),
+            postgres_source_query_failures: self
+                .postgres_source_query_failures
+                .load(Ordering::Relaxed),
+            postgres_source_timeouts: self.postgres_source_timeouts.load(Ordering::Relaxed),
+            postgres_sink_rows: self.postgres_sink_rows.load(Ordering::Relaxed),
+            postgres_sink_transactions: self.postgres_sink_transactions.load(Ordering::Relaxed),
+            postgres_sink_statements: self.postgres_sink_statements.load(Ordering::Relaxed),
+            postgres_sink_batch_errors: self.postgres_sink_batch_errors.load(Ordering::Relaxed),
+            postgres_sink_dropped_bad: self.postgres_sink_dropped_bad.load(Ordering::Relaxed),
+            postgres_sink_dropped_oversize: self
+                .postgres_sink_dropped_oversize
+                .load(Ordering::Relaxed),
+            postgres_sink_budget_waits: self.postgres_sink_budget_waits.load(Ordering::Relaxed),
+            postgres_sink_retries: self.postgres_sink_retries.load(Ordering::Relaxed),
+            postgres_sink_connects: self.postgres_sink_connects.load(Ordering::Relaxed),
+            postgres_sink_connect_failures: self
+                .postgres_sink_connect_failures
+                .load(Ordering::Relaxed),
+            postgres_sink_timeouts: self.postgres_sink_timeouts.load(Ordering::Relaxed),
+            postgres_sink_unknown_outcome: self
+                .postgres_sink_unknown_outcome
+                .load(Ordering::Relaxed),
+            postgres_sink_discarded_on_close: self
+                .postgres_sink_discarded_on_close
+                .load(Ordering::Relaxed),
+            postgres_sink_fatal: self.postgres_sink_fatal.load(Ordering::Relaxed),
+            postgres_source_tracking_value: self
+                .postgres_source_tracking_value
+                .load(Ordering::Relaxed),
+            postgres_source_tracking_set: self.postgres_source_tracking_set.load(Ordering::Relaxed),
+            postgres_source_inbox_items: self.postgres_source_inbox.items.load(Ordering::Relaxed),
+            postgres_source_inbox_bytes: self.postgres_source_inbox.bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -719,6 +818,11 @@ pub struct IoSnapshot {
     pub csv_type_errors: u64,
     pub csv_header_errors: u64,
     pub csv_encode_errors: u64,
+    pub protobuf_malformed: u64,
+    pub protobuf_oversize: u64,
+    pub protobuf_type_errors: u64,
+    pub protobuf_unknown_fields: u64,
+    pub protobuf_encode_errors: u64,
     pub websocket_source_received: u64,
     pub websocket_source_rows: u64,
     pub websocket_source_dropped_bad: u64,
@@ -800,6 +904,35 @@ pub struct IoSnapshot {
     pub file_segments: u64,
     pub file_syncs: u64,
     pub file_failed: u64,
+    pub postgres_source_rows: u64,
+    pub postgres_source_queries: u64,
+    pub postgres_source_dropped_bad: u64,
+    pub postgres_source_dropped_oversize: u64,
+    pub postgres_source_backpressure_waits: u64,
+    pub postgres_source_budget_waits: u64,
+    pub postgres_source_connects: u64,
+    pub postgres_source_connect_failures: u64,
+    pub postgres_source_query_failures: u64,
+    pub postgres_source_timeouts: u64,
+    pub postgres_sink_rows: u64,
+    pub postgres_sink_transactions: u64,
+    pub postgres_sink_statements: u64,
+    pub postgres_sink_batch_errors: u64,
+    pub postgres_sink_dropped_bad: u64,
+    pub postgres_sink_dropped_oversize: u64,
+    pub postgres_sink_budget_waits: u64,
+    pub postgres_sink_retries: u64,
+    pub postgres_sink_connects: u64,
+    pub postgres_sink_connect_failures: u64,
+    pub postgres_sink_timeouts: u64,
+    pub postgres_sink_unknown_outcome: u64,
+    pub postgres_sink_discarded_on_close: u64,
+    pub postgres_sink_fatal: u64,
+    /// Not summed by `add_assign`: the maximum is kept.
+    pub postgres_source_tracking_value: i64,
+    pub postgres_source_tracking_set: u64,
+    pub postgres_source_inbox_items: u64,
+    pub postgres_source_inbox_bytes: u64,
 }
 
 impl std::fmt::Display for IoSnapshot {
@@ -973,6 +1106,11 @@ impl IoSnapshot {
         self.csv_type_errors += other.csv_type_errors;
         self.csv_header_errors += other.csv_header_errors;
         self.csv_encode_errors += other.csv_encode_errors;
+        self.protobuf_malformed += other.protobuf_malformed;
+        self.protobuf_oversize += other.protobuf_oversize;
+        self.protobuf_type_errors += other.protobuf_type_errors;
+        self.protobuf_unknown_fields += other.protobuf_unknown_fields;
+        self.protobuf_encode_errors += other.protobuf_encode_errors;
         self.websocket_source_received += other.websocket_source_received;
         self.websocket_source_rows += other.websocket_source_rows;
         self.websocket_source_dropped_bad += other.websocket_source_dropped_bad;
@@ -1054,6 +1192,41 @@ impl IoSnapshot {
         self.file_segments += other.file_segments;
         self.file_syncs += other.file_syncs;
         self.file_failed += other.file_failed;
+        self.postgres_source_rows += other.postgres_source_rows;
+        self.postgres_source_queries += other.postgres_source_queries;
+        self.postgres_source_dropped_bad += other.postgres_source_dropped_bad;
+        self.postgres_source_dropped_oversize += other.postgres_source_dropped_oversize;
+        self.postgres_source_backpressure_waits += other.postgres_source_backpressure_waits;
+        self.postgres_source_budget_waits += other.postgres_source_budget_waits;
+        self.postgres_source_connects += other.postgres_source_connects;
+        self.postgres_source_connect_failures += other.postgres_source_connect_failures;
+        self.postgres_source_query_failures += other.postgres_source_query_failures;
+        self.postgres_source_timeouts += other.postgres_source_timeouts;
+        self.postgres_sink_rows += other.postgres_sink_rows;
+        self.postgres_sink_transactions += other.postgres_sink_transactions;
+        self.postgres_sink_statements += other.postgres_sink_statements;
+        self.postgres_sink_batch_errors += other.postgres_sink_batch_errors;
+        self.postgres_sink_dropped_bad += other.postgres_sink_dropped_bad;
+        self.postgres_sink_dropped_oversize += other.postgres_sink_dropped_oversize;
+        self.postgres_sink_budget_waits += other.postgres_sink_budget_waits;
+        self.postgres_sink_retries += other.postgres_sink_retries;
+        self.postgres_sink_connects += other.postgres_sink_connects;
+        self.postgres_sink_connect_failures += other.postgres_sink_connect_failures;
+        self.postgres_sink_timeouts += other.postgres_sink_timeouts;
+        self.postgres_sink_unknown_outcome += other.postgres_sink_unknown_outcome;
+        self.postgres_sink_discarded_on_close += other.postgres_sink_discarded_on_close;
+        self.postgres_sink_fatal += other.postgres_sink_fatal;
+        if other.postgres_source_tracking_set != 0 {
+            self.postgres_source_tracking_value = if self.postgres_source_tracking_set != 0 {
+                self.postgres_source_tracking_value
+                    .max(other.postgres_source_tracking_value)
+            } else {
+                other.postgres_source_tracking_value
+            };
+            self.postgres_source_tracking_set = 1;
+        }
+        self.postgres_source_inbox_items += other.postgres_source_inbox_items;
+        self.postgres_source_inbox_bytes += other.postgres_source_inbox_bytes;
     }
 }
 

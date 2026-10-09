@@ -1,0 +1,57 @@
+// Golden fixture schema for the protobuf format tests.
+// Regenerate the binaries with scripts/protobuf-fixtures.sh (protoc 36.2).
+syntax = "proto3";
+
+package telemetry.v1;
+
+import "google/protobuf/timestamp.proto";
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OK = 1;
+  STATUS_FAILED = 2;
+}
+
+message Inner {
+  int32 level = 1;
+}
+
+message Location {
+  double lat = 1;
+  double lon = 2;
+  optional string label = 3;
+  Inner inner = 4;
+}
+
+message Reading {
+  string device = 1;
+  int64 seq = 2;
+  optional double value = 3;
+  Status status = 4;
+  bool ok = 5;
+  bytes blob = 6;
+  uint32 u32 = 7;
+  uint64 u64 = 8;
+  sint32 s32 = 9;
+  sint64 s64 = 10;
+  fixed32 f32 = 11;
+  fixed64 f64 = 12;
+  sfixed32 sf32 = 13;
+  sfixed64 sf64 = 14;
+  float ratio = 15;
+  google.protobuf.Timestamp at = 16;
+  Location location = 17;
+  oneof reading {
+    string text = 18;
+    int64 count = 19;
+  }
+  repeated int32 samples = 20;
+  map<string, string> tags = 21;
+  optional int32 maybe = 22;
+  int32 i32 = 23;
+}
+
+message Tree {
+  Tree child = 1;
+  int32 v = 2;
+}

@@ -1041,6 +1041,18 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "semantics":"live_best_effort; batch_acked_after_every_command_reply; unknown_outcome=non_idempotent_command_sent_without_reply_not_resent",
             "scope":"this_attempt"});
     }
+    if s.source_kind == "postgres" {
+        value["postgres_source"] = json!({"rows":io.postgres_source_rows,"queries":io.postgres_source_queries,"dropped_bad":io.postgres_source_dropped_bad,"dropped_oversize":io.postgres_source_dropped_oversize,"backpressure_waits":io.postgres_source_backpressure_waits,"budget_waits":io.postgres_source_budget_waits,"connects":io.postgres_source_connects,"connect_failures":io.postgres_source_connect_failures,"query_failures":io.postgres_source_query_failures,"timeouts":io.postgres_source_timeouts,
+            "tracking_value":(io.postgres_source_tracking_set > 0).then_some(io.postgres_source_tracking_value),
+            "inbox_items":io.postgres_source_inbox_items,"inbox_bytes":io.postgres_source_inbox_bytes,
+            "semantics":"live_best_effort; tracking_value_advanced_after_whole_page_admitted; not_a_replay_point; late_rows_with_smaller_values_skipped",
+            "scope":"this_attempt"});
+    }
+    if s.sink_kind == "postgres" {
+        value["postgres_sink"] = json!({"rows":io.postgres_sink_rows,"transactions":io.postgres_sink_transactions,"statements":io.postgres_sink_statements,"batch_errors":io.postgres_sink_batch_errors,"dropped_bad":io.postgres_sink_dropped_bad,"dropped_oversize":io.postgres_sink_dropped_oversize,"budget_waits":io.postgres_sink_budget_waits,"retries":io.postgres_sink_retries,"connects":io.postgres_sink_connects,"connect_failures":io.postgres_sink_connect_failures,"timeouts":io.postgres_sink_timeouts,"unknown_outcome":io.postgres_sink_unknown_outcome,"discarded_on_close":io.postgres_sink_discarded_on_close,"fatal":io.postgres_sink_fatal,
+            "semantics":"live_best_effort; batch_acked_after_commit; unknown_outcome=insert_commit_sent_without_reply_not_retried",
+            "scope":"this_attempt"});
+    }
     if s.source_kind == "tcp" {
         value["tcp_source"] = json!({"received":io.tcp_source_received,"rows":io.tcp_source_rows,"bytes_read":io.tcp_source_bytes_read,
             "dropped_bad":io.tcp_source_dropped_bad,"dropped_oversize":io.tcp_source_dropped_oversize,"dropped_partial":io.tcp_source_dropped_partial,
@@ -1398,6 +1410,11 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         ("csv_type_errors", io.csv_type_errors),
         ("csv_header_errors", io.csv_header_errors),
         ("csv_encode_errors", io.csv_encode_errors),
+        ("protobuf_malformed", io.protobuf_malformed),
+        ("protobuf_oversize", io.protobuf_oversize),
+        ("protobuf_type_errors", io.protobuf_type_errors),
+        ("protobuf_unknown_fields", io.protobuf_unknown_fields),
+        ("protobuf_encode_errors", io.protobuf_encode_errors),
         ("websocket_source_received", io.websocket_source_received),
         ("websocket_source_rows", io.websocket_source_rows),
         (
@@ -1526,6 +1543,68 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             io.redis_sink_discarded_on_close,
         ),
         ("redis_sink_fatal", io.redis_sink_fatal),
+        ("postgres_source_rows", io.postgres_source_rows),
+        ("postgres_source_queries", io.postgres_source_queries),
+        (
+            "postgres_source_dropped_bad",
+            io.postgres_source_dropped_bad,
+        ),
+        (
+            "postgres_source_dropped_oversize",
+            io.postgres_source_dropped_oversize,
+        ),
+        (
+            "postgres_source_backpressure_waits",
+            io.postgres_source_backpressure_waits,
+        ),
+        (
+            "postgres_source_budget_waits",
+            io.postgres_source_budget_waits,
+        ),
+        ("postgres_source_connects", io.postgres_source_connects),
+        (
+            "postgres_source_connect_failures",
+            io.postgres_source_connect_failures,
+        ),
+        (
+            "postgres_source_query_failures",
+            io.postgres_source_query_failures,
+        ),
+        ("postgres_source_timeouts", io.postgres_source_timeouts),
+        (
+            "postgres_source_inbox_items",
+            io.postgres_source_inbox_items,
+        ),
+        (
+            "postgres_source_inbox_bytes",
+            io.postgres_source_inbox_bytes,
+        ),
+        ("postgres_sink_rows", io.postgres_sink_rows),
+        ("postgres_sink_transactions", io.postgres_sink_transactions),
+        ("postgres_sink_statements", io.postgres_sink_statements),
+        ("postgres_sink_batch_errors", io.postgres_sink_batch_errors),
+        ("postgres_sink_dropped_bad", io.postgres_sink_dropped_bad),
+        (
+            "postgres_sink_dropped_oversize",
+            io.postgres_sink_dropped_oversize,
+        ),
+        ("postgres_sink_budget_waits", io.postgres_sink_budget_waits),
+        ("postgres_sink_retries", io.postgres_sink_retries),
+        ("postgres_sink_connects", io.postgres_sink_connects),
+        (
+            "postgres_sink_connect_failures",
+            io.postgres_sink_connect_failures,
+        ),
+        ("postgres_sink_timeouts", io.postgres_sink_timeouts),
+        (
+            "postgres_sink_unknown_outcome",
+            io.postgres_sink_unknown_outcome,
+        ),
+        (
+            "postgres_sink_discarded_on_close",
+            io.postgres_sink_discarded_on_close,
+        ),
+        ("postgres_sink_fatal", io.postgres_sink_fatal),
         ("tcp_source_received", io.tcp_source_received),
         ("tcp_source_rows", io.tcp_source_rows),
         ("tcp_source_bytes_read", io.tcp_source_bytes_read),

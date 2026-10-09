@@ -294,7 +294,7 @@ pub fn replay_label_for_source(kind: &str) -> &'static str {
         "file" | "file_replay" | "replay" => "replayable",
         "jetstream" if cfg!(feature = "jetstream") => "replayable",
         "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "nats" | "databus" | "websocket"
-        | "tcp" | "http" | "plugin" => "unsupported",
+        | "tcp" | "postgres" | "http" | "plugin" => "unsupported",
         _ => sparrow_plan::REPLAY_UNBOUND,
     }
 }
@@ -402,7 +402,7 @@ pub fn validate_io(
     validate_lookup_io(spec,secrets,policy)?;
     spec.check_delivery()?;
     check_nats_reservation_total(spec)?;
-    check_csv_reliability(spec)?;
+    check_format_reliability(spec)?;
     if let Some(io) = &spec.graph_io {
         for (operator, source) in &io.sources {
             validate_source_io(spec, source, schema, secrets, policy, demo)
@@ -523,10 +523,11 @@ fn jetstream_sink_reservation(sink: &SinkSpec) -> Option<usize> {
     }
 }
 
-/// CSV bodies carry rows only. A reliable pipeline (JetStream source or
-/// aligned recovery) hands the HTTP sink an output identity that only the
-/// JSON envelope can carry, so that combination is refused up front.
-fn check_csv_reliability(spec: &PipelineSpec) -> Result<()> {
+/// CSV and protobuf bodies carry rows only. A reliable pipeline (JetStream
+/// source or aligned recovery) hands the HTTP sink an output identity that
+/// only the JSON envelope can carry, so that combination is refused up
+/// front; so is aligned JetStream output in protobuf (see below).
+fn check_format_reliability(spec: &PipelineSpec) -> Result<()> {
     let sinks: Vec<&SinkSpec> = match &spec.graph_io {
         Some(io) => io.sinks.values().collect(),
         None => vec![&spec.sink],
@@ -535,25 +536,36 @@ fn check_csv_reliability(spec: &PipelineSpec) -> Result<()> {
         Some(io) => io.sources.values().any(|s| s.kind == "jetstream"),
         None => spec.source.kind == "jetstream",
     };
-    let reliable =
-        jetstream_source || RecoveryPolicy::parse(&spec.recovery).is_ok_and(|r| r.is_aligned());
+    let aligned = RecoveryPolicy::parse(&spec.recovery).is_ok_and(|r| r.is_aligned());
+    let reliable = jetstream_source || aligned;
     for sink in sinks {
-        if reliable && sink.kind == "http" && sink.payload_format()?.as_csv().is_some() {
+        let format = sink.payload_format()?;
+        if reliable && sink.kind == "http" && !format.is_json() {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                "HTTP CSV bodies cannot carry reliable output identity; use format=json for checkpointed delivery",
+                format!(
+                    "HTTP {} bodies cannot carry reliable output identity; use format=json for checkpointed delivery",
+                    format.name().to_uppercase()
+                ),
+            ));
+        }
+        // The aligned JetStream sink identity (JSI1/JSI2) binds JSON or the
+        // CSV dialect only; a protobuf descriptor/mapping could change
+        // across a restore unnoticed, so aligned protobuf output is refused.
+        if aligned && sink.kind == "jetstream" && format.as_protobuf().is_some() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "aligned JetStream output does not support format=protobuf (the sink identity cannot bind a descriptor); use json or csv, or recovery=restart_fresh",
             ));
         }
     }
     Ok(())
 }
 
-/// CSV needs a schema it can lay out (columns, NULL spelling).
+/// CSV needs a schema it can lay out (columns, NULL spelling); protobuf
+/// resolves every column to a field path of the message type.
 fn validate_sink_format(sink: &SinkSpec, schema: &Schema) -> Result<()> {
-    if let Some(csv) = sink.payload_format()?.as_csv() {
-        csv.check_schema(schema)?;
-    }
-    Ok(())
+    sink.payload_format()?.check_schema(schema)
 }
 
 /// `msg_id_column` must be a utf8/integer column of the sink's input.
@@ -567,6 +579,10 @@ fn validate_sink_schema(sink: &SinkSpec, schema: &Schema) -> Result<()> {
         let config = influxdb_sink_config(sink)?;
         config.check_schema_budget(schema, sparrow_model::ResourceBudget::compact().reservation_bytes)?;
         config.mapping.compile(schema)?;
+    }
+    #[cfg(feature = "postgres")]
+    if sink.postgres.is_some() {
+        postgres_sink_config(sink)?.compile_schema(schema)?;
     }
     #[cfg(feature = "jetstream")]
     if let Some(js) = &sink.jetstream {
@@ -591,9 +607,7 @@ fn validate_source_io(
     policy: &TargetPolicy,
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
-    if let Some(csv) = source.payload_format()?.as_csv() {
-        csv.check_schema(schema)?;
-    }
+    source.payload_format()?.check_schema(schema)?;
     match source.kind.as_str() {
         "plugin" => source.plugin.as_ref().ok_or_else(||SparrowError::new(ErrorCode::InvalidArgument,"plugin Source binding required"))?.validate()?,
         #[cfg(feature = "jetstream")]
@@ -633,6 +647,28 @@ fn validate_source_io(
             refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
             databus_source_config(source, schema.clone(), spec.effective_fail_on_decode())?
                 .validate()?;
+        }
+        #[cfg(feature = "postgres")]
+        "postgres" => {
+            refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
+            // Checked against the smallest (compact) kernel, as elsewhere.
+            let compact = sparrow_model::ResourceBudget::compact();
+            let config = postgres_source_config(
+                source,
+                schema.clone(),
+                spec.effective_fail_on_decode(),
+                compact.reservation_bytes,
+                COMPACT_INGRESS_ROW_LIMIT,
+            )?;
+            config.validate()?;
+            config.check_inbox_budget(compact.queue_bytes)?;
+            config
+                .check_reservation_budget(compact.reservation_bytes, COMPACT_INGRESS_ROW_LIMIT)?;
+            config.target.bind(
+                secrets,
+                policy,
+                COMPACT_INGRESS_ROW_LIMIT + sparrow_connectors::postgres::conn::MESSAGE_SLACK,
+            )?;
         }
         #[cfg(feature = "websocket")]
         "websocket" => {
@@ -688,7 +724,7 @@ fn validate_source_io(
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
                 format!(
-                    "source kind `{other}` is not supported (mqtt|http_push|http_poll|nats|websocket|tcp|databus|file)"
+                    "source kind `{other}` is not supported (mqtt|http_push|http_poll|nats|websocket|tcp|databus|postgres|file)"
                 ),
             ));
         }
@@ -708,12 +744,15 @@ fn validate_sink_io(
             "file options require a File Sink",
         ));
     }
-    let csv = sink.payload_format()?.as_csv().is_some();
-    if let Some(action) = sink.action.as_ref().filter(|_| csv) {
+    let format = sink.payload_format()?;
+    if let Some(action) = sink.action.as_ref().filter(|_| !format.is_json()) {
         if sink.kind == "file" || action.body.is_some() || action.single {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
-                "a CSV sink writes each row as one CSV record: no action.body/single, and no action on a File Sink",
+                format!(
+                    "a {} sink writes each row as one record: no action.body/single, and no action on a File Sink",
+                    format.name().to_uppercase()
+                ),
             ));
         }
     }
@@ -760,6 +799,19 @@ fn validate_sink_io(
             )?;
         }
         "databus" => databus_sink_config(sink)?.validate()?,
+        #[cfg(feature = "postgres")]
+        "postgres" => {
+            let config = postgres_sink_config(sink)?;
+            config.validate()?;
+            config.check_reservation_budget(
+                sparrow_model::ResourceBudget::compact().reservation_bytes,
+            )?;
+            config.target.bind(
+                secrets,
+                policy,
+                sparrow_connectors::postgres::conn::MESSAGE_SLACK,
+            )?;
+        }
         "redis" => {
             let config = redis_sink_config(sink)?;
             config.validate()?;
@@ -811,7 +863,7 @@ fn validate_sink_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|websocket|tcp|databus|influxdb|redis|file)"),
+                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|websocket|tcp|databus|influxdb|redis|postgres|file)"),
             ));
         }
     }
@@ -845,7 +897,7 @@ pub fn validate_io_with_plan(
             };
             validate_action_schema(&spec.sink, output)?;
         }
-        if spec.sink.jetstream.is_some() || spec.sink.redis.is_some() || spec.sink.influxdb.is_some() {
+        if spec.sink.jetstream.is_some() || spec.sink.postgres.is_some() || spec.sink.redis.is_some() || spec.sink.influxdb.is_some() {
             let output = plan
                 .stages
                 .iter()
@@ -880,6 +932,7 @@ pub fn validate_io_with_plan(
 
     validate_lookup_io(spec,secrets,policy)?;
     check_nats_reservation_total(spec)?;
+    check_format_reliability(spec)?;
     for (operator, source) in &io.sources {
         let actual = graph_endpoint_schema(plan, *operator, true)?;
         validate_source_io(spec, source, &actual, secrets, policy, demo)
@@ -1083,6 +1136,50 @@ pub fn databus_source_config(
             )
         })?
         .connector_config(schema, source.inbox_capacity, fail_on_decode)
+}
+
+/// The ingress row limit of the compact kernel (`compact_kernel`), used to
+/// validate PostgreSQL Source pages before a kernel is chosen.
+#[cfg(feature = "postgres")]
+const COMPACT_INGRESS_ROW_LIMIT: usize = 64 * 1024;
+
+#[cfg(feature = "postgres")]
+pub fn postgres_source_config(
+    source: &SourceSpec,
+    schema: Schema,
+    fail_on_decode: bool,
+    reservation: usize,
+    max_row_bytes: usize,
+) -> Result<sparrow_connectors::PgSourceConfig> {
+    source
+        .postgres
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "PostgreSQL source requires source.postgres",
+            )
+        })?
+        .connector_config(
+            schema,
+            source.inbox_capacity,
+            fail_on_decode,
+            reservation,
+            max_row_bytes,
+        )
+}
+
+#[cfg(feature = "postgres")]
+pub fn postgres_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::PgSinkConfig> {
+    sink.postgres
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "PostgreSQL sink requires sink.postgres",
+            )
+        })?
+        .connector_config(sink.outbox_capacity)
 }
 
 pub fn redis_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::RedisSinkConfig> {
@@ -2024,6 +2121,8 @@ pub fn capabilities_json() -> serde_json::Value {
     let tcp = ConnectorCapabilities::TCP_SOURCE;
     let tcp_sink = ConnectorCapabilities::TCP_SINK;
     let bus_sink = ConnectorCapabilities::DATABUS_SINK;
+    let pg = ConnectorCapabilities::POSTGRES_SOURCE;
+    let pg_sink = ConnectorCapabilities::POSTGRES_SINK;
     let redis_sink = ConnectorCapabilities::REDIS_SINK;
     let influx_sink = ConnectorCapabilities::INFLUXDB_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
@@ -2036,10 +2135,13 @@ pub fn capabilities_json() -> serde_json::Value {
         "exactly_once": "rejected",
         "formats": {
             "default": "json",
-            "available": ["json", "csv"],
+            "available": ["json", "csv", "protobuf"],
             "csv_sources": crate::spec::CSV_SOURCE_KINDS,
             "csv_sinks": crate::spec::CSV_SINK_KINDS,
             "csv_contract": "strict_rfc4180_subset; header_or_positional; typed_per_schema; one_record_per_message; file_header_per_segment; no_reliable_http_identity",
+            "protobuf_sources": crate::spec::PROTOBUF_SOURCE_KINDS,
+            "protobuf_sinks": crate::spec::PROTOBUF_SINK_KINDS,
+            "protobuf_contract": "proto2_proto3_FileDescriptorSet_no_editions; explicit_field_paths_singular_messages_only; repeated_map_group_refused; presence_null_implicit_default; one_message_per_message; http_length_delimited; no_file; no_aligned_jetstream_sink; no_reliable_http_identity",
             "docs": "docs/FORMATS.md",
         },
         "connectors": [
@@ -2192,6 +2294,36 @@ pub fn capabilities_json() -> serde_json::Value {
                 "duplicates": "set_hset_resent_after_lost_connection; xadd_publish_push_never_resent_after_send_unknown_outcome_counted",
                 "maturity": "preview",
                 "contract": "tls_required_for_credentials; one_pipeline_in_flight; bounded_rows_bytes_interval; templated_keys_from_columns; stop_deadline_covers_in_flight",
+            },
+            {
+                "kind": pg.kind,
+                "roles": ["source"],
+                "enabled_by_build": cfg!(feature = "postgres"),
+                "replay": pg.replay.as_str(),
+                "delivery": pg.delivery.as_str(),
+                "recovery": pg.recovery.as_str(),
+                "protocol": "tokio_postgres_0_7_18_extended_query; postgresql_16_tested; no_cdc",
+                "sslmode": ["verify-full", "disable"],
+                "query": "periodic_select_wrapped_where_tracking_gt_last_order_by_tracking_limit_fetch_rows; read_only_transaction",
+                "tracking": "int2_int4_int8_timestamp_timestamptz; advanced_after_whole_page_admitted; not_a_replay_point",
+                "late_rows": "rows_committed_later_with_smaller_or_equal_tracking_value_are_skipped",
+                "maturity": "preview",
+                "contract": "password_requires_verify_full; page_reserved_before_query; server_flags_oversize_rows; backend_messages_bounded; stop_cancels_in_flight_query",
+            },
+            {
+                "kind": pg_sink.kind,
+                "roles": ["sink"],
+                "enabled_by_build": cfg!(feature = "postgres"),
+                "replay": pg_sink.replay.as_str(),
+                "delivery": pg_sink.delivery.as_str(),
+                "recovery": pg_sink.recovery.as_str(),
+                "protocol": "tokio_postgres_0_7_18_extended_query; postgresql_16_tested",
+                "modes": ["insert", "upsert"],
+                "statement": "insert_select_from_rows_from_unnest_binary_arrays; on_conflict_do_update_or_do_nothing",
+                "acknowledgement": "batch_acked_after_commit; one_transaction_per_batch",
+                "duplicates": "upsert_retried_after_unknown_commit_outcome; insert_not_retried_after_commit_sent_unknown_outcome_counted",
+                "maturity": "preview",
+                "contract": "password_requires_verify_full; reservation_charged_up_front; bad_rows_dropped_batch_failed; schema_auth_privilege_errors_fail_job; stop_deadline_covers_in_flight",
             },
             {
                 "kind": influx_sink.kind,
@@ -2985,6 +3117,7 @@ mod tests {
                 nats: None,
                 databus: None,
                 websocket: None,
+                postgres: None,
                 tcp: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
@@ -3007,6 +3140,7 @@ mod tests {
                 file_contract: None,
                 format: None,
                 csv: None,
+                protobuf: None,
             },
             sink: crate::spec::SinkSpec {
                 nats: None,
@@ -3014,6 +3148,7 @@ mod tests {
                 influxdb: None,
                 websocket: None,
                 redis: None,
+                postgres: None,
                 tcp: None,
                 jetstream: None,
                 plugin: None,
@@ -3038,6 +3173,7 @@ mod tests {
                 tls: false,
                 format: None,
                 csv: None,
+                protobuf: None,
             },
             delivery: "at_least_once".into(),
             recovery: "restart_fresh".into(),
@@ -3084,6 +3220,7 @@ mod tests {
             nats: None,
             databus: None,
             websocket: None,
+            postgres: None,
             tcp: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
@@ -3106,6 +3243,7 @@ mod tests {
             file_contract: None,
             format: None,
             csv: None,
+            protobuf: None,
         };
         let schema = Schema::new(
             SchemaId::new(1),
@@ -3135,6 +3273,7 @@ mod tests {
             nats: None,
             databus: None,
             websocket: None,
+            postgres: None,
             tcp: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
@@ -3157,6 +3296,7 @@ mod tests {
             file_contract: None,
             format: None,
             csv: None,
+            protobuf: None,
         };
         let schema = Schema::new(
             SchemaId::new(1),
@@ -3183,6 +3323,7 @@ mod tests {
                 influxdb: None,
                 websocket: None,
                 redis: None,
+                postgres: None,
                 tcp: None,
                 jetstream: None,
                 plugin: None,
@@ -3207,6 +3348,7 @@ mod tests {
             tls: false,
             format: None,
             csv: None,
+            protobuf: None,
         };
         let err = http_config(&sink, None).unwrap_err();
         assert_eq!(err.code, ErrorCode::PolicyDenied);

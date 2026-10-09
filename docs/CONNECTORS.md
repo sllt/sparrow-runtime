@@ -311,6 +311,25 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | 关闭 | `flush_timeout_ms` 截止时间覆盖在途流水线、重试等待、排队批次 |
 | 指标 | `redis_sink_*`，pipeline status 的 `redis_sink` 对象；Lookup 计数在 `lookup_runtime.external` |
 
+## 附：PostgreSQL Source / Sink / Lookup（`kind: "postgres"`，`external_lookups.*.postgres`，feature `postgres`）
+
+说明见 [POSTGRES.md](POSTGRES.md)。客户端为 `tokio-postgres =0.7.18`（无 libpq）+ rustls；只用扩展查询协议，不支持 CDC。
+
+| 合同项 | PostgreSQL 的实现 |
+|---|---|
+| 语义 | capability `postgres` / `postgres_sink`：`live_best_effort` / `restart_fresh` / replay `unsupported`；拒绝 restore、checkpoint、aligned（含 graph Source / Sink）。跟踪值不是回放点：晚提交的较小跟踪值会被跳过。Sink 批次在 `COMMIT` 成功后回执 |
+| Source | 周期查询，`WHERE t > $last ORDER BY t LIMIT fetch_rows`，`READ ONLY` 事务；整页进入 job 后才推进跟踪值；相同跟踪值不跨页，整页同值时停止 |
+| Sink | `INSERT ... SELECT * FROM ROWS FROM (unnest($1::<t>[]), ...)`，可选 `ON CONFLICT (key) DO UPDATE / DO NOTHING`；每批一个事务，按 `chunk_rows` / `chunk_bytes` 拆语句 |
+| Lookup | 一批 key 一条语句（`= ANY($1)` 或 `ROWS FROM (unnest ...)` JOIN），`LIMIT 不同 key 数 + 1`，key 不唯一报错；连接池 = `max_inflight` |
+| 类型 | 显式映射：int2/4/8、float4/8、numeric（Utf8 精确或 Float64）、text 系、bool、timestamp(tz)、json(b)、bytea；其他类型拒绝 |
+| 内存 | 每条后端消息在 socket 上限长（行上限 + 64 KiB）；Source 每次查询前预扣整页额度，服务器端标记超大行；Sink 连接 + 2 × `chunk_bytes`（+ 冲突键）在绑定时预扣，≤ reservation/2；Lookup 每 key 192 KiB scratch |
+| 密钥与 TLS | `sslmode` 只有 `verify-full`（默认，校验链与主机名，`ca_pem` 替换根证书）和 `disable`；`prefer` / `allow` / `require` / `verify-ca` 拒绝；密码只经 secret 引用且只允许 `verify-full`；URL 中不允许 userinfo / query |
+| 白名单 | host:port 经 `TargetPolicy` |
+| 重试 | 连接 / 中断 / 08 / 40 / 53 / 57P0x / 57014 / 55P03 重试；UPSERT 在 `COMMIT` 结果未知时也重试，INSERT 不重试并计 `unknown_outcome`；Lookup 在复用连接已断开时换新连接重试一次 |
+| 失败 | 21 / 22 / 23 使批次失败；28 / 42 / 3D / 3F / 0A / 2B、schema 不符使 job 失败（`postgres_sink_fatal`）；Source 的认证 / 语法 / 权限 / 形状错误停止 job |
+| 关闭 | 放弃的语句（超时、停止，含连接后的 prepare）发送 cancel request 并关闭连接；Sink 的 `flush_timeout_ms` 截止时间覆盖在途事务、重试与排队批次 |
+| 指标 | `postgres_source_*` / `postgres_sink_*`，pipeline status 的 `postgres_source`（含 `tracking_value`）/ `postgres_sink` 对象 |
+
 ## 附：TCP Source / Sink（`kind: "tcp"`，始终构建）
 
 说明见 [TCP.md](TCP.md)。只做客户端模式（`host:port`，可选 TLS）；listen 模式单独立项。
@@ -346,4 +365,6 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | `databus` | ✓（内部） | ✗ | ✗ | 进程内传递行 |
 | `log` / plugin | ✓ | — | ✗ | — |
 
-新增字节型 connector 时，应通过 `PayloadFormat` 编解码，并加入 `CSV_SOURCE_KINDS` / `CSV_SINK_KINDS`，不要自带解析器。先按长度拒绝（`max_message_bytes`），再按 `decode_scratch` / `encode_scratch` 记账，最后用 `encode_row_bounded_with_capacity` 等有界接口编解码。
+`format: "protobuf"`：`mqtt` / `nats` / `jetstream` / `http_push` / `websocket`（二进制帧）一条消息一条记录；`http` Sink 与 `http_poll` 使用长度前缀消息流；`file` / `file_replay` / `replay` / `databus` 拒绝；JetStream Sink aligned、HTTP Sink 的 JetStream 源 / aligned 拒绝。详见 [FORMATS.md](FORMATS.md#protobuf)。
+
+新增字节型 connector 时，应通过 `PayloadFormat` 编解码，并加入 `CSV_SOURCE_KINDS` / `CSV_SINK_KINDS`（以及 `PROTOBUF_SOURCE_KINDS` / `PROTOBUF_SINK_KINDS`），不要自带解析器。先按长度拒绝（`max_message_bytes`），再按 `decode_scratch` / `encode_scratch` 记账，最后用 `encode_row_bounded_with_capacity` 等有界接口编解码。

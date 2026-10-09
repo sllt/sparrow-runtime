@@ -196,14 +196,18 @@ impl HttpPollSourceConfig {
             ));
         }
         self.check_inbox_budget(ResourceBudget::compact().queue_bytes)?;
-        if let Some(csv) = self.payload_format.as_csv() {
+        if !self.payload_format.is_json() {
             if self.format != HttpPollFormat::Json {
                 return Err(error(
                     ErrorCode::InvalidArgument,
-                    "HTTP poll http_poll.format frames JSON bodies; leave it unset with a CSV source format",
+                    format!(
+                        "HTTP poll http_poll.format frames JSON bodies; leave it unset with a {} source format",
+                        self.payload_format.name()
+                    ),
                 ));
             }
-            csv.check_schema(&self.schema)
+            self.payload_format
+                .check_schema(&self.schema)
                 .map_err(|e| error(e.code, e.message))?;
         }
         if self.uses_credentials() && url.scheme() != "https" {
@@ -343,6 +347,7 @@ fn build_headers(
         reqwest::header::ACCEPT,
         HeaderValue::from_static(match (&config.payload_format, config.format) {
             (PayloadFormat::Csv(_), _) => "text/csv",
+            (PayloadFormat::Protobuf(_), _) => "application/x-protobuf",
             (_, HttpPollFormat::Json) => "application/json",
             (_, HttpPollFormat::Ndjson) => "application/x-ndjson, application/json;q=0.5",
         }),
@@ -778,6 +783,11 @@ impl HttpPollSource {
                 .ingest_csv(csv, bytes, ingress, cancel, received_at)
                 .await;
         }
+        if let Some(protobuf) = self.config.payload_format.as_protobuf() {
+            return self
+                .ingest_protobuf(protobuf, bytes, ingress, cancel, received_at)
+                .await;
+        }
         let mut records = Records::new(bytes, self.config.format);
         let mut admission = Admission::Complete;
         while let Some(span) = records.next_span() {
@@ -907,7 +917,7 @@ impl HttpPollSource {
         let mut document = match document {
             Ok(document) => document,
             Err(e) => {
-                self.diag.csv_decode_error(&self.config.payload_format, &e);
+                self.diag.format_decode_error(&self.config.payload_format, &e);
                 self.diag
                     .http_poll_bad_responses
                     .fetch_add(1, Ordering::Relaxed);
@@ -949,7 +959,105 @@ impl HttpPollSource {
             let row = match decoded {
                 Ok(row) => row,
                 Err(e) => {
-                    self.diag.csv_decode_error(&self.config.payload_format, &e);
+                    self.diag.format_decode_error(&self.config.payload_format, &e);
+                    self.diag
+                        .http_poll_dropped_bad
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
+                    if self.config.fail_on_decode {
+                        return Err(PollFailure {
+                            error: error(e.code, "HTTP poll record decode failed (fail_on_decode)"),
+                            fatal: true,
+                        });
+                    }
+                    admission = Admission::Incomplete;
+                    continue;
+                }
+            };
+            self.diag.observation.progress(true, 1);
+            match self
+                .admit(row, ingress, cancel, OriginSpan::at(received_at))
+                .await?
+            {
+                Admission::Complete => {}
+                Admission::Incomplete => admission = Admission::Incomplete,
+                Admission::Stopped => return Ok(Admission::Stopped),
+            }
+        }
+        if cancel.is_cancelled() {
+            return Ok(Admission::Stopped);
+        }
+        Ok(admission)
+    }
+
+    /// Protobuf body: a length-delimited stream (`varint length` + message,
+    /// repeated). A framing error (truncated length or message) rejects the
+    /// rest of the response like a JSON framing error, keeping rows already
+    /// admitted; a bad or over-long message drops that message and makes
+    /// the response Incomplete. Each message is length-checked (inside
+    /// `decode_message`, before any allocation), then its decode scratch is
+    /// charged and held until the row is admitted.
+    async fn ingest_protobuf(
+        &self,
+        protobuf: &sparrow_formats::ProtobufFormat,
+        bytes: &[u8],
+        ingress: &Ingress<'_>,
+        cancel: &CancellationToken,
+        received_at: std::time::Instant,
+    ) -> std::result::Result<Admission, PollFailure> {
+        let schema = &self.config.schema;
+        let max_message = self
+            .config
+            .payload_format
+            .max_message_bytes(&self.config.json_limits);
+        let mut document = protobuf.document(bytes);
+        let mut admission = Admission::Complete;
+        while let Some(message) = document.next_message() {
+            if cancel.is_cancelled() {
+                return Ok(Admission::Stopped);
+            }
+            let message = match message {
+                Ok(message) => message,
+                Err(e) => {
+                    self.diag.format_decode_error(&self.config.payload_format, &e);
+                    self.diag
+                        .http_poll_bad_responses
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(PollFailure {
+                        error: error(e.code, e.message),
+                        fatal: self.config.fail_on_decode,
+                    });
+                }
+            };
+            let decoded = if message.len() > max_message {
+                Err(sparrow_model::SparrowError::new(
+                    ErrorCode::MaxRecordSize,
+                    format!("protobuf message {}B exceeds {max_message}B", message.len()),
+                ))
+            } else {
+                let charged = ingress.owner.acquire(
+                    CreditKind::Reservation,
+                    protobuf.decode_scratch(schema, message.len()),
+                );
+                let Ok(lease) = charged else {
+                    self.diag
+                        .http_poll_dropped_budget
+                        .fetch_add(1, Ordering::Relaxed);
+                    admission = Admission::Incomplete;
+                    continue;
+                };
+                let decode_started = std::time::Instant::now();
+                let decoded = protobuf.decode_message(schema, message, None);
+                self.diag
+                    .observation
+                    .record(Latency::Decode, decode_started.elapsed());
+                decoded.map(|row| (row, lease))
+            };
+            let (row, _scratch) = match decoded {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    self.diag.format_decode_error(&self.config.payload_format, &e);
                     self.diag
                         .http_poll_dropped_bad
                         .fetch_add(1, Ordering::Relaxed);

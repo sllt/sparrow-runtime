@@ -86,6 +86,12 @@ impl TcpSourceConfig {
 
     pub fn validate(&self, policy: &TargetPolicy) -> Result<()> {
         refuse_durable_recovery(&self.restore)?;
+        if self.payload_format.as_protobuf().is_some() {
+            return Err(error(
+                ErrorCode::InvalidArgument,
+                "TCP protobuf framing is not supported",
+            ));
+        }
         if let Some(csv) = self.payload_format.as_csv() {
             if self.client.framing == TcpFraming::Lines && csv.options().multiline {
                 return Err(error(
@@ -547,7 +553,8 @@ impl TcpSource {
 
     /// Count a decode failure; `fail_on_decode` turns it into a job error.
     fn bad(&self, e: &sparrow_model::SparrowError) -> Result<()> {
-        self.diag.csv_decode_error(&self.config.payload_format, e);
+        self.diag
+            .format_decode_error(&self.config.payload_format, e);
         self.diag
             .tcp_source_dropped_bad
             .fetch_add(1, Ordering::Relaxed);

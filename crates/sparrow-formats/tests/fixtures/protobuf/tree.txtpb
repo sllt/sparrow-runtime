@@ -1,0 +1,2 @@
+v: 1
+child { v: 2 child { v: 3 child { v: 4 } } }

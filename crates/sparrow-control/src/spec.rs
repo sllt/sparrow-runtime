@@ -88,6 +88,9 @@ pub struct SourceSpec {
     /// Required exclusively for `kind = "websocket"` (client mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket: Option<WebSocketSourceSpec>,
+    /// Required exclusively for `kind = "postgres"` (`postgres` build feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<Box<crate::postgres_spec::PostgresSourceSpec>>,
     /// Required exclusively for `kind = "tcp"` (client mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp: Option<TcpSourceSpec>,
@@ -134,13 +137,17 @@ pub struct SourceSpec {
     /// emit final ET windows and then complete.
     #[serde(default)]
     pub file_contract: Option<String>,
-    /// Payload/record format: `json` (default; NDJSON for File) or `csv`.
-    /// See docs/FORMATS.md for the per-kind matrix.
+    /// Payload/record format: `json` (default; NDJSON for File), `csv` or
+    /// `protobuf`. See docs/FORMATS.md for the per-kind matrix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// CSV options; accepted only with `format = "csv"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub csv: Option<sparrow_formats::CsvOptions>,
+    /// Protobuf options; required with (and accepted only with)
+    /// `format = "protobuf"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protobuf: Option<sparrow_formats::ProtobufOptions>,
 }
 
 /// Source kinds whose bytes carry a selectable record format.
@@ -157,50 +164,67 @@ pub const CSV_SOURCE_KINDS: &[&str] = &[
     "replay",
 ];
 /// Sink kinds whose bytes carry a selectable record format.
-pub const CSV_SINK_KINDS: &[&str] = &[
-    "mqtt",
-    "http",
-    "nats",
-    "jetstream",
-    "websocket",
-    "tcp",
-    "file",
-];
+pub const CSV_SINK_KINDS: &[&str] = &["mqtt", "http", "nats", "jetstream", "websocket", "tcp", "file"];
+/// Source kinds that decode protobuf: one message per broker message /
+/// WebSocket binary message / HTTP push body, or a length-delimited stream
+/// per HTTP Poll response. File kinds are refused (newline framing only).
+pub const PROTOBUF_SOURCE_KINDS: &[&str] =
+    &["mqtt", "http_push", "http_poll", "nats", "jetstream", "websocket"];
+/// Sink kinds that encode protobuf (HTTP: a length-delimited stream body).
+pub const PROTOBUF_SINK_KINDS: &[&str] = &["mqtt", "http", "nats", "jetstream", "websocket"];
 
 fn payload_format(
     side: &str,
     kind: &str,
     format: Option<&str>,
     csv: Option<&sparrow_formats::CsvOptions>,
+    protobuf: Option<&sparrow_formats::ProtobufOptions>,
     role: sparrow_formats::CsvRole,
 ) -> Result<sparrow_formats::PayloadFormat> {
     let invalid = |message: String| SparrowError::new(ErrorCode::InvalidArgument, message);
-    match format {
-        None | Some("json") => match csv {
-            Some(_) => Err(invalid(format!(
-                "{side}.csv requires {side}.format = \"csv\""
-            ))),
-            None => Ok(sparrow_formats::PayloadFormat::Json),
-        },
-        Some("csv") => {
-            let supported = match role {
-                sparrow_formats::CsvRole::Decode => CSV_SOURCE_KINDS,
-                sparrow_formats::CsvRole::Encode => CSV_SINK_KINDS,
-            };
-            if !supported.contains(&kind) {
-                return Err(SparrowError::new(
-                    ErrorCode::FeatureUnavailable,
-                    format!(
-                        "{side} kind `{kind}` has no CSV format ({})",
-                        supported.join("|")
-                    ),
-                ));
-            }
+    let name = format.unwrap_or("json");
+    if csv.is_some() && name != "csv" {
+        return Err(invalid(format!(
+            "{side}.csv requires {side}.format = \"csv\""
+        )));
+    }
+    if protobuf.is_some() && name != "protobuf" {
+        return Err(invalid(format!(
+            "{side}.protobuf requires {side}.format = \"protobuf\""
+        )));
+    }
+    let supported = |kinds: &[&str], label: &str| {
+        if kinds.contains(&kind) {
+            Ok(())
+        } else {
+            Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                format!("{side} kind `{kind}` has no {label} format ({})", kinds.join("|")),
+            ))
+        }
+    };
+    let decode = role == sparrow_formats::CsvRole::Decode;
+    match name {
+        "json" => Ok(sparrow_formats::PayloadFormat::Json),
+        "csv" => {
+            supported(if decode { CSV_SOURCE_KINDS } else { CSV_SINK_KINDS }, "CSV")?;
             let options = csv.cloned().unwrap_or_default();
             Ok(sparrow_formats::PayloadFormat::csv(options.compile(role)?))
         }
-        Some(other) => Err(invalid(format!(
-            "{side}.format `{other}` is not supported (json|csv)"
+        "protobuf" => {
+            supported(
+                if decode { PROTOBUF_SOURCE_KINDS } else { PROTOBUF_SINK_KINDS },
+                "protobuf",
+            )?;
+            let options = protobuf.ok_or_else(|| {
+                invalid(format!(
+                    "{side}.format = \"protobuf\" requires {side}.protobuf (descriptor_set, message)"
+                ))
+            })?;
+            Ok(sparrow_formats::PayloadFormat::protobuf(options.compile(role)?))
+        }
+        other => Err(invalid(format!(
+            "{side}.format `{other}` is not supported (json|csv|protobuf)"
         ))),
     }
 }
@@ -213,6 +237,7 @@ impl SourceSpec {
             &self.kind,
             self.format.as_deref(),
             self.csv.as_ref(),
+            self.protobuf.as_ref(),
             sparrow_formats::CsvRole::Decode,
         )
     }
@@ -1564,6 +1589,9 @@ pub struct SinkSpec {
     /// Required exclusively for `kind = "redis"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redis: Option<Box<RedisSinkSpec>>,
+    /// Required exclusively for `kind = "postgres"` (`postgres` build feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<Box<crate::postgres_spec::PostgresSinkSpec>>,
     /// Required exclusively for `kind = "tcp"` (client mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp: Option<TcpSinkSpec>,
@@ -1604,13 +1632,18 @@ pub struct SinkSpec {
     pub clean_session: bool,
     #[serde(default)]
     pub tls: bool,
-    /// Payload/record format: `json` (default; NDJSON for File) or `csv`.
+    /// Payload/record format: `json` (default; NDJSON for File), `csv` or
+    /// `protobuf`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// CSV options; accepted only with `format = "csv"`. Decode-only options
     /// (trim, multiline, columns, ...) are refused on a sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub csv: Option<sparrow_formats::CsvOptions>,
+    /// Protobuf options; required with (and accepted only with)
+    /// `format = "protobuf"`. Decode-only options are refused on a sink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protobuf: Option<sparrow_formats::ProtobufOptions>,
 }
 
 impl SinkSpec {
@@ -1621,6 +1654,7 @@ impl SinkSpec {
             &self.kind,
             self.format.as_deref(),
             self.csv.as_ref(),
+            self.protobuf.as_ref(),
             sparrow_formats::CsvRole::Encode,
         )
     }
@@ -1994,6 +2028,7 @@ impl PipelineSpec {
         self.check_influxdb()?;
         self.check_websocket()?;
         self.check_redis()?;
+        self.check_postgres()?;
         self.check_tcp()?;
         if self
             .source
@@ -2456,6 +2491,7 @@ impl PipelineSpec {
                 || sink.max_inflight.is_some()
                 || sink.format.is_some()
                 || sink.csv.is_some()
+                || sink.protobuf.is_some()
             {
                 return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
@@ -2473,6 +2509,118 @@ impl PipelineSpec {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
                 "Redis Sink is live_best_effort/restart_fresh (no checkpoint binds the target; XADD/PUBLISH/LPUSH/RPUSH are not idempotent); no checkpoint or restore",
+            ));
+        }
+        Ok(())
+    }
+
+    /// PostgreSQL Source/Sink: live-only. The tracking value is not a
+    /// checkpoint replay point (a row committed late with a smaller value is
+    /// skipped) and plain INSERT is not idempotent, so every durable claim is
+    /// refused, for legacy and graph endpoints alike.
+    fn check_postgres(&self) -> Result<()> {
+        let (graph_sources, graph_sinks): (Vec<&SourceSpec>, Vec<&SinkSpec>) = self
+            .graph_io
+            .as_ref()
+            .map(|io| (io.sources.values().collect(), io.sinks.values().collect()))
+            .unwrap_or_default();
+        let mut any = false;
+        for source in std::iter::once(&self.source).chain(graph_sources) {
+            if source.postgres.is_some() != (source.kind == "postgres") {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "source.postgres is required exclusively for source kind=postgres",
+                ));
+            }
+            if source.kind != "postgres" {
+                continue;
+            }
+            any = true;
+            if source.jetstream.is_some()
+                || source.http_poll.is_some()
+                || source.nats.is_some()
+                || source.databus.is_some()
+                || source.websocket.is_some()
+                || source.tcp.is_some()
+                || source.plugin.is_some()
+                || source.host.is_some()
+                || source.port.is_some()
+                || source.path.is_some()
+                || source.bind.is_some()
+                || source.client_id.is_some()
+                || source.username_secret.is_some()
+                || source.password_secret.is_some()
+                || source.use_demo_io
+                || source.tls
+                || source.skip_verify
+                || source.file_contract.is_some()
+                || source.qos != 0
+                || !source.clean_session
+                || source.topic != default_topic()
+                || source.inbox_wait_ms.is_some()
+                || source.tcp_quickack.is_some()
+                || source.inbox_bytes.is_some()
+                || source.format.is_some()
+                || source.csv.is_some()
+                || source.protobuf.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "PostgreSQL options belong in source.postgres (rows come typed from the query; no format); mixed connector fields refused",
+                ));
+            }
+        }
+        for sink in std::iter::once(&self.sink).chain(graph_sinks) {
+            if sink.postgres.is_some() != (sink.kind == "postgres") {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "sink.postgres is required exclusively for sink kind=postgres",
+                ));
+            }
+            if sink.kind != "postgres" {
+                continue;
+            }
+            any = true;
+            if sink.has_foreign_fields()
+                || sink.nats.is_some()
+                || sink.jetstream.is_some()
+                || sink.databus.is_some()
+                || sink.websocket.is_some()
+                || sink.tcp.is_some()
+                || sink.influxdb.is_some()
+                || sink.redis.is_some()
+                || sink.batch_rows.is_some()
+                || sink.batch_bytes.is_some()
+                || sink.linger_ms.is_some()
+                || sink.max_inflight.is_some()
+                || sink.format.is_some()
+                || sink.csv.is_some()
+                || sink.protobuf.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "PostgreSQL options belong in sink.postgres (no actions, no format); mixed connector fields refused",
+                ));
+            }
+        }
+        if !any {
+            return Ok(());
+        }
+        if !cfg!(feature = "postgres") {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "PostgreSQL support requires the postgres build feature",
+            ));
+        }
+        if self.delivery != "live_best_effort"
+            || self.recovery != "restart_fresh"
+            || self.restore.is_some()
+            || self.checkpoint.is_some()
+            || self.checkpoint_dir.is_some()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "PostgreSQL Source/Sink are live_best_effort/restart_fresh (the tracking value is not a replay point; INSERT is not idempotent); no checkpoint or restore",
             ));
         }
         Ok(())
@@ -2507,6 +2655,7 @@ impl PipelineSpec {
                 || sink.tcp.is_some()
                 || sink.format.is_some()
                 || sink.csv.is_some()
+                || sink.protobuf.is_some()
                 || sink.batch_rows.is_some()
                 || sink.batch_bytes.is_some()
                 || sink.linger_ms.is_some()
@@ -2598,6 +2747,7 @@ impl PipelineSpec {
         // must not rely solely on from_json/basic_check for the DataBus gate.
         self.check_databus()?;
         self.check_redis()?;
+        self.check_postgres()?;
         self.check_influxdb()?;
         self.check_tcp()?;
         let g = DeliveryGuarantee::parse(&self.delivery)?;
