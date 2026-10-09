@@ -156,6 +156,20 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    pub const KAFKA_SOURCE: Self = Self {
+        kind: "kafka",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    pub const KAFKA_SINK: Self = Self {
+        kind: "kafka_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     /// TCP client Source (`lines` / `length_prefixed`): live, no ack, no
     /// replay.
     pub const TCP_SOURCE: Self = Self {

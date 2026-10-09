@@ -114,3 +114,5 @@ mod redis_tests;
 mod tcp_tests;
 #[cfg(test)]
 mod websocket_tests;
+#[cfg(test)]
+mod kafka_tests;

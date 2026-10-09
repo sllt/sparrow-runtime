@@ -237,6 +237,7 @@ pub struct IoDiagnostics {
     pub file_segments: AtomicU64,
     pub file_syncs: AtomicU64,
     pub file_failed: AtomicU64,
+    pub kafka: crate::kafka_diag::KafkaCounters,
     pub postgres_source_rows: AtomicU64,
     pub postgres_source_queries: AtomicU64,
     pub postgres_source_dropped_bad: AtomicU64,
@@ -620,6 +621,7 @@ impl IoDiagnostics {
             file_segments: self.file_segments.load(Ordering::Relaxed),
             file_syncs: self.file_syncs.load(Ordering::Relaxed),
             file_failed: self.file_failed.load(Ordering::Relaxed),
+            kafka: self.kafka.snapshot(),
             postgres_source_rows: self.postgres_source_rows.load(Ordering::Relaxed),
             postgres_source_queries: self.postgres_source_queries.load(Ordering::Relaxed),
             postgres_source_dropped_bad: self.postgres_source_dropped_bad.load(Ordering::Relaxed),
@@ -904,6 +906,7 @@ pub struct IoSnapshot {
     pub file_segments: u64,
     pub file_syncs: u64,
     pub file_failed: u64,
+    pub kafka: crate::kafka_diag::KafkaSnapshot,
     pub postgres_source_rows: u64,
     pub postgres_source_queries: u64,
     pub postgres_source_dropped_bad: u64,
@@ -1192,6 +1195,7 @@ impl IoSnapshot {
         self.file_segments += other.file_segments;
         self.file_syncs += other.file_syncs;
         self.file_failed += other.file_failed;
+        self.kafka.add_assign(&other.kafka);
         self.postgres_source_rows += other.postgres_source_rows;
         self.postgres_source_queries += other.postgres_source_queries;
         self.postgres_source_dropped_bad += other.postgres_source_dropped_bad;

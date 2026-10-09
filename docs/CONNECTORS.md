@@ -294,6 +294,21 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | 关闭 | Sink 的当前批次、outbox、在途发送、队列及 Close 共用一个 stop deadline（`flush_timeout_ms`），不逐批 / 逐消息重置；剩余计 `discarded_on_close`，未全部入队的 batch receipt 失败；实际 actor / backing 退出前不提前退款 |
 | 指标 | `websocket_source_*` / `websocket_sink_*`，pipeline status 中的 `websocket_source` / `websocket_sink` 对象 |
 
+## 附：Kafka Source / Sink（`kind: "kafka"`，feature `kafka`）
+
+说明见 [KAFKA.md](KAFKA.md)。客户端为 rdkafka 0.39.0 / librdkafka 2.12.1（源码构建，需要 C/C++ 工具链）；只支持 plaintext。
+
+| 合同项 | Kafka 的实现 |
+|---|---|
+| 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`（Sparrow 层面无 checkpoint / restore，拒绝 aligned、restore、checkpoint）。Source 的续读位置是消费组已提交 offset：只提交已进入 job inbox 的行（或 skip 策略下跳过的毒消息）；进入 inbox 前至少一次，进入 inbox 后崩溃会丢失。Sink 在每条记录的投递报告成功后才确认批次 |
+| 消费组 | `cooperative-sticky`；revoke 时同步提交被撤销分区的已处理 offset（assignment lost 时不提交）；提交带身份（cluster id、topic、group、分区数、格式），分配时读回，身份不同或非 Sparrow 客户端写入的提交拒绝（`unsupported_restore`） |
+| 起点 | `auto_offset_reset` 必填：`earliest` / `latest` / `error`（无 offset 时 Source 失败） |
+| 毒消息 | `fail_on_decode`：false 跳过并提交越过（计 `kafka_source_poison_skipped`）；true 时 Source 失败，不提交越过该消息 |
+| 内存 | Source 静态预扣 `prefetch_bytes + 2 × fetch_max_bytes + 256 KiB`，Sink 预扣 `queue_bytes + 2 × max_message_bytes + 256 KiB`（单个 ≤ 1/2，与 NATS / DataBus / WebSocket 合计 ≤ 3/4，饱和算术）；payload 拷贝、decode scratch、编码输出先记账；Source 额度不足等待，不丢弃 |
+| Sink | 默认幂等 `acks=all`；关闭幂等时 `acks` 为 `all` / `leader`，不重试；在途 ≤ `max_in_flight`；投递失败后 fail closed（`kafka_sink_fatal`，job 失败） |
+| 停止 | Source：`stop_timeout_ms` 覆盖最终提交与关闭；Sink：`flush_timeout_ms` 覆盖当前批次、已排队批次和未完成投递报告，到期 purge |
+| 白名单 | bootstrap 与 broker 广播地址都经 `TargetPolicy`（启动时与每 `policy_check_interval_ms`）；librdkafka 可能在周期检查前连接广播地址，见 KAFKA.md |
+| 指标 | `kafka_source_*` / `kafka_sink_*`，pipeline status 中的 `kafka` 对象 |
 ## 附：Redis Sink / Lookup（`sink.kind: "redis"`，`external_lookups.*.redis`）
 
 说明见 [REDIS.md](REDIS.md)。无需 feature；自带有界 RESP2 客户端（Redis 6.2 / 7.x 单节点，Cluster / Sentinel / RESP3 不支持）。
@@ -360,11 +375,12 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | `http_poll` | ✓ | ✓ | — | 一个响应 = 一份文档；`http_poll.format` 必须为空 |
 | `file` / `file_replay` / `replay` | ✓ | ✓ | ✓（`file`） | 文件或段文件 = 一份文档；表头在恢复时重建；段文件为 `part-N.csv`；checkpoint 身份绑定格式与 CSV 选项，Sink 目录标记绑定编码选项 |
 | `websocket` | ✓ | ✓ | ✓ | 一条文本帧 = （表头 +）一条记录；CSV 拒绝 `ndjson` 分帧和二进制帧 |
+| `kafka` | ✓ | ✓ | ✓ | 一条记录 value = （表头 +）一条记录；格式绑定在提交身份里 |
 | `tcp`（`lines`） | ✓ | ✓ | ✓ | 一个连接 = 一份文档：表头每连接一次，之后一行一条记录；拒绝 `multiline` |
 | `tcp`（`length_prefixed`） | ✓ | ✓ | ✓ | 一帧 = （表头 +）一条记录 |
 | `databus` | ✓（内部） | ✗ | ✗ | 进程内传递行 |
 | `log` / plugin | ✓ | — | ✗ | — |
 
-`format: "protobuf"`：`mqtt` / `nats` / `jetstream` / `http_push` / `websocket`（二进制帧）一条消息一条记录；`http` Sink 与 `http_poll` 使用长度前缀消息流；`file` / `file_replay` / `replay` / `databus` 拒绝；JetStream Sink aligned、HTTP Sink 的 JetStream 源 / aligned 拒绝。详见 [FORMATS.md](FORMATS.md#protobuf)。
+`format: "protobuf"`：`mqtt` / `nats` / `jetstream` / `http_push` / `websocket`（二进制帧）/ `kafka` 一条消息一条记录；`http` Sink 与 `http_poll` 使用长度前缀消息流；`file` / `file_replay` / `replay` / `databus` 拒绝；JetStream Sink aligned、HTTP Sink 的 JetStream 源 / aligned 拒绝。详见 [FORMATS.md](FORMATS.md#protobuf)。
 
 新增字节型 connector 时，应通过 `PayloadFormat` 编解码，并加入 `CSV_SOURCE_KINDS` / `CSV_SINK_KINDS`（以及 `PROTOBUF_SOURCE_KINDS` / `PROTOBUF_SINK_KINDS`），不要自带解析器。先按长度拒绝（`max_message_bytes`），再按 `decode_scratch` / `encode_scratch` 记账，最后用 `encode_row_bounded_with_capacity` 等有界接口编解码。

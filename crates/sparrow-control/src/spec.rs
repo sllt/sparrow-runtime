@@ -88,6 +88,9 @@ pub struct SourceSpec {
     /// Required exclusively for `kind = "websocket"` (client mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket: Option<WebSocketSourceSpec>,
+    /// Required exclusively for `kind = "kafka"` (consumer group).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kafka: Option<KafkaSourceSpec>,
     /// Required exclusively for `kind = "postgres"` (`postgres` build feature).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub postgres: Option<Box<crate::postgres_spec::PostgresSourceSpec>>,
@@ -158,20 +161,22 @@ pub const CSV_SOURCE_KINDS: &[&str] = &[
     "nats",
     "jetstream",
     "websocket",
+    "kafka",
     "tcp",
     "file",
     "file_replay",
     "replay",
 ];
 /// Sink kinds whose bytes carry a selectable record format.
-pub const CSV_SINK_KINDS: &[&str] = &["mqtt", "http", "nats", "jetstream", "websocket", "tcp", "file"];
+pub const CSV_SINK_KINDS: &[&str] = &["mqtt", "http", "nats", "jetstream", "websocket", "kafka", "tcp", "file"];
 /// Source kinds that decode protobuf: one message per broker message /
 /// WebSocket binary message / HTTP push body, or a length-delimited stream
 /// per HTTP Poll response. File kinds are refused (newline framing only).
 pub const PROTOBUF_SOURCE_KINDS: &[&str] =
-    &["mqtt", "http_push", "http_poll", "nats", "jetstream", "websocket"];
+    &["mqtt", "http_push", "http_poll", "nats", "jetstream", "websocket", "kafka"];
 /// Sink kinds that encode protobuf (HTTP: a length-delimited stream body).
-pub const PROTOBUF_SINK_KINDS: &[&str] = &["mqtt", "http", "nats", "jetstream", "websocket"];
+pub const PROTOBUF_SINK_KINDS: &[&str] =
+    &["mqtt", "http", "nats", "jetstream", "websocket", "kafka"];
 
 fn payload_format(
     side: &str,
@@ -1025,6 +1030,243 @@ impl WebSocketSinkSpec {
     }
 }
 
+/// Where a Kafka Source starts a partition with no committed offset.
+/// Required: there is no implicit default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaOffsetResetSpec {
+    Earliest,
+    Latest,
+    /// Fail the Source instead of choosing a position.
+    Error,
+}
+
+/// Kafka producer acknowledgement level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaAcksSpec {
+    #[default]
+    All,
+    Leader,
+}
+
+/// Kafka consumer-group Source (plaintext brokers on the allowlist).
+/// Offsets are committed to the group only past rows admitted into the job;
+/// a commit made under another identity (cluster, topic, group, partition
+/// count, format) or by another client is refused. The wire shape stays
+/// readable on builds without the `kafka` feature, which reject it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaSourceSpec {
+    /// Bootstrap `host:port` list (1..=8), each on the target allowlist.
+    pub brokers: Vec<String>,
+    pub topic: String,
+    pub group_id: String,
+    pub auto_offset_reset: KafkaOffsetResetSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_check_interval_ms: Option<u64>,
+    /// Largest record value accepted (default 65536, at most 1 MiB);
+    /// larger records are poison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_message_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_max_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_poll_interval_ms: Option<u64>,
+    /// Bound on the final commit and consumer close at stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_ms: Option<u64>,
+    /// Decoded-row Queue credit for the inbox; default 256 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_bytes: Option<usize>,
+}
+
+/// Kafka producer Sink: one record per row, batch acknowledged after every
+/// delivery report; idempotent `acks=all` unless `idempotence = false`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaSinkSpec {
+    pub brokers: Vec<String>,
+    pub topic: String,
+    /// Utf8/Bytes column used as the record key (NULL: no key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotence: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub acks: KafkaAcksSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_check_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_in_flight: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linger_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_message_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+}
+
+#[cfg(feature = "kafka")]
+fn kafka_client(
+    brokers: &[String],
+    client_id: &Option<String>,
+    socket_timeout_ms: Option<u64>,
+    request_timeout_ms: Option<u64>,
+    policy_check_interval_ms: Option<u64>,
+) -> sparrow_connectors::KafkaClientConfig {
+    use std::time::Duration;
+    let mut c = sparrow_connectors::KafkaClientConfig::new(brokers.to_vec());
+    if let Some(id) = client_id {
+        c.client_id = id.clone();
+    }
+    if let Some(ms) = socket_timeout_ms {
+        c.socket_timeout = Duration::from_millis(ms);
+    }
+    if let Some(ms) = request_timeout_ms {
+        c.request_timeout = Duration::from_millis(ms);
+    }
+    if let Some(ms) = policy_check_interval_ms {
+        c.policy_check_interval = Duration::from_millis(ms);
+    }
+    c
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaSourceSpec {
+    pub fn reservation(&self) -> usize {
+        use sparrow_connectors::kafka::source::{DEFAULT_FETCH_MAX_BYTES, DEFAULT_PREFETCH_BYTES};
+        sparrow_connectors::KafkaSourceConfig::reservation_for(
+            self.prefetch_bytes.unwrap_or(DEFAULT_PREFETCH_BYTES),
+            self.fetch_max_bytes.unwrap_or(DEFAULT_FETCH_MAX_BYTES),
+        )
+    }
+
+    pub fn connector_config(
+        &self,
+        schema: sparrow_model::Schema,
+        inbox_capacity: usize,
+        fail_on_decode: bool,
+    ) -> sparrow_connectors::KafkaSourceConfig {
+        use sparrow_connectors::kafka::OffsetReset;
+        use std::time::Duration;
+        let reset = match self.auto_offset_reset {
+            KafkaOffsetResetSpec::Earliest => OffsetReset::Earliest,
+            KafkaOffsetResetSpec::Latest => OffsetReset::Latest,
+            KafkaOffsetResetSpec::Error => OffsetReset::Error,
+        };
+        let mut c = sparrow_connectors::KafkaSourceConfig::new(
+            self.brokers.clone(),
+            self.topic.clone(),
+            self.group_id.clone(),
+            reset,
+            schema,
+        );
+        c.client = kafka_client(
+            &self.brokers,
+            &self.client_id,
+            self.socket_timeout_ms,
+            self.request_timeout_ms,
+            self.policy_check_interval_ms,
+        );
+        let ms = Duration::from_millis;
+        if let Some(n) = self.max_message_bytes {
+            c.max_message_bytes = n;
+        }
+        if let Some(n) = self.fetch_max_bytes {
+            c.fetch_max_bytes = n;
+        }
+        if let Some(n) = self.prefetch_bytes {
+            c.prefetch_bytes = n;
+        }
+        if let Some(v) = self.commit_interval_ms {
+            c.commit_interval = ms(v);
+        }
+        if let Some(v) = self.session_timeout_ms {
+            c.session_timeout = ms(v);
+        }
+        if let Some(v) = self.max_poll_interval_ms {
+            c.max_poll_interval = ms(v);
+        }
+        if let Some(v) = self.stop_timeout_ms {
+            c.stop_timeout = ms(v);
+        }
+        if let Some(n) = self.inbox_bytes {
+            c.inbox_bytes = n;
+        }
+        c.inbox_capacity = inbox_capacity;
+        c.fail_on_decode = fail_on_decode;
+        c
+    }
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaSinkSpec {
+    pub fn connector_config(&self, outbox_capacity: usize) -> sparrow_connectors::KafkaSinkConfig {
+        use sparrow_connectors::kafka::KafkaAcks;
+        use std::time::Duration;
+        let mut c = sparrow_connectors::KafkaSinkConfig::new(self.brokers.clone(), self.topic.clone());
+        c.client = kafka_client(
+            &self.brokers,
+            &self.client_id,
+            self.socket_timeout_ms,
+            self.request_timeout_ms,
+            self.policy_check_interval_ms,
+        );
+        c.key_column = self.key_column.clone();
+        if let Some(v) = self.idempotence {
+            c.idempotence = v;
+        }
+        c.acks = match self.acks {
+            KafkaAcksSpec::All => KafkaAcks::All,
+            KafkaAcksSpec::Leader => KafkaAcks::Leader,
+        };
+        let ms = Duration::from_millis;
+        if let Some(n) = self.max_in_flight {
+            c.max_in_flight = n;
+        }
+        if let Some(n) = self.queue_bytes {
+            c.queue_bytes = n;
+        }
+        if let Some(v) = self.linger_ms {
+            c.linger = ms(v);
+        }
+        if let Some(v) = self.delivery_timeout_ms {
+            c.delivery_timeout = ms(v);
+        }
+        if let Some(n) = self.max_message_bytes {
+            c.max_message_bytes = n;
+        }
+        if let Some(v) = self.flush_timeout_ms {
+            c.flush_timeout = ms(v);
+        }
+        c.outbox_capacity = outbox_capacity;
+        c
+    }
+}
+
 /// TCP record framing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1586,6 +1828,9 @@ pub struct SinkSpec {
     /// Required exclusively for `kind = "websocket"` (client mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket: Option<WebSocketSinkSpec>,
+    /// Required exclusively for `kind = "kafka"` (producer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kafka: Option<KafkaSinkSpec>,
     /// Required exclusively for `kind = "redis"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redis: Option<Box<RedisSinkSpec>>,
@@ -2027,6 +2272,7 @@ impl PipelineSpec {
         self.check_databus()?;
         self.check_influxdb()?;
         self.check_websocket()?;
+        self.check_kafka()?;
         self.check_redis()?;
         self.check_postgres()?;
         self.check_tcp()?;
@@ -2319,6 +2565,89 @@ impl PipelineSpec {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
                 "Local DataBus is live_best_effort/restart_fresh, at-most-once (in-memory, no replay point); no checkpoint or restore",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Kafka: the resume position is the group's committed offset (bound to
+    /// an identity), not a Sparrow checkpoint, so the job contract is
+    /// live_best_effort/restart_fresh and checkpoint/restore are refused.
+    fn check_kafka(&self) -> Result<()> {
+        if let Some(io) = &self.graph_io {
+            let mut single = self.clone();
+            single.graph_io = None;
+            for source in io.sources.values() {
+                single.source = source.clone();
+                single.check_kafka()?;
+            }
+            single.source = self.source.clone();
+            for sink in io.sinks.values() {
+                single.sink = sink.clone();
+                single.check_kafka()?;
+            }
+        }
+        if self.source.kafka.is_some() != (self.source.kind == "kafka")
+            || self.sink.kafka.is_some() != (self.sink.kind == "kafka")
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "source.kafka / sink.kafka are required exclusively for kind=kafka",
+            ));
+        }
+        let source = self.source.kind == "kafka";
+        let sink = self.sink.kind == "kafka";
+        if !source && !sink {
+            return Ok(());
+        }
+        if !cfg!(feature = "kafka") {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "Kafka support requires the kafka build feature",
+            ));
+        }
+        if source
+            && (self.source_has_foreign_fields()
+                || self.source.nats.is_some()
+                || self.source.databus.is_some()
+                || self.source.websocket.is_some()
+                || self.source.tcp.is_some()
+                || self.source.postgres.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "Kafka options belong in source.kafka; mixed connector fields refused",
+            ));
+        }
+        if sink
+            && (self.sink_has_foreign_fields()
+                || self.sink.nats.is_some()
+                || self.sink.jetstream.is_some()
+                || self.sink.databus.is_some()
+                || self.sink.websocket.is_some()
+                || self.sink.tcp.is_some()
+                || self.sink.postgres.is_some()
+                || self.sink.redis.is_some()
+                || self.sink.influxdb.is_some()
+                || self.sink.batch_rows.is_some()
+                || self.sink.batch_bytes.is_some()
+                || self.sink.linger_ms.is_some()
+                || self.sink.max_inflight.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "Kafka options belong in sink.kafka (one record per row, no actions); mixed connector fields refused",
+            ));
+        }
+        if self.delivery != "live_best_effort"
+            || self.recovery != "restart_fresh"
+            || self.restore.is_some()
+            || self.checkpoint.is_some()
+            || self.checkpoint_dir.is_some()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "Kafka is live_best_effort/restart_fresh: the source resumes from its group's committed offsets (only past admitted rows), not from a Sparrow checkpoint; no checkpoint or restore",
             ));
         }
         Ok(())
@@ -2746,6 +3075,7 @@ impl PipelineSpec {
         // Public IO validators accept typed/serde-created specs too, so they
         // must not rely solely on from_json/basic_check for the DataBus gate.
         self.check_databus()?;
+        self.check_kafka()?;
         self.check_redis()?;
         self.check_postgres()?;
         self.check_influxdb()?;

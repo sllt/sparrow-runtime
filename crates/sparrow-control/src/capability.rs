@@ -19,6 +19,12 @@ pub fn inventory() -> Value {
     } else {
         &[]
     };
+    // The Kafka Source/Sink needs the `kafka` feature.
+    let kafka: &[&str] = if cfg!(feature = "kafka") {
+        &["kafka"]
+    } else {
+        &[]
+    };
     // The PostgreSQL query Source and INSERT/UPSERT Sink need `postgres`.
     let postgres: &[&str] = if cfg!(feature = "postgres") {
         &["postgres"]
@@ -32,6 +38,7 @@ pub fn inventory() -> Value {
         .chain(nats)
         .chain(jetstream_sink)
         .chain(websocket)
+        .chain(kafka)
         .chain(postgres)
         .chain(&["tcp"])
         .copied()
@@ -40,6 +47,7 @@ pub fn inventory() -> Value {
         .iter()
         .chain(nats)
         .chain(websocket)
+        .chain(kafka)
         .chain(postgres)
         .chain(&["tcp"])
         .copied()
@@ -234,14 +242,15 @@ mod tests {
         // one aligned File profile) with `jetstream`, plus WebSocket as both a
         // source and a sink with `websocket`, plus PostgreSQL as both a source
         // and a sink with `postgres`.
-        let (nats, jetstream, websocket, postgres) = (
+        let (nats, jetstream, websocket, postgres, kafka) = (
             usize::from(cfg!(feature = "nats")),
             usize::from(cfg!(feature = "jetstream")),
             usize::from(cfg!(feature = "websocket")),
             usize::from(cfg!(feature = "postgres")),
+            usize::from(cfg!(feature = "kafka")),
         );
         let expected =
-            (5 + nats + websocket + postgres + 1) * (6 + nats + jetstream + websocket + postgres + 1) + jetstream;
+            (5 + nats + websocket + postgres + kafka + 1) * (6 + nats + jetstream + websocket + postgres + kafka + 1) + jetstream;
         assert_eq!(value["combinations"].as_array().unwrap().len(), expected);
         assert!(value["combinations"]
             .as_array()
@@ -251,6 +260,8 @@ mod tests {
                 || c["sink"] == "nats"
                 || c["source"] == "websocket"
                 || c["sink"] == "websocket"
+                || c["source"] == "kafka"
+                || c["sink"] == "kafka"
                 || c["source"] == "tcp"
                 || c["sink"] == "tcp"
                 || c["source"] == "databus"

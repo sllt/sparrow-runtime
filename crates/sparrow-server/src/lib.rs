@@ -1025,6 +1025,19 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "semantics":"live_best_effort_at_most_once_no_replay_no_ack",
             "scope":"this_attempt; dropped_overflow=complete_data_messages_dropped_at_prefetch; dropped_oversize=messages_rejected_by_size_limit_plus_records_over_decode_limit"});
     }
+    if s.source_kind == "kafka" || s.sink_kind == "kafka" {
+        let mut kafka = serde_json::Map::new();
+        for (name, v) in io.kafka.pairs() {
+            let keep = (s.source_kind == "kafka" && name.starts_with("source_"))
+                || (s.sink_kind == "kafka" && name.starts_with("sink_"));
+            if keep {
+                kafka.insert(name.to_string(), json!(v));
+            }
+        }
+        kafka.insert("semantics".into(), json!("source: group_commit_after_inbox_admission (at_least_once_into_inbox; admitted_rows_lost_on_crash); sink: batch_ack_after_all_delivery_reports"));
+        kafka.insert("scope".into(), json!("this_attempt"));
+        value["kafka"] = serde_json::Value::Object(kafka);
+    }
     if s.sink_kind == "websocket" {
         value["websocket_sink"] = json!({"sent":io.websocket_sink_sent,"dropped_bad":io.websocket_sink_dropped_bad,"dropped_oversize":io.websocket_sink_dropped_oversize,
             "dropped_overflow":io.websocket_sink_dropped_overflow,"dropped_budget":io.websocket_sink_dropped_budget,"backpressure_waits":io.websocket_sink_backpressure_waits,"send_failed":io.websocket_sink_send_failed,
@@ -1656,6 +1669,9 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         ("tcp_source_inbox_bytes", io.tcp_source_inbox_bytes),
     ] {
         io_fields[name] = json!(value);
+    }
+    for (name, value) in io.kafka.pairs() {
+        io_fields[format!("kafka_{name}")] = json!(value);
     }
     let mut value = json!({
         "jobs_started": snap.jobs_started,

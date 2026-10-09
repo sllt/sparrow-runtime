@@ -419,6 +419,17 @@ fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
         )
         .retryable(true));
     }
+    if diags.iter().any(|d| {
+        d.kafka
+            .sink_fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }) {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "Kafka Sink failed closed (unconfirmed delivery, denied advertised broker or missing topic); inspect sink health and kafka_sink_*",
+        ));
+    }
     if diags
         .iter()
         .any(|d| d.tcp_sink_fatal.load(std::sync::atomic::Ordering::Relaxed) > 0)
@@ -438,6 +449,7 @@ fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
         "mqtt" => "mqtt",
         "nats" => "nats",
         "websocket" => "websocket",
+        "kafka" => "kafka",
         "tcp" => "tcp",
         "jetstream" => "jetstream",
         "databus" => "databus",
@@ -1429,7 +1441,7 @@ impl Supervisor {
             (None,None)
         } else if matches!(
             kind,
-            "mqtt" | "http_poll" | "nats" | "databus" | "websocket" | "tcp" | "postgres"
+            "mqtt" | "http_poll" | "nats" | "databus" | "websocket" | "tcp" | "postgres" | "kafka"
         ) {
             let (tx, rx) = observed::channel(inbox);
             diag.observe_source(&tx);
@@ -1485,6 +1497,35 @@ impl Supervisor {
                             )
                             .await
                             .map_err(SparrowError::from);
+                        if r.is_err() {
+                            cancel_job.cancel();
+                        }
+                        r
+                    })
+                }
+                #[cfg(feature = "kafka")]
+                "kafka" => {
+                    let cfg = crate::validate::kafka_source_config(
+                        &spec.source,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source =
+                        sparrow_connectors::KafkaSource::bind(cfg, policy, Arc::clone(&diag))?;
+                    let cancel_job = cancel.clone();
+                    let owner = job.memory_owner();
+                    let max_row_bytes = self.kernel.ingress_row_limit();
+                    self.kernel.handle().spawn(async move {
+                        let r = source
+                            .run_budgeted(
+                                tx_budgeted.expect("Kafka ingress"),
+                                cancel_job.clone(),
+                                owner,
+                                max_row_bytes,
+                            )
+                            .await;
                         if r.is_err() {
                             cancel_job.cancel();
                         }
@@ -1722,6 +1763,7 @@ impl Supervisor {
                 "nats" => "nats",
                 "databus" => "databus",
                 "websocket" => "websocket",
+                "kafka" => "kafka",
                 "tcp" => "tcp",
                 "postgres" => "postgres",
                 _ => "http_push",
@@ -2368,6 +2410,12 @@ impl Supervisor {
             "log" => {
                 let log = LogSink::unbuffered(diag).with_action(spec.sink.action.clone());
                 self.kernel.handle().spawn(log.run(rx_out, cancel, outbox))
+            }
+            #[cfg(feature = "kafka")]
+            "kafka" => {
+                let cfg = crate::validate::kafka_sink_config(&spec.sink)?;
+                let sink = sparrow_connectors::KafkaSink::bind(cfg, policy, owner, diag)?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
             #[cfg(feature = "websocket")]
             "websocket" => {

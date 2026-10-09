@@ -171,12 +171,13 @@ fn protobuf_control_format_matrix() {
             "http_poll",
             "nats",
             "jetstream",
-            "websocket"
+            "websocket",
+            "kafka"
         ])
     );
     assert_eq!(
         capabilities["formats"]["protobuf_sinks"],
-        json!(["mqtt", "http", "nats", "jetstream", "websocket"])
+        json!(["mqtt", "http", "nats", "jetstream", "websocket", "kafka"])
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
