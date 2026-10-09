@@ -74,6 +74,7 @@ impl KafkaClientConfig {
         c.set("bootstrap.servers", self.brokers.join(","))
             .set("client.id", &self.client_id)
             .set("security.protocol", "plaintext")
+            .set("allow.auto.create.topics", "false")
             .set("socket.timeout.ms", millis(self.socket_timeout))
             // Keep reconnect attempts bounded in rate; librdkafka retries
             // forever, the connectors decide when to give up.
@@ -105,7 +106,10 @@ pub(crate) fn parse_broker(broker: &str) -> Result<(&str, u16)> {
     };
     if host.is_empty()
         || host.len() > MAX_HOST_BYTES
-        || host.contains(['/', '@', ' ', ','])
+        || host.contains(['/', '@', ',', '[', ']'])
+        || host
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
         || (!broker.starts_with('[') && host.contains(':'))
     {
         return Err(bad());

@@ -977,8 +977,13 @@ async fn kafka_sink_fails_closed_on_delivery_timeout_and_stop_deadline_bounds_it
         health(&sink.diag, false),
         sparrow_model::observation::HealthState::Failed
     );
-    sink.send(4, 4).await;
-    sink.settled(1, 2).await;
+    tokio::time::timeout(Duration::from_secs(2), sink.cancel.cancelled())
+        .await
+        .unwrap();
+    assert!(
+        sink.tx.send(batch(&sink.owner, 4, 4)).await.is_err(),
+        "fatal sink closes input rather than silently consuming forever"
+    );
     assert!(sink.diag.snapshot().kafka.sink_failed >= 1);
     assert_eq!(
         sink.diag.snapshot().kafka.sink_fatal,

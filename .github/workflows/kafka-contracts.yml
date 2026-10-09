@@ -1,0 +1,76 @@
+name: kafka-contracts
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  kafka:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [standalone, combined]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Install pinned isolated broker and JRE
+        run: |
+          set -euo pipefail
+          bash scripts/kafka-broker.sh "$RUNNER_TEMP/kafka-broker"
+          printf 'SPARROW_KAFKA_HOME=%s\n' "$RUNNER_TEMP/kafka-broker/kafka_2.13-4.3.1" >> "$GITHUB_ENV"
+          printf 'SPARROW_JAVA_HOME=%s\n' "$RUNNER_TEMP/kafka-broker/jre" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: kafka-contracts-${{ runner.os }}-1.98.0-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}
+      - name: Kafka feature and real-service contracts
+        env:
+          PROFILE: ${{ matrix.profile }}
+          SPARROW_TEST_ARTIFACTS: ${{ github.workspace }}/artifacts/brokers
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/brokers
+          git rev-parse HEAD > artifacts/commit.txt
+          export SPARROW_DATA_ROOTS="$SPARROW_TEST_ARTIFACTS:/tmp/sparrow"
+          features=sparrow-server/kafka
+          if [[ "$PROFILE" == combined ]]; then
+            features+=,sparrow-server/jetstream,sparrow-server/websocket,sparrow-server/postgres
+          fi
+          if ! cargo test --locked --release --quiet --no-default-features --message-format=json \
+            -p sparrow-connectors -p sparrow-control -p sparrow-server --features "$features" \
+            > artifacts/tests.jsonl 2> artifacts/build.log; then
+            tail -n 60 artifacts/build.log
+            jq -Rr 'fromjson?|select(.reason=="compiler-message" and .message.level=="error")|.message.rendered' artifacts/tests.jsonl || true
+            grep -A 20 -B 3 -E 'FAILED|panicked|test result: FAILED' artifacts/tests.jsonl || true
+            exit 1
+          fi
+          jq -Rn '[inputs|fromjson?|select(.reason=="compiler-artifact" and .profile.test and .executable!=null)|{name:.target.name,exe:.executable}]' \
+            artifacts/tests.jsonl > artifacts/test-binaries.json
+          connector=$(jq -er '.[]|select(.name=="sparrow_connectors")|.exe' artifacts/test-binaries.json)
+          control=$(jq -er '.[]|select(.name=="sparrow_control")|.exe' artifacts/test-binaries.json)
+          sha256sum "$connector" "$control" > artifacts/test-binaries.sha256
+          for round in 1 2; do
+            for name in connector control; do
+              exe=${!name}
+              "$exe" kafka --list > "artifacts/$name.list"
+              grep -q ': test$' "artifacts/$name.list"
+              if ! timeout 900 "$exe" kafka --include-ignored --test-threads=1 \
+                > "artifacts/kafka-$name-$round.log" 2>&1; then
+                tail -n 80 "artifacts/kafka-$name-$round.log"
+                exit 1
+              fi
+              tail -n 3 "artifacts/kafka-$name-$round.log"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kafka-contracts-${{ matrix.profile }}
+          path: artifacts/

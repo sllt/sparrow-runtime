@@ -22,16 +22,18 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use rdkafka::config::ClientConfig;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer, PurgeConfig};
+use rdkafka::ClientContext;
 use sparrow_formats::PayloadFormat;
 use sparrow_io::observed::Receiver as ObservedReceiver;
 use sparrow_model::observation::{HealthState, Latency};
 use sparrow_model::{
-    CreditKind, ErrorCode, InflightCounter, MemoryOwner, RestoreClaim, Result, Row, RowBatch,
-    Scalar,
+    CreditKind, ErrorCode, InflightCounter, MemoryLease, MemoryOwner, RestoreClaim, Result, Row,
+    RowBatch, Scalar,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -45,6 +47,34 @@ use crate::TargetPolicy;
 const MAX_OUTBOX: usize = 4096;
 const CLIENT_OVERHEAD: usize = 256 * 1024;
 const QUEUE_FULL_RETRY: Duration = Duration::from_millis(5);
+const MAX_KEY_BYTES: usize = 1024;
+const REPORT_OVERHEAD: usize = 1024;
+
+/// The SDK owns the context until its final native client is destroyed,
+/// including clones in abandoned metadata requests and background cleanup.
+struct ChargedContext {
+    _lease: Arc<MemoryLease>,
+}
+impl ClientContext for ChargedContext {}
+type KafkaProducer = FutureProducer<ChargedContext>;
+type PendingReport =
+    BoxFuture<'static, (<DeliveryFuture as std::future::Future>::Output, MemoryLease)>;
+
+/// Even task abort must not destroy a native client on a Tokio worker.
+struct DeferredProducer(Option<KafkaProducer>);
+impl std::ops::Deref for DeferredProducer {
+    type Target = KafkaProducer;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("live producer")
+    }
+}
+impl Drop for DeferredProducer {
+    fn drop(&mut self) {
+        if let Some(producer) = self.0.take() {
+            tokio::task::spawn_blocking(move || drop(producer));
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KafkaAcks {
@@ -286,6 +316,9 @@ impl KafkaSink {
     ) -> Result<Self> {
         config.validate(policy)?;
         config.check_reservation_budget(owner.budget().reservation_bytes)?;
+        let mut budget = owner.budget();
+        budget.reservation_bytes /= 2;
+        let owner = MemoryOwner::child(owner, budget, "kafka-sink");
         Ok(Self {
             config,
             diag,
@@ -303,7 +336,7 @@ impl KafkaSink {
         let mut rx = rx.into();
         let _lifecycle = self.diag.observation.lifecycle(false);
         let outbox = outbox.as_ref();
-        let Ok(_static) = self
+        let Ok(static_lease) = self
             .owner
             .acquire(CreditKind::Reservation, self.config.reservation())
         else {
@@ -317,8 +350,13 @@ impl KafkaSink {
             "kafka_sink_connecting",
             None,
         );
-        let producer: FutureProducer = match self.config.producer_config().create() {
-            Ok(p) => p,
+        let mut producer = match self
+            .config
+            .producer_config()
+            .create_with_context::<_, KafkaProducer>(ChargedContext {
+                _lease: Arc::new(static_lease),
+            }) {
+            Ok(p) => DeferredProducer(Some(p)),
             Err(_) => {
                 self.fail(ErrorCode::JobFailed, "kafka_sink_create_failed");
                 self.fail_closed(&mut rx, &cancel, outbox).await;
@@ -345,11 +383,16 @@ impl KafkaSink {
         };
         // Dropping purges and flushes (bounded 500 ms) and destroys the
         // client, which may block: keep it off the runtime workers.
-        let _ = tokio::task::spawn_blocking(move || drop(producer)).await;
         if failed {
-            // Fail closed: every later batch fails its receipt until stop.
+            // Stop the source/job promptly, before any blocking SDK cleanup.
             self.fail_closed(&mut rx, &cancel, outbox).await;
-        } else {
+        }
+        stop.arm();
+        let native = producer.0.take();
+        let _ = stop
+            .wait(tokio::task::spawn_blocking(move || drop(native)))
+            .await;
+        if !failed {
             self.discard(&mut rx, outbox);
             self.diag
                 .observation
@@ -364,19 +407,7 @@ impl KafkaSink {
         outbox: Option<&Arc<InflightCounter>>,
     ) {
         self.diag.kafka.sink_fatal.fetch_add(1, Ordering::Relaxed);
-        loop {
-            let batch = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                b = rx.recv() => b,
-            };
-            let Some(batch) = batch else { break };
-            self.diag
-                .kafka
-                .sink_discarded_on_close
-                .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-            drop(BatchReceipt(outbox.cloned()));
-        }
+        cancel.cancel();
         self.discard(rx, outbox);
     }
 
@@ -390,7 +421,7 @@ impl KafkaSink {
     /// transient metadata failures until stop; `Err` is fail-closed.
     async fn preflight(
         &self,
-        producer: &FutureProducer,
+        producer: &KafkaProducer,
         stop: &mut Stop<'_>,
     ) -> std::result::Result<bool, ErrorCode> {
         let mut backoff = Duration::from_millis(100);
@@ -437,7 +468,7 @@ impl KafkaSink {
 
     async fn pump(
         &self,
-        producer: &FutureProducer,
+        producer: &KafkaProducer,
         rx: &mut ObservedReceiver<RowBatch>,
         stop: &mut Stop<'_>,
         outbox: Option<&Arc<InflightCounter>>,
@@ -462,7 +493,16 @@ impl KafkaSink {
             let Some(batch) = batch else { return true };
             if last_policy.elapsed() >= self.config.client.policy_check_interval {
                 last_policy = std::time::Instant::now();
-                if let Err(code) = self.policy_check(producer).await {
+                let checked = stop.wait(self.policy_check(producer)).await;
+                if checked.is_none() {
+                    drop(BatchReceipt(outbox.cloned()));
+                    self.diag
+                        .kafka
+                        .sink_discarded_on_close
+                        .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                    return true;
+                }
+                if let Some(Err(code)) = checked {
                     self.fail(code, "kafka_sink_broker_denied");
                     drop(BatchReceipt(outbox.cloned()));
                     self.diag
@@ -486,7 +526,7 @@ impl KafkaSink {
         }
     }
 
-    async fn policy_check(&self, producer: &FutureProducer) -> std::result::Result<(), ErrorCode> {
+    async fn policy_check(&self, producer: &KafkaProducer) -> std::result::Result<(), ErrorCode> {
         let p = producer.clone();
         let topic = self.config.topic.clone();
         let timeout = self.config.client.request_timeout;
@@ -516,13 +556,20 @@ impl KafkaSink {
 
     async fn send_batch(
         &self,
-        producer: &FutureProducer,
+        producer: &KafkaProducer,
         batch: &RowBatch,
         stop: &mut Stop<'_>,
         outbox: Option<&Arc<InflightCounter>>,
     ) -> Batch {
         let k = &self.diag.kafka;
         let mut receipt = BatchReceipt(outbox.cloned());
+        if batch.output_sequence().is_some() {
+            self.fail(
+                ErrorCode::UnsupportedRestore,
+                "kafka_reliable_output_rejected",
+            );
+            return Batch::Failed;
+        }
         let mut delivered = self.diag.observation.delivery_guard(
             batch.num_rows(),
             batch.tracked_bytes(),
@@ -542,10 +589,13 @@ impl KafkaSink {
         };
         let format = &self.config.payload_format;
         let limit = self.config.max_message_bytes;
-        let mut pending: FuturesUnordered<DeliveryFuture> = FuturesUnordered::new();
+        let mut pending: FuturesUnordered<PendingReport> = FuturesUnordered::new();
         let mut all = true;
         let rows = batch.rows();
         for (i, row) in rows.iter().enumerate() {
+            if i % 64 == 0 {
+                tokio::task::yield_now().await;
+            }
             if stop.expired() {
                 k.sink_discarded_on_close
                     .fetch_add((rows.len() - i + pending.len()) as u64, Ordering::Relaxed);
@@ -556,6 +606,11 @@ impl KafkaSink {
                 k.sink_dropped_bad.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
+            if key.is_some_and(|k| k.len() > MAX_KEY_BYTES) {
+                all = false;
+                k.sink_dropped_oversize.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let started = std::time::Instant::now();
             let scratch = format.encode_scratch(schema, row);
             let encoded = (|| {
@@ -569,7 +624,7 @@ impl KafkaSink {
             self.diag
                 .observation
                 .record(Latency::Encode, started.elapsed());
-            let (body, _lease) = match encoded {
+            let (body, lease) = match encoded {
                 Ok(v) => v,
                 Err(e) if e.code == ErrorCode::BoundExceeded => {
                     all = false;
@@ -595,14 +650,52 @@ impl KafkaSink {
                     None => return self.expired(rows.len() - i, &pending),
                 }
             }
+            // FutureProducer detaches failed messages into the delivery
+            // future. That copy can outlive librdkafka's queue accounting.
+            let report_bytes = body
+                .len()
+                .saturating_add(key.map_or(0, |k| k.len()))
+                .saturating_add(REPORT_OVERHEAD);
+            if report_bytes
+                > self
+                    .owner
+                    .budget()
+                    .reservation_bytes
+                    .saturating_sub(self.config.reservation())
+                    .saturating_sub(lease.bytes())
+            {
+                all = false;
+                k.sink_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let report_credit = loop {
+                if let Ok(credit) = self.owner.acquire(CreditKind::Reservation, report_bytes) {
+                    break credit;
+                }
+                let progress = if pending.is_empty() {
+                    stop.wait(tokio::time::sleep(QUEUE_FULL_RETRY))
+                        .await
+                        .map(|_| true)
+                } else {
+                    self.next_report(&mut pending, stop).await
+                };
+                match progress {
+                    Some(true) => {}
+                    Some(false) => return Batch::Failed,
+                    None => return self.expired(rows.len() - i, &pending),
+                }
+            };
             let mut record = FutureRecord::<[u8], [u8]>::to(&self.config.topic).payload(&body[..]);
             if let Some(key) = key {
                 record = record.key(key);
             }
             loop {
+                if stop.expired() {
+                    return self.expired(rows.len() - i, &pending);
+                }
                 match producer.send_result(record) {
                     Ok(report) => {
-                        pending.push(report);
+                        pending.push(Box::pin(async move { (report.await, report_credit) }));
                         break;
                     }
                     Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), back)) => {
@@ -652,7 +745,7 @@ impl KafkaSink {
         }
     }
 
-    fn expired(&self, unsent: usize, pending: &FuturesUnordered<DeliveryFuture>) -> Batch {
+    fn expired(&self, unsent: usize, pending: &FuturesUnordered<PendingReport>) -> Batch {
         self.diag
             .kafka
             .sink_discarded_on_close
@@ -664,12 +757,12 @@ impl KafkaSink {
     /// `None` stop deadline expired.
     async fn next_report(
         &self,
-        pending: &mut FuturesUnordered<DeliveryFuture>,
+        pending: &mut FuturesUnordered<PendingReport>,
         stop: &mut Stop<'_>,
     ) -> Option<bool> {
         let k = &self.diag.kafka;
         match stop.wait(pending.next()).await? {
-            Some(Ok(Ok(_))) => {
+            Some((Ok(Ok(_)), _credit)) => {
                 k.sink_acked.fetch_add(1, Ordering::Relaxed);
                 self.diag.observation.progress(false, 1);
                 Some(true)
@@ -692,5 +785,82 @@ impl KafkaSink {
                 outbox.fail();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use sparrow_model::{
+        DataType, Field, FieldId, OutputSequence, ResourceBudget, RowBatchBuilder, Schema, SchemaId,
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn kafka_expired_stop_refuses_ready_work() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut stop = Stop {
+            cancel: &cancel,
+            timeout: Duration::from_millis(100),
+            deadline: None,
+        };
+        assert_eq!(stop.wait(std::future::ready(1)).await, Some(1));
+        let deadline = stop.deadline;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(stop.wait(std::future::ready(2)).await, None);
+        assert_eq!(stop.deadline, deadline);
+    }
+
+    #[tokio::test]
+    async fn kafka_reliable_sequence_is_refused_without_sending() {
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let sink = KafkaSink::bind(
+            KafkaSinkConfig::new(vec!["127.0.0.1:9092".into()], "t"),
+            &TargetPolicy::allow("127.0.0.1", 9092),
+            owner.clone(),
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+        let lease = owner.acquire(CreditKind::Reservation, 1).unwrap();
+        let producer: KafkaProducer = ClientConfig::new()
+            .create_with_context(ChargedContext {
+                _lease: Arc::new(lease),
+            })
+            .unwrap();
+        let schema = Arc::new(
+            Schema::new(
+                SchemaId::new(1),
+                vec![Field::new(FieldId::new(1), "v", DataType::Int64, false)],
+            )
+            .unwrap(),
+        );
+        let mut b =
+            RowBatchBuilder::new(schema, owner.clone(), CreditKind::Reservation, 1, 1024).unwrap();
+        b.push(Row {
+            values: vec![Scalar::Int64(1)],
+        })
+        .unwrap();
+        let batch = b
+            .finish()
+            .unwrap()
+            .with_output_sequence(OutputSequence::new([1; 16], 1).unwrap())
+            .unwrap();
+        let outbox = Arc::new(InflightCounter::new());
+        outbox.enqueue();
+        let cancel = CancellationToken::new();
+        let mut stop = Stop {
+            cancel: &cancel,
+            timeout: Duration::from_secs(1),
+            deadline: None,
+        };
+        assert!(matches!(
+            sink.send_batch(&producer, &batch, &mut stop, Some(&outbox))
+                .await,
+            Batch::Failed
+        ));
+        assert_eq!((outbox.acked(), outbox.failed()), (0, 1));
+        tokio::task::spawn_blocking(move || drop(producer))
+            .await
+            .unwrap();
     }
 }

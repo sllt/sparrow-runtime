@@ -2574,6 +2574,19 @@ impl PipelineSpec {
     /// an identity), not a Sparrow checkpoint, so the job contract is
     /// live_best_effort/restart_fresh and checkpoint/restore are refused.
     fn check_kafka(&self) -> Result<()> {
+        if let Some(io) = &self.graph_io {
+            let mut single = self.clone();
+            single.graph_io = None;
+            for source in io.sources.values() {
+                single.source = source.clone();
+                single.check_kafka()?;
+            }
+            single.source = self.source.clone();
+            for sink in io.sinks.values() {
+                single.sink = sink.clone();
+                single.check_kafka()?;
+            }
+        }
         if self.source.kafka.is_some() != (self.source.kind == "kafka")
             || self.sink.kafka.is_some() != (self.sink.kind == "kafka")
         {
@@ -2597,7 +2610,9 @@ impl PipelineSpec {
             && (self.source_has_foreign_fields()
                 || self.source.nats.is_some()
                 || self.source.databus.is_some()
-                || self.source.websocket.is_some())
+                || self.source.websocket.is_some()
+                || self.source.tcp.is_some()
+                || self.source.postgres.is_some())
         {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
@@ -2609,7 +2624,15 @@ impl PipelineSpec {
                 || self.sink.nats.is_some()
                 || self.sink.jetstream.is_some()
                 || self.sink.databus.is_some()
-                || self.sink.websocket.is_some())
+                || self.sink.websocket.is_some()
+                || self.sink.tcp.is_some()
+                || self.sink.postgres.is_some()
+                || self.sink.redis.is_some()
+                || self.sink.influxdb.is_some()
+                || self.sink.batch_rows.is_some()
+                || self.sink.batch_bytes.is_some()
+                || self.sink.linger_ms.is_some()
+                || self.sink.max_inflight.is_some())
         {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
@@ -3052,6 +3075,7 @@ impl PipelineSpec {
         // Public IO validators accept typed/serde-created specs too, so they
         // must not rely solely on from_json/basic_check for the DataBus gate.
         self.check_databus()?;
+        self.check_kafka()?;
         self.check_redis()?;
         self.check_postgres()?;
         self.check_influxdb()?;

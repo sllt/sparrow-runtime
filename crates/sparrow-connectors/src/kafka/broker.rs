@@ -43,7 +43,10 @@ fn env(name: &str) -> PathBuf {
 
 impl KafkaSandbox {
     pub fn start() -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        let root = std::env::var_os("SPARROW_TEST_ARTIFACTS")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = root.join(format!(
             "sparrow-kafka-{}-{}",
             std::process::id(),
             free_port()
@@ -232,6 +235,8 @@ impl Drop for KafkaSandbox {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if std::env::var_os("SPARROW_TEST_ARTIFACTS").is_none() && !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }

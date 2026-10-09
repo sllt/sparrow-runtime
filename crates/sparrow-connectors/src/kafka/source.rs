@@ -151,6 +151,8 @@ impl KafkaSourceConfig {
 
     pub fn validate(&self, policy: &TargetPolicy) -> Result<()> {
         refuse_durable_recovery(&self.restore)?;
+        self.schema.validate()?;
+        self.payload_format.check_schema(&self.schema)?;
         check_name("topic", &self.topic, 249)?;
         check_name("group_id", &self.group_id, 255)?;
         let within = |d: Duration, lo: Duration, hi: Duration| (lo..=hi).contains(&d);
@@ -546,6 +548,15 @@ struct Thread {
     _static: MemoryLease,
 }
 
+/// Also stop an SDK thread when the async task is aborted, not only when
+/// the normal shutdown tail executes. Its lease stays owned by Thread.
+struct StopThreadOnDrop(Arc<AtomicBool>);
+impl Drop for StopThreadOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 impl Thread {
     fn run(self) -> Result<()> {
         let ctx = Ctx {
@@ -677,6 +688,9 @@ impl Thread {
     fn wait_credit(&self, bytes: usize) -> Option<MemoryLease> {
         let mut waited = false;
         loop {
+            if self.stop.load(Ordering::Acquire) {
+                return None;
+            }
             if let Ok(lease) = self.owner.acquire(CreditKind::Reservation, bytes) {
                 return Some(lease);
             }
@@ -777,6 +791,7 @@ impl KafkaSource {
             .observation
             .health(true, HealthState::Connecting, "kafka_connecting", None);
         let stop = Arc::new(AtomicBool::new(false));
+        let _stop_on_drop = StopThreadOnDrop(stop.clone());
         let (feed_tx, mut feed) = mpsc::channel(1);
         let (outcome_tx, outcomes) = std::sync::mpsc::channel();
         let (done_tx, done) = oneshot::channel();
@@ -877,7 +892,7 @@ impl KafkaSource {
     ) -> Result<bool> {
         let k = &self.diag.kafka;
         let format = &self.config.payload_format;
-        let Some((payload, _copy)) = delivery.payload else {
+        let Some((payload, copy)) = delivery.payload else {
             k.source_oversize.fetch_add(1, Ordering::Relaxed);
             return self.poison(ErrorCode::MaxRecordSize, "value over max_message_bytes");
         };
@@ -901,7 +916,7 @@ impl KafkaSource {
                 "decode scratch over the job bound",
             );
         }
-        let Some(_scratch) = self.wait_credit(ingress.owner, estimate, cancel).await else {
+        let Some(scratch) = self.wait_credit(ingress.owner, estimate, cancel).await else {
             return Ok(false);
         };
         let started = Instant::now();
@@ -923,9 +938,16 @@ impl KafkaSource {
             }
         };
         drop(payload);
+        drop(copy);
         self.diag.observation.progress(true, 1);
-        self.admit(row, ingress, cancel, OriginSpan::at(delivery.received_at))
-            .await
+        self.admit(
+            row,
+            ingress,
+            cancel,
+            OriginSpan::at(delivery.received_at),
+            scratch,
+        )
+        .await
     }
 
     async fn wait_credit(
@@ -936,6 +958,9 @@ impl KafkaSource {
     ) -> Option<MemoryLease> {
         let mut waited = false;
         loop {
+            if cancel.is_cancelled() {
+                return None;
+            }
             if let Ok(lease) = owner.acquire(CreditKind::Reservation, bytes) {
                 return Some(lease);
             }
@@ -961,6 +986,7 @@ impl KafkaSource {
         ingress: &Ingress<'_>,
         cancel: &CancellationToken,
         origin: OriginSpan,
+        mut working: MemoryLease,
     ) -> Result<bool> {
         let _admission = self.diag.observation.timer(Latency::SourceAdmission);
         let k = &self.diag.kafka;
@@ -975,9 +1001,26 @@ impl KafkaSource {
             k.source_oversize.fetch_add(1, Ordering::Relaxed);
             return self.poison(ErrorCode::MaxRecordSize, "row over the inbox bound");
         }
-        let Some(_working) = self.wait_credit(ingress.owner, bytes, cancel).await else {
-            return Ok(false);
-        };
+        // The decoded row is already covered by scratch. Transfer that
+        // credit instead of retaining scratch AND waiting for a second
+        // row-sized lease (which can deadlock against our own reservation).
+        if bytes
+            > ingress
+                .owner
+                .budget()
+                .reservation_bytes
+                .saturating_sub(self.config.reservation())
+        {
+            return self.poison(ErrorCode::MaxRecordSize, "working row over the job bound");
+        }
+        while working.grow_to(bytes.max(1)).is_err() {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(false),
+                _ = tokio::time::sleep(CREDIT_RETRY) => {},
+            }
+        }
+        working.shrink_to(bytes.max(1))?;
         let mut row = Some(row);
         let mut observed_wait: Option<sparrow_io::observed::Wait<'_>> = None;
         loop {
@@ -1022,5 +1065,72 @@ impl KafkaSource {
                 } => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use sparrow_model::{ResourceBudget, Scalar};
+
+    #[test]
+    fn abort_guard_stops_the_consumer_thread() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let guard = StopThreadOnDrop(stop.clone());
+        assert!(!stop.load(Ordering::Acquire));
+        drop(guard);
+        assert!(stop.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn admission_transfers_decode_credit_instead_of_waiting_on_itself() {
+        let config = KafkaSourceConfig::new(
+            vec!["127.0.0.1:9092".into()],
+            "t",
+            "g",
+            OffsetReset::Earliest,
+            Schema::new(1, Vec::new()).unwrap(),
+        );
+        let row = Row {
+            values: vec![Scalar::utf8("already decoded")],
+        };
+        let bytes = QueuedRow::accounted_bytes(&row);
+        let mut budget = ResourceBudget::compact();
+        budget.reservation_bytes = config.reservation() + bytes;
+        let owner = MemoryOwner::new(budget);
+        let static_lease = owner
+            .acquire(CreditKind::Reservation, config.reservation())
+            .unwrap();
+        let working = owner.acquire(CreditKind::Reservation, bytes).unwrap();
+        let source = KafkaSource::bind(
+            config,
+            &TargetPolicy::allow("127.0.0.1", 9092),
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+        let queue = MemoryOwner::child(owner.clone(), budget, "test-inbox");
+        let (tx, mut rx) = sparrow_io::observed::channel(1);
+        let ingress = Ingress {
+            tx: &tx,
+            owner: &owner,
+            queue: &queue,
+            max_row_bytes: bytes,
+        };
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            source.admit(
+                row,
+                &ingress,
+                &CancellationToken::new(),
+                OriginSpan::at(Instant::now()),
+                working,
+            )
+        )
+        .await
+        .expect("cannot wait for a second copy of the same row")
+        .unwrap());
+        drop(rx.recv().await.unwrap());
+        drop(static_lease);
+        assert_eq!(owner.usage().reservation_bytes, 0);
     }
 }

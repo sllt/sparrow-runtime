@@ -38,6 +38,25 @@ fn parse(value: &Value) -> sparrow_model::Result<PipelineSpec> {
     PipelineSpec::from_json(&serde_json::to_vec(value).unwrap())
 }
 
+#[cfg(feature = "kafka")]
+#[test]
+fn kafka_typed_delivery_gate_refuses_recovery_and_foreign_batch_options() {
+    use sparrow_model::ErrorCode;
+    // serde-created specs bypass from_json/basic_check.
+    let mut spec: PipelineSpec = serde_json::from_value(linear_spec(9092)).unwrap();
+    spec.recovery = "aligned".into();
+    assert_eq!(
+        spec.check_delivery().unwrap_err().code,
+        ErrorCode::UnsupportedRestore
+    );
+    spec.recovery = "restart_fresh".into();
+    spec.sink.batch_rows = Some(2);
+    assert_eq!(
+        spec.check_delivery().unwrap_err().code,
+        ErrorCode::InvalidArgument
+    );
+}
+
 #[cfg(not(feature = "kafka"))]
 #[test]
 fn kafka_spec_without_the_feature_is_feature_unavailable() {

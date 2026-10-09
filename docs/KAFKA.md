@@ -160,8 +160,11 @@ job 预算可能给出的额度、解码失败、行超过 inbox 上限。
   无缺口，因此不继续写。
 - 停止：`flush_timeout_ms` 覆盖当前批次剩余部分、已排队批次和未完成投递报告；
   到期后 purge 队列与在途请求，剩余计 `kafka_sink_discarded_on_close`。被 purge 的
-  在途请求可能已被 broker 写入。之后关闭 producer（librdkafka 自身 flush 最多 500 ms，
-  在阻塞线程上执行）。
+  在途请求可能已被 broker 写入。metadata 检查也服从同一停止期限；SDK 销毁在阻塞线程执行，
+  不再阻塞作业超过停止期限。未完成的 metadata 请求或清理线程继续持有客户端额度，
+  直至最后一个 SDK 引用真正释放，不能将返回 stop 等同于 SDK 已销毁。
+- 致命投递错误会取消作业并关闭输入，已排队批次明确失败；不能无限接收并丢弃后续输入。
+- 带可靠输出序号的批次明确失败，不把它误当普通 live 输出。key 上限 1024B，超限不交给 SDK。
 - 作业重启后不去重：Sink 没有事务，上次未确认的批次可能重复写入。
 
 ## 内存
@@ -172,6 +175,11 @@ job 预算可能给出的额度、解码失败、行超过 inbox 上限。
   decode scratch 在解码前记账，行进入 inbox 按 `inbox_bytes` 计 Queue。
 - Sink 静态预扣 `queue_bytes + 2 × max_message_bytes + 256 KiB`（≤ 1/2）；每行先按
   `encode_scratch` 记账，输出按增长记账（上限 `max_message_bytes`）。
+- Sink 使用额度为 job reservation 一半的子 owner。每个待消费的 delivery report 另计
+  value/key 长度及 1024B 元数据，因为 SDK 的错误报告可能独立保留整条消息副本；额度不足
+  先消费已有报告，不能依赖 producer 队列上限约束已经出队的错误报告。
+- Source 从 decode scratch 转移工作行额度，避免持有该行信用再等待第二份信用；异步任务
+  被 abort 时也通知消费线程停止，线程仍持有自己的 SDK 静态额度直到销毁。
 - 所有 Kafka / NATS / DataBus / WebSocket 端点的静态预扣合计 ≤ 3/4（饱和算术）。
 - librdkafka 的设置：`fetch.max.bytes = max.partition.fetch.bytes = fetch_max_bytes`、
   `receive.message.max.bytes = fetch_max_bytes + 512`（单个响应的硬上限）、
