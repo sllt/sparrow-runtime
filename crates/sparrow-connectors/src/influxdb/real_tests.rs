@@ -1,6 +1,6 @@
 //! Against a real `influxd` (InfluxDB OSS 2.x) over HTTPS. Opt-in: set
-//! `SPARROW_INFLUXD` to the `influxd` binary; otherwise each test returns
-//! early (and says so). Verified locally with 2.9.1 (linux amd64 release
+//! `SPARROW_INFLUXD` to the `influxd` binary and run with `--include-ignored`.
+//! These tests never silently pass without the service. Verified with 2.9.1 (linux amd64 release
 //! tarball, sha256 762e4fc825c4386e0c5138e7c3f91fc778081db2bada1ec47066e786bf55d9ff).
 
 use super::*;
@@ -31,11 +31,9 @@ const BUCKET: &str = "b";
 const TOKEN: &str = "s3cr3t-token";
 
 impl Influxd {
-    async fn start() -> Option<Self> {
-        let Ok(bin) = std::env::var("SPARROW_INFLUXD") else {
-            eprintln!("SPARROW_INFLUXD not set: skipping real InfluxDB test");
-            return None;
-        };
+    async fn start() -> Self {
+        let bin = std::env::var("SPARROW_INFLUXD")
+            .expect("SPARROW_INFLUXD must name the pinned test service");
         let dir = std::env::temp_dir().join(format!(
             "sparrow-influxd-{}-{}",
             std::process::id(),
@@ -106,7 +104,7 @@ impl Influxd {
             .await
             .unwrap();
         assert!(setup.status().is_success(), "setup: {}", setup.status());
-        Some(server)
+        server
     }
 
     fn base(&self) -> String {
@@ -244,10 +242,9 @@ fn tricky_schema() -> Schema {
 }
 
 #[tokio::test]
+#[ignore = "requires SPARROW_INFLUXD (isolated InfluxDB OSS 2.9.1)"]
 async fn real_influxd_round_trips_escaping_types_and_precision() {
-    let Some(server) = Influxd::start().await else {
-        return;
-    };
+    let server = Influxd::start().await;
     let mapping = InfluxMapping {
         measurement: Measurement::Column("meas".into()),
         tags: vec!["tag key,=x".into(), "k\\=x\\,y\\ z".into()],
@@ -354,10 +351,9 @@ async fn real_influxd_round_trips_escaping_types_and_precision() {
 }
 
 #[tokio::test]
+#[ignore = "requires SPARROW_INFLUXD (isolated InfluxDB OSS 2.9.1)"]
 async fn real_influxd_partial_write_is_422_and_keeps_valid_points() {
-    let Some(server) = Influxd::start().await else {
-        return;
-    };
+    let server = Influxd::start().await;
     // `v` is a string field in `pw conflict` from now on.
     assert_eq!(
         server
@@ -395,10 +391,9 @@ async fn real_influxd_partial_write_is_422_and_keeps_valid_points() {
 }
 
 #[tokio::test]
+#[ignore = "requires SPARROW_INFLUXD (isolated InfluxDB OSS 2.9.1)"]
 async fn real_influxd_bad_token_and_unknown_bucket_are_fatal() {
-    let Some(server) = Influxd::start().await else {
-        return;
-    };
+    let server = Influxd::start().await;
     for (bucket, token) in [(BUCKET, "wrong"), ("missing", TOKEN)] {
         let mut c = server.config(mapping(true));
         c.bucket = bucket.into();

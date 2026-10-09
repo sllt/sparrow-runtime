@@ -295,6 +295,12 @@ impl InfluxMapping {
                 .map(|(_, f)| f.name.as_str())
                 .collect(),
         };
+        if names.len() > 256 {
+            return Err(err(
+                ErrorCode::BoundExceeded,
+                "InfluxDB mapping: at most 256 fields (including implicit fields)",
+            ));
+        }
         if names.is_empty() {
             return Err(err(
                 ErrorCode::InvalidSchema,
@@ -409,6 +415,9 @@ impl<F: FnMut(usize) -> bool> BoundedOut<'_, F> {
             self.bytes
                 .try_reserve_exact(capacity - self.bytes.len())
                 .map_err(|_| LineError::Budget)?;
+            if self.bytes.capacity() > capacity {
+                return Err(LineError::Budget);
+            }
         }
         self.bytes.extend_from_slice(data);
         Ok(())
@@ -497,6 +506,7 @@ impl CompiledMapping {
             CompiledMeasurement::Column(idx) => match &row.values[*idx] {
                 Scalar::Utf8(m) => {
                     if m.is_empty()
+                        || m.len() > 256
                         || m.starts_with('#')
                         || m.starts_with('_')
                         || backslash_before_special(m)

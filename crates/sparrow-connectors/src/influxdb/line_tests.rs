@@ -203,6 +203,11 @@ fn rows_the_parser_cannot_round_trip_are_refused() {
     m.tags = vec!["t".into()];
     let c = m.compile(&s).unwrap();
     let row = |a: &str, b: &str, d: &str| vec![Scalar::utf8(a), Scalar::utf8(b), Scalar::utf8(d)];
+    assert!(encode(&c, row(&"m".repeat(256), "t", "s")).is_ok());
+    assert_eq!(
+        encode(&c, row(&"m".repeat(257), "t", "s")),
+        Err(LineError::Bad("measurement_name"))
+    );
     for (values, reason) in [
         (row("#m", "t", "s"), "measurement_name"),
         (row("_m", "t", "s"), "measurement_name"),

@@ -108,7 +108,7 @@ telemetry,device_id=d\ 1 temperature=21.5 1700000000123
 | 413 | 请求过大，不重试，同上；应调小 `batch_bytes` |
 | 422 | **部分写入**：能写的 point 已保存，其余被丢弃（例如字段类型冲突）。不重试，计 `partial_writes`，批次回执失败 |
 | 401 / 403 / 404 | token 无效 / 无权限 / org 或 bucket 不存在：Sink 停止并使 job 失败（`fatal`，状态 `failed`，错误信息提示 InfluxDB Sink） |
-| 429 / 503 | 重试；`Retry-After` 为秒数时用它代替退避（超过 `retry_max_ms` 时封顶并计 `retry_after_capped`）；HTTP-date 形式不解析，按退避 |
+| 429 / 503 | 仅有 `time_column` 时重试；无时间列则拒绝该请求并使批次回执失败。`Retry-After` 为秒数时用它代替退避（超过 `retry_max_ms` 时封顶并计 `retry_after_capped`）；HTTP-date 形式不解析，按退避 |
 | 其他 4xx / 5xx（含 500） | 不重试，同 400 计数 |
 | 传输错误 | 有 `time_column` 时重试（同一 point 覆盖写，幂等）；没有 `time_column` 时只重试连接建立失败（请求未发出），超时 / 连接中断不重试，因为服务端可能已写入，重发会以新的接收时间产生重复 point |
 
@@ -121,15 +121,19 @@ telemetry,device_id=d\ 1 temperature=21.5 1700000000123
 压缩器 scratch（384 KiB，按 miniz_oxide 0.9.1 的 `CompressorOxide` 堆分配估算）与输出上界；
 申请失败则以未压缩 body 发送并计 `gzip_fallbacks`。
 
-峰值 `batch_bytes + batch_rows × 8 + 72 KiB`（+ gzip 时 `gzip_bound(batch_bytes) + 384 KiB`）
+峰值 `batch_bytes + batch_rows × (Arc 槽位 + 回执对象额度) + 当前批次回执额度 + 72 KiB`
+（+ gzip 时 `gzip_bound(batch_bytes) + 384 KiB`）
 必须 ≤ job reservation 的一半（compact 为 2 MiB），在 validate 与 bind 时用检查过的算术判断，
 溢出视为超限，不做静默钳制。例如 compact 下 `batch_bytes = 1 MiB` 不开 gzip 可以，开 gzip 拒绝。
+回执对象在创建前单独预扣；请求只持有已成功编码的行所属批次，槽位容量不超过 `batch_rows`。
+坏记录不积累回执，前一个请求失败也不会错误地判定尚未加入该请求的下一批失败。
 
 ## 关闭
 
 第一次取消开始一个 `flush_timeout_ms` 截止时间，由在途请求（含其重试与退避等待）、已排队批次与
 最后的缓冲共用。到期未确认的行计 `discarded_on_close`，回执失败。被中止的在途请求可能已经被
 服务端写入。EOF（上游结束）时没有截止时间，缓冲会全部发送。
+编码循环也观察停止并定期让出执行权；已过期时，立即就绪的操作不能绕过期限。
 
 ## 指标
 
@@ -143,9 +147,12 @@ pipeline status 的 `influxdb_sink` 对象与 `/metrics` 中的 `influxdb_sink_*
 - CI：line protocol 编码单元测试（转义边界、类型、精度、取整、范围）；进程内 HTTPS mock 检查
   精确 body 字节、URL、header、gzip、批次边界、重试 / Retry-After、终止状态码、fatal、停止截止、
   预算拒绝；control 层 spec 矩阵、validate、Store → Supervisor → File → SQL → Sink 端到端与 401 失败。
-- 本地（可选）：设置 `SPARROW_INFLUXD=<influxd 路径>` 后运行真实 InfluxDB OSS 2.x（HTTPS，
+- 真实服务测试：默认标记 ignored，不再未配置服务就显示通过；设置 `SPARROW_INFLUXD=<influxd 路径>`
+  并传 `--include-ignored` 后运行真实 InfluxDB OSS 2.x（HTTPS，
   测试证书）：特殊字符 / 类型 / 精度往返（gzip）、422 部分写入、401 / 404 fatal。已用 2.9.1
   （linux amd64 发布包，sha256 `762e4fc825c4386e0c5138e7c3f91fc778081db2bada1ec47066e786bf55d9ff`）验证。
+  `websocket-contracts` CI 的 standalone / jetstream profile 都下载并校验上述固定服务版本，
+  使用同一批测试二进制重复两轮（含真实服务往返，非仅 mock）。
 
 ## 未承诺
 

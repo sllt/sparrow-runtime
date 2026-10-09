@@ -68,6 +68,9 @@ const REQUEST_OVERHEAD: usize = 8 * 1024 + RESPONSE_LIMIT;
 pub const GZIP_SCRATCH: usize = 384 * 1024;
 const GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
 const ACK_SLOT: usize = std::mem::size_of::<Arc<BatchAck>>();
+// The Arc pointer alone does not account for the retained receipt object.
+const ACK_STATE: usize = std::mem::size_of::<BatchAck>() + 2 * std::mem::size_of::<usize>();
+const MAX_TOKEN_BYTES: usize = 4096;
 
 fn err(code: ErrorCode, message: impl Into<String>) -> SparrowError {
     SparrowError::new(code, message)
@@ -185,7 +188,10 @@ impl InfluxDbSinkConfig {
     pub fn peak_bytes(&self) -> Option<usize> {
         let mut peak = self
             .batch_bytes
-            .checked_add(self.batch_rows.checked_mul(ACK_SLOT)?)?
+            // At most one distinct receipt per successful row, plus the
+            // current batch while flushing a previous full request.
+            .checked_add(self.batch_rows.checked_mul(ACK_SLOT + ACK_STATE)?)?
+            .checked_add(ACK_STATE)?
             .checked_add(REQUEST_OVERHEAD)?;
         if self.gzip {
             peak = peak
@@ -230,6 +236,12 @@ impl InfluxDbSinkConfig {
             return Err(err(
                 ErrorCode::SecretMissing,
                 "InfluxDB token secret is empty",
+            ));
+        }
+        if token.len() > MAX_TOKEN_BYTES {
+            return Err(err(
+                ErrorCode::BoundExceeded,
+                "InfluxDB token exceeds 4096 bytes",
             ));
         }
         let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Token {token}"))
@@ -304,6 +316,7 @@ struct BatchAck {
     guard: Option<DeliveryGuard>,
     encoded: AtomicBool,
     failed: AtomicBool,
+    _lease: MemoryLease,
 }
 
 impl Drop for BatchAck {
@@ -345,12 +358,19 @@ impl Request {
 
     /// Hold `ack` for this request's rows; ack slots are charged before
     /// they are allocated.
-    fn hold(&mut self, ack: &Arc<BatchAck>) -> std::result::Result<(), LineError> {
+    fn hold(
+        &mut self,
+        ack: &Arc<BatchAck>,
+        max_slots: usize,
+    ) -> std::result::Result<(), LineError> {
         if self.acks.last().is_some_and(|a| Arc::ptr_eq(a, ack)) {
             return Ok(());
         }
         if self.acks.len() == self.acks.capacity() {
-            let slots = self.acks.capacity().saturating_mul(2).max(4);
+            if self.acks.len() >= max_slots {
+                return Err(LineError::Budget);
+            }
+            let slots = self.acks.capacity().saturating_mul(2).max(4).min(max_slots);
             let need = self
                 .body
                 .capacity()
@@ -361,6 +381,9 @@ impl Request {
             self.acks
                 .try_reserve_exact(slots - self.acks.len())
                 .map_err(|_| LineError::Budget)?;
+            if self.acks.capacity() > slots {
+                return Err(LineError::Budget);
+            }
         }
         self.acks.push(ack.clone());
         Ok(())
@@ -574,26 +597,47 @@ impl InfluxDbSink {
         cancel: &CancellationToken,
         outbox: Option<&Arc<InflightCounter>>,
     ) {
+        let guard = self.diag.observation.delivery_guard(
+            batch.num_rows(),
+            batch.tracked_bytes(),
+            batch.origin(),
+        );
+        self.observe_stop(state, cancel);
+        if state.fatal || state.deadline.is_some_and(|at| Instant::now() >= at) {
+            self.diag
+                .influxdb_sink_discarded_on_close
+                .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+            if let Some(outbox) = outbox {
+                outbox.fail();
+            }
+            return;
+        }
+        let Ok(lease) = self.owner.acquire(CreditKind::Reservation, ACK_STATE) else {
+            self.diag
+                .influxdb_sink_dropped_budget
+                .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+            if let Some(outbox) = outbox {
+                outbox.fail();
+            }
+            return;
+        };
         let ack = Arc::new(BatchAck {
             outbox: outbox.cloned(),
-            guard: Some(self.diag.observation.delivery_guard(
-                batch.num_rows(),
-                batch.tracked_bytes(),
-                batch.origin(),
-            )),
+            guard: Some(guard),
             encoded: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            _lease: lease,
         });
         if batch.output_sequence().is_some() {
             // Reliable output identity cannot be honoured (live-only).
             self.diag
                 .influxdb_sink_dropped_bad
                 .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-            self.diag.observation.health(
-                false,
-                HealthState::Failed,
+            self.fatal(
+                state,
+                cancel,
                 "influxdb_reliable_output_rejected",
-                Some(ErrorCode::UnsupportedRestore),
+                ErrorCode::UnsupportedRestore,
             );
             return;
         }
@@ -609,6 +653,10 @@ impl InfluxDbSink {
         }
         let limit = self.config.batch_bytes;
         for (i, row) in batch.rows().iter().enumerate() {
+            if i % 16 == 15 {
+                tokio::task::yield_now().await;
+            }
+            self.observe_stop(state, cancel);
             if state.fatal || state.deadline.is_some_and(|d| Instant::now() >= d) {
                 self.diag
                     .influxdb_sink_discarded_on_close
@@ -632,7 +680,7 @@ impl InfluxDbSink {
                 let compiled = &state.compiled.as_ref().expect("compiled above").1;
                 let started = std::time::Instant::now();
                 let mark = request.body.len();
-                let outcome = request.hold(&ack).and_then(|()| {
+                let outcome = {
                     let Request {
                         body,
                         lease,
@@ -659,7 +707,8 @@ impl InfluxDbSink {
                             },
                         },
                     )
-                });
+                }
+                .and_then(|()| request.hold(&ack, self.config.batch_rows));
                 self.diag
                     .observation
                     .record(Latency::Encode, started.elapsed());
@@ -744,6 +793,14 @@ impl InfluxDbSink {
         }
     }
 
+    fn observe_stop(&self, state: &mut State, cancel: &CancellationToken) {
+        if cancel.is_cancelled() {
+            state
+                .deadline
+                .get_or_insert_with(|| Instant::now() + self.config.flush_timeout);
+        }
+    }
+
     fn fatal(
         &self,
         state: &mut State,
@@ -824,6 +881,12 @@ impl InfluxDbSink {
         deadline: &mut Option<Instant>,
         cancel: &CancellationToken,
     ) -> Sent {
+        if cancel.is_cancelled() {
+            deadline.get_or_insert_with(|| Instant::now() + self.config.flush_timeout);
+        }
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Sent::Deadline;
+        }
         let gzip = self.compress(request);
         let rows = request.rows as u64;
         let bytes = request.body.len() as u64;
@@ -919,6 +982,21 @@ impl InfluxDbSink {
                                 HealthState::Failed,
                                 "influxdb_partial_write",
                                 Some(ErrorCode::InvalidArgument),
+                            );
+                            return Sent::Failed;
+                        }
+                        429 | 503 if !idempotent => {
+                            self.diag
+                                .influxdb_sink_rejected_requests
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.diag
+                                .influxdb_sink_rejected_rows
+                                .fetch_add(rows, Ordering::Relaxed);
+                            self.diag.observation.health(
+                                false,
+                                HealthState::Failed,
+                                "influxdb_response_not_retried_without_time",
+                                Some(ErrorCode::Internal),
                             );
                             return Sent::Failed;
                         }
@@ -1022,14 +1100,22 @@ impl InfluxDbSink {
     ) -> Option<F::Output> {
         tokio::pin!(fut);
         loop {
+            if cancel.is_cancelled() {
+                deadline.get_or_insert_with(|| Instant::now() + self.config.flush_timeout);
+            }
             match *deadline {
-                Some(at) => return tokio::time::timeout_at(at, fut.as_mut()).await.ok(),
+                Some(at) => {
+                    if Instant::now() >= at {
+                        return None;
+                    }
+                    return tokio::time::timeout_at(at, fut.as_mut()).await.ok();
+                }
                 None => tokio::select! {
                     biased;
-                    out = fut.as_mut() => return Some(out),
                     _ = cancel.cancelled() => {
                         *deadline = Some(Instant::now() + self.config.flush_timeout);
                     }
+                    out = fut.as_mut() => return Some(out),
                 },
             }
         }

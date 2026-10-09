@@ -214,6 +214,11 @@ fn influxdb_spec_matrix_rejects_mixed_fields_and_durable_claims() {
             InvalidArgument,
         ),
         (
+            "ignored JSON format on line protocol",
+            Box::new(|v| v["sink"]["format"] = json!("json")),
+            InvalidArgument,
+        ),
+        (
             "mixed action",
             Box::new(|v| v["sink"]["action"] = json!({"body": {"a": "$device_id"}})),
             InvalidArgument,

@@ -16,8 +16,7 @@ use tokio::net::TcpListener;
 use super::*;
 use crate::secret::MapSecretResolver;
 
-#[path = "../mqtt/tls_fixture.rs"]
-mod tls_fixture;
+use crate::http::observation_tls_fixture as tls_fixture;
 
 #[cfg(test)]
 #[path = "real_tests.rs"]
@@ -342,6 +341,149 @@ impl Harness {
 
 fn owner() -> Arc<MemoryOwner> {
     MemoryOwner::new(ResourceBudget::compact())
+}
+
+#[tokio::test]
+async fn request_failure_does_not_fail_the_next_batch_without_rows_in_that_request() {
+    let mock = Mock::start(vec![Reply::status(400), Reply::status(204)]).await;
+    let mut c = config(mock.port, true);
+    c.batch_bytes = 1024;
+    c.flush_interval = Duration::from_secs(60);
+    let h = Harness::start(c, owner());
+    h.send(vec![row(1, "a", 1.0, &"x".repeat(700))]).await;
+    h.send(vec![row(2, "b", 2.0, &"y".repeat(700))]).await;
+    let (outbox, snap) = h.finish().await;
+    let requests = mock.texts();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("cpu,host=a "));
+    assert!(requests[1].starts_with("cpu,host=b "));
+    assert_eq!(outbox.failed(), 1);
+    assert_eq!(
+        outbox.acked(),
+        1,
+        "second batch was carried only by the successful request"
+    );
+    assert_eq!(snap.influxdb_sink_rows_written, 1);
+}
+
+#[tokio::test]
+async fn status_retry_requires_explicit_time_column() {
+    for status in [429, 503] {
+        let mock = Mock::start(vec![Reply::status(status), Reply::status(204)]).await;
+        let h = Harness::start(config(mock.port, false), owner());
+        h.send(vec![row(1, "h", 1.0, "x")]).await;
+        let (outbox, snap) = h.finish().await;
+        assert_eq!(mock.requests().len(), 1);
+        assert_eq!(outbox.failed(), 1);
+        assert_eq!(outbox.acked(), 0);
+        assert_eq!(snap.influxdb_sink_retries, 0);
+        assert_eq!(snap.influxdb_sink_rejected_rows, 1);
+    }
+}
+
+fn bound_sink() -> InfluxDbSink {
+    InfluxDbSink::bind(
+        config(8086, true),
+        &secrets(),
+        &TargetPolicy::allow("localhost", 8086),
+        owner(),
+        IoDiagnostics::new(),
+    )
+    .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_stop_wins_over_ready_work_and_never_extends_deadline() {
+    let sink = bound_sink();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let mut deadline = None;
+    assert_eq!(
+        sink.bounded(std::future::ready(1), &mut deadline, &cancel)
+            .await,
+        Some(1)
+    );
+    let first = deadline.expect("even immediately ready work observes cancellation");
+    tokio::time::advance(sink.config.flush_timeout).await;
+    assert_eq!(
+        sink.bounded(std::future::ready(2), &mut deadline, &cancel)
+            .await,
+        None
+    );
+    assert_eq!(deadline, Some(first));
+    let outbox = Arc::new(InflightCounter::new());
+    outbox.enqueue();
+    let mut state = State {
+        pending: None,
+        compiled: None,
+        deadline,
+        fatal: false,
+    };
+    sink.write_batch(
+        batch(&owner(), vec![row(1, "h", 1.0, "x")]),
+        &mut state,
+        &cancel,
+        Some(&outbox),
+    )
+    .await;
+    assert!(state.pending.is_none());
+    assert_eq!(outbox.failed(), 1);
+    assert_eq!(sink.diag.snapshot().influxdb_sink_discarded_on_close, 1);
+}
+
+#[tokio::test]
+async fn bad_batches_do_not_accumulate_receipts_and_ack_slots_stay_bounded() {
+    let sink = bound_sink();
+    let cancel = CancellationToken::new();
+    let outbox = Arc::new(InflightCounter::new());
+    let mut state = State {
+        pending: None,
+        compiled: None,
+        deadline: None,
+        fatal: false,
+    };
+    for _ in 0..100 {
+        outbox.enqueue();
+        sink.write_batch(
+            batch(&owner(), vec![row(1, "h", f64::NAN, "x")]),
+            &mut state,
+            &cancel,
+            Some(&outbox),
+        )
+        .await;
+        let request = state.pending.as_ref().unwrap();
+        assert_eq!(request.rows, 0);
+        assert!(
+            request.acks.is_empty(),
+            "failed encodes never retain receipt handles"
+        );
+    }
+    assert_eq!(outbox.failed(), 100);
+    let before = sink.owner.usage().reservation_bytes;
+    let receipt = Arc::new(BatchAck {
+        outbox: None,
+        guard: None,
+        encoded: AtomicBool::new(true),
+        failed: AtomicBool::new(false),
+        _lease: sink
+            .owner
+            .acquire(CreditKind::Reservation, ACK_STATE)
+            .unwrap(),
+    });
+    let request = state.pending.as_mut().unwrap();
+    request.hold(&receipt, 1).unwrap();
+    assert_eq!(
+        request.acks.capacity(),
+        1,
+        "not minimum geometric allocation of four slots"
+    );
+    assert_eq!(
+        sink.owner.usage().reservation_bytes - before,
+        ACK_STATE + ACK_SLOT
+    );
+    drop(receipt);
+    drop(state);
+    assert_eq!(sink.owner.usage().reservation_bytes, 0);
 }
 
 #[tokio::test]
