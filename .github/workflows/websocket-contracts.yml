@@ -108,6 +108,8 @@ jobs:
             ~/.cargo/git
             target
           key: websocket-contracts-${{ runner.os }}-1.98.0-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            websocket-contracts-${{ runner.os }}-1.98.0-${{ matrix.profile }}-
       - name: Production feature combinations and network connector contracts
         env:
           PROFILE: ${{ matrix.profile }}

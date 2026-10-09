@@ -40,7 +40,7 @@ pub use spec::{
 mod actions_tests;
 #[cfg(all(test, feature = "demo-io", target_os = "linux"))]
 mod csv_tests;
-#[cfg(all(test, feature = "demo-io", target_os = "linux"))]
+#[cfg(all(test, target_os = "linux"))]
 mod protobuf_tests;
 #[cfg(all(test, feature = "demo-io"))]
 mod k3_tests;
