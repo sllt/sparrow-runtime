@@ -127,8 +127,10 @@ impl WebSocketSinkConfig {
         self.client.validate(policy)
     }
 
-    /// Read-side connection buffers, the outgoing payload/formatted frame,
-    /// and a full send queue. Pending encode scratch is charged separately.
+    /// Connection read side, the message being sent plus its formatted frame
+    /// in the write buffer (tungstenite copies the payload into
+    /// `out_buffer`), and a full send queue of maximal messages. A row
+    /// encoded but not yet queued is charged separately by its encode lease.
     pub fn reservation(&self) -> usize {
         let max = self.client.max_message_bytes;
         self.client
@@ -318,6 +320,9 @@ impl WebSocketSink {
                 return false;
             }
             let started = std::time::Instant::now();
+            // Scratch and every output growth are charged first; output is
+            // capped at max_message_bytes. The lease covers the bytes until
+            // they sit in the (pre-charged) send queue.
             let encoded = encode_row_charged(
                 &self.owner,
                 &self.config.payload_format,

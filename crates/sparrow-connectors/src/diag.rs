@@ -116,6 +116,7 @@ pub struct IoDiagnostics {
     pub databus_sink_no_subscribers: AtomicU64,
     pub databus_sink_dropped_bad: AtomicU64,
     pub databus_sink_dropped_oversize: AtomicU64,
+    pub databus_sink_dropped_budget: AtomicU64,
     pub databus_sink_blocked_publishes: AtomicU64,
     pub databus_sink_discarded_on_close: AtomicU64,
     pub databus_sink_batches: AtomicU64,
@@ -144,6 +145,7 @@ pub struct IoDiagnostics {
     pub websocket_sink_dropped_oversize: AtomicU64,
     pub websocket_sink_dropped_budget: AtomicU64,
     pub websocket_sink_dropped_overflow: AtomicU64,
+    pub websocket_sink_dropped_budget: AtomicU64,
     pub websocket_sink_backpressure_waits: AtomicU64,
     pub websocket_sink_send_failed: AtomicU64,
     pub websocket_sink_send_timeouts: AtomicU64,
@@ -338,6 +340,7 @@ impl IoDiagnostics {
             databus_sink_dropped_oversize: self
                 .databus_sink_dropped_oversize
                 .load(Ordering::Relaxed),
+            databus_sink_dropped_budget: self.databus_sink_dropped_budget.load(Ordering::Relaxed),
             databus_sink_blocked_publishes: self
                 .databus_sink_blocked_publishes
                 .load(Ordering::Relaxed),
@@ -385,6 +388,9 @@ impl IoDiagnostics {
             websocket_sink_dropped_budget: self.websocket_sink_dropped_budget.load(Ordering::Relaxed),
             websocket_sink_dropped_overflow: self
                 .websocket_sink_dropped_overflow
+                .load(Ordering::Relaxed),
+            websocket_sink_dropped_budget: self
+                .websocket_sink_dropped_budget
                 .load(Ordering::Relaxed),
             websocket_sink_backpressure_waits: self
                 .websocket_sink_backpressure_waits
@@ -537,6 +543,7 @@ pub struct IoSnapshot {
     pub databus_sink_no_subscribers: u64,
     pub databus_sink_dropped_bad: u64,
     pub databus_sink_dropped_oversize: u64,
+    pub databus_sink_dropped_budget: u64,
     pub databus_sink_blocked_publishes: u64,
     pub databus_sink_discarded_on_close: u64,
     pub databus_sink_batches: u64,
@@ -565,6 +572,7 @@ pub struct IoSnapshot {
     pub websocket_sink_dropped_oversize: u64,
     pub websocket_sink_dropped_budget: u64,
     pub websocket_sink_dropped_overflow: u64,
+    pub websocket_sink_dropped_budget: u64,
     pub websocket_sink_backpressure_waits: u64,
     pub websocket_sink_send_failed: u64,
     pub websocket_sink_send_timeouts: u64,
@@ -727,6 +735,7 @@ impl IoSnapshot {
         self.databus_sink_no_subscribers += other.databus_sink_no_subscribers;
         self.databus_sink_dropped_bad += other.databus_sink_dropped_bad;
         self.databus_sink_dropped_oversize += other.databus_sink_dropped_oversize;
+        self.databus_sink_dropped_budget += other.databus_sink_dropped_budget;
         self.databus_sink_blocked_publishes += other.databus_sink_blocked_publishes;
         self.databus_sink_discarded_on_close += other.databus_sink_discarded_on_close;
         self.databus_sink_batches += other.databus_sink_batches;
@@ -755,6 +764,7 @@ impl IoSnapshot {
         self.websocket_sink_dropped_oversize += other.websocket_sink_dropped_oversize;
         self.websocket_sink_dropped_budget += other.websocket_sink_dropped_budget;
         self.websocket_sink_dropped_overflow += other.websocket_sink_dropped_overflow;
+        self.websocket_sink_dropped_budget += other.websocket_sink_dropped_budget;
         self.websocket_sink_backpressure_waits += other.websocket_sink_backpressure_waits;
         self.websocket_sink_send_failed += other.websocket_sink_send_failed;
         self.websocket_sink_send_timeouts += other.websocket_sink_send_timeouts;

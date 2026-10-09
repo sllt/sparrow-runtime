@@ -18,9 +18,9 @@ pub use source::{
     DEFAULT_PREFETCH_CAPACITY,
 };
 
+// Reuse the one compiled copy of the localhost test CA (clippy duplicate_mod).
 #[cfg(test)]
-#[path = "../mqtt/tls_fixture.rs"]
-mod tls_fixture;
+use crate::http::observation_tls_fixture as tls_fixture;
 
 #[cfg(test)]
 mod tests;

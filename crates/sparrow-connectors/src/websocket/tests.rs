@@ -244,12 +244,21 @@ fn start_source(
     policy: &TargetPolicy,
     mutate: impl FnOnce(&mut WebSocketSourceConfig),
 ) -> RunningSource {
+    start_source_with(url, policy, ResourceBudget::compact(), mutate)
+}
+
+fn start_source_with(
+    url: String,
+    policy: &TargetPolicy,
+    budget: ResourceBudget,
+    mutate: impl FnOnce(&mut WebSocketSourceConfig),
+) -> RunningSource {
     let mut config = WebSocketSourceConfig::new(url, schema());
     mutate(&mut config);
     let diag = IoDiagnostics::new();
     let capacity = config.inbox_capacity;
     let source = WebSocketSource::bind(config, &secrets(), policy, diag.clone()).unwrap();
-    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let owner = MemoryOwner::new(budget);
     diag.observation.initialize(&owner).unwrap();
     let (tx, rx) = sparrow_io::observed::channel(capacity);
     let cancel = CancellationToken::new();
@@ -278,7 +287,7 @@ impl RunningSource {
             self.owner.clone(),
             CreditKind::Reservation,
             got.len().max(1),
-            1 << 20,
+            (1 << 20).min(self.owner.budget().reservation_bytes / 4),
         )
         .unwrap();
         for q in got {
@@ -1144,4 +1153,129 @@ async fn websocket_duplex_write_pending_still_reads_control_frames() {
     .await;
     assert_eq!(result, client::DuplexSent::Ok);
     assert_eq!(probe.reads.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn websocket_source_ndjson_blank_lines_are_json_whitespace_only() {
+    let server = Listener::plain().await;
+    let mut run = start_source(server.url(), &server.policy(), |c| {
+        c.framing = WebSocketFraming::Ndjson;
+    });
+    let mut ws = server.accept().await;
+    // Space/tab/CR lines are blank; a form feed or vertical tab is not JSON
+    // whitespace, so that line is decoded (and rejected as bad JSON).
+    ws.send(Message::text(
+        " \t\r\n\x0c\n\x0b\n{\"device_id\":\"d\",\"v\":5}\n",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(run.take(1).await, vec![5]);
+    let snap = run.diag.snapshot();
+    assert_eq!(snap.websocket_source_dropped_bad, 2, "{snap:?}");
+    assert_eq!(snap.websocket_source_rows, 1);
+    run.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_source_charges_decode_scratch_before_parsing() {
+    let server = Listener::plain().await;
+    // Smallest owner satisfying the half-budget gate for connection +
+    // prefetch; enough for a small row, not a 60 KiB JSON decode estimate.
+    let mut budget = ResourceBudget::compact();
+    budget.reservation_bytes = WebSocketSourceConfig::new(server.url(), schema()).reservation() * 2;
+    let mut run = start_source_with(server.url(), &server.policy(), budget, |c| {
+        c.client.max_message_bytes = 64 * 1024;
+    });
+    let mut ws = server.accept().await;
+    // Malformed on purpose: had it been parsed it would count dropped_bad.
+    ws.send(Message::text(format!(
+        "{{\"device_id\":\"{}\",\"v\":",
+        "x".repeat(60 * 1024)
+    )))
+    .await
+    .unwrap();
+    ws.send(json_row(8)).await.unwrap();
+    assert_eq!(run.take(1).await, vec![8]);
+    let snap = run.diag.snapshot();
+    assert_eq!(snap.websocket_source_dropped_budget, 1, "{snap:?}");
+    assert_eq!(snap.websocket_source_dropped_bad, 0, "{snap:?}");
+    assert_eq!(snap.decode_errors, 0, "{snap:?}");
+    assert_eq!(snap.websocket_source_rows, 1);
+    run.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_sink_charges_encode_before_encoding_and_holds_no_credit_after() {
+    let server = Listener::plain().await;
+    let outbox = Arc::new(sparrow_model::InflightCounter::new());
+    let (owner, diag, tx, cancel, task) =
+        start_sink_with(server.url(), &server.policy(), Some(outbox.clone()), |_| {});
+    let mut ws = server.accept().await;
+    let bound = owner.usage().reservation_bytes;
+    // Exhaust the job reservation: rows from another owner cannot be encoded.
+    let rows_owner = MemoryOwner::new(ResourceBudget::compact());
+    let hog = owner
+        .acquire(
+            CreditKind::Reservation,
+            owner.budget().reservation_bytes - bound,
+        )
+        .unwrap();
+    outbox.enqueue();
+    tx.send(batch(&rows_owner, 1, 3)).await.unwrap();
+    until(Duration::from_secs(5), || {
+        diag.snapshot().websocket_sink_dropped_budget == 3
+    })
+    .await;
+    // Not acknowledged: the batch was not fully queued.
+    until(Duration::from_secs(5), || outbox.failed() == 1).await;
+    drop(hog);
+    outbox.enqueue();
+    tx.send(batch(&rows_owner, 4, 4)).await.unwrap();
+    assert_eq!(value_of(&next_data(&mut ws).await), 4);
+    let snap = diag.snapshot();
+    assert_eq!(snap.websocket_sink_sent, 1, "{snap:?}");
+    assert_eq!(snap.websocket_sink_dropped_bad, 0, "{snap:?}");
+    assert_eq!(snap.csv_encode_errors, 0, "{snap:?}");
+    // Encode leases are released once the message is queued and sent.
+    until(Duration::from_secs(5), || {
+        owner.usage().reservation_bytes == bound
+    })
+    .await;
+    cancel.cancel();
+    task.await.unwrap();
+    drop(tx);
+    until(Duration::from_secs(5), || {
+        owner.usage().reservation_bytes == 0
+    })
+    .await;
+}
+
+#[test]
+fn websocket_reservation_math_saturates_and_huge_values_are_refused() {
+    let policy = TargetPolicy::allow("127.0.0.1", 9000);
+    let mut sink = WebSocketSinkConfig::new("ws://127.0.0.1:9000/");
+    sink.client.max_message_bytes = usize::MAX;
+    sink.queue_capacity = usize::MAX;
+    assert_eq!(sink.reservation(), usize::MAX);
+    assert_eq!(
+        sink.validate(&policy).unwrap_err().code,
+        ErrorCode::BoundExceeded
+    );
+    let _ = sink.client.protocol_config();
+    let mut source = WebSocketSourceConfig::new("ws://127.0.0.1:9000/", schema());
+    source.client.max_message_bytes = usize::MAX;
+    assert_eq!(source.reservation(), usize::MAX);
+    assert_eq!(
+        source.validate(&policy).unwrap_err().code,
+        ErrorCode::BoundExceeded
+    );
+    source.client.max_message_bytes = 64 * 1024;
+    source.inbox_bytes = usize::MAX;
+    assert_eq!(
+        source.validate(&policy).unwrap_err().code,
+        ErrorCode::BoundExceeded
+    );
+    // Default sink: read side + outgoing message/frame + 16 queued messages.
+    let sink = WebSocketSinkConfig::new("ws://127.0.0.1:9000/");
+    assert_eq!(sink.reservation(), 128 * 1024 + (2 + 2 + 16) * 64 * 1024);
 }

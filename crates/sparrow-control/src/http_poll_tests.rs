@@ -215,6 +215,14 @@ fn http_poll_spec_matrix_rejects_mixed_fields_and_durable_claims() {
             "mixed inbox_bytes",
             Box::new(|v| v["source"]["inbox_bytes"] = json!(1024)),
         ),
+        (
+            "mixed inbox_wait_ms",
+            Box::new(|v| v["source"]["inbox_wait_ms"] = json!(0)),
+        ),
+        (
+            "mixed tcp_quickack",
+            Box::new(|v| v["source"]["tcp_quickack"] = json!(false)),
+        ),
         ("aligned", Box::new(|v| v["recovery"] = json!("aligned"))),
         (
             "restore",
@@ -255,6 +263,9 @@ fn http_poll_spec_matrix_rejects_mixed_fields_and_durable_claims() {
             .map_err(|e| e.code)
     };
     check(&base, &allowed).unwrap();
+    let mut nested_inbox = base.clone();
+    nested_inbox["source"]["http_poll"]["inbox_bytes"] = json!(1024);
+    check(&nested_inbox, &allowed).unwrap();
     use sparrow_model::ErrorCode::*;
     assert_eq!(check(&base, &sink_only), Err(PolicyDenied));
     // Default backoff ceiling follows long intervals instead of rejecting them.

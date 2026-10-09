@@ -350,6 +350,18 @@ fn databus_validation_bounds_and_reservation_refusal() {
             Box::new(|v| v["source"]["databus"]["buffer_bytes"] = json!(4 * 1024 * 1024)),
             BoundExceeded,
         ),
+        // The reservation total is computed before per-endpoint bounds:
+        // huge values must saturate into a refusal, not overflow.
+        (
+            "huge buffer_bytes",
+            Box::new(|v| v["source"]["databus"]["buffer_bytes"] = json!(usize::MAX)),
+            BoundExceeded,
+        ),
+        (
+            "huge buffer_capacity",
+            Box::new(|v| v["source"]["databus"]["buffer_capacity"] = json!(usize::MAX)),
+            BoundExceeded,
+        ),
     ];
     for (name, mutate, code) in cases {
         let mut v = base.clone();

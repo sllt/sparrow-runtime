@@ -4,9 +4,15 @@
 //!   header) or, with `framing = ndjson`, newline-delimited JSON objects.
 //!   Binary messages are dropped and counted unless `binary_frames = decode`
 //!   (JSON only; CSV is text and refuses binary decoding).
-//! - The protocol layer rejects an oversized frame before reserving its
-//!   payload; accumulated fragmented messages are checked after reading each
-//!   bounded frame. Records also have a format-specific pre-decode limit.
+//! - The protocol layer rejects a frame above `max_message_bytes` from its
+//!   header, before reserving its payload, and a fragmented message once its
+//!   running size would pass the bound; the connection is then closed
+//!   (counted `dropped_oversize`) and reconnected. A record above the format's
+//!   decode limit (64 KiB JSON / `max_record_bytes` CSV) is dropped by length
+//!   and counted the same way, without decoding.
+//! - Each record's format-specific decode working set is charged to the job
+//!   reservation before decoding and held until the row is admitted;
+//!   without credit the record is counted `dropped_budget` and not parsed.
 //! - A separate wire actor continues reading and answering heartbeats while
 //!   the decode/admission pump waits on its inbox. Complete data messages
 //!   enter a reservation-charged bounded prefetch queue; a full queue drops
@@ -640,6 +646,7 @@ impl WebSocketSource {
             WebSocketFraming::Ndjson => {
                 for line in payload.split(|&b| b == b'\n') {
                     let line = line.strip_suffix(b"\r").unwrap_or(line);
+                    // JSON whitespace only (RFC 8259: space, tab, LF, CR).
                     if line
                         .iter()
                         .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
@@ -672,6 +679,8 @@ impl WebSocketSource {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
+        // Format-specific parser + Row working set, charged before decoding
+        // and held until the row is admitted (or dropped).
         let estimate = format.decode_scratch(&self.config.schema, record.len());
         let Ok(_scratch) = ingress.owner.acquire(CreditKind::Reservation, estimate) else {
             self.diag
