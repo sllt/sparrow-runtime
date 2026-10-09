@@ -1,6 +1,6 @@
 # JetStream 可靠输入/HTTP 输出（K2 Preview）
 
-状态：实现与验证中，未发布、未部署；不能沿用 R11 的长稳或性能结论。设计决定见 [ADR-004](adr/004-jetstream-reliability.md)。默认构建仍不包含 NATS SDK。
+状态：实现与验证中，未发布、未部署；不能沿用 R11 的长稳或性能结论。设计决定见 [ADR-004](adr/004-jetstream-reliability.md)。默认构建仍不包含 NATS SDK。非持久的 NATS Core Source / Sink（`kind: "nats"`，at-most-once、无 ACK、无 replay）见 [NATS.md](NATS.md)，含与 JetStream 的对照表。
 
 **2026-09-24 连接退出修复与来源观测前置：** 实际锁定的 `async-nats 0.50.0` 将 `max_reconnects(0)` 转为无限尝试，原配置并未禁用重连。真实 broker 停止测试复现了关闭等待超时、SDK 额度仍持有的问题。现改为最多与已配置端点数量相同的 SDK 尝试（1～4）；协议连续性丢失仍使本 reader 永久 unhealthy，即使 SDK 重连成功也不授权继续应用输入。关闭仍等待真实 SDK 退出，不以提前退款绕过 guard/目录独占。单节点 broker 停止后的退出与退款已重复验证；不把这项修复解释为透明恢复或 WAN 认证。
 
