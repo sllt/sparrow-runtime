@@ -2212,7 +2212,8 @@ impl Supervisor {
             }
             "databus" => {
                 let cfg = crate::validate::databus_sink_config(&spec.sink)?;
-                let sink = sparrow_connectors::DataBusSink::bind(cfg, self.databus.clone(), diag)?;
+                let sink =
+                    sparrow_connectors::DataBusSink::bind(cfg, self.databus.clone(), owner, diag)?;
                 self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
             "mqtt" => {

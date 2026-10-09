@@ -1004,6 +1004,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
         value["databus_sink"] = json!({"published":io.databus_sink_published,
             "deliveries":io.databus_sink_deliveries,"no_subscribers":io.databus_sink_no_subscribers,
             "dropped_bad":io.databus_sink_dropped_bad,"dropped_oversize":io.databus_sink_dropped_oversize,
+            "dropped_budget":io.databus_sink_dropped_budget,
             "blocked_publishes":io.databus_sink_blocked_publishes,
             "discarded_on_close":io.databus_sink_discarded_on_close,
             "batches":io.databus_sink_batches,"fatal":io.databus_sink_fatal,
@@ -1286,6 +1287,10 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         (
             "databus_sink_dropped_oversize",
             io.databus_sink_dropped_oversize,
+        ),
+        (
+            "databus_sink_dropped_budget",
+            io.databus_sink_dropped_budget,
         ),
         (
             "databus_sink_blocked_publishes",

@@ -116,6 +116,7 @@ pub struct IoDiagnostics {
     pub databus_sink_no_subscribers: AtomicU64,
     pub databus_sink_dropped_bad: AtomicU64,
     pub databus_sink_dropped_oversize: AtomicU64,
+    pub databus_sink_dropped_budget: AtomicU64,
     pub databus_sink_blocked_publishes: AtomicU64,
     pub databus_sink_discarded_on_close: AtomicU64,
     pub databus_sink_batches: AtomicU64,
@@ -271,6 +272,7 @@ impl IoDiagnostics {
             databus_sink_dropped_oversize: self
                 .databus_sink_dropped_oversize
                 .load(Ordering::Relaxed),
+            databus_sink_dropped_budget: self.databus_sink_dropped_budget.load(Ordering::Relaxed),
             databus_sink_blocked_publishes: self
                 .databus_sink_blocked_publishes
                 .load(Ordering::Relaxed),
@@ -403,6 +405,7 @@ pub struct IoSnapshot {
     pub databus_sink_no_subscribers: u64,
     pub databus_sink_dropped_bad: u64,
     pub databus_sink_dropped_oversize: u64,
+    pub databus_sink_dropped_budget: u64,
     pub databus_sink_blocked_publishes: u64,
     pub databus_sink_discarded_on_close: u64,
     pub databus_sink_batches: u64,
@@ -552,6 +555,7 @@ impl IoSnapshot {
         self.databus_sink_no_subscribers += other.databus_sink_no_subscribers;
         self.databus_sink_dropped_bad += other.databus_sink_dropped_bad;
         self.databus_sink_dropped_oversize += other.databus_sink_dropped_oversize;
+        self.databus_sink_dropped_budget += other.databus_sink_dropped_budget;
         self.databus_sink_blocked_publishes += other.databus_sink_blocked_publishes;
         self.databus_sink_discarded_on_close += other.databus_sink_discarded_on_close;
         self.databus_sink_batches += other.databus_sink_batches;

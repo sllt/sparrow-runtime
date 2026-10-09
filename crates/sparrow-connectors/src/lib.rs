@@ -23,6 +23,7 @@ pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
 pub mod policy;
+pub(crate) mod scratch;
 pub mod secret;
 pub mod tls;
 
