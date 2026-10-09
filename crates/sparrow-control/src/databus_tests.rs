@@ -399,6 +399,72 @@ fn databus_validation_bounds_and_reservation_refusal() {
 }
 
 #[test]
+fn databus_nonlegacy_graph_feedback_is_rejected_by_parse_bind_and_public_validation() {
+    use sparrow_model::ErrorCode;
+    let (_dir, path) = input(1);
+    let catalog = store();
+    let file = json!({"kind":"file", "path":path, "file_contract":"sealed", "inbox_capacity":8});
+    let source = json!({"kind":"databus", "inbox_capacity":8, "databus":{"topic":"plant.>"}});
+    let log = json!({"kind":"log", "outbox_capacity":8});
+    let sink = json!({"kind":"databus", "outbox_capacity":8, "databus":{"topic":"alerts.raw"}});
+    let mut value = json!({
+        "version":1, "stream":"telemetry", "source":file, "sink":log,
+        "graph":{"version":1, "pipeline_id":906, "revision_id":1, "nodes":[
+            {"id":1, "kind":"memory_source", "table":"telemetry", "out":[3]},
+            {"id":2, "kind":"memory_source", "table":"telemetry", "out":[3]},
+            {"id":3, "kind":"union_all", "out":[4]},
+            {"id":4, "kind":"branch", "out":[5,6]},
+            {"id":5, "kind":"capture_sink", "name":"log"},
+            {"id":6, "kind":"capture_sink", "name":"bus"}
+        ]},
+        "graph_io":{"sources":{"1":file, "2":source}, "sinks":{"5":log, "6":sink}}
+    });
+    let valid = parse(&value).unwrap();
+    assert_eq!(valid.source.kind, "file");
+    assert_eq!(valid.sink.kind, "log");
+    let plan = crate::bind_plan_with_store(&catalog, &valid, "graph-feedback", 1).unwrap();
+    let schema = crate::stream_to_schema(&catalog.get_stream("telemetry").unwrap()).unwrap();
+    let secrets = sparrow_connectors::MapSecretResolver::empty();
+    let policy = sparrow_connectors::TargetPolicy::deny_all();
+    crate::validate_io(&valid, &schema, &secrets, &policy, None).unwrap();
+    crate::validate::validate_io_with_plan(&valid, &schema, &plan, &secrets, &policy, None)
+        .unwrap();
+    // Only the non-lowest Sink changes. The exact same bound graph was valid
+    // above, so these refusals cannot be explained by a malformed topology.
+    value["graph_io"]["sinks"]["6"]["databus"]["topic"] = json!("plant.raw");
+    let error = parse(&value).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(error.message.contains("feedback loop"), "{error}");
+    let typed: PipelineSpec = serde_json::from_value(value).unwrap();
+    let error = typed.validate().unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(error.message.contains("feedback loop"), "{error}");
+    assert_eq!(
+        crate::bind_plan_with_store(&catalog, &typed, "graph-feedback", 1)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidArgument
+    );
+    for error in [
+        crate::validate_io(&typed, &schema, &secrets, &policy, None).unwrap_err(),
+        crate::validate::validate_io_with_plan(&typed, &schema, &plan, &secrets, &policy, None)
+            .unwrap_err(),
+    ] {
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.message.contains("feedback loop"), "{error}");
+    }
+    // A typed caller also cannot request durability for a DataBus endpoint.
+    let mut durable = valid.clone();
+    durable.recovery = "aligned".into();
+    assert_eq!(
+        crate::validate_io(&durable, &schema, &secrets, &policy, None)
+            .unwrap_err()
+            .code,
+        ErrorCode::UnsupportedRestore
+    );
+}
+
+#[test]
 fn databus_chains_two_pipelines_with_exact_counts_and_fan_out() {
     let kernel = Arc::new(crate::host_kernel().unwrap());
     kernel.block_on(async {

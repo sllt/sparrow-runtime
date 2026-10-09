@@ -20,7 +20,8 @@
 //!   (one or more tokens).
 //! - Registrations are RAII: dropping a [`Subscriber`] / [`Publisher`]
 //!   (pipeline stop, restart or delete) removes it, discards and counts its
-//!   buffered messages and releases its memory. A topic exists only while it
+//!   buffered messages. Buffer credit remains until any in-flight snapshots
+//!   also drop, so the backing allocation never outlives its lease. A topic exists only while it
 //!   has a publisher or subscriber, so nothing leaks; a restarted pipeline
 //!   simply attaches again.
 
@@ -33,8 +34,10 @@ pub use sink::{DataBusSink, DataBusSinkConfig};
 pub use source::{DataBusSource, DataBusSourceConfig};
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use sparrow_model::{CreditKind, ErrorCode, MemoryLease, MemoryOwner, Result, SparrowError};
@@ -192,6 +195,9 @@ struct Subscription {
     readable: Notify,
     writable: Notify,
     diag: Arc<IoDiagnostics>,
+    // Drop last: Publisher snapshots can outlive the registration, and
+    // queue.clear() retains the VecDeque backing allocation after close.
+    _lease: MemoryLease,
 }
 
 enum Offer {
@@ -264,6 +270,12 @@ impl Subscription {
     /// Block policy: wait for space until `deadline`, then drop.
     async fn offer_blocking(&self, payload: &Arc<[u8]>, deadline: tokio::time::Instant) -> bool {
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                self.diag
+                    .databus_source_block_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
             let notified = self.writable.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -413,6 +425,7 @@ impl DataBus {
             readable: Notify::new(),
             writable: Notify::new(),
             diag,
+            _lease: lease,
         });
         registry.subscriptions.insert(id, subscription.clone());
         subscription
@@ -423,7 +436,6 @@ impl DataBus {
             bus: self.clone(),
             id,
             subscription,
-            _lease: lease,
         })
     }
 
@@ -460,7 +472,6 @@ pub struct Subscriber {
     bus: Arc<DataBus>,
     id: u64,
     subscription: Arc<Subscription>,
-    _lease: MemoryLease,
 }
 
 impl Subscriber {
@@ -514,8 +525,8 @@ impl Publisher {
 
     /// Offer `payload` to every subscriber whose pattern matches. Drop
     /// policies apply immediately; block-policy subscribers are awaited
-    /// (each up to its own `block_timeout`) after all others got the
-    /// message, so they cannot delay delivery to the rest.
+    /// concurrently (each up to its own `block_timeout`) after the initial
+    /// offers. No subscriber's wait delays another one's available slot.
     pub async fn publish(&self, payload: Arc<[u8]>) -> PublishOutcome {
         let subscribers = self.bus.matching(&self.topic);
         let mut outcome = PublishOutcome {
@@ -533,14 +544,35 @@ impl Publisher {
         if !blocked.is_empty() {
             outcome.blocked = true;
             let start = tokio::time::Instant::now();
-            for sub in blocked {
-                if sub
-                    .offer_blocking(&payload, start + sub.config.block_timeout)
-                    .await
-                {
-                    outcome.accepted += 1;
+            // At most MAX_SUBSCRIPTIONS pinned waits, driven by this publish
+            // future itself. No per-subscriber task or unbounded work queue.
+            let mut waits: Vec<_> = blocked
+                .into_iter()
+                .map(|sub| {
+                    Some(Box::pin(
+                        sub.offer_blocking(&payload, start + sub.config.block_timeout),
+                    ))
+                })
+                .collect();
+            std::future::poll_fn(|cx| {
+                let mut pending = false;
+                for wait in &mut waits {
+                    let Some(future) = wait else { continue };
+                    match future.as_mut().poll(cx) {
+                        Poll::Ready(accepted) => {
+                            outcome.accepted += usize::from(accepted);
+                            *wait = None;
+                        }
+                        Poll::Pending => pending = true,
+                    }
                 }
-            }
+                if pending {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
         }
         outcome
     }
