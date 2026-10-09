@@ -25,13 +25,22 @@ pub fn inventory() -> Value {
     } else {
         &[]
     };
-    // The in-process Local DataBus is always built (no SDK).
-    let sinks: Vec<&str> = ["http", "mqtt", "log", "databus"]
+    // The PostgreSQL query Source and INSERT/UPSERT Sink need `postgres`.
+    let postgres: &[&str] = if cfg!(feature = "postgres") {
+        &["postgres"]
+    } else {
+        &[]
+    };
+    // The in-process Local DataBus and the Redis Sink (own RESP2 client)
+    // are always built.
+    let sinks: Vec<&str> = ["http", "mqtt", "log", "databus", "influxdb", "redis"]
         .iter()
         .chain(nats)
         .chain(jetstream_sink)
         .chain(websocket)
         .chain(kafka)
+        .chain(postgres)
+        .chain(&["tcp"])
         .copied()
         .collect();
     let mut combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file", "databus"]
@@ -39,6 +48,8 @@ pub fn inventory() -> Value {
         .chain(nats)
         .chain(websocket)
         .chain(kafka)
+        .chain(postgres)
+        .chain(&["tcp"])
         .copied()
         .flat_map(|source| {
             sinks.clone().into_iter().map(move |sink| {
@@ -69,7 +80,7 @@ pub fn inventory() -> Value {
             "checkpoint_dependencies":{"profiles":{"file_stateless":"v8","file_state":"v9","jetstream":"v10","file_graph":"v11"},"source":"File/file_replay/replay or JetStream; graph sources are File only","sink":"required_HTTP","scope":"static Lookup plus Count/IoT ttl0 state; no ET/PT/temporal/Dedup/side/lossy","table_rows_in_checkpoint":false},
             "hysteresis_without_references":{"file":"v12","jetstream":"v13","scope":"new IoT kind only; ttl_micros=0; no automatic migration from v6/v7"},
             "temporal_managed_lookup":false,"external_async_lookup":true,
-            "external":{"provider":"fixed_url_http_post","max_inflight":16,"concurrency_scope":"per_physical_operator","timeout_ms":[10,5000],"max_frame_bytes":65536,"cache_bytes":1048576,"max_cache_ttl_ms":60000,"order":"input_order","errors":"fail_default; transport_only_null_opt_in","timeout_counter":"runtime_deadline_expirations; provider_timeouts_are_failures","redirects":false,"proxy":false,"retry":false,"checkpoint":false},
+            "external":{"provider":"fixed_url_http_post","providers":{"http":"fixed_url_http_post_one_key_per_request","redis":"resp2_get_json_or_hmget_hash_pipelined_batch_keys_up_to_64","postgres":if cfg!(feature = "postgres") {"one_select_per_batch_key_any_or_rows_from_unnest_up_to_64_keys_unique_match_required"} else {"requires_postgres_build_feature"}},"interface":"shared_operator_cache_options_error_policy","max_inflight":16,"concurrency_scope":"per_physical_operator","timeout_ms":[10,5000],"max_frame_bytes":65536,"cache_bytes":1048576,"max_cache_ttl_ms":60000,"order":"input_order","errors":"fail_default; transport_only_null_or_drop_opt_in","negative_cache":"default_on_opt_out","timeout_counter":"runtime_deadline_expirations; provider_timeouts_are_failures","redirects":false,"proxy":false,"retry":false,"redis_stale_pooled_connection":"one_fresh_connection_resend_before_any_reply","postgres_stale_pooled_connection":"one_fresh_connection_resend_after_connection_loss_read_only","checkpoint":false},
             "max_bindings_per_pipeline":8,
             "max_rows_per_revision":crate::reference_table::MAX_REFERENCE_TABLE_ROWS,
             "max_payload_bytes_per_revision":crate::reference_table::MAX_REFERENCE_TABLE_BYTES});
@@ -225,20 +236,21 @@ mod tests {
     #[test]
     fn production_inventory_does_not_claim_unimplemented_backends_or_certification() {
         let value = super::inventory();
-        // 5 live/file sources (mqtt, http_push, http_poll, file, databus) x 4 sinks
-        // (http, mqtt, log, databus), plus NATS Core as both a source and a sink
+        // 5 live/file sources (mqtt, http_push, http_poll, file, databus) x 5 sinks
+        // (http, mqtt, log, databus, influxdb, redis), plus NATS Core as both a source and a sink
         // when the `nats` feature is built, plus the JetStream Sink (live matrix +
-        // one aligned File profile) with `jetstream`, plus WebSocket / Kafka as
-        // both a source and a sink with `websocket` / `kafka`.
-        let (nats, jetstream, websocket, kafka) = (
+        // one aligned File profile) with `jetstream`, plus WebSocket as both a
+        // source and a sink with `websocket`, plus PostgreSQL as both a source
+        // and a sink with `postgres`.
+        let (nats, jetstream, websocket, postgres, kafka) = (
             usize::from(cfg!(feature = "nats")),
             usize::from(cfg!(feature = "jetstream")),
             usize::from(cfg!(feature = "websocket")),
+            usize::from(cfg!(feature = "postgres")),
             usize::from(cfg!(feature = "kafka")),
         );
-        let expected = (5 + nats + websocket + kafka)
-            * (4 + nats + jetstream + websocket + kafka)
-            + jetstream;
+        let expected =
+            (5 + nats + websocket + postgres + kafka + 1) * (6 + nats + jetstream + websocket + postgres + kafka + 1) + jetstream;
         assert_eq!(value["combinations"].as_array().unwrap().len(), expected);
         assert!(value["combinations"]
             .as_array()
@@ -250,8 +262,14 @@ mod tests {
                 || c["sink"] == "websocket"
                 || c["source"] == "kafka"
                 || c["sink"] == "kafka"
+                || c["source"] == "tcp"
+                || c["sink"] == "tcp"
                 || c["source"] == "databus"
                 || c["sink"] == "databus"
+                || c["sink"] == "redis"
+                || c["source"] == "postgres"
+                || c["sink"] == "postgres"
+                || c["sink"] == "influxdb"
                 || (c["sink"] == "jetstream" && c["source"] != "file"))
             .all(|c| c["delivery"] == "live_best_effort" && c["recovery"] == "restart_fresh"));
         assert!(value["combinations"]

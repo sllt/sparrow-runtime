@@ -78,6 +78,8 @@
 | `http_push` | ✓ | — | 每个请求一条记录 |
 | `websocket` | ✓ | ✓ | 每条文本帧一条记录（同 MQTT）；`framing: ndjson`、`binary_frames: decode` 与 Sink `frame: binary` 都拒绝 CSV |
 | `kafka` | ✓ | ✓ | 每条 Kafka 记录（value）一条记录（同 MQTT）；格式进入 Source 提交身份，换格式后旧 offset 拒绝续读 |
+| `tcp`（`lines`） | ✓ | ✓ | 每个连接是一份文档：`header: true` 时连接后第一行是表头（Sink 每个新连接重写表头），之后一行一条记录；`multiline` 拒绝 |
+| `tcp`（`length_prefixed`） | ✓ | ✓ | 每帧一条记录，`header: true` 时前面带表头（同 MQTT） |
 | `http` | — | ✓ | 一个请求体 = 表头 + 多条记录，`Content-Type: text/csv; charset=utf-8` |
 | `http_poll` | ✓ | — | 每个响应是一份文档：表头 + 多条记录，请求带 `Accept: text/csv` |
 | `file` / `file_replay` / `replay` | ✓ | ✓（`file`） | 文件或段文件是一份文档 |
@@ -256,6 +258,8 @@
 
 ### 内存
 
-- 解码 scratch（`ProtobufFormat::decode_scratch`，饱和运算）：线路字节数（Utf8 / Bytes 输出总量不超过它）+ 每列状态 + 映射计划估算 + 4 KiB。解码器只分配输出行与每列状态，不建消息树；计数分配器测试在 7 种 64 KiB 对抗输入下峰值不超过该估算。
+- 解码 scratch（`ProtobufFormat::decode_scratch`，饱和运算）：线路字节数 + 每列状态 + 按列数及映射路径节点计算的冷计划额度 + 4 KiB。enum 名称来自 descriptor，不受线路长度约束，其展开计入计划额度。计划不复制每个祖先的完整子树，也不为 oneof 每个成员复制映射列表；分配器测试覆盖 7 种 64 KiB 输入、80 层映射及 400 成员 oneof。
+- 配置元数据与逐记录 scratch 分开限定，不声称全部配置常驻内存都计入 Job ledger：descriptor 最多 48 KiB、32 文件、2048 个被检查的符号、32 层定义；单名称 256B、全名 1024B、累计展开全名 512 KiB，在链接前拒绝越界。映射最多 64 列、256 个消息节点，列名最多 256B；带点列名必须显式配置字段路径。缓存仅保留最近的一个 schema 计划。
+- `google.protobuf.Timestamp` 必须是规范 proto3 seconds/int64、nanos/int32 形状，不能仅凭名称进入快速解码。proto2 closed enum 的未知数值也会在未映射字段和 packed 字段上拒绝，不能静默清除映射的 oneof 成员。
 - 编码：先算出精确输出长度，超过上限直接拒绝，再按 `encode_scratch`（每列状态 + 计划 + 4 KiB）与精确输出长度一次记账，`try_reserve_exact` 分配。
 - 先按长度拒绝、再记账、最后解码 / 编码的连接器与 CSV 相同（NATS、JetStream、HTTP Poll、MQTT budgeted ingress、WebSocket、Kafka；HTTP、NATS、JetStream、MQTT、WebSocket、Kafka Sink）。Kafka Source 预算不足时等待，不丢弃。HTTP Push 在解码前按 `decode_scratch` 记账并持有到行交给 inbox；额度不足时回 503、计 `http_dropped`，不解码（JSON / CSV 请求体仍不记账，与以前相同）。

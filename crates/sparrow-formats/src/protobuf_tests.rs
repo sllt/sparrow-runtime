@@ -11,6 +11,114 @@ const MERGE: &[u8] = include_bytes!("../tests/fixtures/protobuf/reading_merge.bi
 const TREE: &[u8] = include_bytes!("../tests/fixtures/protobuf/tree.bin");
 const LEGACY: &[u8] = include_bytes!("../tests/fixtures/protobuf/legacy.bin");
 
+#[test]
+fn timestamp_name_cannot_spoof_the_fast_path_shape() {
+    for mutation in 0..3 {
+        let mut set = prost_types::FileDescriptorSet::decode(DESCRIPTOR).unwrap();
+        let file = set
+            .file
+            .iter_mut()
+            .find(|f| f.package() == "google.protobuf")
+            .unwrap();
+        let message = file
+            .message_type
+            .iter_mut()
+            .find(|m| m.name() == "Timestamp")
+            .unwrap();
+        match mutation {
+            0 => message.field[0].r#type = Some(9), // string instead of int64
+            1 => message.field[0].label = Some(3),  // repeated
+            _ => message.field.push(prost_types::FieldDescriptorProto {
+                name: Some("nested".into()),
+                number: Some(3),
+                label: Some(1),
+                r#type: Some(11),
+                type_name: Some(".google.protobuf.Timestamp".into()),
+                ..Default::default()
+            }),
+        }
+        let mut o = options("telemetry.v1.Reading", &[]);
+        o.descriptor_set = base64::engine::general_purpose::STANDARD.encode(set.encode_to_vec());
+        assert_eq!(
+            code(o.compile(FormatRole::Decode)),
+            ErrorCode::InvalidSchema
+        );
+    }
+}
+
+#[test]
+fn descriptor_names_and_symbol_expansion_are_bounded_before_linking() {
+    for mutation in 0..3 {
+        let mut set = prost_types::FileDescriptorSet::decode(DESCRIPTOR).unwrap();
+        match mutation {
+            0 => set.file[0].package = Some("p".repeat(8192)),
+            1 => {
+                let file = set
+                    .file
+                    .iter_mut()
+                    .find(|f| f.package() == "legacy.v1")
+                    .unwrap();
+                file.enum_type[0].value[0].name = Some("V".repeat(8192));
+            }
+            _ => {
+                set.file = vec![prost_types::FileDescriptorProto {
+                    name: Some("many.proto".into()),
+                    syntax: Some("proto3".into()),
+                    message_type: (0..2049)
+                        .map(|n| prost_types::DescriptorProto {
+                            name: Some(format!("M{n}")),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }]
+            }
+        }
+        let mut o = options("telemetry.v1.Reading", &[]);
+        let bytes = set.encode_to_vec();
+        assert!(bytes.len() <= MAX_DESCRIPTOR_SET_BYTES);
+        o.descriptor_set = base64::engine::general_purpose::STANDARD.encode(bytes);
+        assert_eq!(
+            code(o.compile(FormatRole::Decode)),
+            ErrorCode::BoundExceeded
+        );
+    }
+}
+
+#[test]
+fn unmapped_closed_enum_cannot_silently_clear_a_mapped_oneof() {
+    let mut set = prost_types::FileDescriptorSet::decode(DESCRIPTOR).unwrap();
+    let file = set
+        .file
+        .iter_mut()
+        .find(|f| f.package() == "legacy.v1")
+        .unwrap();
+    let m = &mut file.message_type[0];
+    m.oneof_decl.push(prost_types::OneofDescriptorProto {
+        name: Some("choice".into()),
+        ..Default::default()
+    });
+    for f in m.field.iter_mut().take(2) {
+        f.label = Some(1);
+        f.oneof_index = Some(0);
+    }
+    let mut o = options("legacy.v1.Legacy", &[]);
+    o.descriptor_set = base64::engine::general_purpose::STANDARD.encode(set.encode_to_vec());
+    let decoder = o.compile(FormatRole::Decode).unwrap();
+    let s = schema(&[("id", T::Int64, true)]);
+    assert_eq!(
+        code(decoder.decode_message(&s, &[8, 7, 16, 99], None)),
+        ErrorCode::TypeMismatch
+    );
+    assert_eq!(
+        decoder
+            .decode_message(&s, &[8, 7, 16, 1], None)
+            .unwrap()
+            .values,
+        vec![Scalar::Null]
+    );
+}
+
 use DataType as T;
 
 fn schema(fields: &[(&str, DataType, bool)]) -> Schema {
@@ -218,12 +326,12 @@ fn golden_tree_nested_paths_and_depth_limit() {
 }
 
 #[test]
+#[ignore = "requires SPARROW_PROTOC (pinned protoc 36.2)"]
 fn committed_fixtures_match_pinned_protoc_when_available() {
     // Opt-in: SPARROW_PROTOC=/path/to/protoc-36.2 (see
     // scripts/protobuf-fixtures.sh, which downloads and sha-checks it).
-    let Ok(protoc) = std::env::var("SPARROW_PROTOC") else {
-        return;
-    };
+    let protoc = std::env::var("SPARROW_PROTOC")
+        .expect("SPARROW_PROTOC is required for this explicit integration test");
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protobuf");
     let version = std::process::Command::new(&protoc)
         .arg("--version")

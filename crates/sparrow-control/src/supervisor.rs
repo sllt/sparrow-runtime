@@ -355,7 +355,7 @@ pub struct PipelineCheckpointInventory {
     pub storage: sparrow_runtime::checkpoint::CheckpointInventory,
 }
 /// A JetStream Sink that could not confirm a row, a DataBus Sink that could
-/// not attach, or a WebSocket Sink out of reconnect attempts fails the job
+/// not attach, or a WebSocket / TCP Sink out of reconnect attempts fails the job
 /// (fail closed).
 fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
     if diags.iter().any(|d| {
@@ -369,6 +369,16 @@ fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
         ));
     }
     if diags.iter().any(|d| {
+        d.influxdb_sink_fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }) {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "InfluxDB Sink stopped the job (401/403/404 from the server, or a schema that does not match the mapping); inspect sink health and influxdb_sink_*; no replay",
+        ));
+    }
+    if diags.iter().any(|d| {
         d.databus_sink_fatal
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
@@ -376,6 +386,26 @@ fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
         return Err(SparrowError::new(
             sparrow_model::ErrorCode::JobFailed,
             "DataBus Sink could not register its publisher (runtime publisher limit); inspect databus_sink_fatal",
+        ));
+    }
+    if diags.iter().any(|d| {
+        d.postgres_sink_fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }) {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "PostgreSQL Sink stopped the job (authentication, privilege, missing table/column, a schema that does not fit the table, or a statement the server refuses); inspect sink health and postgres_sink_*; no replay",
+        ));
+    }
+    if diags.iter().any(|d| {
+        d.redis_sink_fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }) {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "Redis Sink stopped the job (AUTH/ACL rejection, cluster redirection, read-only replica, or a schema that does not fit the command); inspect sink health and redis_sink_*; no replay",
         ));
     }
     if diags.iter().any(|d| {
@@ -400,6 +430,16 @@ fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
             "Kafka Sink failed closed (unconfirmed delivery, denied advertised broker or missing topic); inspect sink health and kafka_sink_*",
         ));
     }
+    if diags
+        .iter()
+        .any(|d| d.tcp_sink_fatal.load(std::sync::atomic::Ordering::Relaxed) > 0)
+    {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "TCP Sink exhausted its reconnect attempts; inspect sink health and tcp_sink_*",
+        )
+        .retryable(true));
+    }
     Ok(())
 }
 
@@ -410,8 +450,12 @@ fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
         "nats" => "nats",
         "websocket" => "websocket",
         "kafka" => "kafka",
+        "tcp" => "tcp",
         "jetstream" => "jetstream",
         "databus" => "databus",
+        "redis" => "redis",
+        "postgres" => "postgres",
+        "influxdb" => "influxdb",
         "file" => "file",
         "plugin" => "plugin",
         _ => "http",
@@ -1395,7 +1439,10 @@ impl Supervisor {
             request=request.with_live_events(rx).with_live_out(tx_out);
             tx_plugin=Some(tx);
             (None,None)
-        } else if matches!(kind, "mqtt" | "http_poll" | "nats" | "databus" | "websocket" | "kafka") {
+        } else if matches!(
+            kind,
+            "mqtt" | "http_poll" | "nats" | "databus" | "websocket" | "tcp" | "postgres" | "kafka"
+        ) {
             let (tx, rx) = observed::channel(inbox);
             diag.observe_source(&tx);
             request = request.with_budgeted_live_io(rx, tx_out);
@@ -1507,6 +1554,69 @@ impl Supervisor {
                         let r = source
                             .run_budgeted(
                                 tx_budgeted.expect("WebSocket ingress"),
+                                cancel_job.clone(),
+                                owner,
+                                max_row_bytes,
+                            )
+                            .await;
+                        if r.is_err() {
+                            cancel_job.cancel();
+                        }
+                        r
+                    })
+                }
+                #[cfg(feature = "postgres")]
+                "postgres" => {
+                    let budget = self.kernel.job_budget();
+                    let max_row_bytes = self.kernel.ingress_row_limit();
+                    let cfg = crate::validate::postgres_source_config(
+                        &spec.source,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                        budget.reservation_bytes,
+                        max_row_bytes,
+                    )?;
+                    cfg.check_inbox_budget(budget.queue_bytes)?;
+                    cfg.check_reservation_budget(budget.reservation_bytes, max_row_bytes)?;
+                    let source = sparrow_connectors::PgSource::bind(
+                        cfg,
+                        &self.secrets,
+                        policy,
+                        max_row_bytes,
+                        Arc::clone(&diag),
+                    )?;
+                    let cancel_job = cancel.clone();
+                    let owner = job.memory_owner();
+                    self.kernel.handle().spawn(async move {
+                        let r = source
+                            .run_budgeted(
+                                tx_budgeted.expect("PostgreSQL ingress"),
+                                cancel_job.clone(),
+                                owner,
+                                max_row_bytes,
+                            )
+                            .await;
+                        if r.is_err() { cancel_job.cancel(); }
+                        r
+                    })
+                }
+                "tcp" => {
+                    let cfg = crate::validate::tcp_source_config(
+                        &spec.source,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source =
+                        sparrow_connectors::TcpSource::bind(cfg, policy, Arc::clone(&diag))?;
+                    let cancel_job = cancel.clone();
+                    let owner = job.memory_owner();
+                    let max_row_bytes = self.kernel.ingress_row_limit();
+                    self.kernel.handle().spawn(async move {
+                        let r = source
+                            .run_budgeted(
+                                tx_budgeted.expect("TCP ingress"),
                                 cancel_job.clone(),
                                 owner,
                                 max_row_bytes,
@@ -1646,7 +1756,18 @@ impl Supervisor {
         };
         Ok(RunningJob {
             graph_ports: None,
-            source_kind: match kind {"mqtt"=>"mqtt","plugin"=>"plugin","http_poll"=>"http_poll","nats"=>"nats","databus"=>"databus","websocket"=>"websocket","kafka"=>"kafka",_=>"http_push"},
+            source_kind: match kind {
+                "mqtt" => "mqtt",
+                "plugin" => "plugin",
+                "http_poll" => "http_poll",
+                "nats" => "nats",
+                "databus" => "databus",
+                "websocket" => "websocket",
+                "kafka" => "kafka",
+                "tcp" => "tcp",
+                "postgres" => "postgres",
+                _ => "http_push",
+            },
             sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
             stable: false,
@@ -2309,6 +2430,12 @@ impl Supervisor {
                 )?;
                 self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
+            "tcp" => {
+                let cfg = crate::validate::tcp_sink_config(&spec.sink)?;
+                cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                let sink = sparrow_connectors::TcpSink::bind(cfg, policy, owner, diag)?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
             #[cfg(feature = "nats")]
             "nats" => {
                 let cfg = crate::validate::nats_sink_config(&spec.sink)?;
@@ -2321,6 +2448,30 @@ impl Supervisor {
                 let cfg = crate::validate::jetstream_sink_config(&spec.sink)?;
                 cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
                 let sink = sparrow_connectors::jetstream::JetStreamSink::bind(
+                    cfg,
+                    &self.secrets,
+                    policy,
+                    owner,
+                    diag,
+                )?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
+            #[cfg(feature = "postgres")]
+            "postgres" => {
+                let cfg = crate::validate::postgres_sink_config(&spec.sink)?;
+                let sink =
+                    sparrow_connectors::PgSink::bind(cfg, &self.secrets, policy, owner, diag)?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
+            "redis" => {
+                let cfg = crate::validate::redis_sink_config(&spec.sink)?;
+                let sink =
+                    sparrow_connectors::RedisSink::bind(cfg, &self.secrets, policy, owner, diag)?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
+            "influxdb" => {
+                let cfg = crate::validate::influxdb_sink_config(&spec.sink)?;
+                let sink = sparrow_connectors::InfluxDbSink::bind(
                     cfg,
                     &self.secrets,
                     policy,

@@ -51,6 +51,15 @@ enum Input {
         source: sparrow_connectors::WebSocketSource,
         tx: observed::Sender<sparrow_model::QueuedRow>,
     },
+    #[cfg(feature = "postgres")]
+    Postgres {
+        source: sparrow_connectors::PgSource,
+        tx: observed::Sender<sparrow_model::QueuedRow>,
+    },
+    Tcp {
+        source: sparrow_connectors::TcpSource,
+        tx: observed::Sender<sparrow_model::QueuedRow>,
+    },
     #[cfg(feature = "nats")]
     Nats {
         source: sparrow_connectors::NatsSource,
@@ -486,6 +495,45 @@ impl Supervisor {
                     binding.budgeted = Some(rx);
                     Input::WebSocket { source, tx }
                 }
+                #[cfg(feature = "postgres")]
+                "postgres" => {
+                    let budget = self.kernel.job_budget();
+                    let max_row_bytes = self.kernel.ingress_row_limit();
+                    let cfg = crate::validate::postgres_source_config(
+                        source_spec,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                        budget.reservation_bytes,
+                        max_row_bytes,
+                    )?;
+                    cfg.check_inbox_budget(budget.queue_bytes)?;
+                    cfg.check_reservation_budget(budget.reservation_bytes, max_row_bytes)?;
+                    let source = sparrow_connectors::PgSource::bind(
+                        cfg,
+                        &self.secrets,
+                        policy,
+                        max_row_bytes,
+                        diag.clone(),
+                    )?;
+                    let (tx, rx) = observed::channel(source_spec.inbox_capacity);
+                    diag.observe_source(&tx);
+                    binding.budgeted = Some(rx);
+                    Input::Postgres { source, tx }
+                }
+                "tcp" => {
+                    let cfg = crate::validate::tcp_source_config(
+                        source_spec,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source = sparrow_connectors::TcpSource::bind(cfg, policy, diag.clone())?;
+                    let (tx, rx) = observed::channel(source_spec.inbox_capacity);
+                    diag.observe_source(&tx);
+                    binding.budgeted = Some(rx);
+                    Input::Tcp { source, tx }
+                }
                 #[cfg(feature = "nats")]
                 "nats" => {
                     let cfg = crate::validate::nats_source_config(
@@ -669,6 +717,15 @@ impl Supervisor {
                         }
                         #[cfg(feature = "websocket")]
                         Input::WebSocket { source, tx } => {
+                            source
+                                .run_budgeted(tx, child.clone(), owner, max_row_bytes)
+                                .await
+                        }
+                        #[cfg(feature = "postgres")]
+                        Input::Postgres { source, tx } => {
+                            source.run_budgeted(tx, child.clone(), owner, max_row_bytes).await
+                        }
+                        Input::Tcp { source, tx } => {
                             source
                                 .run_budgeted(tx, child.clone(), owner, max_row_bytes)
                                 .await

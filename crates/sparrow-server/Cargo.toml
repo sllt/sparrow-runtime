@@ -12,6 +12,7 @@ nats = ["sparrow-control/nats", "sparrow-connectors/nats"]
 jetstream = ["nats", "sparrow-control/jetstream", "sparrow-connectors/jetstream"]
 websocket = ["sparrow-control/websocket", "sparrow-connectors/websocket"]
 kafka = ["sparrow-control/kafka", "sparrow-connectors/kafka"]
+postgres = ["sparrow-control/postgres", "sparrow-connectors/postgres"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }

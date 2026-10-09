@@ -91,6 +91,12 @@ pub struct SourceSpec {
     /// Required exclusively for `kind = "kafka"` (consumer group).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kafka: Option<KafkaSourceSpec>,
+    /// Required exclusively for `kind = "postgres"` (`postgres` build feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<Box<crate::postgres_spec::PostgresSourceSpec>>,
+    /// Required exclusively for `kind = "tcp"` (client mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<TcpSourceSpec>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -156,15 +162,14 @@ pub const CSV_SOURCE_KINDS: &[&str] = &[
     "jetstream",
     "websocket",
     "kafka",
+    "tcp",
     "file",
     "file_replay",
     "replay",
 ];
 /// Sink kinds whose bytes carry a selectable record format.
-pub const CSV_SINK_KINDS: &[&str] =
-    &["mqtt", "http", "nats", "jetstream", "websocket", "kafka", "file"];
-/// Source kinds that decode protobuf: one message per broker message or
-/// Kafka record /
+pub const CSV_SINK_KINDS: &[&str] = &["mqtt", "http", "nats", "jetstream", "websocket", "kafka", "tcp", "file"];
+/// Source kinds that decode protobuf: one message per broker message /
 /// WebSocket binary message / HTTP push body, or a length-delimited stream
 /// per HTTP Poll response. File kinds are refused (newline framing only).
 pub const PROTOBUF_SOURCE_KINDS: &[&str] =
@@ -445,6 +450,130 @@ impl DataBusSinkSpec {
         }
         c.outbox_capacity = outbox_capacity;
         c
+    }
+}
+
+/// InfluxDB v2 write Sink (`POST <url>/api/v2/write`), live-only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InfluxDbSinkSpec {
+    /// `https://host[:port][/prefix]`.
+    pub url: String,
+    pub org: String,
+    pub bucket: String,
+    /// Secret reference resolving to the API token.
+    pub token_secret: String,
+    /// PEM bundle that replaces the built-in roots (verification stays on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem: Option<String>,
+    /// Fixed measurement name; exclusive with `measurement_column`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<String>,
+    /// `utf8` column holding each row's measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement_column: Option<String>,
+    /// `utf8` columns written as tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Field columns; default: every column that is not the measurement
+    /// column, a tag or the time column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+    /// `timestamp` column; without it InfluxDB stamps points on arrival.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_column: Option<String>,
+    /// `ns|us|ms|s` (default `us`); requires `time_column`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub gzip: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_initial_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_ms: Option<u64>,
+    /// Stop budget shared by the request in flight and queued rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+}
+
+impl InfluxDbSinkSpec {
+    pub fn connector_config(
+        &self,
+        outbox_capacity: usize,
+    ) -> Result<sparrow_connectors::InfluxDbSinkConfig> {
+        use sparrow_connectors::influxdb::{InfluxMapping, Measurement, Precision};
+        use std::time::Duration;
+        let invalid = |m: &str| SparrowError::new(ErrorCode::InvalidArgument, m.to_string());
+        let measurement = match (&self.measurement, &self.measurement_column) {
+            (Some(m), None) => Measurement::Fixed(m.clone()),
+            (None, Some(c)) => Measurement::Column(c.clone()),
+            _ => {
+                return Err(invalid(
+                    "sink.influxdb needs exactly one of measurement / measurement_column",
+                ))
+            }
+        };
+        let precision = match (&self.precision, &self.time_column) {
+            (None, _) => Precision::default(),
+            (Some(_), None) => {
+                return Err(invalid(
+                    "sink.influxdb precision requires time_column (InfluxDB stamps points itself otherwise)",
+                ))
+            }
+            (Some(p), Some(_)) => Precision::parse(p)
+                .ok_or_else(|| invalid("sink.influxdb precision must be ns, us, ms or s"))?,
+        };
+        let mapping = InfluxMapping {
+            measurement,
+            tags: self.tags.clone(),
+            fields: self.fields.clone(),
+            time_column: self.time_column.clone(),
+            precision,
+        };
+        let mut c = sparrow_connectors::InfluxDbSinkConfig::new(
+            self.url.clone(),
+            self.org.clone(),
+            self.bucket.clone(),
+            self.token_secret.clone(),
+            mapping,
+        );
+        c.ca_pem = self.ca_pem.clone();
+        c.gzip = self.gzip;
+        c.outbox_capacity = outbox_capacity;
+        if let Some(n) = self.batch_rows {
+            c.batch_rows = n;
+        }
+        if let Some(n) = self.batch_bytes {
+            c.batch_bytes = n;
+        }
+        if let Some(n) = self.max_retries {
+            c.max_retries = n;
+        }
+        for (value, slot) in [
+            (self.flush_interval_ms, &mut c.flush_interval),
+            (self.timeout_ms, &mut c.timeout),
+            (self.connect_timeout_ms, &mut c.connect_timeout),
+            (self.retry_initial_ms, &mut c.retry_initial),
+            (self.retry_max_ms, &mut c.retry_max),
+            (self.flush_timeout_ms, &mut c.flush_timeout),
+        ] {
+            if let Some(ms) = value {
+                *slot = Duration::from_millis(ms);
+            }
+        }
+        Ok(c)
     }
 }
 
@@ -1138,6 +1267,238 @@ impl KafkaSinkSpec {
     }
 }
 
+/// TCP record framing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpFramingSpec {
+    /// `\n`-terminated records (`\r\n` accepted).
+    #[default]
+    Lines,
+    /// Big-endian length prefix (`length_bytes` 2 or 4), then the record.
+    LengthPrefixed,
+}
+
+/// What a TCP Source does with a record over `max_frame_bytes`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpOversizeSpec {
+    #[default]
+    Resync,
+    Disconnect,
+}
+
+/// What a TCP Sink does when its send queue is full.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpOverflowSpec {
+    #[default]
+    Block,
+    DropNewest,
+}
+
+/// TCP client Source, live and at-most-once. Optional TLS (`tls: true`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpSourceSpec {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub tls: bool,
+    /// PEM CA bundle replacing the built-in roots (private CA / self-signed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    /// TCP keepalive idle time; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_max_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub framing: TcpFramingSpec,
+    /// Length prefix width for `length_prefixed`: 2 or 4 (default 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_bytes: Option<u8>,
+    /// Largest record (default and maximum 65536).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_frame_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub oversize: TcpOversizeSpec,
+    /// No bytes for this long = dead peer (default 60000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+    /// Decoded-row Queue credit for the inbox; default 256 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_bytes: Option<usize>,
+}
+
+/// TCP client Sink: one framed record per row, live and at-most-once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpSinkSpec {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub tls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_max_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub framing: TcpFramingSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_bytes: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_frame_bytes: Option<usize>,
+    /// Bounded send queue in frames (default 16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_capacity: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub overflow: TcpOverflowSpec,
+    /// Bound on writing one frame, partial writes included (default 5000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_timeout_ms: Option<u64>,
+    /// Shutdown budget for queued rows (default 2000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tcp_client(
+    host: &str,
+    port: u16,
+    tls: bool,
+    tls_ca_pem: &Option<String>,
+    connect_timeout_ms: Option<u64>,
+    keepalive_ms: Option<u64>,
+    reconnect_max_ms: Option<u64>,
+    reconnect_attempts: Option<usize>,
+    framing: TcpFramingSpec,
+    length_bytes: Option<u8>,
+    max_frame_bytes: Option<usize>,
+) -> sparrow_connectors::tcp::TcpClientConfig {
+    use sparrow_connectors::tcp::{PrefixWidth, TcpFraming};
+    use std::time::Duration;
+    let mut c = sparrow_connectors::tcp::TcpClientConfig::new(host, port);
+    c.tls = tls;
+    c.tls_ca_pem = tls_ca_pem.clone();
+    if let Some(ms) = connect_timeout_ms {
+        c.connect_timeout = Duration::from_millis(ms);
+    }
+    c.keepalive = keepalive_ms.map(Duration::from_millis);
+    if let Some(ms) = reconnect_max_ms {
+        c.reconnect_max = Duration::from_millis(ms);
+    }
+    if let Some(n) = reconnect_attempts {
+        c.reconnect_attempts = n;
+    }
+    c.framing = match framing {
+        TcpFramingSpec::Lines => TcpFraming::Lines,
+        TcpFramingSpec::LengthPrefixed => TcpFraming::LengthPrefixed,
+    };
+    // Other widths are refused by `check_tcp`.
+    c.prefix_width = match length_bytes {
+        Some(2) => PrefixWidth::U16,
+        _ => PrefixWidth::U32,
+    };
+    // An omitted limit defaults to what the prefix can express (65535 for
+    // length_bytes 2); an explicit value above it is refused by validate.
+    c.max_frame_bytes = match max_frame_bytes {
+        Some(n) => n,
+        None if c.framing == TcpFraming::LengthPrefixed => {
+            c.max_frame_bytes.min(c.prefix_width.max_len())
+        }
+        None => c.max_frame_bytes,
+    };
+    c
+}
+
+impl TcpSourceSpec {
+    pub fn client_config(&self) -> sparrow_connectors::tcp::TcpClientConfig {
+        tcp_client(
+            &self.host,
+            self.port,
+            self.tls,
+            &self.tls_ca_pem,
+            self.connect_timeout_ms,
+            self.keepalive_ms,
+            self.reconnect_max_ms,
+            self.reconnect_attempts,
+            self.framing,
+            self.length_bytes,
+            self.max_frame_bytes,
+        )
+    }
+
+    pub fn connector_config(
+        &self,
+        schema: sparrow_model::Schema,
+        inbox_capacity: usize,
+        fail_on_decode: bool,
+    ) -> sparrow_connectors::TcpSourceConfig {
+        use sparrow_connectors::tcp::OversizePolicy;
+        let mut c = sparrow_connectors::TcpSourceConfig::new(self.host.clone(), self.port, schema);
+        c.client = self.client_config();
+        c.oversize = match self.oversize {
+            TcpOversizeSpec::Resync => OversizePolicy::Resync,
+            TcpOversizeSpec::Disconnect => OversizePolicy::Disconnect,
+        };
+        if let Some(ms) = self.idle_timeout_ms {
+            c.idle_timeout = std::time::Duration::from_millis(ms);
+        }
+        if let Some(n) = self.inbox_bytes {
+            c.inbox_bytes = n;
+        }
+        c.inbox_capacity = inbox_capacity;
+        c.fail_on_decode = fail_on_decode;
+        c
+    }
+}
+
+impl TcpSinkSpec {
+    pub fn connector_config(&self, outbox_capacity: usize) -> sparrow_connectors::TcpSinkConfig {
+        use sparrow_connectors::tcp::TcpOverflow;
+        use std::time::Duration;
+        let mut c = sparrow_connectors::TcpSinkConfig::new(self.host.clone(), self.port);
+        c.client = tcp_client(
+            &self.host,
+            self.port,
+            self.tls,
+            &self.tls_ca_pem,
+            self.connect_timeout_ms,
+            self.keepalive_ms,
+            self.reconnect_max_ms,
+            self.reconnect_attempts,
+            self.framing,
+            self.length_bytes,
+            self.max_frame_bytes,
+        );
+        c.overflow = match self.overflow {
+            TcpOverflowSpec::Block => TcpOverflow::Block,
+            TcpOverflowSpec::DropNewest => TcpOverflow::DropNewest,
+        };
+        if let Some(n) = self.queue_capacity {
+            c.queue_capacity = n;
+        }
+        if let Some(ms) = self.send_timeout_ms {
+            c.send_timeout = Duration::from_millis(ms);
+        }
+        if let Some(ms) = self.flush_timeout_ms {
+            c.flush_timeout = Duration::from_millis(ms);
+        }
+        c.outbox_capacity = outbox_capacity;
+        c
+    }
+}
+
 /// HTTP Poll Source options. Credentials are named secret references only;
 /// the stored revision never contains a credential value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1251,6 +1612,202 @@ impl HttpPollSpec {
     }
 }
 
+/// Redis Sink (one command per row, pipelined), live-only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisSinkSpec {
+    /// `redis://host[:port][/db]` or `rediss://...` (TLS).
+    pub url: String,
+    /// ACL user name secret reference (requires `password_secret`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username_secret: Option<String>,
+    /// Password secret reference (requires `rediss://`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_secret: Option<String>,
+    /// PEM bundle that replaces the built-in roots (verification stays on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    /// `set | hset | xadd | publish | lpush | rpush`.
+    pub command: String,
+    /// Key template (`{column}` placeholders); every command but `publish`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Channel template; `publish` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Column whose text is the value (set/publish/lpush/rpush, hset with
+    /// `field`); default: the row as a JSON object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_column: Option<String>,
+    /// `set` only: `PX` expiry in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// `hset` (one hash field per column) or `xadd` (stream entry fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+    /// `hset` only: one templated hash field holding the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// `xadd` only: `MAXLEN` trim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxlen: Option<u64>,
+    /// `xadd` with `maxlen`: `MAXLEN ~` instead of exact `MAXLEN =`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approximate: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_initial_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_ms: Option<u64>,
+    /// Stop budget shared by the pipeline in flight and queued rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+}
+
+impl RedisSinkSpec {
+    pub fn command(&self) -> Result<sparrow_connectors::redis::RedisCommand> {
+        use sparrow_connectors::redis::{HashFields, RedisCommand, RedisValue, Template};
+        let invalid = |m: &str| SparrowError::new(ErrorCode::InvalidArgument, m.to_string());
+        let template = |t: &str| Template::parse(t);
+        let value = || match &self.value_column {
+            Some(c) => RedisValue::Column(c.clone()),
+            None => RedisValue::Json,
+        };
+        let command = self.command.as_str();
+        let key = match (command, &self.key, &self.channel) {
+            ("publish", None, Some(c)) => template(c)?,
+            ("publish", _, _) => {
+                return Err(invalid("sink.redis publish needs channel (and no key)"))
+            }
+            (_, Some(k), None) => template(k)?,
+            _ => {
+                return Err(invalid(
+                    "sink.redis needs key (channel is for publish only)",
+                ))
+            }
+        };
+        let only = |allowed: bool, what: &str| {
+            if allowed {
+                Ok(())
+            } else {
+                Err(invalid(&format!(
+                    "sink.redis {what} does not apply to command {command}"
+                )))
+            }
+        };
+        only(self.ttl_ms.is_none() || command == "set", "ttl_ms")?;
+        only(self.field.is_none() || command == "hset", "field")?;
+        only(
+            self.fields.is_none() || matches!(command, "hset" | "xadd"),
+            "fields",
+        )?;
+        only(self.maxlen.is_none() || command == "xadd", "maxlen")?;
+        only(
+            !self.approximate || self.maxlen.is_some(),
+            "approximate (without maxlen)",
+        )?;
+        only(
+            self.value_column.is_none() || command != "xadd",
+            "value_column",
+        )?;
+        Ok(match command {
+            "set" => RedisCommand::Set {
+                key,
+                value: value(),
+                ttl: self.ttl_ms.map(std::time::Duration::from_millis),
+            },
+            "hset" => RedisCommand::Hset {
+                key,
+                fields: match (&self.fields, &self.field) {
+                    (Some(columns), None) if self.value_column.is_none() => {
+                        HashFields::Columns(columns.clone())
+                    }
+                    (None, Some(field)) => HashFields::Field {
+                        field: template(field)?,
+                        value: value(),
+                    },
+                    _ => {
+                        return Err(invalid(
+                            "sink.redis hset needs either fields, or field with an optional value_column",
+                        ))
+                    }
+                },
+            },
+            "xadd" => RedisCommand::Xadd {
+                key,
+                fields: self
+                    .fields
+                    .clone()
+                    .ok_or_else(|| invalid("sink.redis xadd needs fields"))?,
+                maxlen: self.maxlen,
+                approximate: self.approximate,
+            },
+            "publish" => RedisCommand::Publish {
+                channel: key,
+                value: value(),
+            },
+            "lpush" | "rpush" => RedisCommand::Push {
+                key,
+                value: value(),
+                left: command == "lpush",
+            },
+            _ => {
+                return Err(invalid(
+                    "sink.redis command must be set, hset, xadd, publish, lpush or rpush",
+                ))
+            }
+        })
+    }
+
+    pub fn connector_config(
+        &self,
+        outbox_capacity: usize,
+    ) -> Result<sparrow_connectors::RedisSinkConfig> {
+        use std::time::Duration;
+        let mut target = sparrow_connectors::redis::RedisTarget::new(self.url.clone());
+        target.username_secret = self.username_secret.clone();
+        target.password_secret = self.password_secret.clone();
+        target.ca_pem = self.ca_pem.clone();
+        if let Some(ms) = self.connect_timeout_ms {
+            target.connect_timeout = Duration::from_millis(ms);
+        }
+        let mut c = sparrow_connectors::RedisSinkConfig::new(target, self.command()?);
+        c.outbox_capacity = outbox_capacity;
+        if let Some(n) = self.pipeline_rows {
+            c.pipeline_rows = n;
+        }
+        if let Some(n) = self.pipeline_bytes {
+            c.pipeline_bytes = n;
+        }
+        if let Some(n) = self.max_retries {
+            c.max_retries = n;
+        }
+        for (value, slot) in [
+            (self.flush_interval_ms, &mut c.flush_interval),
+            (self.timeout_ms, &mut c.timeout),
+            (self.retry_initial_ms, &mut c.retry_initial),
+            (self.retry_max_ms, &mut c.retry_max),
+            (self.flush_timeout_ms, &mut c.flush_timeout),
+        ] {
+            if let Some(ms) = value {
+                *slot = Duration::from_millis(ms);
+            }
+        }
+        Ok(c)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SinkSpec {
@@ -1265,12 +1822,24 @@ pub struct SinkSpec {
     /// Required exclusively for `kind = "databus"` (in-process topic bus).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub databus: Option<DataBusSinkSpec>,
+    /// Required exclusively for `kind = "influxdb"` (InfluxDB v2 write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub influxdb: Option<Box<InfluxDbSinkSpec>>,
     /// Required exclusively for `kind = "websocket"` (client mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket: Option<WebSocketSinkSpec>,
     /// Required exclusively for `kind = "kafka"` (producer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kafka: Option<KafkaSinkSpec>,
+    /// Required exclusively for `kind = "redis"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis: Option<Box<RedisSinkSpec>>,
+    /// Required exclusively for `kind = "postgres"` (`postgres` build feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<Box<crate::postgres_spec::PostgresSinkSpec>>,
+    /// Required exclusively for `kind = "tcp"` (client mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<TcpSinkSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1333,6 +1902,26 @@ impl SinkSpec {
             self.protobuf.as_ref(),
             sparrow_formats::CsvRole::Encode,
         )
+    }
+}
+
+impl SinkSpec {
+    /// HTTP/MQTT/File/plugin/action fields (on a sink of another kind).
+    pub(crate) fn has_foreign_fields(&self) -> bool {
+        self.plugin.is_some()
+            || self.action.is_some()
+            || self.file.is_some()
+            || self.url.is_some()
+            || self.skip_verify
+            || self.use_demo_io
+            || self.header_secret.is_some()
+            || self.host.is_some()
+            || self.port.is_some()
+            || self.topic.is_some()
+            || self.client_id.is_some()
+            || self.qos != 0
+            || !self.clean_session
+            || self.tls
     }
 }
 
@@ -1681,8 +2270,12 @@ impl PipelineSpec {
         self.check_nats()?;
         self.check_jetstream_sink()?;
         self.check_databus()?;
+        self.check_influxdb()?;
         self.check_websocket()?;
         self.check_kafka()?;
+        self.check_redis()?;
+        self.check_postgres()?;
+        self.check_tcp()?;
         if self
             .source
             .jetstream
@@ -2094,22 +2687,305 @@ impl PipelineSpec {
         Ok(())
     }
 
+    /// TCP (client mode) is live, at-most-once: no replay point, so durable
+    /// claims are refused; connector fields must not be mixed.
+    fn check_tcp(&self) -> Result<()> {
+        // Public typed validators call check_delivery without basic_check.
+        // Visit non-legacy graph endpoints as well, before the fast path.
+        if let Some(io) = &self.graph_io {
+            let mut single = self.clone();
+            single.graph_io = None;
+            for source in io.sources.values() {
+                single.source = source.clone();
+                single.check_tcp()?;
+            }
+            single.source = self.source.clone();
+            for sink in io.sinks.values() {
+                single.sink = sink.clone();
+                single.check_tcp()?;
+            }
+        }
+        if self.source.tcp.is_some() != (self.source.kind == "tcp")
+            || self.sink.tcp.is_some() != (self.sink.kind == "tcp")
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "source.tcp / sink.tcp are required exclusively for kind=tcp",
+            ));
+        }
+        let source = self.source.tcp.as_ref();
+        let sink = self.sink.tcp.as_ref();
+        if source.is_none() && sink.is_none() {
+            return Ok(());
+        }
+        if source.is_some() && self.source_has_foreign_fields() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "TCP options (host, port, tls) belong in source.tcp; mixed connector fields refused",
+            ));
+        }
+        if sink.is_some() && self.sink_has_foreign_fields() {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "TCP options (host, port, tls) belong in sink.tcp (one record per row, no actions); mixed connector fields refused",
+            ));
+        }
+        let widths = [
+            source.map(|s| (s.framing, s.length_bytes)),
+            sink.map(|s| (s.framing, s.length_bytes)),
+        ];
+        for (framing, length_bytes) in widths.into_iter().flatten() {
+            if let Some(n) = length_bytes {
+                if framing != TcpFramingSpec::LengthPrefixed || !(n == 2 || n == 4) {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        "TCP length_bytes is 2 or 4 and only applies to framing=length_prefixed",
+                    ));
+                }
+            }
+        }
+        if self.delivery != "live_best_effort"
+            || self.recovery != "restart_fresh"
+            || self.restore.is_some()
+            || self.checkpoint.is_some()
+            || self.checkpoint_dir.is_some()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "TCP is live_best_effort/restart_fresh, at-most-once (no ack, no replay); no checkpoint or restore",
+            ));
+        }
+        Ok(())
+    }
+
     /// HTTP/MQTT/File/plugin/action fields on a NATS-family sink.
     fn sink_has_foreign_fields(&self) -> bool {
-        self.sink.plugin.is_some()
-            || self.sink.action.is_some()
-            || self.sink.file.is_some()
-            || self.sink.url.is_some()
-            || self.sink.skip_verify
-            || self.sink.use_demo_io
-            || self.sink.header_secret.is_some()
-            || self.sink.host.is_some()
-            || self.sink.port.is_some()
-            || self.sink.topic.is_some()
-            || self.sink.client_id.is_some()
-            || self.sink.qos != 0
-            || !self.sink.clean_session
-            || self.sink.tls
+        self.sink.has_foreign_fields()
+    }
+
+    /// Redis Sink: live-only. Neither the target nor the command is bound
+    /// into checkpoints, and XADD/PUBLISH/LPUSH/RPUSH are not idempotent, so
+    /// every durable claim is refused, for the legacy and graph sinks alike.
+    fn check_redis(&self) -> Result<()> {
+        let graph: Vec<&SinkSpec> = self
+            .graph_io
+            .as_ref()
+            .map(|io| io.sinks.values().collect())
+            .unwrap_or_default();
+        let mut any = false;
+        for sink in std::iter::once(&self.sink).chain(graph) {
+            if sink.redis.is_some() != (sink.kind == "redis") {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "sink.redis is required exclusively for sink kind=redis",
+                ));
+            }
+            if sink.kind != "redis" {
+                continue;
+            }
+            any = true;
+            if sink.has_foreign_fields()
+                || sink.nats.is_some()
+                || sink.jetstream.is_some()
+                || sink.databus.is_some()
+                || sink.websocket.is_some()
+                || sink.tcp.is_some()
+                || sink.influxdb.is_some()
+                || sink.batch_rows.is_some()
+                || sink.batch_bytes.is_some()
+                || sink.linger_ms.is_some()
+                || sink.max_inflight.is_some()
+                || sink.format.is_some()
+                || sink.csv.is_some()
+                || sink.protobuf.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "Redis options belong in sink.redis (no actions); mixed connector fields refused",
+                ));
+            }
+        }
+        if any
+            && (self.delivery != "live_best_effort"
+                || self.recovery != "restart_fresh"
+                || self.restore.is_some()
+                || self.checkpoint.is_some()
+                || self.checkpoint_dir.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "Redis Sink is live_best_effort/restart_fresh (no checkpoint binds the target; XADD/PUBLISH/LPUSH/RPUSH are not idempotent); no checkpoint or restore",
+            ));
+        }
+        Ok(())
+    }
+
+    /// PostgreSQL Source/Sink: live-only. The tracking value is not a
+    /// checkpoint replay point (a row committed late with a smaller value is
+    /// skipped) and plain INSERT is not idempotent, so every durable claim is
+    /// refused, for legacy and graph endpoints alike.
+    fn check_postgres(&self) -> Result<()> {
+        let (graph_sources, graph_sinks): (Vec<&SourceSpec>, Vec<&SinkSpec>) = self
+            .graph_io
+            .as_ref()
+            .map(|io| (io.sources.values().collect(), io.sinks.values().collect()))
+            .unwrap_or_default();
+        let mut any = false;
+        for source in std::iter::once(&self.source).chain(graph_sources) {
+            if source.postgres.is_some() != (source.kind == "postgres") {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "source.postgres is required exclusively for source kind=postgres",
+                ));
+            }
+            if source.kind != "postgres" {
+                continue;
+            }
+            any = true;
+            if source.jetstream.is_some()
+                || source.http_poll.is_some()
+                || source.nats.is_some()
+                || source.databus.is_some()
+                || source.websocket.is_some()
+                || source.tcp.is_some()
+                || source.plugin.is_some()
+                || source.host.is_some()
+                || source.port.is_some()
+                || source.path.is_some()
+                || source.bind.is_some()
+                || source.client_id.is_some()
+                || source.username_secret.is_some()
+                || source.password_secret.is_some()
+                || source.use_demo_io
+                || source.tls
+                || source.skip_verify
+                || source.file_contract.is_some()
+                || source.qos != 0
+                || !source.clean_session
+                || source.topic != default_topic()
+                || source.inbox_wait_ms.is_some()
+                || source.tcp_quickack.is_some()
+                || source.inbox_bytes.is_some()
+                || source.format.is_some()
+                || source.csv.is_some()
+                || source.protobuf.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "PostgreSQL options belong in source.postgres (rows come typed from the query; no format); mixed connector fields refused",
+                ));
+            }
+        }
+        for sink in std::iter::once(&self.sink).chain(graph_sinks) {
+            if sink.postgres.is_some() != (sink.kind == "postgres") {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "sink.postgres is required exclusively for sink kind=postgres",
+                ));
+            }
+            if sink.kind != "postgres" {
+                continue;
+            }
+            any = true;
+            if sink.has_foreign_fields()
+                || sink.nats.is_some()
+                || sink.jetstream.is_some()
+                || sink.databus.is_some()
+                || sink.websocket.is_some()
+                || sink.tcp.is_some()
+                || sink.influxdb.is_some()
+                || sink.redis.is_some()
+                || sink.batch_rows.is_some()
+                || sink.batch_bytes.is_some()
+                || sink.linger_ms.is_some()
+                || sink.max_inflight.is_some()
+                || sink.format.is_some()
+                || sink.csv.is_some()
+                || sink.protobuf.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "PostgreSQL options belong in sink.postgres (no actions, no format); mixed connector fields refused",
+                ));
+            }
+        }
+        if !any {
+            return Ok(());
+        }
+        if !cfg!(feature = "postgres") {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "PostgreSQL support requires the postgres build feature",
+            ));
+        }
+        if self.delivery != "live_best_effort"
+            || self.recovery != "restart_fresh"
+            || self.restore.is_some()
+            || self.checkpoint.is_some()
+            || self.checkpoint_dir.is_some()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "PostgreSQL Source/Sink are live_best_effort/restart_fresh (the tracking value is not a replay point; INSERT is not idempotent); no checkpoint or restore",
+            ));
+        }
+        Ok(())
+    }
+
+    /// InfluxDB Sink: live-only. Target identity (url/org/bucket/mapping) is
+    /// not bound into checkpoints, so every durable claim is refused, for the
+    /// legacy sink and for graph sinks alike.
+    fn check_influxdb(&self) -> Result<()> {
+        let graph: Vec<&SinkSpec> = self
+            .graph_io
+            .as_ref()
+            .map(|io| io.sinks.values().collect())
+            .unwrap_or_default();
+        let mut any = false;
+        for sink in std::iter::once(&self.sink).chain(graph) {
+            if sink.influxdb.is_some() != (sink.kind == "influxdb") {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "sink.influxdb is required exclusively for sink kind=influxdb",
+                ));
+            }
+            if sink.kind != "influxdb" {
+                continue;
+            }
+            any = true;
+            if sink.has_foreign_fields()
+                || sink.nats.is_some()
+                || sink.jetstream.is_some()
+                || sink.databus.is_some()
+                || sink.websocket.is_some()
+                || sink.tcp.is_some()
+                || sink.format.is_some()
+                || sink.csv.is_some()
+                || sink.protobuf.is_some()
+                || sink.batch_rows.is_some()
+                || sink.batch_bytes.is_some()
+                || sink.linger_ms.is_some()
+                || sink.max_inflight.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "InfluxDB options belong in sink.influxdb (no actions); mixed connector fields refused",
+                ));
+            }
+        }
+        if any
+            && (self.delivery != "live_best_effort"
+                || self.recovery != "restart_fresh"
+                || self.restore.is_some()
+                || self.checkpoint.is_some()
+                || self.checkpoint_dir.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "InfluxDB Sink is live_best_effort/restart_fresh (no checkpoint binds the write target); no checkpoint or restore",
+            ));
+        }
+        Ok(())
     }
 
     /// JetStream Sink: PubAck-confirmed, at-least-once into the stream. It
@@ -2176,6 +3052,10 @@ impl PipelineSpec {
         // Public IO validators accept typed/serde-created specs too, so they
         // must not rely solely on from_json/basic_check for the DataBus gate.
         self.check_databus()?;
+        self.check_redis()?;
+        self.check_postgres()?;
+        self.check_influxdb()?;
+        self.check_tcp()?;
         let g = DeliveryGuarantee::parse(&self.delivery)?;
         if (g == DeliveryGuarantee::CheckpointedAtLeastOnce)
             != (cfg!(feature = "jetstream") && self.source.kind == "jetstream")

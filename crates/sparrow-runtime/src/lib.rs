@@ -26,6 +26,8 @@ mod buffered_window;
 pub mod external_lookup;
 #[cfg(test)]
 mod external_lookup_tests;
+#[cfg(test)]
+mod external_lookup_batch_tests;
 pub mod finite;
 pub mod graph_cut;
 pub mod kernel;

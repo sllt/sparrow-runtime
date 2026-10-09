@@ -121,6 +121,35 @@ pub struct IoDiagnostics {
     pub databus_sink_discarded_on_close: AtomicU64,
     pub databus_sink_batches: AtomicU64,
     pub databus_sink_fatal: AtomicU64,
+    pub redis_sink_commands_ok: AtomicU64,
+    pub redis_sink_pipelines: AtomicU64,
+    pub redis_sink_bytes_sent: AtomicU64,
+    pub redis_sink_command_errors: AtomicU64,
+    pub redis_sink_publish_no_receivers: AtomicU64,
+    pub redis_sink_dropped_bad: AtomicU64,
+    pub redis_sink_dropped_oversize: AtomicU64,
+    pub redis_sink_dropped_budget: AtomicU64,
+    pub redis_sink_retries: AtomicU64,
+    pub redis_sink_connects: AtomicU64,
+    pub redis_sink_connect_failures: AtomicU64,
+    pub redis_sink_unknown_outcome: AtomicU64,
+    pub redis_sink_discarded_on_close: AtomicU64,
+    pub redis_sink_fatal: AtomicU64,
+    pub influxdb_sink_rows_written: AtomicU64,
+    pub influxdb_sink_requests_ok: AtomicU64,
+    pub influxdb_sink_bytes_sent: AtomicU64,
+    pub influxdb_sink_gzip_fallbacks: AtomicU64,
+    pub influxdb_sink_retries: AtomicU64,
+    pub influxdb_sink_retry_after_waits: AtomicU64,
+    pub influxdb_sink_retry_after_capped: AtomicU64,
+    pub influxdb_sink_dropped_bad: AtomicU64,
+    pub influxdb_sink_dropped_oversize: AtomicU64,
+    pub influxdb_sink_dropped_budget: AtomicU64,
+    pub influxdb_sink_rejected_requests: AtomicU64,
+    pub influxdb_sink_rejected_rows: AtomicU64,
+    pub influxdb_sink_partial_writes: AtomicU64,
+    pub influxdb_sink_discarded_on_close: AtomicU64,
+    pub influxdb_sink_fatal: AtomicU64,
     pub csv_malformed: AtomicU64,
     pub csv_oversize: AtomicU64,
     pub csv_type_errors: AtomicU64,
@@ -166,6 +195,39 @@ pub struct IoDiagnostics {
     pub websocket_sink_fatal: AtomicU64,
     pub websocket_sink_queue_items: AtomicU64,
     pub websocket_source_inbox: Arc<sparrow_model::QueueOccupancy>,
+    pub tcp_source_received: AtomicU64,
+    pub tcp_source_rows: AtomicU64,
+    pub tcp_source_bytes_read: AtomicU64,
+    pub tcp_source_dropped_bad: AtomicU64,
+    pub tcp_source_dropped_oversize: AtomicU64,
+    pub tcp_source_dropped_partial: AtomicU64,
+    pub tcp_source_dropped_budget: AtomicU64,
+    pub tcp_source_backpressure_waits: AtomicU64,
+    pub tcp_source_connects: AtomicU64,
+    pub tcp_source_reconnects: AtomicU64,
+    pub tcp_source_disconnects: AtomicU64,
+    pub tcp_source_connect_failures: AtomicU64,
+    pub tcp_source_idle_timeouts: AtomicU64,
+    pub tcp_sink_sent: AtomicU64,
+    pub tcp_sink_bytes_written: AtomicU64,
+    pub tcp_sink_dropped_bad: AtomicU64,
+    pub tcp_sink_dropped_oversize: AtomicU64,
+    pub tcp_sink_dropped_budget: AtomicU64,
+    pub tcp_sink_dropped_overflow: AtomicU64,
+    pub tcp_sink_backpressure_waits: AtomicU64,
+    pub tcp_sink_send_failed: AtomicU64,
+    pub tcp_sink_send_timeouts: AtomicU64,
+    pub tcp_sink_discarded_on_close: AtomicU64,
+    pub tcp_sink_connects: AtomicU64,
+    pub tcp_sink_reconnects: AtomicU64,
+    pub tcp_sink_disconnects: AtomicU64,
+    pub tcp_sink_connect_failures: AtomicU64,
+    pub tcp_sink_ignored_bytes: AtomicU64,
+    pub tcp_sink_closes: AtomicU64,
+    pub tcp_sink_close_failed: AtomicU64,
+    pub tcp_sink_fatal: AtomicU64,
+    pub tcp_sink_queue_items: AtomicU64,
+    pub tcp_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub databus_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub nats_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub log_written: AtomicU64,
@@ -176,6 +238,35 @@ pub struct IoDiagnostics {
     pub file_syncs: AtomicU64,
     pub file_failed: AtomicU64,
     pub kafka: crate::kafka_diag::KafkaCounters,
+    pub postgres_source_rows: AtomicU64,
+    pub postgres_source_queries: AtomicU64,
+    pub postgres_source_dropped_bad: AtomicU64,
+    pub postgres_source_dropped_oversize: AtomicU64,
+    pub postgres_source_backpressure_waits: AtomicU64,
+    pub postgres_source_budget_waits: AtomicU64,
+    pub postgres_source_connects: AtomicU64,
+    pub postgres_source_connect_failures: AtomicU64,
+    pub postgres_source_query_failures: AtomicU64,
+    pub postgres_source_timeouts: AtomicU64,
+    pub postgres_sink_rows: AtomicU64,
+    pub postgres_sink_transactions: AtomicU64,
+    pub postgres_sink_statements: AtomicU64,
+    pub postgres_sink_batch_errors: AtomicU64,
+    pub postgres_sink_dropped_bad: AtomicU64,
+    pub postgres_sink_dropped_oversize: AtomicU64,
+    pub postgres_sink_budget_waits: AtomicU64,
+    pub postgres_sink_retries: AtomicU64,
+    pub postgres_sink_connects: AtomicU64,
+    pub postgres_sink_connect_failures: AtomicU64,
+    pub postgres_sink_timeouts: AtomicU64,
+    pub postgres_sink_unknown_outcome: AtomicU64,
+    pub postgres_sink_discarded_on_close: AtomicU64,
+    pub postgres_sink_fatal: AtomicU64,
+    /// Last tracking value the PostgreSQL Source advanced to (integer, or
+    /// microseconds since 1970 for timestamps); valid when `..._set` is 1.
+    pub postgres_source_tracking_value: std::sync::atomic::AtomicI64,
+    pub postgres_source_tracking_set: AtomicU64,
+    pub postgres_source_inbox: Arc<sparrow_model::QueueOccupancy>,
 }
 
 impl IoDiagnostics {
@@ -368,6 +459,49 @@ impl IoDiagnostics {
                 .load(Ordering::Relaxed),
             databus_sink_batches: self.databus_sink_batches.load(Ordering::Relaxed),
             databus_sink_fatal: self.databus_sink_fatal.load(Ordering::Relaxed),
+            redis_sink_commands_ok: self.redis_sink_commands_ok.load(Ordering::Relaxed),
+            redis_sink_pipelines: self.redis_sink_pipelines.load(Ordering::Relaxed),
+            redis_sink_bytes_sent: self.redis_sink_bytes_sent.load(Ordering::Relaxed),
+            redis_sink_command_errors: self.redis_sink_command_errors.load(Ordering::Relaxed),
+            redis_sink_publish_no_receivers: self
+                .redis_sink_publish_no_receivers
+                .load(Ordering::Relaxed),
+            redis_sink_dropped_bad: self.redis_sink_dropped_bad.load(Ordering::Relaxed),
+            redis_sink_dropped_oversize: self.redis_sink_dropped_oversize.load(Ordering::Relaxed),
+            redis_sink_dropped_budget: self.redis_sink_dropped_budget.load(Ordering::Relaxed),
+            redis_sink_retries: self.redis_sink_retries.load(Ordering::Relaxed),
+            redis_sink_connects: self.redis_sink_connects.load(Ordering::Relaxed),
+            redis_sink_connect_failures: self.redis_sink_connect_failures.load(Ordering::Relaxed),
+            redis_sink_unknown_outcome: self.redis_sink_unknown_outcome.load(Ordering::Relaxed),
+            redis_sink_discarded_on_close: self
+                .redis_sink_discarded_on_close
+                .load(Ordering::Relaxed),
+            redis_sink_fatal: self.redis_sink_fatal.load(Ordering::Relaxed),
+            influxdb_sink_rows_written: self.influxdb_sink_rows_written.load(Ordering::Relaxed),
+            influxdb_sink_requests_ok: self.influxdb_sink_requests_ok.load(Ordering::Relaxed),
+            influxdb_sink_bytes_sent: self.influxdb_sink_bytes_sent.load(Ordering::Relaxed),
+            influxdb_sink_gzip_fallbacks: self.influxdb_sink_gzip_fallbacks.load(Ordering::Relaxed),
+            influxdb_sink_retries: self.influxdb_sink_retries.load(Ordering::Relaxed),
+            influxdb_sink_retry_after_waits: self
+                .influxdb_sink_retry_after_waits
+                .load(Ordering::Relaxed),
+            influxdb_sink_retry_after_capped: self
+                .influxdb_sink_retry_after_capped
+                .load(Ordering::Relaxed),
+            influxdb_sink_dropped_bad: self.influxdb_sink_dropped_bad.load(Ordering::Relaxed),
+            influxdb_sink_dropped_oversize: self
+                .influxdb_sink_dropped_oversize
+                .load(Ordering::Relaxed),
+            influxdb_sink_dropped_budget: self.influxdb_sink_dropped_budget.load(Ordering::Relaxed),
+            influxdb_sink_rejected_requests: self
+                .influxdb_sink_rejected_requests
+                .load(Ordering::Relaxed),
+            influxdb_sink_rejected_rows: self.influxdb_sink_rejected_rows.load(Ordering::Relaxed),
+            influxdb_sink_partial_writes: self.influxdb_sink_partial_writes.load(Ordering::Relaxed),
+            influxdb_sink_discarded_on_close: self
+                .influxdb_sink_discarded_on_close
+                .load(Ordering::Relaxed),
+            influxdb_sink_fatal: self.influxdb_sink_fatal.load(Ordering::Relaxed),
             csv_malformed: self.csv_malformed.load(Ordering::Relaxed),
             csv_oversize: self.csv_oversize.load(Ordering::Relaxed),
             csv_type_errors: self.csv_type_errors.load(Ordering::Relaxed),
@@ -440,6 +574,42 @@ impl IoDiagnostics {
             websocket_sink_queue_items: self.websocket_sink_queue_items.load(Ordering::Relaxed),
             websocket_source_inbox_items: self.websocket_source_inbox.items.load(Ordering::Relaxed),
             websocket_source_inbox_bytes: self.websocket_source_inbox.bytes.load(Ordering::Relaxed),
+            tcp_source_received: self.tcp_source_received.load(Ordering::Relaxed),
+            tcp_source_rows: self.tcp_source_rows.load(Ordering::Relaxed),
+            tcp_source_bytes_read: self.tcp_source_bytes_read.load(Ordering::Relaxed),
+            tcp_source_dropped_bad: self.tcp_source_dropped_bad.load(Ordering::Relaxed),
+            tcp_source_dropped_oversize: self.tcp_source_dropped_oversize.load(Ordering::Relaxed),
+            tcp_source_dropped_partial: self.tcp_source_dropped_partial.load(Ordering::Relaxed),
+            tcp_source_dropped_budget: self.tcp_source_dropped_budget.load(Ordering::Relaxed),
+            tcp_source_backpressure_waits: self
+                .tcp_source_backpressure_waits
+                .load(Ordering::Relaxed),
+            tcp_source_connects: self.tcp_source_connects.load(Ordering::Relaxed),
+            tcp_source_reconnects: self.tcp_source_reconnects.load(Ordering::Relaxed),
+            tcp_source_disconnects: self.tcp_source_disconnects.load(Ordering::Relaxed),
+            tcp_source_connect_failures: self.tcp_source_connect_failures.load(Ordering::Relaxed),
+            tcp_source_idle_timeouts: self.tcp_source_idle_timeouts.load(Ordering::Relaxed),
+            tcp_sink_sent: self.tcp_sink_sent.load(Ordering::Relaxed),
+            tcp_sink_bytes_written: self.tcp_sink_bytes_written.load(Ordering::Relaxed),
+            tcp_sink_dropped_bad: self.tcp_sink_dropped_bad.load(Ordering::Relaxed),
+            tcp_sink_dropped_oversize: self.tcp_sink_dropped_oversize.load(Ordering::Relaxed),
+            tcp_sink_dropped_budget: self.tcp_sink_dropped_budget.load(Ordering::Relaxed),
+            tcp_sink_dropped_overflow: self.tcp_sink_dropped_overflow.load(Ordering::Relaxed),
+            tcp_sink_backpressure_waits: self.tcp_sink_backpressure_waits.load(Ordering::Relaxed),
+            tcp_sink_send_failed: self.tcp_sink_send_failed.load(Ordering::Relaxed),
+            tcp_sink_send_timeouts: self.tcp_sink_send_timeouts.load(Ordering::Relaxed),
+            tcp_sink_discarded_on_close: self.tcp_sink_discarded_on_close.load(Ordering::Relaxed),
+            tcp_sink_connects: self.tcp_sink_connects.load(Ordering::Relaxed),
+            tcp_sink_reconnects: self.tcp_sink_reconnects.load(Ordering::Relaxed),
+            tcp_sink_disconnects: self.tcp_sink_disconnects.load(Ordering::Relaxed),
+            tcp_sink_connect_failures: self.tcp_sink_connect_failures.load(Ordering::Relaxed),
+            tcp_sink_ignored_bytes: self.tcp_sink_ignored_bytes.load(Ordering::Relaxed),
+            tcp_sink_closes: self.tcp_sink_closes.load(Ordering::Relaxed),
+            tcp_sink_close_failed: self.tcp_sink_close_failed.load(Ordering::Relaxed),
+            tcp_sink_fatal: self.tcp_sink_fatal.load(Ordering::Relaxed),
+            tcp_sink_queue_items: self.tcp_sink_queue_items.load(Ordering::Relaxed),
+            tcp_source_inbox_items: self.tcp_source_inbox.items.load(Ordering::Relaxed),
+            tcp_source_inbox_bytes: self.tcp_source_inbox.bytes.load(Ordering::Relaxed),
             databus_source_inbox_items: self.databus_source_inbox.items.load(Ordering::Relaxed),
             databus_source_inbox_bytes: self.databus_source_inbox.bytes.load(Ordering::Relaxed),
             nats_source_inbox_items: self.nats_source_inbox.items.load(Ordering::Relaxed),
@@ -452,6 +622,52 @@ impl IoDiagnostics {
             file_syncs: self.file_syncs.load(Ordering::Relaxed),
             file_failed: self.file_failed.load(Ordering::Relaxed),
             kafka: self.kafka.snapshot(),
+            postgres_source_rows: self.postgres_source_rows.load(Ordering::Relaxed),
+            postgres_source_queries: self.postgres_source_queries.load(Ordering::Relaxed),
+            postgres_source_dropped_bad: self.postgres_source_dropped_bad.load(Ordering::Relaxed),
+            postgres_source_dropped_oversize: self
+                .postgres_source_dropped_oversize
+                .load(Ordering::Relaxed),
+            postgres_source_backpressure_waits: self
+                .postgres_source_backpressure_waits
+                .load(Ordering::Relaxed),
+            postgres_source_budget_waits: self.postgres_source_budget_waits.load(Ordering::Relaxed),
+            postgres_source_connects: self.postgres_source_connects.load(Ordering::Relaxed),
+            postgres_source_connect_failures: self
+                .postgres_source_connect_failures
+                .load(Ordering::Relaxed),
+            postgres_source_query_failures: self
+                .postgres_source_query_failures
+                .load(Ordering::Relaxed),
+            postgres_source_timeouts: self.postgres_source_timeouts.load(Ordering::Relaxed),
+            postgres_sink_rows: self.postgres_sink_rows.load(Ordering::Relaxed),
+            postgres_sink_transactions: self.postgres_sink_transactions.load(Ordering::Relaxed),
+            postgres_sink_statements: self.postgres_sink_statements.load(Ordering::Relaxed),
+            postgres_sink_batch_errors: self.postgres_sink_batch_errors.load(Ordering::Relaxed),
+            postgres_sink_dropped_bad: self.postgres_sink_dropped_bad.load(Ordering::Relaxed),
+            postgres_sink_dropped_oversize: self
+                .postgres_sink_dropped_oversize
+                .load(Ordering::Relaxed),
+            postgres_sink_budget_waits: self.postgres_sink_budget_waits.load(Ordering::Relaxed),
+            postgres_sink_retries: self.postgres_sink_retries.load(Ordering::Relaxed),
+            postgres_sink_connects: self.postgres_sink_connects.load(Ordering::Relaxed),
+            postgres_sink_connect_failures: self
+                .postgres_sink_connect_failures
+                .load(Ordering::Relaxed),
+            postgres_sink_timeouts: self.postgres_sink_timeouts.load(Ordering::Relaxed),
+            postgres_sink_unknown_outcome: self
+                .postgres_sink_unknown_outcome
+                .load(Ordering::Relaxed),
+            postgres_sink_discarded_on_close: self
+                .postgres_sink_discarded_on_close
+                .load(Ordering::Relaxed),
+            postgres_sink_fatal: self.postgres_sink_fatal.load(Ordering::Relaxed),
+            postgres_source_tracking_value: self
+                .postgres_source_tracking_value
+                .load(Ordering::Relaxed),
+            postgres_source_tracking_set: self.postgres_source_tracking_set.load(Ordering::Relaxed),
+            postgres_source_inbox_items: self.postgres_source_inbox.items.load(Ordering::Relaxed),
+            postgres_source_inbox_bytes: self.postgres_source_inbox.bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -570,6 +786,35 @@ pub struct IoSnapshot {
     pub databus_sink_discarded_on_close: u64,
     pub databus_sink_batches: u64,
     pub databus_sink_fatal: u64,
+    pub redis_sink_commands_ok: u64,
+    pub redis_sink_pipelines: u64,
+    pub redis_sink_bytes_sent: u64,
+    pub redis_sink_command_errors: u64,
+    pub redis_sink_publish_no_receivers: u64,
+    pub redis_sink_dropped_bad: u64,
+    pub redis_sink_dropped_oversize: u64,
+    pub redis_sink_dropped_budget: u64,
+    pub redis_sink_retries: u64,
+    pub redis_sink_connects: u64,
+    pub redis_sink_connect_failures: u64,
+    pub redis_sink_unknown_outcome: u64,
+    pub redis_sink_discarded_on_close: u64,
+    pub redis_sink_fatal: u64,
+    pub influxdb_sink_rows_written: u64,
+    pub influxdb_sink_requests_ok: u64,
+    pub influxdb_sink_bytes_sent: u64,
+    pub influxdb_sink_gzip_fallbacks: u64,
+    pub influxdb_sink_retries: u64,
+    pub influxdb_sink_retry_after_waits: u64,
+    pub influxdb_sink_retry_after_capped: u64,
+    pub influxdb_sink_dropped_bad: u64,
+    pub influxdb_sink_dropped_oversize: u64,
+    pub influxdb_sink_dropped_budget: u64,
+    pub influxdb_sink_rejected_requests: u64,
+    pub influxdb_sink_rejected_rows: u64,
+    pub influxdb_sink_partial_writes: u64,
+    pub influxdb_sink_discarded_on_close: u64,
+    pub influxdb_sink_fatal: u64,
     pub csv_malformed: u64,
     pub csv_oversize: u64,
     pub csv_type_errors: u64,
@@ -616,6 +861,40 @@ pub struct IoSnapshot {
     pub websocket_sink_queue_items: u64,
     pub websocket_source_inbox_items: u64,
     pub websocket_source_inbox_bytes: u64,
+    pub tcp_source_received: u64,
+    pub tcp_source_rows: u64,
+    pub tcp_source_bytes_read: u64,
+    pub tcp_source_dropped_bad: u64,
+    pub tcp_source_dropped_oversize: u64,
+    pub tcp_source_dropped_partial: u64,
+    pub tcp_source_dropped_budget: u64,
+    pub tcp_source_backpressure_waits: u64,
+    pub tcp_source_connects: u64,
+    pub tcp_source_reconnects: u64,
+    pub tcp_source_disconnects: u64,
+    pub tcp_source_connect_failures: u64,
+    pub tcp_source_idle_timeouts: u64,
+    pub tcp_sink_sent: u64,
+    pub tcp_sink_bytes_written: u64,
+    pub tcp_sink_dropped_bad: u64,
+    pub tcp_sink_dropped_oversize: u64,
+    pub tcp_sink_dropped_budget: u64,
+    pub tcp_sink_dropped_overflow: u64,
+    pub tcp_sink_backpressure_waits: u64,
+    pub tcp_sink_send_failed: u64,
+    pub tcp_sink_send_timeouts: u64,
+    pub tcp_sink_discarded_on_close: u64,
+    pub tcp_sink_connects: u64,
+    pub tcp_sink_reconnects: u64,
+    pub tcp_sink_disconnects: u64,
+    pub tcp_sink_connect_failures: u64,
+    pub tcp_sink_ignored_bytes: u64,
+    pub tcp_sink_closes: u64,
+    pub tcp_sink_close_failed: u64,
+    pub tcp_sink_fatal: u64,
+    pub tcp_sink_queue_items: u64,
+    pub tcp_source_inbox_items: u64,
+    pub tcp_source_inbox_bytes: u64,
     pub databus_source_inbox_items: u64,
     pub databus_source_inbox_bytes: u64,
     pub nats_source_inbox_items: u64,
@@ -628,6 +907,35 @@ pub struct IoSnapshot {
     pub file_syncs: u64,
     pub file_failed: u64,
     pub kafka: crate::kafka_diag::KafkaSnapshot,
+    pub postgres_source_rows: u64,
+    pub postgres_source_queries: u64,
+    pub postgres_source_dropped_bad: u64,
+    pub postgres_source_dropped_oversize: u64,
+    pub postgres_source_backpressure_waits: u64,
+    pub postgres_source_budget_waits: u64,
+    pub postgres_source_connects: u64,
+    pub postgres_source_connect_failures: u64,
+    pub postgres_source_query_failures: u64,
+    pub postgres_source_timeouts: u64,
+    pub postgres_sink_rows: u64,
+    pub postgres_sink_transactions: u64,
+    pub postgres_sink_statements: u64,
+    pub postgres_sink_batch_errors: u64,
+    pub postgres_sink_dropped_bad: u64,
+    pub postgres_sink_dropped_oversize: u64,
+    pub postgres_sink_budget_waits: u64,
+    pub postgres_sink_retries: u64,
+    pub postgres_sink_connects: u64,
+    pub postgres_sink_connect_failures: u64,
+    pub postgres_sink_timeouts: u64,
+    pub postgres_sink_unknown_outcome: u64,
+    pub postgres_sink_discarded_on_close: u64,
+    pub postgres_sink_fatal: u64,
+    /// Not summed by `add_assign`: the maximum is kept.
+    pub postgres_source_tracking_value: i64,
+    pub postgres_source_tracking_set: u64,
+    pub postgres_source_inbox_items: u64,
+    pub postgres_source_inbox_bytes: u64,
 }
 
 impl std::fmt::Display for IoSnapshot {
@@ -767,6 +1075,35 @@ impl IoSnapshot {
         self.databus_sink_discarded_on_close += other.databus_sink_discarded_on_close;
         self.databus_sink_batches += other.databus_sink_batches;
         self.databus_sink_fatal += other.databus_sink_fatal;
+        self.redis_sink_commands_ok += other.redis_sink_commands_ok;
+        self.redis_sink_pipelines += other.redis_sink_pipelines;
+        self.redis_sink_bytes_sent += other.redis_sink_bytes_sent;
+        self.redis_sink_command_errors += other.redis_sink_command_errors;
+        self.redis_sink_publish_no_receivers += other.redis_sink_publish_no_receivers;
+        self.redis_sink_dropped_bad += other.redis_sink_dropped_bad;
+        self.redis_sink_dropped_oversize += other.redis_sink_dropped_oversize;
+        self.redis_sink_dropped_budget += other.redis_sink_dropped_budget;
+        self.redis_sink_retries += other.redis_sink_retries;
+        self.redis_sink_connects += other.redis_sink_connects;
+        self.redis_sink_connect_failures += other.redis_sink_connect_failures;
+        self.redis_sink_unknown_outcome += other.redis_sink_unknown_outcome;
+        self.redis_sink_discarded_on_close += other.redis_sink_discarded_on_close;
+        self.redis_sink_fatal += other.redis_sink_fatal;
+        self.influxdb_sink_rows_written += other.influxdb_sink_rows_written;
+        self.influxdb_sink_requests_ok += other.influxdb_sink_requests_ok;
+        self.influxdb_sink_bytes_sent += other.influxdb_sink_bytes_sent;
+        self.influxdb_sink_gzip_fallbacks += other.influxdb_sink_gzip_fallbacks;
+        self.influxdb_sink_retries += other.influxdb_sink_retries;
+        self.influxdb_sink_retry_after_waits += other.influxdb_sink_retry_after_waits;
+        self.influxdb_sink_retry_after_capped += other.influxdb_sink_retry_after_capped;
+        self.influxdb_sink_dropped_bad += other.influxdb_sink_dropped_bad;
+        self.influxdb_sink_dropped_oversize += other.influxdb_sink_dropped_oversize;
+        self.influxdb_sink_dropped_budget += other.influxdb_sink_dropped_budget;
+        self.influxdb_sink_rejected_requests += other.influxdb_sink_rejected_requests;
+        self.influxdb_sink_rejected_rows += other.influxdb_sink_rejected_rows;
+        self.influxdb_sink_partial_writes += other.influxdb_sink_partial_writes;
+        self.influxdb_sink_discarded_on_close += other.influxdb_sink_discarded_on_close;
+        self.influxdb_sink_fatal += other.influxdb_sink_fatal;
         self.csv_malformed += other.csv_malformed;
         self.csv_oversize += other.csv_oversize;
         self.csv_type_errors += other.csv_type_errors;
@@ -813,6 +1150,40 @@ impl IoSnapshot {
         self.websocket_sink_queue_items += other.websocket_sink_queue_items;
         self.websocket_source_inbox_items += other.websocket_source_inbox_items;
         self.websocket_source_inbox_bytes += other.websocket_source_inbox_bytes;
+        self.tcp_source_received += other.tcp_source_received;
+        self.tcp_source_rows += other.tcp_source_rows;
+        self.tcp_source_bytes_read += other.tcp_source_bytes_read;
+        self.tcp_source_dropped_bad += other.tcp_source_dropped_bad;
+        self.tcp_source_dropped_oversize += other.tcp_source_dropped_oversize;
+        self.tcp_source_dropped_partial += other.tcp_source_dropped_partial;
+        self.tcp_source_dropped_budget += other.tcp_source_dropped_budget;
+        self.tcp_source_backpressure_waits += other.tcp_source_backpressure_waits;
+        self.tcp_source_connects += other.tcp_source_connects;
+        self.tcp_source_reconnects += other.tcp_source_reconnects;
+        self.tcp_source_disconnects += other.tcp_source_disconnects;
+        self.tcp_source_connect_failures += other.tcp_source_connect_failures;
+        self.tcp_source_idle_timeouts += other.tcp_source_idle_timeouts;
+        self.tcp_sink_sent += other.tcp_sink_sent;
+        self.tcp_sink_bytes_written += other.tcp_sink_bytes_written;
+        self.tcp_sink_dropped_bad += other.tcp_sink_dropped_bad;
+        self.tcp_sink_dropped_oversize += other.tcp_sink_dropped_oversize;
+        self.tcp_sink_dropped_budget += other.tcp_sink_dropped_budget;
+        self.tcp_sink_dropped_overflow += other.tcp_sink_dropped_overflow;
+        self.tcp_sink_backpressure_waits += other.tcp_sink_backpressure_waits;
+        self.tcp_sink_send_failed += other.tcp_sink_send_failed;
+        self.tcp_sink_send_timeouts += other.tcp_sink_send_timeouts;
+        self.tcp_sink_discarded_on_close += other.tcp_sink_discarded_on_close;
+        self.tcp_sink_connects += other.tcp_sink_connects;
+        self.tcp_sink_reconnects += other.tcp_sink_reconnects;
+        self.tcp_sink_disconnects += other.tcp_sink_disconnects;
+        self.tcp_sink_connect_failures += other.tcp_sink_connect_failures;
+        self.tcp_sink_ignored_bytes += other.tcp_sink_ignored_bytes;
+        self.tcp_sink_closes += other.tcp_sink_closes;
+        self.tcp_sink_close_failed += other.tcp_sink_close_failed;
+        self.tcp_sink_fatal += other.tcp_sink_fatal;
+        self.tcp_sink_queue_items += other.tcp_sink_queue_items;
+        self.tcp_source_inbox_items += other.tcp_source_inbox_items;
+        self.tcp_source_inbox_bytes += other.tcp_source_inbox_bytes;
         self.databus_source_inbox_items += other.databus_source_inbox_items;
         self.databus_source_inbox_bytes += other.databus_source_inbox_bytes;
         self.nats_source_inbox_items += other.nats_source_inbox_items;
@@ -825,6 +1196,41 @@ impl IoSnapshot {
         self.file_syncs += other.file_syncs;
         self.file_failed += other.file_failed;
         self.kafka.add_assign(&other.kafka);
+        self.postgres_source_rows += other.postgres_source_rows;
+        self.postgres_source_queries += other.postgres_source_queries;
+        self.postgres_source_dropped_bad += other.postgres_source_dropped_bad;
+        self.postgres_source_dropped_oversize += other.postgres_source_dropped_oversize;
+        self.postgres_source_backpressure_waits += other.postgres_source_backpressure_waits;
+        self.postgres_source_budget_waits += other.postgres_source_budget_waits;
+        self.postgres_source_connects += other.postgres_source_connects;
+        self.postgres_source_connect_failures += other.postgres_source_connect_failures;
+        self.postgres_source_query_failures += other.postgres_source_query_failures;
+        self.postgres_source_timeouts += other.postgres_source_timeouts;
+        self.postgres_sink_rows += other.postgres_sink_rows;
+        self.postgres_sink_transactions += other.postgres_sink_transactions;
+        self.postgres_sink_statements += other.postgres_sink_statements;
+        self.postgres_sink_batch_errors += other.postgres_sink_batch_errors;
+        self.postgres_sink_dropped_bad += other.postgres_sink_dropped_bad;
+        self.postgres_sink_dropped_oversize += other.postgres_sink_dropped_oversize;
+        self.postgres_sink_budget_waits += other.postgres_sink_budget_waits;
+        self.postgres_sink_retries += other.postgres_sink_retries;
+        self.postgres_sink_connects += other.postgres_sink_connects;
+        self.postgres_sink_connect_failures += other.postgres_sink_connect_failures;
+        self.postgres_sink_timeouts += other.postgres_sink_timeouts;
+        self.postgres_sink_unknown_outcome += other.postgres_sink_unknown_outcome;
+        self.postgres_sink_discarded_on_close += other.postgres_sink_discarded_on_close;
+        self.postgres_sink_fatal += other.postgres_sink_fatal;
+        if other.postgres_source_tracking_set != 0 {
+            self.postgres_source_tracking_value = if self.postgres_source_tracking_set != 0 {
+                self.postgres_source_tracking_value
+                    .max(other.postgres_source_tracking_value)
+            } else {
+                other.postgres_source_tracking_value
+            };
+            self.postgres_source_tracking_set = 1;
+        }
+        self.postgres_source_inbox_items += other.postgres_source_inbox_items;
+        self.postgres_source_inbox_bytes += other.postgres_source_inbox_bytes;
     }
 }
 

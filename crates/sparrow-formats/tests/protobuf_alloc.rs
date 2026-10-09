@@ -178,6 +178,8 @@ fn adversarial() -> Vec<(&'static str, Vec<u8>)> {
 
 #[test]
 fn decode_and_encode_peaks_stay_within_scratch() {
+    deep_mapping_peaks();
+    wide_oneof_peaks();
     let s = schema();
     for (name, bytes) in adversarial() {
         let format = options().compile(CsvRole::Decode).unwrap();
@@ -246,4 +248,88 @@ fn decode_and_encode_peaks_stay_within_scratch() {
             "{name}: encode peak {used} > scratch {scratch} + output {admitted}"
         );
     }
+}
+
+fn deep_mapping_peaks() {
+    let s = Schema::new(
+        SchemaId::new(1),
+        vec![Field::new(FieldId::new(1), "deep", DataType::Int64, true)],
+    )
+    .unwrap();
+    let mut o = options();
+    o.message = "telemetry.v1.Tree".into();
+    o.fields = [("deep".into(), format!("{}v", "child.".repeat(80)))].into();
+    let decoder = o.compile(CsvRole::Decode).unwrap();
+    let scratch = decoder.decode_scratch(&s, 0);
+    let (row, used) = peak(|| decoder.decode_message(&s, &[], None));
+    assert_eq!(row.unwrap().values, vec![Scalar::Null]);
+    assert!(used <= scratch, "deep decode {used} > {scratch}");
+    o.max_depth = None;
+    let encoder = o.compile(CsvRole::Encode).unwrap();
+    // An implicit scalar needs a non-nullable encode schema.
+    let s = Schema::new(
+        SchemaId::new(2),
+        vec![Field::new(FieldId::new(1), "deep", DataType::Int64, false)],
+    )
+    .unwrap();
+    let row = Row {
+        values: vec![Scalar::Int64(7)],
+    };
+    let scratch = encoder.encode_scratch(&row);
+    let (out, used) = peak(|| encoder.encode_message(&s, &row));
+    let out = out.unwrap();
+    assert!(
+        used <= scratch + out.len(),
+        "deep encode {used} > {scratch}"
+    );
+    assert_eq!(decoder.decode_message(&s, &out, None).unwrap(), row);
+}
+
+fn wide_oneof_peaks() {
+    use prost::Message as _;
+    use prost_reflect::prost_types::*;
+    let set = FileDescriptorSet {
+        file: vec![FileDescriptorProto {
+            name: Some("wide.proto".into()),
+            syntax: Some("proto3".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Wide".into()),
+                oneof_decl: vec![OneofDescriptorProto {
+                    name: Some("choice".into()),
+                    ..Default::default()
+                }],
+                field: (1..=400)
+                    .map(|n| FieldDescriptorProto {
+                        name: Some(format!("v{n}")),
+                        number: Some(n),
+                        label: Some(1),
+                        r#type: Some(3),
+                        oneof_index: Some(0),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let mut o = options();
+    o.descriptor_set = base64::engine::general_purpose::STANDARD.encode(set.encode_to_vec());
+    o.message = "Wide".into();
+    o.fields.clear();
+    let s = Schema::new(
+        SchemaId::new(1),
+        (1..=64)
+            .map(|n| Field::new(FieldId::new(n), format!("v{n}"), DataType::Int64, true))
+            .collect(),
+    )
+    .unwrap();
+    let decoder = o.compile(CsvRole::Decode).unwrap();
+    let mut bytes = vec![8, 7];
+    varint(400 << 3, &mut bytes);
+    bytes.push(9); // Unmapped member must clear v1.
+    let scratch = decoder.decode_scratch(&s, bytes.len());
+    let (row, used) = peak(|| decoder.decode_message(&s, &bytes, None));
+    assert!(row.unwrap().values.iter().all(Scalar::is_null));
+    assert!(used <= scratch, "wide oneof decode {used} > {scratch}");
 }

@@ -55,6 +55,10 @@ pub const MAX_DESCRIPTOR_SET_BYTES: usize = 48 * 1024;
 const DEFAULT_MAX_DEPTH: usize = 32;
 const MAX_PATH_BYTES: usize = 512;
 const MAX_COLUMN_NAME: usize = 256;
+const MAX_PLAN_FIELDS: usize = 64;
+const MAX_PLAN_NODES: usize = 256;
+const MAX_DESCRIPTOR_NAME: usize = 256;
+const MAX_QUALIFIED_NAME: usize = 1024;
 const TIMESTAMP: &str = "google.protobuf.Timestamp";
 /// 0001-01-01T00:00:00Z and 9999-12-31T23:59:59Z, the `Timestamp` range.
 const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
@@ -120,6 +124,15 @@ impl ProtobufOptions {
     /// set and the message type. Decode-only options on a sink are refused.
     /// The schema mapping is checked by [`ProtobufFormat::check_schema`].
     pub fn compile(&self, role: FormatRole) -> Result<ProtobufFormat> {
+        if self.message.is_empty()
+            || self.message.len() > MAX_QUALIFIED_NAME
+            || self.fields.len() > MAX_PLAN_FIELDS
+        {
+            return Err(err(
+                ErrorCode::BoundExceeded,
+                "protobuf message name or mapping count exceeds its bound",
+            ));
+        }
         if role == FormatRole::Encode {
             let decode_only = [
                 (
@@ -230,6 +243,7 @@ fn build_pool(descriptor: &[u8]) -> Result<DescriptorPool> {
     };
     let set = prost_reflect::prost_types::FileDescriptorSet::decode(descriptor)
         .map_err(|e| invalid(e.to_string()))?;
+    check_descriptor_complexity(&set)?;
     for file in &set.file {
         match file.syntax.as_deref() {
             None | Some("proto2") | Some("proto3") => {}
@@ -244,11 +258,146 @@ fn build_pool(descriptor: &[u8]) -> Result<DescriptorPool> {
             }
         }
     }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let pool = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         DescriptorPool::from_file_descriptor_set(set)
     }))
     .map_err(|_| invalid("descriptor linking failed".into()))?
-    .map_err(|e| invalid(e.to_string()))
+    .map_err(|e| invalid(e.to_string()))?;
+    // The Timestamp fast path relies on the canonical WKT shape, not on
+    // an untrusted descriptor merely claiming the well-known name.
+    if let Some(m) = pool.get_message_by_name(TIMESTAMP) {
+        let canonical = m.parent_file().syntax() == Syntax::Proto3
+            && m.fields().len() == 2
+            && [(1, "seconds", Kind::Int64), (2, "nanos", Kind::Int32)]
+                .iter()
+                .all(|(n, name, kind)| {
+                    m.get_field(*n).is_some_and(|f| {
+                        f.name() == *name
+                            && f.kind() == *kind
+                            && f.cardinality() == Cardinality::Optional
+                            && !f.supports_presence()
+                            && f.containing_oneof().is_none()
+                            && !f.is_group()
+                    })
+                });
+        if !canonical {
+            return Err(invalid(
+                "google.protobuf.Timestamp must have its canonical proto3 seconds/nanos shape"
+                    .into(),
+            ));
+        }
+    }
+    Ok(pool)
+}
+
+/// Bound descriptor expansion BEFORE prost-reflect constructs qualified
+/// names and lookup tables. A small wire descriptor can otherwise expand
+/// a huge package prefix once per symbol. Configuration metadata is bounded
+/// separately from per-record scratch.
+fn check_descriptor_complexity(set: &prost_reflect::prost_types::FileDescriptorSet) -> Result<()> {
+    use prost_reflect::prost_types::{DescriptorProto, EnumDescriptorProto, FieldDescriptorProto};
+    struct Budget {
+        symbols: usize,
+        names: usize,
+    }
+    impl Budget {
+        fn name(&mut self, name: &str, prefix: usize) -> Result<usize> {
+            let qualified = prefix.saturating_add(name.len()).saturating_add(1);
+            self.symbols = self.symbols.saturating_add(1);
+            self.names = self.names.saturating_add(qualified);
+            if name.len() > MAX_DESCRIPTOR_NAME
+                || qualified > MAX_QUALIFIED_NAME
+                || self.symbols > 2048
+                || self.names > 512 * 1024
+            {
+                return Err(err(
+                    ErrorCode::BoundExceeded,
+                    "protobuf descriptor symbol/name expansion exceeds its bound",
+                ));
+            }
+            Ok(qualified)
+        }
+        fn field(&mut self, f: &FieldDescriptorProto, prefix: usize) -> Result<()> {
+            self.name(f.name(), prefix)?;
+            if f.type_name().len() > MAX_QUALIFIED_NAME
+                || f.extendee().len() > MAX_QUALIFIED_NAME
+                || f.json_name().len() > MAX_DESCRIPTOR_NAME
+            {
+                return Err(err(
+                    ErrorCode::BoundExceeded,
+                    "protobuf descriptor field name exceeds its bound",
+                ));
+            }
+            Ok(())
+        }
+        fn enumeration(&mut self, e: &EnumDescriptorProto, prefix: usize) -> Result<()> {
+            let scope = self.name(e.name(), prefix)?;
+            for v in &e.value {
+                self.name(v.name(), scope)?;
+            }
+            Ok(())
+        }
+        fn message(&mut self, m: &DescriptorProto, prefix: usize, depth: usize) -> Result<()> {
+            if depth > 32 {
+                return Err(err(
+                    ErrorCode::BoundExceeded,
+                    "protobuf descriptor nesting exceeds 32",
+                ));
+            }
+            let scope = self.name(m.name(), prefix)?;
+            for f in m.field.iter().chain(&m.extension) {
+                self.field(f, scope)?;
+            }
+            for o in &m.oneof_decl {
+                self.name(o.name(), scope)?;
+            }
+            for e in &m.enum_type {
+                self.enumeration(e, scope)?;
+            }
+            for n in &m.nested_type {
+                self.message(n, scope, depth + 1)?;
+            }
+            Ok(())
+        }
+    }
+    if set.file.len() > 32 {
+        return Err(err(
+            ErrorCode::BoundExceeded,
+            "protobuf descriptor contains more than 32 files",
+        ));
+    }
+    let mut budget = Budget {
+        symbols: 0,
+        names: 0,
+    };
+    for f in &set.file {
+        budget.name(f.name(), 0)?;
+        let scope = budget.name(f.package(), 0)?;
+        for m in &f.message_type {
+            budget.message(m, scope, 1)?;
+        }
+        for e in &f.enum_type {
+            budget.enumeration(e, scope)?;
+        }
+        for e in &f.extension {
+            budget.field(e, scope)?;
+        }
+        for s in &f.service {
+            let scope = budget.name(s.name(), scope)?;
+            for m in &s.method {
+                budget.name(m.name(), scope)?;
+                if m.input_type().len() > MAX_QUALIFIED_NAME
+                    || m.output_type().len() > MAX_QUALIFIED_NAME
+                {
+                    return Err(err(
+                        ErrorCode::BoundExceeded,
+                        "protobuf method type name exceeds its bound",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_path(path: &str) -> Result<()> {
@@ -458,13 +607,9 @@ struct Node {
     parent: Option<usize>,
     /// Mapped fields of this message, sorted by field number.
     slots: Vec<(u32, Slot)>,
-    /// Field number -> mapped members of its oneof to clear when it is set.
-    clears: Vec<(u32, Vec<Slot>)>,
-    /// Mapped oneof groups (for the encoder's one-member check).
-    oneofs: Vec<(String, Vec<Slot>)>,
-    /// Leaves and nodes below this node, itself included.
-    sub_leaves: Vec<usize>,
-    sub_nodes: Vec<usize>,
+    /// One list per mapped oneof, NOT one duplicated list per descriptor
+    /// member (which expands quadratically for wide oneofs).
+    oneofs: Vec<(String, Vec<(u32, Slot)>)>,
 }
 
 impl Node {
@@ -473,10 +618,7 @@ impl Node {
             desc,
             parent,
             slots: Vec::new(),
-            clears: Vec::new(),
             oneofs: Vec::new(),
-            sub_leaves: Vec::new(),
-            sub_nodes: Vec::new(),
         }
     }
 }
@@ -503,21 +645,6 @@ impl Plan {
             .binary_search_by_key(&number, |(n, _)| *n)
             .ok()
             .map(|i| slots[i].1)
-    }
-
-    fn clears(&self, node: usize, number: u32) -> Option<&[Slot]> {
-        let clears = &self.nodes[node].clears;
-        clears
-            .binary_search_by_key(&number, |(n, _)| *n)
-            .ok()
-            .map(|i| clears[i].1.as_slice())
-    }
-
-    /// Upper bound for the bytes of a plan built for `fields` columns, which
-    /// the scratch estimates include because a plan may be (re)built inside
-    /// a decode or encode call.
-    fn estimate(fields: usize) -> usize {
-        fields.saturating_mul(1024)
     }
 }
 
@@ -552,6 +679,14 @@ impl ProtobufFormat {
     }
 
     fn build_plan(&self, schema: &Schema) -> Result<Plan> {
+        if schema.fields.len() > MAX_PLAN_FIELDS
+            || schema.fields.iter().any(|f| f.name.len() > MAX_COLUMN_NAME)
+        {
+            return Err(err(
+                ErrorCode::BoundExceeded,
+                "protobuf maps at most 64 fields with names <=256 bytes",
+            ));
+        }
         let invalid = |message: String| err(ErrorCode::InvalidSchema, message);
         for column in self.options.fields.keys() {
             if !schema.fields.iter().any(|f| &f.name == column) {
@@ -567,6 +702,11 @@ impl ProtobufFormat {
         let mut nodes = vec![Node::new(self.message.clone(), None)];
         let mut leaves = Vec::with_capacity(schema.fields.len());
         for (index, field) in schema.fields.iter().enumerate() {
+            if field.name.contains('.') && !self.options.fields.contains_key(&field.name) {
+                return Err(invalid(
+                    "a dotted schema column requires an explicit protobuf.fields path".into(),
+                ));
+            }
             let path = self
                 .options
                 .fields
@@ -627,6 +767,12 @@ impl ProtobufFormat {
                         )))
                     }
                     None => {
+                        if nodes.len() == MAX_PLAN_NODES {
+                            return Err(err(
+                                ErrorCode::BoundExceeded,
+                                "protobuf mapping exceeds 256 message nodes",
+                            ));
+                        }
                         let j = nodes.len();
                         nodes.push(Node::new(child, Some(node)));
                         nodes[node].slots.push((proto.number(), Slot::Node(j)));
@@ -646,11 +792,13 @@ impl ProtobufFormat {
                     depth += 1;
                     LeafKind::Timestamp
                 }
-                Kind::Message(m) => return Err(invalid(format!(
+                Kind::Message(m) => {
+                    return Err(invalid(format!(
                     "column '{}': `{path}` is message `{}`; map its scalar fields by path instead",
                     field.name,
                     m.full_name()
-                ))),
+                )))
+                }
                 Kind::Enum(e) => LeafKind::Enum {
                     closed: e.parent_file().syntax() == Syntax::Proto2,
                     desc: e,
@@ -693,25 +841,8 @@ impl ProtobufFormat {
         for node in &mut nodes {
             node.slots.sort_by_key(|(n, _)| *n);
         }
-        // Subtrees (a child always has a larger index than its parent).
-        for j in (0..nodes.len()).rev() {
-            let mut sub_leaves: Vec<usize> = leaves
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.node == j)
-                .map(|(i, _)| i)
-                .collect();
-            let mut sub_nodes = vec![j];
-            for child in nodes[j + 1..].iter().filter(|n| n.parent == Some(j)) {
-                sub_leaves.extend(child.sub_leaves.iter().copied());
-                sub_nodes.extend(child.sub_nodes.iter().copied());
-            }
-            nodes[j].sub_leaves = sub_leaves;
-            nodes[j].sub_nodes = sub_nodes;
-        }
         // Oneofs: setting any member clears the mapped other members.
         for node in &mut nodes {
-            let mut clears = Vec::new();
             let mut groups = Vec::new();
             for oneof in node.desc.oneofs() {
                 let mapped: Vec<(u32, Slot)> = oneof
@@ -721,23 +852,8 @@ impl ProtobufFormat {
                 if mapped.is_empty() {
                     continue;
                 }
-                for member in oneof.fields() {
-                    let others: Vec<Slot> = mapped
-                        .iter()
-                        .filter(|(n, _)| *n != member.number())
-                        .map(|(_, s)| *s)
-                        .collect();
-                    if !others.is_empty() {
-                        clears.push((member.number(), others));
-                    }
-                }
-                groups.push((
-                    oneof.full_name().to_string(),
-                    mapped.into_iter().map(|(_, s)| s).collect(),
-                ));
+                groups.push((oneof.full_name().to_string(), mapped));
             }
-            clears.sort_by_key(|(n, _)| *n);
-            node.clears = clears;
             node.oneofs = groups;
         }
         if self.role == FormatRole::Encode {
@@ -751,12 +867,16 @@ impl ProtobufFormat {
 /// written whenever that message is: a mapped non-nullable leaf, or a mapped
 /// message with at least one non-nullable leaf below it.
 fn check_required(nodes: &[Node], schema: &Schema) -> Result<()> {
+    let mut nonnull = vec![false; nodes.len()];
+    for j in (0..nodes.len()).rev() {
+        nonnull[j] = nodes[j].slots.iter().any(|(_, slot)| match *slot {
+            Slot::Leaf(i) => !schema.fields[i].nullable,
+            Slot::Node(k) => nonnull[k],
+        });
+    }
     let always = |slot: Slot| match slot {
         Slot::Leaf(i) => !schema.fields[i].nullable,
-        Slot::Node(j) => nodes[j]
-            .sub_leaves
-            .iter()
-            .any(|&i| !schema.fields[i].nullable),
+        Slot::Node(j) => nonnull[j],
     };
     for node in nodes {
         for field in node.desc.fields().filter(|f| f.is_required()) {
@@ -975,9 +1095,18 @@ impl<'a> Walker<'_, 'a> {
                 continue;
             };
             // Setting a oneof member clears the mapped other members.
-            if let Some(slots) = node.and_then(|n| plan.clears(n, number)) {
-                for &slot in slots {
-                    self.clear(slot);
+            if let Some(oneof) = desc.get_field(number).and_then(|f| f.containing_oneof()) {
+                if let Some((_, members)) = node.and_then(|n| {
+                    plan.nodes[n]
+                        .oneofs
+                        .iter()
+                        .find(|(name, _)| name == oneof.full_name())
+                }) {
+                    for &(other, slot) in members {
+                        if other != number {
+                            self.clear(slot);
+                        }
+                    }
                 }
             }
             let slot = node.and_then(|n| plan.slot(n, number));
@@ -989,12 +1118,12 @@ impl<'a> Walker<'_, 'a> {
         match slot {
             Slot::Leaf(i) => self.leaves[i] = None,
             Slot::Node(j) => {
-                let node = &self.plan.nodes[j];
-                for &i in &node.sub_leaves {
-                    self.leaves[i] = None;
-                }
-                for &k in &node.sub_nodes {
-                    self.present[k] = false;
+                self.present[j] = false;
+                // Mapping depth is bounded to 100. Traverse the tree rather
+                // than retaining a copy of every subtree at every ancestor.
+                let plan = self.plan;
+                for &(_, child) in &plan.nodes[j].slots {
+                    self.clear(child);
                 }
             }
         }
@@ -1057,7 +1186,8 @@ impl<'a> Walker<'_, 'a> {
             };
             if width == 0 {
                 while inner < inner_end {
-                    self.varint(&mut inner, inner_end)?;
+                    let value = self.varint(&mut inner, inner_end)?;
+                    check_closed_enum(&info.kind, value)?;
                 }
             } else if (inner_end - inner) % width != 0 {
                 return Err(malformed(
@@ -1070,6 +1200,9 @@ impl<'a> Walker<'_, 'a> {
             return Err(Self::mismatch(desc, number, wire));
         }
         let raw = self.value(pos, end, wire)?;
+        if let Raw::Varint(value) = raw {
+            check_closed_enum(&info.kind, value)?;
+        }
         if let (Kind::String, Raw::Len(text)) = (&info.kind, raw) {
             if std::str::from_utf8(text).is_err() {
                 return Err(malformed(format!(
@@ -1229,6 +1362,22 @@ fn default_raw(kind: &LeafKind) -> Raw<'static> {
 }
 
 impl ProtobufFormat {
+    /// Cold plan construction, cached schema clone, enum-name expansion
+    /// and per-node traversal arrays. Count path nodes, not just columns:
+    /// one mapped leaf can sit below 99 recursive messages. No allocation
+    /// or cache mutation is allowed while asking for admission credit.
+    fn plan_scratch(&self, fields: usize) -> usize {
+        let nodes = self
+            .options
+            .fields
+            .values()
+            .fold(1usize, |n, path| {
+                n.saturating_add(path.bytes().filter(|b| *b == b'.').count())
+            })
+            .min(MAX_PLAN_NODES);
+        fields.saturating_add(nodes).saturating_mul(4096)
+    }
+
     /// One message -> one row. Rejects by length before any allocation.
     pub fn decode_message(
         &self,
@@ -1299,7 +1448,7 @@ impl ProtobufFormat {
             + std::mem::size_of::<bool>()
             + 32;
         len.saturating_add(fields.saturating_mul(per_field))
-            .saturating_add(Plan::estimate(fields))
+            .saturating_add(self.plan_scratch(fields))
             .saturating_add(4096)
     }
 
@@ -1313,7 +1462,7 @@ impl ProtobufFormat {
             + 2 * std::mem::size_of::<bool>();
         fields
             .saturating_mul(per_field)
-            .saturating_add(Plan::estimate(fields))
+            .saturating_add(self.plan_scratch(fields))
             .saturating_add(4096)
     }
 
@@ -1381,6 +1530,18 @@ impl<'a> ProtobufDocument<'a> {
         self.pos = start + len;
         Some(Ok(&self.bytes[start..start + len]))
     }
+}
+
+fn check_closed_enum(kind: &Kind, value: u64) -> Result<()> {
+    if let Kind::Enum(e) = kind {
+        if e.parent_file().syntax() == Syntax::Proto2 && e.get_value(value as i32).is_none() {
+            return Err(err(
+                ErrorCode::TypeMismatch,
+                "protobuf closed enum contains an unknown value",
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1609,11 +1770,13 @@ impl ProtobufFormat {
             }
             values.push(enc);
         }
-        let mut emitted: Vec<bool> = plan
-            .nodes
-            .iter()
-            .map(|node| node.sub_leaves.iter().any(|&i| values[i].is_some()))
-            .collect();
+        let mut emitted = vec![false; plan.nodes.len()];
+        for j in (0..plan.nodes.len()).rev() {
+            emitted[j] = plan.nodes[j].slots.iter().any(|(_, slot)| match *slot {
+                Slot::Leaf(i) => values[i].is_some(),
+                Slot::Node(k) => emitted[k],
+            });
+        }
         emitted[0] = true;
         let set = |slot: Slot| match slot {
             Slot::Leaf(i) => values[i].is_some(),
@@ -1621,7 +1784,7 @@ impl ProtobufFormat {
         };
         for node in &plan.nodes {
             for (name, members) in &node.oneofs {
-                if members.iter().filter(|&&s| set(s)).count() > 1 {
+                if members.iter().filter(|&&(_, s)| set(s)).count() > 1 {
                     return Err(err(
                         ErrorCode::TypeMismatch,
                         format!("more than one member of oneof `{name}` is non-null"),
@@ -1696,6 +1859,12 @@ impl ProtobufFormat {
                 format!("protobuf buffer allocation: {e}"),
             )
         })?;
+        if out.capacity() > total {
+            return Err(err(
+                ErrorCode::BoundExceeded,
+                "protobuf allocator exceeded the admitted output capacity",
+            ));
+        }
         Ok(out)
     }
 

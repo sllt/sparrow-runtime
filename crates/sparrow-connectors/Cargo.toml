@@ -17,6 +17,9 @@ websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 # Kafka consumer-group Source / producer Sink via librdkafka (rdkafka-sys
 # builds librdkafka from source: needs a C/C++ toolchain, make and perl).
 kafka = ["dep:rdkafka", "dep:futures-util", "dep:ring"]
+# PostgreSQL query Source, INSERT/UPSERT Sink and Lookup provider
+# (tokio-postgres over the crate's rustls; no libpq, no CDC).
+postgres = ["dep:tokio-postgres", "dep:bytes", "dep:futures-util", "dep:serde"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }
@@ -36,8 +39,11 @@ async-nats = { version = "=0.50.0", optional = true, default-features = false, f
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["std", "async-await"] }
 ring = { version = "0.17", optional = true }
 bytes = { version = "1", optional = true }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tokio-tungstenite = { version = "=0.30.0", optional = true, default-features = false, features = ["handshake"] }
 rdkafka = { version = "=0.39.0", optional = true, default-features = false, features = ["tokio", "libz-static"] }
+tokio-postgres = { version = "=0.7.18", optional = true, default-features = false }
+serde = { version = "1", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
