@@ -17,7 +17,7 @@ pub const MAX_LINE: usize = 4096;
 
 /// Byte length of `$<len>\r\n<bytes>\r\n` for a bulk argument of `len`.
 pub fn bulk_len(len: usize) -> usize {
-    1 + digits(len as u64) + 2 + len + 2
+    len.saturating_add(digits(len as u64)).saturating_add(5)
 }
 
 /// Byte length of the `*<n>\r\n` array header.
@@ -65,8 +65,9 @@ pub fn push_bulk_header(out: &mut Vec<u8>, len: usize) {
 
 /// A whole command of plain arguments (handshake / lookup requests).
 pub fn command_len(args: &[&[u8]]) -> usize {
-    args.iter()
-        .fold(array_header_len(args.len()), |n, a| n + bulk_len(a.len()))
+    args.iter().fold(array_header_len(args.len()), |n, a| {
+        n.saturating_add(bulk_len(a.len()))
+    })
 }
 
 pub fn push_command(out: &mut Vec<u8>, args: &[&[u8]]) {
@@ -182,9 +183,9 @@ impl Reader {
         let Some(&kind) = data.first() else {
             return Ok(None);
         };
-        let window = &data[1..data.len().min(MAX_LINE + 2)];
+        let window = &data[1..data.len().min(MAX_LINE + 3)];
         let Some(eol) = window.windows(2).position(|w| w == b"\r\n") else {
-            if data.len() > MAX_LINE + 2 {
+            if data.len() >= MAX_LINE + 3 {
                 return Err(ReadError::Protocol("Redis reply line exceeds 4096 bytes"));
             }
             return Ok(None);

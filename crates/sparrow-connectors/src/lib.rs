@@ -16,18 +16,21 @@ pub mod http;
 pub mod http_lookup;
 pub mod http_poll;
 pub mod http_push;
+pub mod influxdb;
 #[cfg(feature = "jetstream")]
 pub mod jetstream;
 pub mod log;
 pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
+pub(crate) mod net;
 pub mod policy;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod redis;
 pub(crate) mod scratch;
 pub mod secret;
+pub mod tcp;
 pub mod tls;
 #[cfg(feature = "websocket")]
 pub mod websocket;
@@ -48,6 +51,7 @@ pub use http_poll::{
     HttpPollAuth, HttpPollFormat, HttpPollHeader, HttpPollSource, HttpPollSourceConfig,
 };
 pub use http_push::{HttpPushSource, HttpPushSourceConfig};
+pub use influxdb::{InfluxDbSink, InfluxDbSinkConfig};
 pub use log::{LogSink, LogSinkConfig};
 #[cfg(feature = "demo-io")]
 pub use mqtt::{publish_qos0, publish_qos0_many, EmbeddedBroker, MqttPublisher};
@@ -62,6 +66,7 @@ pub use policy::{
 pub use postgres::{PgLookup, PgLookupConfig, PgSink, PgSinkConfig, PgSource, PgSourceConfig};
 pub use redis::{RedisLookup, RedisLookupConfig, RedisSink, RedisSinkConfig};
 pub use secret::{MapSecretResolver, SecretResolver};
+pub use tcp::{TcpSink, TcpSinkConfig, TcpSource, TcpSourceConfig};
 pub use tls::TlsConfig;
 #[cfg(feature = "websocket")]
 pub use websocket::{WebSocketSink, WebSocketSinkConfig, WebSocketSource, WebSocketSourceConfig};

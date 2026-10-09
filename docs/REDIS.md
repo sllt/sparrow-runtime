@@ -69,7 +69,7 @@ Redis 以两种方式接入：
 
 | `command` | 每行发送 | 必填 / 可选 | 失败后重发 |
 |---|---|---|---|
-| `set` | `SET key value [PX ttl_ms]` | `key`；`value_column` 或整行 JSON；`ttl_ms` 1..=315360000000 | 幂等，可重发 |
+| `set` | `SET key value [PX ttl_ms]` | `key`；`value_column` 或整行 JSON；`ttl_ms` 1..=315360000000 | 无 TTL 才可重发；PX 重发会重置到期时间 |
 | `hset` | `HSET key col val ...` 或 `HSET key field value` | `key`，加上 `fields`（1..=64 列，NULL 列跳过），或 `field` 模板加 `value_column` / JSON | 幂等，可重发 |
 | `xadd` | `XADD key [MAXLEN =\|~ n] * col val ...` | `key`、`fields`；`maxlen` 1..=10^9；`approximate` 使用 `~` | **不幂等**，不重发 |
 | `publish` | `PUBLISH channel value` | `channel`；`value_column` 或 JSON | **不幂等**，不重发 |
@@ -116,15 +116,17 @@ Redis 以两种方式接入：
   - 输入 schema 与命令不匹配（例如缺少列）
 - **连接失败**：连接建立失败时，因为还没有发送任何命令，所有命令都可以按抖动指数退避重试，最多 `max_retries` 次（≤ 20）。
 - **连接中断或超时**：已经发送后连接断开或超过 `timeout_ms`（100..=300000）时：
-  - `set` / `hset` 在新连接上从第一条未确认的命令开始重发。
-  - `xadd` / `publish` / `lpush` / `rpush` **不会重发**。已发送但没有回复的命令计入 `redis_sink_unknown_outcome`（可能已经执行，也可能没有），这一批失败。
+  - 无 TTL 的 `set` / `hset` 在新连接上从第一条未确认的命令开始重发。
+  - 带 `ttl_ms` 的 `set`、`xadd` / `publish` / `lpush` / `rpush` **不会重发**。已发送但没有回复的命令计入 `redis_sink_unknown_outcome`（可能已经执行，也可能没有），这一批失败。
 - **空闲连接检查**：发送前先检查空闲连接是否已被服务器关闭，若已关闭就重新建连，以减少不必要的 unknown outcome。这个检查不能保证发现所有断开的情况。
 - **停止**：`flush_timeout_ms` 的截止时间同时覆盖在途流水线、重试等待和排队中的批次，不会每批重新计时。剩余的计入 `discarded_on_close`。
 
 ### 内存
 
-- **静态预扣**：`128 KiB 连接 + pipeline_bytes + pipeline_rows × 命令/回执槽 + 1 KiB`。JSON 值再加一份 `pipeline_bytes`。
+- **预算估算**：`128 KiB 连接 + pipeline_bytes + pipeline_rows × (命令/回执槽 + 回执对象) + 当前批次回执 + 1 KiB`。JSON 值再加一份 `pipeline_bytes`，编译命令的工作集另计。
   - 必须 ≤ job reservation 的 1/2，计算使用检查过的算术。
+  - 回执、编译命令和各缓冲均先预扣；命令/回执槽容量不超过 `pipeline_rows`。
+  - 同一 child owner 对连接、映射、回执、流水线和编码 scratch 的实际合计占用施加半预算上限。
 - **每行**：编码前先扣 scratch（JSON 行编码使用共享的 charged encoder）。
   - 额度不足时先 flush 再重试一次，仍然不足就计入 `dropped_budget`。
   - 单行命令超过 `pipeline_bytes` 时计入 `dropped_oversize`。
@@ -205,9 +207,9 @@ Redis 以两种方式接入：
 
 **内存**
 
-- provider 声明的 scratch 为每个 key 256 KiB，包括请求、一次读缓冲（64 KiB + 行）、一次 JSON 解析和返回的行。
+- provider 声明的 scratch 为每个 key 384 KiB，包括请求、一次读缓冲（64 KiB + 行）、一次有界 flat JSON 解析和返回的行；hash 所有字段载荷合计超过 64 KiB 时，在继续复制/解码前拒绝。
 - 算子另外为每个 key 计 64 KiB + 1 KiB。
-- `max_inflight × batch_keys` 个 key 的窗口必须 ≤ job reservation 的 1/2。例如默认 4 MiB 预算下最多约 6 个 key。窗口超出时在构建时就被拒绝。
+- `max_inflight × batch_keys` 个 key 的窗口必须 ≤ job reservation 的 1/2。例如默认 4 MiB 预算下最多约 4 个 key。窗口超出时在构建时就被拒绝。
 - TLS 和 socket 内部缓冲不计入额度（与 HTTP 相同）。
 
 ## 共享 Lookup 选项（HTTP 与 Redis）
@@ -220,3 +222,9 @@ Redis 以两种方式接入：
 `on_error` 新增 `"drop"`：transport 类错误发生时丢弃对应的输入行，计入 `lookup_runtime` 的 `error_drops`。原有的 `"null"` 是把这些行的 Lookup 字段填为 NULL。批量请求失败时，`drop` 和 `null` 作用于这一批中的每一个 key。
 
 错误不会进入缓存。
+
+## 测试与边界回归
+
+- 真实服务用例默认 ignored，缺少服务时不再假通过；配置 `SPARROW_REDIS_SERVER` 并传 `--include-ignored` 才执行。
+- `websocket-contracts` 的 standalone / jetstream profile 分别验证 Redis 6.2.24 / 7.2.16（官方 SHA256 固定、TLS 构建），同一测试二进制重复两轮。
+- 回归覆盖 PX 未知结果不重发、部分未请求回复污染连接、HMGET 累计大小、回执计费、停止期限与 RESP 行长度边界。

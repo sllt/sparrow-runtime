@@ -1,7 +1,7 @@
 //! Opt-in tests against a real `redis-server` (Redis 6.2 / 7.x, RESP2).
 //!
 //! Set `SPARROW_REDIS_SERVER` to the path of a `redis-server` binary built
-//! with TLS (`BUILD_TLS=yes`); every test is a no-op otherwise. Each test
+//! with TLS (`BUILD_TLS=yes`) and run with `--include-ignored`. Each test
 //! starts its own server on free ports with a plain and a TLS listener and
 //! these ACL users: `default` (no password), `app` (all commands) and
 //! `reader` (read commands only), both with password `hunter2`.
@@ -60,10 +60,8 @@ fn free_port() -> u16 {
 
 impl Server {
     fn start() -> Option<Self> {
-        let Some(bin) = std::env::var_os("SPARROW_REDIS_SERVER") else {
-            eprintln!("SPARROW_REDIS_SERVER not set; skipping real Redis test");
-            return None;
-        };
+        let bin = std::env::var_os("SPARROW_REDIS_SERVER")
+            .expect("SPARROW_REDIS_SERVER must name the pinned TLS-enabled test service");
         let dir = std::env::temp_dir().join(format!(
             "sparrow-redis-{}-{}",
             std::process::id(),
@@ -259,6 +257,7 @@ fn rows(n: usize) -> Vec<Row> {
 // --------------------------------------------------------- sink tests --
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_REDIS_SERVER (isolated TLS-enabled Redis)"]
 async fn real_sink_commands_write_what_they_claim() {
     let Some(server) = Server::start() else {
         return;
@@ -382,6 +381,7 @@ async fn real_sink_commands_write_what_they_claim() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_REDIS_SERVER (isolated TLS-enabled Redis)"]
 async fn real_sink_wrongtype_fails_only_its_batch() {
     let Some(server) = Server::start() else {
         return;
@@ -410,6 +410,7 @@ async fn real_sink_wrongtype_fails_only_its_batch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_REDIS_SERVER (isolated TLS-enabled Redis)"]
 async fn real_sink_tls_acl_auth_and_rejections() {
     let Some(server) = Server::start() else {
         return;
@@ -483,6 +484,7 @@ async fn real_sink_tls_acl_auth_and_rejections() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_REDIS_SERVER (isolated TLS-enabled Redis)"]
 async fn real_sink_reconnects_after_the_server_drops_it() {
     let Some(server) = Server::start() else {
         return;
@@ -624,6 +626,7 @@ fn limits(batch: &RowBatch) -> Vec<(Scalar, Scalar)> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_REDIS_SERVER (isolated TLS-enabled Redis)"]
 async fn real_lookup_hits_misses_batches_and_ttl() {
     let Some(server) = Server::start() else {
         return;
@@ -638,7 +641,7 @@ async fn real_lookup_hits_misses_batches_and_ttl() {
             &format!("L{d}"),
         ]);
     }
-    // 8 keys in flight need (256 + 65) KiB each: more than half of the
+    // 8 keys in flight need (384 + 65) KiB each: more than half of the
     // compact 4 MiB reservation, so use the performance budget.
     let owner = MemoryOwner::new(ResourceBudget::performance());
     let mut op = operator(
@@ -714,6 +717,7 @@ async fn real_lookup_hits_misses_batches_and_ttl() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_REDIS_SERVER (isolated TLS-enabled Redis)"]
 async fn real_lookup_cache_is_bounded_by_bytes() {
     let Some(server) = Server::start() else {
         return;
@@ -765,6 +769,7 @@ async fn real_lookup_cache_is_bounded_by_bytes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_REDIS_SERVER (isolated TLS-enabled Redis)"]
 async fn real_lookup_timeout_policy_and_reconnect() {
     let Some(server) = Server::start() else {
         return;
@@ -845,6 +850,7 @@ async fn real_lookup_timeout_policy_and_reconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SPARROW_REDIS_SERVER (isolated TLS-enabled Redis)"]
 async fn real_lookup_json_over_tls_with_acl_user() {
     let Some(server) = Server::start() else {
         return;

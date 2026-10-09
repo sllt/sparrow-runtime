@@ -262,6 +262,21 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | 关闭 | 订阅 / 发布注册为 RAII，job 结束即注销，topic 不泄漏；未消费缓冲计 `discarded_on_close`；Sink 停止时在途与已排队批次共用一个 `flush_timeout_ms` 截止时间（不受 `block_timeout_ms` 延长） |
 | 指标 | `databus_source_*` / `databus_sink_*`，pipeline status 中的 `databus_source` / `databus_sink` 对象 |
 
+## 附：InfluxDB Sink（`sink.kind: "influxdb"`）
+
+说明见 [INFLUXDB.md](INFLUXDB.md)。无需 feature。
+
+| 合同项 | InfluxDB Sink 的实现 |
+|---|---|
+| 语义 | capability `influxdb_sink`：`live_best_effort` / `restart_fresh` / replay `unsupported`；批次在所有相关请求得到 2xx 后才回执；拒绝 restore、checkpoint、aligned（含 graph Sink） |
+| 内存 | 请求缓冲每次增长前先扣 job reservation，持有到请求结束（含重试）；gzip 先扣 scratch 与输出上界；峰值 ≤ reservation/2，检查过的算术 |
+| 背压 | 串行请求，缓冲受 `batch_rows` / `batch_bytes` / `flush_interval_ms` 约束；outbox 有界 |
+| 密钥与 TLS | 仅 `https://`；token 来自 secret 引用；可选 `ca_pem` 替换根证书，校验始终开启；不跟随重定向、不走代理 |
+| 白名单 | 写入 URL 走 `TargetPolicy::check_http_url` |
+| 重试 | 429 / 503 / 传输错误，抖动指数退避封顶，`Retry-After`（秒）封顶；无时间列时只重试连接建立失败 |
+| 失败 | 400 / 413 / 422 / 其他状态不重试；401 / 403 / 404 使 job 失败（`influxdb_sink_fatal`） |
+| 关闭 | `flush_timeout_ms` 截止时间覆盖在途请求、重试等待、排队批次 |
+| 指标 | `influxdb_sink_*`，pipeline status 的 `influxdb_sink` 对象 |
 ## 附：WebSocket Source / Sink（`kind: "websocket"`，feature `websocket`）
 
 说明见 [WEBSOCKET.md](WEBSOCKET.md)。只做客户端模式（`ws://` / `wss://`）；不提供 listen 模式。
@@ -315,6 +330,24 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | 关闭 | 放弃的语句（超时、停止，含连接后的 prepare）发送 cancel request 并关闭连接；Sink 的 `flush_timeout_ms` 截止时间覆盖在途事务、重试与排队批次 |
 | 指标 | `postgres_source_*` / `postgres_sink_*`，pipeline status 的 `postgres_source`（含 `tracking_value`）/ `postgres_sink` 对象 |
 
+## 附：TCP Source / Sink（`kind: "tcp"`，始终构建）
+
+说明见 [TCP.md](TCP.md)。只做客户端模式（`host:port`，可选 TLS）；listen 模式单独立项。
+
+| 合同项 | TCP 的实现 |
+|---|---|
+| 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`，at-most-once、无应用层确认；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
+| 分帧 | `lines`（`\n`，接受 `\r\n`，空行跳过；JSON 额外跳过纯空白行，CSV 保留空白字段）或 `length_prefixed`（大端 2/4 字节长度）；Sink 自己添加换行 / 前缀 |
+| 内存 | 每连接 64 KiB + 固定读缓冲（`max_frame_bytes` + 16 KiB）+ 一帧，Sink 加 `(queue_capacity + 1) × 帧`（CSV over lines 再加表头槽位），饱和运算；解码 / 编码工作集在解析 / 编码前按条记账，额度不足计 `dropped_budget`；在 bind 时记入 job reservation（单个 ≤ 1/2，与 NATS/JetStream/DataBus/WebSocket 合计 ≤ 3/4）；Source inbox 按 `inbox_bytes` 计入 queue 账本 |
+| 大小上限 | `max_frame_bytes`（16..=65536；`length_bytes: 2` 时默认 65535，显式更大值拒绝而非截断）在解码前检查；Sink 编码在上限处截停；长度前缀在分配前拒绝；超长按 `oversize: resync`（跳过）或 `disconnect`（重连）处理，计 `dropped_oversize`；断线时的残缺记录计 `dropped_partial`，不解码 |
+| 背压 | Source inbox 满时停止读 socket（TCP 背压）；Sink 有界发送队列，`block` / `drop_newest`；一帧写入（含部分写）超过 `send_timeout_ms` 即断开重连 |
+| 空闲 / 重连 | `idle_timeout_ms` 无字节即重连（inbox 阻塞不计）；可选 TCP keepalive；指数退避（100 ms → `reconnect_max_ms`，抖动取 [d/2, d]），每次断线 ≤ `reconnect_attempts`（拒绝 0）；耗尽后 Source 可重试失败，Sink fail closed（`tcp_sink_fatal`） |
+| TLS | 可选 `tls: true`，rustls 强制校验，`tls_ca_pem` 替换信任根；错误中不出现主机、端口、证书 |
+| 白名单 | host:port 经 `TargetPolicy`（端口必填），与 HTTP 相同 |
+| 格式 | JSON；CSV 在 `lines` 上每个连接是一份文档（表头每连接一次，拒绝 multiline），在 `length_prefixed` 上一帧 = （表头 +）一条记录 |
+| 关闭 | Sink 在 `flush_timeout_ms` 内写完 outbox 与队列并关闭写方向，剩余计 `discarded_on_close` |
+| 指标 | `tcp_source_*` / `tcp_sink_*`，pipeline status 中的 `tcp_source` / `tcp_sink` 对象 |
+
 ## 附：负载格式矩阵（`source.format` / `sink.format`）
 
 详见 [FORMATS.md](FORMATS.md)。默认是 `json`，未写 `format` 的 spec 行为不变。不支持的组合在校验阶段拒绝。
@@ -327,6 +360,8 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | `http_poll` | ✓ | ✓ | — | 一个响应 = 一份文档；`http_poll.format` 必须为空 |
 | `file` / `file_replay` / `replay` | ✓ | ✓ | ✓（`file`） | 文件或段文件 = 一份文档；表头在恢复时重建；段文件为 `part-N.csv`；checkpoint 身份绑定格式与 CSV 选项，Sink 目录标记绑定编码选项 |
 | `websocket` | ✓ | ✓ | ✓ | 一条文本帧 = （表头 +）一条记录；CSV 拒绝 `ndjson` 分帧和二进制帧 |
+| `tcp`（`lines`） | ✓ | ✓ | ✓ | 一个连接 = 一份文档：表头每连接一次，之后一行一条记录；拒绝 `multiline` |
+| `tcp`（`length_prefixed`） | ✓ | ✓ | ✓ | 一帧 = （表头 +）一条记录 |
 | `databus` | ✓（内部） | ✗ | ✗ | 进程内传递行 |
 | `log` / plugin | ✓ | — | ✗ | — |
 

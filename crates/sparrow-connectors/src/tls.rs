@@ -50,6 +50,56 @@ pub fn http_client(timeout: std::time::Duration, connect_timeout: std::time::Dur
         .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("http client: {e}")))
 }
 
+/// Largest accepted `ca_pem` bundle.
+pub const MAX_CA_PEM_BYTES: usize = 64 * 1024;
+
+/// HTTPS-only client for credentialed targets: certificate verification is
+/// always on, redirects/proxies/retries are off. `ca_pem` (one or more PEM
+/// certificates) replaces the built-in webpki roots.
+pub fn https_client(
+    timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
+    ca_pem: Option<&str>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .retry(reqwest::retry::never())
+        .https_only(true);
+    match ca_pem {
+        None => builder = builder.tls_built_in_root_certs(true),
+        Some(pem) => {
+            if pem.len() > MAX_CA_PEM_BYTES {
+                return Err(ConnectorError::new(
+                    ErrorCode::BoundExceeded,
+                    "ca_pem exceeds 65536 bytes",
+                ));
+            }
+            let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes()).map_err(|_| {
+                ConnectorError::new(
+                    ErrorCode::InvalidArgument,
+                    "ca_pem is not a PEM certificate bundle",
+                )
+            })?;
+            if certs.is_empty() {
+                return Err(ConnectorError::new(
+                    ErrorCode::InvalidArgument,
+                    "ca_pem contains no certificate",
+                ));
+            }
+            builder = builder.tls_built_in_root_certs(false);
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+    }
+    builder
+        .build()
+        .map_err(|e| ConnectorError::new(ErrorCode::Internal, format!("https client: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

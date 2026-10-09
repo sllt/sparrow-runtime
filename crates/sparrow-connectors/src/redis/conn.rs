@@ -286,9 +286,12 @@ impl Connection {
             return false;
         }
         // Pending means nothing arrived; the read is cancel-safe.
-        tokio::time::timeout(Duration::ZERO, reader.next(&mut self.io))
+        let pending = tokio::time::timeout(Duration::ZERO, reader.next(&mut self.io))
             .await
-            .is_err()
+            .is_err();
+        // An incomplete unsolicited frame is not an idle connection either.
+        // Otherwise its prefix can be mistaken for the next command's reply.
+        pending && !reader.has_buffered()
     }
 }
 

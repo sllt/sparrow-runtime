@@ -4,7 +4,7 @@
 //! charge the parser/encoder working set to the job reservation, then decode
 //! or encode. The estimates are the ones the NATS and HTTP Poll paths use.
 
-use sparrow_formats::PayloadFormat;
+use sparrow_formats::{CsvFormat, PayloadFormat};
 use sparrow_model::{CreditKind, ErrorCode, MemoryLease, MemoryOwner, Row, Schema, SparrowError};
 use std::sync::Arc;
 
@@ -51,6 +51,27 @@ pub(crate) fn encode_row_charged(
         .acquire(CreditKind::Reservation, scratch)
         .map_err(|_| EncodeRejected::Budget)?;
     match format.encode_row_bounded_with_capacity(schema, row, limit, |capacity| {
+        lease.grow_to(scratch.saturating_add(capacity))
+    }) {
+        Ok(body) => Ok((body, lease)),
+        Err(e) => Err(classify(&e)),
+    }
+}
+
+/// One CSV record line (never a header) of at most `limit` bytes, with the
+/// record encoder scratch charged first and every output growth after it.
+pub(crate) fn encode_csv_record_charged(
+    owner: &Arc<MemoryOwner>,
+    csv: &CsvFormat,
+    schema: &Schema,
+    row: &Row,
+    limit: usize,
+) -> std::result::Result<(Vec<u8>, MemoryLease), EncodeRejected> {
+    let scratch = csv.encode_scratch(row);
+    let mut lease = owner
+        .acquire(CreditKind::Reservation, scratch)
+        .map_err(|_| EncodeRejected::Budget)?;
+    match csv.encode_record_bounded(schema, row, limit, |capacity| {
         lease.grow_to(scratch.saturating_add(capacity))
     }) {
         Ok(body) => Ok((body, lease)),
