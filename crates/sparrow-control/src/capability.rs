@@ -14,7 +14,7 @@ pub fn inventory() -> Value {
         &[]
     };
     // The in-process Local DataBus is always built (no SDK).
-    let sinks: Vec<&str> = ["http", "mqtt", "log", "databus"]
+    let sinks: Vec<&str> = ["http", "mqtt", "log", "databus", "influxdb"]
         .iter()
         .chain(nats)
         .chain(jetstream_sink)
@@ -209,16 +209,16 @@ mod tests {
     #[test]
     fn production_inventory_does_not_claim_unimplemented_backends_or_certification() {
         let value = super::inventory();
-        // 5 live/file sources (mqtt, http_push, http_poll, file, databus) x 4 sinks
-        // (http, mqtt, log, databus), plus NATS Core as both a source and a sink
+        // 5 live/file sources (mqtt, http_push, http_poll, file, databus) x 5 sinks
+        // (http, mqtt, log, databus, influxdb), plus NATS Core as both a source and a sink
         // when the `nats` feature is built, plus the JetStream Sink (live matrix +
         // one aligned File profile) with `jetstream`.
         let expected = if cfg!(feature = "jetstream") {
-            6 * 6 + 1
+            6 * 7 + 1
         } else if cfg!(feature = "nats") {
-            6 * 5
+            6 * 6
         } else {
-            5 * 4
+            5 * 5
         };
         assert_eq!(value["combinations"].as_array().unwrap().len(), expected);
         assert!(value["combinations"]
@@ -229,6 +229,7 @@ mod tests {
                 || c["sink"] == "nats"
                 || c["source"] == "databus"
                 || c["sink"] == "databus"
+                || c["sink"] == "influxdb"
                 || (c["sink"] == "jetstream" && c["source"] != "file"))
             .all(|c| c["delivery"] == "live_best_effort" && c["recovery"] == "restart_fresh"));
         assert!(value["combinations"]

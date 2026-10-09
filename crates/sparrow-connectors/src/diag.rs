@@ -121,6 +121,21 @@ pub struct IoDiagnostics {
     pub databus_sink_discarded_on_close: AtomicU64,
     pub databus_sink_batches: AtomicU64,
     pub databus_sink_fatal: AtomicU64,
+    pub influxdb_sink_rows_written: AtomicU64,
+    pub influxdb_sink_requests_ok: AtomicU64,
+    pub influxdb_sink_bytes_sent: AtomicU64,
+    pub influxdb_sink_gzip_fallbacks: AtomicU64,
+    pub influxdb_sink_retries: AtomicU64,
+    pub influxdb_sink_retry_after_waits: AtomicU64,
+    pub influxdb_sink_retry_after_capped: AtomicU64,
+    pub influxdb_sink_dropped_bad: AtomicU64,
+    pub influxdb_sink_dropped_oversize: AtomicU64,
+    pub influxdb_sink_dropped_budget: AtomicU64,
+    pub influxdb_sink_rejected_requests: AtomicU64,
+    pub influxdb_sink_rejected_rows: AtomicU64,
+    pub influxdb_sink_partial_writes: AtomicU64,
+    pub influxdb_sink_discarded_on_close: AtomicU64,
+    pub influxdb_sink_fatal: AtomicU64,
     pub databus_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub nats_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub log_written: AtomicU64,
@@ -281,6 +296,31 @@ impl IoDiagnostics {
                 .load(Ordering::Relaxed),
             databus_sink_batches: self.databus_sink_batches.load(Ordering::Relaxed),
             databus_sink_fatal: self.databus_sink_fatal.load(Ordering::Relaxed),
+            influxdb_sink_rows_written: self.influxdb_sink_rows_written.load(Ordering::Relaxed),
+            influxdb_sink_requests_ok: self.influxdb_sink_requests_ok.load(Ordering::Relaxed),
+            influxdb_sink_bytes_sent: self.influxdb_sink_bytes_sent.load(Ordering::Relaxed),
+            influxdb_sink_gzip_fallbacks: self.influxdb_sink_gzip_fallbacks.load(Ordering::Relaxed),
+            influxdb_sink_retries: self.influxdb_sink_retries.load(Ordering::Relaxed),
+            influxdb_sink_retry_after_waits: self
+                .influxdb_sink_retry_after_waits
+                .load(Ordering::Relaxed),
+            influxdb_sink_retry_after_capped: self
+                .influxdb_sink_retry_after_capped
+                .load(Ordering::Relaxed),
+            influxdb_sink_dropped_bad: self.influxdb_sink_dropped_bad.load(Ordering::Relaxed),
+            influxdb_sink_dropped_oversize: self
+                .influxdb_sink_dropped_oversize
+                .load(Ordering::Relaxed),
+            influxdb_sink_dropped_budget: self.influxdb_sink_dropped_budget.load(Ordering::Relaxed),
+            influxdb_sink_rejected_requests: self
+                .influxdb_sink_rejected_requests
+                .load(Ordering::Relaxed),
+            influxdb_sink_rejected_rows: self.influxdb_sink_rejected_rows.load(Ordering::Relaxed),
+            influxdb_sink_partial_writes: self.influxdb_sink_partial_writes.load(Ordering::Relaxed),
+            influxdb_sink_discarded_on_close: self
+                .influxdb_sink_discarded_on_close
+                .load(Ordering::Relaxed),
+            influxdb_sink_fatal: self.influxdb_sink_fatal.load(Ordering::Relaxed),
             databus_source_inbox_items: self.databus_source_inbox.items.load(Ordering::Relaxed),
             databus_source_inbox_bytes: self.databus_source_inbox.bytes.load(Ordering::Relaxed),
             nats_source_inbox_items: self.nats_source_inbox.items.load(Ordering::Relaxed),
@@ -410,6 +450,21 @@ pub struct IoSnapshot {
     pub databus_sink_discarded_on_close: u64,
     pub databus_sink_batches: u64,
     pub databus_sink_fatal: u64,
+    pub influxdb_sink_rows_written: u64,
+    pub influxdb_sink_requests_ok: u64,
+    pub influxdb_sink_bytes_sent: u64,
+    pub influxdb_sink_gzip_fallbacks: u64,
+    pub influxdb_sink_retries: u64,
+    pub influxdb_sink_retry_after_waits: u64,
+    pub influxdb_sink_retry_after_capped: u64,
+    pub influxdb_sink_dropped_bad: u64,
+    pub influxdb_sink_dropped_oversize: u64,
+    pub influxdb_sink_dropped_budget: u64,
+    pub influxdb_sink_rejected_requests: u64,
+    pub influxdb_sink_rejected_rows: u64,
+    pub influxdb_sink_partial_writes: u64,
+    pub influxdb_sink_discarded_on_close: u64,
+    pub influxdb_sink_fatal: u64,
     pub databus_source_inbox_items: u64,
     pub databus_source_inbox_bytes: u64,
     pub nats_source_inbox_items: u64,
@@ -560,6 +615,21 @@ impl IoSnapshot {
         self.databus_sink_discarded_on_close += other.databus_sink_discarded_on_close;
         self.databus_sink_batches += other.databus_sink_batches;
         self.databus_sink_fatal += other.databus_sink_fatal;
+        self.influxdb_sink_rows_written += other.influxdb_sink_rows_written;
+        self.influxdb_sink_requests_ok += other.influxdb_sink_requests_ok;
+        self.influxdb_sink_bytes_sent += other.influxdb_sink_bytes_sent;
+        self.influxdb_sink_gzip_fallbacks += other.influxdb_sink_gzip_fallbacks;
+        self.influxdb_sink_retries += other.influxdb_sink_retries;
+        self.influxdb_sink_retry_after_waits += other.influxdb_sink_retry_after_waits;
+        self.influxdb_sink_retry_after_capped += other.influxdb_sink_retry_after_capped;
+        self.influxdb_sink_dropped_bad += other.influxdb_sink_dropped_bad;
+        self.influxdb_sink_dropped_oversize += other.influxdb_sink_dropped_oversize;
+        self.influxdb_sink_dropped_budget += other.influxdb_sink_dropped_budget;
+        self.influxdb_sink_rejected_requests += other.influxdb_sink_rejected_requests;
+        self.influxdb_sink_rejected_rows += other.influxdb_sink_rejected_rows;
+        self.influxdb_sink_partial_writes += other.influxdb_sink_partial_writes;
+        self.influxdb_sink_discarded_on_close += other.influxdb_sink_discarded_on_close;
+        self.influxdb_sink_fatal += other.influxdb_sink_fatal;
         self.databus_source_inbox_items += other.databus_source_inbox_items;
         self.databus_source_inbox_bytes += other.databus_source_inbox_bytes;
         self.nats_source_inbox_items += other.nats_source_inbox_items;

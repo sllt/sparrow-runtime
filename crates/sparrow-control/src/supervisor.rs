@@ -359,6 +359,16 @@ fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
         ));
     }
     if diags.iter().any(|d| {
+        d.influxdb_sink_fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }) {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "InfluxDB Sink stopped the job (401/403/404 from the server, or a schema that does not match the mapping); inspect sink health and influxdb_sink_*; no replay",
+        ));
+    }
+    if diags.iter().any(|d| {
         d.databus_sink_fatal
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
@@ -378,6 +388,7 @@ fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
         "nats" => "nats",
         "jetstream" => "jetstream",
         "databus" => "databus",
+        "influxdb" => "influxdb",
         "file" => "file",
         "plugin" => "plugin",
         _ => "http",
@@ -2202,6 +2213,17 @@ impl Supervisor {
                 let cfg = crate::validate::jetstream_sink_config(&spec.sink)?;
                 cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
                 let sink = sparrow_connectors::jetstream::JetStreamSink::bind(
+                    cfg,
+                    &self.secrets,
+                    policy,
+                    owner,
+                    diag,
+                )?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
+            "influxdb" => {
+                let cfg = crate::validate::influxdb_sink_config(&spec.sink)?;
+                let sink = sparrow_connectors::InfluxDbSink::bind(
                     cfg,
                     &self.secrets,
                     policy,

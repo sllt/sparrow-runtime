@@ -255,6 +255,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
         sink: SinkSpec {
             nats: None,
             databus: None,
+            influxdb: None,
             jetstream: None,
             plugin: None,
             action: None,
@@ -417,6 +418,7 @@ fn mqtt_aligned_still_rejected() {
         sink: SinkSpec {
             nats: None,
             databus: None,
+            influxdb: None,
             jetstream: None,
             plugin: None,
             action: None,

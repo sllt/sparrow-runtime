@@ -333,6 +333,130 @@ impl DataBusSinkSpec {
     }
 }
 
+/// InfluxDB v2 write Sink (`POST <url>/api/v2/write`), live-only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InfluxDbSinkSpec {
+    /// `https://host[:port][/prefix]`.
+    pub url: String,
+    pub org: String,
+    pub bucket: String,
+    /// Secret reference resolving to the API token.
+    pub token_secret: String,
+    /// PEM bundle that replaces the built-in roots (verification stays on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem: Option<String>,
+    /// Fixed measurement name; exclusive with `measurement_column`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<String>,
+    /// `utf8` column holding each row's measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement_column: Option<String>,
+    /// `utf8` columns written as tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Field columns; default: every column that is not the measurement
+    /// column, a tag or the time column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+    /// `timestamp` column; without it InfluxDB stamps points on arrival.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_column: Option<String>,
+    /// `ns|us|ms|s` (default `us`); requires `time_column`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub gzip: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_initial_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_ms: Option<u64>,
+    /// Stop budget shared by the request in flight and queued rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+}
+
+impl InfluxDbSinkSpec {
+    pub fn connector_config(
+        &self,
+        outbox_capacity: usize,
+    ) -> Result<sparrow_connectors::InfluxDbSinkConfig> {
+        use sparrow_connectors::influxdb::{InfluxMapping, Measurement, Precision};
+        use std::time::Duration;
+        let invalid = |m: &str| SparrowError::new(ErrorCode::InvalidArgument, m.to_string());
+        let measurement = match (&self.measurement, &self.measurement_column) {
+            (Some(m), None) => Measurement::Fixed(m.clone()),
+            (None, Some(c)) => Measurement::Column(c.clone()),
+            _ => {
+                return Err(invalid(
+                    "sink.influxdb needs exactly one of measurement / measurement_column",
+                ))
+            }
+        };
+        let precision = match (&self.precision, &self.time_column) {
+            (None, _) => Precision::default(),
+            (Some(_), None) => {
+                return Err(invalid(
+                    "sink.influxdb precision requires time_column (InfluxDB stamps points itself otherwise)",
+                ))
+            }
+            (Some(p), Some(_)) => Precision::parse(p)
+                .ok_or_else(|| invalid("sink.influxdb precision must be ns, us, ms or s"))?,
+        };
+        let mapping = InfluxMapping {
+            measurement,
+            tags: self.tags.clone(),
+            fields: self.fields.clone(),
+            time_column: self.time_column.clone(),
+            precision,
+        };
+        let mut c = sparrow_connectors::InfluxDbSinkConfig::new(
+            self.url.clone(),
+            self.org.clone(),
+            self.bucket.clone(),
+            self.token_secret.clone(),
+            mapping,
+        );
+        c.ca_pem = self.ca_pem.clone();
+        c.gzip = self.gzip;
+        c.outbox_capacity = outbox_capacity;
+        if let Some(n) = self.batch_rows {
+            c.batch_rows = n;
+        }
+        if let Some(n) = self.batch_bytes {
+            c.batch_bytes = n;
+        }
+        if let Some(n) = self.max_retries {
+            c.max_retries = n;
+        }
+        for (value, slot) in [
+            (self.flush_interval_ms, &mut c.flush_interval),
+            (self.timeout_ms, &mut c.timeout),
+            (self.connect_timeout_ms, &mut c.connect_timeout),
+            (self.retry_initial_ms, &mut c.retry_initial),
+            (self.retry_max_ms, &mut c.retry_max),
+            (self.flush_timeout_ms, &mut c.flush_timeout),
+        ] {
+            if let Some(ms) = value {
+                *slot = Duration::from_millis(ms);
+            }
+        }
+        Ok(c)
+    }
+}
+
 /// JetStream publish Sink: PubAck-confirmed, at-least-once into an existing
 /// stream that binds `subject`. Never creates streams.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,6 +756,9 @@ pub struct SinkSpec {
     /// Required exclusively for `kind = "databus"` (in-process topic bus).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub databus: Option<DataBusSinkSpec>,
+    /// Required exclusively for `kind = "influxdb"` (InfluxDB v2 write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub influxdb: Option<Box<InfluxDbSinkSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -669,6 +796,26 @@ pub struct SinkSpec {
     pub clean_session: bool,
     #[serde(default)]
     pub tls: bool,
+}
+
+impl SinkSpec {
+    /// HTTP/MQTT/File/plugin/action fields (on a sink of another kind).
+    pub(crate) fn has_foreign_fields(&self) -> bool {
+        self.plugin.is_some()
+            || self.action.is_some()
+            || self.file.is_some()
+            || self.url.is_some()
+            || self.skip_verify
+            || self.use_demo_io
+            || self.header_secret.is_some()
+            || self.host.is_some()
+            || self.port.is_some()
+            || self.topic.is_some()
+            || self.client_id.is_some()
+            || self.qos != 0
+            || !self.clean_session
+            || self.tls
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1016,6 +1163,7 @@ impl PipelineSpec {
         self.check_nats()?;
         self.check_jetstream_sink()?;
         self.check_databus()?;
+        self.check_influxdb()?;
         if self
             .source
             .jetstream
@@ -1312,20 +1460,58 @@ impl PipelineSpec {
 
     /// HTTP/MQTT/File/plugin/action fields on a NATS-family sink.
     fn sink_has_foreign_fields(&self) -> bool {
-        self.sink.plugin.is_some()
-            || self.sink.action.is_some()
-            || self.sink.file.is_some()
-            || self.sink.url.is_some()
-            || self.sink.skip_verify
-            || self.sink.use_demo_io
-            || self.sink.header_secret.is_some()
-            || self.sink.host.is_some()
-            || self.sink.port.is_some()
-            || self.sink.topic.is_some()
-            || self.sink.client_id.is_some()
-            || self.sink.qos != 0
-            || !self.sink.clean_session
-            || self.sink.tls
+        self.sink.has_foreign_fields()
+    }
+
+    /// InfluxDB Sink: live-only. Target identity (url/org/bucket/mapping) is
+    /// not bound into checkpoints, so every durable claim is refused, for the
+    /// legacy sink and for graph sinks alike.
+    fn check_influxdb(&self) -> Result<()> {
+        let graph: Vec<&SinkSpec> = self
+            .graph_io
+            .as_ref()
+            .map(|io| io.sinks.values().collect())
+            .unwrap_or_default();
+        let mut any = false;
+        for sink in std::iter::once(&self.sink).chain(graph) {
+            if sink.influxdb.is_some() != (sink.kind == "influxdb") {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "sink.influxdb is required exclusively for sink kind=influxdb",
+                ));
+            }
+            if sink.kind != "influxdb" {
+                continue;
+            }
+            any = true;
+            if sink.has_foreign_fields()
+                || sink.nats.is_some()
+                || sink.jetstream.is_some()
+                || sink.databus.is_some()
+                || sink.batch_rows.is_some()
+                || sink.batch_bytes.is_some()
+                || sink.linger_ms.is_some()
+                || sink.max_inflight.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "InfluxDB options belong in sink.influxdb (no actions); mixed connector fields refused",
+                ));
+            }
+        }
+        if any
+            && (self.delivery != "live_best_effort"
+                || self.recovery != "restart_fresh"
+                || self.restore.is_some()
+                || self.checkpoint.is_some()
+                || self.checkpoint_dir.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "InfluxDB Sink is live_best_effort/restart_fresh (no checkpoint binds the write target); no checkpoint or restore",
+            ));
+        }
+        Ok(())
     }
 
     /// JetStream Sink: PubAck-confirmed, at-least-once into the stream. It
@@ -1392,6 +1578,7 @@ impl PipelineSpec {
         // Public IO validators accept typed/serde-created specs too, so they
         // must not rely solely on from_json/basic_check for the DataBus gate.
         self.check_databus()?;
+        self.check_influxdb()?;
         let g = DeliveryGuarantee::parse(&self.delivery)?;
         if (g == DeliveryGuarantee::CheckpointedAtLeastOnce)
             != (cfg!(feature = "jetstream") && self.source.kind == "jetstream")
