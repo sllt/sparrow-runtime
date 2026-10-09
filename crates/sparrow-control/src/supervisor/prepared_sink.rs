@@ -122,6 +122,10 @@ impl PreparedSink {
         }
     }
 
+    pub(super) fn owner(&self) -> Option<std::sync::Arc<sparrow_model::MemoryOwner>> {
+        self.admission.as_ref().map(SourceAdmission::owner)
+    }
+
     pub(super) fn take_admission(&mut self) -> Option<SourceAdmission> {
         self.admission.take()
     }

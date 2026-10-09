@@ -153,6 +153,9 @@ impl WindowOperator {
     pub(crate) fn use_external_watermarks(&mut self) {
         self.external_watermarks = true;
     }
+    pub(crate) fn memory_owner(&self) -> Arc<MemoryOwner> {
+        Arc::clone(&self.owner)
+    }
     pub(crate) fn operator_id(&self) -> OperatorId {
         self.operator
     }

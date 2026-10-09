@@ -70,11 +70,12 @@ impl Supervisor {
         let max_keys = self.kernel.job_budget().max_state_keys;
         let layout = manifest.clone();
         let retention = policy.retention();
-        let (store, snapshot, generation, pending) = self
+        let restore_owner = owner.clone();
+        let (store, snapshot, generation, pending, restore_credit) = self
             .store
             .run_blocking(move || {
                 sparrow_connectors::check_data_path(Path::new(&dir))?;
-                let store = CheckpointStore::open_for_plan_exclusive(
+                let mut store = CheckpointStore::open_for_plan_exclusive(
                     &dir, max_keys, retention, &layout, profile,
                 )?;
                 let inventory = store.inventory()?;
@@ -89,10 +90,12 @@ impl Supervisor {
                         "history without CURRENT; preserve it and inspect the original directory",
                     ));
                 }
-                let snapshot = if has_current {
-                    Some(store.recover_pipeline_required()?)
+                // Q3 owned decode on the admitted Job owner.
+                let (snapshot, restore_credit) = if has_current {
+                    let (snapshot, credit) = store.recover_pipeline_owned(None, &restore_owner)?;
+                    (Some(snapshot), Some(credit))
                 } else {
-                    None
+                    (None, None)
                 };
                 let pending = log::read(store.dir())?;
                 let generation = if let Some(snapshot) = &snapshot {
@@ -131,7 +134,7 @@ impl Supervisor {
                     generation
                 };
                 store.activate_state_generation(generation)?;
-                Ok((store, snapshot, generation, pending))
+                Ok((store, snapshot, generation, pending, restore_credit))
             })
             .await?;
         let restored_from = snapshot.as_ref().map(|s| s.checkpoint_id);
@@ -255,6 +258,10 @@ impl Supervisor {
                 acks: acks.clone(),
                 outbox: outbox.clone(),
             });
+        let request = match restore_credit {
+            Some(credit) => request.with_restore_credit(credit),
+            None => request,
+        };
         let job = match self.kernel.submit(request) {
             Ok(job) => job,
             Err(e) => {

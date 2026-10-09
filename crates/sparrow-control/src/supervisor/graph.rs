@@ -219,7 +219,9 @@ impl Supervisor {
         let mut restored_from = None;
         let mut generation = [0u8; 16];
         let mut store = None;
+        let mut restore_credit = None;
         if let Some(manifest) = &manifest {
+            let restore_owner = owner.clone();
             let directory = spec.checkpoint_dir.clone().expect("validated directory");
             let policy = checkpoint_policy.clone();
             let selected = spec.restore.clone();
@@ -278,18 +280,17 @@ impl Supervisor {
                             .as_ref()
                             .and_then(|r| r.snapshot_id.as_deref())
                             .filter(|id| !id.is_empty() && *id != "aligned");
-                        let snap = if let Some(id) = id {
-                            let id = id.parse().map_err(|_| {
-                                SparrowError::new(ErrorCode::InvalidArgument, "invalid snapshot_id")
-                            })?;
-                            let snap = store.recover_pipeline_id(id)?;
-                            store.pin_recovery_point(id)?;
-                            snap
-                        } else {
-                            store.recover_pipeline_required()?
-                        };
+                        let id = id
+                            .map(|id| {
+                                id.parse::<u64>().map_err(|_| {
+                                    SparrowError::new(ErrorCode::InvalidArgument, "invalid snapshot_id")
+                                })
+                            })
+                            .transpose()?;
+                        // Q3 owned decode; an explicit id is verified once and pinned.
+                        let (snap, credit) = store.recover_pipeline_owned(id, &restore_owner)?;
                         snap.check_compatible(&layout)?;
-                        Some(snap)
+                        Some((snap, credit))
                     } else {
                         None
                     };
@@ -297,6 +298,10 @@ impl Supervisor {
                 })
                 .await?;
             let (opened, snapshot) = opened;
+            let snapshot = snapshot.map(|(snapshot, credit)| {
+                restore_credit = Some(credit);
+                snapshot
+            });
             if let Some(snapshot) = snapshot {
                 restored_positions = unpack(&snapshot.source)?;
                 if restored_positions.keys().copied().collect::<Vec<_>>()
@@ -327,6 +332,9 @@ impl Supervisor {
         let mut request = JobRequest::new(plan.clone(), vec![], SharedCapture::disabled())
             .with_source_admission(admission)
             .with_observation(diag.observation.clone());
+        if let Some(credit) = restore_credit {
+            request = request.with_restore_credit(credit);
+        }
         if let Some(prepared) = prepared_references {
             request = request.with_tables(prepared.tables);
         }

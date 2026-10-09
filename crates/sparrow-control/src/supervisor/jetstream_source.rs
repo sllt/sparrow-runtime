@@ -143,10 +143,12 @@ impl Supervisor {
         let reliable_iot = plan.has_iot();
         let hysteresis_profile = manifest.has_hysteresis();
         let owner = admission.owner();
+        let restore_owner = owner.clone();
         let reference_profile = prepared_references.is_some();
-        let (store,snapshot,generation,output,binding)=self.store.run_blocking(move || {
+        let extended_profile = manifest.has_extended_state();
+        let (store,snapshot,generation,output,binding,restore_credit)=self.store.run_blocking(move || {
             sparrow_connectors::check_data_path(Path::new(&dir))?;
-            let store=if reference_profile {
+            let mut store=if reference_profile || extended_profile {
                 CheckpointStore::open_for_plan_exclusive(
                     &dir,
                     max_keys,
@@ -164,7 +166,11 @@ impl Supervisor {
             let inventory=store.inventory()?;
             let restore=inventory.current.is_some() || inventory.current_error.is_some();
             if !restore && !inventory.generations.is_empty() {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream checkpoint history exists without CURRENT"));}
-            let snapshot=if restore {Some(store.recover_pipeline_required()?)}else{None};
+            // Q3 owned decode on the admitted Job owner (bootstrap shares it).
+            let (snapshot,restore_credit)=if restore {
+                let (snapshot,credit)=store.recover_pipeline_owned(None,&restore_owner)?;
+                (Some(snapshot),Some(credit))
+            }else{(None,None)};
             let (generation,output)=if let Some(s)=&snapshot {
                 s.check_compatible(&layout)?;
                 if s.source.identity.kind!="jetstream-v1" {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream cannot adopt another source's checkpoint history"));}
@@ -177,7 +183,7 @@ impl Supervisor {
             } else {let generation=random::<16>()?;(generation,OutputSequence::new(generation,1)?)};
             let binding=binding_owner(store.dir())?;
             store.activate_state_generation(generation)?;
-            Ok((store,snapshot,generation,output,binding))
+            Ok((store,snapshot,generation,output,binding,restore_credit))
         }).await?;
         let inventory = store.inventory()?;
         let nonce = random::<16>()?;
@@ -235,6 +241,9 @@ impl Supervisor {
             });
         if let Some(prepared) = prepared_references {
             request = request.with_tables(prepared.tables);
+        }
+        if let Some(credit) = restore_credit {
+            request = request.with_restore_credit(credit);
         }
         let submitted = self.kernel.submit(request);
         let job = match submitted {

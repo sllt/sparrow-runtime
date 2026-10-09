@@ -621,9 +621,12 @@ impl CheckpointStore {
         // generation to skip. Preserve it even when CURRENT is corrupt or a
         // caller requested a fresh start rather than recovery.
         let current = read_current(&store.dir).ok().flatten();
+        let owner = store.pipeline_sink.as_ref().map(|sink| Arc::clone(sink.owner()));
         for id in list_generation_ids(&store.dir)? {
             if store.was_published(id) || current == Some(id) {
-                if let Err(error) = store.load_generation_mode(id, false) {
+                // History classification reads each payload on the Job owner.
+                let mode = owner.as_ref().map_or(LoadMode::Scan, LoadMode::ScanOwned);
+                if let Err(error) = store.load_generation_with(id, mode) {
                     if store.nonfallback_error(&error) { return Err(error); }
                 }
             }
@@ -1037,8 +1040,10 @@ impl CheckpointStore {
     /// reserved on the admitted Job `owner` before materialization; the
     /// returned credit is consumed by Kernel admission. Credit exhaustion is
     /// never treated as corruption (no fallback to an older generation).
+    /// An explicitly requested id is verified by this owned load and then
+    /// pinned (no second unbilled verification pass).
     pub fn recover_pipeline_owned(
-        &self,
+        &mut self,
         requested: Option<u64>,
         owner: &Arc<MemoryOwner>,
     ) -> Result<(PipelineSnapshot, RestoreCredit)> {
@@ -1050,7 +1055,14 @@ impl CheckpointStore {
                     "no verified committed checkpoint; refusing silent empty-state continue"))?,
         };
         let credit = credit.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "owned restore lacks credit"))?;
-        Ok((snapshot.pipeline()?, credit))
+        let snapshot = snapshot.pipeline()?;
+        if let Some(id) = requested {
+            if snapshot.checkpoint_id != id {
+                return Err(SparrowError::new(ErrorCode::Internal, "requested restore id mismatch"));
+            }
+            self.pinned = Some(id);
+        }
+        Ok((snapshot, credit))
     }
 
     /// Legacy SPV1 restore through the same owned entry.
@@ -1184,7 +1196,7 @@ impl CheckpointStore {
             ));
         }
         let payload_lease = match mode {
-            LoadMode::Owned(owner) => Some(
+            LoadMode::Owned(owner) | LoadMode::ScanOwned(owner) => Some(
                 owner
                     .acquire(
                         sparrow_model::CreditKind::Reservation,
@@ -1239,6 +1251,10 @@ impl CheckpointStore {
         self.check_sink_payload(&payload)?;
         let (snapshot, credit) = match mode {
             LoadMode::Scan => (StoredSnapshot::decode(&payload, self.max_state_keys, false)?, None),
+            LoadMode::ScanOwned(owner) => {
+                let mut meter = crate::pipeline_checkpoint::RestoreMeter::billed(owner.clone());
+                (StoredSnapshot::decode_metered(&payload, self.max_state_keys, false, &mut meter)?, None)
+            }
             LoadMode::Materialize => (StoredSnapshot::decode(&payload, self.max_state_keys, true)?, None),
             LoadMode::Owned(owner) => {
                 let charge = |bytes: usize| {
@@ -1389,6 +1405,8 @@ fn incompatible_or_credit(error: &SparrowError) -> bool {
 #[derive(Clone, Copy)]
 enum LoadMode<'a> {
     Scan,
+    /// Verification-only scan with the payload and scan scratch billed.
+    ScanOwned(&'a Arc<MemoryOwner>),
     Materialize,
     Owned(&'a Arc<MemoryOwner>),
 }
