@@ -752,3 +752,46 @@ fn bounded_message_encode_admits_before_growth_and_caps_length() {
         csv.encode_header(&s).unwrap().len()
     );
 }
+
+#[test]
+fn identity_normalizes_explicit_defaults_and_binds_real_changes() {
+    let id = |options: CsvOptions| format(options).identity_bytes();
+    let base = id(CsvOptions::default());
+    assert_eq!(
+        base,
+        id(CsvOptions {
+            max_record_bytes: Some(MAX_CSV_RECORD_BYTES),
+            max_fields: Some(256),
+            missing_columns: MissingColumns::Error,
+            extra_columns: ExtraColumns::Ignore,
+            ..Default::default()
+        }),
+        "explicit defaults are the same effective options"
+    );
+    for other in [
+        CsvOptions {
+            delimiter: ";".into(),
+            ..Default::default()
+        },
+        CsvOptions {
+            trim: true,
+            ..Default::default()
+        },
+        CsvOptions {
+            max_fields: Some(16),
+            ..Default::default()
+        },
+        CsvOptions {
+            header: false,
+            ..Default::default()
+        },
+        CsvOptions {
+            header: false,
+            columns: Some(vec!["id".into(), "name".into(), "t".into()]),
+            ..Default::default()
+        },
+    ] {
+        assert_ne!(base, id(other.clone()), "{other:?}");
+    }
+    assert_eq!(PayloadFormat::Json.identity_bytes(), None);
+}

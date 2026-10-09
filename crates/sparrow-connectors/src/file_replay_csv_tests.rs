@@ -281,6 +281,20 @@ fn csv_checkpoint_identity_binds_format_and_options() {
         let mut same = FileReplaySource::open(&cfg).unwrap();
         same.seek(&cut).unwrap();
         assert!(matches!(same.poll_decoded().unwrap(), FilePoll::Row(_)));
+        // Explicit defaults are the same effective options: also restores.
+        let explicit = config(
+            &path,
+            CsvOptions {
+                delimiter: ",".into(),
+                max_record_bytes: Some(65536),
+                max_fields: Some(256),
+                ..Default::default()
+            },
+            contract,
+        );
+        let mut same = FileReplaySource::open(&explicit).unwrap();
+        same.seek(&cut).unwrap();
+        assert!(matches!(same.poll_decoded().unwrap(), FilePoll::Row(_)));
         let mut json = FileReplayConfig::new(&path, schema());
         json.contract = contract;
         let others = [

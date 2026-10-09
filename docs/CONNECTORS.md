@@ -267,7 +267,7 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 
 | kind | JSON | CSV Source | CSV Sink | CSV 单位 |
 |---|---|---|---|---|
-| `mqtt` / `nats` / `jetstream` | ✓ | ✓ | ✓ | 一条消息 = （表头 +）一条记录 |
+| `mqtt` / `nats` / `jetstream` | ✓ | ✓ | ✓ | 一条消息 = （表头 +）一条记录；JetStream Source 的 cut 身份绑定格式与 CSV 选项（JSON 身份不变） |
 | `http_push` | ✓ | ✓ | — | 一个请求 = （表头 +）一条记录 |
 | `http` Sink | ✓ | — | ✓ | 请求体 = 表头 + 多条记录；不能与 `body` / `single`、JetStream 源或 aligned 一起使用 |
 | `http_poll` | ✓ | ✓ | — | 一个响应 = 一份文档；`http_poll.format` 必须为空 |
