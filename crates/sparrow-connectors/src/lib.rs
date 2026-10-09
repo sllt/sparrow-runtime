@@ -25,6 +25,8 @@ pub mod mqtt;
 pub mod nats;
 pub(crate) mod net;
 pub mod policy;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod redis;
 pub(crate) mod scratch;
 pub mod secret;
@@ -60,6 +62,8 @@ pub use policy::{
     check_bind_addr, check_data_path, check_data_path_in, configured_data_roots, data_roots,
     default_data_root, default_data_roots, ensure_default_data_root, AllowedTarget, TargetPolicy,
 };
+#[cfg(feature = "postgres")]
+pub use postgres::{PgLookup, PgLookupConfig, PgSink, PgSinkConfig, PgSource, PgSourceConfig};
 pub use redis::{RedisLookup, RedisLookupConfig, RedisSink, RedisSinkConfig};
 pub use secret::{MapSecretResolver, SecretResolver};
 pub use tcp::{TcpSink, TcpSinkConfig, TcpSource, TcpSourceConfig};

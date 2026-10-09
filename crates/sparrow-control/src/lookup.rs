@@ -4,10 +4,11 @@ use sparrow_model::{ErrorCode, Result, Row, Scalar, Schema, SparrowError};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
-/// A remote Lookup binding: exactly one of `url` (HTTP, one key per request)
-/// or `redis` (GET/HMGET, pipelined batches) selects the provider. Both
-/// implement the same runtime `ExternalLookup` trait and share the operator,
-/// cache, options and error policy.
+/// A remote Lookup binding: exactly one of `url` (HTTP, one key per request),
+/// `redis` (GET/HMGET, pipelined batches) or `postgres` (one SELECT per
+/// batch; `postgres` build feature) selects the provider. All implement the
+/// same runtime `ExternalLookup` trait and share the operator, cache, options
+/// and error policy.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalLookupSpec {
@@ -17,6 +18,8 @@ pub struct ExternalLookupSpec {
     pub header_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redis: Option<RedisLookupSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<crate::postgres_spec::PostgresLookupSpec>,
     pub fields: Vec<sparrow_plan::graph::FieldSpec>,
     pub keys: Vec<String>,
     #[serde(default)]
@@ -67,8 +70,8 @@ impl ExternalLookupSpec {
         self.empty_table().validate()?;
         self.options.validate()?;
         self.schema(name)?;
-        match (&self.url, &self.redis) {
-            (Some(_), None) => {
+        match (&self.url, &self.redis, &self.postgres) {
+            (Some(_), None, None) => {
                 if self.options.batch_keys != 1 {
                     return Err(SparrowError::new(
                         ErrorCode::InvalidArgument,
@@ -76,7 +79,16 @@ impl ExternalLookupSpec {
                     ));
                 }
             }
-            (None, Some(_)) => {
+            (None, None, Some(_)) => {
+                if self.header_secret.is_some() {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        "header_secret belongs to HTTP external Lookups; use postgres.password_secret",
+                    ));
+                }
+                self.check_postgres(name)?;
+            }
+            (None, Some(_), None) => {
                 if self.header_secret.is_some() {
                     return Err(SparrowError::new(
                         ErrorCode::InvalidArgument,
@@ -88,7 +100,7 @@ impl ExternalLookupSpec {
             _ => {
                 return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
-                    "external Lookup needs exactly one provider: url (HTTP) or redis",
+                    "external Lookup needs exactly one provider: url (HTTP), redis or postgres",
                 ))
             }
         }
@@ -135,6 +147,34 @@ impl ExternalLookupSpec {
             pool_size: self.options.max_inflight,
         })
     }
+    #[cfg(feature = "postgres")]
+    fn check_postgres(&self, name: &str) -> Result<()> {
+        sparrow_connectors::PgLookup::check(&self.postgres_config(name)?)
+    }
+    #[cfg(not(feature = "postgres"))]
+    fn check_postgres(&self, _name: &str) -> Result<()> {
+        Err(SparrowError::new(
+            ErrorCode::FeatureUnavailable,
+            "PostgreSQL external Lookup requires the postgres build feature",
+        ))
+    }
+    #[cfg(feature = "postgres")]
+    fn postgres_config(&self, name: &str) -> Result<sparrow_connectors::PgLookupConfig> {
+        self.postgres
+            .as_ref()
+            .ok_or_else(|| {
+                SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "postgres external Lookup missing",
+                )
+            })?
+            .connector_config(
+                self.schema(name)?,
+                self.keys.clone(),
+                Duration::from_millis(self.options.timeout_ms),
+                self.options.max_inflight,
+            )
+    }
     pub(crate) fn provider(
         &self,
         name: &str,
@@ -155,6 +195,17 @@ impl ExternalLookupSpec {
                     sparrow_connectors::http_lookup::HttpLookup::bind(config, secrets, policy)
                         .map_err(SparrowError::from)?,
                 ))
+            } else if self.postgres.is_some() {
+                #[cfg(feature = "postgres")]
+                {
+                    Arc::new(PostgresProvider(sparrow_connectors::PgLookup::bind(
+                        self.postgres_config(name)?,
+                        secrets,
+                        policy,
+                    )?))
+                }
+                #[cfg(not(feature = "postgres"))]
+                unreachable!("validate refuses postgres without the feature")
             } else {
                 Arc::new(RedisProvider(sparrow_connectors::RedisLookup::bind(
                     self.redis_config(name)?,
@@ -224,6 +275,38 @@ impl sparrow_runtime::external_lookup::ExternalLookup for HttpProvider {
 
 struct RedisProvider(sparrow_connectors::RedisLookup);
 impl sparrow_runtime::external_lookup::ExternalLookup for RedisProvider {
+    fn schema(&self) -> &Schema {
+        self.0.schema()
+    }
+    fn keys(&self) -> &[String] {
+        self.0.keys()
+    }
+    fn scratch_bytes(&self) -> usize {
+        self.0.scratch_bytes()
+    }
+    fn max_batch_keys(&self) -> usize {
+        self.0.max_batch_keys()
+    }
+    fn lookup<'a>(
+        &'a self,
+        key: Vec<Scalar>,
+        cancel: CancellationToken,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Row>>> + Send + 'a>> {
+        Box::pin(self.0.lookup(key, cancel))
+    }
+    fn lookup_batch<'a>(
+        &'a self,
+        keys: Vec<Vec<Scalar>>,
+        cancel: CancellationToken,
+    ) -> sparrow_runtime::external_lookup::LookupBatchFuture<'a> {
+        Box::pin(self.0.lookup_batch(keys, cancel))
+    }
+}
+
+#[cfg(feature = "postgres")]
+struct PostgresProvider(sparrow_connectors::PgLookup);
+#[cfg(feature = "postgres")]
+impl sparrow_runtime::external_lookup::ExternalLookup for PostgresProvider {
     fn schema(&self) -> &Schema {
         self.0.schema()
     }

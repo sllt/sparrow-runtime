@@ -19,6 +19,31 @@ jobs:
       - run: rustup toolchain install 1.98.0 --profile minimal
       - uses: actions/cache@v4
         with:
+          path: ~/.cache/sparrow-services/postgresql-16.15
+          key: postgres-tls-${{ runner.os }}-16.15-v1
+      - name: Install pinned isolated PostgreSQL test service
+        run: |
+          set -euo pipefail
+          dest="$HOME/.cache/sparrow-services/postgresql-16.15"
+          if [[ ! -x "$dest/bin/postgres" ]]; then
+            mkdir -p "$RUNNER_TEMP/pg-build"
+            curl --fail --location --retry 3 \
+              https://ftp.postgresql.org/pub/source/v16.15/postgresql-16.15.tar.bz2 \
+              -o "$RUNNER_TEMP/pg-build/source.tar.bz2"
+            printf '%s  %s\n' c1575341fa7bd40f5274ea465b34390f4dc64cdd0770af327005caaeb9f6b7ed \
+              "$RUNNER_TEMP/pg-build/source.tar.bz2" | sha256sum --check
+            tar -xjf "$RUNNER_TEMP/pg-build/source.tar.bz2" -C "$RUNNER_TEMP/pg-build"
+            cd "$RUNNER_TEMP/pg-build/postgresql-16.15"
+            if ! (./configure --prefix="$dest" --with-openssl --without-readline --without-icu \
+              && make -j2 && make install) > "$RUNNER_TEMP/pg-build/build.log" 2>&1; then
+              tail -n 80 "$RUNNER_TEMP/pg-build/build.log"
+              exit 1
+            fi
+          fi
+          "$dest/bin/postgres" --version
+          printf 'SPARROW_POSTGRES_BIN=%s\n' "$dest/bin" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
           path: ~/.cache/sparrow-services/redis
           key: redis-tls-${{ runner.os }}-${{ matrix.profile }}-6.2.24-7.2.16-v1
       - name: Install pinned isolated Redis test service
@@ -77,7 +102,7 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           git rev-parse HEAD > artifacts/commit.txt
-          features=sparrow-server/websocket
+          features=sparrow-server/websocket,sparrow-server/postgres
           if [[ "$PROFILE" == jetstream ]]; then
             features+=,sparrow-server/jetstream
           fi
@@ -117,6 +142,8 @@ jobs:
             run_contracts "$control" 'influxdb_tests::' "influxdb-control-$round"
             run_contracts "$connector" 'redis::' "redis-connector-$round"
             run_contracts "$control" 'redis_tests::' "redis-control-$round"
+            run_contracts "$connector" 'postgres::' "postgres-connector-$round"
+            run_contracts "$control" 'postgres_tests::' "postgres-control-$round"
           done
       - uses: actions/upload-artifact@v4
         if: always()

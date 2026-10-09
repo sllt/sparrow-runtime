@@ -14,6 +14,7 @@ pub mod checkpoint;
 pub mod query;
 pub mod lookup;
 pub mod plugins;
+pub mod postgres_spec;
 pub mod reference_table;
 pub mod spec;
 pub mod status;
@@ -103,6 +104,8 @@ mod k2_tests;
 mod nats_tests;
 #[cfg(test)]
 mod reference_completion_tests;
+#[cfg(test)]
+mod postgres_tests;
 #[cfg(test)]
 mod redis_tests;
 #[cfg(test)]

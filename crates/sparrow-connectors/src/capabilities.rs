@@ -89,6 +89,26 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// PostgreSQL periodic query by a tracking column. The tracking value is
+    /// not a replay point (later commits may carry smaller values), so the
+    /// Source is live-only.
+    pub const POSTGRES_SOURCE: Self = Self {
+        kind: "postgres",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// PostgreSQL INSERT/UPSERT, one transaction per batch, acked after
+    /// COMMIT. Checkpoints/replay are refused (the target is not bound into
+    /// checkpoints), so restarts start fresh.
+    pub const POSTGRES_SINK: Self = Self {
+        kind: "postgres_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     /// InfluxDB v2 `/api/v2/write`. A batch is acknowledged after HTTP 204;
     /// checkpoints/replay are refused (target identity is not bound into
     /// checkpoints), so restarts start fresh.
