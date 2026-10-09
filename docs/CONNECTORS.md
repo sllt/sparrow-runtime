@@ -255,3 +255,19 @@ Control crate：
 | 校验 | topic 语法（订阅可用 `*` / 末尾 `>`，发布必须是字面 topic）、边界、同一 pipeline 内的自反馈环；Sink 注册失败 fail closed（`databus_sink_fatal`） |
 | 关闭 | 订阅 / 发布注册为 RAII，job 结束即注销，topic 不泄漏；未消费缓冲计 `discarded_on_close`；Sink 在 `flush_timeout_ms` 内投完已排队批次 |
 | 指标 | `databus_source_*` / `databus_sink_*`，pipeline status 中的 `databus_source` / `databus_sink` 对象 |
+
+## 附：负载格式矩阵（`source.format` / `sink.format`）
+
+详见 [FORMATS.md](FORMATS.md)。默认是 `json`，未写 `format` 的 spec 行为不变。不支持的组合在校验阶段拒绝。
+
+| kind | JSON | CSV Source | CSV Sink | CSV 单位 |
+|---|---|---|---|---|
+| `mqtt` / `nats` / `jetstream` | ✓ | ✓ | ✓ | 一条消息 = （表头 +）一条记录 |
+| `http_push` | ✓ | ✓ | — | 一个请求 = （表头 +）一条记录 |
+| `http` Sink | ✓ | — | ✓ | 请求体 = 表头 + 多条记录；不能与 `body` / `single`、JetStream 源或 aligned 一起使用 |
+| `http_poll` | ✓ | ✓ | — | 一个响应 = 一份文档；`http_poll.format` 必须为空 |
+| `file` / `file_replay` / `replay` | ✓ | ✓ | ✓（`file`） | 文件或段文件 = 一份文档；表头在恢复时重建；段文件为 `part-N.csv` |
+| `databus` | ✓（内部） | ✗ | ✗ | 进程内传递行 |
+| `log` / plugin | ✓ | — | ✗ | — |
+
+新增字节型 connector 时，应通过 `PayloadFormat` 编解码，并加入 `CSV_SOURCE_KINDS` / `CSV_SINK_KINDS`，不要自带解析器。
