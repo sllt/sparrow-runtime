@@ -198,12 +198,12 @@ Control crate：
 |---|---|
 | 语义 | `live_best_effort` / `restart_fresh` / replay `unsupported`；拒绝 restore、checkpoint、aligned |
 | 调度 | 启动立即轮询一次，之后每 `interval_ms`（100 ms..24 h） |
-| 背压 | 至多一个在途请求；上一响应的行全部入队前不发新请求；错过的 tick 计入 `http_poll_skipped_ticks` |
-| 内存 | 响应体硬上限 `max_response_bytes`（默认 256 KiB，最大 1 MiB，≤ job reservation/2），先记 Reservation 再增长；`content-length` 超限直接拒绝；记录切分为惰性扫描，无索引放大 |
+| 背压 | 至多一个在途请求；上一响应的行全部处理完毕（入队或计数丢弃）前不发新请求；错过的 tick 计入 `http_poll_skipped_ticks` |
+| 内存 | 响应体硬上限 `max_response_bytes`（默认 256 KiB，最大 1 MiB，≤ job reservation/2），先记 Reservation 再增长；`content-length` 超限直接拒绝；记录切分为惰性扫描，无索引放大；每条解码前按 `record_bytes * 64 + schema_fields * size_of(Scalar) * 2 + 4096` 预扣 Reservation，持续覆盖解码及入队等待，预算不足不解码并计入 `http_poll_dropped_budget` |
 | 超时/重试 | 单请求 `timeout_ms`（10 ms..60 s）；失败退避从 interval 倍增至 `backoff_max_ms`（默认 max(interval, 60 s)，上限 max(interval, 1 h)），成功后复位；无请求内重试、不跟随重定向 |
-| 条件请求 | `conditional: true` 时发送 `If-None-Match` / `If-Modified-Since`；304 计入 `http_poll_not_modified`；校验值只在完整入队后更新 |
+| 条件请求 | `conditional: true` 时发送 `If-None-Match` / `If-Modified-Since`；304 计入 `http_poll_not_modified`；校验值与 `http_poll_ok` 只在完整入队后更新，解码/大小/预算丢行、失败或取消均不推进校验值；压力解除后同一版本仍可恢复，重试可能重复此前已入队的行 |
 | 认证 | bearer / basic 仅 secret 引用；自定义头 `value` 或 `value_secret` 二选一；保留头（Authorization、Host、Content-Length 等）拒绝；需 https |
-| 解码 | 复用 `decode_json_row`；单条解码失败计数丢弃，`fail_on_decode` 时 job 失败；结构错误计入 `http_poll_bad_responses` |
+| 解码 | 复用 `decode_json_row`；记录字节上限在解码展开预算检查前拒绝，保留 `fail_on_decode` 语义；单条解码失败计数丢弃，`fail_on_decode` 时 job 失败；结构错误计入 `http_poll_bad_responses` |
 | 指标 | `http_poll_{requests,ok,not_modified,failed,timeouts,status_errors,oversize,bad_responses,rows,dropped_bad,dropped_oversize,dropped_budget,skipped_ticks,backpressure_waits,inflight,inbox_items,inbox_bytes}` |
 
 限制：仅 GET；不支持从包络字段（如 `{"data":[...]}`）提取记录；不按 DNS 解析

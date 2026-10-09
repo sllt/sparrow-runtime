@@ -5,7 +5,7 @@
 //! - `live_best_effort` + `restart_fresh`, `replay=unsupported`. A response is
 //!   not a replay log; restart polls the API again "now".
 //! - At most one request is in flight. The next poll is not issued until every
-//!   row of the previous response has been admitted to the bounded inbox, or
+//!   row of the previous response has been admitted or counted as dropped, or
 //!   the job stops. Ticks that elapse meanwhile are counted, never queued.
 //! - The response body is a hard-capped, Reservation-billed buffer. Larger
 //!   responses are rejected before growth and their rows are not emitted.
@@ -460,7 +460,17 @@ impl From<ConnectorError> for PollFailure {
 #[derive(Debug, PartialEq, Eq)]
 enum Cycle {
     Ingested,
+    Incomplete,
     NotModified,
+    Stopped,
+}
+
+/// Admission is incomplete if any record was dropped, even when the HTTP
+/// exchange itself succeeded. Only Complete may advance response validators.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Complete,
+    Incomplete,
     Stopped,
 }
 
@@ -555,6 +565,16 @@ impl HttpPollSource {
                         .health(true, HealthState::Ready, "http_poll_ok", None);
                     interval
                 }
+                Ok(Cycle::Incomplete) => {
+                    backoff = interval;
+                    self.diag.observation.health(
+                        true,
+                        HealthState::Ready,
+                        "http_poll_incomplete",
+                        None,
+                    );
+                    interval
+                }
                 Err(PollFailure { error, fatal: true }) => {
                     self.diag.observation.health(
                         true,
@@ -611,6 +631,9 @@ impl HttpPollSource {
             },
         };
         drop(inflight);
+        if cancel.is_cancelled() {
+            return Ok(Cycle::Stopped);
+        }
         let Some(fetched) = fetched else {
             self.diag
                 .http_poll_not_modified
@@ -618,16 +641,19 @@ impl HttpPollSource {
             return Ok(Cycle::NotModified);
         };
         let received_at = std::time::Instant::now();
-        if !self
+        let admission = self
             .ingest(&fetched.body, ingress, cancel, received_at)
-            .await?
-        {
+            .await?;
+        if cancel.is_cancelled() || admission == Admission::Stopped {
             return Ok(Cycle::Stopped);
+        }
+        if admission == Admission::Incomplete {
+            return Ok(Cycle::Incomplete);
         }
         self.diag.http_poll_ok.fetch_add(1, Ordering::Relaxed);
         if self.config.conditional {
-            // Only after every row was handed off; a cancelled/failed ingest
-            // must not suppress the data on the next poll.
+            // Only after every row was handed off; a dropped record or a
+            // cancelled/failed ingest must not suppress the next response.
             *validators = fetched.validators;
         }
         Ok(Cycle::Ingested)
@@ -721,19 +747,23 @@ impl HttpPollSource {
         }))
     }
 
-    /// Decode and admit every record of one response. Returns false when the
-    /// job stopped. A structural error after some rows were admitted keeps
-    /// them (best effort) and reports the response as failed.
+    /// Decode and admit every record of one response, distinguishing drops
+    /// from full admission. A structural error after some rows were admitted
+    /// keeps them (best effort) and reports the response as failed.
     async fn ingest(
         &self,
         body: &BilledBody,
         ingress: &Ingress<'_>,
         cancel: &CancellationToken,
         received_at: std::time::Instant,
-    ) -> std::result::Result<bool, PollFailure> {
+    ) -> std::result::Result<Admission, PollFailure> {
         let bytes = body.bytes.as_slice();
         let mut records = Records::new(bytes, self.config.format);
+        let mut admission = Admission::Complete;
         while let Some(span) = records.next_span() {
+            if cancel.is_cancelled() {
+                return Ok(Admission::Stopped);
+            }
             let (start, end) = match span {
                 Ok(span) => span,
                 Err(e) => {
@@ -747,12 +777,49 @@ impl HttpPollSource {
                     });
                 }
             };
+            let frame = &bytes[start..end];
+            // Preserve the decoder's allocation-free wire-length rejection
+            // (including fail_on_decode) before testing expansion headroom.
+            if frame.len() > self.config.json_limits.max_bytes {
+                self.diag
+                    .http_poll_dropped_bad
+                    .fetch_add(1, Ordering::Relaxed);
+                self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
+                if self.config.fail_on_decode {
+                    return Err(PollFailure {
+                        error: error(
+                            ErrorCode::MaxRecordSize,
+                            "HTTP poll record decode failed (fail_on_decode)",
+                        ),
+                        fatal: true,
+                    });
+                }
+                admission = Admission::Incomplete;
+                continue;
+            }
+            // Bill parser/tree + Row expansion before decoding, and retain
+            // that conservative allowance across any admission wait.
+            let estimate = frame
+                .len()
+                .saturating_mul(64)
+                .saturating_add(
+                    self.config
+                        .schema
+                        .fields
+                        .len()
+                        .saturating_mul(std::mem::size_of::<sparrow_model::Scalar>())
+                        .saturating_mul(2),
+                )
+                .saturating_add(4096);
+            let Ok(_scratch) = ingress.owner.acquire(CreditKind::Reservation, estimate) else {
+                self.diag
+                    .http_poll_dropped_budget
+                    .fetch_add(1, Ordering::Relaxed);
+                admission = Admission::Incomplete;
+                continue;
+            };
             let decode_started = std::time::Instant::now();
-            let decoded = decode_json_row(
-                &self.config.schema,
-                &bytes[start..end],
-                &self.config.json_limits,
-            );
+            let decoded = decode_json_row(&self.config.schema, frame, &self.config.json_limits);
             self.diag
                 .observation
                 .record(Latency::Decode, decode_started.elapsed());
@@ -769,18 +836,24 @@ impl HttpPollSource {
                             fatal: true,
                         });
                     }
+                    admission = Admission::Incomplete;
                     continue;
                 }
             };
             self.diag.observation.progress(true, 1);
-            if !self
+            match self
                 .admit(row, ingress, cancel, OriginSpan::at(received_at))
                 .await?
             {
-                return Ok(false);
+                Admission::Complete => {}
+                Admission::Incomplete => admission = Admission::Incomplete,
+                Admission::Stopped => return Ok(Admission::Stopped),
             }
         }
-        Ok(true)
+        if cancel.is_cancelled() {
+            return Ok(Admission::Stopped);
+        }
+        Ok(admission)
     }
 
     /// Wait (cancel-aware, no deadline) for a channel slot and Queue credit.
@@ -792,8 +865,11 @@ impl HttpPollSource {
         ingress: &Ingress<'_>,
         cancel: &CancellationToken,
         origin: OriginSpan,
-    ) -> Result<bool> {
+    ) -> Result<Admission> {
         let _admission = self.diag.observation.timer(Latency::SourceAdmission);
+        if cancel.is_cancelled() {
+            return Ok(Admission::Stopped);
+        }
         let bytes = QueuedRow::accounted_bytes(&row);
         if bytes
             > ingress
@@ -805,19 +881,19 @@ impl HttpPollSource {
             self.diag
                 .http_poll_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(true);
+            return Ok(Admission::Incomplete);
         }
         let Ok(_working) = ingress.owner.acquire(CreditKind::Reservation, bytes) else {
             self.diag
                 .http_poll_dropped_budget
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(true);
+            return Ok(Admission::Incomplete);
         };
         let mut row = Some(row);
         let mut observed_wait: Option<sparrow_io::observed::Wait<'_>> = None;
         loop {
             if cancel.is_cancelled() {
-                return Ok(false);
+                return Ok(Admission::Stopped);
             }
             let budget_full = match ingress.tx.try_reserve() {
                 Ok(permit) => match QueuedRow::try_new(
@@ -831,14 +907,14 @@ impl HttpPollSource {
                         }
                         permit.send_with_origin(queued, origin);
                         self.diag.http_poll_rows.fetch_add(1, Ordering::Relaxed);
-                        return Ok(true);
+                        return Ok(Admission::Complete);
                     }
                     Err((r, _)) => {
                         row = Some(r);
                         true
                     }
                 },
-                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(false),
+                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(Admission::Stopped),
                 Err(mpsc::error::TrySendError::Full(_)) => false,
             };
             if observed_wait.is_none() {
@@ -849,7 +925,7 @@ impl HttpPollSource {
             }
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Ok(false),
+                _ = cancel.cancelled() => return Ok(Admission::Stopped),
                 _ = async {
                     if budget_full {
                         // Queue credit is freed by the Kernel draining rows; a
@@ -923,6 +999,10 @@ enum SplitState {
     Done,
 }
 
+fn json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
 impl<'a> Records<'a> {
     fn new(bytes: &'a [u8], format: HttpPollFormat) -> Self {
         Self {
@@ -934,7 +1014,7 @@ impl<'a> Records<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
+        while self.pos < self.bytes.len() && json_whitespace(self.bytes[self.pos]) {
             self.pos += 1;
         }
     }
@@ -960,11 +1040,11 @@ impl<'a> Records<'a> {
                 .map_or(self.bytes.len(), |n| start + n);
             self.pos = end + 1;
             let line = &self.bytes[start..end];
-            let lead = line.iter().take_while(|b| b.is_ascii_whitespace()).count();
+            let lead = line.iter().take_while(|b| json_whitespace(**b)).count();
             let trail = line[lead..]
                 .iter()
                 .rev()
-                .take_while(|b| b.is_ascii_whitespace())
+                .take_while(|b| json_whitespace(**b))
                 .count();
             if lead + trail < line.len() {
                 return Some(Ok((start + lead, end - trail)));
@@ -988,7 +1068,7 @@ impl<'a> Records<'a> {
                         self.state = SplitState::Done;
                         let start = self.pos;
                         let mut end = self.bytes.len();
-                        while end > start && self.bytes[end - 1].is_ascii_whitespace() {
+                        while end > start && json_whitespace(self.bytes[end - 1]) {
                             end -= 1;
                         }
                         Some(Ok((start, end)))
@@ -1069,7 +1149,7 @@ impl<'a> Records<'a> {
                     }
                 }
                 b',' if depth == 0 => return Ok(self.pos),
-                b if b.is_ascii_whitespace() && depth == 0 => return Ok(self.pos),
+                b if json_whitespace(b) && depth == 0 => return Ok(self.pos),
                 _ => {}
             }
             self.pos += 1;
