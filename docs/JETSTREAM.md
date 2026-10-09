@@ -137,13 +137,13 @@ stream，并等待服务器 PubAck；决策与取舍见 [ADR-005](adr/005-jetstr
 | 字段 | 默认 | 范围 / 说明 |
 |---|---|---|
 | `servers` / `token_secret` / `reconnect_attempts` / `connect_timeout_ms` / `max_payload_bytes` | 同 NATS Core | token 仅 `tls://`；端点经 TargetPolicy |
-| `client_capacity` | 8 | SDK 命令缓冲（消息数） |
+| `client_capacity` | 4 | SDK 命令缓冲（消息数）；独立于默认 8 个在途 PubAck，不暗中钳制显式配置 |
 | `stream` | 必填 | 1..=255 可见字节，不含 `. * > / \`；必须已存在 |
 | `subject` | 必填 | 字面 subject，必须被 stream 的 subjects 覆盖 |
 | `ack_timeout_ms` | 2000 | 100..=30000；每次尝试上限 2× |
-| `max_inflight_acks` | 8 | 1..=256；`1` = 严格顺序 |
+| `max_inflight_acks` | 8 | 1..=256；`1` = 本 Sink 的相对行顺序，非跨生产者全局顺序 |
 | `max_retries` | 5 | 0..=20，100 ms→2 s 退避 |
-| `flush_timeout_ms` | 5000 | 10..=60000，stop/EOF 确认已排队批次 |
+| `flush_timeout_ms` | 5000 | 10..=60000，stop 的在途与队列共用 deadline；EOF 排空队列 |
 | `msg_id_column` | 无 | utf8/int64/uint64 输出列 → `Nats-Msg-Id`；stream 需 `duplicate_window > 0` |
 
 语义：
@@ -151,16 +151,29 @@ stream，并等待服务器 PubAck；决策与取舍见 [ADR-005](adr/005-jetstr
 - **at-least-once 进入 stream**：批次只有全部行拿到 PubAck 才算交付；重试可能
   重复（`jetstream_sink_duplicates` 为服务器报告的去重命中）。设置 `msg_id_column` 时
   服务器在 `duplicate_window` 内去重；超过窗口的重放仍会重复。不提供内容哈希 id
-  （会合并合法的相同行）。
+  （会合并合法的相同行）。id 须对合法输出唯一且重放稳定；空值行不带 msg-id，仍可能重复。
 - **Fail closed**：stream 缺失/不可写/未绑定 subject、超限行、非法 msg id、重试耗尽、
   stop 时未能在 `flush_timeout_ms` 内确认 → job `JobFailed`（`JetStream Sink failed closed`）。
 - **从不创建 stream**：由运维按保留/配额策略预先创建。
-- **Aligned**：仅线性 File 源 profile（`recovery: aligned` + `checkpoint_dir`）。checkpoint
-  只在 barrier 前所有批次都已 PubAck 后提交；broker 暂停时 checkpoint 超时、不提交；
-  恢复后从最后 checkpoint 重放 File 输入，配合 `msg_id_column` 不产生重复。
+- **发布目标**：启动拒绝 `no_ack`，每次发布带 Expected-Stream 并核对 ack.stream；wrong-stream
+  不盲重试。fresh-only 可接纳 Memory stream，但不承诺它在 broker 重启后保留。
+- **Aligned v27**：仅独立线性 File 源 profile（`recovery: aligned` + `checkpoint_dir`），
+  prepared 目标必须是可写的 **File/Limits** stream。先在同一 job owner/slot 上验证目标，
+  再打开/seek File、激活状态；运行复用该 session，失败显式 close 并等待真实 SDK 退出。
+  snapshot 用 `JSI1` 保存 canonical endpoints、token SecretRef、stream 精确 created nanos、
+  subject、msg-id 策略；恢复严格比较**完整**计划，不能沿用 v3 的 downstream-prefix 宽松规则。
+  旧 v1..v26 与 v27 不混写、不自动升级；HTTP↔JetStream、目标/策略/下游表达式变化
+  必须用独立新历史。checkpoint 只在全部前置 PubAck 和批后目标复验成功后提交。
+  每批前/后及 retry 前做实时 INFO 检查；同名重建/配置变化拒绝 receipt/CURRENT。
+  恢复后从最后 checkpoint 重放 File 输入，msg-id 仅在 duplicate_window 内去重。
   NATS/MQTT/HTTP 等 live 源与 graph/IoT/引用表/JetStream source 的 checkpoint profile
   返回 `UnsupportedRestore`（这些 profile 依赖 HTTP 稳定输出 ID）。
-- **顺序**：`max_inflight_acks > 1` 时重试会打乱顺序。
+- **预算**：SDK command queue 与 writer batch 双缓冲、在途 payload、bounded JSON codec
+  scratch 和 prepared identity/config 都记入同一 owner，超出额度失败，不增大预算或暗中钳制配置。
+- **顺序**：`max_inflight_acks > 1` 不保证输入行入 stream 的顺序。
+- **可信边界**：管理员不能在检查之间修改又恢复目标/策略来绕过检查；保留/淘汰归运维。
+  File/PubAck 不是消费方业务提交、设备掉电/fsync 或 HA/exactly-once 认证；本功能仍为 Preview，
+  专项回归由当前候选单独验证，不沿用旧 Source profile 的测试数字；10k/20k 性能压测未执行。
 - **指标**：`jetstream_sink_{acked,duplicates,retries,ack_timeouts,failed,batches,discarded_on_close,dropped_bad,dropped_oversize,msg_id_missing,disconnects,reconnects,client_errors,sessions,fatal,inflight}`。
 
 真实 broker 测试：

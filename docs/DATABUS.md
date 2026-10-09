@@ -58,7 +58,7 @@ policy has its own counter.
 | 字段 | 默认 | 范围 | 说明 |
 |---|---|---|---|
 | `topic` | 必填 | 字面 topic | 发布 topic |
-| `flush_timeout_ms` | 1000 | 10..=30000 | 停止 / EOF 时把已排队批次送出的时限 |
+| `flush_timeout_ms` | 1000 | 10..=30000 | 停止 / EOF 时的总时限：从第一次取消起算，在途批次（含正在等待 `block` 订阅者的发布）与已排队批次共用 |
 
 ## 内存
 
@@ -67,7 +67,18 @@ policy has its own counter.
 
 - 单个订阅不能超过 job reservation 的 1/2。
 - 一个 pipeline 的所有 databus 订阅，加上 NATS / JetStream SDK 缓冲，合计不能超过 3/4。
-- 超出时，校验或启动返回 `BoundExceeded`。
+- 超出时，校验或启动返回 `BoundExceeded`。上限计算使用饱和算术，极大的配置值同样得到
+  `BoundExceeded`，不会溢出。
+
+临时内存同样先记账再分配：
+
+- **Source 解码**：超过 64 KiB 的消息按长度直接拒绝（`databus_source_dropped_oversize`），
+  不解析；否则先按 `消息字节 × 64 + 字段数 × size_of(Scalar) × 2 + 4096` 向订阅方 job
+  预扣 Reservation（与 NATS / HTTP Poll Source 相同的估算），持有到该行入队完成。
+  预扣失败计 `databus_source_dropped_budget`，消息不解析。
+- **Sink 编码**：每行先按 `行驻留字节 × 8 + 字段名 × 4 + 8 KiB` 向发布方 job 预扣编码 scratch
+  （与 NATS Sink 相同），编码输出在增长前检查 64 KiB 上限；发布期间仍持有覆盖正文的额度。
+  预扣失败计 `databus_sink_dropped_budget`，所在批次不回执。
 
 消息正文是 `Arc<[u8]>`，扇出时共享，不复制。所以 N 个订阅者里只有缓冲上限计账，
 没有 N 份拷贝。
@@ -114,8 +125,9 @@ policy has its own counter.
   和 `databus_sink_discarded_on_close`。同时唤醒正在 `block` 等待它的发布方。
 - 重启（stop → start 或修订切换）会**重新订阅**，从重新订阅那一刻起接收，**不补发**
   停机期间的消息。
-- Sink 在停止或 EOF 时，于 `flush_timeout_ms` 内把已排队批次投给总线，剩余部分计入
-  `databus_sink_discarded_on_close`。如果截止时间到达时某行正在等待 `block` 订阅者，这一行可能已经投给了非阻塞订阅者，
+- Sink 停止时，第一次取消就建立一个 `flush_timeout_ms` 截止时间，**正在进行**的批次
+  （包括正等待 `block` 订阅者的那次发布）和已排队批次共用它；`block_timeout_ms` 再长也不会
+  拖过这个截止时间。截止后未投完的行计入 `databus_sink_discarded_on_close`，所在批次回执失败。如果截止时间到达时某行正在等待 `block` 订阅者，这一行可能已经投给了非阻塞订阅者，
   但仍按"未完成"计数。
 - 本 runtime 没有删除 pipeline 的 API。停止（desired=stopped）就是释放 topic 的操作。
 
@@ -145,6 +157,7 @@ policy has its own counter.
 - `/v1/metrics` 提供 `databus_source_*` 和 `databus_sink_*`。
 - pipeline status 中有 `databus_source` 和 `databus_sink` 对象。
 - 计数范围是本次 attempt。
+- `databus_sink_dropped_budget` / `databus_source_dropped_budget`：编码 / 解码临时额度不足而丢弃的行。
 - `databus_sink_deliveries` 统计订阅缓冲接受的次数。扇出到 N 个订阅者时，每行计 N 次。
 - 一个订阅者上有如下恒等式（不含关闭时的丢弃）：
   `deliveries + dropped_newest + block_timeouts + dropped_oversize = published`。

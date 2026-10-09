@@ -7,20 +7,34 @@
 //! or – for `block` subscribers – after waiting up to their timeout. With no
 //! subscriber the row is counted in `databus_sink_no_subscribers` and
 //! discarded. None of this is a downstream processing receipt.
+//!
+//! Each row is encoded under a reservation lease (encoder scratch plus the
+//! bounded output, stopped at the 64 KiB record limit before growing past
+//! it); the lease is held while the publisher still owns the payload. A row
+//! without credit is counted `databus_sink_dropped_budget`.
+//!
+//! Stop: the first cancellation starts one `flush_timeout` deadline shared by
+//! the batch in flight (including a publish waiting on a `block` subscriber)
+//! and the batches still queued. Rows not fully offered by then are counted
+//! `discarded_on_close` and their batch receipt fails.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sparrow_formats::{encode_json_row, JsonLimits};
+use sparrow_formats::JsonLimits;
 use sparrow_io::observed::Receiver as ObservedReceiver;
 use sparrow_model::observation::{HealthState, Latency};
-use sparrow_model::{ErrorCode, InflightCounter, RestoreClaim, Result, RowBatch, SparrowError};
+use sparrow_model::{
+    ErrorCode, InflightCounter, MemoryOwner, RestoreClaim, Result, RowBatch, SparrowError,
+};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{check_topic, err, DataBus, Publisher};
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
+use crate::scratch::{encode_json_row_charged, EncodeRejected};
 
 const MAX_OUTBOX: usize = 4096;
 
@@ -67,6 +81,7 @@ pub struct DataBusSink {
     pub config: DataBusSinkConfig,
     pub diag: Arc<IoDiagnostics>,
     bus: Arc<DataBus>,
+    owner: Arc<MemoryOwner>,
 }
 
 impl std::fmt::Debug for DataBusSink {
@@ -98,10 +113,16 @@ impl DataBusSink {
     pub fn bind(
         config: DataBusSinkConfig,
         bus: Arc<DataBus>,
+        owner: Arc<MemoryOwner>,
         diag: Arc<IoDiagnostics>,
     ) -> Result<Self> {
         config.validate()?;
-        Ok(Self { config, diag, bus })
+        Ok(Self {
+            config,
+            diag,
+            bus,
+            owner,
+        })
     }
 
     pub async fn run(
@@ -123,6 +144,9 @@ impl DataBusSink {
         self.diag
             .observation
             .health(false, HealthState::Ready, "databus_publisher_ready", None);
+        // Set once, by the first cancellation (or EOF), and shared by the
+        // batch in flight and the queued ones.
+        let mut deadline: Option<Instant> = None;
         loop {
             let batch = tokio::select! {
                 biased;
@@ -130,16 +154,25 @@ impl DataBusSink {
                 b = rx.recv() => b,
             };
             let Some(batch) = batch else { break };
-            self.publish_batch(&publisher, &batch, outbox.as_ref(), None)
+            self.publish_batch(&publisher, &batch, outbox.as_ref(), &mut deadline, &cancel)
                 .await;
+            if deadline.is_some() {
+                break;
+            }
         }
-        // Stop/EOF: publish what is already queued within flush_timeout.
-        let deadline = tokio::time::Instant::now() + self.config.flush_timeout;
+        // Stop/EOF: publish what is already queued within the same deadline.
+        let deadline = *deadline.get_or_insert_with(|| Instant::now() + self.config.flush_timeout);
         rx.close();
-        while tokio::time::Instant::now() < deadline {
+        while Instant::now() < deadline {
             let Ok(batch) = rx.try_recv() else { break };
-            self.publish_batch(&publisher, &batch, outbox.as_ref(), Some(deadline))
-                .await;
+            self.publish_batch(
+                &publisher,
+                &batch,
+                outbox.as_ref(),
+                &mut Some(deadline),
+                &cancel,
+            )
+            .await;
         }
         self.discard(&mut rx, outbox.as_ref());
         drop(publisher);
@@ -153,7 +186,8 @@ impl DataBusSink {
         publisher: &Publisher,
         batch: &RowBatch,
         outbox: Option<&Arc<InflightCounter>>,
-        deadline: Option<tokio::time::Instant>,
+        deadline: &mut Option<Instant>,
+        cancel: &CancellationToken,
     ) {
         let mut receipt = BatchReceipt(outbox.cloned());
         let mut delivered = self.diag.observation.delivery_guard(
@@ -164,44 +198,64 @@ impl DataBusSink {
         let limit = JsonLimits::default().max_bytes;
         let schema = batch.schema();
         let mut all = true;
-        for row in batch.rows() {
+        for (i, row) in batch.rows().iter().enumerate() {
+            if deadline.is_none() && cancel.is_cancelled() {
+                *deadline = Some(Instant::now() + self.config.flush_timeout);
+            }
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                // The receipt guard fails this partial batch.
+                self.diag
+                    .databus_sink_discarded_on_close
+                    .fetch_add((batch.num_rows() - i) as u64, Ordering::Relaxed);
+                return;
+            }
             let started = std::time::Instant::now();
-            let encoded = encode_json_row(schema, row);
+            let encoded = encode_json_row_charged(&self.owner, schema, row, limit);
             self.diag
                 .observation
                 .record(Latency::Encode, started.elapsed());
-            let body = match encoded {
-                Ok(body) if body.len() <= limit => body,
-                Ok(_) => {
+            // Dropped at the end of this iteration, after the publish future.
+            let (body, mut lease) = match encoded {
+                Ok(encoded) => encoded,
+                Err(rejected) => {
                     all = false;
-                    self.diag
-                        .databus_sink_dropped_oversize
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                Err(_) => {
-                    all = false;
-                    self.diag
-                        .databus_sink_dropped_bad
-                        .fetch_add(1, Ordering::Relaxed);
+                    let counter = match rejected {
+                        EncodeRejected::Oversize => &self.diag.databus_sink_dropped_oversize,
+                        EncodeRejected::Budget => &self.diag.databus_sink_dropped_budget,
+                        EncodeRejected::Bad => &self.diag.databus_sink_dropped_bad,
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             };
-            let publish = publisher.publish(Arc::from(body));
-            let outcome = match deadline {
-                // On stop a block-policy subscriber may not hold us past the
-                // flush budget.
-                Some(at) => match tokio::time::timeout_at(at, publish).await {
-                    Ok(outcome) => outcome,
-                    Err(_) => {
-                        all = false;
-                        self.diag
-                            .databus_sink_discarded_on_close
-                            .fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                },
-                None => publish.await,
+            // Copy into the shared payload while the scratch lease still
+            // covers both buffers, then keep only the payload charged while
+            // the publisher owns it.
+            let payload: Arc<[u8]> = Arc::from(body);
+            let _ = lease.shrink_to(payload.len());
+            let publish = publisher.publish(payload);
+            tokio::pin!(publish);
+            let outcome = loop {
+                match *deadline {
+                    // On stop a block-policy subscriber may not hold us past
+                    // the shared flush deadline.
+                    Some(at) => break tokio::time::timeout_at(at, publish.as_mut()).await.ok(),
+                    None => tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            *deadline = Some(Instant::now() + self.config.flush_timeout);
+                        }
+                        outcome = publish.as_mut() => break Some(outcome),
+                    },
+                }
+            };
+            let Some(outcome) = outcome else {
+                // Interrupted at the deadline; the rest of the batch is
+                // discarded and the receipt fails.
+                self.diag
+                    .databus_sink_discarded_on_close
+                    .fetch_add((batch.num_rows() - i) as u64, Ordering::Relaxed);
+                return;
             };
             self.diag
                 .databus_sink_published

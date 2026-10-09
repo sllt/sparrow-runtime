@@ -998,6 +998,32 @@ impl Kernel {
                 ));
             }
             if let Some(pipeline) = &aligned.pipeline {
+                if pipeline.sink.is_some() {
+                    // A physical MemorySource is also the File connector's
+                    // ingress stage. Require the admitted ordered connector
+                    // path, not memory rows or a synthetic JS source cursor.
+                    if req.source_admission.is_none()
+                        || req.live_events.is_none()
+                        || req.live_out.is_none()
+                        || !req.rows.is_empty()
+                        || req.live_in.is_some()
+                        || req.budgeted_in.is_some()
+                        || req.live_ctrl.is_some()
+                        || !req.trailing_controls.is_empty()
+                        || !req.graph_inputs.is_empty()
+                        || !req.graph_outputs.is_empty()
+                        || req.plan.edges.is_some()
+                        || aligned.restore.is_some()
+                        || aligned.acks.output_sequence().is_some()
+                    {
+                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                            "File/JetStream sink checkpoint requires an admitted ordered File connector, not Memory or another profile"));
+                    }
+                    pipeline.check_compatible(
+                        &sparrow_plan::CheckpointPlan::from_physical(&req.plan)?,
+                        &req.source_admission.as_ref().expect("validated File admission").owner,
+                    )?;
+                }
                 // The source connector is not started yet, but the profile is
                 // already unambiguous from the physical topology and whether
                 // a reliable output cursor was provisioned.  Select it before
@@ -1019,8 +1045,13 @@ impl Kernel {
                 } else {
                     "file"
                 };
-                let profile =
-                    crate::pipeline_checkpoint::snapshot_version_for(&pipeline.plan, source_kind)?;
+                let profile = if let Some(binding) = &pipeline.sink {
+                    crate::pipeline_checkpoint::sink_snapshot_version_for(
+                        &pipeline.plan, source_kind, binding.live.identity(),
+                    )?
+                } else {
+                    crate::pipeline_checkpoint::snapshot_version_for(&pipeline.plan, source_kind)?
+                };
                 if matches!(
                     profile,
                     crate::pipeline_checkpoint::REFERENCE_RELIABLE_SNAPSHOT_VERSION
@@ -1064,9 +1095,11 @@ impl Kernel {
                             "reference tables require a dependency-bearing checkpoint plan",
                         ));
                     }
-                    pipeline.plan.check_compatible(
-                        &sparrow_plan::CheckpointPlan::from_physical(&req.plan)?,
-                    )?;
+                    if pipeline.sink.is_none() {
+                        pipeline.plan.check_compatible(
+                            &sparrow_plan::CheckpointPlan::from_physical(&req.plan)?,
+                        )?;
+                    }
                 }
             } else {
                 if !req.tables.is_empty() {

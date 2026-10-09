@@ -199,12 +199,24 @@ struct RunningSource {
 }
 
 fn start_source(broker: &NatsSandbox, mutate: impl FnOnce(&mut NatsSourceConfig)) -> RunningSource {
-    let mut config = NatsSourceConfig::new(vec![broker.url()], "in.>", schema());
+    start_source_url(broker.url(), broker.port, mutate)
+}
+
+fn start_source_url(
+    url: String,
+    port: u16,
+    mutate: impl FnOnce(&mut NatsSourceConfig),
+) -> RunningSource {
+    let mut config = NatsSourceConfig::new(vec![url], "in.>", schema());
     config.client.reconnect_attempts = 20;
     mutate(&mut config);
+    start_source_config(config, TargetPolicy::allow("127.0.0.1", port))
+}
+
+fn start_source_config(config: NatsSourceConfig, allowed: TargetPolicy) -> RunningSource {
     let diag = IoDiagnostics::new();
     let capacity = config.inbox_capacity;
-    let source = NatsSource::bind(config, &secrets(), &policy(broker), diag.clone()).unwrap();
+    let source = NatsSource::bind(config, &secrets(), &allowed, diag.clone()).unwrap();
     let owner = MemoryOwner::new(ResourceBudget::compact());
     diag.observation.initialize(&owner).unwrap();
     let (tx, rx) = sparrow_io::observed::channel(capacity);
@@ -413,10 +425,10 @@ async fn nats_core_queue_group_splits_and_plain_subscriber_sees_all() {
     b.ready().await;
     all.ready().await;
     let client = raw_client(&broker).await;
-    // Paced so no subscriber hits its SDK buffer bound (that path is the
+    // Paced so no subscriber hits its wire prefetch bound (that path is the
     // slow-consumer test); the server picks a random member per message.
-    for chunk in 0..20 {
-        publish_rows(&client, "in.q", chunk * 10 + 1, chunk * 10 + 10).await;
+    for chunk in 0..25 {
+        publish_rows(&client, "in.q", chunk * 8 + 1, chunk * 8 + 8).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(ints(&all.take(200).await), (1..=200).collect::<Vec<_>>());
@@ -453,8 +465,8 @@ async fn nats_core_slow_consumer_drops_are_counted_and_memory_bounded() {
     run.ready().await;
     let client = raw_client(&broker).await;
     publish_rows(&client, "in.burst", 1, 500).await;
-    // Inbox (2) + one waiting row + SDK buffer (4); the rest is dropped by
-    // the SDK and surfaced as slow-consumer events.
+    // Inbox (2) + one waiting row + wire prefetch (4); the rest is explicitly
+    // dropped by the actor, with no lossy SDK event channel involved.
     until(Duration::from_secs(5), || {
         let s = run.diag.snapshot();
         s.nats_source_slow_consumer > 0 && s.nats_source_backpressure_waits >= 1
@@ -465,11 +477,9 @@ async fn nats_core_slow_consumer_drops_are_counted_and_memory_bounded() {
     assert_eq!(snap.nats_source_rows, 2, "{snap:?}");
     assert!(snap.nats_source_inbox_items <= 2);
     assert!(snap.nats_source_received <= 3, "{snap:?}");
-    // The SDK event queue is lossy, so the count is a lower bound of the
-    // ~493 dropped messages, never more than were published.
-    assert!(
-        (100..=500).contains(&snap.nats_source_slow_consumer),
-        "SDK drops surfaced: {snap:?}"
+    assert_eq!(
+        snap.nats_source_slow_consumer, 493,
+        "all actor drops are counted: {snap:?}"
     );
     let queue = run.owner.usage().queue_bytes;
     let reservation = run.owner.usage().reservation_bytes;
@@ -524,7 +534,7 @@ async fn nats_core_server_restart_reconnects_source_and_sink() {
     .await;
     assert!(run.diag.snapshot().nats_source_disconnects >= 1);
     assert!(sink_diag.snapshot().nats_sink_disconnects >= 1);
-    // The SDK resubscribed: new messages flow; nothing from the outage is replayed.
+    // The source actor resubscribed and the sink SDK reconnected; no replay.
     let client = raw_client(&broker).await;
     let mut sub = client.subscribe("out.rows").await.unwrap();
     client.flush().await.unwrap();
@@ -693,6 +703,325 @@ async fn nats_core_sink_counts_oversize_and_ends_on_input_close() {
         (1, 1)
     );
     assert_eq!(snap.nats_sink_flushes, 1);
+}
+
+// Scripted peers assert protocol order directly; no sleep/poll is used as a
+// substitute for the subscription PONG or pre-reconnect payload gate.
+async fn peer_line(socket: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0; 1];
+        socket.read_exact(&mut byte).await.unwrap();
+        line.push(byte[0]);
+        assert!(line.len() <= 32 * 1024);
+        if line.ends_with(b"\r\n") {
+            return String::from_utf8(line).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn nats_core_source_ready_requires_this_subscriptions_pong() {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+    let (pong_tx, pong_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket
+            .write_all(b"INFO {\"max_payload\":65536}\r\n")
+            .await
+            .unwrap();
+        let connect = peer_line(&mut socket).await;
+        let options: serde_json::Value =
+            serde_json::from_str(connect.trim().strip_prefix("CONNECT ").unwrap()).unwrap();
+        assert_eq!(options["headers"], false);
+        assert_eq!(peer_line(&mut socket).await, "SUB in.> 1\r\n");
+        assert_eq!(peer_line(&mut socket).await, "PING\r\n");
+        barrier_tx.send(()).unwrap();
+        pong_rx.await.unwrap();
+        socket.write_all(b"PONG\r\n").await.unwrap();
+        let body = br#"{"device_id":"d","v":1}"#;
+        socket
+            .write_all(format!("MSG in.a 1 {}\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        socket.write_all(body).await.unwrap();
+        socket.write_all(b"\r\n").await.unwrap();
+        finish_rx.await.unwrap();
+    });
+    let mut run = start_source_url(format!("nats://127.0.0.1:{port}"), port, |_| {});
+    barrier_rx.await.unwrap();
+    assert_ne!(
+        run.diag.observation.endpoints().unwrap().0.state,
+        sparrow_model::observation::HealthState::Ready
+    );
+    pong_tx.send(()).unwrap();
+    run.ready().await;
+    assert_eq!(ints(&run.take(1).await), vec![1]);
+    run.stop().await.unwrap();
+    finish_tx.send(()).unwrap();
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn nats_core_source_payload_gate_precedes_connect_and_sub() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket
+            .write_all(b"INFO {\"max_payload\":131072}\r\n")
+            .await
+            .unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(
+            socket.read(&mut byte).await.unwrap(),
+            0,
+            "no CONNECT/SUB may escape the rejected INFO gate"
+        );
+    });
+    let run = start_source_url(format!("nats://127.0.0.1:{port}"), port, |_| {});
+    let result = tokio::time::timeout(Duration::from_secs(2), run.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.unwrap_err().code, ErrorCode::BoundExceeded);
+    assert_eq!(run.owner.usage().reservation_bytes, 0);
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn nats_core_source_refuses_unnegotiated_header_frame_before_body_allocation() {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket
+            .write_all(b"INFO {\"max_payload\":65536}\r\n")
+            .await
+            .unwrap();
+        assert!(peer_line(&mut socket).await.starts_with("CONNECT "));
+        assert_eq!(peer_line(&mut socket).await, "SUB in.> 1\r\n");
+        assert_eq!(peer_line(&mut socket).await, "PING\r\n");
+        socket
+            .write_all(b"PONG\r\nHMSG in.a 1 60000 60030\r\n")
+            .await
+            .unwrap();
+        // No header/body bytes are necessary for the bounded rejection.
+    });
+    let run = start_source_url(format!("nats://127.0.0.1:{port}"), port, |_| {});
+    let result = tokio::time::timeout(Duration::from_secs(2), run.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.unwrap_err().code, ErrorCode::CodecViolation);
+    assert_eq!(run.owner.usage().reservation_bytes, 0);
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn nats_core_reconnect_payload_gate_runs_while_ingress_is_blocked() {
+    let mut small = NatsSandbox::start().await;
+    let mut large = NatsSandbox::start().await;
+    let path = large.root.join("nats.conf");
+    let config = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("max_payload: 65536", "max_payload: 131072");
+    std::fs::write(&path, config).unwrap();
+    large.restart().await;
+    let mut config = NatsSourceConfig::new(vec![small.url(), large.url()], "in.>", schema());
+    config.inbox_capacity = 1;
+    config.client.capacity = 4;
+    config.client.reconnect_attempts = 2;
+    let run = start_source_config(config, policy(&small).with_allow("127.0.0.1", large.port));
+    run.ready().await;
+    publish_rows(&raw_client(&small).await, "in.a", 1, 20).await;
+    until(Duration::from_secs(2), || {
+        run.diag.snapshot().nats_source_backpressure_waits > 0
+    })
+    .await;
+    small.stop_broker();
+    let result = tokio::time::timeout(Duration::from_secs(3), run.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.unwrap_err().code, ErrorCode::BoundExceeded);
+    assert_eq!(
+        run.diag.snapshot().nats_source_reconnects,
+        0,
+        "rejected INFO must not report a successful reconnect"
+    );
+    assert_eq!(run.owner.usage().reservation_bytes, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn nats_core_header_storm_is_not_negotiated_or_materialized() {
+    let broker = NatsSandbox::start().await;
+    let mut run = start_source(&broker, |_| {});
+    run.ready().await;
+    let before = run.owner.usage().reservation_bytes;
+    let client = raw_client(&broker).await;
+    let mut headers = async_nats::HeaderMap::new();
+    for _ in 0..10000 {
+        headers.append("X", "v");
+    }
+    client
+        .publish_with_headers(
+            "in.a",
+            headers,
+            br#"{"device_id":"d","v":42}"#.as_slice().into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ints(&run.take(1).await),
+        vec![42],
+        "broker must strip headers for CONNECT headers=false"
+    );
+    assert_eq!(run.diag.snapshot().nats_source_dropped_bad, 0);
+    assert_eq!(run.owner.usage().reservation_bytes, before);
+    run.stop().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn nats_core_sink_cancel_bounds_active_and_queued_batches_by_one_deadline() {
+    let mut broker = NatsSandbox::start().await;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let diag = IoDiagnostics::new();
+    diag.observation.initialize(&owner).unwrap();
+    let mut config = NatsSinkConfig::new(vec![broker.url()], "out.rows");
+    config.client.capacity = 1;
+    config.client.reconnect_attempts = 4;
+    config.client.connect_timeout = Duration::from_millis(100);
+    config.publish_timeout = Duration::from_secs(30);
+    config.flush_timeout = Duration::from_millis(100);
+    let sink = NatsSink::bind(
+        config,
+        &secrets(),
+        &policy(&broker),
+        owner.clone(),
+        diag.clone(),
+    )
+    .unwrap();
+    let (tx, rx) = sparrow_io::observed::channel(8);
+    let cancel = CancellationToken::new();
+    let outbox = Arc::new(sparrow_model::InflightCounter::new());
+    let task = tokio::spawn(sink.run(rx, cancel.clone(), Some(outbox.clone())));
+    until(Duration::from_secs(2), || {
+        diag.snapshot().nats_sink_sessions == 1
+    })
+    .await;
+    broker.stop_broker();
+    until(Duration::from_secs(2), || {
+        diag.snapshot().nats_sink_disconnects == 1
+    })
+    .await;
+    outbox.enqueue();
+    tx.send(batch(&owner, 1, 64)).await.unwrap();
+    outbox.enqueue();
+    tx.send(batch(&owner, 100, 101)).await.unwrap();
+    until(Duration::from_secs(1), || {
+        diag.snapshot().nats_sink_published == 1
+    })
+    .await;
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot = diag.snapshot();
+    assert_eq!(snapshot.nats_sink_published, 1);
+    assert_eq!(
+        snapshot.nats_sink_failed, 1,
+        "only the blocked in-flight publish expires"
+    );
+    assert_eq!(
+        snapshot.nats_sink_discarded_on_close, 64,
+        "remaining 62 active + 2 queued rows share the expired deadline"
+    );
+    assert_eq!(
+        (outbox.pending(), outbox.acked(), outbox.failed()),
+        (0, 0, 2)
+    );
+    assert_eq!(owner.usage().reservation_bytes, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn nats_core_sdk_exit_does_not_refund_a_live_core_client() {
+    let mut broker = NatsSandbox::start().await;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let diag = IoDiagnostics::new();
+    let mut config = NatsClientConfig::new(vec![broker.url()]);
+    config.capacity = 1;
+    config.reconnect_attempts = 1;
+    let expected = config.sdk_reservation();
+    let client =
+        super::client::CoreClient::open(&config, None, &owner, &diag, super::client::Role::Sink)
+            .await
+            .unwrap();
+    broker.stop_broker();
+    until(Duration::from_secs(2), || client.is_closed()).await;
+    assert_eq!(owner.usage().reservation_bytes, expected);
+    client.close(false).await.unwrap();
+    assert_eq!(owner.usage().reservation_bytes, 0);
+}
+
+#[tokio::test]
+async fn nats_core_sink_flush_is_only_a_local_socket_flush_without_server_pong() {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket
+            .write_all(b"INFO {\"max_payload\":65536}\r\n")
+            .await
+            .unwrap();
+        assert!(peer_line(&mut socket).await.starts_with("CONNECT "));
+        assert_eq!(peer_line(&mut socket).await, "PING\r\n");
+        socket.write_all(b"PONG\r\n").await.unwrap();
+        // Deliberately never read any PUB or reply to any later PING.
+        done_rx.await.unwrap();
+    });
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let diag = IoDiagnostics::new();
+    let sink = NatsSink::bind(
+        NatsSinkConfig::new(vec![format!("nats://127.0.0.1:{port}")], "out.rows"),
+        &secrets(),
+        &TargetPolicy::allow("127.0.0.1", port),
+        owner.clone(),
+        diag.clone(),
+    )
+    .unwrap();
+    let (tx, rx) = sparrow_io::observed::channel(1);
+    tx.send(batch(&owner, 1, 1)).await.unwrap();
+    drop(tx);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        sink.run(rx, CancellationToken::new(), None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(diag.snapshot().nats_sink_published, 1);
+    assert_eq!(
+        diag.snapshot().nats_sink_flushes,
+        1,
+        "socket flush can succeed without broker receipt/PONG"
+    );
+    assert_eq!(owner.usage().reservation_bytes, 0);
+    done_tx.send(()).unwrap();
+    peer.await.unwrap();
 }
 
 fn csv_format(role: sparrow_formats::CsvRole) -> sparrow_formats::PayloadFormat {

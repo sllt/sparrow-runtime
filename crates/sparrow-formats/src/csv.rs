@@ -405,14 +405,23 @@ pub struct CsvDocument<'a> {
     records: Records<'a>,
 }
 
-impl CsvDocument<'_> {
+impl<'a> CsvDocument<'a> {
     /// Next data record. Errors are per record; the document continues.
     pub fn next_row(&mut self, owner: Option<&MemoryOwner>) -> Option<Result<Row>> {
         let record = self.records.next_record()?;
-        Some(
-            self.format
-                .decode_record(self.schema, &self.mapping, record, owner),
-        )
+        Some(self.decode(record, owner))
+    }
+
+    /// Next non-blank data record as raw bytes (terminator stripped), so a
+    /// caller can reject it by length and charge decode scratch first.
+    pub fn next_record(&mut self) -> Option<&'a [u8]> {
+        self.records.next_record()
+    }
+
+    /// Decode one record returned by [`Self::next_record`].
+    pub fn decode(&self, record: &[u8], owner: Option<&MemoryOwner>) -> Result<Row> {
+        self.format
+            .decode_record(self.schema, &self.mapping, record, owner)
     }
 }
 
@@ -983,6 +992,82 @@ impl CsvFormat {
         }
         Ok(out.bytes)
     }
+
+    /// [`Self::encode_message`] under a hard byte bound: `admit` bills each
+    /// capacity growth before allocation.
+    pub fn encode_message_bounded_with_capacity(
+        &self,
+        schema: &Schema,
+        row: &Row,
+        limit: usize,
+        admit: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<u8>> {
+        self.encode_rows_bounded_with_capacity(schema, std::slice::from_ref(row), limit, admit)
+    }
+
+    /// Conservative decode working set for one CSV message or record of
+    /// `len` wire bytes, to be charged before decoding. Callers reject
+    /// `len` over the record limit first, without allocating.
+    ///
+    /// Per wire byte: the unescaped field copies, the `csv` crate record
+    /// buffer, header names and Utf8/Bytes values are each at most `len`
+    /// (4×). A Dynamic or nested column parses its cell as JSON, so such a
+    /// schema uses the JSON factor (64×). Per field: the structural scan,
+    /// the split vector and the record bounds (doubled for `Vec` growth),
+    /// bounded by `max_fields`. Per schema field: the mapping, the Row and
+    /// the positional names. Constants: the reader buffer (≤8 KiB) and slack.
+    pub fn decode_scratch(&self, schema: &Schema, len: usize) -> usize {
+        let per_byte = if schema.fields.iter().any(|f| !is_flat(&f.data_type)) {
+            64
+        } else {
+            4
+        };
+        let fields = len
+            .saturating_add(1)
+            .min(self.limits.max_fields.saturating_add(1))
+            .max(schema.fields.len());
+        let per_field = std::mem::size_of::<(std::borrow::Cow<'static, [u8]>, bool)>()
+            + std::mem::size_of::<bool>()
+            + 2 * std::mem::size_of::<usize>();
+        let names = schema.fields.iter().fold(0usize, |n, f| {
+            n.saturating_add(f.name.len())
+                .saturating_add(std::mem::size_of::<String>())
+        });
+        let per_schema_field = 2 * std::mem::size_of::<Scalar>() + std::mem::size_of::<Option<usize>>();
+        len.saturating_mul(per_byte)
+            .saturating_add(fields.saturating_mul(per_field).saturating_mul(2))
+            .saturating_add(schema.fields.len().saturating_mul(per_schema_field))
+            .saturating_add(names)
+            .saturating_add(8 * 1024 + 4096)
+    }
+
+    /// Conservative encoder scratch outside the bounded output buffer: number
+    /// formatting, base64 text, and the JSON tree of Dynamic cells.
+    pub fn encode_scratch(&self, row: &Row) -> usize {
+        let factor = if row.values.iter().any(|v| matches!(v, Scalar::Dynamic(_))) {
+            8
+        } else {
+            2
+        };
+        row.resident_bytes()
+            .saturating_mul(factor)
+            .saturating_add(row.values.len().saturating_mul(64))
+            .saturating_add(4096)
+    }
+}
+
+/// Column types decoded straight from the cell text (no JSON parse).
+fn is_flat(ty: &DataType) -> bool {
+    matches!(
+        ty,
+        DataType::Bool
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Float64
+            | DataType::TimestampMicrosUTC
+            | DataType::Utf8
+            | DataType::Bytes
+    )
 }
 
 trait Out {
@@ -1092,6 +1177,85 @@ impl PayloadFormat {
         match self {
             Self::Json => crate::json::encode_json_row(schema, row),
             Self::Csv(format) => format.encode_message(schema, row),
+        }
+    }
+
+    /// [`Self::encode_row`] under a hard byte bound. `admit` bills each output
+    /// capacity growth before allocation (JSON: the one-row array envelope is
+    /// removed in place, so `limit` bounds the object itself).
+    pub fn encode_row_bounded_with_capacity(
+        &self,
+        schema: &Schema,
+        row: &Row,
+        limit: usize,
+        admit: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<u8>> {
+        match self {
+            Self::Json => {
+                let mut body = crate::json::encode_json_batch_bounded_with_capacity(
+                    schema,
+                    std::slice::from_ref(row),
+                    limit.saturating_add(2),
+                    admit,
+                )?;
+                body.remove(0);
+                body.pop();
+                Ok(body)
+            }
+            Self::Csv(format) => {
+                format.encode_message_bounded_with_capacity(schema, row, limit, admit)
+            }
+        }
+    }
+
+    /// Largest message payload this format may decode under `json`: the
+    /// connector rejects anything longer by length alone, before charging
+    /// scratch or allocating. CSV also honours its own record limit (a
+    /// message may carry a header record plus one data record).
+    pub fn max_message_bytes(&self, json: &JsonLimits) -> usize {
+        match self {
+            Self::Json => json.max_bytes,
+            Self::Csv(format) => json
+                .max_bytes
+                .min(format.limits.max_record_bytes.saturating_mul(2)),
+        }
+    }
+
+    /// Decode working set to charge before decoding one `len`-byte message.
+    /// JSON keeps the parse-tree estimate of the NATS/HTTP Poll sources;
+    /// CSV uses [`CsvFormat::decode_scratch`].
+    pub fn decode_scratch(&self, schema: &Schema, len: usize) -> usize {
+        match self {
+            Self::Json => len
+                .saturating_mul(64)
+                .saturating_add(
+                    schema
+                        .fields
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Scalar>())
+                        .saturating_mul(2),
+                )
+                .saturating_add(4096),
+            Self::Csv(format) => format.decode_scratch(schema, len),
+        }
+    }
+
+    /// Encoder scratch to charge before encoding `row`, in addition to the
+    /// output buffer billed through `admit`.
+    pub fn encode_scratch(&self, schema: &Schema, row: &Row) -> usize {
+        match self {
+            Self::Json => row
+                .resident_bytes()
+                .saturating_mul(8)
+                .saturating_add(
+                    schema
+                        .fields
+                        .iter()
+                        .fold(0usize, |n, f| n.saturating_add(f.name.capacity()))
+                        .saturating_mul(4),
+                )
+                .saturating_add(8192),
+            Self::Csv(format) => format.encode_scratch(row),
         }
     }
 }
