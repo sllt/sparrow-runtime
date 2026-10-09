@@ -63,7 +63,8 @@ policy has its own counter.
 ## 内存
 
 订阅缓冲的上限为 `buffer_bytes + buffer_capacity × 64 B`。订阅时把这一上限**一次性**
-作为 Reservation credit 记入订阅方 job 的内存账本，取消订阅时退还。
+作为 Reservation credit 记入订阅方 job 的内存账本。取消订阅先移除注册并清空消息；
+若在途发布快照仍持有已关闭的订阅，额度会保留到最后一个快照释放、底层缓冲真实销毁后才退还。
 
 - 单个订阅不能超过 job reservation 的 1/2。
 - 一个 pipeline 的所有 databus 订阅，加上 NATS / JetStream SDK 缓冲，合计不能超过 3/4。
@@ -102,7 +103,8 @@ policy has its own counter.
 `databus_source_dropped_oversize`。编码后超过 64 KiB 的行由 Sink 在发布前丢弃，计入
 `databus_sink_dropped_oversize`，所在批次不回执。
 
-**慢订阅者隔离**：发布方先把消息投给所有非 `block` 订阅者，再逐个等待 `block` 订阅者。
+**慢订阅者隔离**：发布方先非阻塞投递所有匹配订阅者，再在同一发布 future 内并发等待仍满的 `block` 订阅者。
+最多 256 个有界等待，不为订阅者另开 task；各自使用自己的截止时间，到期不再接受迟到投递。
 因此：
 
 - 在 drop 策略下，一个慢订阅者只影响它自己的计数。

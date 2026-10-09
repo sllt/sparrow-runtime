@@ -234,7 +234,7 @@ Control crate：
 | 合同项 | JetStream Sink 的实现 |
 |---|---|
 | 语义 | capability `jetstream_sink`：delivery `checkpointed_at_least_once`、recovery `aligned`、replay `unsupported`；每行等 PubAck，批次全部确认才回执 outbox；重试可能重复，`msg_id_column` 在 `duplicate_window` 内去重 |
-| Aligned | 独立线性 File v27，JSI1 精确目标 + 完整计划兼容；不沿用 v3 下游宽松规则，不与 v1..v26 混写/自动迁移；其他 checkpoint profile 拒绝（`UnsupportedRestore`） |
+| Aligned | 独立线性 File：JSON v27/JSI1 或 CSV v28/JSI2，精确目标与编码 + 完整计划兼容；不沿用 v3 下游宽松规则，不跨 profile 混写/自动迁移；其他 checkpoint profile 拒绝（`UnsupportedRestore`） |
 | 内存 | SDK 命令队列与 writer 双缓冲 + `max_inflight_acks × (max_payload_bytes + 8 KiB)` 在途保留记入 job reservation（≤ reservation/2），与其他 NATS 端点合计 ≤ 3/4；默认 client_capacity=4、max_inflight_acks=8，显式值不暗中钳制；编码 scratch 与 prepared metadata 另取同 owner 信用 |
 | 背压 | outbox 有界；在途 PubAck ≤ `max_inflight_acks`（SDK `max_ack_inflight` + 背压） |
 | 重试 | 每次 `2 × ack_timeout_ms`，100 ms→2 s 退避，≤ `max_retries`；耗尽、超限、非法 msg id → job 失败（fail closed） |
@@ -243,7 +243,8 @@ Control crate：
 | 指标 | `jetstream_sink_*`，pipeline status 的 `jetstream_sink` 对象 |
 
 JSI1 绑定端点、token SecretRef（不保存值）、stream 精确 created nanos、subject 和 msg-id 策略；
-旧目录/目标/下游语义变化不能静默继承历史。去重只在窗口内且要求稳定唯一 id，空值仍可能重复。
+CSV 的 JSI2 另绑定生效的 delimiter、quote、header、null_value，显式默认值与省略等价。
+旧目录/目标/下游语义或 JSON↔CSV/CSV 编码选项变化不能静默继承历史；拒绝不推进 CURRENT/状态代际，也不发布新行。去重只在窗口内且要求稳定唯一 id，空值仍可能重复。
 配置管理员不得在检查之间修改又恢复策略；PubAck/File 不等于消费者业务提交或设备掉电/fsync、HA、
 exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/20k 压测未执行。
 
@@ -268,14 +269,14 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | 合同项 | WebSocket 的实现 |
 |---|---|
 | 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`，at-most-once、无应用层确认；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
-| 内存 | 每连接读方向 128 KiB + 2 × `max_message_bytes`（1 KiB..1 MiB，默认 64 KiB），Sink 加发送中消息与写缓冲帧 2 × `max_message_bytes` 和 `queue_capacity × max_message_bytes`；在 bind 时记入 job reservation（单个 ≤ 1/2，与 NATS/JetStream/DataBus 合计 ≤ 3/4，饱和算术）；Source inbox 按 `inbox_bytes` 计入 queue 账本；Source 解码与 Sink 编码前先预扣临时额度（不足计 `dropped_budget`，不解析 / 不编码） |
+| 内存 | 读方向 128 KiB + 2 × `max_message_bytes`（1 KiB..1 MiB，默认 64 KiB）；Source 加 `(prefetch_capacity + 1) × (max_message_bytes + 256 B) + 8 KiB`；Sink 加发送中消息与写缓冲帧 2 × `max_message_bytes` 和 `queue_capacity × max_message_bytes`。同 job owner 静态预扣，actor / 消息共享 Arc lease 随真实 backing 生命周期保留（单个 ≤ 1/2，与 NATS/JetStream/DataBus 合计 ≤ 3/4，饱和算术）；inbox 按 `inbox_bytes` 计 Queue；decode scratch / bounded encode 先预扣，预算不足不解析 / 不编码 |
 | 大小上限 | 单帧超限在帧头处拒绝，不预留载荷；分片消息按累计长度在追加下一分片前拒绝；超大消息计 `dropped_oversize` 并重连；单条记录另按长度受格式解码上限（JSON 64 KiB / CSV `max_record_bytes`）；Sink 编码输出有上限 |
-| 背压 | Source inbox 满时停止读 socket（TCP 背压）；Sink 有界发送队列，`block` / `drop_newest`，`send_timeout_ms` 超时断开重连 |
-| 心跳 / 重连 | Ping 每 `ping_interval_ms`，`idle_timeout_ms` 无帧即重连；指数退避（100 ms → `reconnect_max_ms`，抖动取 [d/2, d]），每次断线 ≤ `reconnect_attempts`（拒绝 0）；耗尽后 Source 可重试失败，Sink fail closed（`websocket_sink_fatal`） |
-| 认证 / TLS | bearer / basic / 自定义头，仅 secret 引用且需 `wss://`；保留头和重复头拒绝；rustls 强制校验，`tls_ca_pem` 替换信任根；错误中不出现 URL、头值、凭据 |
+| 背压 | Source pump 等待 inbox 额度 / slot，wire actor 持续读控制帧；prefetch 默认4、1..=64，满时 drop newest 并计 `websocket_source_dropped_overflow`（完整消息数，不是 NDJSON 行数）。Sink 有界发送队列，`block` / `drop_newest`，`send_timeout_ms` 超时断开重连；反向读帧与发送公平轮转 |
+| 心跳 / 重连 | Ping 每 `ping_interval_ms`，`idle_timeout_ms` 无帧即重连；Source admission 背压 / Sink pending send 不暂停读控制帧；指数退避（100 ms → `reconnect_max_ms`，抖动取 [d/2, d]），每次断线 ≤ `reconnect_attempts`（拒绝 0）；耗尽后 Source 可重试失败，Sink fail closed（`websocket_sink_fatal`） |
+| 认证 / TLS | bearer / basic 和认证类头（Authorization / Proxy-Authorization / Cookie）必须 auth / SecretRef + `wss://`，其他字面头可用 ws；头名≤128 B、完整 upgrade 请求≤16 KiB，保留头和重复头拒绝；TCP+TLS+upgrade 共用 connect deadline；rustls 强制校验，`tls_ca_pem` 替换信任根；错误中不出现 URL、头值、凭据 |
 | 白名单 | host:port 经 `TargetPolicy`（默认端口 80/443），与 HTTP 相同 |
 | 格式 | JSON 文本帧（或 `binary_frames: decode`）、NDJSON 文本帧；CSV 只走文本帧且一条消息一条记录，与 ndjson / 二进制帧组合拒绝 |
-| 关闭 | Sink 在 `flush_timeout_ms` 内发完 outbox 与队列并发送 Close，剩余计 `discarded_on_close` |
+| 关闭 | Sink 的当前批次、outbox、在途发送、队列及 Close 共用一个 stop deadline（`flush_timeout_ms`），不逐批 / 逐消息重置；剩余计 `discarded_on_close`，未全部入队的 batch receipt 失败；实际 actor / backing 退出前不提前退款 |
 | 指标 | `websocket_source_*` / `websocket_sink_*`，pipeline status 中的 `websocket_source` / `websocket_sink` 对象 |
 
 ## 附：TCP Source / Sink（`kind: "tcp"`，始终构建）
@@ -302,7 +303,7 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 
 | kind | JSON | CSV Source | CSV Sink | CSV 单位 |
 |---|---|---|---|---|
-| `mqtt` / `nats` / `jetstream` | ✓ | ✓ | ✓ | 一条消息 = （表头 +）一条记录；JetStream Source 的 cut 身份绑定格式与 CSV 选项（JSON 身份不变） |
+| `mqtt` / `nats` / `jetstream` | ✓ | ✓ | ✓ | 一条消息 = （表头 +）一条记录；JetStream Source 的 cut 身份绑定格式与 CSV 选项（JSON 身份不变）；JetStream Sink 独立 File aligned 输出为 JSON v27 或 CSV v28 |
 | `http_push` | ✓ | ✓ | — | 一个请求 = （表头 +）一条记录 |
 | `http` Sink | ✓ | — | ✓ | 请求体 = 表头 + 多条记录；不能与 `body` / `single`、JetStream 源或 aligned 一起使用 |
 | `http_poll` | ✓ | ✓ | — | 一个响应 = 一份文档；`http_poll.format` 必须为空 |

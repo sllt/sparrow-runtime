@@ -356,13 +356,14 @@ impl CsvFramer {
     }
 }
 
-/// Strip one trailing `\n` and one `\r` before it.
+/// Strip one LF or CRLF terminator. A bare CR is data (and the strict
+/// scanner rejects it outside quotes), not another record terminator.
 pub fn strip_terminator(mut record: &[u8]) -> &[u8] {
     if let [rest @ .., b'\n'] = record {
         record = rest;
-    }
-    if let [rest @ .., b'\r'] = record {
-        record = rest;
+        if let [rest @ .., b'\r'] = record {
+            record = rest;
+        }
     }
     record
 }
@@ -477,7 +478,11 @@ impl CsvFormat {
                 "a single nullable CSV column needs a non-empty csv.null_value (a NULL row would be a blank line)",
             ));
         }
-        if !self.options.header {
+        if self.options.header {
+            // The header we emit must obey the same name contract as the
+            // decoder's header_mapping, including the 256-byte limit.
+            check_names(schema.fields.iter().map(|field| field.name.as_str()))?;
+        } else {
             self.positional_mapping(schema)?;
         }
         Ok(())
@@ -875,7 +880,8 @@ impl CsvFormat {
     }
 
     fn needs_quote(&self, text: &[u8]) -> bool {
-        text == self.options.null_value.as_bytes()
+        text.is_empty()
+            || text == self.options.null_value.as_bytes()
             || text.starts_with(BOM)
             || matches!(text.first(), Some(b' ' | b'\t'))
             || matches!(text.last(), Some(b' ' | b'\t'))
@@ -901,14 +907,17 @@ impl CsvFormat {
     fn put_value(&self, out: &mut impl Out, value: &Scalar) -> Result<()> {
         match value {
             Scalar::Null => out.put(self.options.null_value.as_bytes()),
-            Scalar::Bool(v) => out.put(if *v { b"true" } else { b"false" }),
-            Scalar::Int64(v) | Scalar::TimestampMicrosUTC(v) => out.put(v.to_string().as_bytes()),
-            Scalar::UInt64(v) => out.put(v.to_string().as_bytes()),
+            Scalar::Bool(v) => self.put_text(out, if *v { b"true" } else { b"false" }),
+            Scalar::Int64(v) | Scalar::TimestampMicrosUTC(v) => {
+                self.put_text(out, v.to_string().as_bytes())
+            }
+            Scalar::UInt64(v) => self.put_text(out, v.to_string().as_bytes()),
             // Non-finite floats have no CSV/JSON number form: NULL, as in JSON.
             Scalar::Float64(v) if !v.is_finite() => out.put(self.options.null_value.as_bytes()),
-            Scalar::Float64(v) => out.put(v.to_string().as_bytes()),
+            Scalar::Float64(v) => self.put_text(out, v.to_string().as_bytes()),
             Scalar::Utf8(v) => self.put_text(out, v.as_bytes()),
-            Scalar::Bytes(v) => out.put(
+            Scalar::Bytes(v) => self.put_text(
+                out,
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v.as_ref())
                     .as_bytes(),
             ),

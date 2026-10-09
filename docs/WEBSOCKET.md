@@ -28,6 +28,7 @@ spec 校验返回 `FeatureUnavailable`。feature 只增加 `tokio-tungstenite`�
       "reconnect_max_ms": 5000,
       "reconnect_attempts": 10,
       "max_message_bytes": 65536,
+      "prefetch_capacity": 4,
       "framing": "message"
     }
   },
@@ -63,7 +64,7 @@ WebSocket 网关。listen 模式如需要，单独立项。
 |---|---|---|---|
 | `url` | 必填 | `ws://` / `wss://`，≤ 4096 B | 不允许 userinfo（`user:pw@`）和 `#fragment`；查询串保留 |
 | `auth` | 无 | `{"type":"bearer","token_secret":…}` / `{"type":"basic","username_secret":…,"password_secret":…}` | 只接受 secret 引用；需要 `wss://` |
-| `headers` | `[]` | ≤ 16 个 | `{"name","value"}` 或 `{"name","value_secret"}` 二选一；`value_secret` 需要 `wss://`；保留头（`Host`、`Connection`、`Upgrade`、`Content-Length`、`Transfer-Encoding`、`Sec-WebSocket-*`）以及重复头（含设置了 `auth` 时的 `Authorization`）拒绝 |
+| `headers` | `[]` | ≤ 16 个，头名 ≤ 128 B，字面值 / 单个 secret 值 ≤ 4096 B | `{"name","value"}` 或 `{"name","value_secret"}` 二选一；`value_secret` 需要 `wss://`；`Authorization`、`Proxy-Authorization`、`Cookie` 不接受字面值，必须用 auth / SecretRef + WSS；保留头（`Host`、`Connection`、`Upgrade`、`Content-Length`、`Transfer-Encoding`、`Sec-WebSocket-*`）以及重复头（含设置了 `auth` 时的 `Authorization`）拒绝 |
 | `subprotocols` | `[]` | ≤ 8 个不重复的 RFC 6455 token | 作为 `Sec-WebSocket-Protocol` 发送；服务器必须选中其中一个，否则握手失败 |
 | `tls_ca_pem` | 无 | 内联 PEM，1..=16 张证书，≤ 64 KiB | **替换**内置 web PKI 根（私有 CA / 自签名）；证书与主机名校验始终开启，没有“跳过校验”选项；只能和 `wss://` 一起用 |
 | `connect_timeout_ms` | 5000 | 100..=60000 | TCP + TLS + 升级握手的总时限；Source 的 Ping 发送也受它约束（Sink 的 Ping 受 `send_timeout_ms` 约束） |
@@ -74,7 +75,8 @@ WebSocket 网关。listen 模式如需要，单独立项。
 | `max_message_bytes` | 65536 | 1024..=1048576 | 单条消息 / 单帧上限，见“大小上限” |
 
 Source 专有：`framing`（`message` 默认 / `ndjson`）、`binary_frames`（`drop` 默认 /
-`decode`）、`inbox_bytes`（默认 256 KiB）。Source 级的 `format`、`fail_on_decode`、
+`decode`）、`inbox_bytes`（默认 256 KiB）、`prefetch_capacity`（默认 **4**，范围 **1..=64**，
+完整消息预取数，满时丢弃最新消息，不暗中钳制显式配置）。Source 级的 `format`、`fail_on_decode`、
 `inbox_capacity` 照常使用。
 
 Sink 专有：`frame`（`text` 默认 / `binary`）、`queue_capacity`（默认 16，1..=1024）、
@@ -90,15 +92,22 @@ Sink 专有：`frame`（`text` 默认 / `binary`）、`queue_capacity`（默认 
 - **白名单 / SSRF**：主机和端口经 `TargetPolicy`（与 HTTP 相同的 deny-by-default 白名单，
   并拒绝 link-local / 云元数据 / 未指定地址）。与 HTTP 一样，不对 DNS 解析结果再次校验 IP。
 - **凭据**：`auth` 和 `value_secret` 头只在 `wss://` 上允许，在 `bind` 时解析，
-  缺失返回 `SecretMissing`。错误信息、`Debug` 输出和状态中**从不**出现 URL、
+  缺失返回 `SecretMissing`。认证类头 `Authorization` / `Proxy-Authorization` / `Cookie`
+  不能用 `value` 内联凭据；非认证类字面头可用于 `ws://`。错误信息、`Debug` 输出和状态中**从不**出现 URL、
   头的值或凭据；握手被拒只报告 `HTTP <status>`（例如 401）。
+- **升级请求**：请求行、URL path/query、标准升级头、subprotocols 与解析后的认证 / 自定义头
+  合计最多 **16 KiB**，不是只数自定义头。TCP、TLS、HTTP upgrade 共用一个 connect deadline，
+  每阶段不重发 `connect_timeout_ms` 预算；这里的 16 KiB 是请求限制，不是响应限制。
 - **TLS**：rustls，强制证书校验；`tls_ca_pem` 只是换一组信任根。
 
 ## 心跳与重连
 
 - 每个连接按 `ping_interval_ms` 发 Ping，计 `*_pings_sent`。
-- 等待读的时候超过 `idle_timeout_ms` 没收到任何帧 → 计 `*_heartbeat_timeouts`，
-  断开并重连。Source 因自身 inbox 满而阻塞的时间**不算**空闲（不会因为下游慢就被误判断线）。
+- 超过 `idle_timeout_ms` 没收到任何帧 → 计 `*_heartbeat_timeouts`，断开并重连。
+  Source 的独立 wire actor 在 inbox 背压期间仍读 socket、处理 Ping/Pong 和发心跳；
+  pump 等待不停止心跳计时，活跃 peer 的控制帧会持续刷新期限。
+- Source 的 Ping 和 Sink 的数据 / Ping 发送被写端阻塞时，仍并行 poll 读端，
+  不因慢写停止处理控制帧；Sink 在接收帧和发送队列之间公平轮转，持续反向数据不会饿死发送。
 - 断线（对端 Close、读写错误、心跳超时、超大消息）计 `*_disconnects`，
   然后按指数退避重连：从 100 ms 起翻倍，封顶 `reconnect_max_ms`，带随机抖动
   （实际等待在 [d/2, d] 内均匀取值）。断线后的**第一次**重连前也会退避，
@@ -140,9 +149,14 @@ Sink 中 `frame: text` 但编码结果不是合法 UTF-8 的行计 `dropped_bad`
 
 ## Source：入口预算
 
-与 NATS/HTTP Poll 相同的预算式入口：每行先在 inbox 中按 `inbox_bytes`
-取得 Queue 额度再入队；额度/容量满时等待（计 `websocket_source_backpressure_waits`），
-等待期间不读 socket，压力通过 TCP 窗口传回服务器；单行大于整个预算时计
+独立 wire actor 继续读取协议帧，完整数据消息进入有界 `prefetch_capacity` 队列；
+只有取得队列 slot 后才复制为 exact-size payload。队列满时丢弃**整条最新消息**，计
+`websocket_source_dropped_overflow`，不等待下游、不停止读取心跳。NDJSON 一条消息包含多行时，
+这仍计一次消息丢弃，不是按行计数；live/at-most-once 不承诺压力下无损。
+
+pump 逐消息解码，按 `inbox_bytes` 取得 Queue 额度再入队；额度/容量满时等待
+（计 `websocket_source_backpressure_waits`），但 wire actor 不随它暂停。
+单行大于 inbox 总额度或 `max_row_bytes` 时计 `dropped_oversize`；临时额度不足计
 `dropped_budget`。inbox 占用见 `websocket_source_inbox_items` / `inbox_bytes`。
 
 解码前，先按长度拒绝，再把该格式的解码工作集估算（`decode_scratch`，JSON 与 CSV
@@ -153,31 +167,38 @@ Sink 中 `frame: text` 但编码结果不是合法 UTF-8 的行计 `dropped_bad`
 
 - 结构：pump（从 outbox 取批次、编码、放入有界队列）与 writer（持有连接、
   发送、心跳、重连）并行运行，共享一个 `queue_capacity` 条消息的队列。
-- 批次中的每一行都放入队列（或计数丢弃）后才回执 outbox——“完成”是“交给了发送队列”，
-  不是对端收到。
+- 批次中的每一行都成功放入队列才记 outbox 成功回执；丢弃、预算不足或关闭导致未入队时
+  receipt 失败——“成功完成”是“交给了发送队列”，不是对端收到。
 - 队列满：`block` 等待（计 `backpressure_waits`，压力传回 outbox / SQL）；
   `drop_newest` 丢掉新行并计 `dropped_overflow`。
 - 单条发送超过 `send_timeout_ms`（对端不读、TCP 窗口塞满）计 `send_timeouts`，
   断开并重连；该消息丢失。发送错误计 `send_failed`。
 - 服务器发给 Sink 的数据帧计 `ignored_frames` 并丢弃。
 - 编码前先把编码临时额度记入 job reservation，输出每次扩容也先记账，并且有
-  `max_message_bytes` 上限；额度不足的行不编码，计 `dropped_budget`，所在批次不回执。
+  `max_message_bytes` 上限；额度不足的行不编码，计 `dropped_budget`，所在批次不记成功回执。
   该额度持有到消息进入（已预扣的）发送队列为止。
-- 停止：在 `flush_timeout_ms` 内把 outbox 和队列中剩余的行发完，然后发 Close 帧
+- 停止：第一处观察到取消时建立**唯一** `flush_timeout_ms` deadline，pump 的当前批次 / outbox、
+  writer 的在途发送 / 队列以及 Close 都共用剩余预算，不给下一批或下一条消息重置时限。
+  尽力发完后发 Close 帧
   （计 `closes`，失败计 `close_failed`）；超时后剩余的计 `discarded_on_close`。
-  停止发生在某次被阻塞的发送中时，该次发送也只等到 flush 截止时间。
+  停止发生在某次被阻塞的发送中时，该次发送也只等到 flush 截止时间；已断线时不为排空重新连接。
 
 ## 内存
 
 - 每个连接的读方向：128 KiB 固定开销 + 2 × `max_message_bytes`（读缓冲中的一帧载荷与
   一条在组装的分片消息；依据 tungstenite 0.30 的读路径）。Source 只发 Ping，按此记账。
+- Source 再预留 `(prefetch_capacity + 1) × (max_message_bytes + 256 B) + 8 KiB`，
+  覆盖完整消息队列、pump 已取出的一个消息和队列元数据；默认总预留 **599,296 B**。
 - Sink 另加 2 × `max_message_bytes`（正在发送的消息，以及 tungstenite 把它复制进写缓冲
   后的帧）和 `queue_capacity × max_message_bytes`。默认 128 KiB + (2 + 2 + 16) × 64 KiB
   ≈ 1.4 MiB。单个端点必须 ≤ job reservation 的一半。
 - 已编码但尚未进入队列的行由它的编码额度单独记账（见上）。
-- 这些是账本估算，不是 RSS 上限（TLS、内核 socket 缓冲等不在内）。所有算术饱和，
-  超大配置值在校验时以 `BoundExceeded` 拒绝（有测试）。
-- 在 `bind` 时记入 job reservation；pipeline 中所有 WebSocket / NATS / JetStream /
+- 这些是账本估算，不是 RSS 上限；连接固定项估算 TLS 等状态，内核 socket 缓冲不计入 job 账本。所有算术饱和，
+  超大配置值在校验时以 `BoundExceeded` 拒绝（有测试），不调大预算掩盖压力。
+- Source 启动 wire actor、Sink `bind` 时在**同一 job owner** 预扣静态 reservation；
+  actor、接收端和每个排队 / 正在处理的消息共享 Arc lease，直到实际 socket / backing payload
+  释放才退款，取消或 drop handle 不提前释放正在关闭的 actor 或正在 ingest 的消息信用。
+  pipeline 中所有 WebSocket / NATS / JetStream /
   DataBus 端点合计 ≤ reservation 的 3/4，超出在校验时返回 `BoundExceeded`。
 - Source 的 inbox 按 `inbox_bytes` 计入 queue 账本。
 
@@ -193,7 +214,7 @@ capability `websocket` / `websocket_sink`：delivery `live_best_effort`、recove
 
 pipeline status 中的 `websocket_source` / `websocket_sink` 对象，`/metrics` 的 io 字段：
 
-- Source：`websocket_source_{received,rows,dropped_bad,dropped_oversize,dropped_binary,dropped_budget,backpressure_waits,connects,reconnects,disconnects,connect_failures,heartbeat_timeouts,pings_sent,inbox_items,inbox_bytes}`
+- Source：`websocket_source_{received,rows,dropped_bad,dropped_oversize,dropped_binary,dropped_budget,dropped_overflow,backpressure_waits,connects,reconnects,disconnects,connect_failures,heartbeat_timeouts,pings_sent,inbox_items,inbox_bytes}`
 - Sink：`websocket_sink_{sent,dropped_bad,dropped_oversize,dropped_overflow,dropped_budget,backpressure_waits,send_failed,send_timeouts,discarded_on_close,connects,reconnects,disconnects,connect_failures,heartbeat_timeouts,pings_sent,ignored_frames,closes,close_failed,fatal,queue_items}`
 
 健康状态：断线时为 `Reconnecting`（原因如 `websocket_heartbeat_timeout`），

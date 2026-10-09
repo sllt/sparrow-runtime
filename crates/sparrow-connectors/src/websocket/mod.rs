@@ -13,7 +13,10 @@ pub use client::{
     reconnect_delay, BoundClient, WebSocketAuth, WebSocketClientConfig, WebSocketHeader,
 };
 pub use sink::{Overflow, SinkFrame, WebSocketSink, WebSocketSinkConfig};
-pub use source::{BinaryFrames, WebSocketFraming, WebSocketSource, WebSocketSourceConfig};
+pub use source::{
+    BinaryFrames, WebSocketFraming, WebSocketSource, WebSocketSourceConfig,
+    DEFAULT_PREFETCH_CAPACITY,
+};
 
 // Reuse the one compiled copy of the localhost test CA (clippy duplicate_mod).
 #[cfg(test)]

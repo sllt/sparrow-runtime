@@ -7,7 +7,7 @@
 
 use std::hash::{BuildHasher, Hasher};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject;
@@ -15,12 +15,39 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use sparrow_model::{ErrorCode, Result, SparrowError};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 pub const MAX_RECONNECT_ATTEMPTS: usize = 1000;
 pub const DEFAULT_RECONNECT_ATTEMPTS: usize = 10;
 const MAX_CA_PEM_BYTES: usize = 64 * 1024;
 const MAX_CA_CERTS: usize = 16;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
+
+/// One stop deadline shared by the pump, writer and in-flight send. The
+/// first observer fixes it; subsequent work cannot extend the shutdown.
+pub(crate) struct FlushBudget {
+    timeout: Duration,
+    deadline: OnceLock<Instant>,
+}
+
+impl FlushBudget {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self { timeout, deadline: OnceLock::new() }
+    }
+
+    pub(crate) fn deadline(&self, cancel: &CancellationToken) -> Option<Instant> {
+        if cancel.is_cancelled() {
+            Some(*self.deadline.get_or_init(|| Instant::now() + self.timeout))
+        } else {
+            self.deadline.get().copied()
+        }
+    }
+
+    pub(crate) fn expired(&self, cancel: &CancellationToken) -> bool {
+        self.deadline(cancel).is_some_and(|at| Instant::now() >= at)
+    }
+}
 
 /// Install the process-wide rustls `ring` provider once (idempotent; a
 /// provider installed elsewhere first is kept).
