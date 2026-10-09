@@ -225,3 +225,20 @@ Control crate：
 | 认证 | 仅 `token_secret`，必须 `tls://`；URL 不得含 userinfo；端点经 `TargetPolicy` |
 | 关闭 | Sink 在 `flush_timeout_ms` 内发布已排队批次、flush，剩余计 `discarded_on_close`；等待 SDK 真实退出后退款 |
 | 指标 | `nats_source_*` / `nats_sink_*`，pipeline status 中的 `nats_source` / `nats_sink` 对象 |
+
+## 附：JetStream Sink（`sink.kind: "jetstream"`，feature `jetstream`）
+
+说明见 [JETSTREAM.md](JETSTREAM.md#jetstream-sink)，决策见
+[ADR-005](adr/005-jetstream-sink.md)。
+
+| 合同项 | JetStream Sink 的实现 |
+|---|---|
+| 语义 | capability `jetstream_sink`：delivery `checkpointed_at_least_once`、recovery `aligned`、replay `unsupported`；每行等 PubAck，批次全部确认才回执 outbox；重试可能重复，`msg_id_column` 在 `duplicate_window` 内去重 |
+| Aligned | 仅线性 File profile（barrier 等 outbox 清空）；其他 checkpoint profile 拒绝（`UnsupportedRestore`） |
+| 内存 | SDK 缓冲 + `max_inflight_acks × (max_payload_bytes + 8 KiB)` 在途保留记入 job reservation（≤ reservation/2），与其他 NATS 端点合计 ≤ 3/4 |
+| 背压 | outbox 有界；在途 PubAck ≤ `max_inflight_acks`（SDK `max_ack_inflight` + 背压） |
+| 重试 | 每次 `2 × ack_timeout_ms`，100 ms→2 s 退避，≤ `max_retries`；耗尽、超限、非法 msg id → job 失败（fail closed） |
+| 校验 | stream 名、字面 subject、边界；启动时 stream 必须存在、未 sealed、非 mirror、绑定 subject，从不自动创建 |
+| 关闭 | `flush_timeout_ms` 内确认已排队批次；剩余计 `discarded_on_close` 并使 job 失败 |
+| 指标 | `jetstream_sink_*`，pipeline status 的 `jetstream_sink` 对象 |
+

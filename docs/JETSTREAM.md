@@ -112,6 +112,71 @@ SDK `read_buffer_capacity` 只是初始容量；不能把它或订阅条数当�
 - 删除管线不会自动删除 stream/KV。停掉引用该逻辑 consumer 的全部 Job，确认 SDK 已退出后，保留 checkpoint/owner/KV 备份；由管理员核对绑定中的 attempt nonce，删除对应 reader。reader 另设 24 h inactivity 回收，**KV 绑定不自动过期**。仅确认永久弃用这个逻辑身份时才按 broker 的 KV 管理流程清理绑定；需要复用身份应优先恢复原目录，不强行覆盖。
 - `JETSTREAM_OWNER` 损坏默认拒绝。只有确认是首次创建中断、没有 CURRENT/历史快照且 broker 尚无该绑定时，才可备份并移除这个未完成 marker 后重试。已有绑定或来源不明时必须恢复匹配备份/制定迁移方案，不能一概删除重建。
 
+## JetStream Sink
+
+`sink.kind: "jetstream"`（feature `jetstream`，Preview）把每个输出行发布到**已存在**的
+stream，并等待服务器 PubAck；决策与取舍见 [ADR-005](adr/005-jetstream-sink.md)。
+
+```json
+"sink": {
+  "kind": "jetstream",
+  "outbox_capacity": 16,
+  "jetstream": {
+    "servers": ["nats://127.0.0.1:4222"],
+    "stream": "OUT",
+    "subject": "out.events",
+    "msg_id_column": "id",
+    "ack_timeout_ms": 2000,
+    "max_inflight_acks": 8,
+    "max_retries": 5,
+    "flush_timeout_ms": 5000
+  }
+}
+```
+
+| 字段 | 默认 | 范围 / 说明 |
+|---|---|---|
+| `servers` / `token_secret` / `reconnect_attempts` / `connect_timeout_ms` / `max_payload_bytes` | 同 NATS Core | token 仅 `tls://`；端点经 TargetPolicy |
+| `client_capacity` | 8 | SDK 命令缓冲（消息数） |
+| `stream` | 必填 | 1..=255 可见字节，不含 `. * > / \`；必须已存在 |
+| `subject` | 必填 | 字面 subject，必须被 stream 的 subjects 覆盖 |
+| `ack_timeout_ms` | 2000 | 100..=30000；每次尝试上限 2× |
+| `max_inflight_acks` | 8 | 1..=256；`1` = 严格顺序 |
+| `max_retries` | 5 | 0..=20，100 ms→2 s 退避 |
+| `flush_timeout_ms` | 5000 | 10..=60000，stop/EOF 确认已排队批次 |
+| `msg_id_column` | 无 | utf8/int64/uint64 输出列 → `Nats-Msg-Id`；stream 需 `duplicate_window > 0` |
+
+语义：
+
+- **at-least-once 进入 stream**：批次只有全部行拿到 PubAck 才算交付；重试可能
+  重复（`jetstream_sink_duplicates` 为服务器报告的去重命中）。设置 `msg_id_column` 时
+  服务器在 `duplicate_window` 内去重；超过窗口的重放仍会重复。不提供内容哈希 id
+  （会合并合法的相同行）。
+- **Fail closed**：stream 缺失/不可写/未绑定 subject、超限行、非法 msg id、重试耗尽、
+  stop 时未能在 `flush_timeout_ms` 内确认 → job `JobFailed`（`JetStream Sink failed closed`）。
+- **从不创建 stream**：由运维按保留/配额策略预先创建。
+- **Aligned**：仅线性 File 源 profile（`recovery: aligned` + `checkpoint_dir`）。checkpoint
+  只在 barrier 前所有批次都已 PubAck 后提交；broker 暂停时 checkpoint 超时、不提交；
+  恢复后从最后 checkpoint 重放 File 输入，配合 `msg_id_column` 不产生重复。
+  NATS/MQTT/HTTP 等 live 源与 graph/IoT/引用表/JetStream source 的 checkpoint profile
+  返回 `UnsupportedRestore`（这些 profile 依赖 HTTP 稳定输出 ID）。
+- **顺序**：`max_inflight_acks > 1` 时重试会打乱顺序。
+- **指标**：`jetstream_sink_{acked,duplicates,retries,ack_timeouts,failed,batches,discarded_on_close,dropped_bad,dropped_oversize,msg_id_missing,disconnects,reconnects,client_errors,sessions,fatal,inflight}`。
+
+真实 broker 测试：
+
+```bash
+SPARROW_NATS_SERVER=/path/to/nats-server \
+  cargo test -p sparrow-connectors --features jetstream --lib jetstream_s -- --include-ignored
+SPARROW_NATS_SERVER=/path/to/nats-server \
+  cargo test -p sparrow-control --features jetstream --lib jetstream_sink -- --include-ignored
+```
+
+覆盖：PubAck 后才回执、stream 缺失/subject 未绑定且不创建、ack 超时重试与去重后
+fail closed、broker 重启（无 msg id：不丢、重复计数；有 msg id：无重复）、stop 时刷新、
+超限行失败、NATS → SQL 过滤 → JetStream 的精确 stream 计数、aligned checkpoint 等待
+PubAck 且恢复去重、aligned job 在 stream 缺失时失败。
+
 ## 构建和验证
 
 ```sh

@@ -16,9 +16,9 @@ reconnecting are lost. Use JetStream when you need durability.
 | | NATS Core（`nats`） | JetStream（`jetstream`） |
 |---|---|---|
 | cargo feature | `nats`（只带 `async-nats`） | `jetstream`（= `nats` + ring） |
-| 角色 | Source + Sink | Source（输出走 required HTTP） |
+| 角色 | Source + Sink | Source（输出走 required HTTP）；Sink `kind: "jetstream"`（PubAck，见 [JETSTREAM.md](JETSTREAM.md#jetstream-sink)） |
 | 交付语义 | `live_best_effort`，at-most-once | `checkpointed_at_least_once` |
-| 确认 | 无（Source 不 ACK，Sink 不等 broker ACK） | durable publication 后 Explicit ACK |
+| 确认 | 无（Source 不 ACK，Sink 不等 broker ACK） | Source：durable publication 后 Explicit ACK；Sink：每行等 PubAck，批次全确认才回执 |
 | Replay / 恢复 | 不支持；`restart_fresh`，停机期间消息丢失 | consumer 位置随 checkpoint 恢复 |
 | 允许的 recovery | 仅 `restart_fresh`；拒绝 `aligned`、`restore`、`checkpoint`、`checkpoint_dir` | 需要 `aligned` + checkpoint |
 | 订阅 | subject（可含 `*` / 尾部 `>`），可选 queue group | stream + durable consumer + ownership bucket |
