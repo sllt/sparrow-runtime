@@ -332,6 +332,9 @@ impl TcpSource {
             Read(std::io::Result<usize>),
         }
         let mut reader = self.client.reader(self.config.oversize);
+        if self.config.payload_format.as_csv().is_some() {
+            reader.preserve_whitespace_lines();
+        }
         // Lines + CSV: each connection is one document.
         let mut mapping: Option<CsvMapping> = match self.config.payload_format.as_csv() {
             Some(csv) if self.client.config.framing == TcpFraming::Lines && !csv.header() => {
@@ -340,9 +343,18 @@ impl TcpSource {
             _ => None,
         };
         let mut last_read = Instant::now();
+        let mut frames = 0usize;
         loop {
             let mut drained = false;
             while let Some(frame) = reader.next_frame() {
+                frames += 1;
+                if frames % 16 == 0 {
+                    tokio::task::yield_now().await;
+                }
+                if cancel.is_cancelled() {
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, stream.shutdown()).await;
+                    return Ok(SessionEnd::Stop);
+                }
                 drained = true;
                 let range = match frame {
                     Frame::Oversize => {
@@ -351,6 +363,9 @@ impl TcpSource {
                             .fetch_add(1, Ordering::Relaxed);
                         if self.config.oversize == OversizePolicy::Disconnect {
                             return Ok(SessionEnd::Lost("tcp_frame_too_big"));
+                        }
+                        if self.needs_csv_header(&mapping) {
+                            return Ok(SessionEnd::Lost("tcp_csv_header_too_big"));
                         }
                         continue;
                     }
@@ -439,7 +454,11 @@ impl TcpSource {
             self.diag
                 .tcp_source_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(Ingested::Continue);
+            return Ok(if self.needs_csv_header(mapping) {
+                Ingested::Lost("tcp_csv_header_too_big")
+            } else {
+                Ingested::Continue
+            });
         }
         let lines_csv = match format.as_csv() {
             Some(csv) if self.client.config.framing == TcpFraming::Lines => Some(csv),
@@ -503,6 +522,17 @@ impl TcpSource {
                 Ingested::Stop
             },
         )
+    }
+
+    /// A lost header invalidates the entire connection's CSV document.
+    fn needs_csv_header(&self, mapping: &Option<CsvMapping>) -> bool {
+        self.client.config.framing == TcpFraming::Lines
+            && self
+                .config
+                .payload_format
+                .as_csv()
+                .is_some_and(|csv| csv.header())
+            && mapping.is_none()
     }
 
     /// Count a decode failure; `fail_on_decode` turns it into a job error.

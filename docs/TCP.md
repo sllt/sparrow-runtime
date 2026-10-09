@@ -90,7 +90,8 @@ Sink 专有：`queue_capacity`（默认 16，1..=1024）、`overflow`（`block` 
 ### `lines`
 
 - 一条记录 = 以 `\n` 结尾的一行；行尾的 `\r` 一并去掉（接受 `\r\n`）。
-- 空行和只含 JSON 空白（空格、`\t`、`\r`）的行跳过，不计数；其他字节（如 `\x0b`、
+- 空行跳过，不计数；JSON 另外跳过只含 JSON 空白（空格、`\t`、`\r`）的行。CSV 的空格、
+  Tab 和去掉一次 CRLF 后剩余的 CR 必须交给 CSV 解码器，不可当空行丢弃。其他字节（如 `\x0b`、
   `\x0c`、Unicode 空白）不算空白，按记录解码（通常计 `dropped_bad`）。
 - 长度检查在解码之前：缓冲区中超过 `max_frame_bytes` 仍没有换行即判为超长，
   不会继续缓冲（读缓冲是固定大小的，不会增长）。
@@ -124,6 +125,7 @@ Sink 专有：`queue_capacity`（默认 16，1..=1024）、`overflow`（`block` 
 - CSV over `lines` 的表头：长度先不分配地算出，超过 `max_frame_bytes` 时整批计
   `dropped_oversize`、不发送、不回执（没有表头的 CSV 文档无法使用）。表头与该连接的第一条
   记录在同一次有界发送中先后写出，不拼接复制。
+  表头上限不含末尾 LF，输出容量也有界；含 CR/LF 的列名拒绝，避免拆成多行。
 
 ## 格式
 
@@ -143,6 +145,7 @@ Source 中表头无效（与 schema 不符等）计 `dropped_bad`（及 `csv_*` 
 （表头和记录都一样）。额度不足的记录计 `tcp_source_dropped_budget`、不解析；
 如果是 CSV over `lines` 的表头拿不到额度，则断开重连（原因 `tcp_csv_header_budget`），
 避免把下一行误当成表头。
+表头超过分帧或 CSV 格式上限时同样断开重连，即使配置了 `resync`；该连接剩余数据不再解析。
 
 ## 空闲、keepalive 与重连
 
@@ -177,7 +180,10 @@ Source 中表头无效（与 schema 不符等）计 `dropped_bad`（及 `csv_*` 
 
 - 结构：pump（从 outbox 取批次、编码、加分帧、放入有界队列）与 writer（持有连接、写、
   重连）并行运行，共享 `queue_capacity` 帧的队列。
-- 批次中每一行都入队（或计数丢弃）后才回执 outbox——“完成”是“交给发送队列”，不是对端收到。
+- 只有批次中每一行都成功入队才回执 outbox；任一行丢弃则该批次失败——“完成”是“交给发送队列”，不是对端收到。
+- 读取和发送交替优先；部分写阻塞期间仍读取并丢弃对端数据，避免双向写入相互阻塞。
+- 首次观察到停止时固定一个 deadline，pump、writer、在途发送和排空共用，不逐行重置。
+  期限到达后即使队列/写 socket 立即就绪，也不得继续接收或发送。
 - 队列满：`block` 等待（计 `backpressure_waits`，压力传回 outbox / SQL）；`drop_newest`
   丢掉新行并计 `dropped_overflow`。
 - 一帧的写入（含所有部分写和 flush）超过 `send_timeout_ms`（对端不读、窗口塞满）计

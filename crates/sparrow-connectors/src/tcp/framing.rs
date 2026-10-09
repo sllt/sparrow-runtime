@@ -79,6 +79,7 @@ pub(crate) struct FrameReader {
     width: PrefixWidth,
     limit: usize,
     oversize: OversizePolicy,
+    skip_whitespace_lines: bool,
     buf: Box<[u8]>,
     start: usize,
     end: usize,
@@ -103,6 +104,7 @@ impl FrameReader {
             width,
             limit,
             oversize,
+            skip_whitespace_lines: true,
             buf: vec![0u8; Self::capacity(limit, width)].into_boxed_slice(),
             start: 0,
             end: 0,
@@ -122,6 +124,11 @@ impl FrameReader {
 
     pub(crate) fn bytes(&self, range: Range<usize>) -> &[u8] {
         &self.buf[range]
+    }
+
+    /// CSV treats spaces/tabs as field data, not a blank document line.
+    pub(crate) fn preserve_whitespace_lines(&mut self) {
+        self.skip_whitespace_lines = false;
     }
 
     /// Bytes of an unfinished record (or a skip in progress) at EOF.
@@ -209,9 +216,11 @@ impl FrameReader {
             }
             // Blank = only JSON whitespace (space, tab, CR; LF ends the
             // line). Form feed / vertical tab are record bytes.
-            if self.buf[line_start..line_end]
-                .iter()
-                .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
+            if line_start == line_end
+                || (self.skip_whitespace_lines
+                    && self.buf[line_start..line_end]
+                        .iter()
+                        .all(|b| matches!(b, b' ' | b'\t' | b'\r')))
             {
                 continue;
             }
@@ -286,6 +295,19 @@ mod tests {
 
     fn ok(s: &str) -> Result<Vec<u8>, ()> {
         Ok(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn csv_preserves_space_tab_and_bare_cr_records() {
+        let mut r = FrameReader::new(
+            TcpFraming::Lines,
+            PrefixWidth::U32,
+            16,
+            OversizePolicy::Resync,
+        );
+        r.preserve_whitespace_lines();
+        r.push(b" \n\t\n\r\r\n\n\r\n");
+        assert_eq!(drain(&mut r), vec![ok(" "), ok("\t"), ok("\r")]);
     }
 
     #[test]

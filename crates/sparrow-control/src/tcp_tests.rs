@@ -35,6 +35,41 @@ fn parse(value: &Value) -> sparrow_model::Result<PipelineSpec> {
 type Mutation = Box<dyn Fn(&mut Value)>;
 
 #[test]
+fn tcp_typed_graph_nonlegacy_endpoint_refuses_durable_claims() {
+    let tcp = linear_spec(9001, 9002);
+    for source in [false, true] {
+        let mut value = tcp.clone();
+        value["source"] = json!({"kind":"file", "path":"/tmp/sparrow/input.jsonl"});
+        value["sink"] = json!({"kind":"http", "url":"https://localhost/out"});
+        value["graph_io"] = json!({
+            "sources":{"1":value["source"].clone()},
+            "sinks":{"2":value["sink"].clone()}
+        });
+        if source {
+            value["graph_io"]["sources"]["3"] = tcp["source"].clone();
+        } else {
+            value["graph_io"]["sinks"]["3"] = tcp["sink"].clone();
+        }
+        for claim in [
+            json!({"checkpoint_dir":"/tmp/sparrow/ck"}),
+            json!({"recovery":"aligned"}),
+            json!({"restore":{"kind":"checkpoint", "snapshot_id":"1"}}),
+        ] {
+            let mut changed = value.clone();
+            changed
+                .as_object_mut()
+                .unwrap()
+                .extend(claim.as_object().unwrap().clone());
+            let typed: PipelineSpec = serde_json::from_value(changed).unwrap();
+            assert_eq!(
+                typed.check_delivery().unwrap_err().code,
+                sparrow_model::ErrorCode::UnsupportedRestore
+            );
+        }
+    }
+}
+
+#[test]
 fn tcp_spec_matrix_rejects_mixed_fields_and_durable_claims() {
     let base = linear_spec(9001, 9002);
     parse(&base).unwrap();

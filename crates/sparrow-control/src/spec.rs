@@ -2001,6 +2001,21 @@ impl PipelineSpec {
     /// TCP (client mode) is live, at-most-once: no replay point, so durable
     /// claims are refused; connector fields must not be mixed.
     fn check_tcp(&self) -> Result<()> {
+        // Public typed validators call check_delivery without basic_check.
+        // Visit non-legacy graph endpoints as well, before the fast path.
+        if let Some(io) = &self.graph_io {
+            let mut single = self.clone();
+            single.graph_io = None;
+            for source in io.sources.values() {
+                single.source = source.clone();
+                single.check_tcp()?;
+            }
+            single.source = self.source.clone();
+            for sink in io.sinks.values() {
+                single.sink = sink.clone();
+                single.check_tcp()?;
+            }
+        }
         if self.source.tcp.is_some() != (self.source.kind == "tcp")
             || self.sink.tcp.is_some() != (self.sink.kind == "tcp")
         {
@@ -2136,6 +2151,7 @@ impl PipelineSpec {
         // Public IO validators accept typed/serde-created specs too, so they
         // must not rely solely on from_json/basic_check for the DataBus gate.
         self.check_databus()?;
+        self.check_tcp()?;
         let g = DeliveryGuarantee::parse(&self.delivery)?;
         if (g == DeliveryGuarantee::CheckpointedAtLeastOnce)
             != (cfg!(feature = "jetstream") && self.source.kind == "jetstream")

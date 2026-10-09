@@ -24,7 +24,7 @@ jobs:
             ~/.cargo/git
             target
           key: websocket-contracts-${{ runner.os }}-1.98.0-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}
-      - name: Production feature combinations and WebSocket loopback contracts
+      - name: Production feature combinations and WebSocket/TCP contracts
         env:
           PROFILE: ${{ matrix.profile }}
         run: |
@@ -65,6 +65,8 @@ jobs:
           for round in 1 2; do
             run_contracts "$connector" 'websocket::' "websocket-connector-$round"
             run_contracts "$control" 'websocket_tests::' "websocket-control-$round"
+            run_contracts "$connector" 'tcp::' "tcp-connector-$round"
+            run_contracts "$control" 'tcp_tests::' "tcp-control-$round"
           done
       - uses: actions/upload-artifact@v4
         if: always()

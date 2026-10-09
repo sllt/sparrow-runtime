@@ -858,6 +858,44 @@ async fn tcp_sink_fails_closed_after_reconnect_attempts() {
     assert_eq!(snap.tcp_sink_fatal, 1);
     assert_eq!(snap.tcp_sink_connect_failures, 2);
     assert_eq!(snap.tcp_sink_queue_items, 0);
+    let (_, health) = diag.observation.endpoints().unwrap();
+    assert_eq!(
+        health.state,
+        sparrow_model::observation::HealthState::Failed
+    );
+    assert_eq!(health.reason, "tcp_sink_connect_exhausted");
+    assert_eq!(health.failures, 1);
+}
+
+#[tokio::test]
+async fn tcp_source_csv_oversize_header_never_promotes_next_row_to_header() {
+    for frame_limit in [16, 128] {
+        let server = Server::plain().await;
+        let mut run = start_source(&server, |cfg| {
+            cfg.client.max_frame_bytes = frame_limit;
+            cfg.payload_format = sparrow_formats::PayloadFormat::csv(
+                sparrow_formats::CsvOptions {
+                    max_record_bytes: Some(16),
+                    ..Default::default()
+                }
+                .compile(sparrow_formats::CsvRole::Decode)
+                .unwrap(),
+            );
+        });
+        let mut conn = server.accept().await;
+        // Test both framer and format length gates. The second line could
+        // parse as a header, but belongs to the rejected document.
+        conn.write_all(b"way_too_long_csv_header\ndevice_id,v\nd,1\n")
+            .await
+            .unwrap();
+        assert!(read_to_eof(&mut conn).await.is_empty());
+        assert_eq!(run.diag.snapshot().tcp_source_dropped_oversize, 1);
+        assert_eq!(run.diag.snapshot().tcp_source_rows, 0);
+        let mut conn = server.accept().await;
+        conn.write_all(b"device_id,v\nd,2\n").await.unwrap();
+        assert_eq!(run.take(1).await, vec![2]);
+        run.stop().await.unwrap();
+    }
 }
 
 /// Take every free Reservation byte of `owner` (after the connector charged

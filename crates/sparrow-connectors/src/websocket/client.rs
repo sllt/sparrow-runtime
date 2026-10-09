@@ -21,9 +21,9 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) use crate::net::{ConnectFailure, FlushBudget};
 use crate::net::{connect_stream, root_store, Endpoint, NetStream, TlsClient};
 pub use crate::net::{reconnect_delay, DEFAULT_RECONNECT_ATTEMPTS, MAX_RECONNECT_ATTEMPTS};
+pub(crate) use crate::net::{ConnectFailure, FlushBudget};
 use crate::{SecretResolver, TargetPolicy};
 
 pub const MIN_MESSAGE_BYTES: usize = 1024;

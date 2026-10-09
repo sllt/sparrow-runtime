@@ -33,7 +33,10 @@ pub(crate) struct FlushBudget {
 
 impl FlushBudget {
     pub(crate) fn new(timeout: Duration) -> Self {
-        Self { timeout, deadline: OnceLock::new() }
+        Self {
+            timeout,
+            deadline: OnceLock::new(),
+        }
     }
 
     pub(crate) fn deadline(&self, cancel: &CancellationToken) -> Option<Instant> {

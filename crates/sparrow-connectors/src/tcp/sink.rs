@@ -33,7 +33,7 @@ use sparrow_model::{
     CreditKind, ErrorCode, InflightCounter, MemoryLease, MemoryOwner, RestoreClaim, Result,
     RowBatch, Schema,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -42,7 +42,7 @@ use super::client::{error, BoundTcp, TcpClientConfig};
 use super::framing::{PrefixWidth, TcpFraming};
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
-use crate::net::{reconnect_delay, NetStream};
+use crate::net::{reconnect_delay, FlushBudget, NetStream};
 use crate::scratch::{encode_csv_record_charged, encode_row_charged, EncodeRejected};
 use crate::TargetPolicy;
 
@@ -59,6 +59,10 @@ pub enum TcpOverflow {
     /// Drop the row and count `dropped_overflow`.
     DropNewest,
 }
+
+#[cfg(test)]
+#[path = "sink_tests.rs"]
+mod tests;
 
 #[derive(Clone, Debug)]
 pub struct TcpSinkConfig {
@@ -151,7 +155,14 @@ pub struct TcpSink {
     /// CSV header line, set by the pump from the first batch schema (at most
     /// `max_frame_bytes`, charged in the static reservation).
     header: OnceLock<Vec<u8>>,
-    _lease: MemoryLease,
+    _lease: Arc<MemoryLease>,
+}
+
+/// Queue/in-flight bytes retain their prepaid credit, even if the owning
+/// task is cancelled or the Sink is dropped first.
+struct QueuedFrame {
+    bytes: Vec<u8>,
+    _reservation: Arc<MemoryLease>,
 }
 
 impl std::fmt::Debug for TcpSink {
@@ -241,7 +252,7 @@ impl TcpSink {
             client,
             owner,
             header: OnceLock::new(),
-            _lease: lease,
+            _lease: Arc::new(lease),
         })
     }
 
@@ -253,22 +264,26 @@ impl TcpSink {
     ) {
         let mut rx = rx.into();
         let _lifecycle = self.diag.observation.lifecycle(false);
+        let flush = FlushBudget::new(self.config.flush_timeout);
         let (queue_tx, queue_rx) = mpsc::channel(self.config.queue_capacity);
         tokio::join!(
-            self.pump(&mut rx, queue_tx, &cancel, outbox.as_ref()),
-            self.writer(queue_rx, &cancel),
+            self.pump(&mut rx, queue_tx, &cancel, outbox.as_ref(), &flush),
+            self.writer(queue_rx, &cancel, &flush),
         );
-        self.diag
-            .observation
-            .health(false, HealthState::Stopped, "tcp_sink_stopped", None);
+        if self.diag.tcp_sink_fatal.load(Ordering::Relaxed) == 0 {
+            self.diag
+                .observation
+                .health(false, HealthState::Stopped, "tcp_sink_stopped", None);
+        }
     }
 
     async fn pump(
         &self,
         rx: &mut ObservedReceiver<RowBatch>,
-        queue: mpsc::Sender<Vec<u8>>,
+        queue: mpsc::Sender<QueuedFrame>,
         cancel: &CancellationToken,
         outbox: Option<&Arc<InflightCounter>>,
+        flush: &FlushBudget,
     ) {
         loop {
             let batch = tokio::select! {
@@ -279,17 +294,20 @@ impl TcpSink {
             let Some(batch) = batch else {
                 return; // input ended: the writer drains the queue and closes
             };
-            if !self.queue_batch(&batch, &queue, cancel, outbox, None).await {
+            if !self
+                .queue_batch(&batch, &queue, cancel, outbox, flush)
+                .await
+            {
                 break;
             }
         }
         // Stop: queue what the outbox already holds within flush_timeout.
-        let deadline = Instant::now() + self.config.flush_timeout;
+        flush.deadline(cancel);
         rx.close();
-        while Instant::now() < deadline && !queue.is_closed() {
+        while !flush.expired(cancel) && !queue.is_closed() {
             let Ok(batch) = rx.try_recv() else { break };
             if !self
-                .queue_batch(&batch, &queue, cancel, outbox, Some(deadline))
+                .queue_batch(&batch, &queue, cancel, outbox, flush)
                 .await
             {
                 break;
@@ -388,10 +406,10 @@ impl TcpSink {
     async fn queue_batch(
         &self,
         batch: &RowBatch,
-        queue: &mpsc::Sender<Vec<u8>>,
+        queue: &mpsc::Sender<QueuedFrame>,
         cancel: &CancellationToken,
         outbox: Option<&Arc<InflightCounter>>,
-        deadline: Option<Instant>,
+        flush: &FlushBudget,
     ) -> bool {
         let mut receipt = BatchReceipt(outbox.cloned());
         let mut delivered = self.diag.observation.delivery_guard(
@@ -414,6 +432,15 @@ impl TcpSink {
         }
         let mut all = true;
         for (i, row) in batch.rows().iter().enumerate() {
+            if i % 16 == 15 {
+                tokio::task::yield_now().await;
+            }
+            if flush.expired(cancel) || queue.is_closed() {
+                self.diag
+                    .tcp_sink_discarded_on_close
+                    .fetch_add((batch.num_rows() - i) as u64, Ordering::Relaxed);
+                return false;
+            }
             let started = std::time::Instant::now();
             let framed = self.frame(schema, row);
             self.diag
@@ -434,7 +461,7 @@ impl TcpSink {
                     continue;
                 }
             };
-            match self.enqueue(frame, queue, cancel, deadline).await {
+            match self.enqueue(frame, queue, cancel, flush).await {
                 Queued::Yes => {}
                 Queued::Dropped => all = false,
                 Queued::Closed => {
@@ -463,15 +490,26 @@ impl TcpSink {
         let Some(csv) = self.config.payload_format.as_csv() else {
             return Ok(());
         };
+        csv.check_schema(schema).map_err(|_| Rejected::Bad)?;
+        if schema.fields.iter().any(|f| f.name.contains(['\n', '\r'])) {
+            return Err(Rejected::Bad);
+        }
         let len = csv.header_len(schema).map_err(|_| Rejected::Bad)?;
-        if len > self.client.config.frame_limit() {
+        // header_len includes the one LF terminator; frame_limit does not.
+        if len.saturating_sub(1) > self.client.config.frame_limit() {
             return Err(Rejected::Oversize);
         }
-        let mut header = csv.encode_header(schema).map_err(|_| Rejected::Bad)?;
-        while matches!(header.last(), Some(b'\n' | b'\r')) {
-            header.pop();
-        }
-        header.push(b'\n');
+        // Bound capacity, not only length: unbounded Vec geometric growth
+        // can exceed the statically reserved header slot.
+        let header = csv
+            .encode_header_bounded(schema, len, |_| Ok(()))
+            .map_err(|e| {
+                if e.code == ErrorCode::ResourceExhausted {
+                    Rejected::Budget
+                } else {
+                    Rejected::Bad
+                }
+            })?;
         let _ = self.header.set(header);
         Ok(())
     }
@@ -479,10 +517,17 @@ impl TcpSink {
     async fn enqueue(
         &self,
         frame: Vec<u8>,
-        queue: &mpsc::Sender<Vec<u8>>,
+        queue: &mpsc::Sender<QueuedFrame>,
         cancel: &CancellationToken,
-        mut deadline: Option<Instant>,
+        flush: &FlushBudget,
     ) -> Queued {
+        if flush.expired(cancel) {
+            return Queued::Closed;
+        }
+        let frame = QueuedFrame {
+            bytes: frame,
+            _reservation: self._lease.clone(),
+        };
         let frame = match queue.try_send(frame) {
             Ok(()) => {
                 self.diag
@@ -493,7 +538,7 @@ impl TcpSink {
             Err(mpsc::error::TrySendError::Closed(_)) => return Queued::Closed,
             Err(mpsc::error::TrySendError::Full(frame)) => frame,
         };
-        if self.config.overflow == TcpOverflow::DropNewest && deadline.is_none() {
+        if self.config.overflow == TcpOverflow::DropNewest && flush.deadline(cancel).is_none() {
             self.diag
                 .tcp_sink_dropped_overflow
                 .fetch_add(1, Ordering::Relaxed);
@@ -503,26 +548,31 @@ impl TcpSink {
             .tcp_sink_backpressure_waits
             .fetch_add(1, Ordering::Relaxed);
         loop {
+            let deadline = flush.deadline(cancel);
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                return Queued::Closed;
+            }
             let at = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
             tokio::select! {
                 biased;
+                _ = cancel.cancelled(), if deadline.is_none() => { flush.deadline(cancel); }
+                _ = tokio::time::sleep_until(at), if deadline.is_some() => return Queued::Closed,
                 permit = queue.reserve() => {
                     let Ok(permit) = permit else { return Queued::Closed };
                     permit.send(frame);
                     self.diag.tcp_sink_queue_items.fetch_add(1, Ordering::Relaxed);
                     return Queued::Yes;
                 }
-                _ = cancel.cancelled(), if deadline.is_none() => {
-                    // Stop while blocked: keep waiting, but only until the
-                    // flush deadline.
-                    deadline = Some(Instant::now() + self.config.flush_timeout);
-                }
-                _ = tokio::time::sleep_until(at) => return Queued::Closed,
             }
         }
     }
 
-    async fn writer(&self, mut queue: mpsc::Receiver<Vec<u8>>, cancel: &CancellationToken) {
+    async fn writer(
+        &self,
+        mut queue: mpsc::Receiver<QueuedFrame>,
+        cancel: &CancellationToken,
+        flush: &FlushBudget,
+    ) {
         let mut connected_before = false;
         let mut attempt = 0usize;
         loop {
@@ -577,7 +627,7 @@ impl TcpSink {
             self.diag
                 .observation
                 .health(false, HealthState::Ready, "tcp_sink_connected", None);
-            match self.session(stream, &mut queue, cancel).await {
+            match self.session(stream, &mut queue, cancel, flush).await {
                 SessionEnd::Finished => break,
                 SessionEnd::Lost(reason) => {
                     self.diag
@@ -602,40 +652,58 @@ impl TcpSink {
 
     async fn session(
         &self,
-        mut stream: NetStream,
-        queue: &mut mpsc::Receiver<Vec<u8>>,
+        stream: NetStream,
+        queue: &mut mpsc::Receiver<QueuedFrame>,
         cancel: &CancellationToken,
+        flush: &FlushBudget,
     ) -> SessionEnd {
         enum Event {
             Stop,
             Deadline,
             Read(std::io::Result<usize>),
-            Send(Option<Vec<u8>>),
+            Send(Option<QueuedFrame>),
         }
+        let (mut reader, mut writer) = tokio::io::split(stream);
         let mut discard = [0u8; DISCARD_BUFFER];
         let mut header_pending = self.config.per_connection_header();
-        // Set on stop: keep sending the queue until it closes or this passes.
-        let mut flush_deadline: Option<Instant> = None;
+        let mut prefer_send = false;
+        let mut turns = 0usize;
         loop {
+            let flush_deadline = flush.deadline(cancel);
+            if flush_deadline.is_some_and(|at| Instant::now() >= at) {
+                return SessionEnd::Finished;
+            }
             let deadline =
                 flush_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
-            let event = tokio::select! {
-                biased;
-                _ = cancel.cancelled(), if flush_deadline.is_none() => Event::Stop,
-                _ = tokio::time::sleep_until(deadline), if flush_deadline.is_some() => Event::Deadline,
-                n = stream.read(&mut discard) => Event::Read(n),
-                item = queue.recv() => Event::Send(item),
+            // A peer whose read side is always ready must not starve queued
+            // output. Alternate priorities, rather than depending on chance.
+            let event = if prefer_send {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if flush_deadline.is_none() => Event::Stop,
+                    _ = tokio::time::sleep_until(deadline), if flush_deadline.is_some() => Event::Deadline,
+                    item = queue.recv() => Event::Send(item),
+                    n = reader.read(&mut discard) => Event::Read(n),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if flush_deadline.is_none() => Event::Stop,
+                    _ = tokio::time::sleep_until(deadline), if flush_deadline.is_some() => Event::Deadline,
+                    n = reader.read(&mut discard) => Event::Read(n),
+                    item = queue.recv() => Event::Send(item),
+                }
             };
             match event {
                 Event::Stop => {
-                    flush_deadline = Some(Instant::now() + self.config.flush_timeout);
+                    flush.deadline(cancel);
                 }
                 Event::Deadline => {
-                    self.close(&mut stream, Duration::from_millis(10)).await;
                     return SessionEnd::Finished;
                 }
                 Event::Read(Ok(0)) => return SessionEnd::Lost("tcp_sink_peer_closed"),
                 Event::Read(Ok(n)) => {
+                    prefer_send = true;
                     self.diag
                         .tcp_sink_ignored_bytes
                         .fetch_add(n as u64, Ordering::Relaxed);
@@ -645,12 +713,12 @@ impl TcpSink {
                     // Pump finished and the queue is drained: shut down.
                     let budget = flush_deadline
                         .map(|at| at.saturating_duration_since(Instant::now()))
-                        .unwrap_or(self.config.flush_timeout)
-                        .max(Duration::from_millis(10));
-                    self.close(&mut stream, budget).await;
+                        .unwrap_or(self.config.flush_timeout);
+                    self.close(&mut writer, budget).await;
                     return SessionEnd::Finished;
                 }
                 Event::Send(Some(frame)) => {
+                    prefer_send = false;
                     self.diag
                         .tcp_sink_queue_items
                         .fetch_sub(1, Ordering::Relaxed);
@@ -663,11 +731,14 @@ impl TcpSink {
                         .map(Vec::as_slice);
                     header_pending = false;
                     match self
-                        .send_bounded(&mut stream, head, &frame, cancel, &mut flush_deadline)
+                        .send_bounded(&mut writer, &mut reader, head, &frame.bytes, cancel, flush)
                         .await
                     {
                         Sent::Ok => {
-                            let written = frame.len().saturating_add(head.map_or(0, <[u8]>::len));
+                            let written = frame
+                                .bytes
+                                .len()
+                                .saturating_add(head.map_or(0, <[u8]>::len));
                             self.diag.tcp_sink_sent.fetch_add(1, Ordering::Relaxed);
                             self.diag
                                 .tcp_sink_bytes_written
@@ -686,7 +757,7 @@ impl TcpSink {
                             self.diag
                                 .tcp_sink_send_timeouts
                                 .fetch_add(1, Ordering::Relaxed);
-                            if flush_deadline.is_some() {
+                            if flush.deadline(cancel).is_some() {
                                 self.diag
                                     .tcp_sink_discarded_on_close
                                     .fetch_add(1, Ordering::Relaxed);
@@ -697,6 +768,10 @@ impl TcpSink {
                     }
                 }
             }
+            turns += 1;
+            if turns % 16 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -704,35 +779,52 @@ impl TcpSink {
     /// `send_timeout`, cut short by the flush deadline once the job stops.
     async fn send_bounded(
         &self,
-        stream: &mut NetStream,
+        writer: &mut WriteHalf<NetStream>,
+        reader: &mut ReadHalf<NetStream>,
         head: Option<&[u8]>,
         frame: &[u8],
         cancel: &CancellationToken,
-        flush_deadline: &mut Option<Instant>,
+        flush: &FlushBudget,
     ) -> Sent {
         let send_deadline = Instant::now() + self.config.send_timeout;
         let send = async {
             if let Some(head) = head {
-                stream.write_all(head).await?;
+                writer.write_all(head).await?;
             }
-            stream.write_all(frame).await?;
-            stream.flush().await
+            writer.write_all(frame).await?;
+            writer.flush().await
         };
         tokio::pin!(send);
+        let mut discard = [0u8; DISCARD_BUFFER];
+        let mut reads = 0usize;
         loop {
+            let flush_deadline = flush.deadline(cancel);
             let at = flush_deadline.map_or(send_deadline, |f| f.min(send_deadline));
+            if Instant::now() >= at {
+                return Sent::TimedOut;
+            }
             tokio::select! {
                 biased;
-                r = &mut send => return if r.is_ok() { Sent::Ok } else { Sent::Failed },
                 _ = cancel.cancelled(), if flush_deadline.is_none() => {
-                    *flush_deadline = Some(Instant::now() + self.config.flush_timeout);
+                    flush.deadline(cancel);
                 }
                 _ = tokio::time::sleep_until(at) => return Sent::TimedOut,
+                r = &mut send => return if r.is_ok() { Sent::Ok } else { Sent::Failed },
+                n = reader.read(&mut discard) => {
+                    match n {
+                        Ok(0) | Err(_) => return Sent::Failed,
+                        Ok(n) => { self.diag.tcp_sink_ignored_bytes.fetch_add(n as u64, Ordering::Relaxed); }
+                    }
+                    reads += 1;
+                    if reads % 16 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
             }
         }
     }
 
-    async fn close(&self, stream: &mut NetStream, budget: Duration) {
+    async fn close(&self, stream: &mut WriteHalf<NetStream>, budget: Duration) {
         match tokio::time::timeout(budget, stream.shutdown()).await {
             Ok(Ok(())) => {
                 self.diag.tcp_sink_closes.fetch_add(1, Ordering::Relaxed);
