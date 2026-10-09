@@ -1060,6 +1060,19 @@ func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
 	return summary
 }
 
+// refused waits (no fixed sleep) until the start attempt is held as failed
+// with the expected reason and returns the status document.
+func (v *env) refused(label, reason string) map[string]any {
+	var st map[string]any
+	eventually(label+" refused", func() bool {
+		st, _ = v.a.call("GET", "/v1/pipelines/check/status", nil)
+		return nested(st, "actual", "status") == "failed"
+	})
+	msg, _ := nested(st, "actual", "last_error").(string)
+	require(strings.Contains(msg, reason), label+": unexpected refusal reason: "+msg)
+	return st
+}
+
 // compat: upgrade/rollback with an old (pre-v29) binary, plus new-binary
 // directory profile mismatches. Nothing may change CURRENT or emit output.
 func compat(root, serverBin, oldBin string) map[string]any {
@@ -1085,13 +1098,12 @@ func compat(root, serverBin, oldBin string) map[string]any {
 	if oldBin != "" {
 		v.start(oldBin)
 		resp, code := v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
-		time.Sleep(500 * time.Millisecond)
-		st, _ := v.a.call("GET", "/v1/pipelines/check/status", nil)
-		running := nested(st, "actual", "status") == "running"
+		// The old binary has no FIRST/LAST/VAR_* recovery; any held refusal
+		// counts, the reason text is recorded as evidence.
+		st := v.refused("old binary on v29", "")
 		result["rollback_start_code"] = code
 		result["rollback_start"] = resp
 		result["rollback_status"] = st
-		require(code >= 400 || !running, "old binary started a v29 extended pipeline")
 		require(hash(filepath.Join(v.checkpoint, "CURRENT")) == v29Current, "old binary changed v29 CURRENT")
 		require(v.sink.count() == outputs, "old binary produced output from v29 history")
 		// Old binary on a fresh directory also rejects the extended aligned profile.
@@ -1108,9 +1120,10 @@ func compat(root, serverBin, oldBin string) map[string]any {
 		v.a.ok("POST", "/v1/pipelines/check/stop", map[string]any{})
 		v.a.ok("PUT", "/v1/pipelines/check", plain)
 		v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
-		eventually("old v3 outputs", func() bool { return v.sink.count() == outputs+12 })
+		// Fresh v3 directory replays the 12 file rows: 2 Count windows per key.
+		eventually("old v3 outputs", func() bool { return v.sink.count() == outputs+4 })
 		eventually("old applied", func() bool {
-			return number(v.status(), "observation", "runtime_progress", "ingested_rows") == 36-24 || v.sink.count() == outputs+12
+			return number(v.status(), "observation", "runtime_progress", "ingested_rows") == 12
 		})
 		v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
 		require(snapshotVersion(v.checkpoint) == 3, "old binary should write v3")
@@ -1131,11 +1144,9 @@ func compat(root, serverBin, oldBin string) map[string]any {
 		v.a.ok("PUT", "/v1/pipelines/check", mismatch)
 		before = v.sink.count()
 		_, code = v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
-		time.Sleep(500 * time.Millisecond)
-		st, _ = v.a.call("GET", "/v1/pipelines/check/status", nil)
+		st = v.refused("extended plan on v3", "profile mismatch")
 		result["ext_on_v3_code"] = code
 		result["ext_on_v3_status"] = st
-		require(code >= 400 || nested(st, "actual", "status") != "running", "extended plan restored from a v3 directory")
 		require(hash(filepath.Join(v.checkpoint, "CURRENT")) == v3Current, "mismatch changed v3 CURRENT")
 		require(v.sink.count() == before, "mismatch produced output")
 		v.server.stop(syscall.SIGTERM)
@@ -1149,11 +1160,9 @@ func compat(root, serverBin, oldBin string) map[string]any {
 	v.a.ok("PUT", "/v1/pipelines/check", plainOnV29)
 	before := v.sink.count()
 	_, code := v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
-	time.Sleep(500 * time.Millisecond)
-	st, _ := v.a.call("GET", "/v1/pipelines/check/status", nil)
+	st := v.refused("plain plan on v29", "profile mismatch")
 	result["plain_on_v29_code"] = code
 	result["plain_on_v29_status"] = st
-	require(code >= 400 || nested(st, "actual", "status") != "running", "plain plan restored from a v29 directory")
 	require(hash(filepath.Join(v.checkpoint, "CURRENT")) == v29Current, "mismatch changed v29 CURRENT")
 	require(v.sink.count() == before, "mismatch produced output")
 	// (6) Semantic change (FIRST <-> LAST) on the v29 directory is refused.
@@ -1163,11 +1172,9 @@ func compat(root, serverBin, oldBin string) map[string]any {
 	list[1].(map[string]any)["fn"], list[2].(map[string]any)["fn"] = "last", "first"
 	v.a.ok("PUT", "/v1/pipelines/check", changed)
 	_, code = v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
-	time.Sleep(500 * time.Millisecond)
-	st, _ = v.a.call("GET", "/v1/pipelines/check/status", nil)
+	st = v.refused("FIRST/LAST swap", "semantics changed")
 	result["first_last_swap_code"] = code
 	result["first_last_swap_status"] = st
-	require(code >= 400 || nested(st, "actual", "status") != "running", "FIRST/LAST swap restored")
 	require(hash(filepath.Join(v.checkpoint, "CURRENT")) == v29Current, "semantic mismatch changed CURRENT")
 	require(v.sink.count() == before, "semantic mismatch produced output")
 	// (7) Original plan still restores (the refusals did not damage history).
