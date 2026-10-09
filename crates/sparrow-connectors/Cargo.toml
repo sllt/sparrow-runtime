@@ -12,6 +12,8 @@ demo-io = []
 # setup, so `jetstream` implies `nats`.
 nats = ["dep:async-nats", "dep:futures-util"]
 jetstream = ["nats", "dep:ring", "dep:bytes"]
+# WebSocket client Source/Sink (ws:// and wss:// over the crate's rustls).
+websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }
@@ -31,6 +33,7 @@ async-nats = { version = "=0.50.0", optional = true, default-features = false, f
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["std", "async-await"] }
 ring = { version = "0.17", optional = true }
 bytes = { version = "1", optional = true }
+tokio-tungstenite = { version = "=0.30.0", optional = true, default-features = false, features = ["handshake"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }

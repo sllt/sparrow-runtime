@@ -13,16 +13,24 @@ pub fn inventory() -> Value {
     } else {
         &[]
     };
+    // The WebSocket client Source/Sink needs the `websocket` feature.
+    let websocket: &[&str] = if cfg!(feature = "websocket") {
+        &["websocket"]
+    } else {
+        &[]
+    };
     // The in-process Local DataBus is always built (no SDK).
     let sinks: Vec<&str> = ["http", "mqtt", "log", "databus"]
         .iter()
         .chain(nats)
         .chain(jetstream_sink)
+        .chain(websocket)
         .copied()
         .collect();
     let mut combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file", "databus"]
         .iter()
         .chain(nats)
+        .chain(websocket)
         .copied()
         .flat_map(|source| {
             sinks.clone().into_iter().map(move |sink| {
@@ -212,14 +220,14 @@ mod tests {
         // 5 live/file sources (mqtt, http_push, http_poll, file, databus) x 4 sinks
         // (http, mqtt, log, databus), plus NATS Core as both a source and a sink
         // when the `nats` feature is built, plus the JetStream Sink (live matrix +
-        // one aligned File profile) with `jetstream`.
-        let expected = if cfg!(feature = "jetstream") {
-            6 * 6 + 1
-        } else if cfg!(feature = "nats") {
-            6 * 5
-        } else {
-            5 * 4
-        };
+        // one aligned File profile) with `jetstream`, plus WebSocket as both a
+        // source and a sink with `websocket`.
+        let (nats, jetstream, websocket) = (
+            usize::from(cfg!(feature = "nats")),
+            usize::from(cfg!(feature = "jetstream")),
+            usize::from(cfg!(feature = "websocket")),
+        );
+        let expected = (5 + nats + websocket) * (4 + nats + jetstream + websocket) + jetstream;
         assert_eq!(value["combinations"].as_array().unwrap().len(), expected);
         assert!(value["combinations"]
             .as_array()
@@ -227,6 +235,8 @@ mod tests {
             .iter()
             .filter(|c| c["source"] == "nats"
                 || c["sink"] == "nats"
+                || c["source"] == "websocket"
+                || c["sink"] == "websocket"
                 || c["source"] == "databus"
                 || c["sink"] == "databus"
                 || (c["sink"] == "jetstream" && c["source"] != "file"))
