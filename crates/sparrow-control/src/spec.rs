@@ -1347,9 +1347,31 @@ impl PipelineSpec {
                 "source.databus / sink.databus are required exclusively for kind=databus",
             ));
         }
+        // A graph's lowest-ID legacy endpoints need not use DataBus. Inspect
+        // all endpoints before the legacy fast path; per-endpoint recursion
+        // cannot detect a non-legacy Source/Sink pair feeding itself.
+        let (sources, sinks): (Vec<&SourceSpec>, Vec<&SinkSpec>) = match &self.graph_io {
+            Some(io) => (io.sources.values().collect(), io.sinks.values().collect()),
+            None => (vec![&self.source], vec![&self.sink]),
+        };
+        for pattern in sources.iter().filter_map(|s| s.databus.as_ref()) {
+            for topic in sinks.iter().filter_map(|s| s.databus.as_ref()) {
+                if sparrow_connectors::databus::patterns_overlap(&pattern.topic, &topic.topic) {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "DataBus source `{}` would receive this pipeline's own sink topic `{}` (feedback loop)",
+                            pattern.topic, topic.topic
+                        ),
+                    ));
+                }
+            }
+        }
         let source = self.source.kind == "databus";
         let sink = self.sink.kind == "databus";
-        if !source && !sink {
+        let graph_databus = sources.iter().any(|s| s.kind == "databus")
+            || sinks.iter().any(|s| s.kind == "databus");
+        if !source && !sink && !graph_databus {
             return Ok(());
         }
         if source && (self.source_has_foreign_fields() || self.source.nats.is_some()) {
@@ -1378,23 +1400,6 @@ impl PipelineSpec {
                 ErrorCode::UnsupportedRestore,
                 "Local DataBus is live_best_effort/restart_fresh, at-most-once (in-memory, no replay point); no checkpoint or restore",
             ));
-        }
-        let (sources, sinks): (Vec<&SourceSpec>, Vec<&SinkSpec>) = match &self.graph_io {
-            Some(io) => (io.sources.values().collect(), io.sinks.values().collect()),
-            None => (vec![&self.source], vec![&self.sink]),
-        };
-        for pattern in sources.iter().filter_map(|s| s.databus.as_ref()) {
-            for topic in sinks.iter().filter_map(|s| s.databus.as_ref()) {
-                if sparrow_connectors::databus::patterns_overlap(&pattern.topic, &topic.topic) {
-                    return Err(SparrowError::new(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "DataBus source `{}` would receive this pipeline's own sink topic `{}` (feedback loop)",
-                            pattern.topic, topic.topic
-                        ),
-                    ));
-                }
-            }
         }
         Ok(())
     }
@@ -1478,6 +1483,9 @@ impl PipelineSpec {
     }
 
     pub fn check_delivery(&self) -> Result<(DeliveryGuarantee, RecoveryPolicy)> {
+        // Public IO validators accept typed/serde-created specs too, so they
+        // must not rely solely on from_json/basic_check for the DataBus gate.
+        self.check_databus()?;
         let g = DeliveryGuarantee::parse(&self.delivery)?;
         if (g == DeliveryGuarantee::CheckpointedAtLeastOnce)
             != (cfg!(feature = "jetstream") && self.source.kind == "jetstream")
