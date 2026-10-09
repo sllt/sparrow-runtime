@@ -283,7 +283,7 @@ fn r11_encoded(
     let lease = owner
         .acquire(CreditKind::Reservation, bytes.capacity())
         .unwrap();
-    crate::barrier::EncodedFreeze { bytes, lease }
+    crate::barrier::EncodedFreeze { bytes, lease, ext: false }
 }
 
 #[test]

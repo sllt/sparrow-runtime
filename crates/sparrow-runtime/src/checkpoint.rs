@@ -12,9 +12,10 @@
 
 use sparrow_io::{SourceIdentity, SourcePosition};
 use sparrow_model::{
-    DeliveryContract, ErrorCode, OperatorId, RecoveryPolicy, ResourceBudget, Result, Scalar,
-    SparrowError, StateSlotId,
+    DeliveryContract, ErrorCode, MemoryOwner, OperatorId, RecoveryPolicy, ResourceBudget, Result,
+    Scalar, SparrowError, StateSlotId,
 };
+use std::sync::Arc;
 use sparrow_plan::PlanLayout;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -136,7 +137,8 @@ impl CheckpointSnapshot {
         let cap = freeze_entry_cap(max_state_keys);
         let mut out = Vec::new();
         write_snapshot_prefix(&mut out, checkpoint_id, ingested_rows, source)?;
-        op.encode_freeze_into(&mut out, cap)?;
+        // Legacy SPV1 is codec 1 only: tags 8/9 are refused on encode.
+        op.encode_freeze_into_codec(&mut out, cap, crate::aggregate::AccumulatorCodec::Window)?;
         write_snapshot_suffix(&mut out, layout, table)?;
         Ok(out)
     }
@@ -195,6 +197,15 @@ impl CheckpointSnapshot {
     }
 
     pub(crate) fn decode_mode(src: &[u8], max_state_keys: usize, materialize: bool) -> Result<Self> {
+        Self::decode_metered(src, max_state_keys, materialize, &mut crate::pipeline_checkpoint::RestoreMeter::unbilled())
+    }
+
+    pub(crate) fn decode_metered(
+        src: &[u8],
+        max_state_keys: usize,
+        materialize: bool,
+        meter: &mut crate::pipeline_checkpoint::RestoreMeter,
+    ) -> Result<Self> {
         let cap = freeze_entry_cap(max_state_keys);
         let mut src = src;
         if src.len() < 4 + 2 + 8 + 8 || &src[..4] != MAGIC {
@@ -217,7 +228,24 @@ impl CheckpointSnapshot {
         let ingested_rows = u64::from_le_bytes(src[..8].try_into().unwrap());
         src = &src[8..];
         let source = decode_position(&mut src)?;
-        let window = decode_freeze_mode(&mut src, cap, materialize)?;
+        // SPV1 is codec 1: tags 8/9 are rejected on scan and materialize.
+        meter.charge_scratch(src.len().saturating_add(1024))?;
+        let mut resident = 0usize;
+        let window = decode_freeze_metered(&mut src, cap, materialize, None, crate::aggregate::AccumulatorCodec::Window, &mut resident)?;
+        if materialize
+            && meter
+                .planned
+                .as_ref()
+                .is_some_and(|planned| resident > planned.first().copied().unwrap_or(0))
+        {
+            return Err(SparrowError::new(
+                ErrorCode::Internal,
+                "restored window exceeds its reserved restore credit",
+            ));
+        }
+        meter.resident.clear();
+        meter.resident.push(resident);
+        meter.release_scratch();
         let layout = decode_layout(&mut src, ver)?;
         if layout.operator != window.operator || layout.slot != window.slot {
             return Err(SparrowError::new(
@@ -605,6 +633,7 @@ impl CheckpointStore {
 
     fn nonfallback_error(&self, error: &SparrowError) -> bool {
         sink_profile_mismatch(error)
+            || incompatible_or_credit(error)
             || (self.pipeline_sink.is_some() && error.code == ErrorCode::ResourceExhausted)
     }
 
@@ -677,7 +706,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28) {
+        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {
@@ -713,7 +742,8 @@ impl CheckpointStore {
     /// request. Keep that verified point until the owning attempt is stopped
     /// and a new configuration opens the store without that dependency.
     pub fn pin_recovery_point(&mut self, id: u64) -> Result<()> {
-        self.recover_any_id(id)?;
+        // Verification only: a bounded scan, never a second unbilled copy.
+        self.recover_any_id_with(id, LoadMode::Scan)?;
         self.pinned = Some(id);
         Ok(())
     }
@@ -758,13 +788,17 @@ impl CheckpointStore {
     }
 
     fn recover_any_id(&self,id:u64)->Result<StoredSnapshot> {
+        self.recover_any_id_with(id, LoadMode::Materialize).map(|(snapshot, _)| snapshot)
+    }
+
+    fn recover_any_id_with(&self, id: u64, mode: LoadMode<'_>) -> Result<(StoredSnapshot, Option<RestoreCredit>)> {
         if !self.was_published(id) && read_current(&self.dir)? != Some(id) {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
                 "checkpoint has no durable publication proof",
             ));
         }
-        self.load_generation(id)
+        self.load_generation_with(id, mode)
     }
 
     pub fn set_max_state_keys(&mut self, max_state_keys: usize) {
@@ -998,13 +1032,51 @@ impl CheckpointStore {
             "no verified committed checkpoint; refusing silent empty-state continue"))?.pipeline()
     }
 
+    /// Production restore entry for every participant-aware profile. The
+    /// payload, decode scratch and every participant's resident state are
+    /// reserved on the admitted Job `owner` before materialization; the
+    /// returned credit is consumed by Kernel admission. Credit exhaustion is
+    /// never treated as corruption (no fallback to an older generation).
+    pub fn recover_pipeline_owned(
+        &self,
+        requested: Option<u64>,
+        owner: &Arc<MemoryOwner>,
+    ) -> Result<(PipelineSnapshot, RestoreCredit)> {
+        let (snapshot, credit) = match requested {
+            Some(id) => self.recover_any_id_with(id, LoadMode::Owned(owner))?,
+            None => self
+                .recover_any_committed_with(LoadMode::Owned(owner))?
+                .ok_or_else(|| SparrowError::new(ErrorCode::UnsupportedRestore,
+                    "no verified committed checkpoint; refusing silent empty-state continue"))?,
+        };
+        let credit = credit.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "owned restore lacks credit"))?;
+        Ok((snapshot.pipeline()?, credit))
+    }
+
+    /// Legacy SPV1 restore through the same owned entry.
+    pub fn recover_required_owned(
+        &self,
+        owner: &Arc<MemoryOwner>,
+    ) -> Result<(CheckpointSnapshot, RestoreCredit)> {
+        let (snapshot, credit) = self
+            .recover_any_committed_with(LoadMode::Owned(owner))?
+            .ok_or_else(|| SparrowError::new(ErrorCode::UnsupportedRestore,
+                "no verified committed checkpoint; refusing silent empty-state continue"))?;
+        let credit = credit.ok_or_else(|| SparrowError::new(ErrorCode::Internal, "owned restore lacks credit"))?;
+        Ok((snapshot.legacy()?, credit))
+    }
+
     fn recover_any_committed(&self)->Result<Option<StoredSnapshot>> {
+        Ok(self.recover_any_committed_with(LoadMode::Materialize)?.map(|(snapshot, _)| snapshot))
+    }
+
+    fn recover_any_committed_with(&self, mode: LoadMode<'_>)->Result<Option<(StoredSnapshot, Option<RestoreCredit>)>> {
         match read_current(&self.dir) {
-            Ok(Some(id)) => match self.load_generation(id) {
+            Ok(Some(id)) => match self.load_generation_with(id, mode) {
                 Ok(snap) => Ok(Some(snap)),
                 Err(e) => {
                     if self.nonfallback_error(&e) { return Err(e); }
-                    if let Some(snap) = self.load_latest_valid_except(Some(id))? {
+                    if let Some(snap) = self.load_latest_valid_except_with(Some(id), mode)? {
                         return Ok(Some(snap));
                     }
                     Err(e)
@@ -1014,7 +1086,7 @@ impl CheckpointStore {
             // promote an unpublished MANIFEST (crash after rename, before CURRENT).
             Ok(None) => Ok(None),
             Err(e) => {
-                if let Some(snap) = self.load_latest_valid_except(None)? {
+                if let Some(snap) = self.load_latest_valid_except_with(None, mode)? {
                     Ok(Some(snap))
                 } else {
                     Err(e)
@@ -1024,6 +1096,10 @@ impl CheckpointStore {
     }
 
     fn load_latest_valid_except(&self, skip: Option<u64>) -> Result<Option<StoredSnapshot>> {
+        Ok(self.load_latest_valid_except_with(skip, LoadMode::Scan)?.map(|(snapshot, _)| snapshot))
+    }
+
+    fn load_latest_valid_except_with(&self, skip: Option<u64>, mode: LoadMode<'_>) -> Result<Option<(StoredSnapshot, Option<RestoreCredit>)>> {
         let mut ids = match list_generation_ids(&self.dir) {
             Ok(ids) => ids,
             Err(_) => return Ok(None),
@@ -1039,7 +1115,7 @@ impl CheckpointStore {
             if !self.was_published(id) {
                 continue;
             }
-            match self.load_generation(id) {
+            match self.load_generation_with(id, mode) {
                 Ok(snap) => return Ok(Some(snap)),
                 Err(error) if self.nonfallback_error(&error) => return Err(error),
                 Err(_) => {}
@@ -1048,11 +1124,16 @@ impl CheckpointStore {
         Ok(None)
     }
 
-    fn load_generation(&self, id: u64) -> Result<StoredSnapshot> {
-        self.load_generation_mode(id, true)
+    fn load_generation_mode(&self, id: u64, materialize: bool) -> Result<StoredSnapshot> {
+        let mode = if materialize { LoadMode::Materialize } else { LoadMode::Scan };
+        self.load_generation_with(id, mode).map(|(snapshot, _)| snapshot)
     }
 
-    fn load_generation_mode(&self, id: u64, materialize: bool) -> Result<StoredSnapshot> {
+    /// Common Store restore entry. `LoadMode::Owned` reserves the payload
+    /// before reading chunks, scans the complete snapshot with bounded
+    /// scratch, reserves every participant's exact resident size, and only
+    /// then materializes. Any failure drops every lease (full refund).
+    fn load_generation_with(&self, id: u64, mode: LoadMode<'_>) -> Result<(StoredSnapshot, Option<RestoreCredit>)> {
         let chk = self.dir.join(format!("chk-{id:08}"));
         if !fs::symlink_metadata(&chk)
             .map_err(io_err)?
@@ -1096,7 +1177,28 @@ impl CheckpointStore {
                 "MANIFEST checkpoint id does not match CURRENT",
             ));
         }
-        let mut payload = Vec::new();
+        if manifest.bytes > MAX_SNAPSHOT_BYTES {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "MANIFEST declares a snapshot above the snapshot bound",
+            ));
+        }
+        let payload_lease = match mode {
+            LoadMode::Owned(owner) => Some(
+                owner
+                    .acquire(
+                        sparrow_model::CreditKind::Reservation,
+                        (manifest.bytes as usize).saturating_add(CHUNK_SIZE),
+                    )
+                    .map_err(crate::pipeline_checkpoint::restore_credit_error)?,
+            ),
+            _ => None,
+        };
+        let mut payload = if payload_lease.is_some() {
+            Vec::with_capacity(manifest.bytes as usize)
+        } else {
+            Vec::new()
+        };
         for i in 0..manifest.n_chunks {
             let part = chk.join(format!("{i:04}.bin.part"));
             if part.exists() {
@@ -1135,14 +1237,57 @@ impl CheckpointStore {
             ));
         }
         self.check_sink_payload(&payload)?;
-        let snapshot = StoredSnapshot::decode(&payload, self.max_state_keys, materialize)?;
+        let (snapshot, credit) = match mode {
+            LoadMode::Scan => (StoredSnapshot::decode(&payload, self.max_state_keys, false)?, None),
+            LoadMode::Materialize => (StoredSnapshot::decode(&payload, self.max_state_keys, true)?, None),
+            LoadMode::Owned(owner) => {
+                let charge = |bytes: usize| {
+                    owner
+                        .acquire(sparrow_model::CreditKind::Reservation, bytes.max(1))
+                        .map_err(crate::pipeline_checkpoint::restore_credit_error)
+                };
+                // Envelope copies (manifest semantics, source strings, sink
+                // identity) are bounded by the payload and by fixed limits.
+                let header = charge(
+                    payload
+                        .len()
+                        .saturating_mul(2)
+                        .min(MAX_RESTORE_ENVELOPE_BYTES)
+                        .saturating_add(4096),
+                )?;
+                let mut meter = crate::pipeline_checkpoint::RestoreMeter::billed(owner.clone());
+                let scanned = StoredSnapshot::decode_metered(&payload, self.max_state_keys, false, &mut meter)?;
+                let ids = scanned.credit_participants();
+                drop(scanned);
+                if ids.len() != meter.resident.len() {
+                    return Err(SparrowError::new(ErrorCode::Internal, "restore credit scan/participant mismatch"));
+                }
+                let planned = meter.resident.clone();
+                let mut participants = Vec::with_capacity(planned.len());
+                for (participant, bytes) in ids.into_iter().zip(&planned) {
+                    participants.push((participant, charge(*bytes)?));
+                }
+                meter.planned = Some(planned);
+                let snapshot = StoredSnapshot::decode_metered(&payload, self.max_state_keys, true, &mut meter)?;
+                (
+                    snapshot,
+                    Some(RestoreCredit {
+                        owner: owner.clone(),
+                        _header: Some(header),
+                        participants,
+                    }),
+                )
+            }
+        };
+        drop(payload);
+        drop(payload_lease);
         if snapshot.id() != id {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
                 "snapshot and generation ids differ",
             ));
         }
-        Ok(snapshot)
+        Ok((snapshot, credit))
     }
 
     fn record_publication(&self, id: u64) -> Result<()> {
@@ -1217,13 +1362,61 @@ impl CheckpointStore {
     }
 
     pub fn has_committed(&self) -> bool {
-        matches!(self.recover_any_committed(), Ok(Some(_)))
+        matches!(self.recover_any_committed_with(LoadMode::Scan), Ok(Some(_)))
     }
 }
 
 fn sink_mismatch(message: &str) -> SparrowError {
     SparrowError::new(ErrorCode::UnsupportedRestore, message)
         .context("checkpoint_guard", "sink_profile_mismatch")
+}
+
+/// Version/profile/codec incompatibility and restore-credit exhaustion come
+/// from a complete checksummed record; an older generation is not a repair.
+fn incompatible_or_credit(error: &SparrowError) -> bool {
+    error.context.iter().any(|(key, value)| {
+        key == "checkpoint_guard"
+            && matches!(
+                value.as_str(),
+                crate::pipeline_checkpoint::EXTENDED_PROFILE_GUARD
+                    | crate::pipeline_checkpoint::RESTORE_CREDIT_GUARD
+                    | "extended_codec_mismatch"
+                    | "extended_state_mismatch"
+            )
+    })
+}
+
+#[derive(Clone, Copy)]
+enum LoadMode<'a> {
+    Scan,
+    Materialize,
+    Owned(&'a Arc<MemoryOwner>),
+}
+
+/// Envelope scratch cap (manifest semantics, strings, sink identity).
+const MAX_RESTORE_ENVELOPE_BYTES: usize = 512 * 1024;
+
+/// Restore memory reserved on the admitted Job owner before materialization.
+/// Kernel admission consumes it per participant; dropping it refunds all.
+#[derive(Debug)]
+pub struct RestoreCredit {
+    owner: Arc<MemoryOwner>,
+    _header: Option<sparrow_model::MemoryLease>,
+    participants: Vec<(sparrow_plan::ParticipantId, sparrow_model::MemoryLease)>,
+}
+
+impl RestoreCredit {
+    pub fn bytes(&self) -> usize {
+        self._header.as_ref().map_or(0, |l| l.bytes())
+            + self.participants.iter().map(|(_, l)| l.bytes()).sum::<usize>()
+    }
+    pub(crate) fn belongs_to(&self, owner: &Arc<MemoryOwner>) -> bool {
+        Arc::ptr_eq(&self.owner, owner)
+    }
+    pub(crate) fn take(&mut self, participant: sparrow_plan::ParticipantId) -> Option<sparrow_model::MemoryLease> {
+        let index = self.participants.iter().position(|(id, _)| *id == participant)?;
+        Some(self.participants.remove(index).1)
+    }
 }
 
 fn sink_profile_mismatch(error: &SparrowError) -> bool {
@@ -1832,25 +2025,34 @@ fn write_snapshot_suffix(
     Ok(())
 }
 
-fn estimated_frozen_bytes(f: &WindowFreeze) -> usize {
+fn estimated_frozen_bytes(
+    f: &WindowFreeze,
+    codec: crate::aggregate::AccumulatorCodec,
+) -> Result<usize> {
     const ENTRY_OVERHEAD: usize = 2 + 8 + 8 + 8 + 2;
-    f.entries
-        .iter()
-        .map(|e| {
-            e.key
-                .iter()
-                .map(|v| v.encoded_value_len().unwrap_or(0))
-                .sum::<usize>()
-                + e.accs
-                    .iter()
-                    .map(|a| a.encoded_len().unwrap_or(0))
-                    .sum::<usize>()
-                + ENTRY_OVERHEAD
-        })
-        .sum()
+    let mut total = 0usize;
+    for e in &f.entries {
+        total = total.saturating_add(ENTRY_OVERHEAD);
+        for v in &e.key {
+            total = total.saturating_add(v.encoded_value_len()?);
+        }
+        for a in &e.accs {
+            total = total.saturating_add(a.encoded_len_codec(codec)?);
+        }
+    }
+    Ok(total)
 }
 
 pub(crate) fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>, max_entries: usize) -> Result<()> {
+    encode_freeze_codec(f, out, max_entries, crate::aggregate::AccumulatorCodec::Window)
+}
+
+pub(crate) fn encode_freeze_codec(
+    f: &WindowFreeze,
+    out: &mut Vec<u8>,
+    max_entries: usize,
+    codec: crate::aggregate::AccumulatorCodec,
+) -> Result<()> {
     if f.entries.len() > max_entries {
         return Err(SparrowError::new(
             ErrorCode::BoundExceeded,
@@ -1860,7 +2062,7 @@ pub(crate) fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>, max_entries: us
             ),
         ));
     }
-    let estimate = estimated_frozen_bytes(f).saturating_add(256);
+    let estimate = estimated_frozen_bytes(f, codec)?.saturating_add(256);
     if estimate as u64 > MAX_SNAPSHOT_BYTES {
         return Err(SparrowError::new(
             ErrorCode::BoundExceeded,
@@ -1881,6 +2083,7 @@ pub(crate) fn encode_freeze(f: &WindowFreeze, out: &mut Vec<u8>, max_entries: us
             e.window_end,
             e.count,
             &e.accs,
+            codec,
         )?;
     }
     encode_opt_i64(f.wm_in, out);
@@ -1909,6 +2112,7 @@ impl FreezeHeader {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_freeze_mode(
     src: &mut &[u8],
     max_entries: usize,
@@ -1917,7 +2121,22 @@ pub(crate) fn decode_freeze_mode(
     decode_freeze_at_cut(src,max_entries,materialize,None)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_freeze_at_cut(src: &mut &[u8], max_entries: usize, materialize: bool, pt_cut: Option<i64>) -> Result<WindowFreeze> {
+    decode_freeze_metered(src, max_entries, materialize, pt_cut, crate::aggregate::AccumulatorCodec::Window, &mut 0)
+}
+
+/// Bounded scan/materialize of one WindowFreeze frame. In scan mode
+/// `resident` receives the exact [`WindowFreeze::resident_bytes`] that
+/// materialization would produce, so restore credit is reserved first.
+pub(crate) fn decode_freeze_metered(
+    src: &mut &[u8],
+    max_entries: usize,
+    materialize: bool,
+    pt_cut: Option<i64>,
+    codec: crate::aggregate::AccumulatorCodec,
+    resident: &mut usize,
+) -> Result<WindowFreeze> {
     let FreezeHeader {operator,slot,kind,entries:n} = FreezeHeader::parse(src)?;
     *src = &src[11..];
     const MIN_FREEZE_ENTRY: usize = 2 + 8 + 8 + 8 + 2;
@@ -1934,7 +2153,9 @@ pub(crate) fn decode_freeze_at_cut(src: &mut &[u8], max_entries: usize, material
         ));
     }
     let mut entries = Vec::with_capacity(if materialize { n } else { 0 });
+    let mut metered = 128usize.saturating_add(n.saturating_mul(std::mem::size_of::<FrozenEntry>()));
     for _ in 0..n {
+        metered = metered.saturating_add(128);
         if src.len() < 2 {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
@@ -1951,11 +2172,15 @@ pub(crate) fn decode_freeze_at_cut(src: &mut &[u8], max_entries: usize, material
         }
         let mut key = Vec::with_capacity(if materialize { nk } else { 0 });
         for _ in 0..nk {
+            let before = *src;
             if materialize {
                 key.push(Scalar::decode_value(src)?);
             } else {
                 Scalar::skip_encoded_value(src)?;
             }
+            metered = metered.saturating_add(crate::aggregate::encoded_scalar_resident(
+                &before[..before.len() - src.len()],
+            ));
         }
         if src.len() < 8 + 8 + 8 + 2 {
             return Err(SparrowError::new(
@@ -1983,9 +2208,11 @@ pub(crate) fn decode_freeze_at_cut(src: &mut &[u8], max_entries: usize, material
         let mut accs = Vec::with_capacity(if materialize { na } else { 0 });
         for _ in 0..na {
             if materialize {
-                accs.push(Accumulator::decode(src)?);
+                let acc = Accumulator::decode_codec(src, codec)?;
+                metered = metered.saturating_add(acc.tracked_bytes());
+                accs.push(acc);
             } else {
-                Accumulator::skip_encoded(src)?;
+                metered = metered.saturating_add(Accumulator::skip_encoded_codec(src, codec)?);
             }
         }
         if materialize {
@@ -2010,6 +2237,7 @@ pub(crate) fn decode_freeze_at_cut(src: &mut &[u8], max_entries: usize, material
     if pt_cut.is_some() && (freeze.wm_in.is_some() || freeze.wm_out.is_some() || freeze.last_effective.is_some()) {
         return Err(SparrowError::new(ErrorCode::CodecViolation,"PT freeze contains event-time watermarks"));
     }
+    *resident = if materialize { freeze.resident_bytes() } else { metered };
     Ok(freeze)
 }
 

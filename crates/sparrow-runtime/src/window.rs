@@ -223,7 +223,17 @@ impl WindowOperator {
                     return Err(invalid());
                 }
                 let n = match actual {
-                    Accumulator::Extended(_) => return Err(invalid()),
+                    Accumulator::Extended(extra) => {
+                        extra.check_restore(
+                            call.func,
+                            &call.input_type(&self.input)?,
+                            count.then_some(entry.count),
+                        )?;
+                        match extra.as_ref() {
+                            crate::aggregate::ExtendedAccumulator::Moment { n, .. } => *n,
+                            crate::aggregate::ExtendedAccumulator::Value { .. } => 0,
+                        }
+                    }
                     Accumulator::Count {
                         rows,
                         non_null,
@@ -1238,40 +1248,51 @@ impl WindowOperator {
         }
     }
 
-    /// Estimated encoded freeze body (keys + accs + per-entry headers).
-    /// Walks live state by reference — does not clone entries.
-    pub fn estimated_freeze_bytes(&self) -> usize {
-        const ENTRY_OVERHEAD: usize = 2 + 8 + 8 + 8 + 2;
-        match &self.store {
-            WindowStore::Tumble(s) => s
-                .iter()
-                .map(|(k, e)| {
-                    k.key
-                        .iter()
-                        .map(|v| v.encoded_value_len().unwrap_or(0))
-                        .sum::<usize>()
-                        + e.accs
-                            .iter()
-                            .map(|a| a.encoded_len().unwrap_or(0))
-                            .sum::<usize>()
-                        + ENTRY_OVERHEAD
-                })
-                .sum(),
-            WindowStore::Count(s) => s
-                .iter()
-                .map(|(k, e)| {
-                    k.key
-                        .iter()
-                        .map(|v| v.encoded_value_len().unwrap_or(0))
-                        .sum::<usize>()
-                        + e.accs
-                            .iter()
-                            .map(|a| a.encoded_len().unwrap_or(0))
-                            .sum::<usize>()
-                        + ENTRY_OVERHEAD
-                })
-                .sum(),
+    /// Participant codec selected by the aggregate list: codec 3 only when an
+    /// extended aggregate is present, so existing plans keep codec 1 bytes.
+    pub(crate) fn accumulator_codec(&self) -> crate::aggregate::AccumulatorCodec {
+        if self.spec.has_extended_aggs() {
+            crate::aggregate::AccumulatorCodec::WindowExt
+        } else {
+            crate::aggregate::AccumulatorCodec::Window
         }
+    }
+
+    /// Estimated encoded freeze body (keys + accs + per-entry headers).
+    /// Walks live state by reference — does not clone entries. A value that
+    /// has no durable encoding makes the estimate fail closed (never zero).
+    pub fn estimated_freeze_bytes(&self) -> usize {
+        self.try_estimated_freeze_bytes()
+            .unwrap_or(crate::checkpoint::MAX_SNAPSHOT_BYTES as usize + 1)
+    }
+
+    pub(crate) fn try_estimated_freeze_bytes(&self) -> Result<usize> {
+        const ENTRY_OVERHEAD: usize = 2 + 8 + 8 + 8 + 2;
+        let codec = self.accumulator_codec();
+        let entry = |key: &[Scalar], accs: &[Accumulator]| -> Result<usize> {
+            let mut total = ENTRY_OVERHEAD;
+            for v in key {
+                total = total.saturating_add(v.encoded_value_len()?);
+            }
+            for a in accs {
+                total = total.saturating_add(a.encoded_len_codec(codec)?);
+            }
+            Ok(total)
+        };
+        let mut total = 0usize;
+        match &self.store {
+            WindowStore::Tumble(s) => {
+                for (k, e) in s.iter() {
+                    total = total.saturating_add(entry(&k.key, &e.accs)?);
+                }
+            }
+            WindowStore::Count(s) => {
+                for (k, e) in s.iter() {
+                    total = total.saturating_add(entry(&k.key, &e.accs)?);
+                }
+            }
+        }
+        Ok(total)
     }
 
     pub(crate) fn freeze_workspace_bytes(&self) -> usize {
@@ -1294,7 +1315,7 @@ impl WindowOperator {
                 ),
             ));
         }
-        let estimate = self.estimated_freeze_bytes().saturating_add(256);
+        let estimate = self.try_estimated_freeze_bytes()?.saturating_add(256);
         if estimate as u64 > crate::checkpoint::MAX_SNAPSHOT_BYTES {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -1323,6 +1344,15 @@ impl WindowOperator {
     /// into `out`. Peak is live retention + the output buffer — no
     /// `Vec<FrozenEntry>` clone of all accs/keys (P1-14).
     pub fn encode_freeze_into(&self, out: &mut Vec<u8>, max_entries: usize) -> Result<()> {
+        self.encode_freeze_into_codec(out, max_entries, self.accumulator_codec())
+    }
+
+    pub(crate) fn encode_freeze_into_codec(
+        &self,
+        out: &mut Vec<u8>,
+        max_entries: usize,
+        codec: crate::aggregate::AccumulatorCodec,
+    ) -> Result<()> {
         self.check_freeze_encode_bound(max_entries)?;
         let n = self.key_count();
         // Sorted references are temporary workspace, not encoded payload.
@@ -1343,7 +1373,7 @@ impl WindowOperator {
                 keys.sort_by(|a, b| a.encoded_bytes().cmp(b.encoded_bytes()));
                 for k in keys {
                     let e = store.get(k).expect("freeze key");
-                    write_freeze_entry(out, &k.key, e.window_start, e.window_end, 0, &e.accs)?;
+                    write_freeze_entry(out, &k.key, e.window_start, e.window_end, 0, &e.accs, codec)?;
                 }
             }
             WindowStore::Count(store) => {
@@ -1351,7 +1381,7 @@ impl WindowOperator {
                 keys.sort_by(|a, b| a.encoded_bytes().cmp(b.encoded_bytes()));
                 for k in keys {
                     let e = store.get(k).expect("freeze key");
-                    write_freeze_entry(out, &k.key, 0, 0, e.count, &e.accs)?;
+                    write_freeze_entry(out, &k.key, 0, 0, e.count, &e.accs, codec)?;
                 }
             }
         }
@@ -1413,6 +1443,8 @@ impl WindowOperator {
     }
 
     /// Replace in-memory state from a committed freeze (experimental).
+    /// Public/legacy entry: extended aggregates are restorable only through
+    /// the participant (codec 3, v29/v30) path.
     pub fn restore_freeze(&mut self, freeze: &WindowFreeze) -> Result<()> {
         if self.spec.kind.is_new_window() || self.spec.has_extended_aggs() {
             return Err(SparrowError::new(
@@ -1420,6 +1452,21 @@ impl WindowOperator {
                 "new window families have no published restore codec/profile",
             ));
         }
+        self.restore_freeze_inner(freeze)
+    }
+
+    /// K1 participant restore after `validate_participant_restore`.
+    pub(crate) fn restore_participant_freeze(&mut self, freeze: &WindowFreeze) -> Result<()> {
+        if self.spec.kind.is_new_window() {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "new window families have no published restore codec/profile",
+            ));
+        }
+        self.restore_freeze_inner(freeze)
+    }
+
+    fn restore_freeze_inner(&mut self, freeze: &WindowFreeze) -> Result<()> {
         if freeze.operator != self.operator {
             return Err(SparrowError::new(
                 ErrorCode::InvalidArgument,
@@ -1609,6 +1656,7 @@ pub(crate) fn write_freeze_entry(
     window_end: i64,
     count: u64,
     accs: &[Accumulator],
+    codec: crate::aggregate::AccumulatorCodec,
 ) -> Result<()> {
     out.extend_from_slice(&(key.len() as u16).to_le_bytes());
     for s in key {
@@ -1619,7 +1667,7 @@ pub(crate) fn write_freeze_entry(
     out.extend_from_slice(&count.to_le_bytes());
     out.extend_from_slice(&(accs.len() as u16).to_le_bytes());
     for a in accs {
-        a.encode(out)?;
+        a.encode_codec(out, codec)?;
     }
     Ok(())
 }

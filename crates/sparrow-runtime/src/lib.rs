@@ -47,7 +47,10 @@ pub mod window;
 #[cfg(test)]
 mod window_completion_tests;
 pub use iot::{IotFreeze, IotOperator};
-pub use pipeline_checkpoint::{sink_snapshot_version_for, snapshot_version_for, PipelineSnapshot};
+pub use pipeline_checkpoint::{
+    sink_snapshot_version_for, snapshot_version_for, PipelineSnapshot,
+    EXT_AGG_FILE_SNAPSHOT_VERSION, EXT_AGG_RELIABLE_SNAPSHOT_VERSION,
+};
 #[cfg(test)]
 mod sink_checkpoint_tests;
 #[cfg(test)]
@@ -88,7 +91,7 @@ pub use barrier::{
 };
 pub use capture::{CaptureMode, SharedCapture, StallGate};
 pub use checkpoint::{
-    freeze_entry_cap, CheckpointSnapshot, CheckpointStore, FaultHook, FaultPoint,
+    freeze_entry_cap, CheckpointSnapshot, CheckpointStore, FaultHook, FaultPoint, RestoreCredit,
     TableRevisionBind, MAX_FREEZE_ENTRIES,
 };
 pub use clock::RuntimeClock;

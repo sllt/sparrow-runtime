@@ -80,6 +80,253 @@ impl ExtendedAccumulator {
     }
 }
 
+/// Accumulator wire grammar selected by the participant codec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccumulatorCodec {
+    /// Participant codec 1: tags 1..=7 only.
+    Window,
+    /// Participant codec 3: tags 1..=9.
+    WindowExt,
+}
+
+pub(crate) const ACC_BASE_BYTES: usize = 48;
+pub(crate) const EXT_ACC_BASE_BYTES: usize = 128;
+const MOMENT_ENCODED_BYTES: usize = 1 + 1 + 8 + 8 + 8;
+
+fn codec1_extended() -> SparrowError {
+    SparrowError::new(
+        ErrorCode::UnsupportedRestore,
+        "window state codec 1 cannot carry FIRST/LAST/VAR/STDDEV accumulator tags 8/9; codec 3 (v29/v30) is required",
+    )
+    .context("checkpoint_guard", "extended_codec_mismatch")
+}
+
+fn ext_invalid(message: &str) -> SparrowError {
+    SparrowError::new(ErrorCode::CodecViolation, message)
+}
+
+/// Resident bytes of a scalar materialized from one validated value encoding.
+/// Mirrors `Scalar::resident_bytes` for the non-Dynamic value codec.
+pub(crate) fn encoded_scalar_resident(encoded: &[u8]) -> usize {
+    let heap = match encoded.first() {
+        Some(5 | 6) => encoded.len().saturating_sub(5).saturating_add(48),
+        _ => 0,
+    };
+    std::mem::size_of::<Scalar>().saturating_add(heap)
+}
+
+/// Strict scalar value validation for tag 8: a non-NULL, non-Dynamic value
+/// whose Bool byte is canonical. Returns the encoded length.
+fn check_value_scalar(src: &[u8]) -> Result<usize> {
+    match src.first() {
+        Some(1) => {
+            if !matches!(src.get(1), Some(0 | 1)) {
+                return Err(ext_invalid("FIRST/LAST Bool value is not canonical"));
+            }
+        }
+        Some(2..=7) => {}
+        _ => return Err(ext_invalid("FIRST/LAST value must be a non-NULL scalar tag 1..=7")),
+    }
+    let mut cursor = src;
+    Scalar::skip_encoded_value(&mut cursor)?;
+    Ok(src.len() - cursor.len())
+}
+
+impl ExtendedAccumulator {
+    fn check_moment(n: u64, mean: f64, m2: f64) -> Result<()> {
+        let valid = if n == 0 {
+            mean.to_bits() == 0 && m2.to_bits() == 0
+        } else {
+            mean.is_finite() && m2.is_finite() && (n != 1 || m2.to_bits() == 0)
+        };
+        if !valid {
+            return Err(ext_invalid("invalid VAR/STDDEV moment state"));
+        }
+        Ok(())
+    }
+
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(match self {
+            Self::Value { value, .. } => {
+                3 + match value {
+                    None => 0,
+                    Some(v) => {
+                        if v.is_null() || matches!(v, Scalar::Dynamic(_)) {
+                            return Err(SparrowError::new(
+                                ErrorCode::UnsupportedRestore,
+                                "FIRST/LAST state value has no durable scalar encoding",
+                            ));
+                        }
+                        v.encoded_value_len()?
+                    }
+                }
+            }
+            Self::Moment { .. } => MOMENT_ENCODED_BYTES,
+        })
+    }
+
+    /// Tag 8: `[8][mode 0=FIRST,1=LAST][has 0|1][scalar tag 1..=7]`.
+    /// Tag 9: `[9][sample | sqrt<<1][n u64][mean f64 bits][m2 f64 bits]`.
+    /// The encoder applies the decoder's validator; invalid state never lands.
+    fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Self::Value { first, value } => {
+                let start = out.len();
+                out.push(8);
+                out.push(u8::from(!*first));
+                match value {
+                    None => out.push(0),
+                    Some(v) => {
+                        if v.is_null() || matches!(v, Scalar::Dynamic(_)) {
+                            out.truncate(start);
+                            return Err(SparrowError::new(
+                                ErrorCode::UnsupportedRestore,
+                                "FIRST/LAST state value has no durable scalar encoding",
+                            ));
+                        }
+                        if let Scalar::Utf8(_) | Scalar::Bytes(_) = v {
+                            if v.encoded_value_len()? - 5 > u32::MAX as usize {
+                                out.truncate(start);
+                                return Err(SparrowError::new(
+                                    ErrorCode::BoundExceeded,
+                                    "FIRST/LAST value exceeds the scalar codec length",
+                                ));
+                            }
+                        }
+                        out.push(1);
+                        if let Err(error) = v.encode_value(out) {
+                            out.truncate(start);
+                            return Err(error);
+                        }
+                        if let Err(error) = check_value_scalar(&out[start + 3..]) {
+                            out.truncate(start);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            Self::Moment { sample, sqrt, n, mean, m2 } => {
+                Self::check_moment(*n, *mean, *m2)?;
+                out.push(9);
+                out.push(u8::from(*sample) | (u8::from(*sqrt) << 1));
+                out.extend_from_slice(&n.to_le_bytes());
+                out.extend_from_slice(&mean.to_bits().to_le_bytes());
+                out.extend_from_slice(&m2.to_bits().to_le_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates tags 8/9 and returns the materialized `tracked_bytes`.
+    fn skip_encoded(src: &mut &[u8]) -> Result<usize> {
+        let truncated = || ext_invalid("truncated extended accumulator");
+        match src.first() {
+            Some(8) => {
+                if src.len() < 3 {
+                    return Err(truncated());
+                }
+                if src[1] > 1 {
+                    return Err(ext_invalid("invalid FIRST/LAST mode"));
+                }
+                match src[2] {
+                    0 => {
+                        *src = &src[3..];
+                        Ok(EXT_ACC_BASE_BYTES)
+                    }
+                    1 => {
+                        let len = check_value_scalar(&src[3..])?;
+                        let resident = encoded_scalar_resident(&src[3..3 + len]);
+                        *src = &src[3 + len..];
+                        Ok(EXT_ACC_BASE_BYTES.saturating_add(resident))
+                    }
+                    _ => Err(ext_invalid("invalid FIRST/LAST presence flag")),
+                }
+            }
+            Some(9) => {
+                if src.len() < MOMENT_ENCODED_BYTES {
+                    return Err(truncated());
+                }
+                if src[1] > 3 {
+                    return Err(ext_invalid("invalid VAR/STDDEV mode"));
+                }
+                let n = u64::from_le_bytes(src[2..10].try_into().unwrap());
+                let mean = f64::from_bits(u64::from_le_bytes(src[10..18].try_into().unwrap()));
+                let m2 = f64::from_bits(u64::from_le_bytes(src[18..26].try_into().unwrap()));
+                Self::check_moment(n, mean, m2)?;
+                *src = &src[MOMENT_ENCODED_BYTES..];
+                Ok(EXT_ACC_BASE_BYTES)
+            }
+            _ => Err(ext_invalid("unknown extended accumulator tag")),
+        }
+    }
+
+    fn decode(src: &mut &[u8]) -> Result<Self> {
+        let mut cursor = *src;
+        Self::skip_encoded(&mut cursor)?;
+        let tag = src[0];
+        let decoded = if tag == 8 {
+            let first = src[1] == 0;
+            let value = if src[2] == 1 {
+                let mut value_src = &src[3..];
+                Some(Scalar::decode_value(&mut value_src)?)
+            } else {
+                None
+            };
+            Self::Value { first, value }
+        } else {
+            Self::Moment {
+                sample: src[1] & 1 != 0,
+                sqrt: src[1] & 2 != 0,
+                n: u64::from_le_bytes(src[2..10].try_into().unwrap()),
+                mean: f64::from_bits(u64::from_le_bytes(src[10..18].try_into().unwrap())),
+                m2: f64::from_bits(u64::from_le_bytes(src[18..26].try_into().unwrap())),
+            }
+        };
+        *src = cursor;
+        Ok(decoded)
+    }
+
+    /// Participant-level checks after codec validation. Mismatch is an
+    /// incompatible restore, never corruption fallback.
+    pub(crate) fn check_restore(&self, func: AggFn, input: &DataType, count: Option<u64>) -> Result<()> {
+        let mismatch = |message: &str| {
+            Err(SparrowError::new(ErrorCode::UnsupportedRestore, message.to_string())
+                .context("checkpoint_guard", "extended_state_mismatch"))
+        };
+        match self {
+            Self::Value { first, value } => {
+                if !matches!(func, AggFn::First | AggFn::Last) || *first != (func == AggFn::First) {
+                    return mismatch("restored FIRST/LAST mode differs from the live aggregate");
+                }
+                if let Some(v) = value {
+                    if v.is_null() || !v.matches_type(input) {
+                        return mismatch("restored FIRST/LAST value type differs from the live input type");
+                    }
+                }
+                if value.is_some() && count == Some(0) {
+                    return mismatch("restored FIRST/LAST value exceeds the window row count");
+                }
+            }
+            Self::Moment { sample, sqrt, n, .. } => {
+                let expected = match func {
+                    AggFn::VarPop => (false, false),
+                    AggFn::VarSamp => (true, false),
+                    AggFn::StddevPop => (false, true),
+                    AggFn::StddevSamp => (true, true),
+                    _ => return mismatch("restored moment state has no matching live aggregate"),
+                };
+                if (*sample, *sqrt) != expected {
+                    return mismatch("restored VAR/STDDEV mode differs from the live aggregate");
+                }
+                if count.is_some_and(|rows| *n > rows) {
+                    return mismatch("restored moment count exceeds the window row count");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One incremental accumulator. Never stores input rows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Accumulator {
@@ -173,10 +420,10 @@ impl Accumulator {
     }
 
     pub fn tracked_bytes(&self) -> usize {
-        const BASE: usize = 48;
+        const BASE: usize = ACC_BASE_BYTES;
         match self {
             Self::Extended(extra) => {
-                128 + match extra.as_ref() {
+                EXT_ACC_BASE_BYTES + match extra.as_ref() {
                     ExtendedAccumulator::Value { value, .. } => {
                         value.as_ref().map_or(0, Scalar::resident_bytes)
                     }
@@ -351,13 +598,18 @@ impl Accumulator {
         }
     }
 
+    /// Codec 1 (WindowFreeze) encoding. Tags 8/9 are never written here.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.encode_codec(out, AccumulatorCodec::Window)
+    }
+
+    pub(crate) fn encode_codec(&self, out: &mut Vec<u8>, codec: AccumulatorCodec) -> Result<()> {
         match self {
-            Self::Extended(_) => {
-                return Err(SparrowError::new(
-                    ErrorCode::UnsupportedRestore,
-                    "extended aggregate codec is not published",
-                ))
+            Self::Extended(extra) => {
+                if codec != AccumulatorCodec::WindowExt {
+                    return Err(codec1_extended());
+                }
+                extra.encode(out)?;
             }
             Self::Count {
                 rows,
@@ -402,13 +654,18 @@ impl Accumulator {
         Ok(())
     }
 
+    /// Exact codec 1 wire length.
     pub fn encoded_len(&self) -> Result<usize> {
+        self.encoded_len_codec(AccumulatorCodec::Window)
+    }
+
+    pub(crate) fn encoded_len_codec(&self, codec: AccumulatorCodec) -> Result<usize> {
         Ok(match self {
-            Self::Extended(_) => {
-                return Err(SparrowError::new(
-                    ErrorCode::UnsupportedRestore,
-                    "extended aggregate codec is not published",
-                ))
+            Self::Extended(extra) => {
+                if codec != AccumulatorCodec::WindowExt {
+                    return Err(codec1_extended());
+                }
+                extra.encoded_len()?
             }
             Self::Count { .. } | Self::Avg { .. } => 18,
             Self::SumI64 { .. } | Self::SumU64 { .. } | Self::SumF64 { .. } => 17,
@@ -422,7 +679,10 @@ impl Accumulator {
         })
     }
 
-    pub(crate) fn skip_encoded(src: &mut &[u8]) -> Result<()> {
+    /// Validate and advance one accumulator without materializing it. Returns
+    /// the exact [`Self::tracked_bytes`] the materialized value would have, so
+    /// restore credit can be reserved before any state is built.
+    pub(crate) fn skip_encoded_codec(src: &mut &[u8], codec: AccumulatorCodec) -> Result<usize> {
         let invalid = || {
             SparrowError::new(
                 ErrorCode::CodecViolation,
@@ -432,6 +692,12 @@ impl Accumulator {
         let Some((&tag, tail)) = src.split_first() else {
             return Err(invalid());
         };
+        if matches!(tag, 8 | 9) {
+            if codec != AccumulatorCodec::WindowExt {
+                return Err(codec1_extended());
+            }
+            return ExtendedAccumulator::skip_encoded(src);
+        }
         *src = tail;
         let size = match tag {
             1 | 5 => 17,
@@ -442,8 +708,13 @@ impl Accumulator {
                 };
                 *src = tail;
                 return match option {
-                    0 => Ok(()),
-                    1 => Scalar::skip_encoded_value(src),
+                    0 => Ok(ACC_BASE_BYTES),
+                    1 => {
+                        let before = *src;
+                        Scalar::skip_encoded_value(src)?;
+                        Ok(ACC_BASE_BYTES
+                            .saturating_add(encoded_scalar_resident(&before[..before.len() - src.len()])))
+                    }
                     _ => Err(invalid()),
                 };
             }
@@ -453,10 +724,15 @@ impl Accumulator {
             return Err(invalid());
         }
         *src = &src[size..];
-        Ok(())
+        Ok(ACC_BASE_BYTES)
     }
 
+    /// Codec 1 decode. Tags 8/9 are rejected.
     pub fn decode(src: &mut &[u8]) -> Result<Self> {
+        Self::decode_codec(src, AccumulatorCodec::Window)
+    }
+
+    pub(crate) fn decode_codec(src: &mut &[u8], codec: AccumulatorCodec) -> Result<Self> {
         if src.is_empty() {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
@@ -464,6 +740,12 @@ impl Accumulator {
             ));
         }
         let tag = src[0];
+        if matches!(tag, 8 | 9) {
+            if codec != AccumulatorCodec::WindowExt {
+                return Err(codec1_extended());
+            }
+            return Ok(Self::Extended(Box::new(ExtendedAccumulator::decode(src)?)));
+        }
         *src = &src[1..];
         match tag {
             1 => {

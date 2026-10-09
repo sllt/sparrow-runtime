@@ -310,6 +310,7 @@ fn completion_hysteresis_snapshot_decode_rejects_legacy_profile_downgrade() {
             freezes: vec![crate::barrier::EncodedFreeze {
                 bytes: frame,
                 lease,
+                ext: false,
             }],
             next_output: (kind == "jetstream-v1")
                 .then(|| OutputSequence::new([0x73; 16], 1).unwrap()),

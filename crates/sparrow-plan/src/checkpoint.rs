@@ -16,6 +16,10 @@ pub const WINDOW_STATE_CODEC: u16 = 1;
 /// Versioned keyed IoT state.  It is intentionally distinct from the
 /// WindowFreeze codec; an IoT value is not a window accumulator.
 pub const IOT_STATE_CODEC: u16 = 2;
+/// WindowFreeze plus the FIRST/LAST (tag 8) and VAR/STDDEV moment (tag 9)
+/// accumulator encodings. Codec 1 never carries tags 8/9; a codec 1 reader
+/// rejects them. Only the strict linear v29/v30 profiles admit codec 3.
+pub const WINDOW_EXT_STATE_CODEC: u16 = 3;
 // Keep the CPL1 outer grammar readable by old K1 Stores. An old reader must
 // reach compatibility rejection, NOT mistake a new manifest for corruption
 // and fall back to an older published snapshot. The CP01 prefix intentionally
@@ -61,7 +65,7 @@ pub struct StateParticipant {
 impl StateParticipant {
     pub fn freeze_kind(&self) -> u8 {
         match self.codec {
-            WINDOW_STATE_CODEC => u8::from(self.window_kind == 1),
+            WINDOW_STATE_CODEC | WINDOW_EXT_STATE_CODEC => u8::from(self.window_kind == 1),
             IOT_STATE_CODEC if matches!(self.window_kind, 4..=15) => self.window_kind,
             _ => 0,
         }
@@ -134,8 +138,19 @@ impl CheckpointPlan {
         reference_tables: Vec<ReferenceTableDependency>,
     ) -> Result<Self> {
         if plan.has_plugins() {return Err(rejected("plugin functions have no checkpoint/restore profile"));}
-        if plan.has_analysis() || plan.has_extended_aggs() {
-            return Err(rejected("analysis/extended aggregates have no published checkpoint profile; restart_fresh only"));
+        if plan.has_analysis() {
+            return Err(rejected("analysis has no published checkpoint profile; restart_fresh only"));
+        }
+        let extended = plan.has_extended_aggs();
+        if extended
+            && (plan.edges.is_some()
+                || !reference_tables.is_empty()
+                || plan.has_processing_time_state()
+                || plan.has_iot()
+                || !plan.side_outputs.is_empty()
+                || !plan.source_times.is_empty())
+        {
+            return Err(rejected("extended aggregate checkpoint requires a linear Count/event-time window plan without DAG, references, processing-time state, IoT, side outputs or source time"));
         }
         if plan.has_new_windows() {
             return Err(rejected("new hopping-PT/sliding/session windows are restart_fresh only; no compatible state codec/profile is published"));
@@ -267,6 +282,14 @@ impl CheckpointPlan {
                         }
                     }
                     for call in &spec.aggs {
+                        if matches!(call.func, sparrow_model::AggFn::First | sparrow_model::AggFn::Last) {
+                            let ty = call.input_type(input)?;
+                            if ty.is_nested() || ty == sparrow_model::DataType::Dynamic {
+                                return Err(rejected(
+                                    "checkpoint FIRST/LAST codec excludes nested/Dynamic values",
+                                ));
+                            }
+                        }
                         if matches!(
                             call.func,
                             sparrow_model::AggFn::Min | sparrow_model::AggFn::Max
@@ -286,7 +309,11 @@ impl CheckpointPlan {
                     }
                     states.push(StateParticipant {
                         id: ParticipantId::window(*operator),
-                        codec: WINDOW_STATE_CODEC,
+                        codec: if spec.has_extended_aggs() {
+                            WINDOW_EXT_STATE_CODEC
+                        } else {
+                            WINDOW_STATE_CODEC
+                        },
                         window_kind: crate::compat::window_kind_tag(spec.kind),
                     });
                     if states.len() > MAX_CHECKPOINT_STATES {
@@ -418,7 +445,12 @@ impl CheckpointPlan {
             semantics,
             // IoT state depends on the complete computation descriptor.  Do
             // not apply the linear RCP2 downstream-only relaxation to it.
-            recovery_prefix_len: (!has_iot && !has_references && !plan.has_processing_time_state())
+            // Extended aggregate profiles (v29/v30) are strict: the complete
+            // computation, including downstream transforms, is the identity.
+            recovery_prefix_len: (!has_iot
+                && !has_references
+                && !plan.has_processing_time_state()
+                && !extended)
                 .then_some(recovery_prefix_len),
         };
         result.validate()?;
@@ -443,7 +475,11 @@ impl CheckpointPlan {
     pub fn has_event_time_state(&self) -> bool {
         self.states
             .iter()
-            .any(|s| s.codec == WINDOW_STATE_CODEC && matches!(s.window_kind, 2 | 3))
+            .any(|s| matches!(s.codec, WINDOW_STATE_CODEC | WINDOW_EXT_STATE_CODEC) && matches!(s.window_kind, 2 | 3))
+    }
+    /// Codec 3 participants select the strict v29/v30 profiles.
+    pub fn has_extended_state(&self) -> bool {
+        self.states.iter().any(|s| s.codec == WINDOW_EXT_STATE_CODEC)
     }
     fn graph_ports(&self) -> Result<(Vec<OperatorId>, Vec<OperatorId>)> {
         let mut bytes = self
@@ -760,6 +796,17 @@ impl CheckpointPlan {
 
     pub fn validate(&self) -> Result<()> {
         validate_references(&self.reference_tables)?;
+        if self.has_extended_state()
+            && (self.is_graph()
+                || self.has_references()
+                || self.has_iot()
+                || self.recovery_prefix_len.is_some()
+                || self.requires_paused_time())
+        {
+            return Err(rejected(
+                "extended aggregate manifest requires strict linear Count/event-time windows without references or IoT",
+            ));
+        }
         if self.has_resample()
             && (self.is_graph()
                 || self.has_references()
@@ -851,9 +898,12 @@ impl CheckpointPlan {
             else {
                 return Err(rejected("invalid state participant role"));
             };
-            let valid_window = state.codec == WINDOW_STATE_CODEC
+            let valid_window = (state.codec == WINDOW_STATE_CODEC
                 && slot.raw() == 1
-                && matches!(state.window_kind, 0..=3);
+                && matches!(state.window_kind, 0..=3))
+                || (state.codec == WINDOW_EXT_STATE_CODEC
+                    && slot.raw() == 1
+                    && matches!(state.window_kind, 1..=3));
             let valid_iot = state.codec == IOT_STATE_CODEC
                 && slot.raw() == 3
                 && matches!(state.window_kind, 4..=15);

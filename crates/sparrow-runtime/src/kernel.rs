@@ -93,6 +93,9 @@ pub struct JobRequest {
     pub inject_panic: bool,
     /// Production aligned recovery hooks (Kernel path; not AlignedSession).
     pub aligned: Option<AlignedJob>,
+    /// Restore memory already reserved on the admitted Job owner by the
+    /// Store's owned decode. Consumed by the pre-spawn participant restore.
+    restore_credit: Option<crate::checkpoint::RestoreCredit>,
 }
 
 /// Ordered live ingress envelope (R18).
@@ -188,7 +191,15 @@ impl JobRequest {
             live_events: None,
             inject_panic: false,
             aligned: None,
+            restore_credit: None,
         }
+    }
+
+    /// Attach Store restore credit. It must belong to this request's
+    /// SourceAdmission owner; otherwise admission rejects the restore.
+    pub fn with_restore_credit(mut self, credit: crate::checkpoint::RestoreCredit) -> Self {
+        self.restore_credit = Some(credit);
+        self
     }
 
     pub fn with_aligned(mut self, aligned: AlignedJob) -> Self {
@@ -836,10 +847,23 @@ impl Kernel {
                 "native plugin functions require restart_fresh",
             ));
         }
-        if (req.plan.has_analysis() || req.plan.has_extended_aggs()) && req.aligned.is_some() {
+        if req.plan.has_analysis() && req.aligned.is_some() {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                "analysis/extended aggregates are restart_fresh only",
+                "analysis is restart_fresh only",
+            ));
+        }
+        // Extended aggregates are recoverable only through the strict
+        // participant profile (codec 3, v29/v30); never legacy AlignedSession.
+        if req.plan.has_extended_aggs()
+            && req.aligned.as_ref().is_some_and(|aligned| {
+                aligned.pipeline.is_none()
+                    || sparrow_plan::CheckpointPlan::from_physical(&req.plan).is_err()
+            })
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "extended aggregates require the strict linear v29/v30 participant checkpoint profile",
             ));
         }
         for stage in &req.plan.stages {
@@ -1061,6 +1085,7 @@ impl Kernel {
                         | crate::pipeline_checkpoint::PAUSED_COMBINED_FILE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::OBSERVED_FILE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::RESAMPLE_FILE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::EXT_AGG_RELIABLE_SNAPSHOT_VERSION
                 ) && aligned
                     .acks
                     .output_sequence()
@@ -1329,7 +1354,7 @@ impl Kernel {
                             "graph control state belongs to another owner or generation",
                         ));
                     }
-                    crate::barrier::RuntimeAligned::prepare(
+                    crate::barrier::RuntimeAligned::prepare_with_credit(
                         job,
                         &req.plan,
                         &owner,
@@ -1338,6 +1363,7 @@ impl Kernel {
                         self.job_budget.max_timers,
                         (ordered_time && !req.plan.has_event_time_window())
                             .then(|| req.clock.now_micros()),
+                        req.restore_credit.take(),
                     )
                 })
                 .transpose()?,
@@ -1598,6 +1624,7 @@ async fn run_job(ctx: JobCtx, req: JobRequest, _admit: QueueAdmit) -> Result<Job
         live_tables: _,
         external_lookups: _,
         trailing_controls,
+        restore_credit: _,
         mut live_ctrl,
         mut live_events,
         inject_panic,

@@ -54,7 +54,74 @@ pub const FILE_JETSTREAM_SINK_SNAPSHOT_VERSION: u16 = 27;
 /// CSV-v1 output uses JSI2 and its own directory/profile. Existing v27/JSI1
 /// JSON history is never upgraded or reinterpreted as a CSV output target.
 pub const FILE_JETSTREAM_CSV_SINK_SNAPSHOT_VERSION: u16 = 28;
+/// Linear File with at least one codec 3 (FIRST/LAST/VAR/STDDEV) window.
+/// Strict full-semantics identity; never the v3 downstream-prefix relaxation.
+pub const EXT_AGG_FILE_SNAPSHOT_VERSION: u16 = 29;
+/// Linear reliable JetStream input plus output cursor and codec 3 Count windows.
+pub const EXT_AGG_RELIABLE_SNAPSHOT_VERSION: u16 = 30;
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
+
+pub(crate) const EXTENDED_PROFILE_GUARD: &str = "extended_profile_mismatch";
+pub(crate) const RESTORE_CREDIT_GUARD: &str = "restore_credit";
+
+fn extended_mismatch(message: &str) -> SparrowError {
+    SparrowError::new(ErrorCode::UnsupportedRestore, message)
+        .context("checkpoint_guard", EXTENDED_PROFILE_GUARD)
+}
+
+/// Restore-time memory accounting shared by every Store decode entry. With an
+/// owner, decode scratch is reserved before each frame is scanned/decoded and
+/// the materialize pass verifies every participant against the credit that
+/// was reserved from the preceding bounded scan.
+pub(crate) struct RestoreMeter {
+    owner: Option<Arc<MemoryOwner>>,
+    scratch: Option<sparrow_model::MemoryLease>,
+    /// Materialize pass only: per-participant reserved resident bytes.
+    pub(crate) planned: Option<Vec<usize>>,
+    /// Per-participant exact resident bytes, in manifest order.
+    pub(crate) resident: Vec<usize>,
+}
+
+impl RestoreMeter {
+    pub(crate) fn unbilled() -> Self {
+        Self { owner: None, scratch: None, planned: None, resident: Vec::new() }
+    }
+    pub(crate) fn billed(owner: Arc<MemoryOwner>) -> Self {
+        Self { owner: Some(owner), scratch: None, planned: None, resident: Vec::new() }
+    }
+    pub(crate) fn charge_scratch(&mut self, bytes: usize) -> Result<()> {
+        let Some(owner) = &self.owner else { return Ok(()); };
+        let bytes = bytes.max(1);
+        match &mut self.scratch {
+            Some(lease) if lease.bytes() >= bytes => Ok(()),
+            Some(lease) => lease.grow_to(bytes).map_err(restore_credit_error),
+            None => {
+                self.scratch = Some(owner.acquire(CreditKind::Reservation, bytes).map_err(restore_credit_error)?);
+                Ok(())
+            }
+        }
+    }
+    pub(crate) fn release_scratch(&mut self) {
+        self.scratch = None;
+    }
+}
+
+pub(crate) fn restore_credit_error(error: SparrowError) -> SparrowError {
+    error.context("checkpoint_guard", RESTORE_CREDIT_GUARD)
+}
+
+/// Decode scratch per frame: temporary scalar copies for WindowFreeze; IoT
+/// additionally keeps a duplicate-key set (key bytes + tree nodes).
+fn frame_scratch_bound(codec: u16, frame_len: usize, entries: usize) -> usize {
+    if codec == sparrow_plan::checkpoint::IOT_STATE_CODEC {
+        frame_len
+            .saturating_mul(5)
+            .saturating_add(entries.saturating_mul(72))
+            .saturating_add(1024)
+    } else {
+        frame_len.saturating_add(1024)
+    }
+}
 
 fn sink_profile_version(sink: &SinkIdentity) -> u16 {
     match &sink.encoding {
@@ -118,6 +185,27 @@ pub fn snapshot_version_for(
     let graph = plan.is_graph();
     let references = plan.has_references();
     let hysteresis = plan.has_hysteresis();
+
+    if plan.has_extended_state() {
+        // validate() already excludes DAG/references/IoT/processing time.
+        if graph || references || plan.has_iot() || plan.requires_paused_time() {
+            return Err(extended_mismatch("extended aggregate state requires a strict linear profile"));
+        }
+        return match source_kind {
+            "file" => Ok(EXT_AGG_FILE_SNAPSHOT_VERSION),
+            "jetstream-v1"
+                if plan.states.iter().all(|state| state.window_kind == 1) =>
+            {
+                Ok(EXT_AGG_RELIABLE_SNAPSHOT_VERSION)
+            }
+            "jetstream-v1" => Err(extended_mismatch(
+                "JetStream extended aggregate profile requires Count windows",
+            )),
+            _ => Err(extended_mismatch(
+                "extended aggregate state requires a linear File or JetStream source",
+            )),
+        };
+    }
 
     if plan.has_resample() {
         if graph || references || plan.states.len() != 1 || !plan.requires_paused_time() {
@@ -540,6 +628,13 @@ impl PipelineSnapshot {
             if id != participant.id || kind != participant.freeze_kind() {
                 return Err(invalid("pipeline freeze and manifest identity mismatch"));
             }
+            // A codec 1 frame never carries tags 8/9, and a codec 3 manifest
+            // never wraps a frame written without the extended grammar.
+            if freeze.ext != (participant.codec == sparrow_plan::checkpoint::WINDOW_EXT_STATE_CODEC) {
+                return Err(extended_mismatch(
+                    "participant state codec differs from the encoded freeze grammar",
+                ));
+            }
             // max_state_keys remains per operator. Participant count and total
             // bytes are separately bounded, rather than halving legal capacity.
             entries = entries.max(n);
@@ -589,9 +684,18 @@ impl PipelineSnapshot {
     }
 
     pub(crate) fn decode_mode(
+        bytes: &[u8],
+        max_keys: usize,
+        materialize: bool,
+    ) -> Result<Self> {
+        Self::decode_metered(bytes, max_keys, materialize, &mut RestoreMeter::unbilled())
+    }
+
+    pub(crate) fn decode_metered(
         mut bytes: &[u8],
         max_keys: usize,
         materialize: bool,
+        meter: &mut RestoreMeter,
     ) -> Result<Self> {
         if bytes.len() as u64 > MAX_SNAPSHOT_BYTES
             || take(&mut bytes, 4)? != crate::checkpoint::MAGIC
@@ -620,6 +724,8 @@ impl PipelineSnapshot {
                 | RESAMPLE_FILE_SNAPSHOT_VERSION | RESAMPLE_RELIABLE_SNAPSHOT_VERSION
                 | FILE_JETSTREAM_SINK_SNAPSHOT_VERSION
                 | FILE_JETSTREAM_CSV_SINK_SNAPSHOT_VERSION
+                | EXT_AGG_FILE_SNAPSHOT_VERSION
+                | EXT_AGG_RELIABLE_SNAPSHOT_VERSION
         ) {
             return Err(invalid("unsupported pipeline snapshot version"));
         }
@@ -671,6 +777,7 @@ impl PipelineSnapshot {
                 | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION
                 | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION
                 | RESAMPLE_FILE_SNAPSHOT_VERSION | RESAMPLE_RELIABLE_SNAPSHOT_VERSION
+                | EXT_AGG_RELIABLE_SNAPSHOT_VERSION
         ) {
             let epoch=take(&mut bytes,16)?.try_into().unwrap();
             Some(sparrow_model::OutputSequence::new(epoch,u64_value(&mut bytes)?)
@@ -681,6 +788,33 @@ impl PipelineSnapshot {
         }
         let length = u32_value(&mut bytes)?;
         let plan = CheckpointPlan::decode(take(&mut bytes, length)?)?;
+        // Codec 3 and the v29/v30 envelopes select each other exactly. A
+        // mismatch is a version/profile incompatibility from a complete,
+        // checksummed record; never classify it as corruption fallback.
+        let extended_version = matches!(
+            version,
+            EXT_AGG_FILE_SNAPSHOT_VERSION | EXT_AGG_RELIABLE_SNAPSHOT_VERSION
+        );
+        if extended_version != plan.has_extended_state() {
+            return Err(extended_mismatch(
+                "checkpoint outer version and extended aggregate state codec disagree",
+            ));
+        }
+        if extended_version {
+            let expected = snapshot_version_for(&plan, &source.identity.kind)?;
+            if expected != version {
+                return Err(extended_mismatch(
+                    "extended aggregate checkpoint source/profile disagree",
+                ));
+            }
+            if version == EXT_AGG_RELIABLE_SNAPSHOT_VERSION
+                && next_output.is_none_or(|position| position.epoch() != generation)
+            {
+                return Err(invalid(
+                    "v30 checkpoint lacks a stable output identity for its state generation",
+                ));
+            }
+        }
         // New output profiles have a complete, independent eligibility
         // contract. Reject foreign graph/IoT/time manifests before the old
         // version/participant checks can turn them into corruption fallback.
@@ -859,7 +993,8 @@ impl PipelineSnapshot {
         let mut remaining = per_participant
             .checked_mul(plan.states.len())
             .ok_or_else(|| invalid("total participant work bound overflow"))?;
-        for participant in &plan.states {
+        meter.resident.clear();
+        for (index, participant) in plan.states.iter().enumerate() {
             let length = u32_value(&mut bytes)?;
             let mut frame = take(&mut bytes, length)?;
             let entries = crate::checkpoint::FreezeHeader::parse(frame)?.entries;
@@ -869,19 +1004,38 @@ impl PipelineSnapshot {
                     "total decoded participant entry limit",
                 ));
             }
+            meter.charge_scratch(frame_scratch_bound(participant.codec, frame.len(), entries))?;
+            let planned = meter.planned.as_ref().map(|planned| planned.get(index).copied().unwrap_or(0));
+            let check_planned = |resident: usize| -> Result<()> {
+                if materialize && planned.is_some_and(|planned| resident > planned) {
+                    return Err(SparrowError::new(
+                        ErrorCode::Internal,
+                        "restored participant exceeds its reserved restore credit",
+                    ));
+                }
+                Ok(())
+            };
             if participant.codec == sparrow_plan::checkpoint::IOT_STATE_CODEC {
-                let freeze = crate::iot::IotFreeze::decode_at_cut(&mut frame, per_participant, materialize, processing_time)?;
+                let mut resident = 0usize;
+                let freeze = crate::iot::IotFreeze::decode_metered(&mut frame, per_participant, materialize, processing_time, &mut resident)?;
                 remaining -= entries;
                 if !frame.is_empty() || participant.id != ParticipantId::iot(freeze.operator)
                     || freeze.kind != participant.freeze_kind() {
                     return Err(invalid("IoT checkpoint state identity or codec mismatch"));
                 }
+                check_planned(resident)?;
+                meter.resident.push(resident);
                 if materialize { iot.push(freeze); }
                 continue;
             }
+            let codec = match participant.codec {
+                sparrow_plan::checkpoint::WINDOW_EXT_STATE_CODEC => crate::aggregate::AccumulatorCodec::WindowExt,
+                _ => crate::aggregate::AccumulatorCodec::Window,
+            };
+            let mut resident = 0usize;
             let freeze =
-                crate::checkpoint::decode_freeze_at_cut(&mut frame, per_participant, materialize,
-                    processing_time.filter(|_|participant.window_kind == 0))?;
+                crate::checkpoint::decode_freeze_metered(&mut frame, per_participant, materialize,
+                    processing_time.filter(|_|participant.window_kind == 0), codec, &mut resident)?;
             remaining -= entries;
             if !frame.is_empty()
                 || participant.id
@@ -896,10 +1050,13 @@ impl PipelineSnapshot {
                     "duplicate/unknown/misordered checkpoint state identity or codec",
                 ));
             }
+            check_planned(resident)?;
+            meter.resident.push(resident);
             if materialize {
                 windows.push(freeze);
             }
         }
+        meter.release_scratch();
         if !bytes.is_empty() {
             return Err(invalid("trailing pipeline snapshot bytes"));
         }
@@ -949,16 +1106,32 @@ impl StoredSnapshot {
         }
     }
     pub(crate) fn decode(bytes: &[u8], max_keys: usize, materialize: bool) -> Result<Self> {
-        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28,0])) {
-            Ok(Self::Pipeline(PipelineSnapshot::decode_mode(
+        Self::decode_metered(bytes, max_keys, materialize, &mut RestoreMeter::unbilled())
+    }
+    pub(crate) fn decode_metered(
+        bytes: &[u8],
+        max_keys: usize,
+        materialize: bool,
+        meter: &mut RestoreMeter,
+    ) -> Result<Self> {
+        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30,0])) {
+            Ok(Self::Pipeline(PipelineSnapshot::decode_metered(
                 bytes,
                 max_keys,
                 materialize,
+                meter,
             )?))
         } else {
             Ok(Self::Legacy(
-                crate::checkpoint::CheckpointSnapshot::decode_mode(bytes, max_keys, materialize)?,
+                crate::checkpoint::CheckpointSnapshot::decode_metered(bytes, max_keys, materialize, meter)?,
             ))
+        }
+    }
+    /// Restore-credit participant identities, in decode (`meter.resident`) order.
+    pub(crate) fn credit_participants(&self) -> Vec<ParticipantId> {
+        match self {
+            Self::Legacy(s) => vec![ParticipantId::State { operator: s.window.operator, slot: s.window.slot, shard: 0 }],
+            Self::Pipeline(s) => s.plan.states.iter().map(|state| state.id).collect(),
         }
     }
     pub(crate) fn legacy(self) -> Result<crate::checkpoint::CheckpointSnapshot> {
