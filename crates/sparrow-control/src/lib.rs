@@ -92,4 +92,6 @@ mod hysteresis_completion_tests;
 #[cfg(all(test, feature = "jetstream", feature = "demo-io"))]
 mod k2_tests;
 #[cfg(test)]
+mod nats_tests;
+#[cfg(test)]
 mod reference_completion_tests;

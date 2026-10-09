@@ -168,7 +168,7 @@ impl RestoreClaim {
 /// Capability matrix: configs that require unsupported recovery are rejected.
 ///
 /// `replayable` is the connector's declared ReplayableSource capability.
-/// MQTT / HTTP push / HTTP poll are never replayable.
+/// MQTT / HTTP push / HTTP poll / NATS Core are never replayable.
 pub fn check_recovery_capabilities(
     source_kind: &str,
     replayable: bool,
@@ -178,7 +178,7 @@ pub fn check_recovery_capabilities(
     claim.validate_with_policy(recovery)?;
     let mqtt_like = matches!(
         source_kind,
-        "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "http"
+        "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "nats" | "http"
     );
     if matches!(claim, RestoreClaim::MqttSession { .. }) {
         return Err(SparrowError::new(

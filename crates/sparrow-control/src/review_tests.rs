@@ -231,6 +231,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
             kind: "file".into(),
             jetstream: None,
             http_poll: None,
+            nats: None,
             host: None,
             port: None,
             topic: "sensors/json".into(),
@@ -251,6 +252,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
             file_contract: None,
         },
         sink: SinkSpec {
+            nats: None,
             plugin: None,
             action: None,
             file: None,
@@ -388,6 +390,7 @@ fn mqtt_aligned_still_rejected() {
             kind: "mqtt".into(),
             jetstream: None,
             http_poll: None,
+            nats: None,
             host: Some("127.0.0.1".into()),
             port: Some(1883),
             topic: "t".into(),
@@ -408,6 +411,7 @@ fn mqtt_aligned_still_rejected() {
             file_contract: None,
         },
         sink: SinkSpec {
+            nats: None,
             plugin: None,
             action: None,
             file: None,

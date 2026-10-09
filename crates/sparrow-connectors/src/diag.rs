@@ -57,6 +57,32 @@ pub struct IoDiagnostics {
     pub http_poll_inflight: AtomicU64,
     /// Admitted HTTP poll rows still in the inbox (byte-accounted).
     pub http_poll_inbox: Arc<sparrow_model::QueueOccupancy>,
+    /// NATS Core (non-JetStream). Source counters are prefixed `nats_source_`,
+    /// sink counters `nats_sink_`. `slow_consumer` counts SDK slow-consumer
+    /// events: messages the client dropped because its bounded subscription
+    /// buffer was full (a lower bound; the SDK event queue is lossy).
+    pub nats_source_received: AtomicU64,
+    pub nats_source_rows: AtomicU64,
+    pub nats_source_dropped_bad: AtomicU64,
+    pub nats_source_dropped_oversize: AtomicU64,
+    pub nats_source_dropped_budget: AtomicU64,
+    pub nats_source_backpressure_waits: AtomicU64,
+    pub nats_source_slow_consumer: AtomicU64,
+    pub nats_source_disconnects: AtomicU64,
+    pub nats_source_reconnects: AtomicU64,
+    pub nats_source_client_errors: AtomicU64,
+    pub nats_sink_published: AtomicU64,
+    pub nats_sink_failed: AtomicU64,
+    pub nats_sink_dropped_bad: AtomicU64,
+    pub nats_sink_dropped_oversize: AtomicU64,
+    pub nats_sink_discarded_on_close: AtomicU64,
+    pub nats_sink_flushes: AtomicU64,
+    pub nats_sink_flush_failed: AtomicU64,
+    pub nats_sink_disconnects: AtomicU64,
+    pub nats_sink_reconnects: AtomicU64,
+    pub nats_sink_client_errors: AtomicU64,
+    pub nats_sink_sessions: AtomicU64,
+    pub nats_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub log_written: AtomicU64,
     pub decode_errors: AtomicU64,
     pub file_written: AtomicU64,
@@ -127,6 +153,31 @@ impl IoDiagnostics {
             http_poll_inflight: self.http_poll_inflight.load(Ordering::Relaxed),
             http_poll_inbox_items: self.http_poll_inbox.items.load(Ordering::Relaxed),
             http_poll_inbox_bytes: self.http_poll_inbox.bytes.load(Ordering::Relaxed),
+            nats_source_received: self.nats_source_received.load(Ordering::Relaxed),
+            nats_source_rows: self.nats_source_rows.load(Ordering::Relaxed),
+            nats_source_dropped_bad: self.nats_source_dropped_bad.load(Ordering::Relaxed),
+            nats_source_dropped_oversize: self.nats_source_dropped_oversize.load(Ordering::Relaxed),
+            nats_source_dropped_budget: self.nats_source_dropped_budget.load(Ordering::Relaxed),
+            nats_source_backpressure_waits: self
+                .nats_source_backpressure_waits
+                .load(Ordering::Relaxed),
+            nats_source_slow_consumer: self.nats_source_slow_consumer.load(Ordering::Relaxed),
+            nats_source_disconnects: self.nats_source_disconnects.load(Ordering::Relaxed),
+            nats_source_reconnects: self.nats_source_reconnects.load(Ordering::Relaxed),
+            nats_source_client_errors: self.nats_source_client_errors.load(Ordering::Relaxed),
+            nats_sink_published: self.nats_sink_published.load(Ordering::Relaxed),
+            nats_sink_failed: self.nats_sink_failed.load(Ordering::Relaxed),
+            nats_sink_dropped_bad: self.nats_sink_dropped_bad.load(Ordering::Relaxed),
+            nats_sink_dropped_oversize: self.nats_sink_dropped_oversize.load(Ordering::Relaxed),
+            nats_sink_discarded_on_close: self.nats_sink_discarded_on_close.load(Ordering::Relaxed),
+            nats_sink_flushes: self.nats_sink_flushes.load(Ordering::Relaxed),
+            nats_sink_flush_failed: self.nats_sink_flush_failed.load(Ordering::Relaxed),
+            nats_sink_disconnects: self.nats_sink_disconnects.load(Ordering::Relaxed),
+            nats_sink_reconnects: self.nats_sink_reconnects.load(Ordering::Relaxed),
+            nats_sink_client_errors: self.nats_sink_client_errors.load(Ordering::Relaxed),
+            nats_sink_sessions: self.nats_sink_sessions.load(Ordering::Relaxed),
+            nats_source_inbox_items: self.nats_source_inbox.items.load(Ordering::Relaxed),
+            nats_source_inbox_bytes: self.nats_source_inbox.bytes.load(Ordering::Relaxed),
             log_written: self.log_written.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             file_written: self.file_written.load(Ordering::Relaxed),
@@ -192,6 +243,29 @@ pub struct IoSnapshot {
     pub http_poll_inflight: u64,
     pub http_poll_inbox_items: u64,
     pub http_poll_inbox_bytes: u64,
+    pub nats_source_received: u64,
+    pub nats_source_rows: u64,
+    pub nats_source_dropped_bad: u64,
+    pub nats_source_dropped_oversize: u64,
+    pub nats_source_dropped_budget: u64,
+    pub nats_source_backpressure_waits: u64,
+    pub nats_source_slow_consumer: u64,
+    pub nats_source_disconnects: u64,
+    pub nats_source_reconnects: u64,
+    pub nats_source_client_errors: u64,
+    pub nats_sink_published: u64,
+    pub nats_sink_failed: u64,
+    pub nats_sink_dropped_bad: u64,
+    pub nats_sink_dropped_oversize: u64,
+    pub nats_sink_discarded_on_close: u64,
+    pub nats_sink_flushes: u64,
+    pub nats_sink_flush_failed: u64,
+    pub nats_sink_disconnects: u64,
+    pub nats_sink_reconnects: u64,
+    pub nats_sink_client_errors: u64,
+    pub nats_sink_sessions: u64,
+    pub nats_source_inbox_items: u64,
+    pub nats_source_inbox_bytes: u64,
     pub log_written: u64,
     pub decode_errors: u64,
     pub file_written: u64,
@@ -278,6 +352,29 @@ impl IoSnapshot {
         self.http_poll_inflight += other.http_poll_inflight;
         self.http_poll_inbox_items += other.http_poll_inbox_items;
         self.http_poll_inbox_bytes += other.http_poll_inbox_bytes;
+        self.nats_source_received += other.nats_source_received;
+        self.nats_source_rows += other.nats_source_rows;
+        self.nats_source_dropped_bad += other.nats_source_dropped_bad;
+        self.nats_source_dropped_oversize += other.nats_source_dropped_oversize;
+        self.nats_source_dropped_budget += other.nats_source_dropped_budget;
+        self.nats_source_backpressure_waits += other.nats_source_backpressure_waits;
+        self.nats_source_slow_consumer += other.nats_source_slow_consumer;
+        self.nats_source_disconnects += other.nats_source_disconnects;
+        self.nats_source_reconnects += other.nats_source_reconnects;
+        self.nats_source_client_errors += other.nats_source_client_errors;
+        self.nats_sink_published += other.nats_sink_published;
+        self.nats_sink_failed += other.nats_sink_failed;
+        self.nats_sink_dropped_bad += other.nats_sink_dropped_bad;
+        self.nats_sink_dropped_oversize += other.nats_sink_dropped_oversize;
+        self.nats_sink_discarded_on_close += other.nats_sink_discarded_on_close;
+        self.nats_sink_flushes += other.nats_sink_flushes;
+        self.nats_sink_flush_failed += other.nats_sink_flush_failed;
+        self.nats_sink_disconnects += other.nats_sink_disconnects;
+        self.nats_sink_reconnects += other.nats_sink_reconnects;
+        self.nats_sink_client_errors += other.nats_sink_client_errors;
+        self.nats_sink_sessions += other.nats_sink_sessions;
+        self.nats_source_inbox_items += other.nats_source_inbox_items;
+        self.nats_source_inbox_bytes += other.nats_source_inbox_bytes;
         self.log_written += other.log_written;
         self.decode_errors += other.decode_errors;
         self.file_written += other.file_written;

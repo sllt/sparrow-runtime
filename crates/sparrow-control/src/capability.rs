@@ -1,10 +1,23 @@
 //! Static implementation inventory, not a substitute for binding or certification.
 use serde_json::{json, Value};
 pub fn inventory() -> Value {
+    // NATS Core joins the live matrix only when the build carries the `nats` feature.
+    let nats: &[&str] = if cfg!(feature = "nats") {
+        &["nats"]
+    } else {
+        &[]
+    };
+    let sinks: Vec<&str> = ["http", "mqtt", "log"]
+        .iter()
+        .chain(nats)
+        .copied()
+        .collect();
     let combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file"]
-        .into_iter()
+        .iter()
+        .chain(nats)
+        .copied()
         .flat_map(|source| {
-            ["http", "mqtt", "log"].into_iter().map(move |sink| {
+            sinks.clone().into_iter().map(move |sink| {
                 json!({"source":source,"sink":sink,
             "graph":"linear","delivery":"live_best_effort","recovery":"restart_fresh",
             "configuration":"requires_schema_target_secret_and_budget_validation",
@@ -180,8 +193,16 @@ mod tests {
     #[test]
     fn production_inventory_does_not_claim_unimplemented_backends_or_certification() {
         let value = super::inventory();
-        // 4 live/file sources (mqtt, http_push, http_poll, file) x 3 sinks.
-        assert_eq!(value["combinations"].as_array().unwrap().len(), 12);
+        // 4 live/file sources (mqtt, http_push, http_poll, file) x 3 sinks, plus NATS Core
+        // as both a source and a sink when the `nats` feature is built.
+        let expected = if cfg!(feature = "nats") { 5 * 4 } else { 4 * 3 };
+        assert_eq!(value["combinations"].as_array().unwrap().len(), expected);
+        assert!(value["combinations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["source"] == "nats" || c["sink"] == "nats")
+            .all(|c| c["delivery"] == "live_best_effort" && c["recovery"] == "restart_fresh"));
         assert!(value["combinations"]
             .as_array()
             .unwrap()

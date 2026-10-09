@@ -1,4 +1,4 @@
-//! Production I/O adapters. MQTT/HTTP (sink, push, poll, lookup)/file live here — never in
+//! Production I/O adapters. MQTT/HTTP (sink, push, poll, lookup)/NATS Core/file live here — never in
 //! `sparrow-runtime` or `sparrow-model`.
 //!
 //! Default delivery is `live_best_effort` + `restart_fresh`. MQTT replay is
@@ -19,6 +19,8 @@ pub mod http_push;
 pub mod jetstream;
 pub mod log;
 pub mod mqtt;
+#[cfg(feature = "nats")]
+pub mod nats;
 pub mod policy;
 pub mod secret;
 pub mod tls;
@@ -42,6 +44,8 @@ pub use log::{LogSink, LogSinkConfig};
 #[cfg(feature = "demo-io")]
 pub use mqtt::{publish_qos0, publish_qos0_many, EmbeddedBroker, MqttPublisher};
 pub use mqtt::{MqttSink, MqttSinkConfig, MqttSource, MqttSourceConfig};
+#[cfg(feature = "nats")]
+pub use nats::{NatsClientConfig, NatsSink, NatsSinkConfig, NatsSource, NatsSourceConfig};
 pub use policy::{
     check_bind_addr, check_data_path, check_data_path_in, configured_data_roots, data_roots,
     default_data_root, default_data_roots, ensure_default_data_root, AllowedTarget, TargetPolicy,

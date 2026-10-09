@@ -4,7 +4,8 @@
 JetStream 实现中**提炼**出新增内置 connector 必须遵守的规则，不新增运行时语义。
 外部进程插件另见 [EXTENSIONS.md](EXTENSIONS.md)；JetStream 的可靠协议见
 [JETSTREAM.md](JETSTREAM.md)。HTTP Poll Source（`http_poll`）是第一个按本合同
-实现的 connector，文末给出它的对照。
+实现的 connector，文末给出它的对照；NATS Core Source / Sink（`nats`）是第二个，
+见 [NATS.md](NATS.md)。
 
 English summary: every new built-in connector must (1) declare its delivery /
 replay / recovery semantics as a `ConnectorCapabilities` const and refuse
@@ -22,7 +23,7 @@ release all credit on cancel, (8) validate config with `deny_unknown_fields`,
   `ConnectorCapabilities` 常量：`kind`、`replay`、`delivery`、`recovery`。
   **声明必须与实现一致，只能偏弱不能偏强。** 没有 broker 位置/确认协议的
   live 来源一律是 `LiveBestEffort` + `RestartFresh` + `ReplaySupport::Unsupported`
-  （MQTT、HTTP Push、HTTP Poll）。
+  （MQTT、HTTP Push、HTTP Poll、NATS Core）。
 - 构造/绑定时调用 `refuse_durable_recovery(caps, restore)`，任何
   `RestoreClaim::Durable*` / checkpoint 恢复都返回 `UnsupportedRestore`，
   不得静默降级。
@@ -152,6 +153,10 @@ Control crate：
   `sparrow-connectors` 的可选 feature 后（同 `jetstream` → `async-nats`），
   上层 crate 透传同名 feature；默认构建不包含。未启用时 spec 校验返回
   `FeatureUnavailable`，而不是未知 kind。
+- 共用同一 SDK 的 connector 共享连接/认证/TLS 校验并用层级 feature：
+  `nats`（NATS Core，只带 `async-nats`）是 `jetstream` 的子集，
+  `jetstream = ["nats", ...]`；服务器白名单、subject 语法和 token 规则在
+  `nats::common` 中只实现一次。
 
 ---
 
@@ -204,3 +209,19 @@ Control crate：
 限制：仅 GET；不支持从包络字段（如 `{"data":[...]}`）提取记录；不按 DNS 解析
 结果再次校验 IP；无私有 CA；数组中途出现结构错误时已入队的行保留；
 密钥轮换需重启；持续 401 只退避不使 job 失败。
+
+---
+
+## 附：NATS Core Source / Sink（`kind: "nats"`，feature `nats`）
+
+完整说明与 Core/JetStream 对照表见 [NATS.md](NATS.md)。
+
+| 合同项 | NATS Core 的实现 |
+|---|---|
+| 语义 | Source / Sink 均为 `live_best_effort` / `restart_fresh` / replay `unsupported`，at-most-once、无 ACK；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
+| 内存 | `(capacity + min(capacity,16)) × (max_payload_bytes + 8 KiB) + 256 KiB` 记入 reservation（≤ reservation/2），包括 Sink SDK command/writer 重叠，Source 保守沿用；Source 每次 INFO 后、SUB 前检查服务器 payload 上限，并在分配前校验 frame；inbox 按 `inbox_bytes` 计入 queue 账本，解码/编码 scratch 另行预扣 |
+| 背压 | inbox 满时 Source 等待；有界 wire prefetch 满后丢弃并精确计 `nats_source_slow_consumer`（不是全链路损失）；Sink outbox 有界，发布超时计 `nats_sink_failed` |
+| 重连 | 每次断线 ≤ `reconnect_attempts`（1..100，拒绝 0=无限），100 ms→2 s 退避；耗尽后 Source 可重试失败、Sink 退避重开 |
+| 认证 | 仅 `token_secret`，必须 `tls://`；URL 不得含 userinfo；端点经 `TargetPolicy` |
+| 关闭 | 从取消起当前在途与已排队批次共用 `flush_timeout_ms`；flush 只证明本地 socket 写出，不是 broker ACK；剩余计 `discarded_on_close`；缓冲、调用方和 SDK 均退出后才退还对应信用 |
+| 指标 | `nats_source_*` / `nats_sink_*`，pipeline status 中的 `nats_source` / `nats_sink` 对象 |

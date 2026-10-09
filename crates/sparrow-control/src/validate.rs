@@ -293,7 +293,9 @@ pub fn replay_label_for_source(kind: &str) -> &'static str {
     match kind {
         "file" | "file_replay" | "replay" => "replayable",
         "jetstream" if cfg!(feature = "jetstream") => "replayable",
-        "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "http" | "plugin" => "unsupported",
+        "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "nats" | "http" | "plugin" => {
+            "unsupported"
+        }
         _ => sparrow_plan::REPLAY_UNBOUND,
     }
 }
@@ -400,6 +402,7 @@ pub fn validate_io(
 ) -> Result<()> {
     validate_lookup_io(spec,secrets,policy)?;
     spec.check_delivery()?;
+    check_nats_reservation_total(spec)?;
     if let Some(io) = &spec.graph_io {
         for (operator, source) in &io.sources {
             validate_source_io(spec, source, schema, secrets, policy, demo)
@@ -414,6 +417,43 @@ pub fn validate_io(
 
     validate_source_io(spec, &spec.source, schema, secrets, policy, demo)?;
     validate_sink_io(&spec.sink, secrets, policy, demo)
+}
+
+/// Every NATS client reserves its SDK buffers on the same job owner. Each one
+/// is already capped at half the reservation budget; the sum over all NATS
+/// endpoints of one pipeline must also leave a quarter for rows and state,
+/// so an over-subscribed graph is refused here instead of failing at start.
+fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
+    #[cfg(feature = "nats")]
+    {
+        let (sources, sinks): (Vec<&SourceSpec>, Vec<&SinkSpec>) = match &spec.graph_io {
+            Some(io) => (io.sources.values().collect(), io.sinks.values().collect()),
+            None => (vec![&spec.source], vec![&spec.sink]),
+        };
+        let total = sources
+            .iter()
+            .filter_map(|s| s.nats.as_ref())
+            .map(|n| n.client_config().sdk_reservation())
+            .chain(
+                sinks
+                    .iter()
+                    .filter_map(|s| s.nats.as_ref())
+                    .map(|n| n.client_config().sdk_reservation()),
+            )
+            .fold(0usize, usize::saturating_add);
+        let budget = sparrow_model::ResourceBudget::compact().reservation_bytes;
+        if total > budget / 4 * 3 {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                format!(
+                    "NATS SDK buffers of all endpoints ({total} bytes) exceed 3/4 of the job reservation budget ({budget}); lower subscription_capacity/client_capacity or max_payload_bytes"
+                ),
+            ));
+        }
+    }
+    #[cfg(not(feature = "nats"))]
+    let _ = spec;
+    Ok(())
 }
 
 fn validate_lookup_io(spec:&PipelineSpec,secrets:&dyn SecretResolver,policy:&TargetPolicy)->Result<()> {
@@ -465,6 +505,15 @@ fn validate_source_io(
                 .validate(secrets, policy)
                 .map_err(io)?;
         }
+        #[cfg(feature = "nats")]
+        "nats" => {
+            refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
+            let nats = nats_source_config(source, schema.clone(), spec.effective_fail_on_decode())?;
+            nats.validate(secrets, policy)?;
+            let compact = sparrow_model::ResourceBudget::compact();
+            nats.check_inbox_budget(compact.queue_bytes)?;
+            nats.check_reservation_budget(compact.reservation_bytes)?;
+        }
         "file" | "file_replay" | "replay" => {
             let path = source.path.clone().ok_or_else(|| {
                 SparrowError::new(
@@ -489,7 +538,9 @@ fn validate_source_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("source kind `{other}` is not supported (mqtt|http_push|http_poll|file)"),
+                format!(
+                    "source kind `{other}` is not supported (mqtt|http_push|http_poll|nats|file)"
+                ),
             ));
         }
     }
@@ -542,6 +593,14 @@ fn validate_sink_io(
             }
         }
         "log" => {}
+        #[cfg(feature = "nats")]
+        "nats" => {
+            let nats = nats_sink_config(sink)?;
+            nats.validate(secrets, policy)?;
+            nats.check_reservation_budget(
+                sparrow_model::ResourceBudget::compact().reservation_bytes,
+            )?;
+        }
         "mqtt" => {
             let mqtt = mqtt_sink_config(sink, demo)?;
             mqtt.validate(secrets, policy).map_err(io)?;
@@ -557,7 +616,7 @@ fn validate_sink_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("sink kind `{other}` is not supported (http|log|mqtt|file)"),
+                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|file)"),
             ));
         }
     }
@@ -595,6 +654,7 @@ pub fn validate_io_with_plan(
     };
 
     validate_lookup_io(spec,secrets,policy)?;
+    check_nats_reservation_total(spec)?;
     for (operator, source) in &io.sources {
         let actual = graph_endpoint_schema(plan, *operator, true)?;
         validate_source_io(spec, source, &actual, secrets, policy, demo)
@@ -773,6 +833,35 @@ pub fn http_poll_config(
             )
         })?
         .connector_config(schema, source.inbox_capacity, fail_on_decode)
+}
+
+#[cfg(feature = "nats")]
+pub fn nats_source_config(
+    source: &SourceSpec,
+    schema: Schema,
+    fail_on_decode: bool,
+) -> Result<sparrow_connectors::NatsSourceConfig> {
+    Ok(source
+        .nats
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "NATS source requires source.nats",
+            )
+        })?
+        .connector_config(schema, source.inbox_capacity, fail_on_decode))
+}
+
+#[cfg(feature = "nats")]
+pub fn nats_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::NatsSinkConfig> {
+    Ok(sink
+        .nats
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidArgument, "NATS sink requires sink.nats")
+        })?
+        .connector_config(sink.outbox_capacity))
 }
 
 pub fn http_push_config(source: &SourceSpec, schema: Schema) -> Result<HttpPushSourceConfig> {
@@ -1464,6 +1553,8 @@ pub fn capabilities_json() -> serde_json::Value {
     let push = ConnectorCapabilities::HTTP_PUSH;
     let poll = ConnectorCapabilities::HTTP_POLL;
     let mqtt_sink = ConnectorCapabilities::MQTT_SINK;
+    let nats = ConnectorCapabilities::NATS_SOURCE;
+    let nats_sink = ConnectorCapabilities::NATS_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
     serde_json::json!({
         "inventory":crate::capability::inventory(),
@@ -1500,6 +1591,28 @@ pub fn capabilities_json() -> serde_json::Value {
                 "recovery": poll.recovery.as_str(),
                 "maturity": "preview",
                 "contract": "single_inflight_GET; next_poll_after_admission; skipped_ticks_counted; bounded_response; failure_backoff",
+            },
+            {
+                "kind": nats.kind,
+                "roles": ["source"],
+                "enabled_by_build": cfg!(feature = "nats"),
+                "replay": nats.replay.as_str(),
+                "delivery": nats.delivery.as_str(),
+                "recovery": nats.recovery.as_str(),
+                "acknowledgement": "none",
+                "maturity": "preview",
+                "contract": "nats_core_at_most_once; no_ack; no_replay; bounded_wire_prefetch_drops_counted; subscribed_after_PONG; bounded_reconnect_per_outage; not_jetstream",
+            },
+            {
+                "kind": nats_sink.kind,
+                "roles": ["sink"],
+                "enabled_by_build": cfg!(feature = "nats"),
+                "replay": nats_sink.replay.as_str(),
+                "delivery": nats_sink.delivery.as_str(),
+                "recovery": nats_sink.recovery.as_str(),
+                "acknowledgement": "none",
+                "maturity": "preview",
+                "contract": "nats_core_at_most_once; static_subject; published_means_handed_to_client; flush_on_stop; not_jetstream",
             },
             {
                 "kind": mqtt_sink.kind,
@@ -2182,6 +2295,7 @@ mod tests {
                 plugin: None,
                 jetstream: None,
                 http_poll: None,
+                nats: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
                 port: Some(1883),
@@ -2203,6 +2317,7 @@ mod tests {
                 file_contract: None,
             },
             sink: crate::spec::SinkSpec {
+                nats: None,
                 plugin: None,
                 action: None,
                 file: None,
@@ -2266,6 +2381,7 @@ mod tests {
                 plugin: None,
             jetstream: None,
             http_poll: None,
+            nats: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),
@@ -2311,6 +2427,7 @@ mod tests {
                 plugin: None,
             jetstream: None,
             http_poll: None,
+            nats: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),
@@ -2351,6 +2468,7 @@ mod tests {
     #[test]
     fn n16_http_header_secret_requires_https() {
         let mut sink = crate::spec::SinkSpec {
+                nats: None,
                 plugin: None,
             action: None,
             file: None,

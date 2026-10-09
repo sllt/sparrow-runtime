@@ -52,6 +52,23 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// NATS Core subscribe. At-most-once: no ack, no persistence, no replay.
+    /// Distinct from the JetStream reliable profile.
+    pub const NATS_SOURCE: Self = Self {
+        kind: "nats",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// NATS Core publish. Handed to the client; no server receipt.
+    pub const NATS_SINK: Self = Self {
+        kind: "nats_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     pub const MQTT_SINK: Self = Self {
         kind: "mqtt_sink",
         replay: ReplaySupport::Unsupported,

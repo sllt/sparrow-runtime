@@ -1914,6 +1914,7 @@ name = "sparrow-control"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "futures-util",
  "ring",
  "rusqlite",
  "serde",
