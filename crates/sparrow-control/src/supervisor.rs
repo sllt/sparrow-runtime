@@ -1934,7 +1934,7 @@ impl Supervisor {
             .with_aligned(AlignedJob {
                 restore: None,
                 pipeline: Some(PipelineRestore {
-                    // v27 independently verifies the saved full semantics at
+                    // v27/v28 independently verify the saved full semantics at
                     // Kernel admission, rather than comparing live to itself.
                     plan: if sink_identity.is_some() { saved_plan } else { layout.clone() },
                     generation:state_generation,restore:restore_freeze,iot:restore_iot,

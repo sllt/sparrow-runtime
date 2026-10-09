@@ -312,7 +312,7 @@ pub struct PipelineRestore {
     /// IoT frames are separate codecs; Some(empty) windows plus these frames
     /// represents a restored IoT-only plan, never a fresh reset.
     pub iot: Vec<crate::iot::IotFreeze>,
-    /// Only v27 carries a Job-owned saved/live output target. `plan` must be
+    /// v27/v28 carry a Job-owned saved/live output target. `plan` must be
     /// the saved plan on restore, not a substituted live manifest.
     pub sink: Option<SinkRestoreBinding>,
 }

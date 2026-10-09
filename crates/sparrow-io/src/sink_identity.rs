@@ -1,5 +1,6 @@
 //! Bounded output-target identity, independent of the replay source cursor.
-//! JSI1 identifies the JetStream JSON-per-row/msg-id policy, not credentials.
+//! JSI1 preserves the JetStream JSON-per-row policy. JSI2 independently binds
+//! the CSV-v1 encode dialect; neither codec stores credential values.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -13,10 +14,61 @@ pub const MAX_SINK_TOKEN_REF_BYTES: usize = 1024;
 pub const MAX_SINK_STREAM_BYTES: usize = 255;
 pub const MAX_SINK_SUBJECT_BYTES: usize = 4096;
 pub const MAX_SINK_MSG_ID_COLUMN_BYTES: usize = 256;
+pub const MAX_SINK_CSV_NULL_BYTES: usize = 64;
 const MAGIC: &[u8; 4] = b"JSI1";
+const CSV_MAGIC: &[u8; 4] = b"JSI2";
+const CSV_ENCODING_VERSION: u8 = 1;
 
 fn invalid(message: &str) -> SparrowError {
     SparrowError::new(ErrorCode::CodecViolation, message)
+}
+
+/// Encode-only CSV semantics, kept primitive so the I/O contract and runtime
+/// do not depend on the formats/connector implementation. Explicit defaults
+/// and omitted options produce the same identity after format compilation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CsvEncodeIdentity {
+    pub delimiter: u8,
+    pub quote: u8,
+    pub header: bool,
+    pub null_value: String,
+}
+
+impl CsvEncodeIdentity {
+    pub fn new(delimiter: u8, quote: u8, header: bool, null_value: &str) -> Result<Self> {
+        validate_csv_fields(delimiter, quote, null_value)?;
+        Ok(Self {
+            delimiter,
+            quote,
+            header,
+            null_value: null_value.to_owned(),
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_csv_fields(self.delimiter, self.quote, &self.null_value)
+    }
+}
+
+fn validate_csv_fields(delimiter: u8, quote: u8, null_value: &str) -> Result<()> {
+    if !(delimiter == b'\t' || delimiter.is_ascii_punctuation())
+        || !quote.is_ascii_punctuation()
+        || delimiter == quote
+        || null_value.len() > MAX_SINK_CSV_NULL_BYTES
+        || null_value.bytes().any(|byte| {
+            byte == delimiter || byte == quote || byte.is_ascii_control() || byte == b' '
+        })
+    {
+        return Err(invalid("invalid or oversized CSV sink encode identity"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SinkEncoding {
+    #[default]
+    Json,
+    Csv(CsvEncodeIdentity),
 }
 
 /// Exact configured target plus the broker-observed stream incarnation.
@@ -30,6 +82,7 @@ pub struct SinkIdentity {
     pub created_nanos: i128,
     pub subject: String,
     pub msg_id_column: Option<String>,
+    pub encoding: SinkEncoding,
 }
 
 impl SinkIdentity {
@@ -59,12 +112,22 @@ impl SinkIdentity {
             created_nanos,
             subject: subject.to_owned(),
             msg_id_column: msg_id_column.map(str::to_owned),
+            encoding: SinkEncoding::Json,
         };
         identity.validate()?;
         Ok(identity)
     }
 
+    pub fn with_csv(mut self, csv: CsvEncodeIdentity) -> Result<Self> {
+        self.encoding = SinkEncoding::Csv(csv);
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if let SinkEncoding::Csv(csv) = &self.encoding {
+            csv.validate()?;
+        }
         validate_fields(
             self.token_secret.as_deref(),
             &self.stream,
@@ -108,6 +171,10 @@ impl SinkIdentity {
             + 4
             + self.subject.len()
             + option_len(self.msg_id_column.as_deref())
+            + match &self.encoding {
+                SinkEncoding::Json => 0,
+                SinkEncoding::Csv(csv) => 8 + csv.null_value.len(),
+            }
     }
 
     pub fn encoded_len(&self) -> Result<usize> {
@@ -123,11 +190,18 @@ impl SinkIdentity {
             + self.stream.capacity()
             + self.subject.capacity()
             + self.msg_id_column.as_ref().map_or(0, String::capacity)
+            + match &self.encoding {
+                SinkEncoding::Json => 0,
+                SinkEncoding::Csv(csv) => csv.null_value.capacity(),
+            }
     }
 
     pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate()?;
-        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(match &self.encoding {
+            SinkEncoding::Json => MAGIC,
+            SinkEncoding::Csv(_) => CSV_MAGIC,
+        });
         out.push(self.endpoints.len() as u8);
         for endpoint in &self.endpoints {
             encode_string(endpoint, out);
@@ -137,13 +211,30 @@ impl SinkIdentity {
         out.extend_from_slice(&self.created_nanos.to_le_bytes());
         encode_string(&self.subject, out);
         encode_option(self.msg_id_column.as_deref(), out);
+        if let SinkEncoding::Csv(csv) = &self.encoding {
+            out.extend_from_slice(&[
+                CSV_ENCODING_VERSION,
+                csv.delimiter,
+                csv.quote,
+                u8::from(csv.header),
+            ]);
+            encode_string(&csv.null_value, out);
+        }
         Ok(())
     }
 
     pub fn decode(mut bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > MAX_SINK_IDENTITY_BYTES || take(&mut bytes, 4)? != MAGIC {
+        if bytes.len() > MAX_SINK_IDENTITY_BYTES {
             return Err(invalid("unsupported sink identity magic/size"));
         }
+        let magic = take(&mut bytes, 4)?;
+        let is_csv = if magic == MAGIC {
+            false
+        } else if magic == CSV_MAGIC {
+            true
+        } else {
+            return Err(invalid("unsupported sink identity magic/size"));
+        };
         let count = take(&mut bytes, 1)?[0] as usize;
         if !(1..=MAX_SINK_ENDPOINTS).contains(&count) {
             return Err(invalid("sink identity endpoint count exceeds bound"));
@@ -152,14 +243,27 @@ impl SinkIdentity {
         for _ in 0..count {
             endpoints.push(decode_string(&mut bytes, MAX_SINK_ENDPOINT_BYTES)?);
         }
-        let identity = Self {
+        let mut identity = Self {
             endpoints,
             token_secret: decode_option(&mut bytes, MAX_SINK_TOKEN_REF_BYTES)?,
             stream: decode_string(&mut bytes, MAX_SINK_STREAM_BYTES)?,
             created_nanos: i128::from_le_bytes(take(&mut bytes, 16)?.try_into().unwrap()),
             subject: decode_string(&mut bytes, MAX_SINK_SUBJECT_BYTES)?,
             msg_id_column: decode_option(&mut bytes, MAX_SINK_MSG_ID_COLUMN_BYTES)?,
+            encoding: SinkEncoding::Json,
         };
+        if is_csv {
+            let fields = take(&mut bytes, 4)?;
+            if fields[0] != CSV_ENCODING_VERSION || fields[3] > 1 {
+                return Err(invalid("unsupported CSV sink encoding version/header tag"));
+            }
+            identity.encoding = SinkEncoding::Csv(CsvEncodeIdentity {
+                delimiter: fields[1],
+                quote: fields[2],
+                header: fields[3] == 1,
+                null_value: decode_string(&mut bytes, MAX_SINK_CSV_NULL_BYTES)?,
+            });
+        }
         if !bytes.is_empty() {
             return Err(invalid("trailing sink identity bytes"));
         }

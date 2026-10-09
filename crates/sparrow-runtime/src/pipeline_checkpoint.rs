@@ -3,7 +3,7 @@
 use crate::barrier::ParticipantAcks;
 use crate::checkpoint::{EncodedSnapshot, MAX_SNAPSHOT_BYTES};
 use crate::window::WindowFreeze;
-use sparrow_io::{SinkIdentity, SourcePosition};
+use sparrow_io::{SinkEncoding, SinkIdentity, SourcePosition};
 use sparrow_model::{CreditKind, ErrorCode, MemoryOwner, Result, SparrowError};
 use sparrow_plan::{CheckpointPlan, ParticipantId};
 use std::sync::Arc;
@@ -51,27 +51,38 @@ pub const RESAMPLE_RELIABLE_SNAPSHOT_VERSION: u16 = 26;
 /// Neither v3's downstream-prefix relaxation nor a JS source/output cursor
 /// can authorize this restore. Existing v1..v26 payloads remain unchanged.
 pub const FILE_JETSTREAM_SINK_SNAPSHOT_VERSION: u16 = 27;
+/// CSV-v1 output uses JSI2 and its own directory/profile. Existing v27/JSI1
+/// JSON history is never upgraded or reinterpreted as a CSV output target.
+pub const FILE_JETSTREAM_CSV_SINK_SNAPSHOT_VERSION: u16 = 28;
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
+
+fn sink_profile_version(sink: &SinkIdentity) -> u16 {
+    match &sink.encoding {
+        SinkEncoding::Json => FILE_JETSTREAM_SINK_SNAPSHOT_VERSION,
+        SinkEncoding::Csv(_) => FILE_JETSTREAM_CSV_SINK_SNAPSHOT_VERSION,
+    }
+}
 
 pub fn sink_snapshot_version_for(
     plan: &CheckpointPlan,
     source_kind: &str,
     sink: &SinkIdentity,
 ) -> Result<u16> {
-    sink.validate()?;
+    let guard = |error: SparrowError| error.context("checkpoint_guard", "sink_profile_mismatch");
+    sink.validate().map_err(guard)?;
     if source_kind != "file"
         || plan.is_graph()
-        || snapshot_version_for(plan, source_kind)? != PIPELINE_SNAPSHOT_VERSION
+        || snapshot_version_for(plan, source_kind).map_err(guard)? != PIPELINE_SNAPSHOT_VERSION
     {
-        return Err(SparrowError::new(
+        return Err(guard(SparrowError::new(
             ErrorCode::UnsupportedRestore,
-            "JetStream sink checkpoint requires its independent linear File/v27 profile",
-        ));
+            "JetStream sink checkpoint requires its independent linear File output profile",
+        )));
     }
-    Ok(FILE_JETSTREAM_SINK_SNAPSHOT_VERSION)
+    Ok(sink_profile_version(sink))
 }
 
-/// v27 preserves all output computation, including transforms after the last
+/// v27/v28 preserve all output computation, including transforms after the last
 /// stateful participant. Never change the old CheckpointPlan prefix contract.
 pub(crate) fn check_sink_plan_compatible(saved: &CheckpointPlan, live: &CheckpointPlan) -> Result<()> {
     saved.validate()?;
@@ -324,10 +335,12 @@ impl PipelineSnapshot {
     /// Bounded header-only target parse for profile writers. It never decodes
     /// state or treats diagnostic provenance as a restore authorization.
     pub(crate) fn encoded_sink_identity(mut bytes: &[u8]) -> Result<SinkIdentity> {
-        if take(&mut bytes, 4)? != crate::checkpoint::MAGIC
-            || u16::from_le_bytes(take(&mut bytes, 2)?.try_into().unwrap())
-                != FILE_JETSTREAM_SINK_SNAPSHOT_VERSION
-        {
+        if take(&mut bytes, 4)? != crate::checkpoint::MAGIC {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                "JetStream sink writer cannot adopt another snapshot profile"));
+        }
+        let version = u16::from_le_bytes(take(&mut bytes, 2)?.try_into().unwrap());
+        if !matches!(version, FILE_JETSTREAM_SINK_SNAPSHOT_VERSION | FILE_JETSTREAM_CSV_SINK_SNAPSHOT_VERSION) {
             return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
                 "JetStream sink writer cannot adopt another snapshot profile"));
         }
@@ -338,7 +351,7 @@ impl PipelineSnapshot {
             take(&mut bytes, length)?;
         }
         take(&mut bytes, 48)?;
-        decode_sink_identity(&mut bytes)
+        decode_sink_identity(&mut bytes, version)
     }
 
     pub fn encode_frozen(
@@ -606,6 +619,7 @@ impl PipelineSnapshot {
                 | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION
                 | RESAMPLE_FILE_SNAPSHOT_VERSION | RESAMPLE_RELIABLE_SNAPSHOT_VERSION
                 | FILE_JETSTREAM_SINK_SNAPSHOT_VERSION
+                | FILE_JETSTREAM_CSV_SINK_SNAPSHOT_VERSION
         ) {
             return Err(invalid("unsupported pipeline snapshot version"));
         }
@@ -636,9 +650,16 @@ impl PipelineSnapshot {
         if attempt == 0 {
             return Err(invalid("pipeline snapshot lacks attempt identity"));
         }
-        let sink_identity = if version == FILE_JETSTREAM_SINK_SNAPSHOT_VERSION {
-            Some(decode_sink_identity(&mut bytes)?)
+        let sink_identity = if matches!(version, FILE_JETSTREAM_SINK_SNAPSHOT_VERSION | FILE_JETSTREAM_CSV_SINK_SNAPSHOT_VERSION) {
+            Some(decode_sink_identity(&mut bytes, version)?)
         } else { None };
+        if sink_identity.is_some() && source.identity.kind != "file" {
+            // Do this before the legacy source/output-cursor matrix can
+            // classify a foreign source as a damaged output position.
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                "JetStream sink checkpoint cannot adopt a non-File source profile")
+                .context("checkpoint_guard", "sink_profile_mismatch"));
+        }
         let next_output=if matches!(
             version,
             RELIABLE_SNAPSHOT_VERSION
@@ -660,6 +681,12 @@ impl PipelineSnapshot {
         }
         let length = u32_value(&mut bytes)?;
         let plan = CheckpointPlan::decode(take(&mut bytes, length)?)?;
+        // New output profiles have a complete, independent eligibility
+        // contract. Reject foreign graph/IoT/time manifests before the old
+        // version/participant checks can turn them into corruption fallback.
+        let expected_sink_version = sink_identity.as_ref()
+            .map(|sink| sink_snapshot_version_for(&plan, &source.identity.kind, sink))
+            .transpose()?;
         let mandatory_iot_version = matches!(
             version,
             IOT_SNAPSHOT_VERSION
@@ -797,8 +824,8 @@ impl PipelineSnapshot {
             && (source.identity.kind == "file-dag-v1") != plan.is_graph() {
             return Err(invalid("checkpoint source topology mismatch"));
         }
-        let expected_version = if let Some(sink) = &sink_identity {
-            sink_snapshot_version_for(&plan, &source.identity.kind, sink)?
+        let expected_version = if let Some(version) = expected_sink_version {
+            version
         } else {
             snapshot_version_for(&plan, &source.identity.kind)?
         };
@@ -892,12 +919,20 @@ impl PipelineSnapshot {
     }
 }
 
-fn decode_sink_identity(bytes: &mut &[u8]) -> Result<SinkIdentity> {
-    let length = u32_value(bytes)?;
+fn decode_sink_identity(bytes: &mut &[u8], version: u16) -> Result<SinkIdentity> {
+    let guard = |error: SparrowError| error.context("checkpoint_guard", "sink_profile_mismatch");
+    let length = u32_value(bytes).map_err(guard)?;
     if length > sparrow_io::sink_identity::MAX_SINK_IDENTITY_BYTES {
-        return Err(invalid("sink identity exceeds byte bound"));
+        return Err(guard(invalid("sink identity exceeds byte bound")));
     }
-    SinkIdentity::decode(take(bytes, length)?)
+    let sink = SinkIdentity::decode(take(bytes, length).map_err(guard)?)
+        .map_err(guard)?;
+    if sink_profile_version(&sink) != version {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+            "checkpoint output profile and sink encoding codec disagree")
+            .context("checkpoint_guard", "sink_profile_mismatch"));
+    }
+    Ok(sink)
 }
 
 /// Store integrity/GC understands both codecs, without converting one into the
@@ -914,7 +949,7 @@ impl StoredSnapshot {
         }
     }
     pub(crate) fn decode(bytes: &[u8], max_keys: usize, materialize: bool) -> Result<Self> {
-        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27,0])) {
+        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28,0])) {
             Ok(Self::Pipeline(PipelineSnapshot::decode_mode(
                 bytes,
                 max_keys,

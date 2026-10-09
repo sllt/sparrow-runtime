@@ -1628,14 +1628,17 @@ fn validate_file_jetstream_sink_profile(spec: &PipelineSpec, plan: &PhysicalPlan
         || !spec.reference_tables.is_empty()
     {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-            "JetStream Sink checkpoints require the enabled independent linear File/v27 profile"));
+            "JetStream Sink checkpoints require the enabled independent linear File profile (JSON/v27 or CSV/v28)"));
     }
+    // Typed callers must also compile the encoding before advertising a
+    // profile; invalid CSV must not fall through to JSON/v27 diagnostics.
+    spec.sink.payload_format()?;
     let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
     if sparrow_runtime::snapshot_version_for(&manifest, "file")?
         != sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION
     {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-            "File/JetStream Sink v27 excludes IoT, reference, paused/observed-time and graph profiles"));
+            "File/JetStream Sink v27/v28 excludes IoT, reference, paused/observed-time and graph profiles"));
     }
     Ok(())
 }
@@ -1981,7 +1984,7 @@ pub fn capabilities_json() -> serde_json::Value {
                 "recovery": js_sink.recovery.as_str(),
                 "acknowledgement": "jetstream_pub_ack_per_message",
                 "duplicates": "possible_on_retry; deduplicated_within_stream_duplicate_window_when_msg_id_column_set",
-                "aligned_checkpoint": "independent_linear_file_v27; exact_JSI1_target_and_full_plan; File_storage_and_Limits_retention; outbox_acked_after_all_pub_acks_and_target_recheck",
+                "aligned_checkpoint": "independent_linear_file_JSON_v27_JSI1_or_CSV_v28_JSI2; exact_target_encoding_and_full_plan; File_storage_and_Limits_retention; outbox_acked_after_all_pub_acks_and_target_recheck",
                 "stream_management": "existing_stream_required; never_auto_created",
                 "maturity": "preview",
                 "contract": "at_least_once_into_stream; bounded_inflight_acks; bounded_retry_backoff; fail_closed_on_unconfirmed; ordering_not_guaranteed_under_retry",
@@ -2549,15 +2552,31 @@ pub fn effective_guarantees_with_plan(
                         _=>unreachable!(),
                     }).collect::<Vec<_>>(),"profile":reference_version.map_or_else(|| format!("v{snapshot_version}"), |version| format!("reference_v{version}")),"scope":if reference_version.is_some() {"single_file_static_reference_required_http_linear_shapes"} else {"single_file_single_required_sink_tested_linear_shapes"},"certified":false});
                 if spec.sink.kind == "jetstream" {
-                    value["aligned_eligibility_reason"] = serde_json::json!("file_required_jetstream_v27; runtime_target_bootstrap_required");
+                    let csv = spec
+                        .sink
+                        .payload_format()
+                        .is_ok_and(|format| format.as_csv().is_some());
+                    let (version, codec) = if csv {
+                        (
+                            sparrow_runtime::pipeline_checkpoint::FILE_JETSTREAM_CSV_SINK_SNAPSHOT_VERSION,
+                            "JSI2",
+                        )
+                    } else {
+                        (
+                            sparrow_runtime::pipeline_checkpoint::FILE_JETSTREAM_SINK_SNAPSHOT_VERSION,
+                            "JSI1",
+                        )
+                    };
+                    value["aligned_eligibility_reason"] = serde_json::json!(format!("file_required_jetstream_v{version}; runtime_target_bootstrap_required"));
                     let participants = &mut value["checkpoint_participants"];
-                    participants["snapshot_version"] = serde_json::json!(sparrow_runtime::pipeline_checkpoint::FILE_JETSTREAM_SINK_SNAPSHOT_VERSION);
-                    participants["profile"] = serde_json::json!("file_jetstream_sink_v27");
+                    participants["snapshot_version"] = serde_json::json!(version);
+                    participants["profile"] = serde_json::json!(format!("file_jetstream_sink_v{version}"));
                     participants["scope"] = serde_json::json!("single_file_single_required_jetstream_sink");
-                    participants["semantics_version"] = serde_json::json!("CP01_full_plan_strict_with_JSI1_output_target");
-                    participants["restore_compatibility"] = serde_json::json!("exact_endpoints_token_SecretRef_stream_created_nanos_subject_msg_id_policy_and_full_plan; separate_v27_directory");
-                    participants["downstream_changes"] = serde_json::json!("rejected; old_v1_to_v26_history_cannot_be_adopted; external_outputs_are_not_rolled_back");
-                    participants["sink_identity_codec"] = serde_json::json!("JSI1");
+                    participants["semantics_version"] = serde_json::json!(format!("CP01_full_plan_strict_with_{codec}_output_target"));
+                    participants["restore_compatibility"] = serde_json::json!(format!("exact_endpoints_token_SecretRef_stream_created_nanos_subject_msg_id_policy_encoding_and_full_plan; separate_v{version}_directory"));
+                    participants["downstream_changes"] = serde_json::json!("rejected; other_snapshot_profiles_and_JSON_CSV_or_CSV_dialect_changes_cannot_be_adopted; external_outputs_are_not_rolled_back");
+                    participants["sink_identity_codec"] = serde_json::json!(codec);
+                    participants["sink_encoding"] = serde_json::json!(if csv {"csv_v1_delimiter_quote_header_null_value"} else {"json"});
                     participants["runtime_prerequisites"] = serde_json::json!("existing_File_storage_Limits_stream_with_PubAck_enabled; exact_incarnation_checked_before_input_and_after_batch");
                 }
                 if iot {

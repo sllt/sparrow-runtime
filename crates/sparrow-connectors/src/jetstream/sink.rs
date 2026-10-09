@@ -29,7 +29,7 @@ use async_nats::jetstream::stream::{
 use async_nats::jetstream::{Context, ContextBuilder, ErrorCode as JsErrorCode};
 use futures_util::stream::{self, StreamExt};
 use sparrow_io::observed::Receiver as ObservedReceiver;
-use sparrow_io::{OwnedSinkIdentity, SinkIdentity};
+use sparrow_io::{CsvEncodeIdentity, OwnedSinkIdentity, SinkIdentity};
 use sparrow_model::observation::{HealthState, Latency};
 use sparrow_model::{
     CreditKind, ErrorCode, InflightCounter, MemoryLease, MemoryOwner, Result, Row, RowBatch,
@@ -234,7 +234,7 @@ struct PreparedTarget {
     _config_credit: MemoryLease,
 }
 
-/// The v27 sink has already connected and captured its exact target before
+/// The v27/v28 sink has already connected and captured its exact target before
 /// the controller opens/seeks/activates the replay source. No second session
 /// or independently owned budget is created by `run`.
 pub struct PreparedJetStreamSink {
@@ -654,6 +654,20 @@ impl JetStreamSink {
             &self.config.subject,
             self.config.msg_id_column.as_deref(),
         )?;
+        // The compiled format has already validated single-byte delimiter /
+        // quote and encode-only options. Bind effective values, not whether a
+        // default happened to be written explicitly in the stored spec.
+        let identity = if let Some(csv) = self.config.payload_format.as_csv() {
+            let options = csv.options();
+            identity.with_csv(CsvEncodeIdentity::new(
+                options.delimiter.as_bytes()[0],
+                options.quote.as_bytes()[0],
+                csv.header(),
+                &options.null_value,
+            )?)?
+        } else {
+            identity
+        };
         let identity = OwnedSinkIdentity::new(identity, &self.owner)?;
         Ok(PreparedTarget {
             identity,

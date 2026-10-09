@@ -234,7 +234,7 @@ Control crate：
 | 合同项 | JetStream Sink 的实现 |
 |---|---|
 | 语义 | capability `jetstream_sink`：delivery `checkpointed_at_least_once`、recovery `aligned`、replay `unsupported`；每行等 PubAck，批次全部确认才回执 outbox；重试可能重复，`msg_id_column` 在 `duplicate_window` 内去重 |
-| Aligned | 独立线性 File v27，JSI1 精确目标 + 完整计划兼容；不沿用 v3 下游宽松规则，不与 v1..v26 混写/自动迁移；其他 checkpoint profile 拒绝（`UnsupportedRestore`） |
+| Aligned | 独立线性 File：JSON v27/JSI1 或 CSV v28/JSI2，精确目标与编码 + 完整计划兼容；不沿用 v3 下游宽松规则，不跨 profile 混写/自动迁移；其他 checkpoint profile 拒绝（`UnsupportedRestore`） |
 | 内存 | SDK 命令队列与 writer 双缓冲 + `max_inflight_acks × (max_payload_bytes + 8 KiB)` 在途保留记入 job reservation（≤ reservation/2），与其他 NATS 端点合计 ≤ 3/4；默认 client_capacity=4、max_inflight_acks=8，显式值不暗中钳制；编码 scratch 与 prepared metadata 另取同 owner 信用 |
 | 背压 | outbox 有界；在途 PubAck ≤ `max_inflight_acks`（SDK `max_ack_inflight` + 背压） |
 | 重试 | 每次 `2 × ack_timeout_ms`，100 ms→2 s 退避，≤ `max_retries`；耗尽、超限、非法 msg id → job 失败（fail closed） |
@@ -243,7 +243,8 @@ Control crate：
 | 指标 | `jetstream_sink_*`，pipeline status 的 `jetstream_sink` 对象 |
 
 JSI1 绑定端点、token SecretRef（不保存值）、stream 精确 created nanos、subject 和 msg-id 策略；
-旧目录/目标/下游语义变化不能静默继承历史。去重只在窗口内且要求稳定唯一 id，空值仍可能重复。
+CSV 的 JSI2 另绑定生效的 delimiter、quote、header、null_value，显式默认值与省略等价。
+旧目录/目标/下游语义或 JSON↔CSV/CSV 编码选项变化不能静默继承历史；拒绝不推进 CURRENT/状态代际，也不发布新行。去重只在窗口内且要求稳定唯一 id，空值仍可能重复。
 配置管理员不得在检查之间修改又恢复策略；PubAck/File 不等于消费者业务提交或设备掉电/fsync、HA、
 exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/20k 压测未执行。
 
@@ -284,7 +285,7 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 
 | kind | JSON | CSV Source | CSV Sink | CSV 单位 |
 |---|---|---|---|---|
-| `mqtt` / `nats` / `jetstream` | ✓ | ✓ | ✓ | 一条消息 = （表头 +）一条记录；JetStream Source 的 cut 身份绑定格式与 CSV 选项（JSON 身份不变） |
+| `mqtt` / `nats` / `jetstream` | ✓ | ✓ | ✓ | 一条消息 = （表头 +）一条记录；JetStream Source 的 cut 身份绑定格式与 CSV 选项（JSON 身份不变）；JetStream Sink 独立 File aligned 输出为 JSON v27 或 CSV v28 |
 | `http_push` | ✓ | ✓ | — | 一个请求 = （表头 +）一条记录 |
 | `http` Sink | ✓ | — | ✓ | 请求体 = 表头 + 多条记录；不能与 `body` / `single`、JetStream 源或 aligned 一起使用 |
 | `http_poll` | ✓ | ✓ | — | 一个响应 = 一份文档；`http_poll.format` 必须为空 |

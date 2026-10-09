@@ -196,9 +196,11 @@ impl DataBusSource {
         // Detach (discarding and counting anything still buffered) before
         // reporting stopped, so a restart re-attaches to a clean slot.
         drop(subscriber);
-        self.diag
-            .observation
-            .health(true, HealthState::Stopped, "databus_detached", None);
+        if result.is_ok() {
+            self.diag
+                .observation
+                .health(true, HealthState::Stopped, "databus_detached", None);
+        }
         result
     }
 
