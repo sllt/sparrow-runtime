@@ -63,7 +63,7 @@ fn analysis_sql_join_range_window_left_and_strict_rejections() {
     assert!(bind("SELECT k FROM l a JOIN r b ON a.k=b.k AND WINDOW_MATCH(a.ts,b.ts,10)").is_err());
 }
 #[test]
-fn analysis_sql_extended_aggregates_are_fresh_only_and_checked() {
+fn analysis_sql_extended_aggregates_use_codec3_and_are_checked() {
     for f in [
         "first",
         "last",
@@ -77,7 +77,9 @@ fn analysis_sql_extended_aggregates_are_fresh_only_and_checked() {
         ))
         .unwrap();
         assert!(plan.has_extended_aggs());
-        assert!(sparrow_plan::CheckpointPlan::from_physical(&plan).is_err());
+        // Sub-batch 1: scalar inputs get participant codec 3 (v29/v30).
+        let checkpoint = sparrow_plan::CheckpointPlan::from_physical(&plan).unwrap();
+        assert!(checkpoint.has_extended_state());
         for args in ["*", "v,v", "DISTINCT v"] {
             assert!(bind(&format!(
                 "SELECT {f}({args}) FROM l GROUP BY COUNT_WINDOW(8)"
@@ -86,6 +88,12 @@ fn analysis_sql_extended_aggregates_are_fresh_only_and_checked() {
         }
     }
     assert!(bind("SELECT var_pop(k) FROM l GROUP BY COUNT_WINDOW(8)").is_err());
+    // FIRST/LAST over nested/Dynamic values stays fresh-only.
+    for f in ["first", "last"] {
+        if let Ok(plan) = bind(&format!("SELECT {f}(items) AS value FROM l GROUP BY COUNT_WINDOW(8)")) {
+            assert!(sparrow_plan::CheckpointPlan::from_physical(&plan).is_err());
+        }
+    }
     for f in [
         "array_length(items)",
         "object_get(items,'a')",
