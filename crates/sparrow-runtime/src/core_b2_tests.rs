@@ -129,6 +129,7 @@ fn aligned_job(plan: Arc<CheckpointPlan>, restored: bool, acks: AlignedAcks) -> 
     AlignedJob {
         restore: None,
         pipeline: Some(PipelineRestore {
+            sink: None,
             plan,
             generation: [0x42; 16],
             restore: restored.then_some(Vec::new()),

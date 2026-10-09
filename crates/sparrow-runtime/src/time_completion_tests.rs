@@ -166,6 +166,7 @@ fn drive(
                     .with_aligned(AlignedJob {
                         restore: None,
                         pipeline: Some(PipelineRestore {
+                            sink: None,
                             plan: manifest.clone(),
                             generation: [5; 16],
                             restore,

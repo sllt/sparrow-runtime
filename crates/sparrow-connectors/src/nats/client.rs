@@ -23,7 +23,7 @@ pub const DEFAULT_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_RECONNECT_ATTEMPTS: usize = 100;
 pub const DEFAULT_RECONNECT_ATTEMPTS: usize = 10;
 pub const MAX_CAPACITY: usize = 256;
-pub const DEFAULT_CAPACITY: usize = 16;
+pub const DEFAULT_CAPACITY: usize = 8;
 /// Upper bound of the SDK reconnect delay (exponential from 100ms).
 pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -49,11 +49,11 @@ pub struct NatsClientConfig {
     /// SDK connection attempts per outage (reset after each success).
     pub reconnect_attempts: usize,
     pub connect_timeout: Duration,
-    /// Largest message payload this connector accepts. A Source refuses a
-    /// server whose advertised `max_payload` is larger, because the SDK
-    /// buffers whole messages before the Source can drop them.
+    /// Largest message payload this connector accepts. A Source gates every
+    /// server's advertised `max_payload` before subscribing, and also checks
+    /// each incoming wire frame before allocating its bounded body.
     pub max_payload_bytes: usize,
-    /// Source: SDK subscription buffer (messages). Sink: SDK command buffer.
+    /// Source: bounded wire prefetch (messages). Sink: SDK command buffer.
     pub capacity: usize,
 }
 
@@ -88,12 +88,18 @@ impl NatsClientConfig {
         Ok(())
     }
 
-    /// Ledger charge for SDK-held buffers: every buffered message may be a
-    /// full payload plus subject/header overhead.
+    /// Ledger charge for SDK-held buffers. The command queue can refill while
+    /// the SDK's recv_many batch (at most 16 commands) remains in its writer.
+    /// Source wire buffers conservatively use the same public estimate.
     pub fn sdk_reservation(&self) -> usize {
         SDK_FIXED_RESERVATION.saturating_add(
             self.capacity
-                .saturating_mul(self.max_payload_bytes + PER_MESSAGE_OVERHEAD + MAX_SUBJECT_BYTES),
+                .saturating_add(self.capacity.min(16))
+                .saturating_mul(
+                    self.max_payload_bytes
+                        .saturating_add(PER_MESSAGE_OVERHEAD)
+                        .saturating_add(MAX_SUBJECT_BYTES),
+                ),
         )
     }
 
@@ -102,7 +108,7 @@ impl NatsClientConfig {
         if self.sdk_reservation() > reservation_budget / 2 {
             return Err(error(
                 ErrorCode::BoundExceeded,
-                "NATS SDK buffers (capacity x max_payload_bytes) exceed half the job reservation budget; lower capacity or max_payload_bytes",
+                "NATS buffers (command/prefetch plus overlapping writer) exceed half the job reservation budget; lower capacity or max_payload_bytes",
             ));
         }
         Ok(())
@@ -112,6 +118,12 @@ impl NatsClientConfig {
 /// A token resolved from its SecretRef at bind. Never printed.
 #[derive(Clone)]
 pub struct BoundToken(String);
+
+impl BoundToken {
+    pub(crate) fn value(&self) -> &str {
+        &self.0
+    }
+}
 
 impl std::fmt::Debug for BoundToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -143,12 +155,14 @@ struct Completion {
 /// Owned by the SDK event callback, so it drops only when the SDK
 /// connection handler has actually exited (same pattern as JetStream).
 struct SdkLifetime {
-    lease: Option<MemoryLease>,
+    lease: Option<Arc<MemoryLease>>,
     completion: Arc<Completion>,
+    _shutdown_guard: Option<Arc<dyn Send + Sync>>,
 }
 impl Drop for SdkLifetime {
     fn drop(&mut self) {
         drop(self.lease.take());
+        drop(self._shutdown_guard.take());
         self.completion.closed.store(true, Ordering::Release);
         self.completion.notify.notify_waiters();
     }
@@ -217,6 +231,9 @@ impl EventState {
 pub(crate) struct CoreClient {
     pub(crate) client: async_nats::Client,
     completion: Arc<Completion>,
+    // The SDK task and the caller jointly own the charge. SDK exit alone
+    // must not refund buffers still retained by the caller/subscription.
+    _reservation: Arc<MemoryLease>,
 }
 
 impl CoreClient {
@@ -233,12 +250,26 @@ impl CoreClient {
         diag: &Arc<IoDiagnostics>,
         role: Role,
     ) -> Result<Self> {
-        let lease = owner.acquire(CreditKind::Reservation, config.sdk_reservation())?;
+        Self::open_with_guard(config, token, owner, diag, role, None).await
+    }
+
+    /// Prepared probes may retain a SourceAdmission lifecycle guard until the
+    /// SDK really exits, including cancellation or a failed bounded close.
+    pub(crate) async fn open_with_guard(
+        config: &NatsClientConfig,
+        token: Option<&BoundToken>,
+        owner: &Arc<MemoryOwner>,
+        diag: &Arc<IoDiagnostics>,
+        role: Role,
+        shutdown_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Self> {
+        let lease = Arc::new(owner.acquire(CreditKind::Reservation, config.sdk_reservation())?);
         let completion = Arc::new(Completion::default());
         let state = Arc::new(EventState {
             _lifetime: SdkLifetime {
-                lease: Some(lease),
+                lease: Some(lease.clone()),
                 completion: completion.clone(),
+                _shutdown_guard: shutdown_guard,
             },
             diag: diag.clone(),
             role,
@@ -273,7 +304,11 @@ impl CoreClient {
         .await
         .map_err(|_| error(ErrorCode::JobFailed, "NATS connect timed out").retryable(true))?
         .map_err(|_| error(ErrorCode::JobFailed, "NATS connection failed").retryable(true))?;
-        let opened = Self { client, completion };
+        let opened = Self {
+            client,
+            completion,
+            _reservation: lease,
+        };
         if role == Role::Source {
             if let Err(e) = opened.check_server_payload(config.max_payload_bytes) {
                 let _ = opened.close(false).await;
@@ -303,10 +338,14 @@ impl CoreClient {
         self.completion.closed.load(Ordering::Acquire)
     }
 
-    /// Optionally flush (PING/PONG round trip after pending writes), then
+    /// Optionally flush local socket writes (not a broker receipt), then
     /// drain and wait (bounded) for the SDK to exit and release its credit.
     pub(crate) async fn close(self, flush: bool) -> Result<bool> {
-        let Self { client, completion } = self;
+        let Self {
+            client,
+            completion,
+            _reservation,
+        } = self;
         let flushed = if flush {
             matches!(
                 tokio::time::timeout(CLOSE_TIMEOUT, client.flush()).await,
@@ -393,8 +432,8 @@ mod tests {
             ErrorCode::SecretMissing
         );
 
-        // Defaults fit half of the compact job reservation; a 1 MiB payload
-        // bound only fits with a single buffered message.
+        // Defaults fit half of the compact job reservation. A full 1 MiB
+        // payload plus overlapping writer cannot fit even at capacity one.
         let compact = sparrow_model::ResourceBudget::compact().reservation_bytes;
         base.check_reservation_budget(compact).unwrap();
         let mut big = base.clone();
@@ -404,7 +443,20 @@ mod tests {
             ErrorCode::BoundExceeded
         );
         big.capacity = 1;
+        assert_eq!(
+            big.check_reservation_budget(compact).unwrap_err().code,
+            ErrorCode::BoundExceeded
+        );
+        big.max_payload_bytes = 512 * 1024;
         big.check_reservation_budget(compact).unwrap();
+        let mut overlapping = base.clone();
+        overlapping.capacity = 16;
+        assert!(
+            overlapping.check_reservation_budget(compact).is_err(),
+            "queue plus writer batch must be charged"
+        );
+        overlapping.max_payload_bytes = usize::MAX;
+        assert_eq!(overlapping.sdk_reservation(), usize::MAX);
 
         let delays: Vec<_> = (1..=8).map(reconnect_delay).collect();
         assert_eq!(delays[0], Duration::from_millis(100));

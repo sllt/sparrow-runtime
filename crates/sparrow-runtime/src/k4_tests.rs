@@ -71,6 +71,7 @@ fn aligned(
     AlignedJob {
         restore: None,
         pipeline: Some(PipelineRestore {
+            sink: None,
             plan: manifest,
             generation,
             restore: windows,
