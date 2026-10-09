@@ -443,6 +443,7 @@ async fn databus_sink_to_source_actors_exact_rows_and_cleanup() {
     let sink = DataBusSink::bind(
         DataBusSinkConfig::new("rows.a"),
         bus.clone(),
+        sink_owner.clone(),
         sink_diag.clone(),
     )
     .unwrap();
@@ -508,7 +509,13 @@ async fn databus_sink_registration_failure_is_fatal() {
         .map(|i| bus.publisher(&format!("p.{i}")).unwrap())
         .collect();
     let diag = IoDiagnostics::new();
-    let sink = DataBusSink::bind(DataBusSinkConfig::new("p.x"), bus.clone(), diag.clone()).unwrap();
+    let sink = DataBusSink::bind(
+        DataBusSinkConfig::new("p.x"),
+        bus.clone(),
+        owner(),
+        diag.clone(),
+    )
+    .unwrap();
     let (_tx, rx) = sparrow_io::observed::channel::<RowBatch>(4);
     let cancel = CancellationToken::new();
     sink.run(rx, cancel.clone(), None).await;
@@ -516,4 +523,151 @@ async fn databus_sink_registration_failure_is_fatal() {
     assert!(cancel.is_cancelled(), "fatal cancels the job");
     drop(held);
     assert!(bus.snapshot().topics.is_empty());
+}
+
+/// The decoder working set is charged before decoding: without credit the
+/// message is counted `dropped_budget` and never parsed; with credit again
+/// the next message decodes normally.
+#[tokio::test]
+async fn databus_source_charges_decode_scratch_before_parsing() {
+    let bus = DataBus::new();
+    let mut budget = ResourceBudget::compact();
+    budget.reservation_bytes = 16 * 1024;
+    let source_owner = MemoryOwner::new(budget);
+    let diag = IoDiagnostics::new();
+    let mut config = DataBusSourceConfig::new("rows.a", schema());
+    config.subscription.capacity = 4;
+    config.subscription.max_bytes = 4 * 1024;
+    let source = DataBusSource::bind(config, bus.clone(), diag.clone()).unwrap();
+    let (tx, mut rx) = sparrow_io::observed::channel::<QueuedRow>(16);
+    let cancel = CancellationToken::new();
+    let task =
+        tokio::spawn(source.run_budgeted(tx, cancel.clone(), source_owner.clone(), 64 * 1024));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while bus.snapshot().topics.is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let publisher = bus.publisher("rows.a").unwrap();
+    // 2 KiB payload: 2 KiB x 64 scratch does not fit 16 KiB minus the
+    // subscriber buffer; a short one does.
+    let long = format!(r#"{{"device_id":"{}","v":1}}"#, "x".repeat(2048));
+    publisher.publish(Arc::from(long.into_bytes())).await;
+    publisher
+        .publish(Arc::from(br#"{"device_id":"d","v":2}"#.to_vec()))
+        .await;
+    let row = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap();
+    assert!(row.is_some(), "the short message decodes");
+    let s = diag.snapshot();
+    assert_eq!(s.databus_source_dropped_budget, 1, "{s:?}");
+    assert_eq!(s.databus_source_dropped_bad, 0, "never parsed");
+    assert_eq!(s.decode_errors, 0);
+    assert_eq!(s.databus_source_rows, 1);
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+}
+
+/// A stop while a publish waits on a `block` subscriber is bounded by the
+/// sink's `flush_timeout`, not the subscriber's `block_timeout`; the rest of
+/// the batch and the queued batches are counted and their receipts fail.
+#[tokio::test]
+async fn databus_sink_stop_bounds_a_publish_blocked_in_flight() {
+    let bus = DataBus::new();
+    let sub_owner = owner();
+    let mut blocking = sub_config("rows.a", 1, Overflow::Block);
+    blocking.block_timeout = Duration::from_secs(30);
+    let _sub = bus
+        .subscribe(blocking, &sub_owner, IoDiagnostics::new())
+        .unwrap();
+    let sink_owner = owner();
+    let diag = IoDiagnostics::new();
+    let mut config = DataBusSinkConfig::new("rows.a");
+    config.flush_timeout = Duration::from_millis(100);
+    let sink = DataBusSink::bind(config, bus.clone(), sink_owner.clone(), diag.clone()).unwrap();
+    let (out_tx, out_rx) = sparrow_io::observed::channel(4);
+    let cancel = CancellationToken::new();
+    let outbox = Arc::new(sparrow_model::InflightCounter::new());
+    let task = tokio::spawn(sink.run(out_rx, cancel.clone(), Some(outbox.clone())));
+    for (from, to) in [(1, 5), (6, 8)] {
+        outbox.enqueue();
+        out_tx.send(batch(&sink_owner, from, to)).await.unwrap();
+    }
+    // Row 1 fills the subscriber, row 2 blocks.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while diag.snapshot().databus_sink_published < 1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stopped = Instant::now();
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("stop is bounded by flush_timeout")
+        .unwrap();
+    assert!(
+        stopped.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        stopped.elapsed()
+    );
+    let s = diag.snapshot();
+    assert_eq!(s.databus_sink_published, 1, "{s:?}");
+    assert_eq!(s.databus_sink_discarded_on_close, 4 + 3, "{s:?}");
+    assert_eq!((outbox.acked(), outbox.failed()), (0, 2));
+    assert_eq!(outbox.pending(), 0);
+    drop(out_tx);
+    assert_eq!(
+        sink_owner.usage().reservation_bytes,
+        0,
+        "encode leases released"
+    );
+}
+
+/// Encoding is bounded by the record limit and charged to the sink's job:
+/// without credit the row is counted `dropped_budget`, not encoded.
+#[tokio::test]
+async fn databus_sink_encode_is_charged_and_bounded() {
+    let bus = DataBus::new();
+    let sub_owner = owner();
+    let sub = bus
+        .subscribe(
+            sub_config("rows.a", 64, Overflow::DropNewest),
+            &sub_owner,
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+    let mut tiny = ResourceBudget::compact();
+    tiny.reservation_bytes = 1024;
+    let sink_owner = MemoryOwner::new(tiny);
+    let rows_owner = owner();
+    let diag = IoDiagnostics::new();
+    let sink = DataBusSink::bind(
+        DataBusSinkConfig::new("rows.a"),
+        bus.clone(),
+        sink_owner,
+        diag.clone(),
+    )
+    .unwrap();
+    let (out_tx, out_rx) = sparrow_io::observed::channel(4);
+    let outbox = Arc::new(sparrow_model::InflightCounter::new());
+    let task = tokio::spawn(sink.run(out_rx, CancellationToken::new(), Some(outbox.clone())));
+    outbox.enqueue();
+    out_tx.send(batch(&rows_owner, 1, 3)).await.unwrap();
+    drop(out_tx);
+    task.await.unwrap();
+    let s = diag.snapshot();
+    assert_eq!(s.databus_sink_dropped_budget, 3, "{s:?}");
+    assert_eq!(s.databus_sink_published, 0);
+    assert_eq!(
+        (outbox.acked(), outbox.failed()),
+        (0, 1),
+        "incomplete batch is not acked"
+    );
+    assert!(drain(&sub).await.is_empty());
 }

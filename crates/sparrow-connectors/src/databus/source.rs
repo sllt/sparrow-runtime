@@ -1,7 +1,10 @@
 //! DataBus Source: subscribe to a topic pattern on the in-process bus.
 //!
 //! Each message is one JSON object (the publishing Sink's row encoding)
-//! decoded with this pipeline's stream schema. Rows enter the byte-accounted
+//! decoded with this pipeline's stream schema. A message over the record
+//! limit is rejected by length; otherwise the decoder working set is charged
+//! to the job reservation before decoding and held until the row is queued
+//! (no credit: counted `dropped_budget`, not decoded). Rows enter the byte-accounted
 //! Kernel ingress one at a time; while that inbox is full the pump waits and
 //! the subscriber buffer fills, where the overflow policy applies.
 
@@ -212,6 +215,14 @@ impl DataBusSource {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
+        // Parser tree + Row expansion, held until the row is queued.
+        let scratch = crate::scratch::json_decode_scratch(payload.len(), &self.config.schema);
+        let Ok(_scratch) = ingress.owner.acquire(CreditKind::Reservation, scratch) else {
+            self.diag
+                .databus_source_dropped_budget
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
+        };
         let started = std::time::Instant::now();
         let decoded = decode_json_row(&self.config.schema, payload, &self.config.json_limits);
         self.diag

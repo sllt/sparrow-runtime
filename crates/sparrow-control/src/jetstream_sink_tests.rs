@@ -47,7 +47,7 @@ fn aligned_spec(url: &str, path: &std::path::Path, dir: &std::path::Path) -> Val
             "kind": "jetstream",
             "outbox_capacity": 4,
             "jetstream": {"servers": [url], "stream": "OUT", "subject": "out.events",
-                "msg_id_column": "id", "ack_timeout_ms": 3000}
+                "msg_id_column": "id", "ack_timeout_ms": 3000, "max_inflight_acks": 1}
         },
         "recovery": "aligned",
         "checkpoint_dir": dir,
@@ -242,14 +242,13 @@ fn jetstream_sink_validation_bounds_schema_and_shared_reservation() {
     check(&v, &allowed).unwrap();
     // Each client fits on its own; source plus sink must share 3/4 of the job.
     let mut v = base.clone();
-    v["source"]["nats"]["max_payload_bytes"] = json!(1024 * 1024);
+    v["source"]["nats"]["max_payload_bytes"] = json!(768 * 1024);
     v["source"]["nats"]["subscription_capacity"] = json!(1);
     v["sink"]["jetstream"]["max_payload_bytes"] = json!(256 * 1024);
     v["sink"]["jetstream"]["max_inflight_acks"] = json!(1);
     v["sink"]["jetstream"]["client_capacity"] = json!(1);
     check(&v, &allowed).unwrap();
-    v["sink"]["jetstream"]["max_inflight_acks"] = json!(4);
-    v["sink"]["jetstream"]["client_capacity"] = json!(4);
+    v["sink"]["jetstream"]["client_capacity"] = json!(2);
     assert_eq!(
         check(&v, &allowed),
         Err(BoundExceeded),
@@ -271,6 +270,24 @@ fn jetstream_sink_validation_bounds_schema_and_shared_reservation() {
         "deduplicated_within_stream_duplicate_window"
     );
     assert_eq!(effective["exactly_once"], false);
+    let effective = crate::validate::effective_guarantees_with_plan(&spec, &plan);
+    assert_eq!(
+        effective["checkpoint_participants"]["profile"],
+        "file_jetstream_sink_v27"
+    );
+    assert_eq!(effective["checkpoint_participants"]["snapshot_version"], 27);
+    assert_eq!(
+        effective["checkpoint_participants"]["sink_identity_codec"],
+        "JSI1"
+    );
+    assert_eq!(
+        spec.delivery, "live_best_effort",
+        "PubAck output does not redefine source delivery"
+    );
+    assert!(
+        !spec.fail_on_decode,
+        "v27 does not silently change the File decode policy"
+    );
 }
 
 #[cfg(feature = "jetstream")]
@@ -373,6 +390,86 @@ mod broker {
             writeln!(f, "{}", json!({"id": id, "v": v})).unwrap();
         }
         f.sync_all().unwrap();
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DurableCut {
+        current: Vec<u8>,
+        generation: Vec<u8>,
+        generations: Vec<(u64, u64, bool)>,
+    }
+
+    fn durable_cut(dir: &std::path::Path) -> DurableCut {
+        let inventory = sparrow_runtime::CheckpointStore::open_readonly(dir)
+            .unwrap()
+            .inventory()
+            .unwrap();
+        DurableCut {
+            current: std::fs::read(dir.join("CURRENT")).unwrap(),
+            generation: std::fs::read(dir.join("STATE_GENERATION")).unwrap(),
+            generations: inventory
+                .generations
+                .iter()
+                .map(|g| (g.id, g.bytes, g.published))
+                .collect(),
+        }
+    }
+
+    fn snapshot_version(dir: &std::path::Path, id: u64) -> u16 {
+        sparrow_runtime::CheckpointStore::open_readonly(dir)
+            .unwrap()
+            .inventory()
+            .unwrap()
+            .generations
+            .into_iter()
+            .find(|g| g.id == id)
+            .unwrap()
+            .metadata
+            .unwrap()
+            .version
+    }
+
+    #[cfg(feature = "demo-io")]
+    fn http_rows(http: &sparrow_connectors::HttpCapture) -> usize {
+        http.bodies()
+            .iter()
+            .map(|body| {
+                let value: Value = serde_json::from_slice(body).unwrap();
+                value.as_array().expect("legacy File/HTTP JSON batch").len()
+            })
+            .sum()
+    }
+
+    async fn assert_released(kernel: &sparrow_runtime::Kernel) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while kernel.admitted_jobs() != 0 || kernel.process_owner().usage().physical_bytes != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("bootstrap/session must release its SourceAdmission and all process credit after SDK exit");
+        assert_eq!(kernel.process_owner().accounting_errors_total(), 0);
+        let admission = kernel.prepare_source_admission(987.into()).unwrap();
+        assert_eq!(kernel.admitted_jobs(), 1);
+        drop(admission);
+        assert_eq!(kernel.admitted_jobs(), 0);
+    }
+
+    async fn assert_start_rejected(
+        sup: &Arc<Supervisor>,
+        store: &Store,
+        kernel: &sparrow_runtime::Kernel,
+    ) -> String {
+        sup.converge_once().await.unwrap();
+        let actual = store.actual("js").unwrap();
+        assert_eq!(
+            actual.status, "failed",
+            "startup must fail before source activation: {actual:?}"
+        );
+        assert!(
+            sup.flow_snapshot("js").unwrap().is_none(),
+            "failed bootstrap must not install a running job"
+        );
+        assert_released(kernel).await;
+        actual.last_error.expect("decisive startup error")
     }
 
     #[test]
@@ -480,6 +577,7 @@ mod broker {
                 "never auto-created"
             );
             sup.stop_all().await;
+            assert_released(&kernel).await;
         });
     }
 
@@ -513,12 +611,18 @@ mod broker {
             })
             .await
             .expect("aligned job must fail, not checkpoint past unconfirmed rows");
-            assert!(error.contains("JetStream Sink failed closed"), "{error}");
+            assert!(
+                error.contains("does not exist") && error.contains("never creates"),
+                "{error}"
+            );
             assert!(
                 context.get_stream("OUT").await.is_err(),
                 "never auto-created"
             );
+            assert!(!scratch.0.join("checkpoints/CURRENT").exists());
+            assert!(!scratch.0.join("checkpoints/STATE_GENERATION").exists());
             sup.stop_all().await;
+            assert_released(&kernel).await;
         });
     }
 
@@ -544,6 +648,32 @@ mod broker {
             sup.converge_once().await.unwrap();
             wait_count(&context, "OUT", 4, &sup, &store, "js").await;
             let first = checkpoint(&sup).await;
+            let directory = scratch.0.join("checkpoints");
+            assert_eq!(
+                snapshot_version(&directory, first),
+                27,
+                "real control flow must not write a legacy File/HTTP v3 checkpoint"
+            );
+            let saved = sparrow_runtime::CheckpointStore::open_readonly(&directory)
+                .unwrap()
+                .recover_pipeline_id(first)
+                .unwrap();
+            let identity = saved
+                .sink_identity
+                .as_ref()
+                .expect("v27 required sink identity");
+            let mut stream = context.get_stream("OUT").await.unwrap();
+            assert_eq!(
+                identity.created_nanos,
+                stream.info().await.unwrap().created.unix_timestamp_nanos()
+            );
+            assert_eq!(identity.stream, "OUT");
+            assert_eq!(identity.subject, "out.events");
+            assert_eq!(identity.msg_id_column.as_deref(), Some("id"));
+            assert!(
+                saved.next_output.is_none(),
+                "v27 output identity is not the JetStream input cursor"
+            );
 
             // Broker frozen: rows reach the sink but cannot be PubAcked, so
             // the barrier must not commit (outbox pending), and the job lives.
@@ -568,6 +698,15 @@ mod broker {
             wait_count(&context, "OUT", 6, &sup, &store, "js").await;
             let second = checkpoint(&sup).await;
             assert!(second > first);
+            assert_eq!(snapshot_version(&directory, second), 27);
+            assert_eq!(
+                sparrow_runtime::CheckpointStore::open_readonly(&directory)
+                    .unwrap()
+                    .recover_pipeline_id(second)
+                    .unwrap()
+                    .generation,
+                saved.generation
+            );
             assert_eq!(store.actual("js").unwrap().status, "running");
 
             // Rows after the last checkpoint replay on restore; msg ids dedup.
@@ -612,7 +751,207 @@ mod broker {
                 .collect();
             assert_eq!(ids, vec![1, 3, 5, 7, 9, 11, 13, 15]);
             sup.stop_all().await;
-            assert_eq!(kernel.admitted_jobs(), 0);
+            assert_released(&kernel).await;
+        });
+    }
+
+    #[test]
+    #[ignore = "requires SPARROW_NATS_SERVER (real nats-server binary)"]
+    fn jetstream_sink_v27_rejects_target_and_projection_drift_before_any_new_publish() {
+        let kernel = Arc::new(crate::host_kernel().unwrap());
+        kernel.block_on(async {
+            for change in ["stream", "subject", "msg_id_column", "created", "projection"] {
+                let scratch = Scratch::new();
+                let input = scratch.0.join("events.ndjson");
+                let directory = scratch.0.join("checkpoints");
+                append(&input, 1, 8);
+                let fixture = NatsSandbox::start().await;
+                let context = create_stream(&fixture, "OUT", "out.>").await;
+                let store = Arc::new(Store::open_memory().unwrap());
+                store.put_stream("events", EVENTS_SCHEMA).unwrap();
+                store.put_allow("127.0.0.1", fixture.port).unwrap();
+                let mut value = aligned_spec(&fixture.url(), &input, &directory);
+                store.put_pipeline("js", &parse(&value).unwrap(), None).unwrap();
+                request_start(&store, "js", "test").unwrap();
+                let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+                sup.converge_once().await.unwrap();
+                wait_count(&context, "OUT", 4, &sup, &store, "js").await;
+                let checkpoint_id = checkpoint(&sup).await;
+                assert_eq!(snapshot_version(&directory, checkpoint_id), 27);
+                let saved = sparrow_runtime::CheckpointStore::open_readonly(&directory).unwrap()
+                    .recover_pipeline_id(checkpoint_id).unwrap();
+                sup.kill_named("js").await.unwrap();
+                assert_released(&kernel).await;
+                let before = durable_cut(&directory);
+                // These IDs were never sent. Dedup cannot hide a wrongly
+                // admitted restore advancing the source and publishing them.
+                append(&input, 9, 12);
+                let target = match change {
+                    "stream" => {
+                        // NATS forbids overlapping stream subjects. Move the
+                        // existing writable subject to ALT, then change only
+                        // the spec stream name; bootstrap itself stays valid.
+                        context.delete_stream("OUT").await.unwrap();
+                        create_stream(&fixture, "ALT", "out.>").await;
+                        value["sink"]["jetstream"]["stream"] = json!("ALT");
+                        "ALT"
+                    }
+                    "subject" => { value["sink"]["jetstream"]["subject"] = json!("out.changed"); "OUT" }
+                    "msg_id_column" => { value["sink"]["jetstream"]["msg_id_column"] = json!("v"); "OUT" }
+                    "created" => {
+                        context.delete_stream("OUT").await.unwrap();
+                        create_stream(&fixture, "OUT", "out.>").await;
+                        let mut replacement = context.get_stream("OUT").await.unwrap();
+                        assert_ne!(replacement.info().await.unwrap().created.unix_timestamp_nanos(),
+                            saved.sink_identity.as_ref().unwrap().created_nanos);
+                        "OUT"
+                    }
+                    "projection" => { value["sql"] = json!("SELECT id, v + 100 AS v FROM events WHERE v > 0"); "OUT" }
+                    _ => unreachable!(),
+                };
+                let published = count(&context, target).await;
+                let etag = store.get_pipeline("js").unwrap().etag;
+                store.put_pipeline("js", &parse(&value).unwrap(), Some(&etag)).unwrap();
+                request_start(&store, "js", "test").unwrap();
+                let error = assert_start_rejected(&sup, &store, &kernel).await;
+                assert!(error.contains("checkpoint") || error.contains("semantic") || error.contains("sink"), "{change}: {error}");
+                assert_eq!(durable_cut(&directory), before, "{change}: CURRENT, state generation and all published generations must remain unchanged");
+                assert_eq!(count(&context, target).await, published, "{change}: rejection must happen before any extra publish");
+                sup.stop_all().await;
+                assert_released(&kernel).await;
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires SPARROW_NATS_SERVER (real nats-server binary)"]
+    fn jetstream_sink_v27_memory_storage_bootstrap_rejects_and_releases_slot_and_credit() {
+        let scratch = Scratch::new();
+        let input = scratch.0.join("events.ndjson");
+        let directory = scratch.0.join("checkpoints");
+        append(&input, 1, 8);
+        let kernel = Arc::new(crate::host_kernel().unwrap());
+        kernel.block_on(async {
+            let fixture = NatsSandbox::start().await;
+            let context = fixture.context().await;
+            context
+                .create_stream(jetstream::stream::Config {
+                    name: "OUT".into(),
+                    subjects: vec!["out.>".into()],
+                    storage: jetstream::stream::StorageType::Memory,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let store = Arc::new(Store::open_memory().unwrap());
+            store.put_stream("events", EVENTS_SCHEMA).unwrap();
+            store.put_allow("127.0.0.1", fixture.port).unwrap();
+            store
+                .put_pipeline(
+                    "js",
+                    &parse(&aligned_spec(&fixture.url(), &input, &directory)).unwrap(),
+                    None,
+                )
+                .unwrap();
+            request_start(&store, "js", "test").unwrap();
+            let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+            let error = assert_start_rejected(&sup, &store, &kernel).await;
+            assert!(error.contains("File/Limits"), "{error}");
+            assert_eq!(count(&context, "OUT").await, 0);
+            assert!(!directory.join("CURRENT").exists());
+            assert!(
+                !directory.join("STATE_GENERATION").exists(),
+                "bootstrap must precede state generation activation"
+            );
+            sup.stop_all().await;
+            assert_released(&kernel).await;
+        });
+    }
+
+    #[cfg(feature = "demo-io")]
+    #[test]
+    #[ignore = "requires SPARROW_NATS_SERVER (real nats-server binary)"]
+    fn jetstream_sink_v27_and_http_v3_histories_are_rejected_in_both_control_directions() {
+        let kernel = Arc::new(crate::host_kernel().unwrap());
+        kernel.block_on(async {
+            let fixture = NatsSandbox::start().await;
+            let context = create_stream(&fixture, "OUT", "out.>").await;
+            let http = sparrow_connectors::HttpCapture::start().await.unwrap();
+            for seed_jetstream in [false, true] {
+                let scratch = Scratch::new();
+                let input = scratch.0.join("events.ndjson");
+                let directory = scratch.0.join("checkpoints");
+                append(&input, 1, 8);
+                let store = Arc::new(Store::open_memory().unwrap());
+                store.put_stream("events", EVENTS_SCHEMA).unwrap();
+                store.put_allow("127.0.0.1", fixture.port).unwrap();
+                store.put_allow("127.0.0.1", http.port()).unwrap();
+                let mut value = aligned_spec(&fixture.url(), &input, &directory);
+                let js_sink = value["sink"].clone();
+                let http_sink = json!({"kind":"http", "url":http.url(), "outbox_capacity":4});
+                value["sink"] = if seed_jetstream {
+                    js_sink.clone()
+                } else {
+                    http_sink.clone()
+                };
+                store
+                    .put_pipeline("js", &parse(&value).unwrap(), None)
+                    .unwrap();
+                request_start(&store, "js", "test").unwrap();
+                let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+                let previous_http_rows = http_rows(&http);
+                sup.converge_once().await.unwrap();
+                if seed_jetstream {
+                    wait_count(&context, "OUT", 4, &sup, &store, "js").await;
+                } else {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while http_rows(&http) < previous_http_rows + 4 {
+                            sup.converge_once().await.unwrap();
+                            assert_eq!(store.actual("js").unwrap().status, "running");
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }).await.expect("actual File/HTTP v3 baseline must deliver its four filtered rows before the cut");
+                    assert_eq!(http_rows(&http), previous_http_rows + 4);
+                }
+                // The real checkpoint is the barrier proof for HTTP acceptance
+                // too; its legacy pipeline profile is v3, never manufactured.
+                let id = checkpoint(&sup).await;
+                assert_eq!(
+                    snapshot_version(&directory, id),
+                    if seed_jetstream { 27 } else { 3 }
+                );
+                sup.kill_named("js").await.unwrap();
+                assert_released(&kernel).await;
+                let before = durable_cut(&directory);
+                let before_http = http.bodies();
+                let before_js = count(&context, "OUT").await;
+                append(&input, 9, 12);
+                value["sink"] = if seed_jetstream { http_sink } else { js_sink };
+                let etag = store.get_pipeline("js").unwrap().etag;
+                store
+                    .put_pipeline("js", &parse(&value).unwrap(), Some(&etag))
+                    .unwrap();
+                request_start(&store, "js", "test").unwrap();
+                let error = assert_start_rejected(&sup, &store, &kernel).await;
+                assert!(
+                    error.contains("profile") || error.contains("checkpoint"),
+                    "{error}"
+                );
+                assert_eq!(
+                    durable_cut(&directory),
+                    before,
+                    "cross-profile rejection must preserve CURRENT/generation/history"
+                );
+                assert_eq!(http.bodies(), before_http, "v27 must not resume into HTTP");
+                assert_eq!(
+                    count(&context, "OUT").await,
+                    before_js,
+                    "v3 must not resume into JetStream"
+                );
+                sup.stop_all().await;
+                assert_released(&kernel).await;
+            }
+            http.stop().await;
         });
     }
 

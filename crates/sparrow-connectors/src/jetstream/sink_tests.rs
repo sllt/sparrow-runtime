@@ -5,11 +5,12 @@ use super::sink::{JetStreamSink, JetStreamSinkConfig};
 use crate::nats::common::{check_stream_name, subject_matches};
 use crate::{IoDiagnostics, MapSecretResolver, TargetPolicy};
 use sparrow_model::{
-    CreditKind, DataType, ErrorCode, Field, FieldId, InflightCounter, MemoryOwner, ResourceBudget,
-    Row, RowBatch, RowBatchBuilder, Scalar, Schema, SchemaId,
+    CreditKind, DataType, DynamicValue, ErrorCode, Field, FieldId, InflightCounter, MemoryOwner,
+    ResourceBudget, Row, RowBatch, RowBatchBuilder, Scalar, Schema, SchemaId,
 };
 use sparrow_testkit::nats::{jetstream, NatsSandbox};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -41,6 +42,12 @@ fn jetstream_sink_config_bounds_semantics_and_redaction() {
     let s = secrets();
     let p = TargetPolicy::allow("127.0.0.1", 4222);
     let base = JetStreamSinkConfig::new(vec![LOCAL.into()], "OUT", "out.rows");
+    assert_eq!(
+        base.client.capacity,
+        JetStreamSinkConfig::DEFAULT_CLIENT_CAPACITY
+    );
+    assert_eq!(base.client.capacity, 4);
+    assert_eq!(base.max_inflight_acks, 8);
     base.validate(&s, &p).unwrap();
     let caps = JetStreamSinkConfig::capabilities();
     assert_eq!(caps.kind, "jetstream_sink");
@@ -102,6 +109,17 @@ fn jetstream_sink_config_bounds_semantics_and_redaction() {
         big.check_reservation_budget(compact).unwrap_err().code,
         ErrorCode::BoundExceeded
     );
+    // Reservation estimation must not overflow before config validation.
+    let mut saturated = base.clone();
+    saturated.max_inflight_acks = usize::MAX;
+    assert_eq!(saturated.sdk_reservation(), usize::MAX);
+    assert_eq!(
+        saturated
+            .check_reservation_budget(compact)
+            .unwrap_err()
+            .code,
+        ErrorCode::BoundExceeded
+    );
 
     // msg_id_column must exist and be utf8/integer.
     let mut with_id = base.clone();
@@ -147,6 +165,121 @@ fn jetstream_subject_and_stream_name_grammar() {
     for bad in ["", "a.b", "a*", "a>", "a/b", "a\\b", "a b"] {
         assert!(check_stream_name(bad).is_err(), "{bad:?}");
     }
+}
+
+#[test]
+fn jetstream_sink_encode_acquires_scratch_before_id_headers_or_codec() {
+    let budget = ResourceBudget::compact();
+    let owner = MemoryOwner::new(budget);
+    let diag = IoDiagnostics::new();
+    let mut config = JetStreamSinkConfig::new(vec![LOCAL.into()], "OUT", "out.rows");
+    config.msg_id_column = Some("event_id".into());
+    let sink = JetStreamSink::bind(
+        config,
+        &secrets(),
+        &TargetPolicy::allow("127.0.0.1", 4222),
+        owner.clone(),
+        diag.clone(),
+    )
+    .unwrap();
+    let row = Row {
+        values: vec![Scalar::utf8("invalid\nid"), Scalar::Int64(1)],
+    };
+    let held = owner
+        .acquire(CreditKind::Reservation, budget.reservation_bytes - 8192)
+        .unwrap();
+    let error = sink.encode(&schema(), &row, Some(0), 1024).unwrap_err();
+    assert_eq!(error.code, ErrorCode::ResourceExhausted);
+    assert_eq!(
+        diag.snapshot().jetstream_sink_dropped_bad,
+        0,
+        "id validation must not run without scratch credit"
+    );
+    assert_eq!(diag.snapshot().jetstream_sink_dropped_oversize, 0);
+    assert_eq!(owner.usage().reservation_bytes, held.bytes());
+    drop(held);
+    // With credit available, the same row reaches id validation and fails
+    // there instead; both failure paths return the temporary scratch lease.
+    assert_eq!(
+        sink.encode(&schema(), &row, Some(0), 1024)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(diag.snapshot().jetstream_sink_dropped_bad, 1);
+    assert_eq!(owner.usage().reservation_bytes, 0);
+    assert_eq!(owner.usage().physical_bytes, 0);
+    assert_eq!(owner.accounting_errors_total(), 0);
+}
+
+#[test]
+fn jetstream_sink_wide_bytes_dynamic_codec_scratch_is_charged_and_returned() {
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let diag = IoDiagnostics::new();
+    let config = JetStreamSinkConfig::new(vec![LOCAL.into()], "OUT", "out.rows");
+    let retained = owner
+        .acquire(CreditKind::Reservation, config.sdk_reservation())
+        .unwrap();
+    let sink = JetStreamSink::bind(
+        config,
+        &secrets(),
+        &TargetPolicy::allow("127.0.0.1", 4222),
+        owner.clone(),
+        diag.clone(),
+    )
+    .unwrap();
+    let mut fields = Vec::new();
+    let mut values = Vec::new();
+    for index in 0..15u16 {
+        fields.push(Field::new(
+            FieldId::new(index + 1),
+            format!("f{index}"),
+            DataType::Int64,
+            false,
+        ));
+        values.push(Scalar::Int64(i64::from(index)));
+    }
+    fields.push(Field::new(
+        FieldId::new(16),
+        "bytes",
+        DataType::Bytes,
+        false,
+    ));
+    values.push(Scalar::Bytes(Arc::from(b"abc".as_slice())));
+    fields.push(Field::new(
+        FieldId::new(17),
+        "dynamic",
+        DataType::Dynamic,
+        false,
+    ));
+    values.push(Scalar::Dynamic(DynamicValue::object(vec![(
+        "message",
+        DynamicValue::utf8("quoted \" value\n"),
+    )])));
+    let output = Schema::new(SchemaId::new(2), fields).unwrap();
+    let row = Row { values };
+    let before = owner.usage().physical_bytes;
+    let (body, id) = sink.encode(&output, &row, None, 1024).unwrap();
+    assert!(id.is_none());
+    let decoded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(decoded["bytes"], "YWJj");
+    assert_eq!(decoded["dynamic"]["message"], "quoted \" value\n");
+    assert_eq!(decoded["f14"], 14);
+    assert!(body.len() <= 1024);
+    assert_eq!(
+        owner.usage().physical_bytes,
+        before,
+        "scratch must be released; encoded bytes use the existing retained reservation"
+    );
+    assert!(
+        owner.usage().peak_physical_bytes > before,
+        "the temporary codec scratch must have been charged"
+    );
+    drop(body);
+    drop(retained);
+    assert_eq!(owner.usage().physical_bytes, 0);
+    assert_eq!(owner.accounting_errors_total(), 0);
+    assert_eq!(diag.snapshot().jetstream_sink_dropped_bad, 0);
 }
 
 // ---------------------------------------------------------- broker harness
@@ -226,7 +359,10 @@ struct Running {
     task: tokio::task::JoinHandle<()>,
 }
 
-fn start(broker: &NatsSandbox, mutate: impl FnOnce(&mut JetStreamSinkConfig)) -> Running {
+fn bound_sink(
+    broker: &NatsSandbox,
+    mutate: impl FnOnce(&mut JetStreamSinkConfig),
+) -> (JetStreamSink, Arc<MemoryOwner>, Arc<IoDiagnostics>) {
     let mut config = JetStreamSinkConfig::new(vec![broker.url()], "OUT", "out.rows");
     config.client.reconnect_attempts = 20;
     mutate(&mut config);
@@ -240,10 +376,40 @@ fn start(broker: &NatsSandbox, mutate: impl FnOnce(&mut JetStreamSinkConfig)) ->
         diag.clone(),
     )
     .unwrap();
-    let (tx, rx) = sparrow_io::observed::channel(config.outbox_capacity);
+    (sink, owner, diag)
+}
+
+fn start(broker: &NatsSandbox, mutate: impl FnOnce(&mut JetStreamSinkConfig)) -> Running {
+    let (sink, owner, diag) = bound_sink(broker, mutate);
+    let (tx, rx) = sparrow_io::observed::channel(sink.config.outbox_capacity);
     let cancel = CancellationToken::new();
     let outbox = Arc::new(InflightCounter::new());
     let task = tokio::spawn(sink.run(rx, cancel.clone(), Some(outbox.clone())));
+    Running {
+        diag,
+        owner,
+        tx: Some(tx),
+        outbox,
+        cancel,
+        task,
+    }
+}
+
+async fn start_prepared(
+    broker: &NatsSandbox,
+    mutate: impl FnOnce(&mut JetStreamSinkConfig),
+) -> Running {
+    let (sink, owner, diag) = bound_sink(broker, mutate);
+    let (tx, rx) = sparrow_io::observed::channel(sink.config.outbox_capacity);
+    let cancel = CancellationToken::new();
+    let prepared = sink
+        .prepare_aligned(cancel.clone(), Arc::new(()))
+        .await
+        .unwrap()
+        .expect("prepared File/Limits sink");
+    assert!(prepared.identity().belongs_to(&owner));
+    let outbox = Arc::new(InflightCounter::new());
+    let task = tokio::spawn(prepared.run(rx, cancel.clone(), Some(outbox.clone())));
     Running {
         diag,
         owner,
@@ -262,13 +428,11 @@ impl Running {
         .await;
     }
     async fn send(&self, from: i64, to: i64) {
+        self.send_batch(batch(&self.owner, from, to)).await;
+    }
+    async fn send_batch(&self, batch: RowBatch) {
         self.outbox.enqueue();
-        self.tx
-            .as_ref()
-            .unwrap()
-            .send(batch(&self.owner, from, to))
-            .await
-            .unwrap();
+        self.tx.as_ref().unwrap().send(batch).await.unwrap();
     }
     async fn settled(&self, batches: u64) {
         until(Duration::from_secs(30), || {
@@ -287,11 +451,229 @@ impl Running {
             self.owner.usage().reservation_bytes == 0
         })
         .await;
+        assert_eq!(self.owner.usage().physical_bytes, 0);
+        assert_eq!(self.owner.accounting_errors_total(), 0);
         (self.diag, self.outbox, cancelled)
     }
 }
 
 // ----------------------------------------------------------- broker tests
+
+struct ProbeGuard(Arc<AtomicBool>);
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_prepared_probe_close_joins_the_original_sdk_and_guard() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    let (sink, owner, diag) = bound_sink(&broker, |_| {});
+    let released = Arc::new(AtomicBool::new(false));
+    let guard = Arc::new(ProbeGuard(released.clone()));
+    let weak = Arc::downgrade(&guard);
+    let prepared = sink
+        .prepare_aligned(CancellationToken::new(), guard.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let identity = prepared.identity();
+    assert!(identity.belongs_to(&owner));
+    assert_eq!(identity.identity().stream, "OUT");
+    assert_eq!(identity.identity().subject, "out.rows");
+    assert_eq!(
+        identity.identity().created_nanos,
+        context
+            .get_stream("OUT")
+            .await
+            .unwrap()
+            .cached_info()
+            .created
+            .unix_timestamp_nanos()
+    );
+    assert_eq!(diag.snapshot().jetstream_sink_sessions, 1);
+    assert_eq!(
+        diag.snapshot().jetstream_sink_acked,
+        0,
+        "probe publishes no source rows"
+    );
+    assert_eq!(stream_rows(&context, "OUT").await.1, 0);
+    drop(guard);
+    assert!(
+        weak.upgrade().is_some(),
+        "the SDK must own the lifecycle guard"
+    );
+    assert!(!released.load(Ordering::SeqCst));
+    prepared.close().await.unwrap();
+    drop(identity);
+    until(Duration::from_secs(10), || {
+        owner.usage().physical_bytes == 0 && weak.upgrade().is_none()
+    })
+    .await;
+    assert!(released.load(Ordering::SeqCst));
+    assert_eq!(owner.accounting_errors_total(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_prepared_run_reuses_the_probe_session() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    let sink = start_prepared(&broker, |_| {}).await;
+    sink.send(1, 5).await;
+    sink.settled(1).await;
+    let (diag, outbox, cancelled) = sink.finish().await;
+    assert!(!cancelled);
+    assert_eq!((outbox.acked(), outbox.failed()), (1, 0));
+    assert_eq!(
+        diag.snapshot().jetstream_sink_sessions,
+        1,
+        "run must not reopen a second SDK session"
+    );
+    assert_eq!(diag.snapshot().jetstream_sink_acked, 5);
+    assert_eq!(stream_rows(&context, "OUT").await.1, 5);
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_prepared_refuses_memory_interest_and_no_ack_streams() {
+    let broker = NatsSandbox::start().await;
+    let context = broker.context().await;
+    for (storage, retention, no_ack, expected) in [
+        (
+            jetstream::stream::StorageType::Memory,
+            jetstream::stream::RetentionPolicy::Limits,
+            false,
+            ErrorCode::UnsupportedRestore,
+        ),
+        (
+            jetstream::stream::StorageType::File,
+            jetstream::stream::RetentionPolicy::Interest,
+            false,
+            ErrorCode::UnsupportedRestore,
+        ),
+        (
+            jetstream::stream::StorageType::File,
+            jetstream::stream::RetentionPolicy::Limits,
+            true,
+            ErrorCode::InvalidArgument,
+        ),
+    ] {
+        context
+            .create_stream(jetstream::stream::Config {
+                name: "OUT".into(),
+                subjects: vec!["out.>".into()],
+                storage,
+                retention,
+                no_ack,
+                max_bytes: 16 * 1024 * 1024,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (sink, owner, diag) = bound_sink(&broker, |_| {});
+        let error = sink
+            .prepare_aligned(CancellationToken::new(), Arc::new(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, expected);
+        assert_eq!(diag.snapshot().jetstream_sink_sessions, 0);
+        assert_eq!(diag.snapshot().jetstream_sink_acked, 0);
+        assert_eq!(diag.snapshot().jetstream_sink_fatal, 1);
+        until(Duration::from_secs(10), || {
+            owner.usage().physical_bytes == 0
+        })
+        .await;
+        assert_eq!(owner.accounting_errors_total(), 0);
+        assert_eq!(stream_rows(&context, "OUT").await.1, 0);
+        context.delete_stream("OUT").await.unwrap();
+    }
+    // Non-aligned PubAck publishing deliberately keeps its weaker contract.
+    context
+        .create_stream(jetstream::stream::Config {
+            name: "OUT".into(),
+            subjects: vec!["out.>".into()],
+            storage: jetstream::stream::StorageType::Memory,
+            max_bytes: 16 * 1024 * 1024,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let sink = start(&broker, |_| {});
+    sink.ready().await;
+    sink.send(1, 1).await;
+    sink.settled(1).await;
+    let (_, outbox, cancelled) = sink.finish().await;
+    assert!(!cancelled);
+    assert_eq!((outbox.acked(), outbox.failed()), (1, 0));
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_prepared_rejects_same_named_recreation_before_receipt() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    let old_created = context
+        .get_stream("OUT")
+        .await
+        .unwrap()
+        .cached_info()
+        .created;
+    let sink = start_prepared(&broker, |_| {}).await;
+    context.delete_stream("OUT").await.unwrap();
+    create_stream(&broker, "OUT", &["out.>"]).await;
+    assert_ne!(
+        context
+            .get_stream("OUT")
+            .await
+            .unwrap()
+            .cached_info()
+            .created,
+        old_created
+    );
+    sink.send(1, 1).await;
+    sink.settled(1).await;
+    let (diag, outbox, cancelled) = sink.finish().await;
+    assert!(cancelled);
+    assert_eq!((outbox.acked(), outbox.failed()), (0, 1));
+    assert_eq!(diag.snapshot().jetstream_sink_acked, 0);
+    assert_eq!(diag.snapshot().jetstream_sink_fatal, 1);
+    assert_eq!(diag.snapshot().jetstream_sink_retries, 0);
+    assert_eq!(stream_rows(&context, "OUT").await.1, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_prepared_rejects_config_drift_before_receipt() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    let sink = start_prepared(&broker, |_| {}).await;
+    let stream = context.get_stream("OUT").await.unwrap();
+    let created = stream.cached_info().created;
+    let mut changed = stream.cached_info().config.clone();
+    changed.max_bytes += 1024;
+    context.update_stream(changed).await.unwrap();
+    assert_eq!(
+        context
+            .get_stream("OUT")
+            .await
+            .unwrap()
+            .cached_info()
+            .created,
+        created
+    );
+    sink.send(1, 1).await;
+    sink.settled(1).await;
+    let (diag, outbox, cancelled) = sink.finish().await;
+    assert!(cancelled);
+    assert_eq!((outbox.acked(), outbox.failed()), (0, 1));
+    assert_eq!(diag.snapshot().jetstream_sink_acked, 0);
+    assert_eq!(diag.snapshot().jetstream_sink_fatal, 1);
+    assert_eq!(stream_rows(&context, "OUT").await.1, 0);
+}
 
 #[tokio::test]
 #[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
@@ -498,6 +880,197 @@ async fn jetstream_sink_flushes_queued_batches_on_stop() {
     assert_eq!(s.jetstream_sink_fatal, 0, "{s:?}");
     let (seen, messages) = stream_rows(&context, "OUT").await;
     assert_eq!((seen.len(), messages), (24, 24));
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_stop_bounds_the_inflight_batch_and_queued_receipts() {
+    let broker = NatsSandbox::start().await;
+    create_stream(&broker, "OUT", &["out.>"]).await;
+    let sink = start(&broker, |c| {
+        c.ack_timeout = Duration::from_secs(5);
+        c.max_retries = 20;
+        c.max_inflight_acks = 1;
+        c.flush_timeout = Duration::from_millis(100);
+    });
+    sink.ready().await;
+    broker.pause();
+    sink.send(1, 1).await;
+    until(Duration::from_secs(2), || {
+        sink.diag.snapshot().jetstream_sink_inflight == 1
+    })
+    .await;
+    sink.send(2, 2).await;
+    assert_eq!(sink.outbox.pending(), 2);
+    sink.cancel.cancel();
+    // A 100ms flush must not wait for even the first 5s PubAck timeout,
+    // let alone give every retry / queued batch a fresh flush budget.
+    until(Duration::from_secs(2), || sink.outbox.failed() == 2).await;
+    let snapshot = sink.diag.snapshot();
+    assert_eq!((sink.outbox.acked(), sink.outbox.pending()), (0, 0));
+    assert_eq!(snapshot.jetstream_sink_inflight, 0, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_fatal, 1, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_failed, 1, "{snapshot:?}");
+    assert_eq!(
+        snapshot.jetstream_sink_discarded_on_close, 1,
+        "{snapshot:?}"
+    );
+    assert_eq!(snapshot.jetstream_sink_retries, 0, "{snapshot:?}");
+    // Closing is still real SDK lifecycle work, not an early ledger refund.
+    // Some SDKs can flush their socket and exit without a broker response.
+    if !sink.task.is_finished() {
+        assert!(sink.owner.usage().reservation_bytes > 0);
+    }
+    broker.resume();
+    let (diag, outbox, cancelled) = sink.finish().await;
+    assert!(cancelled);
+    assert_eq!((outbox.acked(), outbox.failed()), (0, 2));
+    assert_eq!(diag.snapshot().jetstream_sink_inflight, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_subject_rebinding_fails_without_retry_or_foreign_publish() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    let sink = start(&broker, |c| c.max_retries = 20);
+    sink.ready().await;
+    context.delete_stream("OUT").await.unwrap();
+    create_stream(&broker, "OTHER", &["out.>"]).await;
+    sink.send(1, 1).await;
+    until(Duration::from_secs(2), || {
+        sink.outbox.acked() + sink.outbox.failed() == 1
+    })
+    .await;
+    let (diag, outbox, cancelled) = sink.finish().await;
+    assert!(cancelled);
+    assert_eq!((outbox.acked(), outbox.failed()), (0, 1));
+    let snapshot = diag.snapshot();
+    assert_eq!(snapshot.jetstream_sink_acked, 0, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_fatal, 1, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_failed, 1, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_retries, 0, "{snapshot:?}");
+    assert_eq!(stream_rows(&context, "OTHER").await.1, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_refuses_no_ack_stream_before_publishing() {
+    let broker = NatsSandbox::start().await;
+    broker
+        .context()
+        .await
+        .create_stream(jetstream::stream::Config {
+            name: "OUT".into(),
+            subjects: vec!["out.>".into()],
+            no_ack: true,
+            storage: jetstream::stream::StorageType::File,
+            max_bytes: 16 * 1024 * 1024,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let sink = start(&broker, |c| c.max_retries = 20);
+    let (diag, outbox, cancelled) = sink.finish().await;
+    assert!(cancelled);
+    assert_eq!((outbox.acked(), outbox.failed()), (0, 0));
+    let snapshot = diag.snapshot();
+    assert_eq!(snapshot.jetstream_sink_sessions, 0, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_fatal, 1, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_ack_timeouts, 0, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_retries, 0, "{snapshot:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_bounded_encoder_rejects_json_escape_expansion() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    let sink = start(&broker, |c| c.client.max_payload_bytes = 1024);
+    sink.ready().await;
+    let mut builder = RowBatchBuilder::new(
+        Arc::new(schema()),
+        sink.owner.clone(),
+        CreditKind::Reservation,
+        1,
+        1 << 16,
+    )
+    .unwrap();
+    // Only 300 source bytes, but each NUL expands to six JSON bytes.
+    builder
+        .push(Row {
+            values: vec![Scalar::utf8("\0".repeat(300)), Scalar::Int64(1)],
+        })
+        .unwrap();
+    sink.send_batch(builder.finish().unwrap()).await;
+    let (diag, outbox, cancelled) = sink.finish().await;
+    assert!(cancelled);
+    assert_eq!((outbox.acked(), outbox.failed()), (0, 1));
+    let snapshot = diag.snapshot();
+    assert_eq!(snapshot.jetstream_sink_dropped_oversize, 1, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_dropped_bad, 0, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_acked, 0, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_fatal, 1, "{snapshot:?}");
+    assert_eq!(stream_rows(&context, "OUT").await.1, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires SPARROW_NATS_SERVER; isolated broker child only"]
+async fn jetstream_sink_payload_limit_includes_expected_stream_and_msg_id_headers() {
+    let broker = NatsSandbox::start().await;
+    let context = create_stream(&broker, "OUT", &["out.>"]).await;
+    let sink = start(&broker, |c| {
+        c.client.max_payload_bytes = 1024;
+        c.msg_id_column = Some("event_id".into());
+    });
+    sink.ready().await;
+    let id = "i".repeat(super::sink::MAX_MSG_ID_BYTES);
+    let header_bytes =
+        format!("NATS/1.0\r\nNats-Expected-Stream: OUT\r\nNats-Msg-Id: {id}\r\n\r\n").len();
+    let empty_body = serde_json::json!({"event_id": id, "v": 1, "blob": ""});
+    let blob_bytes = 1024 - header_bytes - empty_body.to_string().len();
+    let mut fields = schema().fields;
+    fields.push(Field::new(FieldId::new(3), "blob", DataType::Utf8, false));
+    let output = Arc::new(Schema::new(SchemaId::new(2), fields).unwrap());
+    let owner = sink.owner.clone();
+    let make = |extra: usize| {
+        let mut builder = RowBatchBuilder::new(
+            output.clone(),
+            owner.clone(),
+            CreditKind::Reservation,
+            1,
+            1 << 16,
+        )
+        .unwrap();
+        builder
+            .push(Row {
+                values: vec![
+                    Scalar::utf8(&id),
+                    Scalar::Int64(1),
+                    Scalar::utf8("x".repeat(blob_bytes + extra)),
+                ],
+            })
+            .unwrap();
+        builder.finish().unwrap()
+    };
+    sink.send_batch(make(0)).await;
+    sink.settled(1).await;
+    assert_eq!((sink.outbox.acked(), sink.outbox.failed()), (1, 0));
+    let stream = context.get_stream("OUT").await.unwrap();
+    assert_eq!(
+        stream.get_raw_message(1).await.unwrap().payload.len() + header_bytes,
+        1024
+    );
+    // The body still fits alone, but one extra byte no longer fits with the
+    // exact Expected-Stream plus msg-id header block.
+    sink.send_batch(make(1)).await;
+    let (diag, outbox, cancelled) = sink.finish().await;
+    assert!(cancelled);
+    assert_eq!((outbox.acked(), outbox.failed()), (1, 1));
+    let snapshot = diag.snapshot();
+    assert_eq!(snapshot.jetstream_sink_dropped_oversize, 1, "{snapshot:?}");
+    assert_eq!(snapshot.jetstream_sink_acked, 1, "{snapshot:?}");
+    assert_eq!(stream_rows(&context, "OUT").await.1, 1);
 }
 
 #[tokio::test]

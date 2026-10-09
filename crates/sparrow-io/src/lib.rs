@@ -17,6 +17,8 @@ pub mod live_feed;
 pub mod observed;
 
 pub mod fs_lock;
+pub mod sink_identity;
+pub use sink_identity::{OwnedSinkIdentity, SinkIdentity};
 
 pub use replay::{
     fnv1a64, MemoryReplaySource, ReplayCapabilities, ReplaySupport, ReplayableSource,

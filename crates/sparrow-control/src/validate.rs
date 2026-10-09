@@ -1635,6 +1635,9 @@ fn validate_aligned_plan_inner(
     if !recovery.is_aligned() {
         return Ok(());
     }
+    if spec.sink.kind == "jetstream" {
+        validate_file_jetstream_sink_profile(spec, plan)?;
+    }
     if plan.has_iot() && spec.graph_io.is_none() {
         validate_linear_iot_profile(spec)?;
     }
@@ -1672,6 +1675,26 @@ fn validate_aligned_plan_inner(
     if spec.source.kind=="jetstream" && !plan.has_processing_time_state() && plan.stages.iter().any(|stage|
         matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}))) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state or one/two Count windows only; event/processing-time replay context not verified"));
+    }
+    Ok(())
+}
+
+fn validate_file_jetstream_sink_profile(spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<()> {
+    if !cfg!(feature = "jetstream")
+        || !matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay")
+        || spec.graph_io.is_some()
+        || plan.edges.is_some()
+        || !spec.reference_tables.is_empty()
+    {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+            "JetStream Sink checkpoints require the enabled independent linear File/v27 profile"));
+    }
+    let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    if sparrow_runtime::snapshot_version_for(&manifest, "file")?
+        != sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION
+    {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+            "File/JetStream Sink v27 excludes IoT, reference, paused/observed-time and graph profiles"));
     }
     Ok(())
 }
@@ -1942,7 +1965,7 @@ pub fn capabilities_json() -> serde_json::Value {
                 "recovery": nats.recovery.as_str(),
                 "acknowledgement": "none",
                 "maturity": "preview",
-                "contract": "nats_core_at_most_once; no_ack; no_replay; sdk_slow_consumer_drops_counted; bounded_reconnect_per_outage; not_jetstream",
+                "contract": "nats_core_at_most_once; no_ack; no_replay; bounded_wire_prefetch_drops_counted; subscribed_after_PONG; bounded_reconnect_per_outage; not_jetstream",
             },
             {
                 "kind": nats_sink.kind,
@@ -2049,7 +2072,7 @@ pub fn capabilities_json() -> serde_json::Value {
                 "recovery": js_sink.recovery.as_str(),
                 "acknowledgement": "jetstream_pub_ack_per_message",
                 "duplicates": "possible_on_retry; deduplicated_within_stream_duplicate_window_when_msg_id_column_set",
-                "aligned_checkpoint": "linear_file_profile_only; outbox_acked_after_all_pub_acks",
+                "aligned_checkpoint": "independent_linear_file_v27; exact_JSI1_target_and_full_plan; File_storage_and_Limits_retention; outbox_acked_after_all_pub_acks_and_target_recheck",
                 "stream_management": "existing_stream_required; never_auto_created",
                 "maturity": "preview",
                 "contract": "at_least_once_into_stream; bounded_inflight_acks; bounded_retry_backoff; fail_closed_on_unconfirmed; ordering_not_guaranteed_under_retry",
@@ -2562,7 +2585,12 @@ pub fn effective_guarantees_with_plan(
         return value;
     }
     if matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
-        let checkpoint_plan = if !spec.reference_tables.is_empty() {
+        let checkpoint_plan = if spec.sink.kind == "jetstream" {
+            let mut aligned = spec.clone();
+            aligned.recovery = "aligned".into();
+            validate_aligned_plan(&aligned, plan)
+                .and_then(|_| sparrow_plan::CheckpointPlan::from_physical(plan))
+        } else if !spec.reference_tables.is_empty() {
             let mut aligned = spec.clone();
             aligned.recovery = "aligned".into();
             validate_aligned_plan(&aligned, plan).and_then(|_| {
@@ -2611,6 +2639,18 @@ pub fn effective_guarantees_with_plan(
                         sparrow_plan::ParticipantId::State {operator,slot,shard}=>serde_json::json!({"operator":operator.raw(),"slot":slot.raw(),"shard":shard,"codec":state.codec,"window_kind":state.window_kind}),
                         _=>unreachable!(),
                     }).collect::<Vec<_>>(),"profile":reference_version.map_or_else(|| format!("v{snapshot_version}"), |version| format!("reference_v{version}")),"scope":if reference_version.is_some() {"single_file_static_reference_required_http_linear_shapes"} else {"single_file_single_required_sink_tested_linear_shapes"},"certified":false});
+                if spec.sink.kind == "jetstream" {
+                    value["aligned_eligibility_reason"] = serde_json::json!("file_required_jetstream_v27; runtime_target_bootstrap_required");
+                    let participants = &mut value["checkpoint_participants"];
+                    participants["snapshot_version"] = serde_json::json!(sparrow_runtime::pipeline_checkpoint::FILE_JETSTREAM_SINK_SNAPSHOT_VERSION);
+                    participants["profile"] = serde_json::json!("file_jetstream_sink_v27");
+                    participants["scope"] = serde_json::json!("single_file_single_required_jetstream_sink");
+                    participants["semantics_version"] = serde_json::json!("CP01_full_plan_strict_with_JSI1_output_target");
+                    participants["restore_compatibility"] = serde_json::json!("exact_endpoints_token_SecretRef_stream_created_nanos_subject_msg_id_policy_and_full_plan; separate_v27_directory");
+                    participants["downstream_changes"] = serde_json::json!("rejected; old_v1_to_v26_history_cannot_be_adopted; external_outputs_are_not_rolled_back");
+                    participants["sink_identity_codec"] = serde_json::json!("JSI1");
+                    participants["runtime_prerequisites"] = serde_json::json!("existing_File_storage_Limits_stream_with_PubAck_enabled; exact_incarnation_checked_before_input_and_after_batch");
+                }
                 if iot {
                     value["iot"] = serde_json::json!({
                         "operators":if plan_has_hysteresis(plan) { vec!["change_detect","deadband","hysteresis"] } else { vec!["change_detect","deadband"] },

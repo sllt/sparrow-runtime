@@ -24,6 +24,7 @@ pub mod mqtt;
 pub mod nats;
 pub(crate) mod net;
 pub mod policy;
+pub(crate) mod scratch;
 pub mod secret;
 pub mod tcp;
 pub mod tls;

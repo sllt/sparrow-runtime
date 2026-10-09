@@ -454,6 +454,24 @@ impl MqttSource {
                             let received_at=std::time::Instant::now();
                             self.diag.observation.progress(true,1);
                             self.diag.mqtt_received.fetch_add(1, Ordering::Relaxed);
+                            // Budgeted ingress: charge the format's decode working set
+                            // before decoding and hold it through admission. A payload
+                            // over the format limit is refused by length inside the
+                            // decoder, so the charge is bounded by that limit.
+                            let _scratch = match tx {
+                                Ingress::Budgeted { owner, .. } => {
+                                    let format = &self.codec.format;
+                                    let len = payload.len().min(format.max_message_bytes(&self.codec.limits));
+                                    match owner.acquire(sparrow_model::CreditKind::Reservation, format.decode_scratch(&self.codec.schema, len)) {
+                                        Ok(lease) => Some(lease),
+                                        Err(_) => {
+                                            self.diag.mqtt_dropped_budget.fetch_add(1, Ordering::Relaxed);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Ingress::Plain(_) => None,
+                            };
                             let frame = SourceFrame::new(payload, 0);
                             let decoded = self.codec.decode_frame_with(&frame, |e| {
                                 self.diag.csv_decode_error(&self.codec.format, e)

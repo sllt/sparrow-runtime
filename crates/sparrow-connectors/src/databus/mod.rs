@@ -175,7 +175,8 @@ impl SubscriptionConfig {
 
     /// Bytes charged to the subscribing job's reservation for the buffer.
     pub fn reservation(&self) -> usize {
-        self.max_bytes + self.capacity * MESSAGE_OVERHEAD
+        self.max_bytes
+            .saturating_add(self.capacity.saturating_mul(MESSAGE_OVERHEAD))
     }
 }
 

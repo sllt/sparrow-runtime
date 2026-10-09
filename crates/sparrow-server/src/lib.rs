@@ -972,7 +972,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "reconnects":io.nats_source_reconnects,"client_errors":io.nats_source_client_errors,
             "inbox_items":io.nats_source_inbox_items,"inbox_bytes":io.nats_source_inbox_bytes,
             "semantics":"live_best_effort_at_most_once_no_replay_no_ack",
-            "scope":"this_attempt; slow_consumer_events=lower_bound_of_sdk_drop_events"});
+            "scope":"this_attempt; slow_consumer_events=exact_local_prefetch_drops_not_total_network_loss"});
     }
     if s.sink_kind == "nats" {
         value["nats_sink"] = json!({"published":io.nats_sink_published,"failed":io.nats_sink_failed,
@@ -1004,6 +1004,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
         value["databus_sink"] = json!({"published":io.databus_sink_published,
             "deliveries":io.databus_sink_deliveries,"no_subscribers":io.databus_sink_no_subscribers,
             "dropped_bad":io.databus_sink_dropped_bad,"dropped_oversize":io.databus_sink_dropped_oversize,
+            "dropped_budget":io.databus_sink_dropped_budget,
             "blocked_publishes":io.databus_sink_blocked_publishes,
             "discarded_on_close":io.databus_sink_discarded_on_close,
             "batches":io.databus_sink_batches,"fatal":io.databus_sink_fatal,
@@ -1021,7 +1022,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
     }
     if s.sink_kind == "websocket" {
         value["websocket_sink"] = json!({"sent":io.websocket_sink_sent,"dropped_bad":io.websocket_sink_dropped_bad,"dropped_oversize":io.websocket_sink_dropped_oversize,
-            "dropped_overflow":io.websocket_sink_dropped_overflow,"backpressure_waits":io.websocket_sink_backpressure_waits,"send_failed":io.websocket_sink_send_failed,
+            "dropped_overflow":io.websocket_sink_dropped_overflow,"dropped_budget":io.websocket_sink_dropped_budget,"backpressure_waits":io.websocket_sink_backpressure_waits,"send_failed":io.websocket_sink_send_failed,
             "send_timeouts":io.websocket_sink_send_timeouts,"discarded_on_close":io.websocket_sink_discarded_on_close,"connects":io.websocket_sink_connects,
             "reconnects":io.websocket_sink_reconnects,"disconnects":io.websocket_sink_disconnects,"connect_failures":io.websocket_sink_connect_failures,
             "heartbeat_timeouts":io.websocket_sink_heartbeat_timeouts,"pings_sent":io.websocket_sink_pings_sent,"ignored_frames":io.websocket_sink_ignored_frames,
@@ -1327,6 +1328,10 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             io.databus_sink_dropped_oversize,
         ),
         (
+            "databus_sink_dropped_budget",
+            io.databus_sink_dropped_budget,
+        ),
+        (
             "databus_sink_blocked_publishes",
             io.databus_sink_blocked_publishes,
         ),
@@ -1393,6 +1398,10 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         (
             "websocket_sink_dropped_overflow",
             io.websocket_sink_dropped_overflow,
+        ),
+        (
+            "websocket_sink_dropped_budget",
+            io.websocket_sink_dropped_budget,
         ),
         (
             "websocket_sink_backpressure_waits",

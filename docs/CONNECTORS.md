@@ -198,12 +198,12 @@ Control crate：
 |---|---|
 | 语义 | `live_best_effort` / `restart_fresh` / replay `unsupported`；拒绝 restore、checkpoint、aligned |
 | 调度 | 启动立即轮询一次，之后每 `interval_ms`（100 ms..24 h） |
-| 背压 | 至多一个在途请求；上一响应的行全部入队前不发新请求；错过的 tick 计入 `http_poll_skipped_ticks` |
-| 内存 | 响应体硬上限 `max_response_bytes`（默认 256 KiB，最大 1 MiB，≤ job reservation/2），先记 Reservation 再增长；`content-length` 超限直接拒绝；记录切分为惰性扫描，无索引放大 |
+| 背压 | 至多一个在途请求；上一响应的行全部处理完毕（入队或计数丢弃）前不发新请求；错过的 tick 计入 `http_poll_skipped_ticks` |
+| 内存 | 响应体硬上限 `max_response_bytes`（默认 256 KiB，最大 1 MiB，≤ job reservation/2），先记 Reservation 再增长；`content-length` 超限直接拒绝；记录切分为惰性扫描，无索引放大；每条解码前按 `record_bytes * 64 + schema_fields * size_of(Scalar) * 2 + 4096` 预扣 Reservation，持续覆盖解码及入队等待，预算不足不解码并计入 `http_poll_dropped_budget` |
 | 超时/重试 | 单请求 `timeout_ms`（10 ms..60 s）；失败退避从 interval 倍增至 `backoff_max_ms`（默认 max(interval, 60 s)，上限 max(interval, 1 h)），成功后复位；无请求内重试、不跟随重定向 |
-| 条件请求 | `conditional: true` 时发送 `If-None-Match` / `If-Modified-Since`；304 计入 `http_poll_not_modified`；校验值只在完整入队后更新 |
+| 条件请求 | `conditional: true` 时发送 `If-None-Match` / `If-Modified-Since`；304 计入 `http_poll_not_modified`；校验值与 `http_poll_ok` 只在完整入队后更新，解码/大小/预算丢行、失败或取消均不推进校验值；压力解除后同一版本仍可恢复，重试可能重复此前已入队的行 |
 | 认证 | bearer / basic 仅 secret 引用；自定义头 `value` 或 `value_secret` 二选一；保留头（Authorization、Host、Content-Length 等）拒绝；需 https |
-| 解码 | 复用 `decode_json_row`；单条解码失败计数丢弃，`fail_on_decode` 时 job 失败；结构错误计入 `http_poll_bad_responses` |
+| 解码 | 复用 `decode_json_row`；记录字节上限在解码展开预算检查前拒绝，保留 `fail_on_decode` 语义；单条解码失败计数丢弃，`fail_on_decode` 时 job 失败；结构错误计入 `http_poll_bad_responses` |
 | 指标 | `http_poll_{requests,ok,not_modified,failed,timeouts,status_errors,oversize,bad_responses,rows,dropped_bad,dropped_oversize,dropped_budget,skipped_ticks,backpressure_waits,inflight,inbox_items,inbox_bytes}` |
 
 限制：仅 GET；不支持从包络字段（如 `{"data":[...]}`）提取记录；不按 DNS 解析
@@ -219,11 +219,11 @@ Control crate：
 | 合同项 | NATS Core 的实现 |
 |---|---|
 | 语义 | Source / Sink 均为 `live_best_effort` / `restart_fresh` / replay `unsupported`，at-most-once、无 ACK；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
-| 内存 | SDK 缓冲 `capacity × (max_payload_bytes + 8 KiB) + 256 KiB` 记入 job reservation（≤ reservation/2）；服务器 `max_payload` 大于配置时 Source 拒绝连接；inbox 按 `inbox_bytes` 计入 queue 账本 |
-| 背压 | inbox 满时 Source 等待；SDK 订阅缓冲满后丢弃并计 `nats_source_slow_consumer`（下界）；Sink outbox 有界，发布超时计 `nats_sink_failed` |
+| 内存 | `(capacity + min(capacity,16)) × (max_payload_bytes + 8 KiB) + 256 KiB` 记入 reservation（≤ reservation/2），包括 Sink SDK command/writer 重叠，Source 保守沿用；Source 每次 INFO 后、SUB 前检查服务器 payload 上限，并在分配前校验 frame；inbox 按 `inbox_bytes` 计入 queue 账本，解码/编码 scratch 另行预扣 |
+| 背压 | inbox 满时 Source 等待；有界 wire prefetch 满后丢弃并精确计 `nats_source_slow_consumer`（不是全链路损失）；Sink outbox 有界，发布超时计 `nats_sink_failed` |
 | 重连 | 每次断线 ≤ `reconnect_attempts`（1..100，拒绝 0=无限），100 ms→2 s 退避；耗尽后 Source 可重试失败、Sink 退避重开 |
 | 认证 | 仅 `token_secret`，必须 `tls://`；URL 不得含 userinfo；端点经 `TargetPolicy` |
-| 关闭 | Sink 在 `flush_timeout_ms` 内发布已排队批次、flush，剩余计 `discarded_on_close`；等待 SDK 真实退出后退款 |
+| 关闭 | 从取消起当前在途与已排队批次共用 `flush_timeout_ms`；flush 只证明本地 socket 写出，不是 broker ACK；剩余计 `discarded_on_close`；缓冲、调用方和 SDK 均退出后才退还对应信用 |
 | 指标 | `nats_source_*` / `nats_sink_*`，pipeline status 中的 `nats_source` / `nats_sink` 对象 |
 
 ## 附：JetStream Sink（`sink.kind: "jetstream"`，feature `jetstream`）
@@ -234,13 +234,18 @@ Control crate：
 | 合同项 | JetStream Sink 的实现 |
 |---|---|
 | 语义 | capability `jetstream_sink`：delivery `checkpointed_at_least_once`、recovery `aligned`、replay `unsupported`；每行等 PubAck，批次全部确认才回执 outbox；重试可能重复，`msg_id_column` 在 `duplicate_window` 内去重 |
-| Aligned | 仅线性 File profile（barrier 等 outbox 清空）；其他 checkpoint profile 拒绝（`UnsupportedRestore`） |
-| 内存 | SDK 缓冲 + `max_inflight_acks × (max_payload_bytes + 8 KiB)` 在途保留记入 job reservation（≤ reservation/2），与其他 NATS 端点合计 ≤ 3/4 |
+| Aligned | 独立线性 File v27，JSI1 精确目标 + 完整计划兼容；不沿用 v3 下游宽松规则，不与 v1..v26 混写/自动迁移；其他 checkpoint profile 拒绝（`UnsupportedRestore`） |
+| 内存 | SDK 命令队列与 writer 双缓冲 + `max_inflight_acks × (max_payload_bytes + 8 KiB)` 在途保留记入 job reservation（≤ reservation/2），与其他 NATS 端点合计 ≤ 3/4；默认 client_capacity=4、max_inflight_acks=8，显式值不暗中钳制；编码 scratch 与 prepared metadata 另取同 owner 信用 |
 | 背压 | outbox 有界；在途 PubAck ≤ `max_inflight_acks`（SDK `max_ack_inflight` + 背压） |
 | 重试 | 每次 `2 × ack_timeout_ms`，100 ms→2 s 退避，≤ `max_retries`；耗尽、超限、非法 msg id → job 失败（fail closed） |
-| 校验 | stream 名、字面 subject、边界；启动时 stream 必须存在、未 sealed、非 mirror、绑定 subject，从不自动创建 |
-| 关闭 | `flush_timeout_ms` 内确认已排队批次；剩余计 `discarded_on_close` 并使 job 失败 |
+| 校验 | 每次 Expected-Stream + ack.stream；拒绝 no_ack。aligned probe 要求 File/Limits，先于 File seek/状态激活；每批前/后和 retry 前实时核对 stream.created 及配置，复用原 Session；Memory 仅 fresh PubAck-only，无跨 broker 重启保留承诺 |
+| 关闭 | `flush_timeout_ms` 内在途与队列共用 deadline，未确认 receipt 失败；SDK 真实退出前不提前释放 slot/信用；restore/admission 失败显式 close |
 | 指标 | `jetstream_sink_*`，pipeline status 的 `jetstream_sink` 对象 |
+
+JSI1 绑定端点、token SecretRef（不保存值）、stream 精确 created nanos、subject 和 msg-id 策略；
+旧目录/目标/下游语义变化不能静默继承历史。去重只在窗口内且要求稳定唯一 id，空值仍可能重复。
+配置管理员不得在检查之间修改又恢复策略；PubAck/File 不等于消费者业务提交或设备掉电/fsync、HA、
+exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/20k 压测未执行。
 
 ## 附：Local DataBus Source/Sink（`kind: "databus"`）
 
@@ -249,11 +254,11 @@ Control crate：
 | 合同项 | Local DataBus 的实现 |
 |---|---|
 | 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`，即 at-most-once、进程内、无历史；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
-| 内存 | 订阅缓冲上限 `buffer_bytes + buffer_capacity × 64 B` 在订阅时记入 job reservation（≤ reservation/2），与 NATS/JetStream 缓冲合计 ≤ 3/4；inbox 按 `inbox_bytes` 计入 queue 账本 |
+| 内存 | 订阅缓冲上限 `buffer_bytes + buffer_capacity × 64 B` 在订阅时记入 job reservation（≤ reservation/2），与 NATS/JetStream 缓冲合计 ≤ 3/4（饱和算术）；inbox 按 `inbox_bytes` 计入 queue 账本；Source 解码与 Sink 编码前先预扣临时额度（不足计 `dropped_budget`，不解析 / 不编码） |
 | 背压 / 慢消费者 | 每个订阅有界；`drop_oldest`（默认）/ `drop_newest` 从不阻塞发布方；`block` 最多等 `block_timeout_ms`，超时只对该订阅者丢弃；阻塞订阅者排在最后等待，不拖慢其他订阅者 |
 | 完成 | 批次中的每一行都投给所有匹配订阅后才回执 outbox；无订阅者时计 `no_subscribers` 并丢弃 |
 | 校验 | topic 语法（订阅可用 `*` / 末尾 `>`，发布必须是字面 topic）、边界、同一 pipeline 内的自反馈环；Sink 注册失败 fail closed（`databus_sink_fatal`） |
-| 关闭 | 订阅 / 发布注册为 RAII，job 结束即注销，topic 不泄漏；未消费缓冲计 `discarded_on_close`；Sink 在 `flush_timeout_ms` 内投完已排队批次 |
+| 关闭 | 订阅 / 发布注册为 RAII，job 结束即注销，topic 不泄漏；未消费缓冲计 `discarded_on_close`；Sink 停止时在途与已排队批次共用一个 `flush_timeout_ms` 截止时间（不受 `block_timeout_ms` 延长） |
 | 指标 | `databus_source_*` / `databus_sink_*`，pipeline status 中的 `databus_source` / `databus_sink` 对象 |
 
 ## 附：WebSocket Source / Sink（`kind: "websocket"`，feature `websocket`）
@@ -263,8 +268,8 @@ Control crate：
 | 合同项 | WebSocket 的实现 |
 |---|---|
 | 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`，at-most-once、无应用层确认；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
-| 内存 | 每连接 128 KiB + 2 × `max_message_bytes`（1 KiB..1 MiB，默认 64 KiB），Sink 加 `queue_capacity × max_message_bytes`；在 bind 时记入 job reservation（单个 ≤ 1/2，与 NATS/JetStream/DataBus 合计 ≤ 3/4）；Source inbox 按 `inbox_bytes` 计入 queue 账本 |
-| 大小上限 | 帧/消息上限在帧头处拒绝，不先缓冲；超大消息计 `dropped_oversize` 并重连；单条记录另受 64 KiB 解码上限 |
+| 内存 | 每连接读方向 128 KiB + 2 × `max_message_bytes`（1 KiB..1 MiB，默认 64 KiB），Sink 加发送中消息与写缓冲帧 2 × `max_message_bytes` 和 `queue_capacity × max_message_bytes`；在 bind 时记入 job reservation（单个 ≤ 1/2，与 NATS/JetStream/DataBus 合计 ≤ 3/4，饱和算术）；Source inbox 按 `inbox_bytes` 计入 queue 账本；Source 解码与 Sink 编码前先预扣临时额度（不足计 `dropped_budget`，不解析 / 不编码） |
+| 大小上限 | 单帧超限在帧头处拒绝，不预留载荷；分片消息按累计长度在追加下一分片前拒绝；超大消息计 `dropped_oversize` 并重连；单条记录另按长度受格式解码上限（JSON 64 KiB / CSV `max_record_bytes`）；Sink 编码输出有上限 |
 | 背压 | Source inbox 满时停止读 socket（TCP 背压）；Sink 有界发送队列，`block` / `drop_newest`，`send_timeout_ms` 超时断开重连 |
 | 心跳 / 重连 | Ping 每 `ping_interval_ms`，`idle_timeout_ms` 无帧即重连；指数退避（100 ms → `reconnect_max_ms`，抖动取 [d/2, d]），每次断线 ≤ `reconnect_attempts`（拒绝 0）；耗尽后 Source 可重试失败，Sink fail closed（`websocket_sink_fatal`） |
 | 认证 / TLS | bearer / basic / 自定义头，仅 secret 引用且需 `wss://`；保留头和重复头拒绝；rustls 强制校验，`tls_ca_pem` 替换信任根；错误中不出现 URL、头值、凭据 |
@@ -297,15 +302,15 @@ Control crate：
 
 | kind | JSON | CSV Source | CSV Sink | CSV 单位 |
 |---|---|---|---|---|
-| `mqtt` / `nats` / `jetstream` | ✓ | ✓ | ✓ | 一条消息 = （表头 +）一条记录 |
+| `mqtt` / `nats` / `jetstream` | ✓ | ✓ | ✓ | 一条消息 = （表头 +）一条记录；JetStream Source 的 cut 身份绑定格式与 CSV 选项（JSON 身份不变） |
 | `http_push` | ✓ | ✓ | — | 一个请求 = （表头 +）一条记录 |
 | `http` Sink | ✓ | — | ✓ | 请求体 = 表头 + 多条记录；不能与 `body` / `single`、JetStream 源或 aligned 一起使用 |
 | `http_poll` | ✓ | ✓ | — | 一个响应 = 一份文档；`http_poll.format` 必须为空 |
-| `file` / `file_replay` / `replay` | ✓ | ✓ | ✓（`file`） | 文件或段文件 = 一份文档；表头在恢复时重建；段文件为 `part-N.csv` |
+| `file` / `file_replay` / `replay` | ✓ | ✓ | ✓（`file`） | 文件或段文件 = 一份文档；表头在恢复时重建；段文件为 `part-N.csv`；checkpoint 身份绑定格式与 CSV 选项，Sink 目录标记绑定编码选项 |
 | `websocket` | ✓ | ✓ | ✓ | 一条文本帧 = （表头 +）一条记录；CSV 拒绝 `ndjson` 分帧和二进制帧 |
 | `tcp`（`lines`） | ✓ | ✓ | ✓ | 一个连接 = 一份文档：表头每连接一次，之后一行一条记录；拒绝 `multiline` |
 | `tcp`（`length_prefixed`） | ✓ | ✓ | ✓ | 一帧 = （表头 +）一条记录 |
 | `databus` | ✓（内部） | ✗ | ✗ | 进程内传递行 |
 | `log` / plugin | ✓ | — | ✗ | — |
 
-新增字节型 connector 时，应通过 `PayloadFormat` 编解码，并加入 `CSV_SOURCE_KINDS` / `CSV_SINK_KINDS`，不要自带解析器。
+新增字节型 connector 时，应通过 `PayloadFormat` 编解码，并加入 `CSV_SOURCE_KINDS` / `CSV_SINK_KINDS`，不要自带解析器。先按长度拒绝（`max_message_bytes`），再按 `decode_scratch` / `encode_scratch` 记账，最后用 `encode_row_bounded_with_capacity` 等有界接口编解码。
