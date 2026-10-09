@@ -69,6 +69,17 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// JetStream publish confirmed by PubAck: at-least-once into the stream
+    /// (duplicates possible on retry unless `Nats-Msg-Id` dedup applies).
+    /// Participates in aligned checkpoints by acking the outbox only after
+    /// every PubAck; it has no replay of its own.
+    pub const JETSTREAM_SINK: Self = Self {
+        kind: "jetstream_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::CheckpointedAtLeastOnce,
+        recovery: RecoveryPolicy::Aligned,
+    };
+
     pub const MQTT_SINK: Self = Self {
         kind: "mqtt_sink",
         replay: ReplaySupport::Unsupported,

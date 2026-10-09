@@ -440,6 +440,7 @@ fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
                     .filter_map(|s| s.nats.as_ref())
                     .map(|n| n.client_config().sdk_reservation()),
             )
+            .chain(sinks.iter().filter_map(|s| jetstream_sink_reservation(s)))
             .fold(0usize, usize::saturating_add);
         let budget = sparrow_model::ResourceBudget::compact().reservation_bytes;
         if total > budget / 4 * 3 {
@@ -453,6 +454,33 @@ fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
     }
     #[cfg(not(feature = "nats"))]
     let _ = spec;
+    Ok(())
+}
+
+/// SDK buffers plus payloads retained for PubAck retries.
+#[cfg(feature = "nats")]
+fn jetstream_sink_reservation(sink: &SinkSpec) -> Option<usize> {
+    #[cfg(feature = "jetstream")]
+    {
+        sink.jetstream
+            .as_ref()
+            .map(|js| js.connector_config(sink.outbox_capacity).sdk_reservation())
+    }
+    #[cfg(not(feature = "jetstream"))]
+    {
+        let _ = sink;
+        None
+    }
+}
+
+/// `msg_id_column` must be a utf8/integer column of the sink's input.
+fn validate_sink_schema(sink: &SinkSpec, schema: &Schema) -> Result<()> {
+    #[cfg(feature = "jetstream")]
+    if let Some(js) = &sink.jetstream {
+        js.connector_config(sink.outbox_capacity)
+            .check_schema(schema)?;
+    }
+    let _ = (sink, schema);
     Ok(())
 }
 
@@ -593,6 +621,14 @@ fn validate_sink_io(
             }
         }
         "log" => {}
+        #[cfg(feature = "jetstream")]
+        "jetstream" => {
+            let js = jetstream_sink_config(sink)?;
+            js.validate(secrets, policy)?;
+            js.check_reservation_budget(
+                sparrow_model::ResourceBudget::compact().reservation_bytes,
+            )?;
+        }
         #[cfg(feature = "nats")]
         "nats" => {
             let nats = nats_sink_config(sink)?;
@@ -616,7 +652,7 @@ fn validate_sink_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|file)"),
+                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|file)"),
             ));
         }
     }
@@ -650,6 +686,21 @@ pub fn validate_io_with_plan(
             };
             validate_action_schema(&spec.sink, output)?;
         }
+        if spec.sink.jetstream.is_some() {
+            let output = plan
+                .stages
+                .iter()
+                .rev()
+                .find_map(|stage| match stage {
+                    sparrow_plan::PhysicalStage::CaptureSink { schema, .. }
+                    | sparrow_plan::PhysicalStage::BestEffortSink { schema, .. } => Some(schema),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    SparrowError::new(ErrorCode::InvalidSchema, "sink requires a typed schema")
+                })?;
+            validate_sink_schema(&spec.sink, output)?;
+        }
         return Ok(());
     };
 
@@ -663,6 +714,7 @@ pub fn validate_io_with_plan(
     for (operator, sink) in &io.sinks {
         let actual = graph_endpoint_schema(plan, *operator, false)?;
         validate_action_schema(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
+        validate_sink_schema(sink, &actual).map_err(|e| e.at_operator((*operator).into()))?;
         validate_sink_io(sink, secrets, policy, demo)
             .map_err(|e| e.at_operator((*operator).into()))?;
     }
@@ -851,6 +903,22 @@ pub fn nats_source_config(
             )
         })?
         .connector_config(schema, source.inbox_capacity, fail_on_decode))
+}
+
+#[cfg(feature = "jetstream")]
+pub fn jetstream_sink_config(
+    sink: &SinkSpec,
+) -> Result<sparrow_connectors::jetstream::JetStreamSinkConfig> {
+    Ok(sink
+        .jetstream
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "JetStream sink requires sink.jetstream",
+            )
+        })?
+        .connector_config(sink.outbox_capacity))
 }
 
 #[cfg(feature = "nats")]
@@ -1309,6 +1377,9 @@ fn validate_aligned_plan_inner(
     if !recovery.is_aligned() {
         return Ok(());
     }
+    if spec.sink.kind == "jetstream" {
+        validate_file_jetstream_sink_profile(spec, plan)?;
+    }
     if plan.has_iot() && spec.graph_io.is_none() {
         validate_linear_iot_profile(spec)?;
     }
@@ -1346,6 +1417,26 @@ fn validate_aligned_plan_inner(
     if spec.source.kind=="jetstream" && !plan.has_processing_time_state() && plan.stages.iter().any(|stage|
         matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}))) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state or one/two Count windows only; event/processing-time replay context not verified"));
+    }
+    Ok(())
+}
+
+fn validate_file_jetstream_sink_profile(spec: &PipelineSpec, plan: &PhysicalPlan) -> Result<()> {
+    if !cfg!(feature = "jetstream")
+        || !matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay")
+        || spec.graph_io.is_some()
+        || plan.edges.is_some()
+        || !spec.reference_tables.is_empty()
+    {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+            "JetStream Sink checkpoints require the enabled independent linear File/v27 profile"));
+    }
+    let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    if sparrow_runtime::snapshot_version_for(&manifest, "file")?
+        != sparrow_runtime::pipeline_checkpoint::PIPELINE_SNAPSHOT_VERSION
+    {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+            "File/JetStream Sink v27 excludes IoT, reference, paused/observed-time and graph profiles"));
     }
     Ok(())
 }
@@ -1555,6 +1646,7 @@ pub fn capabilities_json() -> serde_json::Value {
     let mqtt_sink = ConnectorCapabilities::MQTT_SINK;
     let nats = ConnectorCapabilities::NATS_SOURCE;
     let nats_sink = ConnectorCapabilities::NATS_SINK;
+    let js_sink = ConnectorCapabilities::JETSTREAM_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
     serde_json::json!({
         "inventory":crate::capability::inventory(),
@@ -1615,6 +1707,20 @@ pub fn capabilities_json() -> serde_json::Value {
                 "contract": "nats_core_at_most_once; static_subject; published_means_handed_to_client; flush_on_stop; not_jetstream",
             },
             {
+                "kind": js_sink.kind,
+                "roles": ["sink"],
+                "enabled_by_build": cfg!(feature = "jetstream"),
+                "replay": js_sink.replay.as_str(),
+                "delivery": js_sink.delivery.as_str(),
+                "recovery": js_sink.recovery.as_str(),
+                "acknowledgement": "jetstream_pub_ack_per_message",
+                "duplicates": "possible_on_retry; deduplicated_within_stream_duplicate_window_when_msg_id_column_set",
+                "aligned_checkpoint": "independent_linear_file_v27; exact_JSI1_target_and_full_plan; File_storage_and_Limits_retention; outbox_acked_after_all_pub_acks_and_target_recheck",
+                "stream_management": "existing_stream_required; never_auto_created",
+                "maturity": "preview",
+                "contract": "at_least_once_into_stream; bounded_inflight_acks; bounded_retry_backoff; fail_closed_on_unconfirmed; ordering_not_guaranteed_under_retry",
+            },
+            {
                 "kind": mqtt_sink.kind,
                 "replay": mqtt_sink.replay.as_str(),
                 "delivery": mqtt_sink.delivery.as_str(),
@@ -1661,7 +1767,7 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
     } else {
         "no_durable_restore; live_best_effort_drops_ok"
     };
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "delivery": if reliable {DeliveryGuarantee::CheckpointedAtLeastOnce.as_str()} else {DeliveryGuarantee::LiveBestEffort.as_str()},
         "recovery": recovery.as_str(),
         "replay": replay,
@@ -1670,7 +1776,22 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
         "aligned_eligible": if replayable { serde_json::Value::Null } else { serde_json::json!(false) },
         "aligned_eligibility_reason": if replayable { "requires_bound_plan" } else { "source_not_replayable" },
         "honesty": HONESTY,
-    })
+    });
+    if spec.sink.jetstream.is_some() {
+        // Output side only: PubAck before the outbox receipt; with aligned
+        // File recovery the uncheckpointed tail is re-published on restore.
+        value["sink_delivery"] = serde_json::json!({
+            "kind": "jetstream",
+            "acknowledgement": "pub_ack_per_message",
+            "into_stream": "at_least_once",
+            "duplicates": if spec.sink.jetstream.as_ref().is_some_and(|j| j.msg_id_column.is_some()) {
+                "deduplicated_within_stream_duplicate_window"
+            } else {
+                "possible_on_retry_or_restore"
+            },
+        });
+    }
+    value
 }
 
 fn iot_ttls(plan: &PhysicalPlan) -> Vec<i64> {
@@ -2107,7 +2228,12 @@ pub fn effective_guarantees_with_plan(
         return value;
     }
     if matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
-        let checkpoint_plan = if !spec.reference_tables.is_empty() {
+        let checkpoint_plan = if spec.sink.kind == "jetstream" {
+            let mut aligned = spec.clone();
+            aligned.recovery = "aligned".into();
+            validate_aligned_plan(&aligned, plan)
+                .and_then(|_| sparrow_plan::CheckpointPlan::from_physical(plan))
+        } else if !spec.reference_tables.is_empty() {
             let mut aligned = spec.clone();
             aligned.recovery = "aligned".into();
             validate_aligned_plan(&aligned, plan).and_then(|_| {
@@ -2156,6 +2282,18 @@ pub fn effective_guarantees_with_plan(
                         sparrow_plan::ParticipantId::State {operator,slot,shard}=>serde_json::json!({"operator":operator.raw(),"slot":slot.raw(),"shard":shard,"codec":state.codec,"window_kind":state.window_kind}),
                         _=>unreachable!(),
                     }).collect::<Vec<_>>(),"profile":reference_version.map_or_else(|| format!("v{snapshot_version}"), |version| format!("reference_v{version}")),"scope":if reference_version.is_some() {"single_file_static_reference_required_http_linear_shapes"} else {"single_file_single_required_sink_tested_linear_shapes"},"certified":false});
+                if spec.sink.kind == "jetstream" {
+                    value["aligned_eligibility_reason"] = serde_json::json!("file_required_jetstream_v27; runtime_target_bootstrap_required");
+                    let participants = &mut value["checkpoint_participants"];
+                    participants["snapshot_version"] = serde_json::json!(sparrow_runtime::pipeline_checkpoint::FILE_JETSTREAM_SINK_SNAPSHOT_VERSION);
+                    participants["profile"] = serde_json::json!("file_jetstream_sink_v27");
+                    participants["scope"] = serde_json::json!("single_file_single_required_jetstream_sink");
+                    participants["semantics_version"] = serde_json::json!("CP01_full_plan_strict_with_JSI1_output_target");
+                    participants["restore_compatibility"] = serde_json::json!("exact_endpoints_token_SecretRef_stream_created_nanos_subject_msg_id_policy_and_full_plan; separate_v27_directory");
+                    participants["downstream_changes"] = serde_json::json!("rejected; old_v1_to_v26_history_cannot_be_adopted; external_outputs_are_not_rolled_back");
+                    participants["sink_identity_codec"] = serde_json::json!("JSI1");
+                    participants["runtime_prerequisites"] = serde_json::json!("existing_File_storage_Limits_stream_with_PubAck_enabled; exact_incarnation_checked_before_input_and_after_batch");
+                }
                 if iot {
                     value["iot"] = serde_json::json!({
                         "operators":if plan_has_hysteresis(plan) { vec!["change_detect","deadband","hysteresis"] } else { vec!["change_detect","deadband"] },
@@ -2318,6 +2456,7 @@ mod tests {
             },
             sink: crate::spec::SinkSpec {
                 nats: None,
+                jetstream: None,
                 plugin: None,
                 action: None,
                 file: None,
@@ -2469,6 +2608,7 @@ mod tests {
     fn n16_http_header_secret_requires_https() {
         let mut sink = crate::spec::SinkSpec {
                 nats: None,
+                jetstream: None,
                 plugin: None,
             action: None,
             file: None,

@@ -125,6 +125,7 @@ pub(crate) struct RuntimeAligned {
     pub iot: Mutex<BTreeMap<sparrow_model::OperatorId, crate::iot::IotOperator>>,
     pub acks: AlignedAcks,
     pub outbox: Arc<InflightCounter>,
+    _sink_binding: Option<SinkRestoreBinding>,
 }
 pub(crate) struct RestoreState {
     pub freeze: WindowFreeze,
@@ -153,6 +154,7 @@ impl RuntimeAligned {
             iot: Mutex::new(BTreeMap::new()),
             acks: job.acks,
             outbox: job.outbox,
+            _sink_binding: None,
         }))
     }
 
@@ -189,7 +191,11 @@ impl RuntimeAligned {
         } else {
             CheckpointPlan::from_physical(plan)?
         };
-        pipeline.plan.check_compatible(&live_plan)?;
+        pipeline.check_compatible(&live_plan, owner)?;
+        if pipeline.sink.is_some() && job.acks.output_sequence().is_some() {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                "File/JetStream sink checkpoint cannot adopt a source output cursor"));
+        }
         let mut restored = BTreeMap::new();
         let mut restored_iot = BTreeMap::new();
         if pipeline.restore.is_none() && !pipeline.iot.is_empty() {
@@ -293,6 +299,7 @@ impl RuntimeAligned {
             iot: Mutex::new(iot),
             acks: job.acks,
             outbox: job.outbox,
+            _sink_binding: pipeline.sink,
         }))
     }
 }
@@ -305,6 +312,61 @@ pub struct PipelineRestore {
     /// IoT frames are separate codecs; Some(empty) windows plus these frames
     /// represents a restored IoT-only plan, never a fresh reset.
     pub iot: Vec<crate::iot::IotFreeze>,
+    /// Only v27 carries a Job-owned saved/live output target. `plan` must be
+    /// the saved plan on restore, not a substituted live manifest.
+    pub sink: Option<SinkRestoreBinding>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SinkRestoreBinding {
+    pub live: Arc<sparrow_io::OwnedSinkIdentity>,
+    pub saved: Option<Arc<sparrow_io::OwnedSinkIdentity>>,
+}
+
+impl SinkRestoreBinding {
+    pub fn fresh(live: Arc<sparrow_io::OwnedSinkIdentity>) -> Self {
+        Self { live, saved: None }
+    }
+
+    pub fn restored(
+        live: Arc<sparrow_io::OwnedSinkIdentity>,
+        saved: Arc<sparrow_io::OwnedSinkIdentity>,
+    ) -> Self {
+        Self { live, saved: Some(saved) }
+    }
+
+    fn check(&self, restored: bool, owner: &Arc<MemoryOwner>) -> Result<()> {
+        self.live.identity().validate()?;
+        if !self.live.belongs_to(owner)
+            || restored != self.saved.is_some()
+            || self.saved.as_ref().is_some_and(|saved| {
+                !saved.belongs_to(owner) || saved.identity() != self.live.identity()
+            })
+        {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                "JetStream sink restore requires matching saved/live identities on the admitted Job owner"));
+        }
+        Ok(())
+    }
+}
+
+impl PipelineRestore {
+    /// Independently used by Kernel admission and the pre-spawn participant
+    /// restore handoff. Existing profiles retain their old prefix contract.
+    pub fn check_compatible(&self, live: &CheckpointPlan, owner: &Arc<MemoryOwner>) -> Result<()> {
+        if let Some(binding) = &self.sink {
+            binding.check(self.restore.is_some(), owner)?;
+            if !self.iot.is_empty() {
+                return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                    "File/JetStream sink checkpoint excludes IoT state"));
+            }
+            crate::pipeline_checkpoint::sink_snapshot_version_for(&self.plan, "file", binding.live.identity())?;
+            crate::pipeline_checkpoint::sink_snapshot_version_for(live, "file", binding.live.identity())?;
+            crate::pipeline_checkpoint::check_sink_plan_compatible(&self.plan, live)
+        } else {
+            self.plan.check_compatible(live)
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -225,3 +225,24 @@ Control crate：
 | 认证 | 仅 `token_secret`，必须 `tls://`；URL 不得含 userinfo；端点经 `TargetPolicy` |
 | 关闭 | 从取消起当前在途与已排队批次共用 `flush_timeout_ms`；flush 只证明本地 socket 写出，不是 broker ACK；剩余计 `discarded_on_close`；缓冲、调用方和 SDK 均退出后才退还对应信用 |
 | 指标 | `nats_source_*` / `nats_sink_*`，pipeline status 中的 `nats_source` / `nats_sink` 对象 |
+
+## 附：JetStream Sink（`sink.kind: "jetstream"`，feature `jetstream`）
+
+说明见 [JETSTREAM.md](JETSTREAM.md#jetstream-sink)，决策见
+[ADR-005](adr/005-jetstream-sink.md)。
+
+| 合同项 | JetStream Sink 的实现 |
+|---|---|
+| 语义 | capability `jetstream_sink`：delivery `checkpointed_at_least_once`、recovery `aligned`、replay `unsupported`；每行等 PubAck，批次全部确认才回执 outbox；重试可能重复，`msg_id_column` 在 `duplicate_window` 内去重 |
+| Aligned | 独立线性 File v27，JSI1 精确目标 + 完整计划兼容；不沿用 v3 下游宽松规则，不与 v1..v26 混写/自动迁移；其他 checkpoint profile 拒绝（`UnsupportedRestore`） |
+| 内存 | SDK 命令队列与 writer 双缓冲 + `max_inflight_acks × (max_payload_bytes + 8 KiB)` 在途保留记入 job reservation（≤ reservation/2），与其他 NATS 端点合计 ≤ 3/4；默认 client_capacity=4、max_inflight_acks=8，显式值不暗中钳制；编码 scratch 与 prepared metadata 另取同 owner 信用 |
+| 背压 | outbox 有界；在途 PubAck ≤ `max_inflight_acks`（SDK `max_ack_inflight` + 背压） |
+| 重试 | 每次 `2 × ack_timeout_ms`，100 ms→2 s 退避，≤ `max_retries`；耗尽、超限、非法 msg id → job 失败（fail closed） |
+| 校验 | 每次 Expected-Stream + ack.stream；拒绝 no_ack。aligned probe 要求 File/Limits，先于 File seek/状态激活；每批前/后和 retry 前实时核对 stream.created 及配置，复用原 Session；Memory 仅 fresh PubAck-only，无跨 broker 重启保留承诺 |
+| 关闭 | `flush_timeout_ms` 内在途与队列共用 deadline，未确认 receipt 失败；SDK 真实退出前不提前释放 slot/信用；restore/admission 失败显式 close |
+| 指标 | `jetstream_sink_*`，pipeline status 的 `jetstream_sink` 对象 |
+
+JSI1 绑定端点、token SecretRef（不保存值）、stream 精确 created nanos、subject 和 msg-id 策略；
+旧目录/目标/下游语义变化不能静默继承历史。去重只在窗口内且要求稳定唯一 id，空值仍可能重复。
+配置管理员不得在检查之间修改又恢复策略；PubAck/File 不等于消费者业务提交或设备掉电/fsync、HA、
+exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/20k 压测未执行。

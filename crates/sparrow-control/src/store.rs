@@ -2643,6 +2643,7 @@ mod tests {
             },
             sink: SinkSpec {
                 nats: None,
+                jetstream: None,
                 plugin: None,
                 action: None,
                 file: None,

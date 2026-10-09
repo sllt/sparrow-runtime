@@ -11,7 +11,7 @@ demo-io = []
 # NATS Core (non-JetStream) live Source/Sink. JetStream reuses its client
 # setup, so `jetstream` implies `nats`.
 nats = ["dep:async-nats", "dep:futures-util"]
-jetstream = ["nats", "dep:ring"]
+jetstream = ["nats", "dep:ring", "dep:bytes"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }
@@ -30,6 +30,7 @@ socket2 = { version = "0.6.5", features = ["all"] }
 async-nats = { version = "=0.50.0", optional = true, default-features = false, features = ["ring", "jetstream", "kv", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["std", "async-await"] }
 ring = { version = "0.17", optional = true }
+bytes = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }

@@ -4,7 +4,7 @@
 //! NATS Core is at-most-once: no acknowledgement, no persistence, no replay.
 //! Nothing here is a checkpoint or reliable-delivery claim.
 
-mod client;
+pub(crate) mod client;
 pub mod common;
 mod sink;
 mod source;

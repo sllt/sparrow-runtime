@@ -272,6 +272,7 @@ impl Supervisor {
             .with_aligned(AlignedJob {
                 restore: None,
                 pipeline: Some(PipelineRestore {
+                    sink: None,
                     plan: manifest.clone(),
                     generation,
                     restore,

@@ -8,11 +8,31 @@ use std::{
     time::Duration,
 };
 static NEXT: AtomicUsize = AtomicUsize::new(1);
+
+/// A free port outside the kernel ephemeral range (32768..=60999 by default),
+/// so a broker `restart()` that briefly releases its fixed port cannot have
+/// it handed to another sandbox through `bind(0)` in the meantime.
+fn free_port() -> u16 {
+    let base = std::process::id() as usize * 131;
+    for _ in 0..1000 {
+        let port = 20000 + (base + NEXT.fetch_add(1, Ordering::SeqCst) * 7) % 12000;
+        if std::net::TcpListener::bind(("127.0.0.1", port as u16)).is_ok() {
+            return port as u16;
+        }
+    }
+    panic!("no free sandbox port in 20000..32000");
+}
 pub struct NatsSandbox {
     child: Option<Child>,
     pub root: PathBuf,
     pub port: u16,
 }
+fn ready_lines(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log)
+        .map(|text| text.matches("Server is ready").count())
+        .unwrap_or(0)
+}
+
 impl NatsSandbox {
     pub async fn start() -> Self {
         let parent = std::env::var_os("SPARROW_TEST_ARTIFACTS")
@@ -30,9 +50,7 @@ impl NatsSandbox {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = free_port();
         std::fs::write(root.join("nats.conf"),format!("host: 127.0.0.1\nport: {port}\nmax_payload: 65536\njetstream {{\nstore_dir: {}\nmax_file_store: 256MB\nmax_memory_store: 16MB\nsync_interval: always\n}}\n",serde_json::to_string(&root.join("data")).unwrap())).unwrap();
         let mut fixture = Self {
             child: None,
@@ -45,10 +63,12 @@ impl NatsSandbox {
     async fn launch(&mut self) {
         let binary = std::env::var_os("SPARROW_NATS_SERVER")
             .expect("set SPARROW_NATS_SERVER to pinned nats-server test binary");
+        let log_path = self.root.join("broker.log");
+        let ready_before = ready_lines(&log_path);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.root.join("broker.log"))
+            .open(&log_path)
             .unwrap();
         self.child = Some(
             Command::new(binary)
@@ -65,9 +85,12 @@ impl NatsSandbox {
                     self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
                     "isolated broker exited; inspect broker.log"
                 );
-                if tokio::net::TcpStream::connect(("127.0.0.1", self.port))
-                    .await
-                    .is_ok()
+                // Readiness is this child's own "Server is ready" line, not
+                // just an open port (which could belong to another broker).
+                if ready_lines(&log_path) > ready_before
+                    && tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+                        .await
+                        .is_ok()
                 {
                     break;
                 }
@@ -86,6 +109,23 @@ impl NatsSandbox {
     pub async fn restart(&mut self) {
         self.stop_broker();
         self.launch().await;
+    }
+    /// SIGSTOP / SIGCONT the broker: TCP stays open but nothing is
+    /// answered, which exercises client-side ack timeouts.
+    pub fn pause(&self) {
+        self.signal("-STOP");
+    }
+    pub fn resume(&self) {
+        self.signal("-CONT");
+    }
+    fn signal(&self, signal: &str) {
+        let pid = self.child.as_ref().expect("broker running").id();
+        let status = Command::new("kill")
+            .arg(signal)
+            .arg(pid.to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill {signal} {pid}");
     }
     pub fn url(&self) -> String {
         format!("nats://127.0.0.1:{}", self.port)

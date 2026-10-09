@@ -108,6 +108,39 @@ pub fn check_subject(subject: &str, allow_wildcards: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether a literal `subject` is matched by a stream/subscription `filter`
+/// (`*` = one token, trailing `>` = one or more tokens).
+pub fn subject_matches(filter: &str, subject: &str) -> bool {
+    let mut f = filter.split('.');
+    let mut s = subject.split('.');
+    loop {
+        match (f.next(), s.next()) {
+            (Some(">"), Some(_)) => return true,
+            (Some("*"), Some(_)) => {}
+            (Some(a), Some(b)) if a == b => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+/// JetStream stream names: 1..=255 printable ASCII bytes without
+/// whitespace, `.`, `*`, `>`, path separators.
+pub fn check_stream_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 255
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'.' | b'*' | b'>' | b'/' | b'\\'))
+    {
+        return Err(error(
+            ErrorCode::InvalidArgument,
+            "JetStream stream name must be 1..=255 printable bytes without `.`, `*`, `>`, `/` or `\\`",
+        ));
+    }
+    Ok(())
+}
+
 pub fn check_queue_group(group: &str) -> Result<()> {
     if group.is_empty()
         || group.len() > MAX_QUEUE_GROUP_BYTES

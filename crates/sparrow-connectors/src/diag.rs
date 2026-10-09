@@ -82,6 +82,22 @@ pub struct IoDiagnostics {
     pub nats_sink_reconnects: AtomicU64,
     pub nats_sink_client_errors: AtomicU64,
     pub nats_sink_sessions: AtomicU64,
+    pub jetstream_sink_acked: AtomicU64,
+    pub jetstream_sink_duplicates: AtomicU64,
+    pub jetstream_sink_retries: AtomicU64,
+    pub jetstream_sink_ack_timeouts: AtomicU64,
+    pub jetstream_sink_failed: AtomicU64,
+    pub jetstream_sink_batches: AtomicU64,
+    pub jetstream_sink_discarded_on_close: AtomicU64,
+    pub jetstream_sink_dropped_bad: AtomicU64,
+    pub jetstream_sink_dropped_oversize: AtomicU64,
+    pub jetstream_sink_msg_id_missing: AtomicU64,
+    pub jetstream_sink_disconnects: AtomicU64,
+    pub jetstream_sink_reconnects: AtomicU64,
+    pub jetstream_sink_client_errors: AtomicU64,
+    pub jetstream_sink_sessions: AtomicU64,
+    pub jetstream_sink_fatal: AtomicU64,
+    pub jetstream_sink_inflight: AtomicU64,
     pub nats_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub log_written: AtomicU64,
     pub decode_errors: AtomicU64,
@@ -176,6 +192,28 @@ impl IoDiagnostics {
             nats_sink_reconnects: self.nats_sink_reconnects.load(Ordering::Relaxed),
             nats_sink_client_errors: self.nats_sink_client_errors.load(Ordering::Relaxed),
             nats_sink_sessions: self.nats_sink_sessions.load(Ordering::Relaxed),
+            jetstream_sink_acked: self.jetstream_sink_acked.load(Ordering::Relaxed),
+            jetstream_sink_duplicates: self.jetstream_sink_duplicates.load(Ordering::Relaxed),
+            jetstream_sink_retries: self.jetstream_sink_retries.load(Ordering::Relaxed),
+            jetstream_sink_ack_timeouts: self.jetstream_sink_ack_timeouts.load(Ordering::Relaxed),
+            jetstream_sink_failed: self.jetstream_sink_failed.load(Ordering::Relaxed),
+            jetstream_sink_batches: self.jetstream_sink_batches.load(Ordering::Relaxed),
+            jetstream_sink_discarded_on_close: self
+                .jetstream_sink_discarded_on_close
+                .load(Ordering::Relaxed),
+            jetstream_sink_dropped_bad: self.jetstream_sink_dropped_bad.load(Ordering::Relaxed),
+            jetstream_sink_dropped_oversize: self
+                .jetstream_sink_dropped_oversize
+                .load(Ordering::Relaxed),
+            jetstream_sink_msg_id_missing: self
+                .jetstream_sink_msg_id_missing
+                .load(Ordering::Relaxed),
+            jetstream_sink_disconnects: self.jetstream_sink_disconnects.load(Ordering::Relaxed),
+            jetstream_sink_reconnects: self.jetstream_sink_reconnects.load(Ordering::Relaxed),
+            jetstream_sink_client_errors: self.jetstream_sink_client_errors.load(Ordering::Relaxed),
+            jetstream_sink_sessions: self.jetstream_sink_sessions.load(Ordering::Relaxed),
+            jetstream_sink_fatal: self.jetstream_sink_fatal.load(Ordering::Relaxed),
+            jetstream_sink_inflight: self.jetstream_sink_inflight.load(Ordering::Relaxed),
             nats_source_inbox_items: self.nats_source_inbox.items.load(Ordering::Relaxed),
             nats_source_inbox_bytes: self.nats_source_inbox.bytes.load(Ordering::Relaxed),
             log_written: self.log_written.load(Ordering::Relaxed),
@@ -264,6 +302,22 @@ pub struct IoSnapshot {
     pub nats_sink_reconnects: u64,
     pub nats_sink_client_errors: u64,
     pub nats_sink_sessions: u64,
+    pub jetstream_sink_acked: u64,
+    pub jetstream_sink_duplicates: u64,
+    pub jetstream_sink_retries: u64,
+    pub jetstream_sink_ack_timeouts: u64,
+    pub jetstream_sink_failed: u64,
+    pub jetstream_sink_batches: u64,
+    pub jetstream_sink_discarded_on_close: u64,
+    pub jetstream_sink_dropped_bad: u64,
+    pub jetstream_sink_dropped_oversize: u64,
+    pub jetstream_sink_msg_id_missing: u64,
+    pub jetstream_sink_disconnects: u64,
+    pub jetstream_sink_reconnects: u64,
+    pub jetstream_sink_client_errors: u64,
+    pub jetstream_sink_sessions: u64,
+    pub jetstream_sink_fatal: u64,
+    pub jetstream_sink_inflight: u64,
     pub nats_source_inbox_items: u64,
     pub nats_source_inbox_bytes: u64,
     pub log_written: u64,
@@ -373,6 +427,22 @@ impl IoSnapshot {
         self.nats_sink_reconnects += other.nats_sink_reconnects;
         self.nats_sink_client_errors += other.nats_sink_client_errors;
         self.nats_sink_sessions += other.nats_sink_sessions;
+        self.jetstream_sink_acked += other.jetstream_sink_acked;
+        self.jetstream_sink_duplicates += other.jetstream_sink_duplicates;
+        self.jetstream_sink_retries += other.jetstream_sink_retries;
+        self.jetstream_sink_ack_timeouts += other.jetstream_sink_ack_timeouts;
+        self.jetstream_sink_failed += other.jetstream_sink_failed;
+        self.jetstream_sink_batches += other.jetstream_sink_batches;
+        self.jetstream_sink_discarded_on_close += other.jetstream_sink_discarded_on_close;
+        self.jetstream_sink_dropped_bad += other.jetstream_sink_dropped_bad;
+        self.jetstream_sink_dropped_oversize += other.jetstream_sink_dropped_oversize;
+        self.jetstream_sink_msg_id_missing += other.jetstream_sink_msg_id_missing;
+        self.jetstream_sink_disconnects += other.jetstream_sink_disconnects;
+        self.jetstream_sink_reconnects += other.jetstream_sink_reconnects;
+        self.jetstream_sink_client_errors += other.jetstream_sink_client_errors;
+        self.jetstream_sink_sessions += other.jetstream_sink_sessions;
+        self.jetstream_sink_fatal += other.jetstream_sink_fatal;
+        self.jetstream_sink_inflight += other.jetstream_sink_inflight;
         self.nats_source_inbox_items += other.nats_source_inbox_items;
         self.nats_source_inbox_bytes += other.nats_source_inbox_bytes;
         self.log_written += other.log_written;

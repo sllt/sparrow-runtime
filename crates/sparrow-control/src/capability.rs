@@ -7,12 +7,19 @@ pub fn inventory() -> Value {
     } else {
         &[]
     };
+    // The JetStream Sink (PubAck-confirmed) needs the `jetstream` feature.
+    let jetstream_sink: &[&str] = if cfg!(feature = "jetstream") {
+        &["jetstream"]
+    } else {
+        &[]
+    };
     let sinks: Vec<&str> = ["http", "mqtt", "log"]
         .iter()
         .chain(nats)
+        .chain(jetstream_sink)
         .copied()
         .collect();
-    let combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file"]
+    let mut combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file"]
         .iter()
         .chain(nats)
         .copied()
@@ -27,6 +34,14 @@ pub fn inventory() -> Value {
             })
         })
         .collect();
+    if cfg!(feature = "jetstream") {
+        combinations.push(json!({"source":"file","sink":"jetstream",
+            "graph":"linear","delivery":"at_least_once_into_stream","recovery":"aligned",
+            "configuration":"requires_existing_stream_binding_subject",
+            "time_modes":["none"],
+            "state":"checkpoint_commits_after_all_pre_barrier_pub_acks; duplicates_possible_unless_msg_id_column",
+            "certification":"not_claimed_by_static_inventory"}));
+    }
     let reference_tables=json!({"maturity":"preview","certified":false,"frontend":false,
             "managed_lookup":"static_reference_profiles8_9_10_11_or_explicit_follow_latest_fresh","selection":"explicit_revision_and_sha256; opt-in follow_latest observes compatible head before IO and at subsequent batch boundaries",
             "publication":"immutable_revision_with_atomic_CAS_head_switch",
@@ -194,14 +209,23 @@ mod tests {
     fn production_inventory_does_not_claim_unimplemented_backends_or_certification() {
         let value = super::inventory();
         // 4 live/file sources (mqtt, http_push, http_poll, file) x 3 sinks, plus NATS Core
-        // as both a source and a sink when the `nats` feature is built.
-        let expected = if cfg!(feature = "nats") { 5 * 4 } else { 4 * 3 };
+        // as both a source and a sink when the `nats` feature is built, plus the
+        // JetStream Sink (live matrix + one aligned File profile) with `jetstream`.
+        let expected = if cfg!(feature = "jetstream") {
+            5 * 5 + 1
+        } else if cfg!(feature = "nats") {
+            5 * 4
+        } else {
+            4 * 3
+        };
         assert_eq!(value["combinations"].as_array().unwrap().len(), expected);
         assert!(value["combinations"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|c| c["source"] == "nats" || c["sink"] == "nats")
+            .filter(|c| c["source"] == "nats"
+                || c["sink"] == "nats"
+                || (c["sink"] == "jetstream" && c["source"] != "file"))
             .all(|c| c["delivery"] == "live_best_effort" && c["recovery"] == "restart_fresh"));
         assert!(value["combinations"]
             .as_array()

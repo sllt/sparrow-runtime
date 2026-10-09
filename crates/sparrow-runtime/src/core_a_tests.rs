@@ -114,6 +114,7 @@ fn aligned_job(
     AlignedJob {
         restore: None,
         pipeline: Some(PipelineRestore {
+            sink: None,
             plan,
             generation,
             restore: restore_windows,
