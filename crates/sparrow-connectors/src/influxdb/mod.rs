@@ -353,12 +353,13 @@ impl Drop for BatchAck {
 /// One write request under construction or in flight.
 struct Request {
     body: Vec<u8>,
-    lease: MemoryLease,
     credit: EncodedGuard,
     rows: usize,
     acks: Vec<Arc<BatchAck>>,
     first: Instant,
     ok: bool,
+    // Vec storage is freed before its capacity credit is returned.
+    lease: MemoryLease,
 }
 
 impl Request {
