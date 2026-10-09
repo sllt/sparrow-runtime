@@ -56,6 +56,9 @@ jobs:
           connector=$(jq -er '.[]|select(.name=="sparrow_connectors")|.exe' artifacts/test-binaries.json)
           control=$(jq -er '.[]|select(.name=="sparrow_control")|.exe' artifacts/test-binaries.json)
           sha256sum "$connector" "$control" > artifacts/test-binaries.sha256
+          # Broker fixtures persist checkpoint evidence outside the default
+          # /tmp/sparrow root. Authorize that test directory, not the whole FS.
+          export SPARROW_DATA_ROOTS="$SPARROW_TEST_ARTIFACTS:${TMPDIR:-/tmp}/sparrow"
           run_contracts() {
             local binary=$1 filter=$2 label=$3
             "$binary" "$filter" --list > "artifacts/$label.list"
