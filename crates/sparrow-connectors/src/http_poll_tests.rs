@@ -405,6 +405,9 @@ fn record_splitter_is_lazy_strict_and_string_aware() {
         "\"str\"",
         "42",
         "[{\"a\":\"x]",
+        "\u{000b}[{}]",
+        "[{}]\u{000c}",
+        "[{}\u{000b},{}]",
     ] {
         assert_eq!(spans(bad, Json), Err(ErrorCode::CodecViolation), "{bad}");
     }
@@ -421,6 +424,23 @@ fn record_splitter_is_lazy_strict_and_string_aware() {
         n += 1;
     }
     assert_eq!(n, 400_001);
+}
+
+#[test]
+fn record_splitter_does_not_strip_non_json_control_bytes() {
+    let valid = r#"{"device_id":"a","v":1}"#;
+    for format in [HttpPollFormat::Json, HttpPollFormat::Ndjson] {
+        for bad in [format!("\u{000b}{valid}"), format!("{valid}\u{000c}")] {
+            match spans(&bad, format) {
+                Err(ErrorCode::CodecViolation) => {}
+                Ok(records) => {
+                    assert_eq!(records.len(), 1);
+                    assert!(decode_json_row(&schema(), records[0].as_bytes(), &JsonLimits::default()).is_err());
+                }
+                Err(other) => panic!("unexpected splitter error: {other:?}"),
+            }
+        }
+    }
 }
 
 // --------------------------------------------------------- test HTTP server

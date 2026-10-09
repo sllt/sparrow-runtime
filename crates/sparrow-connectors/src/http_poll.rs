@@ -999,6 +999,10 @@ enum SplitState {
     Done,
 }
 
+fn json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
 impl<'a> Records<'a> {
     fn new(bytes: &'a [u8], format: HttpPollFormat) -> Self {
         Self {
@@ -1010,7 +1014,7 @@ impl<'a> Records<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
+        while self.pos < self.bytes.len() && json_whitespace(self.bytes[self.pos]) {
             self.pos += 1;
         }
     }
@@ -1036,11 +1040,11 @@ impl<'a> Records<'a> {
                 .map_or(self.bytes.len(), |n| start + n);
             self.pos = end + 1;
             let line = &self.bytes[start..end];
-            let lead = line.iter().take_while(|b| b.is_ascii_whitespace()).count();
+            let lead = line.iter().take_while(|b| json_whitespace(**b)).count();
             let trail = line[lead..]
                 .iter()
                 .rev()
-                .take_while(|b| b.is_ascii_whitespace())
+                .take_while(|b| json_whitespace(**b))
                 .count();
             if lead + trail < line.len() {
                 return Some(Ok((start + lead, end - trail)));
@@ -1064,7 +1068,7 @@ impl<'a> Records<'a> {
                         self.state = SplitState::Done;
                         let start = self.pos;
                         let mut end = self.bytes.len();
-                        while end > start && self.bytes[end - 1].is_ascii_whitespace() {
+                        while end > start && json_whitespace(self.bytes[end - 1]) {
                             end -= 1;
                         }
                         Some(Ok((start, end)))
@@ -1145,7 +1149,7 @@ impl<'a> Records<'a> {
                     }
                 }
                 b',' if depth == 0 => return Ok(self.pos),
-                b if b.is_ascii_whitespace() && depth == 0 => return Ok(self.pos),
+                b if json_whitespace(b) && depth == 0 => return Ok(self.pos),
                 _ => {}
             }
             self.pos += 1;
