@@ -203,7 +203,7 @@ pub fn inventory() -> Value {
             "joins":{"kinds":["interval_inner","interval_left","tumbling_window_inner","tumbling_window_left"],"inputs":"two_direct_explicit_event_time_sources","late":"error_L0","idle":"does_not_authorize_cleanup_or_unmatched","max_rows_per_side":4096,"default_max_rows_per_side":1024,"max_matches_per_row":4096,"default_max_matches_per_row":1024},
             "finite_query":{"endpoint":"POST /v1/query","io":"inline_rows_or_client_prepared_history_only; no_source_sink_IO","concurrency":2,"kernel":"independent","request_bytes":65536,"sql_bytes":8192,"max_input_rows":4096,"max_output_rows":4096,"max_output_bytes":1048576,"max_timeout_ms":30000}},
         "sql":{"runtime_parser":"sparrow_sql_subset","aggregates":["count","sum","avg","min","max","first","last","var_pop","var_samp","stddev_pop","stddev_samp"],
-            "extended_aggregates":{"recovery":"restart_fresh_only","order":"arrival_order_or_buffered_ET_timestamp_then_arrival","moments":"Welford_f64_finite; no_merge_codec; integers_may_lose_precision_above_2pow53"},
+            "extended_aggregates":{"recovery":"aligned_only_linear_File_v29_Count_or_ET_tumbling_hopping_or_JetStream_v30_Count_to_required_HTTP; otherwise_restart_fresh_only","state_codec":3,"recovery_maturity":"development_preview","order":"arrival_order_or_buffered_ET_timestamp_then_arrival","moments":"Welford_f64_finite; no_merge_codec; integers_may_lose_precision_above_2pow53"},
             "not_full_ansi_sql":true,"differential_test_parser":"sqlparser 0.62.0 (testkit only)"},
         "http":{"batch":true,"linger":true,"max_inflight":8,"max_outbox_items":1024,
             "durable_outbox":false,"exactly_once":false,"oversized_output":"bounded_rejection_not_implicit_splitting"},

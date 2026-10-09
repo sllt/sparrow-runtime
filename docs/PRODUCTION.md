@@ -636,8 +636,8 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 |---|---|---|---|
 | Count、ET 滚动、ET 跳跃 + COUNT/SUM/AVG/MIN/MAX | codec 1，tag 1..7 | File v3、JetStream v4 及各组合 profile | 已验证（既有批次） |
 | PT 滚动 + 旧聚合 | codec 1 | paused v16/v17、图 v18 | 已验证（既有批次） |
-| Count/ET 滚动/ET 跳跃 + FIRST/LAST/VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP（可与旧聚合混用） | codec 3，tag 1..9 | File v29 | 已验证（子批1：Count、ET 滚动进程级；ET 跳跃单元级） |
-| Count + 新聚合 | codec 3 | JetStream v30 | 已验证（子批1） |
+| Count/ET 滚动/ET 跳跃 + FIRST/LAST/VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP（可与旧聚合混用） | codec 3，tag 1..9 | File v29 | 已实现（子批1：Kernel 级恢复等价与独立 oracle 单元测试；进程级 SIGKILL 证据待子批1 验收） |
+| Count + 新聚合 | codec 3 | JetStream v30 | 已实现（同上；真实 NATS 进程级证据待子批1 验收） |
 | ET 窗口 + 新聚合 | — | JetStream | 暂不支持（子批2 单独验证） |
 | PT 窗口 + 新聚合 | — | — | 暂不支持（子批2） |
 | FIRST/LAST 输入为 nested/Dynamic | — | — | 暂不支持（validate/start 拒绝，与 MIN/MAX 同规则） |
@@ -651,7 +651,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 | 维度 | 范围 | 状态 |
 |---|---|---|
 | PT | TPD1/PTC1 逻辑钟（v14～v17）、GTD1/GTC1（v18） | 已验证（既有）；子批1 不扩时间协议 |
-| ET | frame 内 wm_in/wm_out/last_effective；v29 原样复用 | 已验证（v29 ET 滚动进程级） |
+| ET | frame 内 wm_in/wm_out/last_effective；v29 原样复用 | 已验证（既有 v3）；v29 已实现，进程级证据待验收 |
 | 图 ET idle/EOF | v19 | 已验证（既有）；与新聚合组合暂不支持 |
 | 观测时间 | OFD1/OFC1（v23/v24） | 已验证（既有）；与新聚合组合暂不支持 |
 
@@ -659,11 +659,11 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 
 | 端点 | 恢复位置与确认 | 状态 |
 |---|---|---|
-| File / replay | 身份 kind/path/size/指纹 + offset/record_index；CURRENT 即切点；只承诺未提交后缀重放 | 已验证（含 v29） |
-| JetStream Source | BND1/JOW1 绑定 + consumer 序号 + OutputSequence；HTTP 2xx 且 CURRENT 落盘后才 ACK | 已验证（含 v30） |
+| File / replay | 身份 kind/path/size/指纹 + offset/record_index；CURRENT 即切点；只承诺未提交后缀重放 | 已验证（既有）；v29 已实现 |
+| JetStream Source | BND1/JOW1 绑定 + consumer 序号 + OutputSequence；HTTP 2xx 且 CURRENT 落盘后才 ACK | 已验证（既有）；v30 已实现 |
 | MQTT / NATS Core / WS / TCP / HTTP Poll/Push / DataBus | 无可重放身份 | 暂不支持（restart_fresh；不因下游支持 checkpoint 获得重放） |
 | Kafka / Redis / Postgres | 尚未通过自身恢复协议验收 | 暂不支持 |
-| required HTTP JSON | v29 无稳定 ID；v30 带 OutputSequence | 已验证 |
+| required HTTP JSON | v29 无稳定 ID；v30 带 OutputSequence | 已验证（既有 v3/v4）；v29/v30 已实现 |
 | HTTP CSV（aligned） | — | 暂不支持 |
 | JetStream Sink v27/v28 | 线性 File | 已验证（既有）；与新聚合组合暂不支持 |
 | File/Action Sink 等其他 Sink | — | 暂不支持（子批5 outbox） |
@@ -672,7 +672,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 
 | 拓扑 | 状态 |
 |---|---|
-| 线性 ≤2 状态 | 已验证；v29/v30 只开放线性 |
+| 线性 ≤2 状态 | 已验证（既有）；v29/v30 只开放线性，已实现 |
 | File DAG ≤16 状态 / ≤16 required HTTP Sink | 已验证（既有）；含新聚合暂不支持 |
 | 双输入 / Join | 暂不支持（子批3） |
 | 侧路、有损边、source-time、参考表/Lookup + 新聚合 | 暂不支持 |

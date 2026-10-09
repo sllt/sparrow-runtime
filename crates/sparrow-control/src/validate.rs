@@ -2379,10 +2379,12 @@ pub fn effective_guarantees_with_plan(
             "first_last":"arrival_order_within_window; NULL_skipped; all_NULL_is_NULL",
             "variance":"sequential_Welford_f64; samp_needs_two_values; exact_f64_bits_restored"
         });
-        value["recovery_risk"] = serde_json::json!(if spec.recovery == "aligned" {
-            "required_HTTP_may_repeat_before_CURRENT; deduplicate_by_output_identity; no_exactly_once"
-        } else {
+        value["recovery_risk"] = serde_json::json!(if spec.recovery != "aligned" {
             "restart_fresh_loses_window_state"
+        } else if jetstream {
+            "required_HTTP_may_repeat_before_CURRENT; deduplicate_by_OutputSequence; no_exactly_once"
+        } else {
+            "required_HTTP_may_repeat_uncommitted_suffix; File_v29_has_no_stable_output_id; no_exactly_once"
         });
         return value;
     }
