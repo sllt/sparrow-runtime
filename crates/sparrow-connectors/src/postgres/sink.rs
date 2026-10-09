@@ -1138,15 +1138,21 @@ impl PgSink {
             } else {
                 0
             };
-            let _key_scratch = match self.owner.acquire(CreditKind::Reservation, key_len) {
-                Ok(lease) => lease,
-                Err(_) => {
-                    drop(tx);
-                    guard.disarm();
-                    self.diag
-                        .postgres_sink_budget_waits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Attempt::Retry("postgres_sink_key_budget_wait");
+            // INSERT and DO NOTHING have no local conflict-key set.
+            // A zero-byte lease is invalid, not memory pressure.
+            let _key_scratch = if key_len == 0 {
+                None
+            } else {
+                match self.owner.acquire(CreditKind::Reservation, key_len) {
+                    Ok(lease) => Some(lease),
+                    Err(_) => {
+                        drop(tx);
+                        guard.disarm();
+                        self.diag
+                            .postgres_sink_budget_waits
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Attempt::Retry("postgres_sink_key_budget_wait");
+                    }
                 }
             };
             let key = if dedupe {
