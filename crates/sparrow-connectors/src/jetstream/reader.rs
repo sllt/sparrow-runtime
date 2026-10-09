@@ -142,6 +142,11 @@ impl InputRecord {
                     "JetStream decode scratch overflow",
                 )
             })?;
+        // CSV has its own (smaller, flat-column) working-set estimator.
+        let estimate = match self.format.as_csv() {
+            Some(csv) => csv.decode_scratch(schema, self.payload().len()),
+            None => estimate,
+        };
         let _scratch = owner.acquire(CreditKind::Reservation, estimate)?;
         let row = self.format.decode_row(
             schema,
@@ -209,6 +214,8 @@ pub struct Reader {
     ownership_key: String,
     ownership_revision: u64,
     identity: StreamIdentity,
+    /// Payload format bound into every cut (0 = JSON).
+    format_fingerprint: u64,
     reader_name: String,
     config: ReaderConfig,
     owner: Arc<MemoryOwner>,
@@ -235,6 +242,7 @@ impl Reader {
         attempt_nonce: [u8; 16],
         restore: Option<&sparrow_io::SourcePosition>,
     ) -> Result<Self> {
+        let format_fingerprint = super::policy::format_fingerprint(&config.payload_format);
         let setup=async {
             config.validate()?;
             if config.pull_bytes>connection.pull_bytes || config.pull_messages+2>connection.subscription_capacity {
@@ -246,7 +254,7 @@ impl Reader {
             let mut stream=context.get_stream(&config.stream).await.map_err(|_|error(ErrorCode::JobFailed,"JetStream input stream unavailable").retryable(true))?;
             let info=stream.info().await.map_err(|_|error(ErrorCode::JobFailed,"JetStream stream info unavailable").retryable(true))?;
             let identity=StreamIdentity::from_info(&config.namespace,info)?.with_reader(&config.ownership_bucket,&config.consumer);
-            let cut=if let Some(position)=restore {identity.check_position(position)?;position.offset_bytes}else{0};
+            let cut=if let Some(position)=restore {identity.check_position_bound(position,format_fingerprint)?;position.offset_bytes}else{0};
             let next=cut.checked_add(1).ok_or_else(||error(ErrorCode::BoundExceeded,"JetStream source sequence exhausted"))?;
             check_stream(info,next)?;
             let mut ownership=context.get_key_value(&config.ownership_bucket).await.map_err(|_|error(ErrorCode::PolicyDenied,"JetStream ownership KV bucket must be provisioned"))?;
@@ -314,6 +322,7 @@ impl Reader {
                 ownership_key,
                 ownership_revision,
                 identity,
+                format_fingerprint,
                 reader_name,
                 config,
                 owner,
@@ -333,7 +342,8 @@ impl Reader {
     }
 
     pub fn position(&self, records: u64) -> sparrow_io::SourcePosition {
-        self.identity.position(self.ledger.published(), records)
+        self.identity
+            .position_bound(self.ledger.published(), records, self.format_fingerprint)
     }
     pub fn pending(&self) -> usize {
         self.ledger.pending()

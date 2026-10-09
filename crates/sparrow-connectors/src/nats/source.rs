@@ -3,19 +3,18 @@
 //! - One JSON object per message (`sparrow-formats` decoder). Headers ignored.
 //! - Rows enter the byte-accounted Kernel ingress one at a time; while the
 //!   bounded inbox is full the pump waits (cancel-aware) holding one row.
-//! - Meanwhile the SDK keeps reading the socket into its bounded
-//!   subscription buffer; when that is full the SDK drops messages and emits
-//!   slow-consumer events, counted as `nats_source_slow_consumer`. Nothing is
+//! - Meanwhile a private wire actor keeps reading into its bounded
+//!   prefetch buffer; when that is full it drops messages and increments
+//!   `nats_source_slow_consumer`. Nothing is
 //!   buffered without bound and nothing is redelivered.
 //! - Reconnect is bounded per outage (see [`NatsClientConfig`]); messages
-//!   published while disconnected are lost. When the SDK gives up the Source
+//!   published while disconnected are lost. When the actor gives up the Source
 //!   fails retryably and the supervisor restart policy applies.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use sparrow_formats::{JsonLimits, PayloadFormat};
 use sparrow_io::observed::Sender as ObservedSender;
 use sparrow_model::observation::{HealthState, Latency, OriginSpan};
@@ -25,7 +24,7 @@ use sparrow_model::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::client::{BoundToken, CoreClient, NatsClientConfig, Role};
+use super::client::{BoundToken, NatsClientConfig};
 use super::common::{self, error};
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
@@ -183,49 +182,26 @@ impl NatsSource {
         self.diag
             .observation
             .health(true, HealthState::Connecting, "nats_connecting", None);
-        let connect = CoreClient::open(
-            &self.config.client,
-            self.token.as_ref(),
-            &owner,
-            &self.diag,
-            Role::Source,
-        );
-        let client = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Ok(()),
-            c = connect => c?,
-        };
-        let subscribed = match &self.config.queue_group {
-            Some(group) => {
-                client
-                    .client
-                    .queue_subscribe(self.config.subject.clone(), group.clone())
-                    .await
-            }
-            None => client.client.subscribe(self.config.subject.clone()).await,
-        };
-        let mut subscriber = match subscribed {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = client.close(false).await;
-                return Err(error(ErrorCode::JobFailed, "NATS subscribe failed").retryable(true));
-            }
-        };
-        // Make sure the SUB reached the server before reporting Ready, so a
-        // caller observing Ready can rely on the subscription being live.
-        let _ = tokio::time::timeout(Duration::from_secs(2), client.client.flush()).await;
-        self.diag
-            .observation
-            .health(true, HealthState::Ready, "nats_subscribed", None);
-        let mut seen_reconnects = self.diag.nats_source_reconnects.load(Ordering::Relaxed);
+        let child = cancel.child_token();
+        let _cancel_on_drop = child.clone().drop_guard();
+        let mut wire = super::wire::Wire::start(
+            self.config.client.clone(),
+            self.token.clone(),
+            self.config.subject.clone(),
+            self.config.queue_group.clone(),
+            self.config.json_limits.max_bytes,
+            owner.clone(),
+            self.diag.clone(),
+            child.clone(),
+        )?;
         let result = loop {
             let message = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => break Ok(()),
-                m = subscriber.next() => m,
+                _ = child.cancelled() => break Ok(()),
+                m = wire.messages.recv() => m,
             };
             let Some(message) = message else {
-                // Subscription channel closed: the SDK exhausted its bounded
+                // Subscription channel closed: the actor exhausted its bounded
                 // reconnect attempts (or the server closed us).
                 self.diag.observation.health(
                     true,
@@ -239,21 +215,17 @@ impl NatsSource {
                 )
                 .retryable(true));
             };
-            let reconnects = self.diag.nats_source_reconnects.load(Ordering::Relaxed);
-            if reconnects != seen_reconnects {
-                // A reconnect may land on a server with a larger max_payload
-                // than our ledger charge assumes.
-                seen_reconnects = reconnects;
-                if let Err(e) = client.check_server_payload(self.config.client.max_payload_bytes) {
-                    break Err(e);
-                }
-            }
-            let received_at = std::time::Instant::now();
             self.diag
                 .nats_source_received
                 .fetch_add(1, Ordering::Relaxed);
+            let Some(payload) = message.payload.as_deref() else {
+                self.diag
+                    .nats_source_dropped_oversize
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
             match self
-                .ingest(&message.payload, &ingress, &cancel, received_at)
+                .ingest(payload, &ingress, &child, message.received_at)
                 .await
             {
                 Ok(true) => {}
@@ -261,9 +233,17 @@ impl NatsSource {
                 Err(e) => break Err(e),
             }
         };
-        drop(subscriber);
-        if let Err(e) = client.close(false).await {
-            return result.and(Err(e));
+        let actor = wire.close().await;
+        // Actor failure must not be mistaken for external cancellation merely
+        // because it interrupted admission using the child token.
+        let result = result.and(actor);
+        if let Err(e) = &result {
+            self.diag.observation.health(
+                true,
+                HealthState::Failed,
+                "nats_wire_failed",
+                Some(e.code),
+            );
         }
         result
     }
@@ -275,12 +255,21 @@ impl NatsSource {
         cancel: &CancellationToken,
         received_at: std::time::Instant,
     ) -> Result<bool> {
-        if payload.len() > self.config.json_limits.max_bytes {
+        let format = &self.config.payload_format;
+        if payload.len() > format.max_message_bytes(&self.config.json_limits) {
             self.diag
                 .nats_source_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
+        // Format-specific parser + Row working set, charged before decoding.
+        let estimate = format.decode_scratch(&self.config.schema, payload.len());
+        let Ok(_scratch) = ingress.owner.acquire(CreditKind::Reservation, estimate) else {
+            self.diag
+                .nats_source_dropped_budget
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
+        };
         let started = std::time::Instant::now();
         let decoded = self.config.payload_format.decode_row(
             &self.config.schema,

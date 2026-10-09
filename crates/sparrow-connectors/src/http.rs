@@ -325,7 +325,7 @@ impl HttpSink {
                     let bytes=match self.config.payload_format.as_csv() {
                         Some(csv)=>csv.encode_rows_bounded_with_capacity(batch.schema(),std::slice::from_ref(row),self.config.batch_bytes,|cap|lease.grow_to(cap+32*1024)),
                         None=>action.encode(batch.schema(),std::slice::from_ref(row),!action.single,self.config.batch_bytes,|cap|lease.grow_to(cap+32*1024)),
-                    }.inspect_err(|_|self.diag.csv_encode_error(&self.config.payload_format))?;
+                    }.inspect_err(|e|if e.code!=ErrorCode::ResourceExhausted {self.diag.csv_encode_error(&self.config.payload_format)})?;
                     let mut url=url::Url::parse(&self.config.url).map_err(|_|sparrow_model::SparrowError::new(ErrorCode::InvalidArgument,"invalid action base URL"))?;
                     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
                         return Err(sparrow_model::SparrowError::new(ErrorCode::PolicyDenied,"action URL forbids userinfo and fragments"));
@@ -538,7 +538,11 @@ impl HttpSink {
                     },
                 )
             }
-            .inspect_err(|_| self.diag.csv_encode_error(&self.config.payload_format))
+            .inspect_err(|e| {
+                if e.code != ErrorCode::ResourceExhausted {
+                    self.diag.csv_encode_error(&self.config.payload_format)
+                }
+            })
         } else if let Some(action)=&self.action {
             if batch.output_sequence().is_some() {Err(sparrow_model::SparrowError::new(ErrorCode::UnsupportedRestore,"action payloads cannot inherit reliable output identity"))}
             else {action.encode(batch.schema(),batch.rows(),true,self.config.batch_bytes,
@@ -564,9 +568,7 @@ impl HttpSink {
         let csv_header = match csv {
             // Column names may be quoted and contain line breaks, so the
             // header length comes from the encoder, not a newline search.
-            Some(csv) if csv.header() => {
-                Some(csv.encode_header(batch.schema()).map_or(0, |h| h.len()))
-            }
+            Some(csv) if csv.header() => Some(csv.header_len(batch.schema()).unwrap_or(0)),
             Some(_) => Some(0),
             None => None,
         };

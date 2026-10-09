@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 const MARKER: &[u8] = b"SPARROW_NDJSON_SINK_V1\n";
 const CSV_MARKER: &[u8] = b"SPARROW_CSV_SINK_V1\n";
+/// Bound before reading FORMAT (the CSV marker carries its small options).
+const MAX_MARKER_BYTES: u64 = 1024;
 const LOCK: &str = "WRITER_LOCK";
 const FORMAT: &str = "FORMAT";
 
@@ -32,10 +34,21 @@ pub struct FileSinkConfig {
     pub format: sparrow_formats::PayloadFormat,
 }
 impl FileSinkConfig {
-    fn marker(&self) -> &'static [u8] {
-        match self.format {
-            sparrow_formats::PayloadFormat::Json => MARKER,
-            sparrow_formats::PayloadFormat::Csv(_) => CSV_MARKER,
+    /// Directory FORMAT marker. A CSV directory also records its encode
+    /// options, so a restart (aligned or not) with another delimiter, quote,
+    /// header or NULL text never appends a different dialect next to it.
+    fn marker(&self) -> Vec<u8> {
+        match &self.format {
+            sparrow_formats::PayloadFormat::Json => MARKER.to_vec(),
+            sparrow_formats::PayloadFormat::Csv(csv) => {
+                let mut marker = CSV_MARKER.to_vec();
+                // Sink options compile only with encode fields set, so this
+                // serialization is canonical for one dialect.
+                let options = serde_json::to_vec(csv.options()).unwrap_or_default();
+                marker.extend_from_slice(&options);
+                marker.push(b'\n');
+                marker
+            }
         }
     }
     fn extension(&self) -> &'static str {
@@ -159,7 +172,7 @@ impl Writer {
         let (bytes, files, next, marked) = Self::scan(&anchored, &config, true)?;
         if !marked {
             let mut marker = create(&anchored.join(FORMAT))?;
-            marker.write_all(config.marker()).map_err(io)?;
+            marker.write_all(&config.marker()).map_err(io)?;
             marker.sync_all().map_err(io)?;
             directory.sync_all().map_err(io)?;
         }
@@ -199,11 +212,17 @@ impl Writer {
                 continue;
             }
             if name == FORMAT {
-                if meta.len() != config.marker().len() as u64 {
+                let expected = config.marker();
+                if meta.len() > MAX_MARKER_BYTES {
                     return Err(denied("invalid File Sink FORMAT size"));
                 }
                 let raw = std::fs::read(&path).map_err(io)?;
-                if raw != config.marker() {
+                if raw != expected {
+                    if raw.starts_with(CSV_MARKER) && expected.starts_with(CSV_MARKER) {
+                        return Err(denied(
+                            "File Sink directory was written with different CSV options",
+                        ));
+                    }
                     return Err(denied("foreign or incomplete File Sink FORMAT"));
                 }
                 marked = true;
@@ -335,7 +354,23 @@ impl Writer {
         let owner = batch.lease().owner();
         let csv = self.config.format.as_csv().cloned();
         if let Some(csv) = csv.as_ref().filter(|csv| csv.header()) {
-            let header = csv.encode_header(batch.schema()).map_err(model)?;
+            // Quoted names are at most 2·len+2 bytes plus a separator; the
+            // unbounded Vec may double that. Charge it before encoding.
+            let schema = batch.schema();
+            let names = schema
+                .fields
+                .iter()
+                .fold(0usize, |n, f| n.saturating_add(f.name.len()));
+            let header_bytes = names
+                .saturating_mul(2)
+                .saturating_add(schema.fields.len().saturating_mul(3))
+                .saturating_add(1)
+                .saturating_mul(2)
+                .saturating_add(64);
+            let _credit = owner
+                .acquire(CreditKind::Reservation, header_bytes)
+                .map_err(model)?;
+            let header = csv.encode_header(schema).map_err(model)?;
             if self.file.is_some() && header != self.header {
                 // A segment never mixes layouts: a different header (schema)
                 // starts a new segment.
@@ -351,8 +386,12 @@ impl Writer {
                     "File Sink cancelled before batch completion",
                 ));
             }
+            // CSV: its encoder scratch (number text, base64, Dynamic JSON).
+            let scratch = csv
+                .as_ref()
+                .map_or(8192, |csv| csv.encode_scratch(row).max(8192));
             let mut credit = owner
-                .acquire(CreditKind::Reservation, 8192)
+                .acquire(CreditKind::Reservation, scratch)
                 .map_err(model)?;
             let bytes = match &csv {
                 Some(csv) => {
@@ -361,10 +400,12 @@ impl Writer {
                             batch.schema(),
                             row,
                             self.config.row_bytes + 1,
-                            |cap| credit.grow_to(cap + 8192),
+                            |cap| credit.grow_to(cap.saturating_add(scratch)),
                         )
                         .map_err(|e| {
-                            diag.csv_encode_error(&self.config.format);
+                            if e.code != ErrorCode::ResourceExhausted {
+                                diag.csv_encode_error(&self.config.format);
+                            }
                             model(e)
                         })?;
                     bytes.pop(); // `row` writes the newline terminator
@@ -752,7 +793,10 @@ mod tests {
         assert_eq!(read(1), format!("value\n{a}\n\"x,\"\"y\"\"\n\"\n"));
         assert_eq!(read(2), format!("value\n{b}\n"));
         assert_eq!(read(3), "value\n\" pad \"\n");
-        assert_eq!(std::fs::read(dir.0.join(FORMAT)).unwrap(), CSV_MARKER);
+        assert_eq!(
+            std::fs::read(dir.0.join(FORMAT)).unwrap(),
+            csv_config(&dir, true).marker()
+        );
         let snap = diag.snapshot();
         assert_eq!((snap.file_written, snap.file_segments), (4, 3));
         let total: usize = (1..=3).map(|n| read(n).len()).sum();
@@ -773,6 +817,63 @@ mod tests {
             .row(b"{}", &diag)
             .unwrap();
         assert!(Writer::open(csv_config(&ndjson, true)).is_err());
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+    #[test]
+    fn csv_file_directory_binds_its_encode_options() {
+        let dir = directory();
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let diag = IoDiagnostics::new();
+        let cancel = CancellationToken::new();
+        let action = ActionSpec::default();
+        Writer::open(csv_config(&dir, true))
+            .unwrap()
+            .batch(&csv_batch(&owner, "a"), &action, &diag, &cancel)
+            .unwrap();
+        let with = |options: sparrow_formats::CsvOptions| FileSinkConfig {
+            format: sparrow_formats::PayloadFormat::csv(
+                options.compile(sparrow_formats::CsvRole::Encode).unwrap(),
+            ),
+            ..config(&dir)
+        };
+        for other in [
+            sparrow_formats::CsvOptions {
+                delimiter: ";".into(),
+                ..Default::default()
+            },
+            sparrow_formats::CsvOptions {
+                header: false,
+                ..Default::default()
+            },
+            sparrow_formats::CsvOptions {
+                null_value: "NULL".into(),
+                ..Default::default()
+            },
+            sparrow_formats::CsvOptions {
+                quote: "'".into(),
+                ..Default::default()
+            },
+        ] {
+            let refused = Writer::open(with(other.clone())).err().expect("refused");
+            assert_eq!(refused.code(), ErrorCode::PolicyDenied, "{other:?}");
+            assert!(
+                refused.to_string().contains("different CSV options"),
+                "{refused}"
+            );
+        }
+        // The same options still adopt the directory; nothing was written by
+        // the refused opens.
+        Writer::open(with(Default::default()))
+            .unwrap()
+            .batch(&csv_batch(&owner, "b"), &action, &diag, &cancel)
+            .unwrap();
+        let read =
+            |n: u64| std::fs::read_to_string(dir.0.join(format!("part-{n:020}.csv"))).unwrap();
+        assert_eq!(
+            (read(1), read(2)),
+            ("value\na\n".into(), "value\nb\n".into())
+        );
+        assert!(!dir.0.join("part-00000000000000000003.csv").exists());
         assert_eq!(owner.usage().physical_bytes, 0);
     }
     #[test]

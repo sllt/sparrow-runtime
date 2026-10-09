@@ -91,7 +91,8 @@ fn csv_control_file_to_sql_to_file_exact_output() {
         );
         assert_eq!(
             std::fs::read(dir.0.join("output/FORMAT")).unwrap(),
-            b"SPARROW_CSV_SINK_V1\n"
+            b"SPARROW_CSV_SINK_V1\n{\"delimiter\":\",\",\"quote\":\"\\\"\",\"header\":true,\"null_value\":\"\\\\N\"}\n",
+            "the directory marker binds the encode options"
         );
         // The output is itself valid CSV for a CSV File source.
         let reread = parse(json!({"version":1,"stream":"echo",
@@ -197,6 +198,75 @@ fn csv_control_aligned_resume_after_header_is_exact() {
         append(&input, b"d,4,\n");
         wait_rows(&http, 5, &sup, &store).await;
         assert_eq!(http_rows(&http)[4], json!({"device":"d","n":4,"note":null}));
+        sup.stop_all().await;
+        assert_eq!(kernel.admitted_jobs(), 0);
+        http.stop().await;
+    });
+}
+
+#[test]
+fn csv_control_aligned_restore_refuses_changed_csv_options() {
+    let dir = Scratch::new();
+    let input = dir.0.join("input.csv");
+    std::fs::write(&input, "device,n,note\na,1,x\nb,2,\n").unwrap();
+    let kernel = Arc::new(crate::host_kernel().unwrap());
+    kernel.block_on(async {
+        let http = sparrow_connectors::HttpCapture::start().await.unwrap();
+        let store = Arc::new(Store::open(&dir.0.join("catalog.db")).unwrap());
+        store.put_stream("readings", READINGS).unwrap();
+        store.put_allow("127.0.0.1", http.port()).unwrap();
+        let spec = |csv: Value| {
+            parse(
+                json!({"stream":"readings","sql":"SELECT device, n, note FROM readings",
+                "source":{"kind":"file","path":input,"file_contract":"append_only",
+                    "format":"csv","csv":csv},
+                "sink":{"kind":"http","url":http.url(),"batch_rows":1,"outbox_capacity":4},
+                "recovery":"aligned","checkpoint_dir":dir.0.join("checkpoints"),
+                "checkpoint":{"timeout_ms":2000,"resume_latest":true}}),
+            )
+        };
+        let put = |value: &PipelineSpec| {
+            let etag = store
+                .get_pipeline("resume")
+                .ok()
+                .map(|row| format!("rev-{}", row.latest_revision));
+            store
+                .put_pipeline("resume", value, etag.as_deref())
+                .unwrap();
+            request_start(&store, "resume", "test").unwrap();
+        };
+        put(&spec(json!({})));
+        let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+        sup.converge_once().await.unwrap();
+        wait_rows(&http, 2, &sup, &store).await;
+        let checkpoint = sup.checkpoint_named("resume").await.unwrap();
+        sup.kill_named("resume").await.unwrap();
+        append(&input, b"c,3,\n");
+        // Same bytes and the same cut, but the checkpoint was taken under other
+        // CSV options: restore is refused, nothing is replayed.
+        put(&spec(json!({"trim":true})));
+        assert_eq!(finish(&sup, &store, "resume").await, "failed");
+        let error = store
+            .actual("resume")
+            .unwrap()
+            .last_error
+            .unwrap_or_default();
+        assert!(error.contains("CSV options"), "{error}");
+        assert_eq!(http_rows(&http).len(), 2);
+        // The original options adopt the checkpoint and resume after the cut.
+        put(&spec(json!({})));
+        sup.converge_once().await.unwrap();
+        wait_rows(&http, 3, &sup, &store).await;
+        assert_eq!(
+            sup.checkpoint_snapshot("resume")
+                .unwrap()
+                .unwrap()
+                .1
+                .snapshot()
+                .restored_from,
+            Some(checkpoint)
+        );
+        assert_eq!(http_rows(&http)[2], json!({"device":"c","n":3,"note":null}));
         sup.stop_all().await;
         assert_eq!(kernel.admitted_jobs(), 0);
         http.stop().await;

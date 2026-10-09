@@ -972,7 +972,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "reconnects":io.nats_source_reconnects,"client_errors":io.nats_source_client_errors,
             "inbox_items":io.nats_source_inbox_items,"inbox_bytes":io.nats_source_inbox_bytes,
             "semantics":"live_best_effort_at_most_once_no_replay_no_ack",
-            "scope":"this_attempt; slow_consumer_events=lower_bound_of_sdk_drop_events"});
+            "scope":"this_attempt; slow_consumer_events=exact_local_prefetch_drops_not_total_network_loss"});
     }
     if s.sink_kind == "nats" {
         value["nats_sink"] = json!({"published":io.nats_sink_published,"failed":io.nats_sink_failed,
@@ -1004,6 +1004,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
         value["databus_sink"] = json!({"published":io.databus_sink_published,
             "deliveries":io.databus_sink_deliveries,"no_subscribers":io.databus_sink_no_subscribers,
             "dropped_bad":io.databus_sink_dropped_bad,"dropped_oversize":io.databus_sink_dropped_oversize,
+            "dropped_budget":io.databus_sink_dropped_budget,
             "blocked_publishes":io.databus_sink_blocked_publishes,
             "discarded_on_close":io.databus_sink_discarded_on_close,
             "batches":io.databus_sink_batches,"fatal":io.databus_sink_fatal,
@@ -1306,6 +1307,10 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         (
             "databus_sink_dropped_oversize",
             io.databus_sink_dropped_oversize,
+        ),
+        (
+            "databus_sink_dropped_budget",
+            io.databus_sink_dropped_budget,
         ),
         (
             "databus_sink_blocked_publishes",

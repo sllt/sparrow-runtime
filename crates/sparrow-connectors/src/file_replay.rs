@@ -164,6 +164,9 @@ pub struct FileReplaySource {
     contract: FileContract,
     csv: Option<CsvRead>,
     diag: Option<Arc<IoDiagnostics>>,
+    /// Payload format identity mixed into the checkpoint fingerprint
+    /// (`None` for NDJSON, so JSON identities are unchanged).
+    format_identity: Option<Vec<u8>>,
 }
 
 impl FileReplaySource {
@@ -201,6 +204,8 @@ impl FileReplaySource {
                 format!("rewind {}: {e}", path.display()),
             )
         })?;
+        let format_identity = cfg.format.identity_bytes();
+        let fingerprint = bind_format(fingerprint, format_identity.as_deref());
         let identity = SourceIdentity::file(path.to_string_lossy().into_owned(), size, fingerprint);
         let csv = match cfg.format.as_csv() {
             Some(format) => Some(CsvRead {
@@ -231,6 +236,7 @@ impl FileReplaySource {
             contract: cfg.contract,
             csv,
             diag: None,
+            format_identity,
         })
     }
 
@@ -292,7 +298,10 @@ impl FileReplaySource {
         } else {
             meta.len()
         };
-        let fingerprint = content_fingerprint(&mut probe, size).map_err(io)?;
+        let fingerprint = bind_format(
+            content_fingerprint(&mut probe, size).map_err(io)?,
+            self.format_identity.as_deref(),
+        );
         Ok(SourcePosition {
             offset_bytes: self.offset,
             record_index: self.record_index,
@@ -339,8 +348,11 @@ impl FileReplaySource {
         row_limit:usize)->ModelResult<(Option<sparrow_model::RowBatch>,bool)> {
         match self.read_frame(2*MAX_RECORD)? {
             FramePoll::Frame(frame)=>{
-                let estimate=frame.payload.len().saturating_mul(64)
-                    .saturating_add(schema.fields.len()*std::mem::size_of::<sparrow_model::Scalar>()*2).saturating_add(4096);
+                // Format-specific: the CSV estimator for CSV records.
+                let estimate=match &self.csv {
+                    Some(csv)=>csv.format.decode_scratch(&schema,frame.payload.len()),
+                    None=>PayloadFormat::Json.decode_scratch(&schema,frame.payload.len()),
+                };
                 let _scratch=owner.acquire(sparrow_model::CreditKind::Reservation,estimate)?;
                 let row=self.decode_frame(&frame)?.ok_or_else(||SparrowError::new(ErrorCode::CodecViolation,"File row decode failed"))?;
                 let resident=row.resident_bytes();
@@ -424,6 +436,7 @@ impl FileReplaySource {
         let fingerprint = content_fingerprint(&mut f, size).map_err(|e| {
             ConnectorError::new(ErrorCode::UnsupportedRestore, format!("fingerprint: {e}"))
         })?;
+        let fingerprint = bind_format(fingerprint, self.format_identity.as_deref());
         Ok(SourceIdentity::file(
             self.path.to_string_lossy().into_owned(),
             size,
@@ -445,7 +458,7 @@ impl FileReplaySource {
                     return Err(ConnectorError::new(
                         ErrorCode::UnsupportedRestore,
                         format!(
-                            "file '{}' was replaced or rotated ({} contract)",
+                            "file '{}' was replaced or rotated, or its payload format / CSV options changed ({} contract)",
                             self.path.display(),
                             self.contract.as_str()
                         ),
@@ -473,11 +486,12 @@ impl FileReplaySource {
                         format!("cut fingerprint: {e}"),
                     )
                 })?;
+                let cut_fp = bind_format(cut_fp, self.format_identity.as_deref());
                 if cut_fp != stored.fingerprint {
                     return Err(ConnectorError::new(
                         ErrorCode::UnsupportedRestore,
                         format!(
-                            "file '{}' prefix before cut changed (append contract)",
+                            "file '{}' prefix before cut changed, or its payload format / CSV options changed (append contract)",
                             self.path.display()
                         ),
                     ));
@@ -485,6 +499,20 @@ impl FileReplaySource {
             }
         }
         Ok(())
+    }
+}
+
+/// Checkpoint fingerprint = content fingerprint, mixed with the canonical
+/// CSV options when the file is read as CSV. A cut taken as NDJSON, or under
+/// other CSV options, therefore never matches and restore is refused.
+fn bind_format(content: u64, format: Option<&[u8]>) -> u64 {
+    match format {
+        None => content,
+        Some(format) => {
+            let mut mix = content.to_le_bytes().to_vec();
+            mix.extend_from_slice(format);
+            fnv1a64(&mix)
+        }
     }
 }
 
@@ -591,7 +619,8 @@ impl FileReplaySource {
             if chunk.is_empty() {
                 break;
             }
-            let chunk = &chunk[..chunk.len().min((offset - pos) as usize)];
+            let left = usize::try_from(offset - pos).unwrap_or(usize::MAX);
+            let chunk = &chunk[..chunk.len().min(left)];
             let end = framer.find_terminator(chunk);
             let take = end.map_or(chunk.len(), |i| i + 1);
             if mapping.is_none() {

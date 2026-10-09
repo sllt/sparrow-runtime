@@ -405,6 +405,9 @@ fn record_splitter_is_lazy_strict_and_string_aware() {
         "\"str\"",
         "42",
         "[{\"a\":\"x]",
+        "\u{000b}[{}]",
+        "[{}]\u{000c}",
+        "[{}\u{000b},{}]",
     ] {
         assert_eq!(spans(bad, Json), Err(ErrorCode::CodecViolation), "{bad}");
     }
@@ -421,6 +424,23 @@ fn record_splitter_is_lazy_strict_and_string_aware() {
         n += 1;
     }
     assert_eq!(n, 400_001);
+}
+
+#[test]
+fn record_splitter_does_not_strip_non_json_control_bytes() {
+    let valid = r#"{"device_id":"a","v":1}"#;
+    for format in [HttpPollFormat::Json, HttpPollFormat::Ndjson] {
+        for bad in [format!("\u{000b}{valid}"), format!("{valid}\u{000c}")] {
+            match spans(&bad, format) {
+                Err(ErrorCode::CodecViolation) => {}
+                Ok(records) => {
+                    assert_eq!(records.len(), 1);
+                    assert!(decode_json_row(&schema(), records[0].as_bytes(), &JsonLimits::default()).is_err());
+                }
+                Err(other) => panic!("unexpected splitter error: {other:?}"),
+            }
+        }
+    }
 }
 
 // --------------------------------------------------------- test HTTP server
@@ -589,6 +609,14 @@ struct Running {
 }
 
 fn start(config: HttpPollSourceConfig, client: Option<reqwest::Client>) -> Running {
+    start_with_owner(config, client, MemoryOwner::new(ResourceBudget::compact()))
+}
+
+fn start_with_owner(
+    config: HttpPollSourceConfig,
+    client: Option<reqwest::Client>,
+    owner: Arc<MemoryOwner>,
+) -> Running {
     let diag = IoDiagnostics::new();
     let policy = allow(&config.url);
     let capacity = config.inbox_capacity;
@@ -597,7 +625,6 @@ fn start(config: HttpPollSourceConfig, client: Option<reqwest::Client>) -> Runni
         // Test-only trust anchor; verification stays on (no skip-verify).
         source.client = client;
     }
-    let owner = MemoryOwner::new(ResourceBudget::compact());
     let (tx, rx) = sparrow_io::observed::channel(capacity);
     let cancel = CancellationToken::new();
     let task = tokio::spawn(source.run_budgeted(tx, cancel.clone(), owner.clone(), 64 * 1024));
@@ -874,6 +901,7 @@ async fn stop_while_blocked_on_admission_is_prompt_and_releases_credit() {
     })
     .await;
     let owner = run.owner.clone();
+    let diag = run.diag.clone();
     assert!(
         owner.usage().reservation_bytes > 0,
         "body + working row are billed while blocked"
@@ -882,6 +910,11 @@ async fn stop_while_blocked_on_admission_is_prompt_and_releases_credit() {
     // Body, working row and the queued row (receiver dropped) are all refunded.
     let usage = owner.usage();
     assert_eq!((usage.reservation_bytes, usage.queue_bytes), (0, 0));
+    assert_eq!(
+        diag.snapshot().http_poll_ok,
+        0,
+        "cancelled ingest is not success"
+    );
 }
 
 #[tokio::test]
@@ -990,6 +1023,171 @@ async fn conditional_requests_send_validators_and_skip_304() {
 }
 
 #[tokio::test]
+async fn conditional_budget_drop_retries_the_same_version_after_pressure_clears() {
+    let body = r#"{"device_id":"c","v":1}"#;
+    let served_200 = Arc::new(AtomicUsize::new(0));
+    let served = served_200.clone();
+    let server = Server::start(Arc::new(move |_, head| {
+        let lower = head.to_ascii_lowercase();
+        if lower.contains("if-none-match: \"v1\"")
+            && lower.contains("if-modified-since: wed, 21 oct 2015 07:28:00 gmt")
+        {
+            Reply {
+                body: vec![],
+                ..Reply::status(304)
+            }
+        } else {
+            served.fetch_add(1, Ordering::SeqCst);
+            Reply {
+                headers: vec![
+                    ("etag".into(), "\"v1\"".into()),
+                    (
+                        "last-modified".into(),
+                        "Wed, 21 Oct 2015 07:28:00 GMT".into(),
+                    ),
+                ],
+                ..Reply::json(body)
+            }
+        }
+    }))
+    .await;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    // The body fits, but even the old post-decode working-row charge does
+    // not: this reproduces the validator bug independently of scratch size.
+    let headroom = body.len()
+        + QueuedRow::accounted_bytes(&Row {
+            values: row("c", 1),
+        })
+        - 1;
+    let pressure = owner
+        .acquire(
+            CreditKind::Reservation,
+            owner.budget().reservation_bytes - headroom,
+        )
+        .unwrap();
+    let mut c = cfg(&server.url);
+    c.conditional = true;
+    let mut run = start_with_owner(c, None, owner.clone());
+    until(Duration::from_secs(3), || {
+        run.diag.snapshot().http_poll_dropped_budget >= 2
+    })
+    .await;
+    let snap = run.diag.snapshot();
+    assert_eq!(
+        (
+            snap.http_poll_rows,
+            snap.http_poll_ok,
+            snap.http_poll_not_modified
+        ),
+        (0, 0, 0)
+    );
+    assert!(run.rx.try_recv().is_err());
+    assert!(server.requests.lock().unwrap().iter().all(|head| {
+        let lower = head.to_ascii_lowercase();
+        !lower.contains("if-none-match:") && !lower.contains("if-modified-since:")
+    }));
+    let before = served_200.load(Ordering::SeqCst);
+    drop(pressure);
+    // The API has not changed its body or validators; clearing only local
+    // credit pressure must cause another 200 and recover the missing row.
+    assert_eq!(run.take(1).await, vec![row("c", 1)]);
+    assert!(served_200.load(Ordering::SeqCst) > before);
+    until(Duration::from_secs(3), || {
+        run.diag.snapshot().http_poll_not_modified >= 1
+    })
+    .await;
+    assert_eq!(run.diag.snapshot().http_poll_rows, 1);
+    assert_eq!(run.diag.snapshot().http_poll_ok, 1);
+    run.stop().await.unwrap();
+    let usage = owner.usage();
+    assert_eq!(
+        (
+            usage.reservation_bytes,
+            usage.queue_bytes,
+            usage.physical_bytes
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn insufficient_decode_credit_skips_decode_and_refunds_all_credit() {
+    // Structurally valid JSON, but the decoder would fail the job if called.
+    let server = Server::start(Arc::new(|_, _| {
+        Reply::json(r#"{"device_id":"unbilled","v":"invalid"}"#)
+    }))
+    .await;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let pressure = owner
+        .acquire(
+            CreditKind::Reservation,
+            owner.budget().reservation_bytes - 2048,
+        )
+        .unwrap();
+    let mut c = cfg(&server.url);
+    c.fail_on_decode = true;
+    let mut run = start_with_owner(c, None, owner.clone());
+    until(Duration::from_secs(3), || {
+        run.diag.snapshot().http_poll_dropped_budget >= 2
+    })
+    .await;
+    let snap = run.diag.snapshot();
+    assert_eq!(
+        (
+            snap.decode_errors,
+            snap.http_poll_dropped_bad,
+            snap.http_poll_rows,
+            snap.http_poll_ok
+        ),
+        (0, 0, 0, 0)
+    );
+    assert!(
+        !run.task.is_finished(),
+        "unfunded JSON must not reach fail_on_decode"
+    );
+    assert!(run.rx.try_recv().is_err());
+    run.stop().await.unwrap();
+    drop(pressure);
+    let usage = owner.usage();
+    assert_eq!(
+        (
+            usage.reservation_bytes,
+            usage.queue_bytes,
+            usage.physical_bytes,
+            usage.live_handles
+        ),
+        (0, 0, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn fail_on_decode_rejects_oversized_record_before_scratch_admission() {
+    let body = format!(r#"{{"device_id":"{}","v":1}}"#, "x".repeat(64 * 1024));
+    let server = Server::start(Arc::new(move |_, _| Reply::json(body.clone()))).await;
+    let mut c = cfg(&server.url);
+    // Fits the response cap, but the record's expansion estimate exceeds the
+    // compact reservation budget. Length rejection must still be fatal.
+    c.max_response_bytes = 128 * 1024;
+    c.fail_on_decode = true;
+    let mut run = start(c, None);
+    let err = tokio::time::timeout(Duration::from_secs(3), run.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::MaxRecordSize);
+    let snap = run.diag.snapshot();
+    assert_eq!((snap.decode_errors, snap.http_poll_dropped_bad), (1, 1));
+    assert_eq!(
+        (snap.http_poll_oversize, snap.http_poll_dropped_budget),
+        (0, 0)
+    );
+    assert_eq!((snap.http_poll_rows, snap.http_poll_ok), (0, 0));
+    assert!(run.rx.try_recv().is_err());
+    assert_eq!(run.owner.usage().physical_bytes, 0);
+}
+
+#[tokio::test]
 async fn fail_on_decode_fails_the_source_instead_of_dropping() {
     let server = Server::start(Arc::new(|_, _| {
         Reply::json(r#"[{"device_id":"f","v":"nope"}]"#)
@@ -1091,4 +1289,55 @@ fn csv_refuses_ndjson_framing_and_unfit_schema() {
     )
     .unwrap();
     assert!(c.validate(&secrets(), &allow(url)).is_err());
+}
+
+#[tokio::test]
+async fn csv_insufficient_decode_credit_skips_decode_and_refunds_all_credit() {
+    // A valid CSV document whose record would fail the job if decoded.
+    let server = Server::start(Arc::new(|_, _| {
+        Reply::json("device_id,v\nunbilled,invalid\n")
+    }))
+    .await;
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let pressure = owner
+        .acquire(
+            CreditKind::Reservation,
+            owner.budget().reservation_bytes - 2048,
+        )
+        .unwrap();
+    let mut c = csv_cfg(&server.url, Default::default());
+    c.fail_on_decode = true;
+    let mut run = start_with_owner(c, None, owner.clone());
+    until(Duration::from_secs(3), || {
+        run.diag.snapshot().http_poll_dropped_budget >= 2
+    })
+    .await;
+    let snap = run.diag.snapshot();
+    assert_eq!(
+        (
+            snap.decode_errors,
+            snap.http_poll_dropped_bad,
+            snap.csv_type_errors,
+            snap.http_poll_rows,
+            snap.http_poll_ok
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    assert!(
+        !run.task.is_finished(),
+        "unfunded CSV must not reach fail_on_decode"
+    );
+    assert!(run.rx.try_recv().is_err());
+    run.stop().await.unwrap();
+    drop(pressure);
+    let usage = owner.usage();
+    assert_eq!(
+        (
+            usage.reservation_bytes,
+            usage.queue_bytes,
+            usage.physical_bytes,
+            usage.live_handles
+        ),
+        (0, 0, 0, 0)
+    );
 }

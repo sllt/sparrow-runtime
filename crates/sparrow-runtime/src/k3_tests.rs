@@ -247,6 +247,7 @@ fn k3_union_barrier_blocks_fast_input_and_abandonment_unblocks_it() {
                 JobRequest::new(p.clone(), vec![], capture.clone()).with_aligned(AlignedJob {
                     restore: None,
                     pipeline: Some(PipelineRestore {
+                        sink: None,
                         iot: Vec::new(),
                         plan: manifest.clone(),
                         generation: [4; 16],
@@ -655,6 +656,7 @@ fn k3_permanent_eof_still_participates_in_aligned_barriers() {
             JobRequest::new(p, vec![], SharedCapture::disabled()).with_aligned(AlignedJob {
                 restore: None,
                 pipeline: Some(PipelineRestore {
+                    sink: None,
                     iot: Vec::new(),
                     plan: manifest.clone(),
                     generation: [6; 16],
