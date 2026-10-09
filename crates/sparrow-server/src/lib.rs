@@ -1372,7 +1372,6 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             io.websocket_source_pings_sent,
         ),
         ("websocket_sink_sent", io.websocket_sink_sent),
-        ("websocket_sink_dropped_budget", io.websocket_sink_dropped_budget),
         ("websocket_sink_dropped_bad", io.websocket_sink_dropped_bad),
         (
             "websocket_sink_dropped_oversize",
