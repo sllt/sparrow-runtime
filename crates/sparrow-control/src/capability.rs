@@ -1,7 +1,7 @@
 //! Static implementation inventory, not a substitute for binding or certification.
 use serde_json::{json, Value};
 pub fn inventory() -> Value {
-    let combinations: Vec<_> = ["mqtt", "http_push", "file"]
+    let combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file"]
         .into_iter()
         .flat_map(|source| {
             ["http", "mqtt", "log"].into_iter().map(move |sink| {
@@ -180,7 +180,14 @@ mod tests {
     #[test]
     fn production_inventory_does_not_claim_unimplemented_backends_or_certification() {
         let value = super::inventory();
-        assert_eq!(value["combinations"].as_array().unwrap().len(), 9);
+        // 4 live/file sources (mqtt, http_push, http_poll, file) x 3 sinks.
+        assert_eq!(value["combinations"].as_array().unwrap().len(), 12);
+        assert!(value["combinations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["source"] == "http_poll")
+            .all(|c| c["delivery"] == "live_best_effort" && c["recovery"] == "restart_fresh"));
         assert_eq!(value["backend"]["jit"], false);
         assert_eq!(value["backend"]["dag"], true);
         assert_eq!(value["dag"]["certified"], false);

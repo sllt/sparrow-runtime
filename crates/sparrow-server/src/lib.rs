@@ -938,6 +938,14 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "http_posted":io.http_posted,"http_failed":io.http_failed,"http_encode_errors":io.http_encode_errors,
             "http_budget_drops":io.http_budget_drops,"http_dropped":io.http_dropped,"http_retries":io.http_retries,
             "decode_errors":io.decode_errors,"budget_and_full_may_overlap":true},
+        "http_poll":if s.source_kind=="http_poll"{Some(json!({"requests":io.http_poll_requests,"ok":io.http_poll_ok,
+            "not_modified":io.http_poll_not_modified,"failed":io.http_poll_failed,"timeouts":io.http_poll_timeouts,
+            "status_errors":io.http_poll_status_errors,"oversize":io.http_poll_oversize,"bad_responses":io.http_poll_bad_responses,
+            "rows":io.http_poll_rows,"dropped_bad":io.http_poll_dropped_bad,"dropped_oversize":io.http_poll_dropped_oversize,
+            "dropped_budget":io.http_poll_dropped_budget,"skipped_ticks":io.http_poll_skipped_ticks,
+            "backpressure_waits":io.http_poll_backpressure_waits,"inflight":io.http_poll_inflight,
+            "inbox_items":io.http_poll_inbox_items,"inbox_bytes":io.http_poll_inbox_bytes,
+            "scope":"this_attempt; rows=admitted_to_volatile_inbox_not_delivery_receipt"}))}else{None},
         "http_active_delivery_groups":io.http_inflight,
         "delivery":{"active_input_batches":delivery.active_groups,"active_rows":delivery.active_rows,
             "encoded_credit_bytes":delivery.encoded_credit_bytes,"peak_encoded_credit_bytes":delivery.peak_encoded_credit_bytes,
@@ -1080,6 +1088,30 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "decode_errors": io.decode_errors,
     });
     io_fields["lookup_update_failed"]=json!(io.lookup_update_failed);
+    for (name, value) in [
+        ("http_poll_requests", io.http_poll_requests),
+        ("http_poll_ok", io.http_poll_ok),
+        ("http_poll_not_modified", io.http_poll_not_modified),
+        ("http_poll_failed", io.http_poll_failed),
+        ("http_poll_timeouts", io.http_poll_timeouts),
+        ("http_poll_status_errors", io.http_poll_status_errors),
+        ("http_poll_oversize", io.http_poll_oversize),
+        ("http_poll_bad_responses", io.http_poll_bad_responses),
+        ("http_poll_rows", io.http_poll_rows),
+        ("http_poll_dropped_bad", io.http_poll_dropped_bad),
+        ("http_poll_dropped_oversize", io.http_poll_dropped_oversize),
+        ("http_poll_dropped_budget", io.http_poll_dropped_budget),
+        ("http_poll_skipped_ticks", io.http_poll_skipped_ticks),
+        (
+            "http_poll_backpressure_waits",
+            io.http_poll_backpressure_waits,
+        ),
+        ("http_poll_inflight", io.http_poll_inflight),
+        ("http_poll_inbox_items", io.http_poll_inbox_items),
+        ("http_poll_inbox_bytes", io.http_poll_inbox_bytes),
+    ] {
+        io_fields[name] = json!(value);
+    }
     let mut value = json!({
         "jobs_started": snap.jobs_started,
         "state_accounting_errors_total": state.supervisor.kernel().process_owner().accounting_errors_total(),

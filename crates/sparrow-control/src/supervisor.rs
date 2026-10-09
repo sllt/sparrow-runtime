@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "demo-io")]
 use sparrow_connectors::{publish_qos0, sensor_json, EmbeddedBroker, HttpCapture};
 use sparrow_connectors::{
-    FileReplayConfig, FileReplaySource, HttpPushSource, HttpSink, IoDiagnostics, LogSink, MqttSink,
-    MqttSource,
+    FileReplayConfig, FileReplaySource, HttpPollSource, HttpPushSource, HttpSink, IoDiagnostics,
+    LogSink, MqttSink, MqttSource,
 };
 use sparrow_io::observed;
 use sparrow_io::ReplayableSource;
@@ -30,9 +30,9 @@ use tokio_util::sync::CancellationToken;
 use crate::checkpoint::{CheckpointAdmission, CheckpointControl, CheckpointSpec};
 use crate::store::{ActualState, Store};
 use crate::validate::{
-    bind_plan_with_store, http_config, http_push_config, mqtt_config, mqtt_sink_config,
-    store_policy, stream_to_schema, validate_aligned_plan, validate_io_with_plan, DemoEndpoints,
-    StoreSecrets,
+    bind_plan_with_store, http_config, http_poll_config, http_push_config, mqtt_config,
+    mqtt_sink_config, store_policy, stream_to_schema, validate_aligned_plan, validate_io_with_plan,
+    DemoEndpoints, StoreSecrets,
 };
 
 /// Cap on **consecutive** start failures. Lifetime `attempt_id` still
@@ -1323,7 +1323,7 @@ impl Supervisor {
             request=request.with_live_events(rx).with_live_out(tx_out);
             tx_plugin=Some(tx);
             (None,None)
-        } else if kind == "mqtt" {
+        } else if kind == "mqtt" || kind == "http_poll" {
             let (tx, rx) = observed::channel(inbox);
             diag.observe_source(&tx);
             request = request.with_budgeted_live_io(rx, tx_out);
@@ -1353,6 +1353,34 @@ impl Supervisor {
                     self.kernel.handle().spawn(async move {
                         push.run(tx_in.expect("HTTP ingress"), cancel_src).await;
                         Ok(())
+                    })
+                }
+                "http_poll" => {
+                    let cfg =
+                        http_poll_config(&spec.source, schema, spec.effective_fail_on_decode())?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)
+                        .map_err(SparrowError::from)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)
+                        .map_err(SparrowError::from)?;
+                    let poll = HttpPollSource::bind(cfg, &self.secrets, policy, Arc::clone(&diag))
+                        .map_err(SparrowError::from)?;
+                    let cancel_job = cancel.clone();
+                    let owner = job.memory_owner();
+                    let max_row_bytes = self.kernel.ingress_row_limit();
+                    self.kernel.handle().spawn(async move {
+                        let r = poll
+                            .run_budgeted(
+                                tx_budgeted.expect("HTTP poll ingress"),
+                                cancel_job.clone(),
+                                owner,
+                                max_row_bytes,
+                            )
+                            .await
+                            .map_err(SparrowError::from);
+                        if r.is_err() {
+                            cancel_job.cancel();
+                        }
+                        r
                     })
                 }
                 "mqtt" => {
@@ -1419,7 +1447,7 @@ impl Supervisor {
         };
         Ok(RunningJob {
             graph_ports: None,
-            source_kind: match kind {"mqtt"=>"mqtt","plugin"=>"plugin",_=>"http_push"},
+            source_kind: match kind {"mqtt"=>"mqtt","plugin"=>"plugin","http_poll"=>"http_poll",_=>"http_push"},
             sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
             stable: false,

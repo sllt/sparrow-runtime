@@ -31,7 +31,10 @@ pub use reference_table::{
     MAX_REFERENCE_TABLE_CATALOG_BYTES, MAX_REFERENCE_TABLE_NAMES, MAX_REFERENCE_TABLE_PREVIEW_PINS,
     MAX_REFERENCE_TABLE_ROWS, MAX_REFERENCE_TABLE_VERSIONS, REFERENCE_TABLE_METADATA_BYTES,
 };
-pub use spec::{PipelineSpec, ReferenceBinding, RestoreSpec, SinkSpec, SourceSpec, StreamSpec};
+pub use spec::{
+    HttpPollAuthSpec, HttpPollHeaderSpec, HttpPollSpec, PipelineSpec, ReferenceBinding,
+    RestoreSpec, SinkSpec, SourceSpec, StreamSpec,
+};
 #[cfg(all(test, feature = "demo-io", target_os = "linux"))]
 mod actions_tests;
 #[cfg(all(test, feature = "demo-io"))]
@@ -82,6 +85,8 @@ mod r4_tests;
 mod core_a_tests;
 #[cfg(all(test, feature = "demo-io"))]
 mod core_b2_tests;
+#[cfg(all(test, feature = "demo-io"))]
+mod http_poll_tests;
 #[cfg(all(test, feature = "demo-io"))]
 mod hysteresis_completion_tests;
 #[cfg(all(test, feature = "jetstream", feature = "demo-io"))]

@@ -2619,6 +2619,7 @@ mod tests {
             source: SourceSpec {
                 plugin: None,
                 jetstream: None,
+                http_poll: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
                 port: Some(1883),

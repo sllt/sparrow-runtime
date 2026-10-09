@@ -37,6 +37,10 @@ enum Input {
         source: HttpPushSource,
         tx: observed::Sender<sparrow_model::Row>,
     },
+    HttpPoll {
+        source: HttpPollSource,
+        tx: observed::Sender<sparrow_model::QueuedRow>,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -413,6 +417,20 @@ impl Supervisor {
                     binding.live = Some(rx);
                     Input::Http { source, tx }
                 }
+                "http_poll" => {
+                    let cfg =
+                        http_poll_config(source_spec, schema, spec.effective_fail_on_decode())?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)
+                        .map_err(SparrowError::from)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)
+                        .map_err(SparrowError::from)?;
+                    let source = HttpPollSource::bind(cfg, &self.secrets, policy, diag.clone())
+                        .map_err(SparrowError::from)?;
+                    let (tx, rx) = observed::channel(source_spec.inbox_capacity);
+                    diag.observe_source(&tx);
+                    binding.budgeted = Some(rx);
+                    Input::HttpPoll { source, tx }
+                }
                 _ => {
                     return Err(SparrowError::new(
                         ErrorCode::FeatureUnavailable,
@@ -544,6 +562,10 @@ impl Supervisor {
                             source.run(tx, child.clone()).await;
                             Ok(())
                         }
+                        Input::HttpPoll { source, tx } => source
+                            .run_budgeted(tx, child.clone(), owner, max_row_bytes)
+                            .await
+                            .map_err(SparrowError::from),
                     };
                     if result.is_err() {
                         child.cancel();

@@ -1,4 +1,4 @@
-//! Production I/O adapters. MQTT/HTTP/file live here — never in
+//! Production I/O adapters. MQTT/HTTP (sink, push, poll, lookup)/file live here — never in
 //! `sparrow-runtime` or `sparrow-model`.
 //!
 //! Default delivery is `live_best_effort` + `restart_fresh`. MQTT replay is
@@ -13,6 +13,7 @@ pub mod file_replay;
 pub mod file_sink;
 pub mod http;
 pub mod http_lookup;
+pub mod http_poll;
 pub mod http_push;
 #[cfg(feature = "jetstream")]
 pub mod jetstream;
@@ -33,6 +34,9 @@ pub use file_replay::{FileContract, FilePoll, FileReplayConfig, FileReplaySource
 pub use http::{CapturedRequest, HttpCapture};
 pub use http::{HttpSink, HttpSinkConfig};
 pub use http_lookup::{HttpLookup, HttpLookupConfig};
+pub use http_poll::{
+    HttpPollAuth, HttpPollFormat, HttpPollHeader, HttpPollSource, HttpPollSourceConfig,
+};
 pub use http_push::{HttpPushSource, HttpPushSourceConfig};
 pub use log::{LogSink, LogSinkConfig};
 #[cfg(feature = "demo-io")]
