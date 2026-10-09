@@ -559,7 +559,9 @@ fn validate_sink_format(sink: &SinkSpec, schema: &Schema) -> Result<()> {
 /// `msg_id_column` must be a utf8/integer column of the sink's input.
 fn validate_sink_schema(sink: &SinkSpec, schema: &Schema) -> Result<()> {
     if sink.influxdb.is_some() {
-        influxdb_sink_config(sink)?.mapping.compile(schema)?;
+        let config = influxdb_sink_config(sink)?;
+        config.check_schema_budget(schema, sparrow_model::ResourceBudget::compact().reservation_bytes)?;
+        config.mapping.compile(schema)?;
     }
     #[cfg(feature = "jetstream")]
     if let Some(js) = &sink.jetstream {

@@ -127,6 +127,8 @@ telemetry,device_id=d\ 1 temperature=21.5 1700000000123
 溢出视为超限，不做静默钳制。例如 compact 下 `batch_bytes = 1 MiB` 不开 gzip 可以，开 gzip 拒绝。
 回执对象在创建前单独预扣；请求只持有已成功编码的行所属批次，槽位容量不超过 `batch_rows`。
 坏记录不积累回执，前一个请求失败也不会错误地判定尚未加入该请求的下一批失败。
+编译列映射前另预扣工作集，并持有到缓存映射释放；带 schema 的校验把它计入峰值。
+运行时使用 reservation 上限为 job 一半的 child owner，限制映射、回执和请求的合计占用。
 
 ## 关闭
 

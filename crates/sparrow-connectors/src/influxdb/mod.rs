@@ -218,6 +218,19 @@ impl InfluxDbSinkConfig {
         }
     }
 
+    pub fn check_schema_budget(&self, schema: &Schema, reservation_bytes: usize) -> Result<()> {
+        let need = self
+            .peak_bytes()
+            .and_then(|n| n.checked_add(self.mapping.workspace_bytes(schema)));
+        if need.is_none_or(|n| n > reservation_bytes / 2) {
+            return Err(err(
+                ErrorCode::BoundExceeded,
+                "InfluxDB request and compiled mapping exceed half the job reservation budget",
+            ));
+        }
+        Ok(())
+    }
+
     /// Target policy for the write URL and the token secret (never
     /// returned). Returns the `Authorization` header value.
     pub fn validate_target(
@@ -468,6 +481,11 @@ impl InfluxDbSink {
             config.ca_pem.as_deref(),
         )
         .map_err(SparrowError::from)?;
+        // Enforce the per-Sink cap across mapping, receipts and requests,
+        // not merely a static configuration estimate.
+        let mut budget = owner.budget();
+        budget.reservation_bytes /= 2;
+        let owner = MemoryOwner::child(owner, budget, "influxdb-sink");
         Ok(Self {
             config,
             diag,
@@ -642,9 +660,22 @@ impl InfluxDbSink {
             return;
         }
         let schema = batch.schema_arc();
-        if state.compiled.as_ref().is_none_or(|(s, _)| **s != *schema) {
+        if state
+            .compiled
+            .as_ref()
+            .is_none_or(|(s, _, _)| **s != *schema)
+        {
+            let Ok(mapping_lease) = self.owner.acquire(
+                CreditKind::Reservation,
+                self.config.mapping.workspace_bytes(&schema),
+            ) else {
+                self.diag
+                    .influxdb_sink_dropped_budget
+                    .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                return;
+            };
             match self.config.mapping.compile(&schema) {
-                Ok(compiled) => state.compiled = Some((schema.clone(), compiled)),
+                Ok(compiled) => state.compiled = Some((schema.clone(), compiled, mapping_lease)),
                 Err(e) => {
                     self.fatal(state, cancel, "influxdb_schema_mismatch", e.code);
                     return;
@@ -1124,7 +1155,7 @@ impl InfluxDbSink {
 
 struct State {
     pending: Option<Request>,
-    compiled: Option<(Arc<Schema>, CompiledMapping)>,
+    compiled: Option<(Arc<Schema>, CompiledMapping, MemoryLease)>,
     deadline: Option<Instant>,
     fatal: bool,
 }

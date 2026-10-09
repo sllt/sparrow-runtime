@@ -144,6 +144,17 @@ fn check_name(what: &str, name: &str) -> Result<(), SparrowError> {
 }
 
 impl InfluxMapping {
+    /// Conservative transient + retained mapping storage: escaped key
+    /// buffers, tag sorting/indices, validation sets and Vec growth. Charge
+    /// before compile, retain until this compiled mapping is dropped.
+    pub fn workspace_bytes(&self, schema: &Schema) -> usize {
+        schema.fields.iter().fold(8 * 1024usize, |bytes, field| {
+            bytes
+                .saturating_add(field.name.len().saturating_mul(8))
+                .saturating_add(256)
+        })
+    }
+
     /// Schema-independent checks (spec / validate time).
     pub fn check(&self) -> Result<(), SparrowError> {
         if let Measurement::Fixed(name) = &self.measurement {

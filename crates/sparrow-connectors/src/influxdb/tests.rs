@@ -392,6 +392,71 @@ fn bound_sink() -> InfluxDbSink {
     .unwrap()
 }
 
+#[tokio::test]
+async fn reliable_output_is_fatal_instead_of_silently_discarding_and_continuing() {
+    let sink = bound_sink();
+    let cancel = CancellationToken::new();
+    let outbox = Arc::new(InflightCounter::new());
+    outbox.enqueue();
+    let mut state = State {
+        pending: None,
+        compiled: None,
+        deadline: None,
+        fatal: false,
+    };
+    let batch = batch(&owner(), vec![row(1, "h", 1.0, "x")])
+        .with_output_sequence(sparrow_model::OutputSequence::new([1; 16], 1).unwrap())
+        .unwrap();
+    sink.write_batch(batch, &mut state, &cancel, Some(&outbox))
+        .await;
+    assert!(state.fatal);
+    assert!(cancel.is_cancelled());
+    assert_eq!(outbox.failed(), 1);
+    assert_eq!(sink.diag.snapshot().influxdb_sink_fatal, 1);
+    assert!(state.pending.is_none());
+}
+
+#[test]
+fn mapping_credit_and_the_combined_sink_budget_are_not_just_pointer_sizes() {
+    let sink = bound_sink();
+    assert_eq!(
+        sink.owner.budget().reservation_bytes,
+        ResourceBudget::compact().reservation_bytes / 2
+    );
+    let fields = (0..256)
+        .map(|i| {
+            Field::new(
+                FieldId::new(i + 1),
+                format!("{i:03}{}", "x".repeat(250)),
+                DataType::Int64,
+                false,
+            )
+        })
+        .collect();
+    let wide = Schema::new(SchemaId::new(2), fields).unwrap();
+    let mut config = config(8086, true);
+    config.batch_bytes = 1024 * 1024;
+    config
+        .check_reservation_budget(ResourceBudget::compact().reservation_bytes)
+        .unwrap();
+    assert_eq!(
+        config
+            .check_schema_budget(&wide, ResourceBudget::compact().reservation_bytes)
+            .unwrap_err()
+            .code,
+        ErrorCode::BoundExceeded
+    );
+    let huge_token =
+        MapSecretResolver::new([("tok".into(), "x".repeat(MAX_TOKEN_BYTES + 1))].into());
+    assert_eq!(
+        config
+            .validate_target(&huge_token, &TargetPolicy::allow("localhost", 8086))
+            .unwrap_err()
+            .code,
+        ErrorCode::BoundExceeded
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn expired_stop_wins_over_ready_work_and_never_extends_deadline() {
     let sink = bound_sink();
