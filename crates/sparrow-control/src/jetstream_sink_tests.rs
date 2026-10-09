@@ -810,7 +810,8 @@ mod broker {
                     _ => unreachable!(),
                 };
                 let published = count(&context, target).await;
-                store.put_pipeline("js", &parse(&value).unwrap(), None).unwrap();
+                let etag = store.get_pipeline("js").unwrap().etag;
+                store.put_pipeline("js", &parse(&value).unwrap(), Some(&etag)).unwrap();
                 request_start(&store, "js", "test").unwrap();
                 let error = assert_start_rejected(&sup, &store, &kernel).await;
                 assert!(error.contains("checkpoint") || error.contains("semantic") || error.contains("sink"), "{change}: {error}");
@@ -926,8 +927,9 @@ mod broker {
                 let before_js = count(&context, "OUT").await;
                 append(&input, 9, 12);
                 value["sink"] = if seed_jetstream { http_sink } else { js_sink };
+                let etag = store.get_pipeline("js").unwrap().etag;
                 store
-                    .put_pipeline("js", &parse(&value).unwrap(), None)
+                    .put_pipeline("js", &parse(&value).unwrap(), Some(&etag))
                     .unwrap();
                 request_start(&store, "js", "test").unwrap();
                 let error = assert_start_rejected(&sup, &store, &kernel).await;
