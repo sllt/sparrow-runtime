@@ -55,6 +55,11 @@ fn aligned_spec(url: &str, path: &std::path::Path, dir: &std::path::Path) -> Val
     })
 }
 
+#[cfg(feature = "jetstream")]
+fn explicit_csv_sink_defaults() -> Value {
+    json!({"delimiter": ",", "quote": "\"", "header": true, "null_value": ""})
+}
+
 fn parse(value: &Value) -> sparrow_model::Result<PipelineSpec> {
     PipelineSpec::from_json(&serde_json::to_vec(value).unwrap())
 }
@@ -291,6 +296,71 @@ fn jetstream_sink_validation_bounds_schema_and_shared_reservation() {
 }
 
 #[cfg(feature = "jetstream")]
+#[test]
+fn jetstream_sink_csv_aligned_validation_and_v28_diagnostics_bind_effective_format() {
+    let store = crate::Store::open_memory().unwrap();
+    store.put_stream("events", EVENTS_SCHEMA).unwrap();
+    let root = sparrow_connectors::ensure_default_data_root();
+    let mut value = aligned_spec(
+        "nats://127.0.0.1:4222",
+        &root.join("unused.ndjson"),
+        &root.join("unused-checkpoints"),
+    );
+    value["sink"]["format"] = json!("csv");
+    let spec = parse(&value).unwrap();
+    let plan = crate::bind_plan_with_store(&store, &spec, "p", 1).unwrap();
+    let schema = crate::stream_to_schema(&store.get_stream("events").unwrap()).unwrap();
+    crate::validate::validate_io_with_plan(
+        &spec,
+        &schema,
+        &plan,
+        &sparrow_connectors::MapSecretResolver::new(Default::default()),
+        &sparrow_connectors::TargetPolicy::allow("127.0.0.1", 4222),
+        None,
+    )
+    .unwrap();
+    let effective = crate::validate::effective_guarantees_with_plan(&spec, &plan);
+    assert_eq!(
+        effective["checkpoint_participants"]["profile"],
+        "file_jetstream_sink_v28"
+    );
+    assert_eq!(effective["checkpoint_participants"]["snapshot_version"], 28);
+    assert_eq!(
+        effective["checkpoint_participants"]["sink_identity_codec"],
+        "JSI2"
+    );
+    assert_eq!(effective["sink_delivery"]["into_stream"], "at_least_once");
+    assert_eq!(effective["exactly_once"], false);
+    assert_eq!(spec.delivery, "live_best_effort");
+    assert!(!spec.fail_on_decode);
+
+    value["sink"]["csv"] = explicit_csv_sink_defaults();
+    let explicit = parse(&value).unwrap();
+    assert_eq!(
+        spec.sink.payload_format().unwrap(),
+        explicit.sink.payload_format().unwrap()
+    );
+    let explicit_plan = crate::bind_plan_with_store(&store, &explicit, "p", 1).unwrap();
+    assert_eq!(
+        effective,
+        crate::validate::effective_guarantees_with_plan(&explicit, &explicit_plan)
+    );
+
+    // Typed callers cannot bypass compilation and advertise JSON/v27 for a
+    // malformed CSV sink, even if they skipped from_json/basic_check.
+    value["sink"]["csv"]["delimiter"] = json!("not-one-byte");
+    let typed: PipelineSpec = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        crate::validate_aligned_plan(&typed, &plan)
+            .unwrap_err()
+            .code,
+        sparrow_model::ErrorCode::InvalidArgument
+    );
+    let invalid = crate::validate::effective_guarantees_with_plan(&typed, &plan);
+    assert_eq!(invalid["aligned_eligible"], false);
+}
+
+#[cfg(feature = "jetstream")]
 mod broker {
     use super::*;
     use crate::{request_start, Store, Supervisor};
@@ -347,6 +417,16 @@ mod broker {
         for seq in 1..=n {
             let msg = s.get_raw_message(seq).await.unwrap();
             out.push(serde_json::from_slice(&msg.payload).unwrap());
+        }
+        out
+    }
+
+    async fn raw_payloads(context: &jetstream::Context, stream: &str) -> Vec<Vec<u8>> {
+        let s = context.get_stream(stream).await.unwrap();
+        let n = count(context, stream).await;
+        let mut out = Vec::new();
+        for seq in 1..=n {
+            out.push(s.get_raw_message(seq).await.unwrap().payload.to_vec());
         }
         out
     }
@@ -817,6 +897,234 @@ mod broker {
                 assert!(error.contains("checkpoint") || error.contains("semantic") || error.contains("sink"), "{change}: {error}");
                 assert_eq!(durable_cut(&directory), before, "{change}: CURRENT, state generation and all published generations must remain unchanged");
                 assert_eq!(count(&context, target).await, published, "{change}: rejection must happen before any extra publish");
+                sup.stop_all().await;
+                assert_released(&kernel).await;
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires SPARROW_NATS_SERVER (real nats-server binary)"]
+    fn jetstream_sink_csv_v28_checkpoint_restores_with_explicit_defaults_and_dedups() {
+        let scratch = Scratch::new();
+        let input = scratch.0.join("events.ndjson");
+        let directory = scratch.0.join("checkpoints");
+        append(&input, 1, 8);
+        let kernel = Arc::new(crate::host_kernel().unwrap());
+        kernel.block_on(async {
+            let fixture = NatsSandbox::start().await;
+            let context = create_stream(&fixture, "OUT", "out.>").await;
+            let store = Arc::new(Store::open_memory().unwrap());
+            store.put_stream("events", EVENTS_SCHEMA).unwrap();
+            store.put_allow("127.0.0.1", fixture.port).unwrap();
+            let mut value = aligned_spec(&fixture.url(), &input, &directory);
+            value["sink"]["format"] = json!("csv");
+            store
+                .put_pipeline("js", &parse(&value).unwrap(), None)
+                .unwrap();
+            request_start(&store, "js", "test").unwrap();
+            let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+            sup.converge_once().await.unwrap();
+            wait_count(&context, "OUT", 4, &sup, &store, "js").await;
+            let first = checkpoint(&sup).await;
+            assert_eq!(snapshot_version(&directory, first), 28);
+            let saved = sparrow_runtime::CheckpointStore::open_readonly(&directory)
+                .unwrap()
+                .recover_pipeline_id(first)
+                .unwrap();
+            let identity = saved.sink_identity.as_ref().expect("v28 CSV sink identity");
+            assert_eq!(
+                identity.encoding,
+                sparrow_io::SinkEncoding::Csv(
+                    sparrow_io::CsvEncodeIdentity::new(b',', b'"', true, "").unwrap()
+                )
+            );
+            let mut stream = context.get_stream("OUT").await.unwrap();
+            assert_eq!(
+                identity.created_nanos,
+                stream.info().await.unwrap().created.unix_timestamp_nanos()
+            );
+            assert!(
+                saved.next_output.is_none(),
+                "sink target is not a JS input cursor"
+            );
+
+            // Only the first four filtered rows are checkpointed. The next
+            // two actually reach the broker and must replay as duplicate acks.
+            append(&input, 9, 12);
+            wait_count(&context, "OUT", 6, &sup, &store, "js").await;
+            sup.kill_named("js").await.unwrap();
+            assert_released(&kernel).await;
+            let before = durable_cut(&directory);
+            value["sink"]["csv"] = explicit_csv_sink_defaults();
+            let etag = store.get_pipeline("js").unwrap().etag;
+            store
+                .put_pipeline("js", &parse(&value).unwrap(), Some(&etag))
+                .unwrap();
+            request_start(&store, "js", "test").unwrap();
+            sup.converge_once().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    sup.converge_once().await.unwrap();
+                    assert_eq!(store.actual("js").unwrap().status, "running");
+                    if sup
+                        .flow_snapshot("js")
+                        .unwrap()
+                        .unwrap()
+                        .diagnostics
+                        .snapshot()
+                        .jetstream_sink_duplicates
+                        >= 2
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("CSV restore must replay the uncheckpointed tail on the existing target");
+            let replay_io = sup
+                .flow_snapshot("js")
+                .unwrap()
+                .unwrap()
+                .diagnostics
+                .snapshot();
+            assert_eq!(replay_io.jetstream_sink_duplicates, 2);
+            assert_eq!(
+                replay_io.jetstream_sink_acked, 2,
+                "only the uncheckpointed tail is republished"
+            );
+            assert_eq!(
+                sup.checkpoint_snapshot("js")
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .snapshot()
+                    .restored_from,
+                Some(first)
+            );
+            assert_eq!(
+                durable_cut(&directory),
+                before,
+                "equivalent defaults do not fork history at startup"
+            );
+            assert_eq!(
+                count(&context, "OUT").await,
+                6,
+                "CSV replay uses the same Nats-Msg-Id policy"
+            );
+            append(&input, 13, 16);
+            wait_count(&context, "OUT", 8, &sup, &store, "js").await;
+            let second = checkpoint(&sup).await;
+            assert!(second > first);
+            assert_eq!(snapshot_version(&directory, second), 28);
+            let restored = sparrow_runtime::CheckpointStore::open_readonly(&directory)
+                .unwrap()
+                .recover_pipeline_id(second)
+                .unwrap();
+            assert_eq!(restored.generation, saved.generation);
+            assert_eq!(restored.sink_identity, saved.sink_identity);
+            let expected: Vec<Vec<u8>> = [1, 3, 5, 7, 9, 11, 13, 15]
+                .into_iter()
+                .map(|id| format!("id,v\n{id},{id}\n").into_bytes())
+                .collect();
+            assert_eq!(
+                raw_payloads(&context, "OUT").await,
+                expected,
+                "CSV oracle is exact wire bytes, not the JSON rows decoder"
+            );
+            assert_eq!(
+                sup.flow_snapshot("js")
+                    .unwrap()
+                    .unwrap()
+                    .diagnostics
+                    .snapshot()
+                    .csv_encode_errors,
+                0
+            );
+            sup.stop_all().await;
+            assert_released(&kernel).await;
+        });
+    }
+
+    #[test]
+    #[ignore = "requires SPARROW_NATS_SERVER (real nats-server binary)"]
+    fn jetstream_sink_v27_v28_encoding_and_each_csv_option_drift_reject_before_publish() {
+        let kernel = Arc::new(crate::host_kernel().unwrap());
+        kernel.block_on(async {
+            for change in [
+                "json_to_csv",
+                "csv_to_json",
+                "delimiter",
+                "quote",
+                "header",
+                "null_value",
+            ] {
+                let scratch = Scratch::new();
+                let input = scratch.0.join("events.ndjson");
+                let directory = scratch.0.join("checkpoints");
+                append(&input, 1, 8);
+                let fixture = NatsSandbox::start().await;
+                let context = create_stream(&fixture, "OUT", "out.>").await;
+                let store = Arc::new(Store::open_memory().unwrap());
+                store.put_stream("events", EVENTS_SCHEMA).unwrap();
+                store.put_allow("127.0.0.1", fixture.port).unwrap();
+                let mut value = aligned_spec(&fixture.url(), &input, &directory);
+                let seed_csv = change != "json_to_csv";
+                if seed_csv {
+                    value["sink"]["format"] = json!("csv");
+                }
+                store
+                    .put_pipeline("js", &parse(&value).unwrap(), None)
+                    .unwrap();
+                request_start(&store, "js", "test").unwrap();
+                let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+                sup.converge_once().await.unwrap();
+                wait_count(&context, "OUT", 4, &sup, &store, "js").await;
+                let id = checkpoint(&sup).await;
+                assert_eq!(
+                    snapshot_version(&directory, id),
+                    if seed_csv { 28 } else { 27 }
+                );
+                sup.kill_named("js").await.unwrap();
+                assert_released(&kernel).await;
+                let before = durable_cut(&directory);
+                let published = raw_payloads(&context, "OUT").await;
+                assert_eq!(published.len(), 4);
+                // Unpublished IDs prevent broker dedup from masking an
+                // accidentally admitted restore / early source activation.
+                append(&input, 9, 12);
+                match change {
+                    "json_to_csv" => value["sink"]["format"] = json!("csv"),
+                    "csv_to_json" => value["sink"]["format"] = json!("json"),
+                    option => {
+                        value["sink"]["csv"] = explicit_csv_sink_defaults();
+                        value["sink"]["csv"][option] = match option {
+                            "delimiter" => json!(";"),
+                            "quote" => json!("'"),
+                            "header" => json!(false),
+                            "null_value" => json!("NULL"),
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                let etag = store.get_pipeline("js").unwrap().etag;
+                store
+                    .put_pipeline("js", &parse(&value).unwrap(), Some(&etag))
+                    .unwrap();
+                request_start(&store, "js", "test").unwrap();
+                let error = assert_start_rejected(&sup, &store, &kernel).await;
+                assert!(error.contains("checkpoint"), "{change}: {error}");
+                assert_eq!(
+                    durable_cut(&directory),
+                    before,
+                    "{change}: CURRENT/STATE_GENERATION/history must not change"
+                );
+                assert_eq!(
+                    raw_payloads(&context, "OUT").await,
+                    published,
+                    "{change}: no extra or rewritten broker output"
+                );
                 sup.stop_all().await;
                 assert_released(&kernel).await;
             }

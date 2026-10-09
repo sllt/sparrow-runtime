@@ -38,7 +38,7 @@
 
 ## 语法（严格）
 
-- 记录以 `\n` 结束，前面的 `\r` 会被去掉（CRLF）。空行跳过。
+- 记录以 `\n` 或 `\r\n` 结束，只剥掉一组末尾终止符；裸 `\r` 不会被当作终止符宽松剥掉，出现在引号外即 malformed。空行跳过。
 - 引号只能出现在字段开头。引号字段在结束引号之后只能紧跟分隔符或行尾。字段中间出现裸引号、引号后面还有字符、引号未闭合，都属于 malformed。
 - UTF-8 BOM 只在文档开头 / 文件开头（偏移 0）接受，其他位置的 BOM 原样作为数据。
 - 列名不能重复，长度 ≤ 256 B。
@@ -58,10 +58,12 @@
 
 编码只在以下情况给字段加引号：
 
-- 字段文本等于 `null_value`（因此空字符串在默认配置下写成 `""`，与 NULL 区分开）；
+- 非 NULL 空单元格总是加引号，避免变成被跳过的空记录或误解为 NULL；字段文本等于 `null_value` 也加引号；
 - 含有分隔符、引号、`\r` 或 `\n`；
 - 首尾有空格或 tab；
 - 以 BOM 开头。
+
+这些转义规则适用于所有非 NULL 标量文本，包括数字、bool 和 Base64，不只 Utf8；使用自定义分隔符、引号或 NULL 标记时也一样。
 
 编码再解码可以完整还原（有单元测试覆盖）。
 
@@ -99,6 +101,7 @@
 - 目录标记文件 `FORMAT` 为 `SPARROW_CSV_SINK_V1` 加一行编码选项的 JSON（`delimiter`、`quote`、`header`、`null_value`），与 NDJSON 目录互不兼容。这四项总是写出，Sink 也不接受解码选项，因此显式写默认值与省略得到相同的标记。段文件命名为 `part-N.csv`。
 - 用不同的 CSV 选项重新打开已有目录（无论是否 aligned 恢复）会被拒绝（`policy_denied`，"different CSV options"），不会在同一目录中混写两种方言。
 - 每个新段文件开头写一次表头，表头计入段字节数和配额。表头加一行必须能放进一个段，否则拒绝。
+- 表头的驻留信用随 `Writer.header` 跨 batch 保留，直到表头替换或 Writer 关闭才释放，不在单批编码结束时提前退款。
 - schema 表头变化时轮转到新段。
 - CSV File Sink 不接受 `action`。
 
@@ -110,7 +113,14 @@
   - Source 是 JetStream；
   - `recovery: aligned`。
 
-  需要 checkpointed 投递时请用 `format: "json"`。
+  HTTP 需要 checkpointed 投递时请用 `format: "json"`；此限制不适用于下面的 JetStream Sink v28。
+
+## JetStream Sink
+
+- 一行一条消息；`header: true` 时每条消息都带自己的表头，PubAck/outbox 确认语义与 JSON 相同。
+- 独立线性 File → JetStream 的 aligned 输出用 JSON **v27/JSI1** 或 CSV **v28/JSI2**。CSV 目标身份绑定编译后的 `delimiter`、`quote`、`header`、`null_value` 四项，显式默认值与省略等价。
+- JSON↔CSV、任一编码选项、目标或完整输出计算语义变化都拒绝继承历史（`unsupported_restore`）。v27/v28 使用独立目录，不自动迁移；拒绝发生在 File seek/状态激活/发布之前，不推进 `CURRENT` 或 `STATE_GENERATION`。
+- 仍要求可写 File/Limits stream、全部前置 PubAck 和目标复验；不开放其他 source-only/graph/IoT checkpoint profile，亦不承诺 exactly-once。
 
 ## 坏数据与计数
 

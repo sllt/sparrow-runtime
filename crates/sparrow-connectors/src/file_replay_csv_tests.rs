@@ -79,6 +79,31 @@ fn assert_exact_resume(cfg: &FileReplayConfig, expected: &[Seen]) {
 }
 
 #[test]
+fn review_csv_file_bare_cr_is_not_silently_removed_at_eof_or_crlf() {
+    for tail in [b"x\r".as_slice(), b"x\r\r\n", b"x\r\n"] {
+        let path = tmp("bare-cr");
+        let mut content = b"v\n".to_vec();
+        content.extend_from_slice(tail);
+        std::fs::write(&path, content).unwrap();
+        let mut cfg = config(&path, CsvOptions::default(), FileContract::Sealed);
+        cfg.schema = Schema::new(1, vec![Field::new(1, "v", DataType::Utf8, false)]).unwrap();
+        let mut source = FileReplaySource::open(&cfg).unwrap();
+        let got = drain(&mut source);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].0,
+            if tail == b"x\r\n" {
+                Seen::Row(vec![Scalar::utf8("x")])
+            } else {
+                Seen::Bad
+            }
+        );
+        drop(source);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
 fn csv_header_bom_crlf_blank_lines_and_exact_resume() {
     let path = tmp("basic");
     fs::write(

@@ -563,11 +563,17 @@ impl FileReplaySource {
                 format!("record exceeds {MAX_RECORD}B; skipped to next boundary"),
             ));
         }
-        if self.pending.last() == Some(&b'\n') {
-            self.pending.pop();
-        }
-        if self.pending.last() == Some(&b'\r') {
-            self.pending.pop();
+        if self.csv.is_some() {
+            let len = sparrow_formats::csv::strip_terminator(&self.pending).len();
+            self.pending.truncate(len);
+        } else {
+            // Preserve the established NDJSON framing contract.
+            if self.pending.last() == Some(&b'\n') {
+                self.pending.pop();
+            }
+            if self.pending.last() == Some(&b'\r') {
+                self.pending.pop();
+            }
         }
         if start == 0 && self.csv.is_some() && self.pending.starts_with(CSV_BOM) {
             self.pending.drain(..CSV_BOM.len());

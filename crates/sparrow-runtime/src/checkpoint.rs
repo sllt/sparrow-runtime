@@ -577,7 +577,7 @@ impl CheckpointStore {
         Self::open_profile_exclusive(dir, max_keys, retention, version)
     }
 
-    /// Explicit v27 writer. The fixed target and its Job credit live through
+    /// Explicit v27/JSON or v28/CSV writer. Fixed target and encoding credit live through
     /// every blocking commit; neither fresh writes nor recovery may change it.
     pub fn open_file_jetstream_sink_exclusive(
         dir: impl Into<PathBuf>,
@@ -610,7 +610,8 @@ impl CheckpointStore {
 
     fn check_sink_payload(&self, payload: &[u8]) -> Result<()> {
         let Some(expected) = &self.pipeline_sink else { return Ok(()); };
-        if payload.get(4..6) != Some(crate::pipeline_checkpoint::FILE_JETSTREAM_SINK_SNAPSHOT_VERSION.to_le_bytes().as_slice()) {
+        let version = self.pipeline_version.ok_or_else(|| sink_mismatch("sink store has no fixed output profile"))?;
+        if payload.get(4..6) != Some(version.to_le_bytes().as_slice()) {
             return Err(sink_mismatch("JetStream sink store cannot adopt another checkpoint profile"));
         }
         // The target-only parser is bounded, including temporary canonical
@@ -676,7 +677,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27) {
+        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {

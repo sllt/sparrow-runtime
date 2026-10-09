@@ -656,6 +656,112 @@ fn bounded_encoding_admits_capacity_and_honours_the_limit() {
 }
 
 #[test]
+fn review_csv_all_scalar_text_obeys_dialect_and_null_quoting() {
+    let cases = [
+        (DataType::Int64, Scalar::Int64(0), ",", "\"", "0"),
+        (DataType::UInt64, Scalar::UInt64(0), ",", "\"", "0"),
+        (DataType::Bool, Scalar::Bool(true), ",", "\"", "true"),
+        (DataType::Float64, Scalar::Float64(0.0), ",", "\"", "0"),
+        (DataType::Float64, Scalar::Float64(1.5), ".", "\"", "NULL"),
+        (DataType::Int64, Scalar::Int64(-7), "-", "\"", "NULL"),
+        (DataType::Bytes, Scalar::bytes(vec![251]), "+", "\"", "NULL"),
+        (DataType::Bytes, Scalar::bytes(vec![1]), ",", "=", "NULL"),
+    ];
+    for (ty, value, delimiter, quote, null_value) in cases {
+        let schema = schema(&[("v", ty, true)]);
+        let options = CsvOptions {
+            delimiter: delimiter.into(),
+            quote: quote.into(),
+            null_value: null_value.into(),
+            ..Default::default()
+        };
+        let encoder = options.compile(CsvRole::Encode).unwrap();
+        let decoder = options.compile(CsvRole::Decode).unwrap();
+        let row = Row {
+            values: vec![value],
+        };
+        let encoded = encoder
+            .encode_message_bounded_with_capacity(&schema, &row, 4096, |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            decoder.decode_message(&schema, &encoded, None).unwrap(),
+            row,
+            "{options:?}; {encoded:?}"
+        );
+    }
+}
+
+#[test]
+fn review_csv_non_null_empty_single_cells_are_not_blank_records() {
+    for (ty, value) in [
+        (DataType::Utf8, Scalar::utf8("")),
+        (DataType::Bytes, Scalar::bytes(vec![])),
+    ] {
+        for null_value in ["", "NULL"] {
+            for header in [false, true] {
+                let schema = schema(&[("v", ty.clone(), false)]);
+                let options = CsvOptions {
+                    null_value: null_value.into(),
+                    header,
+                    ..Default::default()
+                };
+                let encoder = options.compile(CsvRole::Encode).unwrap();
+                let decoder = options.compile(CsvRole::Decode).unwrap();
+                let row = Row {
+                    values: vec![value.clone()],
+                };
+                let encoded = encoder
+                    .encode_message_bounded_with_capacity(&schema, &row, 4096, |_| Ok(()))
+                    .unwrap();
+                assert_eq!(
+                    decoder.decode_message(&schema, &encoded, None).unwrap(),
+                    row,
+                    "{options:?}"
+                );
+                assert_eq!(rows(&decoder, &schema, &encoded).len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn review_csv_strips_only_one_real_line_ending_and_never_a_bare_cr() {
+    let schema = schema(&[("v", DataType::Utf8, false)]);
+    let decoder = format(CsvOptions::default());
+    for input in [b"v\nx\r\r\n".as_slice(), b"v\nx\r"] {
+        assert_eq!(
+            decoder
+                .decode_message(&schema, input, None)
+                .unwrap_err()
+                .code,
+            ErrorCode::CodecViolation
+        );
+        assert_eq!(
+            code(&rows(&decoder, &schema, input)[0]),
+            ErrorCode::CodecViolation
+        );
+    }
+    assert_eq!(
+        decoder
+            .decode_message(&schema, b"v\r\nx\r\n", None)
+            .unwrap()
+            .values,
+        vec![Scalar::utf8("x")]
+    );
+}
+
+#[test]
+fn review_csv_encode_schema_rejects_names_its_header_cannot_decode() {
+    let name = "x".repeat(257);
+    let schema = schema(&[(&name, DataType::Utf8, false)]);
+    let encoder = CsvOptions::default().compile(CsvRole::Encode).unwrap();
+    assert_eq!(
+        encoder.check_schema(&schema).unwrap_err().code,
+        ErrorCode::InvalidSchema
+    );
+}
+
+#[test]
 fn framer_tracks_quotes_across_chunks() {
     let f = format(CsvOptions {
         multiline: true,

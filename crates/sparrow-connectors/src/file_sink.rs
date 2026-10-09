@@ -140,6 +140,9 @@ struct Writer {
     next: u64,
     /// CSV header line for the current schema (empty without a header).
     header: Vec<u8>,
+    // Declared after the bytes: retain credit through batch boundaries and
+    // release it only after replacing/dropping the retained header.
+    header_credit: Option<sparrow_model::MemoryLease>,
 }
 impl Writer {
     fn open(config: FileSinkConfig) -> Result<Self> {
@@ -187,6 +190,7 @@ impl Writer {
             files,
             next,
             header: Vec::new(),
+            header_credit: None,
         })
     }
     fn scan(
@@ -367,10 +371,11 @@ impl Writer {
                 .saturating_add(1)
                 .saturating_mul(2)
                 .saturating_add(64);
-            let _credit = owner
+            let mut credit = owner
                 .acquire(CreditKind::Reservation, header_bytes)
                 .map_err(model)?;
             let header = csv.encode_header(schema).map_err(model)?;
+            credit.shrink_to(header.capacity()).map_err(model)?;
             if self.file.is_some() && header != self.header {
                 // A segment never mixes layouts: a different header (schema)
                 // starts a new segment.
@@ -378,6 +383,7 @@ impl Writer {
                 self.file = None;
             }
             self.header = header;
+            self.header_credit = Some(credit);
         }
         for row in batch.rows() {
             if cancel.is_cancelled() {
@@ -765,6 +771,34 @@ mod tests {
             })
             .unwrap();
         builder.finish().unwrap()
+    }
+
+    #[test]
+    fn review_csv_file_header_keeps_credit_until_writer_replacement_or_drop() {
+        let dir = directory();
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let diag = IoDiagnostics::new();
+        let cancel = CancellationToken::new();
+        let action = ActionSpec::default();
+        let mut writer = Writer::open(csv_config(&dir, true)).unwrap();
+        writer.batch(&csv_batch(&owner, "first"), &action, &diag, &cancel).unwrap();
+        assert!(!writer.header.is_empty());
+        let retained = owner.usage().reservation_bytes;
+        assert!(retained >= writer.header.capacity(), "a retained header cannot be refunded at the end of batch");
+        let second = csv_batch(&owner, "second");
+        let pressure = owner.acquire(CreditKind::Reservation,
+            owner.budget().reservation_bytes - owner.usage().reservation_bytes).unwrap();
+        let before = writer.header.clone();
+        assert_eq!(writer.batch(&second, &action, &diag, &cancel).unwrap_err().code(), ErrorCode::ResourceExhausted);
+        assert_eq!(writer.header, before);
+        drop(pressure);
+        drop(second);
+        assert_eq!(owner.usage().reservation_bytes, retained);
+        writer.batch(&csv_batch(&owner, "third"), &action, &diag, &cancel).unwrap();
+        assert_eq!(owner.usage().reservation_bytes, retained, "replacement releases the previous header's credit");
+        drop(writer);
+        assert_eq!(owner.usage().physical_bytes, 0);
+        assert_eq!(owner.accounting_errors_total(), 0);
     }
     #[test]
     fn csv_file_segments_have_one_header_each_and_quote_minimally() {
