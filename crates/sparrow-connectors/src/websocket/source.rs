@@ -461,7 +461,7 @@ impl WebSocketSource {
                             ErrorCode::JobFailed,
                             format!(
                                 "{} ({attempt} consecutive attempts); the supervisor restart policy applies",
-                                failure.reason()
+                                failure.reason("WebSocket")
                             ),
                         )
                         .retryable(true));
