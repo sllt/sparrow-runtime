@@ -87,7 +87,8 @@ fn csv_control_file_to_sql_to_file_exact_output() {
             std::fs::read_to_string(dir.0.join("output/part-00000000000000000001.csv")).unwrap();
         assert_eq!(
             output,
-            "dev,n10,note\na!,10,\"hello, world\"\nb!,20,\\N\nc!,30,\ne!,50,\"multi\nline\"\n"
+            // Non-NULL empty text is quoted even with a visible NULL marker.
+            "dev,n10,note\na!,10,\"hello, world\"\nb!,20,\\N\nc!,30,\"\"\ne!,50,\"multi\nline\"\n"
         );
         assert_eq!(
             std::fs::read(dir.0.join("output/FORMAT")).unwrap(),
