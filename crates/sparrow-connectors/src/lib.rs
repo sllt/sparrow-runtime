@@ -16,6 +16,7 @@ pub mod http;
 pub mod http_lookup;
 pub mod http_poll;
 pub mod http_push;
+pub mod influxdb;
 #[cfg(feature = "jetstream")]
 pub mod jetstream;
 pub mod log;
@@ -47,6 +48,7 @@ pub use http_poll::{
     HttpPollAuth, HttpPollFormat, HttpPollHeader, HttpPollSource, HttpPollSourceConfig,
 };
 pub use http_push::{HttpPushSource, HttpPushSourceConfig};
+pub use influxdb::{InfluxDbSink, InfluxDbSinkConfig};
 pub use log::{LogSink, LogSinkConfig};
 #[cfg(feature = "demo-io")]
 pub use mqtt::{publish_qos0, publish_qos0_many, EmbeddedBroker, MqttPublisher};

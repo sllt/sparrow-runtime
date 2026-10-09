@@ -1011,6 +1011,11 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "semantics":"live_best_effort_at_most_once; done=offered_to_every_matching_subscriber",
             "scope":"this_attempt; deliveries=subscriber_buffer_accepts"});
     }
+    if s.sink_kind == "influxdb" {
+        value["influxdb_sink"] = json!({"rows_written":io.influxdb_sink_rows_written,"requests_ok":io.influxdb_sink_requests_ok,"bytes_sent":io.influxdb_sink_bytes_sent,"gzip_fallbacks":io.influxdb_sink_gzip_fallbacks,"retries":io.influxdb_sink_retries,"retry_after_waits":io.influxdb_sink_retry_after_waits,"retry_after_capped":io.influxdb_sink_retry_after_capped,"dropped_bad":io.influxdb_sink_dropped_bad,"dropped_oversize":io.influxdb_sink_dropped_oversize,"dropped_budget":io.influxdb_sink_dropped_budget,"rejected_requests":io.influxdb_sink_rejected_requests,"rejected_rows":io.influxdb_sink_rejected_rows,"partial_writes":io.influxdb_sink_partial_writes,"discarded_on_close":io.influxdb_sink_discarded_on_close,"fatal":io.influxdb_sink_fatal,
+            "semantics":"live_best_effort; batch_acked_after_http_204; 422_partial_write_fails_batch",
+            "scope":"this_attempt"});
+    }
     if s.source_kind == "websocket" {
         value["websocket_source"] = json!({"received":io.websocket_source_received,"rows":io.websocket_source_rows,"dropped_bad":io.websocket_source_dropped_bad,
             "dropped_oversize":io.websocket_source_dropped_oversize,"dropped_binary":io.websocket_source_dropped_binary,"dropped_budget":io.websocket_source_dropped_budget,"dropped_overflow":io.websocket_source_dropped_overflow,
@@ -1341,6 +1346,48 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         ),
         ("databus_sink_batches", io.databus_sink_batches),
         ("databus_sink_fatal", io.databus_sink_fatal),
+        ("influxdb_sink_rows_written", io.influxdb_sink_rows_written),
+        ("influxdb_sink_requests_ok", io.influxdb_sink_requests_ok),
+        ("influxdb_sink_bytes_sent", io.influxdb_sink_bytes_sent),
+        (
+            "influxdb_sink_gzip_fallbacks",
+            io.influxdb_sink_gzip_fallbacks,
+        ),
+        ("influxdb_sink_retries", io.influxdb_sink_retries),
+        (
+            "influxdb_sink_retry_after_waits",
+            io.influxdb_sink_retry_after_waits,
+        ),
+        (
+            "influxdb_sink_retry_after_capped",
+            io.influxdb_sink_retry_after_capped,
+        ),
+        ("influxdb_sink_dropped_bad", io.influxdb_sink_dropped_bad),
+        (
+            "influxdb_sink_dropped_oversize",
+            io.influxdb_sink_dropped_oversize,
+        ),
+        (
+            "influxdb_sink_dropped_budget",
+            io.influxdb_sink_dropped_budget,
+        ),
+        (
+            "influxdb_sink_rejected_requests",
+            io.influxdb_sink_rejected_requests,
+        ),
+        (
+            "influxdb_sink_rejected_rows",
+            io.influxdb_sink_rejected_rows,
+        ),
+        (
+            "influxdb_sink_partial_writes",
+            io.influxdb_sink_partial_writes,
+        ),
+        (
+            "influxdb_sink_discarded_on_close",
+            io.influxdb_sink_discarded_on_close,
+        ),
+        ("influxdb_sink_fatal", io.influxdb_sink_fatal),
         ("csv_malformed", io.csv_malformed),
         ("csv_oversize", io.csv_oversize),
         ("csv_type_errors", io.csv_type_errors),

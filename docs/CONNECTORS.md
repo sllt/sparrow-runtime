@@ -262,6 +262,21 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | 关闭 | 订阅 / 发布注册为 RAII，job 结束即注销，topic 不泄漏；未消费缓冲计 `discarded_on_close`；Sink 停止时在途与已排队批次共用一个 `flush_timeout_ms` 截止时间（不受 `block_timeout_ms` 延长） |
 | 指标 | `databus_source_*` / `databus_sink_*`，pipeline status 中的 `databus_source` / `databus_sink` 对象 |
 
+## 附：InfluxDB Sink（`sink.kind: "influxdb"`）
+
+说明见 [INFLUXDB.md](INFLUXDB.md)。无需 feature。
+
+| 合同项 | InfluxDB Sink 的实现 |
+|---|---|
+| 语义 | capability `influxdb_sink`：`live_best_effort` / `restart_fresh` / replay `unsupported`；批次在所有相关请求得到 2xx 后才回执；拒绝 restore、checkpoint、aligned（含 graph Sink） |
+| 内存 | 请求缓冲每次增长前先扣 job reservation，持有到请求结束（含重试）；gzip 先扣 scratch 与输出上界；峰值 ≤ reservation/2，检查过的算术 |
+| 背压 | 串行请求，缓冲受 `batch_rows` / `batch_bytes` / `flush_interval_ms` 约束；outbox 有界 |
+| 密钥与 TLS | 仅 `https://`；token 来自 secret 引用；可选 `ca_pem` 替换根证书，校验始终开启；不跟随重定向、不走代理 |
+| 白名单 | 写入 URL 走 `TargetPolicy::check_http_url` |
+| 重试 | 429 / 503 / 传输错误，抖动指数退避封顶，`Retry-After`（秒）封顶；无时间列时只重试连接建立失败 |
+| 失败 | 400 / 413 / 422 / 其他状态不重试；401 / 403 / 404 使 job 失败（`influxdb_sink_fatal`） |
+| 关闭 | `flush_timeout_ms` 截止时间覆盖在途请求、重试等待、排队批次 |
+| 指标 | `influxdb_sink_*`，pipeline status 的 `influxdb_sink` 对象 |
 ## 附：WebSocket Source / Sink（`kind: "websocket"`，feature `websocket`）
 
 说明见 [WEBSOCKET.md](WEBSOCKET.md)。只做客户端模式（`ws://` / `wss://`）；不提供 listen 模式。

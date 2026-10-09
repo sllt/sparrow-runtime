@@ -558,6 +558,11 @@ fn validate_sink_format(sink: &SinkSpec, schema: &Schema) -> Result<()> {
 
 /// `msg_id_column` must be a utf8/integer column of the sink's input.
 fn validate_sink_schema(sink: &SinkSpec, schema: &Schema) -> Result<()> {
+    if sink.influxdb.is_some() {
+        let config = influxdb_sink_config(sink)?;
+        config.check_schema_budget(schema, sparrow_model::ResourceBudget::compact().reservation_bytes)?;
+        config.mapping.compile(schema)?;
+    }
     #[cfg(feature = "jetstream")]
     if let Some(js) = &sink.jetstream {
         js.connector_config(sink.outbox_capacity)
@@ -750,6 +755,14 @@ fn validate_sink_io(
             )?;
         }
         "databus" => databus_sink_config(sink)?.validate()?,
+        "influxdb" => {
+            let config = influxdb_sink_config(sink)?;
+            config.validate()?;
+            config.check_reservation_budget(
+                sparrow_model::ResourceBudget::compact().reservation_bytes,
+            )?;
+            config.validate_target(secrets, policy)?;
+        }
         #[cfg(feature = "websocket")]
         "websocket" => {
             let ws = websocket_sink_config(sink)?;
@@ -787,7 +800,7 @@ fn validate_sink_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|websocket|tcp|databus|file)"),
+                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|websocket|tcp|databus|influxdb|file)"),
             ));
         }
     }
@@ -821,7 +834,7 @@ pub fn validate_io_with_plan(
             };
             validate_action_schema(&spec.sink, output)?;
         }
-        if spec.sink.jetstream.is_some() {
+        if spec.sink.jetstream.is_some() || spec.sink.influxdb.is_some() {
             let output = plan
                 .stages
                 .iter()
@@ -1059,6 +1072,18 @@ pub fn databus_source_config(
             )
         })?
         .connector_config(schema, source.inbox_capacity, fail_on_decode)
+}
+
+pub fn influxdb_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::InfluxDbSinkConfig> {
+    sink.influxdb
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "InfluxDB sink requires sink.influxdb",
+            )
+        })?
+        .connector_config(sink.outbox_capacity)
 }
 
 pub fn databus_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::DataBusSinkConfig> {
@@ -1914,6 +1939,7 @@ pub fn capabilities_json() -> serde_json::Value {
     let tcp = ConnectorCapabilities::TCP_SOURCE;
     let tcp_sink = ConnectorCapabilities::TCP_SINK;
     let bus_sink = ConnectorCapabilities::DATABUS_SINK;
+    let influx_sink = ConnectorCapabilities::INFLUXDB_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
     serde_json::json!({
         "inventory":crate::capability::inventory(),
@@ -2065,6 +2091,20 @@ pub fn capabilities_json() -> serde_json::Value {
                 "no_subscribers": "counted_and_discarded",
                 "maturity": "preview",
                 "contract": "at_most_once; literal_topic; json_row_per_message; self_feedback_loop_refused",
+            },
+            {
+                "kind": influx_sink.kind,
+                "roles": ["sink"],
+                "enabled_by_build": true,
+                "replay": influx_sink.replay.as_str(),
+                "delivery": influx_sink.delivery.as_str(),
+                "recovery": influx_sink.recovery.as_str(),
+                "api": "influxdb_v2_http_write_line_protocol",
+                "acknowledgement": "http_204_per_request",
+                "partial_write": "http_422_counted_not_retried_batch_failed",
+                "duplicates": "possible_on_retry_without_time_column_only_connect_errors_retried",
+                "maturity": "preview",
+                "contract": "https_only_token_secret; serial_requests; bounded_rows_bytes_interval; optional_gzip_charged; retry_429_503_transport_capped_jittered_retry_after; 401_403_404_fail_job; stop_deadline_covers_in_flight",
             },
             {
                 "kind": js_sink.kind,
@@ -2838,6 +2878,7 @@ mod tests {
             sink: crate::spec::SinkSpec {
                 nats: None,
                 databus: None,
+                influxdb: None,
                 websocket: None,
                 tcp: None,
                 jetstream: None,
@@ -3005,6 +3046,7 @@ mod tests {
         let mut sink = crate::spec::SinkSpec {
                 nats: None,
                 databus: None,
+                influxdb: None,
                 websocket: None,
                 tcp: None,
                 jetstream: None,

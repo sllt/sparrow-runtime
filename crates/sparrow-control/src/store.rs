@@ -2649,6 +2649,7 @@ mod tests {
             sink: SinkSpec {
                 nats: None,
                 databus: None,
+                influxdb: None,
                 websocket: None,
                 tcp: None,
                 jetstream: None,

@@ -79,6 +79,16 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// InfluxDB v2 `/api/v2/write`. A batch is acknowledged after HTTP 204;
+    /// checkpoints/replay are refused (target identity is not bound into
+    /// checkpoints), so restarts start fresh.
+    pub const INFLUXDB_SINK: Self = Self {
+        kind: "influxdb_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     /// NATS Core publish. Handed to the client; no server receipt.
     pub const NATS_SINK: Self = Self {
         kind: "nats_sink",
