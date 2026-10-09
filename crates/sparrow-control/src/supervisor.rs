@@ -379,6 +379,16 @@ fn sink_failed_closed(diags: &[Arc<IoDiagnostics>]) -> Result<()> {
         ));
     }
     if diags.iter().any(|d| {
+        d.postgres_sink_fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }) {
+        return Err(SparrowError::new(
+            sparrow_model::ErrorCode::JobFailed,
+            "PostgreSQL Sink stopped the job (authentication, privilege, missing table/column, a schema that does not fit the table, or a statement the server refuses); inspect sink health and postgres_sink_*; no replay",
+        ));
+    }
+    if diags.iter().any(|d| {
         d.redis_sink_fatal
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
@@ -411,6 +421,7 @@ fn observed_sink_kind(spec: &crate::spec::PipelineSpec) -> &'static str {
         "jetstream" => "jetstream",
         "databus" => "databus",
         "redis" => "redis",
+        "postgres" => "postgres",
         "file" => "file",
         "plugin" => "plugin",
         _ => "http",
@@ -1394,7 +1405,7 @@ impl Supervisor {
             request=request.with_live_events(rx).with_live_out(tx_out);
             tx_plugin=Some(tx);
             (None,None)
-        } else if matches!(kind, "mqtt" | "http_poll" | "nats" | "databus" | "websocket") {
+        } else if matches!(kind, "mqtt" | "http_poll" | "nats" | "databus" | "websocket" | "postgres") {
             let (tx, rx) = observed::channel(inbox);
             diag.observe_source(&tx);
             request = request.with_budgeted_live_io(rx, tx_out);
@@ -1476,6 +1487,43 @@ impl Supervisor {
                         let r = source
                             .run_budgeted(
                                 tx_budgeted.expect("WebSocket ingress"),
+                                cancel_job.clone(),
+                                owner,
+                                max_row_bytes,
+                            )
+                            .await;
+                        if r.is_err() {
+                            cancel_job.cancel();
+                        }
+                        r
+                    })
+                }
+                #[cfg(feature = "postgres")]
+                "postgres" => {
+                    let budget = self.kernel.job_budget();
+                    let max_row_bytes = self.kernel.ingress_row_limit();
+                    let cfg = crate::validate::postgres_source_config(
+                        &spec.source,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                        budget.reservation_bytes,
+                        max_row_bytes,
+                    )?;
+                    cfg.check_inbox_budget(budget.queue_bytes)?;
+                    cfg.check_reservation_budget(budget.reservation_bytes, max_row_bytes)?;
+                    let source = sparrow_connectors::PgSource::bind(
+                        cfg,
+                        &self.secrets,
+                        policy,
+                        max_row_bytes,
+                        Arc::clone(&diag),
+                    )?;
+                    let cancel_job = cancel.clone();
+                    let owner = job.memory_owner();
+                    self.kernel.handle().spawn(async move {
+                        let r = source
+                            .run_budgeted(
+                                tx_budgeted.expect("PostgreSQL ingress"),
                                 cancel_job.clone(),
                                 owner,
                                 max_row_bytes,
@@ -1615,7 +1663,16 @@ impl Supervisor {
         };
         Ok(RunningJob {
             graph_ports: None,
-            source_kind: match kind {"mqtt"=>"mqtt","plugin"=>"plugin","http_poll"=>"http_poll","nats"=>"nats","databus"=>"databus","websocket"=>"websocket",_=>"http_push"},
+            source_kind: match kind {
+                "mqtt" => "mqtt",
+                "plugin" => "plugin",
+                "http_poll" => "http_poll",
+                "nats" => "nats",
+                "databus" => "databus",
+                "websocket" => "websocket",
+                "postgres" => "postgres",
+                _ => "http_push",
+            },
             sink_kind: observed_sink_kind(spec),
             started_at: Instant::now(),
             stable: false,
@@ -2290,6 +2347,13 @@ impl Supervisor {
                     owner,
                     diag,
                 )?;
+                self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
+            }
+            #[cfg(feature = "postgres")]
+            "postgres" => {
+                let cfg = crate::validate::postgres_sink_config(&spec.sink)?;
+                let sink =
+                    sparrow_connectors::PgSink::bind(cfg, &self.secrets, policy, owner, diag)?;
                 self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
             "redis" => {

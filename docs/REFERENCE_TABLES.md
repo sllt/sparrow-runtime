@@ -33,7 +33,7 @@ CLI：`tables`、`table NAME [REVISION]`、`table-revisions NAME`、`put-table N
 
 head倒退、缺失、加载到的内容损坏、schema/key改变或构建预算不足都会使Job失败并取消；没有无限沿用旧值的stale fallback。head未变化时不重复解码或重算内容摘要，因此不承诺持续检测绕过API的磁盘篡改。旧snapshot只随在途reader保留，其retention credit直到最后reader释放才归还；替换必须容得下构建峰值和新旧重叠。历史baseline仍由管道revision保守pin；运行时观察过的其他版本不构成checkpoint pin，GC后不承诺历史重现。
 
-### 外部 Lookup（HTTP / Redis）
+### 外部 Lookup（HTTP / Redis / PostgreSQL）
 
 复用SQL静态表JOIN的Lookup路径或Graph的 `kind:"lookup"`，无需新造SQL函数。通过 `external_lookups` 声明远端schema/keys及连接：
 
@@ -51,7 +51,7 @@ head倒退、缺失、加载到的内容损坏、schema/key改变或构建预算
 }
 ```
 
-每个绑定恰好选择一个provider：`url`（HTTP，下文）或 `redis`（GET/HMGET，见 [REDIS.md](REDIS.md)）。两者实现同一个runtime `ExternalLookup` 接口，共用Lookup算子、缓存、`options` 与 `on_error` 合同；Redis额外支持 `options.batch_keys`（1～64，默认1）把最多该数量的miss放进一个流水线请求，HTTP始终一次一个key，`batch_keys>1` 校验拒绝。新增选项省略时序列化与旧版完全一致。
+每个绑定恰好选择一个provider：`url`（HTTP，下文）、`redis`（GET/HMGET，见 [REDIS.md](REDIS.md)）或 `postgres`（一批key一条SELECT，需 feature `postgres`，见 [POSTGRES.md](POSTGRES.md)）。三者实现同一个runtime `ExternalLookup` 接口，共用Lookup算子、缓存、`options` 与 `on_error` 合同；Redis与PostgreSQL额外支持 `options.batch_keys`（1～64，默认1）把最多该数量的miss放进一个请求，HTTP始终一次一个key，`batch_keys>1` 校验拒绝。新增选项省略时序列化与旧版完全一致。
 
 URL固定，不从输入拼地址；需原有TargetPolicy allowlist，凭据通过命名Secret显式解析且只允许HTTPS。禁止userinfo/fragment、重复query key、重定向、环境proxy和隐式/应用重试。共用HTTP Client的隐式协议重试也关闭，原HttpSink显式max_retries策略不变。TLS校验仍启用，没有skip_verify。
 

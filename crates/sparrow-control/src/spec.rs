@@ -88,6 +88,9 @@ pub struct SourceSpec {
     /// Required exclusively for `kind = "websocket"` (client mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket: Option<WebSocketSourceSpec>,
+    /// Required exclusively for `kind = "postgres"` (`postgres` build feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<Box<crate::postgres_spec::PostgresSourceSpec>>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -1193,6 +1196,9 @@ pub struct SinkSpec {
     /// Required exclusively for `kind = "redis"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redis: Option<Box<RedisSinkSpec>>,
+    /// Required exclusively for `kind = "postgres"` (`postgres` build feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<Box<crate::postgres_spec::PostgresSinkSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1619,6 +1625,7 @@ impl PipelineSpec {
         self.check_databus()?;
         self.check_websocket()?;
         self.check_redis()?;
+        self.check_postgres()?;
         if self
             .source
             .jetstream
@@ -2029,6 +2036,113 @@ impl PipelineSpec {
         Ok(())
     }
 
+    /// PostgreSQL Source/Sink: live-only. The tracking value is not a
+    /// checkpoint replay point (a row committed late with a smaller value is
+    /// skipped) and plain INSERT is not idempotent, so every durable claim is
+    /// refused, for legacy and graph endpoints alike.
+    fn check_postgres(&self) -> Result<()> {
+        let (graph_sources, graph_sinks): (Vec<&SourceSpec>, Vec<&SinkSpec>) = self
+            .graph_io
+            .as_ref()
+            .map(|io| (io.sources.values().collect(), io.sinks.values().collect()))
+            .unwrap_or_default();
+        let mut any = false;
+        for source in std::iter::once(&self.source).chain(graph_sources) {
+            if source.postgres.is_some() != (source.kind == "postgres") {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "source.postgres is required exclusively for source kind=postgres",
+                ));
+            }
+            if source.kind != "postgres" {
+                continue;
+            }
+            any = true;
+            if source.jetstream.is_some()
+                || source.http_poll.is_some()
+                || source.nats.is_some()
+                || source.databus.is_some()
+                || source.websocket.is_some()
+                || source.plugin.is_some()
+                || source.host.is_some()
+                || source.port.is_some()
+                || source.path.is_some()
+                || source.bind.is_some()
+                || source.client_id.is_some()
+                || source.username_secret.is_some()
+                || source.password_secret.is_some()
+                || source.use_demo_io
+                || source.tls
+                || source.skip_verify
+                || source.file_contract.is_some()
+                || source.qos != 0
+                || !source.clean_session
+                || source.topic != default_topic()
+                || source.inbox_wait_ms.is_some()
+                || source.tcp_quickack.is_some()
+                || source.inbox_bytes.is_some()
+                || source.format.is_some()
+                || source.csv.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "PostgreSQL options belong in source.postgres (rows come typed from the query; no format); mixed connector fields refused",
+                ));
+            }
+        }
+        for sink in std::iter::once(&self.sink).chain(graph_sinks) {
+            if sink.postgres.is_some() != (sink.kind == "postgres") {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "sink.postgres is required exclusively for sink kind=postgres",
+                ));
+            }
+            if sink.kind != "postgres" {
+                continue;
+            }
+            any = true;
+            if sink.has_foreign_fields()
+                || sink.nats.is_some()
+                || sink.jetstream.is_some()
+                || sink.databus.is_some()
+                || sink.websocket.is_some()
+                || sink.redis.is_some()
+                || sink.batch_rows.is_some()
+                || sink.batch_bytes.is_some()
+                || sink.linger_ms.is_some()
+                || sink.max_inflight.is_some()
+                || sink.format.is_some()
+                || sink.csv.is_some()
+            {
+                return Err(SparrowError::new(
+                    ErrorCode::InvalidArgument,
+                    "PostgreSQL options belong in sink.postgres (no actions, no format); mixed connector fields refused",
+                ));
+            }
+        }
+        if !any {
+            return Ok(());
+        }
+        if !cfg!(feature = "postgres") {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "PostgreSQL support requires the postgres build feature",
+            ));
+        }
+        if self.delivery != "live_best_effort"
+            || self.recovery != "restart_fresh"
+            || self.restore.is_some()
+            || self.checkpoint.is_some()
+            || self.checkpoint_dir.is_some()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "PostgreSQL Source/Sink are live_best_effort/restart_fresh (the tracking value is not a replay point; INSERT is not idempotent); no checkpoint or restore",
+            ));
+        }
+        Ok(())
+    }
+
     /// JetStream Sink: PubAck-confirmed, at-least-once into the stream. It
     /// may join an aligned checkpoint only on the linear File profile, whose
     /// barrier waits for the Sink outbox receipts (acked after PubAcks).
@@ -2094,6 +2208,7 @@ impl PipelineSpec {
         // must not rely solely on from_json/basic_check for the DataBus gate.
         self.check_databus()?;
         self.check_redis()?;
+        self.check_postgres()?;
         let g = DeliveryGuarantee::parse(&self.delivery)?;
         if (g == DeliveryGuarantee::CheckpointedAtLeastOnce)
             != (cfg!(feature = "jetstream") && self.source.kind == "jetstream")
