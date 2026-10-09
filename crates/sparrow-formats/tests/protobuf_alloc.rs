@@ -287,7 +287,10 @@ fn deep_mapping_peaks() {
 
 fn wide_oneof_peaks() {
     use prost::Message as _;
-    use prost_reflect::prost_types::*;
+    use prost_reflect::prost_types::{
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        OneofDescriptorProto,
+    };
     let set = FileDescriptorSet {
         file: vec![FileDescriptorProto {
             name: Some("wide.proto".into()),

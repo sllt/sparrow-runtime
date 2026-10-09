@@ -1184,10 +1184,11 @@ fn scratch_math_saturates() {
     let d = decoder();
     let s = reading_schema();
     assert_eq!(d.decode_scratch(&s, usize::MAX), usize::MAX);
-    assert!(d.decode_scratch(&s, 100) > 100 + Plan::estimate(s.fields.len()));
-    assert_eq!(Plan::estimate(usize::MAX), usize::MAX);
+    assert!(d.decode_scratch(&s, 100) > 100 + d.plan_scratch(s.fields.len()));
+    assert_eq!(d.plan_scratch(usize::MAX), usize::MAX);
     let row = Row { values: full_row() };
-    assert!(encoder().encode_scratch(&row) > Plan::estimate(row.values.len()));
+    let e = encoder();
+    assert!(e.encode_scratch(&row) > e.plan_scratch(row.values.len()));
     assert_eq!(encoded_len_varint(u64::MAX), 10);
 }
 
