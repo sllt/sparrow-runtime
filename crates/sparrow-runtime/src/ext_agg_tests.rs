@@ -475,9 +475,28 @@ fn incompatible_versions_and_plans_are_rejected_not_corruption_fallback() {
     let (plan, v29) = committed_v29(&dir);
     let owner = MemoryOwner::new(ResourceBudget::compact());
     // (a) v29 bytes relabelled as v3: codec-3 plan under a non-extended version.
-    // (b) v29 bytes relabelled as v30 (wrong profile for a File plan).
-    for (label, version) in [("v3", 3u16), ("v30", crate::EXT_AGG_RELIABLE_SNAPSHOT_VERSION)] {
-        let mut bytes = v29.clone();
+    // (b) a well-formed v3 (codec-1 plan) relabelled as v29.
+    let v3 = {
+        let schema = schema();
+        let physical = PhysicalPlan {
+            edges: None, side_outputs: vec![], source_times: vec![],
+            pipeline: 1.into(), revision: 1.into(),
+            stages: vec![
+                PhysicalStage::MemorySource { operator: 1.into(), name: "sensors".into(), schema: schema.clone() },
+                PhysicalStage::CaptureSink { operator: 20.into(), name: "out".into(), schema },
+            ],
+        };
+        let plain = CheckpointPlan::from_physical(&physical).unwrap();
+        let mut source = SourcePosition::start(SourceIdentity::memory("fixture", 0, 0));
+        source.identity.kind = "file".into();
+        let encoded = PipelineSnapshot::encode_frozen(1, &source, 0, 1, &plain, crate::ParticipantAcks {
+            attempt: 1, generation: [5; 16], freezes: vec![], next_output: None,
+        }, &owner, 1024).unwrap();
+        assert_eq!(&encoded.bytes()[4..6], &3u16.to_le_bytes());
+        encoded.bytes().to_vec()
+    };
+    for (label, version, base) in [("v29-as-v3", 3u16, &v29), ("v3-as-v29", crate::EXT_AGG_FILE_SNAPSHOT_VERSION, &v3)] {
+        let mut bytes = base.clone();
         bytes[4..6].copy_from_slice(&version.to_le_bytes());
         patch_snapshot_id(&mut bytes, 2);
         let e = PipelineSnapshot::decode(&bytes, 1024).unwrap_err();
@@ -500,14 +519,13 @@ fn incompatible_versions_and_plans_are_rejected_not_corruption_fallback() {
         let store = CheckpointStore::open_for_plan_exclusive(&dir, 1024, Default::default(), &plan, "file").unwrap();
         let mut bytes = v29.clone();
         patch_snapshot_id(&mut bytes, 2);
-        let n = bytes.len();
-        bytes[n - 1] ^= 0xff;
+        bytes.truncate(bytes.len() - 3);
         write_generation(&store, 2, &bytes);
         let mut store = store;
-        if let Ok((snap, credit)) = store.recover_pipeline_owned(None, &owner) {
-            assert_eq!(snap.checkpoint_id, 1);
-            drop(credit);
-        }
+        // Truncation is a codec-level fault: the store falls back to chk-1.
+        let (snap, credit) = store.recover_pipeline_owned(None, &owner).unwrap();
+        assert_eq!(snap.checkpoint_id, 1);
+        drop((snap, credit));
         drop(store);
         fs::remove_dir_all(dir.join("chk-00000002")).unwrap();
         fs::write(dir.join("CURRENT"), b"chk-00000001\n").unwrap();

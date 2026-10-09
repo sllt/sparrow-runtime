@@ -1333,7 +1333,7 @@ mod tests {
                 bytes.capacity().max(1),
             )
             .unwrap();
-        EncodedFreeze { bytes, lease }
+        EncodedFreeze { bytes, lease, ext: false }
     }
 
     fn empty_freeze() -> WindowFreeze {

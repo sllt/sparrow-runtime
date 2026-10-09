@@ -2607,7 +2607,7 @@ mod tests {
         assert!(op.retention_bytes() > estimate * 2);
         assert_eq!(
             op.estimated_freeze_bytes(),
-            estimated_frozen_bytes(&op.freeze())
+            estimated_frozen_bytes(&op.freeze(), crate::aggregate::AccumulatorCodec::Window).unwrap()
         );
     }
 
@@ -2771,7 +2771,7 @@ mod tests {
             snap.ingested_rows,
             &snap.layout,
             snap.table.as_ref(),
-            crate::barrier::EncodedFreeze { bytes, lease },
+            crate::barrier::EncodedFreeze { bytes, lease, ext: false },
         )
         .unwrap();
         assert_eq!(encoded.bytes, snap.encode().unwrap());
