@@ -8,6 +8,56 @@ pub(super) struct PreparedSink {
     sink: Option<sparrow_connectors::jetstream::PreparedJetStreamSink>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_sink_blocking_work_keeps_admission_after_waiter_cancellation() {
+        let kernel = crate::compact_kernel().unwrap();
+        kernel.block_on(async {
+            let mut prepared = PreparedSink {
+                admission: Some(kernel.prepare_source_admission(1.into()).unwrap()),
+                #[cfg(feature = "jetstream")]
+                sink: None,
+            };
+            let source_guard = prepared.lifecycle_guard().unwrap();
+            let blocking_guard = source_guard.clone();
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let waiter = tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
+                    let _guard = blocking_guard;
+                    let _ = started.send(());
+                    let _ = release_rx.recv();
+                })
+                .await
+            });
+            started_rx.await.unwrap();
+            drop(prepared.take_admission());
+            drop(source_guard);
+            waiter.abort();
+            let _ = waiter.await;
+            let held = kernel.admitted_jobs();
+            // Release before asserting so a failed test cannot strand the
+            // blocking pool while the Kernel runtime is being dropped.
+            release.send(()).unwrap();
+            assert_eq!(
+                held, 1,
+                "cancelled waiter must not refund the live work slot"
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while kernel.admitted_jobs() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(kernel.process_owner().usage().physical_bytes, 0);
+        });
+    }
+}
+
 impl PreparedSink {
     pub(super) async fn prepare(
         supervisor: &Supervisor,

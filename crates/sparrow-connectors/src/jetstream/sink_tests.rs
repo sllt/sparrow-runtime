@@ -230,7 +230,7 @@ fn jetstream_sink_wide_bytes_dynamic_codec_scratch_is_charged_and_returned() {
     .unwrap();
     let mut fields = Vec::new();
     let mut values = Vec::new();
-    for index in 0..15u32 {
+    for index in 0..15u16 {
         fields.push(Field::new(
             FieldId::new(index + 1),
             format!("f{index}"),

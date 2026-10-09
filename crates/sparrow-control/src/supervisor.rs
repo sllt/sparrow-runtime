@@ -1676,7 +1676,8 @@ impl Supervisor {
         ).await?;
         let sink_identity = prepared_sink.identity();
         let restore_sink = sink_identity.clone();
-        let restore_guard = prepared_sink.lifecycle_guard();
+        let source_guard = prepared_sink.lifecycle_guard();
+        let restore_guard = source_guard.clone();
         let profile_specific = reference_profile || layout.has_hysteresis() || sink_identity.is_some();
         // Fingerprinting, bounded snapshot reads and cursor verification are
         // cold filesystem work; never block a Tokio executor worker on them.
@@ -1951,6 +1952,7 @@ impl Supervisor {
                         let store = Arc::clone(&store_r);
                         let owner = checkpoint_owner.clone();
                         let sink_identity = sink_identity.clone();
+                        let checkpoint_guard = source_guard.clone();
                         let metrics = metrics.clone();
                         let checkpoint_cancel = checkpoint_cancel.clone();
                         // Cut and barrier publication above remain inline and
@@ -1974,6 +1976,9 @@ impl Supervisor {
                         if checkpoint_cancel.is_cancelled() { metrics.record_checkpoint_abort();return; }
                         admission.phase("committing");
                         let committed = tokio::task::spawn_blocking(move || {
+                            // Kernel/SDK shutdown may finish first. Retain
+                            // admission until this durable write actually ends.
+                            let _checkpoint_guard = checkpoint_guard;
                             let started = std::time::Instant::now();
                             let mut store = store.lock().expect("store");
                             let payload = if let Some(sink) = &sink_identity {

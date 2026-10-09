@@ -48,6 +48,7 @@ jobs:
             --features "sparrow-server/$FEATURE" \
             > artifacts/tests.jsonl 2> artifacts/build.log; then
             tail -n 60 artifacts/build.log
+            jq -Rr 'fromjson?|select(.reason=="compiler-message" and .message.level=="error")|.message.rendered' artifacts/tests.jsonl || true
             grep -A 20 -B 3 -E 'FAILED|panicked|test result: FAILED' artifacts/tests.jsonl || true
             exit 1
           fi

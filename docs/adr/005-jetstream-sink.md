@@ -79,6 +79,8 @@ NATS Core Sink（见 [NATS.md](../NATS.md)）是 at-most-once：发布即交给�
    覆盖 wide/Bytes/Dynamic 的临时 serde Value 与编码；返回时释放，预算不足直接失败。
    JSON writer 在缓冲增长前检查限额，包含 Expected-Stream 与 msg-id 的真实 header 字节。
    prepared identity/配置基线也记入同 owner，配置序列化上限 64 KiB。
+   INFO 响应仍由 SDK 先解码，64 KiB 限制针对后续保留的配置基线；这些是保守信用额度，
+   不是敌对 broker 或 SDK 临时分配的进程 RSS 硬上限。
 9. **Stop 有界排空**。取消时建立一个 flush deadline，在途批次与队列共用，不给下一批
    或下一次 retry 重新发放预算。deadline 到期先 fail 未确认 receipt，再清理 SDK；
    已收到部分 PubAck 不等于整批成功，SDK 清理超时也不虚报退款。
