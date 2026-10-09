@@ -17,6 +17,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Install pinned isolated InfluxDB test service
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/influxdb"
+          curl --fail --location --retry 3 \
+            https://dl.influxdata.com/influxdb/releases/influxdb2-2.9.1_linux_amd64.tar.gz \
+            -o "$RUNNER_TEMP/influxdb/release.tar.gz"
+          printf '%s  %s\n' \
+            762e4fc825c4386e0c5138e7c3f91fc778081db2bada1ec47066e786bf55d9ff \
+            "$RUNNER_TEMP/influxdb/release.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/influxdb/release.tar.gz" -C "$RUNNER_TEMP/influxdb"
+          binary=$(find "$RUNNER_TEMP/influxdb" -type f -name influxd -print -quit)
+          test -x "$binary"
+          printf 'SPARROW_INFLUXD=%s\n' "$binary" >> "$GITHUB_ENV"
       - uses: actions/cache@v4
         with:
           path: |
@@ -24,7 +38,7 @@ jobs:
             ~/.cargo/git
             target
           key: websocket-contracts-${{ runner.os }}-1.98.0-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}
-      - name: Production feature combinations and WebSocket loopback contracts
+      - name: Production feature combinations and WebSocket/TCP/InfluxDB contracts
         env:
           PROFILE: ${{ matrix.profile }}
         run: |
@@ -65,6 +79,10 @@ jobs:
           for round in 1 2; do
             run_contracts "$connector" 'websocket::' "websocket-connector-$round"
             run_contracts "$control" 'websocket_tests::' "websocket-control-$round"
+            run_contracts "$connector" 'tcp::' "tcp-connector-$round"
+            run_contracts "$control" 'tcp_tests::' "tcp-control-$round"
+            run_contracts "$connector" 'influxdb::' "influxdb-connector-$round"
+            run_contracts "$control" 'influxdb_tests::' "influxdb-control-$round"
           done
       - uses: actions/upload-artifact@v4
         if: always()

@@ -89,6 +89,16 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// InfluxDB v2 `/api/v2/write`. A batch is acknowledged after HTTP 204;
+    /// checkpoints/replay are refused (target identity is not bound into
+    /// checkpoints), so restarts start fresh.
+    pub const INFLUXDB_SINK: Self = Self {
+        kind: "influxdb_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     /// NATS Core publish. Handed to the client; no server receipt.
     pub const NATS_SINK: Self = Self {
         kind: "nats_sink",
@@ -121,6 +131,24 @@ impl ConnectorCapabilities {
     /// is no application receipt.
     pub const WEBSOCKET_SINK: Self = Self {
         kind: "websocket_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// TCP client Source (`lines` / `length_prefixed`): live, no ack, no
+    /// replay.
+    pub const TCP_SOURCE: Self = Self {
+        kind: "tcp",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// TCP client Sink. A sent frame is written to the socket; there is no
+    /// application receipt.
+    pub const TCP_SINK: Self = Self {
+        kind: "tcp_sink",
         replay: ReplaySupport::Unsupported,
         delivery: DeliveryGuarantee::LiveBestEffort,
         recovery: RecoveryPolicy::RestartFresh,

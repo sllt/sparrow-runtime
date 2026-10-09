@@ -73,6 +73,8 @@ mod core_b_binding_tests;
 #[cfg(test)]
 mod databus_tests;
 #[cfg(test)]
+mod influxdb_tests;
+#[cfg(test)]
 mod reference_tests;
 #[cfg(test)]
 mod live_lookup_tests;
@@ -103,5 +105,7 @@ mod nats_tests;
 mod reference_completion_tests;
 #[cfg(test)]
 mod redis_tests;
+#[cfg(test)]
+mod tcp_tests;
 #[cfg(test)]
 mod websocket_tests;

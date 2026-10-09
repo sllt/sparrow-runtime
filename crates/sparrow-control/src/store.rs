@@ -2623,6 +2623,7 @@ mod tests {
                 nats: None,
                 databus: None,
                 websocket: None,
+                tcp: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
                 port: Some(1883),
@@ -2648,8 +2649,10 @@ mod tests {
             sink: SinkSpec {
                 nats: None,
                 databus: None,
+                influxdb: None,
                 websocket: None,
                 redis: None,
+                tcp: None,
                 jetstream: None,
                 plugin: None,
                 action: None,

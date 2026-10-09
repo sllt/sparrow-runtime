@@ -19,19 +19,20 @@ pub fn inventory() -> Value {
     } else {
         &[]
     };
-    // The in-process Local DataBus and the Redis Sink (own RESP2 client)
-    // are always built.
-    let sinks: Vec<&str> = ["http", "mqtt", "log", "databus", "redis"]
+    // The in-process Local DataBus and the TCP client are always built.
+    let sinks: Vec<&str> = ["http", "mqtt", "log", "databus", "influxdb", "redis"]
         .iter()
         .chain(nats)
         .chain(jetstream_sink)
         .chain(websocket)
+        .chain(&["tcp"])
         .copied()
         .collect();
     let mut combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file", "databus"]
         .iter()
         .chain(nats)
         .chain(websocket)
+        .chain(&["tcp"])
         .copied()
         .flat_map(|source| {
             sinks.clone().into_iter().map(move |sink| {
@@ -219,16 +220,17 @@ mod tests {
     fn production_inventory_does_not_claim_unimplemented_backends_or_certification() {
         let value = super::inventory();
         // 5 live/file sources (mqtt, http_push, http_poll, file, databus) x 5 sinks
-        // (http, mqtt, log, databus, redis), plus NATS Core as both a source and a sink
+        // (http, mqtt, log, databus, influxdb, redis), plus NATS Core as both a source and a sink
         // when the `nats` feature is built, plus the JetStream Sink (live matrix +
         // one aligned File profile) with `jetstream`, plus WebSocket as both a
-        // source and a sink with `websocket`.
+        // source and a sink with `websocket`, plus TCP (always built) as both.
         let (nats, jetstream, websocket) = (
             usize::from(cfg!(feature = "nats")),
             usize::from(cfg!(feature = "jetstream")),
             usize::from(cfg!(feature = "websocket")),
         );
-        let expected = (5 + nats + websocket) * (5 + nats + jetstream + websocket) + jetstream;
+        let expected =
+            (5 + nats + websocket + 1) * (6 + nats + jetstream + websocket + 1) + jetstream;
         assert_eq!(value["combinations"].as_array().unwrap().len(), expected);
         assert!(value["combinations"]
             .as_array()
@@ -238,9 +240,12 @@ mod tests {
                 || c["sink"] == "nats"
                 || c["source"] == "websocket"
                 || c["sink"] == "websocket"
+                || c["source"] == "tcp"
+                || c["sink"] == "tcp"
                 || c["source"] == "databus"
                 || c["sink"] == "databus"
                 || c["sink"] == "redis"
+                || c["sink"] == "influxdb"
                 || (c["sink"] == "jetstream" && c["source"] != "file"))
             .all(|c| c["delivery"] == "live_best_effort" && c["recovery"] == "restart_fresh"));
         assert!(value["combinations"]
