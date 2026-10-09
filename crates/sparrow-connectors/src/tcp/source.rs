@@ -449,8 +449,22 @@ impl TcpSource {
         received_at: std::time::Instant,
     ) -> Result<Ingested> {
         let format = &self.config.payload_format;
+        let lines_csv = match format.as_csv() {
+            Some(csv) if self.client.config.framing == TcpFraming::Lines => Some(csv),
+            _ => None,
+        };
+        // A lines frame holds ONE record. The generic CSV message limit
+        // allows a header plus a data record and is too loose here.
+        let limit = lines_csv.map_or_else(
+            || format.max_message_bytes(&self.config.json_limits),
+            |csv| {
+                csv.limits()
+                    .max_record_bytes
+                    .min(self.config.json_limits.max_bytes)
+            },
+        );
         // Allocation-free length check first.
-        if record.len() > format.max_message_bytes(&self.config.json_limits) {
+        if record.len() > limit {
             self.diag
                 .tcp_source_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
@@ -460,10 +474,6 @@ impl TcpSource {
                 Ingested::Continue
             });
         }
-        let lines_csv = match format.as_csv() {
-            Some(csv) if self.client.config.framing == TcpFraming::Lines => Some(csv),
-            _ => None,
-        };
         // Format-specific parser + Row working set, charged before parsing
         // (header or record) and held until the row is admitted or dropped.
         let estimate = match lines_csv {
