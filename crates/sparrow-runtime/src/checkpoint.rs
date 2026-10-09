@@ -3368,3 +3368,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "ext_agg_tests.rs"]
+mod ext_agg_tests;
