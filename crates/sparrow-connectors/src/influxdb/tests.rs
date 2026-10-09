@@ -674,7 +674,9 @@ async fn retries_429_503_with_capped_retry_after_then_acks() {
         Reply::status(204),
     ])
     .await;
-    let mut c = config(mock.port, false);
+    // Status retries require a stable point timestamp. The complementary
+    // no-time refusal is covered by status_retry_requires_explicit_time_column.
+    let mut c = config(mock.port, true);
     c.retry_max = Duration::from_millis(150);
     let h = Harness::start(c, owner());
     h.send(vec![row(1, "h", 1.0, "x")]).await;
