@@ -138,6 +138,15 @@ async fn request_checkpoint(
         ));
     }
     let admission = control.begin(trigger)?;
+    request_checkpoint_with_admission(cmd, control, cancel, admission).await
+}
+
+async fn request_checkpoint_with_admission(
+    cmd: &tokio::sync::mpsc::Sender<AlignedCmd>,
+    control: &Arc<CheckpointControl>,
+    cancel: &CancellationToken,
+    admission: CheckpointAdmission,
+) -> Result<u64> {
     let deadline = admission.deadline;
     let (reply, wait) = tokio::sync::oneshot::channel();
     cmd.try_send(AlignedCmd::Checkpoint { reply, admission })
@@ -2379,6 +2388,42 @@ impl Supervisor {
             }
         };
         request_checkpoint(&cmd, &control, &cancel, "manual").await
+    }
+
+    /// Exercise a real coordinator timeout without shortening the running
+    /// attempt's policy (including its subsequent checkpoint requests).
+    #[cfg(all(test, feature = "demo-io"))]
+    pub(crate) async fn checkpoint_named_with_timeout_for_test(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<u64> {
+        let (cmd, control, cancel) = {
+            let jobs = self.running.lock().await;
+            match jobs.get(name).map(|job| &job.kind) {
+                Some(RunningKind::Aligned {
+                    cmd,
+                    checkpoint,
+                    cancel,
+                    ..
+                }) => (cmd.clone(), checkpoint.clone(), cancel.clone()),
+                _ => {
+                    return Err(SparrowError::new(
+                        sparrow_model::ErrorCode::InvalidArgument,
+                        format!("pipeline `{name}` is not a running aligned job"),
+                    ));
+                }
+            }
+        };
+        if cancel.is_cancelled() {
+            return Err(SparrowError::new(
+                sparrow_model::ErrorCode::Cancelled,
+                "job stopping",
+            ));
+        }
+        let mut admission = control.begin("manual")?;
+        admission.deadline = tokio::time::Instant::now() + timeout;
+        request_checkpoint_with_admission(&cmd, &control, &cancel, admission).await
     }
 
     pub async fn kill_named(self: &Arc<Self>, name: &str) -> Result<()> {
