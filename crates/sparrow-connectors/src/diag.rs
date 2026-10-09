@@ -125,6 +125,39 @@ pub struct IoDiagnostics {
     pub csv_type_errors: AtomicU64,
     pub csv_header_errors: AtomicU64,
     pub csv_encode_errors: AtomicU64,
+    pub websocket_source_received: AtomicU64,
+    pub websocket_source_rows: AtomicU64,
+    pub websocket_source_dropped_bad: AtomicU64,
+    pub websocket_source_dropped_oversize: AtomicU64,
+    pub websocket_source_dropped_binary: AtomicU64,
+    pub websocket_source_dropped_budget: AtomicU64,
+    pub websocket_source_backpressure_waits: AtomicU64,
+    pub websocket_source_connects: AtomicU64,
+    pub websocket_source_reconnects: AtomicU64,
+    pub websocket_source_disconnects: AtomicU64,
+    pub websocket_source_connect_failures: AtomicU64,
+    pub websocket_source_heartbeat_timeouts: AtomicU64,
+    pub websocket_source_pings_sent: AtomicU64,
+    pub websocket_sink_sent: AtomicU64,
+    pub websocket_sink_dropped_bad: AtomicU64,
+    pub websocket_sink_dropped_oversize: AtomicU64,
+    pub websocket_sink_dropped_overflow: AtomicU64,
+    pub websocket_sink_backpressure_waits: AtomicU64,
+    pub websocket_sink_send_failed: AtomicU64,
+    pub websocket_sink_send_timeouts: AtomicU64,
+    pub websocket_sink_discarded_on_close: AtomicU64,
+    pub websocket_sink_connects: AtomicU64,
+    pub websocket_sink_reconnects: AtomicU64,
+    pub websocket_sink_disconnects: AtomicU64,
+    pub websocket_sink_connect_failures: AtomicU64,
+    pub websocket_sink_heartbeat_timeouts: AtomicU64,
+    pub websocket_sink_pings_sent: AtomicU64,
+    pub websocket_sink_ignored_frames: AtomicU64,
+    pub websocket_sink_closes: AtomicU64,
+    pub websocket_sink_close_failed: AtomicU64,
+    pub websocket_sink_fatal: AtomicU64,
+    pub websocket_sink_queue_items: AtomicU64,
+    pub websocket_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub databus_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub nats_source_inbox: Arc<sparrow_model::QueueOccupancy>,
     pub log_written: AtomicU64,
@@ -316,6 +349,66 @@ impl IoDiagnostics {
             csv_type_errors: self.csv_type_errors.load(Ordering::Relaxed),
             csv_header_errors: self.csv_header_errors.load(Ordering::Relaxed),
             csv_encode_errors: self.csv_encode_errors.load(Ordering::Relaxed),
+            websocket_source_received: self.websocket_source_received.load(Ordering::Relaxed),
+            websocket_source_rows: self.websocket_source_rows.load(Ordering::Relaxed),
+            websocket_source_dropped_bad: self.websocket_source_dropped_bad.load(Ordering::Relaxed),
+            websocket_source_dropped_oversize: self
+                .websocket_source_dropped_oversize
+                .load(Ordering::Relaxed),
+            websocket_source_dropped_binary: self
+                .websocket_source_dropped_binary
+                .load(Ordering::Relaxed),
+            websocket_source_dropped_budget: self
+                .websocket_source_dropped_budget
+                .load(Ordering::Relaxed),
+            websocket_source_backpressure_waits: self
+                .websocket_source_backpressure_waits
+                .load(Ordering::Relaxed),
+            websocket_source_connects: self.websocket_source_connects.load(Ordering::Relaxed),
+            websocket_source_reconnects: self.websocket_source_reconnects.load(Ordering::Relaxed),
+            websocket_source_disconnects: self.websocket_source_disconnects.load(Ordering::Relaxed),
+            websocket_source_connect_failures: self
+                .websocket_source_connect_failures
+                .load(Ordering::Relaxed),
+            websocket_source_heartbeat_timeouts: self
+                .websocket_source_heartbeat_timeouts
+                .load(Ordering::Relaxed),
+            websocket_source_pings_sent: self.websocket_source_pings_sent.load(Ordering::Relaxed),
+            websocket_sink_sent: self.websocket_sink_sent.load(Ordering::Relaxed),
+            websocket_sink_dropped_bad: self.websocket_sink_dropped_bad.load(Ordering::Relaxed),
+            websocket_sink_dropped_oversize: self
+                .websocket_sink_dropped_oversize
+                .load(Ordering::Relaxed),
+            websocket_sink_dropped_overflow: self
+                .websocket_sink_dropped_overflow
+                .load(Ordering::Relaxed),
+            websocket_sink_backpressure_waits: self
+                .websocket_sink_backpressure_waits
+                .load(Ordering::Relaxed),
+            websocket_sink_send_failed: self.websocket_sink_send_failed.load(Ordering::Relaxed),
+            websocket_sink_send_timeouts: self.websocket_sink_send_timeouts.load(Ordering::Relaxed),
+            websocket_sink_discarded_on_close: self
+                .websocket_sink_discarded_on_close
+                .load(Ordering::Relaxed),
+            websocket_sink_connects: self.websocket_sink_connects.load(Ordering::Relaxed),
+            websocket_sink_reconnects: self.websocket_sink_reconnects.load(Ordering::Relaxed),
+            websocket_sink_disconnects: self.websocket_sink_disconnects.load(Ordering::Relaxed),
+            websocket_sink_connect_failures: self
+                .websocket_sink_connect_failures
+                .load(Ordering::Relaxed),
+            websocket_sink_heartbeat_timeouts: self
+                .websocket_sink_heartbeat_timeouts
+                .load(Ordering::Relaxed),
+            websocket_sink_pings_sent: self.websocket_sink_pings_sent.load(Ordering::Relaxed),
+            websocket_sink_ignored_frames: self
+                .websocket_sink_ignored_frames
+                .load(Ordering::Relaxed),
+            websocket_sink_closes: self.websocket_sink_closes.load(Ordering::Relaxed),
+            websocket_sink_close_failed: self.websocket_sink_close_failed.load(Ordering::Relaxed),
+            websocket_sink_fatal: self.websocket_sink_fatal.load(Ordering::Relaxed),
+            websocket_sink_queue_items: self.websocket_sink_queue_items.load(Ordering::Relaxed),
+            websocket_source_inbox_items: self.websocket_source_inbox.items.load(Ordering::Relaxed),
+            websocket_source_inbox_bytes: self.websocket_source_inbox.bytes.load(Ordering::Relaxed),
             databus_source_inbox_items: self.databus_source_inbox.items.load(Ordering::Relaxed),
             databus_source_inbox_bytes: self.databus_source_inbox.bytes.load(Ordering::Relaxed),
             nats_source_inbox_items: self.nats_source_inbox.items.load(Ordering::Relaxed),
@@ -449,6 +542,40 @@ pub struct IoSnapshot {
     pub csv_type_errors: u64,
     pub csv_header_errors: u64,
     pub csv_encode_errors: u64,
+    pub websocket_source_received: u64,
+    pub websocket_source_rows: u64,
+    pub websocket_source_dropped_bad: u64,
+    pub websocket_source_dropped_oversize: u64,
+    pub websocket_source_dropped_binary: u64,
+    pub websocket_source_dropped_budget: u64,
+    pub websocket_source_backpressure_waits: u64,
+    pub websocket_source_connects: u64,
+    pub websocket_source_reconnects: u64,
+    pub websocket_source_disconnects: u64,
+    pub websocket_source_connect_failures: u64,
+    pub websocket_source_heartbeat_timeouts: u64,
+    pub websocket_source_pings_sent: u64,
+    pub websocket_sink_sent: u64,
+    pub websocket_sink_dropped_bad: u64,
+    pub websocket_sink_dropped_oversize: u64,
+    pub websocket_sink_dropped_overflow: u64,
+    pub websocket_sink_backpressure_waits: u64,
+    pub websocket_sink_send_failed: u64,
+    pub websocket_sink_send_timeouts: u64,
+    pub websocket_sink_discarded_on_close: u64,
+    pub websocket_sink_connects: u64,
+    pub websocket_sink_reconnects: u64,
+    pub websocket_sink_disconnects: u64,
+    pub websocket_sink_connect_failures: u64,
+    pub websocket_sink_heartbeat_timeouts: u64,
+    pub websocket_sink_pings_sent: u64,
+    pub websocket_sink_ignored_frames: u64,
+    pub websocket_sink_closes: u64,
+    pub websocket_sink_close_failed: u64,
+    pub websocket_sink_fatal: u64,
+    pub websocket_sink_queue_items: u64,
+    pub websocket_source_inbox_items: u64,
+    pub websocket_source_inbox_bytes: u64,
     pub databus_source_inbox_items: u64,
     pub databus_source_inbox_bytes: u64,
     pub nats_source_inbox_items: u64,
@@ -603,6 +730,40 @@ impl IoSnapshot {
         self.csv_type_errors += other.csv_type_errors;
         self.csv_header_errors += other.csv_header_errors;
         self.csv_encode_errors += other.csv_encode_errors;
+        self.websocket_source_received += other.websocket_source_received;
+        self.websocket_source_rows += other.websocket_source_rows;
+        self.websocket_source_dropped_bad += other.websocket_source_dropped_bad;
+        self.websocket_source_dropped_oversize += other.websocket_source_dropped_oversize;
+        self.websocket_source_dropped_binary += other.websocket_source_dropped_binary;
+        self.websocket_source_dropped_budget += other.websocket_source_dropped_budget;
+        self.websocket_source_backpressure_waits += other.websocket_source_backpressure_waits;
+        self.websocket_source_connects += other.websocket_source_connects;
+        self.websocket_source_reconnects += other.websocket_source_reconnects;
+        self.websocket_source_disconnects += other.websocket_source_disconnects;
+        self.websocket_source_connect_failures += other.websocket_source_connect_failures;
+        self.websocket_source_heartbeat_timeouts += other.websocket_source_heartbeat_timeouts;
+        self.websocket_source_pings_sent += other.websocket_source_pings_sent;
+        self.websocket_sink_sent += other.websocket_sink_sent;
+        self.websocket_sink_dropped_bad += other.websocket_sink_dropped_bad;
+        self.websocket_sink_dropped_oversize += other.websocket_sink_dropped_oversize;
+        self.websocket_sink_dropped_overflow += other.websocket_sink_dropped_overflow;
+        self.websocket_sink_backpressure_waits += other.websocket_sink_backpressure_waits;
+        self.websocket_sink_send_failed += other.websocket_sink_send_failed;
+        self.websocket_sink_send_timeouts += other.websocket_sink_send_timeouts;
+        self.websocket_sink_discarded_on_close += other.websocket_sink_discarded_on_close;
+        self.websocket_sink_connects += other.websocket_sink_connects;
+        self.websocket_sink_reconnects += other.websocket_sink_reconnects;
+        self.websocket_sink_disconnects += other.websocket_sink_disconnects;
+        self.websocket_sink_connect_failures += other.websocket_sink_connect_failures;
+        self.websocket_sink_heartbeat_timeouts += other.websocket_sink_heartbeat_timeouts;
+        self.websocket_sink_pings_sent += other.websocket_sink_pings_sent;
+        self.websocket_sink_ignored_frames += other.websocket_sink_ignored_frames;
+        self.websocket_sink_closes += other.websocket_sink_closes;
+        self.websocket_sink_close_failed += other.websocket_sink_close_failed;
+        self.websocket_sink_fatal += other.websocket_sink_fatal;
+        self.websocket_sink_queue_items += other.websocket_sink_queue_items;
+        self.websocket_source_inbox_items += other.websocket_source_inbox_items;
+        self.websocket_source_inbox_bytes += other.websocket_source_inbox_bytes;
         self.databus_source_inbox_items += other.databus_source_inbox_items;
         self.databus_source_inbox_bytes += other.databus_source_inbox_bytes;
         self.nats_source_inbox_items += other.nats_source_inbox_items;

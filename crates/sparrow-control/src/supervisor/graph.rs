@@ -41,6 +41,11 @@ enum Input {
         source: HttpPollSource,
         tx: observed::Sender<sparrow_model::QueuedRow>,
     },
+    #[cfg(feature = "websocket")]
+    WebSocket {
+        source: sparrow_connectors::WebSocketSource,
+        tx: observed::Sender<sparrow_model::QueuedRow>,
+    },
     #[cfg(feature = "nats")]
     Nats {
         source: sparrow_connectors::NatsSource,
@@ -441,6 +446,26 @@ impl Supervisor {
                     binding.budgeted = Some(rx);
                     Input::HttpPoll { source, tx }
                 }
+                #[cfg(feature = "websocket")]
+                "websocket" => {
+                    let cfg = crate::validate::websocket_source_config(
+                        source_spec,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source = sparrow_connectors::WebSocketSource::bind(
+                        cfg,
+                        &self.secrets,
+                        policy,
+                        diag.clone(),
+                    )?;
+                    let (tx, rx) = observed::channel(source_spec.inbox_capacity);
+                    diag.observe_source(&tx);
+                    binding.budgeted = Some(rx);
+                    Input::WebSocket { source, tx }
+                }
                 #[cfg(feature = "nats")]
                 "nats" => {
                     let cfg = crate::validate::nats_source_config(
@@ -614,6 +639,12 @@ impl Supervisor {
                             .run_budgeted(tx, child.clone(), owner, max_row_bytes)
                             .await
                             .map_err(SparrowError::from),
+                        #[cfg(feature = "websocket")]
+                        Input::WebSocket { source, tx } => {
+                            source
+                                .run_budgeted(tx, child.clone(), owner, max_row_bytes)
+                                .await
+                        }
                         #[cfg(feature = "nats")]
                         Input::Nats { source, tx } => {
                             source

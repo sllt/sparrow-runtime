@@ -25,6 +25,8 @@ pub mod nats;
 pub mod policy;
 pub mod secret;
 pub mod tls;
+#[cfg(feature = "websocket")]
+pub mod websocket;
 
 pub use capabilities::{
     refuse_delivery_name, refuse_durable_recovery, refuse_qos_durable, refuse_unsupported_recovery,
@@ -54,6 +56,8 @@ pub use policy::{
 };
 pub use secret::{MapSecretResolver, SecretResolver};
 pub use tls::TlsConfig;
+#[cfg(feature = "websocket")]
+pub use websocket::{WebSocketSink, WebSocketSinkConfig, WebSocketSource, WebSocketSourceConfig};
 
 /// Encode a sensor-shaped JSON event for the M2 demo publisher.
 pub fn sensor_json(

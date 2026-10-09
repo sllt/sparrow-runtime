@@ -85,6 +85,9 @@ pub struct SourceSpec {
     /// Required exclusively for `kind = "databus"` (in-process topic bus).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub databus: Option<DataBusSourceSpec>,
+    /// Required exclusively for `kind = "websocket"` (client mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket: Option<WebSocketSourceSpec>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -144,12 +147,13 @@ pub const CSV_SOURCE_KINDS: &[&str] = &[
     "http_poll",
     "nats",
     "jetstream",
+    "websocket",
     "file",
     "file_replay",
     "replay",
 ];
 /// Sink kinds whose bytes carry a selectable record format.
-pub const CSV_SINK_KINDS: &[&str] = &["mqtt", "http", "nats", "jetstream", "file"];
+pub const CSV_SINK_KINDS: &[&str] = &["mqtt", "http", "nats", "jetstream", "websocket", "file"];
 
 fn payload_format(
     side: &str,
@@ -578,6 +582,274 @@ impl NatsSinkSpec {
     }
 }
 
+/// How a WebSocket Source maps one message to records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSocketFramingSpec {
+    #[default]
+    Message,
+    Ndjson,
+}
+
+/// What a WebSocket Source does with binary messages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSocketBinarySpec {
+    #[default]
+    Drop,
+    Decode,
+}
+
+/// Frame type of every message a WebSocket Sink sends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSocketFrameSpec {
+    #[default]
+    Text,
+    Binary,
+}
+
+/// What a WebSocket Sink does when its send queue is full.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSocketOverflowSpec {
+    #[default]
+    Block,
+    DropNewest,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+/// WebSocket client Source (`ws://` / `wss://`), live and at-most-once.
+/// Credentials are SecretRefs only and require `wss://`. The wire shape
+/// stays readable on builds without the `websocket` feature, which reject it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSocketSourceSpec {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<HttpPollAuthSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HttpPollHeaderSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subprotocols: Vec<String>,
+    /// PEM CA bundle replacing the built-in roots (private CA / self-signed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ping_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_max_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<usize>,
+    /// Largest message/frame accepted (default 65536, at most 1 MiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_message_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub framing: WebSocketFramingSpec,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub binary_frames: WebSocketBinarySpec,
+    /// Decoded-row Queue credit for the inbox; default 256 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_bytes: Option<usize>,
+}
+
+/// WebSocket client Sink: one message per row, live and at-most-once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSocketSinkSpec {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<HttpPollAuthSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HttpPollHeaderSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subprotocols: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ping_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_max_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<usize>,
+    /// Largest encoded row sent (default 65536); larger rows are dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_message_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub frame: WebSocketFrameSpec,
+    /// Bounded send queue in messages (default 16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_capacity: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub overflow: WebSocketOverflowSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_timeout_ms: Option<u64>,
+    /// Shutdown budget for queued rows plus the Close frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+}
+
+#[cfg(feature = "websocket")]
+#[allow(clippy::too_many_arguments)]
+fn websocket_client(
+    url: &str,
+    auth: &Option<HttpPollAuthSpec>,
+    headers: &[HttpPollHeaderSpec],
+    subprotocols: &[String],
+    tls_ca_pem: &Option<String>,
+    connect_timeout_ms: Option<u64>,
+    ping_interval_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+    reconnect_max_ms: Option<u64>,
+    reconnect_attempts: Option<usize>,
+    max_message_bytes: Option<usize>,
+) -> sparrow_connectors::websocket::WebSocketClientConfig {
+    use sparrow_connectors::websocket::{WebSocketAuth, WebSocketHeader};
+    use std::time::Duration;
+    let mut c = sparrow_connectors::websocket::WebSocketClientConfig::new(url);
+    c.auth = match auth {
+        None => WebSocketAuth::None,
+        Some(HttpPollAuthSpec::Bearer { token_secret }) => WebSocketAuth::Bearer {
+            token_secret: token_secret.clone(),
+        },
+        Some(HttpPollAuthSpec::Basic {
+            username_secret,
+            password_secret,
+        }) => WebSocketAuth::Basic {
+            username_secret: username_secret.clone(),
+            password_secret: password_secret.clone(),
+        },
+    };
+    c.headers = headers
+        .iter()
+        .map(|h| WebSocketHeader {
+            name: h.name.clone(),
+            value: h.value.clone(),
+            value_secret: h.value_secret.clone(),
+        })
+        .collect();
+    c.subprotocols = subprotocols.to_vec();
+    c.tls_ca_pem = tls_ca_pem.clone();
+    if let Some(ms) = connect_timeout_ms {
+        c.connect_timeout = Duration::from_millis(ms);
+    }
+    if let Some(ms) = ping_interval_ms {
+        c.ping_interval = Duration::from_millis(ms);
+    }
+    if let Some(ms) = idle_timeout_ms {
+        c.idle_timeout = Duration::from_millis(ms);
+    }
+    if let Some(ms) = reconnect_max_ms {
+        c.reconnect_max = Duration::from_millis(ms);
+    }
+    if let Some(n) = reconnect_attempts {
+        c.reconnect_attempts = n;
+    }
+    if let Some(n) = max_message_bytes {
+        c.max_message_bytes = n;
+    }
+    c
+}
+
+#[cfg(feature = "websocket")]
+impl WebSocketSourceSpec {
+    pub fn client_config(&self) -> sparrow_connectors::websocket::WebSocketClientConfig {
+        websocket_client(
+            &self.url,
+            &self.auth,
+            &self.headers,
+            &self.subprotocols,
+            &self.tls_ca_pem,
+            self.connect_timeout_ms,
+            self.ping_interval_ms,
+            self.idle_timeout_ms,
+            self.reconnect_max_ms,
+            self.reconnect_attempts,
+            self.max_message_bytes,
+        )
+    }
+
+    pub fn connector_config(
+        &self,
+        schema: sparrow_model::Schema,
+        inbox_capacity: usize,
+        fail_on_decode: bool,
+    ) -> sparrow_connectors::WebSocketSourceConfig {
+        use sparrow_connectors::websocket::{BinaryFrames, WebSocketFraming};
+        let mut c = sparrow_connectors::WebSocketSourceConfig::new(self.url.clone(), schema);
+        c.client = self.client_config();
+        c.framing = match self.framing {
+            WebSocketFramingSpec::Message => WebSocketFraming::Message,
+            WebSocketFramingSpec::Ndjson => WebSocketFraming::Ndjson,
+        };
+        c.binary_frames = match self.binary_frames {
+            WebSocketBinarySpec::Drop => BinaryFrames::Drop,
+            WebSocketBinarySpec::Decode => BinaryFrames::Decode,
+        };
+        if let Some(n) = self.inbox_bytes {
+            c.inbox_bytes = n;
+        }
+        c.inbox_capacity = inbox_capacity;
+        c.fail_on_decode = fail_on_decode;
+        c
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl WebSocketSinkSpec {
+    pub fn connector_config(
+        &self,
+        outbox_capacity: usize,
+    ) -> sparrow_connectors::WebSocketSinkConfig {
+        use sparrow_connectors::websocket::{Overflow, SinkFrame};
+        use std::time::Duration;
+        let mut c = sparrow_connectors::WebSocketSinkConfig::new(self.url.clone());
+        c.client = websocket_client(
+            &self.url,
+            &self.auth,
+            &self.headers,
+            &self.subprotocols,
+            &self.tls_ca_pem,
+            self.connect_timeout_ms,
+            self.ping_interval_ms,
+            self.idle_timeout_ms,
+            self.reconnect_max_ms,
+            self.reconnect_attempts,
+            self.max_message_bytes,
+        );
+        c.frame = match self.frame {
+            WebSocketFrameSpec::Text => SinkFrame::Text,
+            WebSocketFrameSpec::Binary => SinkFrame::Binary,
+        };
+        c.overflow = match self.overflow {
+            WebSocketOverflowSpec::Block => Overflow::Block,
+            WebSocketOverflowSpec::DropNewest => Overflow::DropNewest,
+        };
+        if let Some(n) = self.queue_capacity {
+            c.queue_capacity = n;
+        }
+        if let Some(ms) = self.send_timeout_ms {
+            c.send_timeout = Duration::from_millis(ms);
+        }
+        if let Some(ms) = self.flush_timeout_ms {
+            c.flush_timeout = Duration::from_millis(ms);
+        }
+        c.outbox_capacity = outbox_capacity;
+        c
+    }
+}
+
 /// HTTP Poll Source options. Credentials are named secret references only;
 /// the stored revision never contains a credential value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -705,6 +977,9 @@ pub struct SinkSpec {
     /// Required exclusively for `kind = "databus"` (in-process topic bus).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub databus: Option<DataBusSinkSpec>,
+    /// Required exclusively for `kind = "websocket"` (client mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket: Option<WebSocketSinkSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1109,6 +1384,7 @@ impl PipelineSpec {
         self.check_nats()?;
         self.check_jetstream_sink()?;
         self.check_databus()?;
+        self.check_websocket()?;
         if self
             .source
             .jetstream
@@ -1394,6 +1670,63 @@ impl PipelineSpec {
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// WebSocket (client mode) is live, at-most-once: no replay point, so
+    /// durable claims are refused; connector fields must not be mixed.
+    fn check_websocket(&self) -> Result<()> {
+        if self.source.websocket.is_some() != (self.source.kind == "websocket")
+            || self.sink.websocket.is_some() != (self.sink.kind == "websocket")
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "source.websocket / sink.websocket are required exclusively for kind=websocket",
+            ));
+        }
+        let source = self.source.kind == "websocket";
+        let sink = self.sink.kind == "websocket";
+        if !source && !sink {
+            return Ok(());
+        }
+        if !cfg!(feature = "websocket") {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "WebSocket support requires the websocket build feature",
+            ));
+        }
+        if source
+            && (self.source_has_foreign_fields()
+                || self.source.nats.is_some()
+                || self.source.databus.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "WebSocket options belong in source.websocket (TLS follows the wss:// URL); mixed connector fields refused",
+            ));
+        }
+        if sink
+            && (self.sink_has_foreign_fields()
+                || self.sink.nats.is_some()
+                || self.sink.jetstream.is_some()
+                || self.sink.databus.is_some())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "WebSocket options belong in sink.websocket (one message per row, no actions); mixed connector fields refused",
+            ));
+        }
+        if self.delivery != "live_best_effort"
+            || self.recovery != "restart_fresh"
+            || self.restore.is_some()
+            || self.checkpoint.is_some()
+            || self.checkpoint_dir.is_some()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "WebSocket is live_best_effort/restart_fresh, at-most-once (no ack, no replay); no checkpoint or restore",
+            ));
         }
         Ok(())
     }

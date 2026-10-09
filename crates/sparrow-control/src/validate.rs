@@ -293,8 +293,8 @@ pub fn replay_label_for_source(kind: &str) -> &'static str {
     match kind {
         "file" | "file_replay" | "replay" => "replayable",
         "jetstream" if cfg!(feature = "jetstream") => "replayable",
-        "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "nats" | "databus" | "http"
-        | "plugin" => "unsupported",
+        "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "nats" | "databus" | "websocket"
+        | "http" | "plugin" => "unsupported",
         _ => sparrow_plan::REPLAY_UNBOUND,
     }
 }
@@ -434,7 +434,8 @@ fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
         .filter_map(|s| s.databus.as_ref())
         .filter_map(|d| d.subscription().ok())
         .map(|c| c.reservation())
-        .fold(0usize, usize::saturating_add);
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(websocket_reservation(&sources, &sinks));
     #[cfg(not(feature = "nats"))]
     let total = databus;
     #[cfg(feature = "nats")]
@@ -460,11 +461,34 @@ fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
         return Err(SparrowError::new(
             ErrorCode::BoundExceeded,
             format!(
-                "NATS SDK / DataBus buffers of all endpoints ({total} bytes) exceed 3/4 of the job reservation budget ({budget}); lower subscription_capacity/client_capacity/buffer_bytes or max_payload_bytes"
+                "NATS SDK / DataBus / WebSocket buffers of all endpoints ({total} bytes) exceed 3/4 of the job reservation budget ({budget}); lower subscription_capacity/client_capacity/buffer_bytes/queue_capacity or max_payload_bytes/max_message_bytes"
             ),
         ));
     }
     Ok(())
+}
+
+/// WebSocket connection buffers (plus the Sink send queue) of all endpoints.
+fn websocket_reservation(sources: &[&SourceSpec], sinks: &[&SinkSpec]) -> usize {
+    #[cfg(feature = "websocket")]
+    {
+        sources
+            .iter()
+            .filter_map(|s| s.websocket.as_ref())
+            .map(|w| w.client_config().connection_reservation())
+            .chain(
+                sinks
+                    .iter()
+                    .filter_map(|s| s.websocket.as_ref())
+                    .map(|w| w.connector_config(1).reservation()),
+            )
+            .fold(0usize, usize::saturating_add)
+    }
+    #[cfg(not(feature = "websocket"))]
+    {
+        let _ = (sources, sinks);
+        0
+    }
 }
 
 /// SDK buffers plus payloads retained for PubAck retries.
@@ -584,6 +608,16 @@ fn validate_source_io(
             databus_source_config(source, schema.clone(), spec.effective_fail_on_decode())?
                 .validate()?;
         }
+        #[cfg(feature = "websocket")]
+        "websocket" => {
+            refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
+            let ws =
+                websocket_source_config(source, schema.clone(), spec.effective_fail_on_decode())?;
+            ws.validate(policy)?;
+            ws.client.bind(secrets, policy)?;
+            let compact = sparrow_model::ResourceBudget::compact();
+            ws.check_inbox_budget(compact.queue_bytes)?;
+        }
         #[cfg(feature = "nats")]
         "nats" => {
             refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
@@ -619,7 +653,7 @@ fn validate_source_io(
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
                 format!(
-                    "source kind `{other}` is not supported (mqtt|http_push|http_poll|nats|databus|file)"
+                    "source kind `{other}` is not supported (mqtt|http_push|http_poll|nats|websocket|databus|file)"
                 ),
             ));
         }
@@ -691,6 +725,12 @@ fn validate_sink_io(
             )?;
         }
         "databus" => databus_sink_config(sink)?.validate()?,
+        #[cfg(feature = "websocket")]
+        "websocket" => {
+            let ws = websocket_sink_config(sink)?;
+            ws.validate(policy)?;
+            ws.client.bind(secrets, policy)?;
+        }
         #[cfg(feature = "nats")]
         "nats" => {
             let nats = nats_sink_config(sink)?;
@@ -714,7 +754,7 @@ fn validate_sink_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|databus|file)"),
+                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|websocket|databus|file)"),
             ));
         }
     }
@@ -1032,6 +1072,42 @@ pub fn jetstream_sink_config(
             SparrowError::new(
                 ErrorCode::InvalidArgument,
                 "JetStream sink requires sink.jetstream",
+            )
+        })?
+        .connector_config(sink.outbox_capacity);
+    config.payload_format = sink.payload_format()?;
+    Ok(config)
+}
+
+#[cfg(feature = "websocket")]
+pub fn websocket_source_config(
+    source: &SourceSpec,
+    schema: Schema,
+    fail_on_decode: bool,
+) -> Result<sparrow_connectors::WebSocketSourceConfig> {
+    let mut config = source
+        .websocket
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "WebSocket source requires source.websocket",
+            )
+        })?
+        .connector_config(schema, source.inbox_capacity, fail_on_decode);
+    config.payload_format = source.payload_format()?;
+    Ok(config)
+}
+
+#[cfg(feature = "websocket")]
+pub fn websocket_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::WebSocketSinkConfig> {
+    let mut config = sink
+        .websocket
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "WebSocket sink requires sink.websocket",
             )
         })?
         .connector_config(sink.outbox_capacity);
@@ -1748,6 +1824,8 @@ pub fn capabilities_json() -> serde_json::Value {
     let nats_sink = ConnectorCapabilities::NATS_SINK;
     let js_sink = ConnectorCapabilities::JETSTREAM_SINK;
     let bus_source = ConnectorCapabilities::DATABUS_SOURCE;
+    let ws = ConnectorCapabilities::WEBSOCKET_SOURCE;
+    let ws_sink = ConnectorCapabilities::WEBSOCKET_SINK;
     let bus_sink = ConnectorCapabilities::DATABUS_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
     serde_json::json!({
@@ -1815,6 +1893,34 @@ pub fn capabilities_json() -> serde_json::Value {
                 "acknowledgement": "none",
                 "maturity": "preview",
                 "contract": "nats_core_at_most_once; static_subject; published_means_handed_to_client; flush_on_stop; not_jetstream",
+            },
+            {
+                "kind": ws.kind,
+                "roles": ["source"],
+                "enabled_by_build": cfg!(feature = "websocket"),
+                "replay": ws.replay.as_str(),
+                "delivery": ws.delivery.as_str(),
+                "recovery": ws.recovery.as_str(),
+                "acknowledgement": "none",
+                "mode": "client",
+                "framing": ["message", "ndjson"],
+                "binary_frames": ["drop", "decode"],
+                "maturity": "preview",
+                "contract": "websocket_client_at_most_once; no_ack; no_replay; size_limit_before_decode; ping_idle_timeout; capped_jittered_reconnect; allowlist; credentials_require_wss",
+            },
+            {
+                "kind": ws_sink.kind,
+                "roles": ["sink"],
+                "enabled_by_build": cfg!(feature = "websocket"),
+                "replay": ws_sink.replay.as_str(),
+                "delivery": ws_sink.delivery.as_str(),
+                "recovery": ws_sink.recovery.as_str(),
+                "acknowledgement": "none",
+                "mode": "client",
+                "overflow": ["block", "drop_newest"],
+                "default_overflow": "block",
+                "maturity": "preview",
+                "contract": "websocket_client_at_most_once; one_message_per_row; bounded_send_queue; sent_means_written_to_socket; flush_on_stop; fail_closed_after_reconnect_attempts",
             },
             {
                 "kind": bus_source.kind,
@@ -2555,6 +2661,7 @@ mod tests {
                 http_poll: None,
                 nats: None,
                 databus: None,
+                websocket: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
                 port: Some(1883),
@@ -2580,6 +2687,7 @@ mod tests {
             sink: crate::spec::SinkSpec {
                 nats: None,
                 databus: None,
+                websocket: None,
                 jetstream: None,
                 plugin: None,
                 action: None,
@@ -2648,6 +2756,7 @@ mod tests {
             http_poll: None,
             nats: None,
             databus: None,
+            websocket: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),
@@ -2697,6 +2806,7 @@ mod tests {
             http_poll: None,
             nats: None,
             databus: None,
+            websocket: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),
@@ -2741,6 +2851,7 @@ mod tests {
         let mut sink = crate::spec::SinkSpec {
                 nats: None,
                 databus: None,
+                websocket: None,
                 jetstream: None,
                 plugin: None,
             action: None,
