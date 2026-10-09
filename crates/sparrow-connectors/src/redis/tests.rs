@@ -1274,7 +1274,7 @@ async fn json_lookup_decodes_flat_objects_strictly() {
     );
     for (k, code) in [
         (key("n", 1), ErrorCode::CodecViolation),
-        (key("r", 1), ErrorCode::InvalidSchema),
+        (key("r", 1), ErrorCode::CodecViolation),
     ] {
         let e = lookup
             .lookup(k, CancellationToken::new())
