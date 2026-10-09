@@ -859,7 +859,7 @@ fn n4_stale_barrier_ack_not_used_for_next_checkpoint() {
         )
         .unwrap();
         let http = sparrow_connectors::HttpCapture::start().await.unwrap();
-        // Delay longer than the coordinator deadline, but shorter than the
+        // Delay longer than the first coordinator deadline, but shorter than the
         // HTTP request timeout. A transport drop must remain sticky (R3-4).
         http.set_delay_ms(400);
         store.put_allow("127.0.0.1", http.port()).unwrap();
@@ -873,26 +873,76 @@ fn n4_stale_barrier_ack_not_used_for_next_checkpoint() {
         spec.sink.url = Some(http.url());
         store.put_pipeline("n4", &spec, None).unwrap();
         request_start(&store, "n4", "test").unwrap();
-        let mut sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
-        Arc::get_mut(&mut sup).unwrap().checkpoint_timeout = std::time::Duration::from_millis(100);
+        let sup = Supervisor::new(Arc::clone(&store), Arc::clone(&kernel), false, None).unwrap();
         let _ = sup.converge_once().await;
         let actual = store.actual("n4").unwrap();
         assert_eq!(actual.status, "running", "{:?}", actual.last_error);
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let diag = sup.flow_snapshot("n4").unwrap().unwrap().diagnostics;
+        let control = sup.checkpoint_snapshot("n4").unwrap().unwrap().1;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let delivery = diag
+                .observation
+                .delivery()
+                .expect("admitted flow observation");
+            let io = diag.snapshot();
+            assert_eq!(
+                io.http_failed, 0,
+                "slow request must not fail transport: {io:?}"
+            );
+            assert_eq!(
+                io.http_posted, 0,
+                "first checkpoint needs a pending response: {io:?}"
+            );
+            if delivery.runtime_ingested_rows == 2 && io.http_inflight == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "initial rows/HTTP request did not start: {delivery:?}, {io:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         let current = chk.join("CURRENT");
         assert!(!current.exists(), "CURRENT must not exist before checkpoint");
 
-        let first = sup.checkpoint_named("n4").await;
-        assert!(
-            first.is_err(),
-            "slow sink must time out barrier #1 without a dishonest commit: {first:?}"
-        );
+        // Only barrier #1 gets a short end-to-end deadline. The actor sees
+        // the same deadline as its waiter; dropping a waiter alone could still
+        // let a dishonest late commit through and would not test abandonment.
+        let first = sup
+            .checkpoint_named_with_timeout_for_test("n4", std::time::Duration::from_millis(100))
+            .await
+            .expect_err("slow sink must time out barrier #1 without a dishonest commit");
+        assert_eq!(first.code, ErrorCode::ResourceExhausted, "{first:?}");
+        assert!(first.message.contains("timed out"), "{first:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let status = control.snapshot();
+            if !status.active {
+                // A queued request discarded before barrier injection records
+                // Cancelled, not a genuine alignment timeout.
+                assert_eq!(
+                    (status.started, status.failed, status.succeeded),
+                    (1, 1, 0)
+                );
+                assert_eq!(status.last_error, Some(ErrorCode::ResourceExhausted));
+                assert_eq!(status.phase, "idle");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed-out barrier did not release coordinator admission: {status:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert!(
             !current.exists(),
             "timed-out barrier must not publish CURRENT"
         );
 
+        // Recovery of later requests must be observed, not guessed from sleeps.
+        http.set_delay_ms(0);
         // Rows between barriers. A stitch of barrier #1's empty freeze + this
         // pos would drop v=3,4,5 from both state and replay.
         {
@@ -905,15 +955,42 @@ fn n4_stale_barrier_ack_not_used_for_next_checkpoint() {
             )
             .unwrap();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        http.set_delay_ms(0);
-        let wait0 = std::time::Instant::now();
-        while http.bodies().is_empty() && wait0.elapsed() < std::time::Duration::from_secs(8) {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let delivery = diag
+                .observation
+                .delivery()
+                .expect("admitted flow observation");
+            let io = diag.snapshot();
+            let status = control.snapshot();
+            assert_eq!(
+                io.http_failed, 0,
+                "late response must recover without transport loss: {io:?}"
+            );
+            assert_eq!(
+                io.http_dropped, 0,
+                "accepted output must not be dropped: {io:?}"
+            );
+            // A captured body is not a completed response. Wait for both real
+            // 2xx receipts and all five runtime inputs before choosing cut #2.
+            if delivery.runtime_ingested_rows == 5
+                && io.http_posted == 2
+                && io.http_acked_batches == 2
+                && io.http_inflight == 0
+                && !status.active
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sink/rows/coordinator did not recover: {delivery:?}, {io:?}, {status:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        // Late freeze/flush for id=1 must now sit in ack_rx (or have been drained).
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !current.exists(),
+            "late ACK must not commit abandoned barrier #1"
+        );
 
         let id = sup
             .checkpoint_named("n4")
