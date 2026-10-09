@@ -8,7 +8,8 @@ description = "Authenticated V0.1 management API (Axum). Depends on control; not
 [features]
 default = ["demo-io"]
 demo-io = ["sparrow-control/demo-io"]
-jetstream = ["sparrow-control/jetstream", "sparrow-connectors/jetstream"]
+nats = ["sparrow-control/nats", "sparrow-connectors/nats"]
+jetstream = ["nats", "sparrow-control/jetstream", "sparrow-connectors/jetstream"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }

@@ -1,4 +1,5 @@
 //! Opt-in, real broker fixture. Never connects to an existing NATS service.
+pub use async_nats;
 pub use async_nats::jetstream;
 use std::{
     path::PathBuf,

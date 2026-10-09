@@ -964,6 +964,26 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "origin_propagation":"conservative_input_batch_bounds; window_aggregate_outputs_unknown",
             "device_event_age_available":false,"broker_wait_available":false,"business_ack_available":false,
             "restored_monotonic_age_available":false,"payload_semantics_changed":false}});
+    if s.source_kind == "nats" {
+        value["nats_source"] = json!({"received":io.nats_source_received,"rows":io.nats_source_rows,
+            "dropped_bad":io.nats_source_dropped_bad,"dropped_oversize":io.nats_source_dropped_oversize,
+            "dropped_budget":io.nats_source_dropped_budget,"backpressure_waits":io.nats_source_backpressure_waits,
+            "slow_consumer_events":io.nats_source_slow_consumer,"disconnects":io.nats_source_disconnects,
+            "reconnects":io.nats_source_reconnects,"client_errors":io.nats_source_client_errors,
+            "inbox_items":io.nats_source_inbox_items,"inbox_bytes":io.nats_source_inbox_bytes,
+            "semantics":"live_best_effort_at_most_once_no_replay_no_ack",
+            "scope":"this_attempt; slow_consumer_events=lower_bound_of_sdk_drop_events"});
+    }
+    if s.sink_kind == "nats" {
+        value["nats_sink"] = json!({"published":io.nats_sink_published,"failed":io.nats_sink_failed,
+            "dropped_bad":io.nats_sink_dropped_bad,"dropped_oversize":io.nats_sink_dropped_oversize,
+            "discarded_on_close":io.nats_sink_discarded_on_close,"flushes":io.nats_sink_flushes,
+            "flush_failed":io.nats_sink_flush_failed,"disconnects":io.nats_sink_disconnects,
+            "reconnects":io.nats_sink_reconnects,"client_errors":io.nats_sink_client_errors,
+            "sessions":io.nats_sink_sessions,
+            "semantics":"live_best_effort_at_most_once_no_broker_ack",
+            "scope":"this_attempt; published=handed_to_client_not_broker_ack"});
+    }
     if let Some(ports) = &s.graph_ports {
         value["graph_ports"] = json!({"sources":ports.sources.iter().map(|(id,diag)|graph_port_json(*id,true,diag)).collect::<Vec<_>>(),"sinks":ports.sinks.iter().map(|(id,diag)|graph_port_json(*id,false,diag)).collect::<Vec<_>>()});
         value["source"] = json!({"available":false,"reason":"multiple_ports_see_graph_ports"});
@@ -1109,6 +1129,38 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         ("http_poll_inflight", io.http_poll_inflight),
         ("http_poll_inbox_items", io.http_poll_inbox_items),
         ("http_poll_inbox_bytes", io.http_poll_inbox_bytes),
+        ("nats_source_received", io.nats_source_received),
+        ("nats_source_rows", io.nats_source_rows),
+        ("nats_source_dropped_bad", io.nats_source_dropped_bad),
+        (
+            "nats_source_dropped_oversize",
+            io.nats_source_dropped_oversize,
+        ),
+        ("nats_source_dropped_budget", io.nats_source_dropped_budget),
+        (
+            "nats_source_backpressure_waits",
+            io.nats_source_backpressure_waits,
+        ),
+        ("nats_source_slow_consumer", io.nats_source_slow_consumer),
+        ("nats_source_disconnects", io.nats_source_disconnects),
+        ("nats_source_reconnects", io.nats_source_reconnects),
+        ("nats_source_client_errors", io.nats_source_client_errors),
+        ("nats_source_inbox_items", io.nats_source_inbox_items),
+        ("nats_source_inbox_bytes", io.nats_source_inbox_bytes),
+        ("nats_sink_published", io.nats_sink_published),
+        ("nats_sink_failed", io.nats_sink_failed),
+        ("nats_sink_dropped_bad", io.nats_sink_dropped_bad),
+        ("nats_sink_dropped_oversize", io.nats_sink_dropped_oversize),
+        (
+            "nats_sink_discarded_on_close",
+            io.nats_sink_discarded_on_close,
+        ),
+        ("nats_sink_flushes", io.nats_sink_flushes),
+        ("nats_sink_flush_failed", io.nats_sink_flush_failed),
+        ("nats_sink_disconnects", io.nats_sink_disconnects),
+        ("nats_sink_reconnects", io.nats_sink_reconnects),
+        ("nats_sink_client_errors", io.nats_sink_client_errors),
+        ("nats_sink_sessions", io.nats_sink_sessions),
     ] {
         io_fields[name] = json!(value);
     }

@@ -8,7 +8,10 @@ description = "MQTT source, HTTP/Log sinks, secrets, and target policy (outside 
 [features]
 default = ["demo-io"]
 demo-io = []
-jetstream = ["dep:async-nats", "dep:futures-util", "dep:ring"]
+# NATS Core (non-JetStream) live Source/Sink. JetStream reuses its client
+# setup, so `jetstream` implies `nats`.
+nats = ["dep:async-nats", "dep:futures-util"]
+jetstream = ["nats", "dep:ring"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }
@@ -33,4 +36,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "te
 sparrow-expr = { path = "../sparrow-expr" }
 sparrow-plan = { path = "../sparrow-plan" }
 sparrow-runtime = { path = "../sparrow-runtime" }
-sparrow-testkit = { path = "../sparrow-testkit" }
+sparrow-testkit = { path = "../sparrow-testkit", features = ["jetstream"] }

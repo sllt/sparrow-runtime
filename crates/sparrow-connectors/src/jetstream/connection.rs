@@ -14,7 +14,7 @@ pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const SDK_FIXED_RESERVATION: usize = 512 * 1024;
 pub(super) const SDK_EXPANSION: usize = 32;
-pub(super) const MAX_SUBJECT_BYTES: usize = 4096;
+pub(super) const MAX_SUBJECT_BYTES: usize = crate::nats::common::MAX_SUBJECT_BYTES;
 const COMMAND_CAPACITY: usize = 32;
 
 #[derive(Clone, Debug)]
@@ -29,8 +29,7 @@ pub struct ConnectionConfig {
 
 impl ConnectionConfig {
     pub fn validate(&self, policy: &TargetPolicy) -> Result<()> {
-        if !(1..=4).contains(&self.servers.len())
-            || !(2..=256).contains(&self.subscription_capacity)
+        if !(2..=256).contains(&self.subscription_capacity)
             || !(4096..=1024 * 1024).contains(&self.pull_bytes)
         {
             return Err(error(
@@ -38,37 +37,9 @@ impl ConnectionConfig {
                 "JetStream connection bounds invalid",
             ));
         }
-        for server in &self.servers {
-            let u = url::Url::parse(server)
-                .map_err(|_| error(ErrorCode::InvalidArgument, "invalid NATS URL"))?;
-            if server.len() > 1024
-                || !matches!(u.scheme(), "nats" | "tls")
-                || !u.username().is_empty()
-                || u.password().is_some()
-                || !matches!(u.path(), "" | "/")
-                || u.query().is_some()
-                || u.fragment().is_some()
-            {
-                return Err(error(
-                    ErrorCode::PolicyDenied,
-                    "NATS URLs require nats/tls and no credentials, path, query or fragment",
-                ));
-            }
-            if self.token_secret.is_some() && u.scheme() != "tls" {
-                return Err(error(
-                    ErrorCode::PolicyDenied,
-                    "NATS authentication requires TLS",
-                ));
-            }
-            policy
-                .check_host_port(
-                    u.host_str()
-                        .ok_or_else(|| error(ErrorCode::InvalidArgument, "NATS host required"))?,
-                    u.port().unwrap_or(4222),
-                )
-                .map_err(|e| error(e.code(), "NATS endpoint not allowed"))?;
-        }
-        Ok(())
+        // Shared with NATS Core: 1..=4 nats/tls endpoints, token requires
+        // TLS, allowlisted host:port, no credentials in URLs.
+        crate::nats::common::validate_servers(&self.servers, self.token_secret.is_some(), policy)
     }
 }
 
@@ -187,20 +158,9 @@ impl Connection {
                 }
             });
         if let Some(reference) = &config.token_secret {
-            let token = secrets
-                .resolve(reference)
-                .map_err(|e| error(e.code(), "NATS token SecretRef resolution failed"))?;
-            if token.is_empty() || token.len() > 4096 {
-                return Err(error(ErrorCode::InvalidArgument, "NATS token size invalid"));
-            }
-            options = options.token(token);
+            options = options.token(crate::nats::common::resolve_token(secrets, reference)?);
         }
-        let servers = config
-            .servers
-            .iter()
-            .map(|s| s.parse::<async_nats::ServerAddr>())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|_| error(ErrorCode::InvalidArgument, "invalid NATS server address"))?;
+        let servers = crate::nats::common::parse_servers(&config.servers)?;
         let client = options
             .connect(servers)
             .await

@@ -79,6 +79,9 @@ pub struct SourceSpec {
     /// Required exclusively for `kind = "http_poll"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_poll: Option<HttpPollSpec>,
+    /// Required exclusively for `kind = "nats"` (NATS Core, not JetStream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nats: Option<NatsSourceSpec>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -184,6 +187,149 @@ impl JetStreamSpec {
             pull_messages: self.pull_messages,
             pull_bytes: self.pull_bytes,
         }
+    }
+}
+
+/// NATS Core subscribe Source (at-most-once; distinct from `jetstream`).
+/// The wire shape stays readable on builds without the `nats` feature, which
+/// reject it before connecting.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NatsSourceSpec {
+    pub servers: Vec<String>,
+    /// `*` tokens and a trailing `>` allowed.
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_group: Option<String>,
+    /// SecretRef; requires `tls://` servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    /// Largest server `max_payload` accepted (default 65536).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_payload_bytes: Option<usize>,
+    /// SDK subscription buffer in messages (default 16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_capacity: Option<usize>,
+    /// Decoded-row Queue credit for the inbox; default 256 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_bytes: Option<usize>,
+}
+
+/// NATS Core publish Sink to one literal subject.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NatsSinkSpec {
+    pub servers: Vec<String>,
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    /// Largest encoded row accepted (default 65536); larger rows are dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_payload_bytes: Option<usize>,
+    /// SDK command buffer in messages (default 16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_capacity: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_timeout_ms: Option<u64>,
+    /// Shutdown budget for queued batches plus the final flush.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_timeout_ms: Option<u64>,
+}
+
+#[cfg(feature = "nats")]
+fn nats_client(
+    servers: &[String],
+    token_secret: &Option<String>,
+    reconnect_attempts: Option<usize>,
+    connect_timeout_ms: Option<u64>,
+    max_payload_bytes: Option<usize>,
+    capacity: Option<usize>,
+) -> sparrow_connectors::NatsClientConfig {
+    let mut c = sparrow_connectors::NatsClientConfig::new(servers.to_vec());
+    c.token_secret = token_secret.clone();
+    if let Some(n) = reconnect_attempts {
+        c.reconnect_attempts = n;
+    }
+    if let Some(ms) = connect_timeout_ms {
+        c.connect_timeout = std::time::Duration::from_millis(ms);
+    }
+    if let Some(n) = max_payload_bytes {
+        c.max_payload_bytes = n;
+    }
+    if let Some(n) = capacity {
+        c.capacity = n;
+    }
+    c
+}
+
+#[cfg(feature = "nats")]
+impl NatsSourceSpec {
+    pub fn client_config(&self) -> sparrow_connectors::NatsClientConfig {
+        nats_client(
+            &self.servers,
+            &self.token_secret,
+            self.reconnect_attempts,
+            self.connect_timeout_ms,
+            self.max_payload_bytes,
+            self.subscription_capacity,
+        )
+    }
+
+    pub fn connector_config(
+        &self,
+        schema: sparrow_model::Schema,
+        inbox_capacity: usize,
+        fail_on_decode: bool,
+    ) -> sparrow_connectors::NatsSourceConfig {
+        let mut c = sparrow_connectors::NatsSourceConfig::new(
+            self.servers.clone(),
+            self.subject.clone(),
+            schema,
+        );
+        c.client = self.client_config();
+        c.queue_group = self.queue_group.clone();
+        if let Some(n) = self.inbox_bytes {
+            c.inbox_bytes = n;
+        }
+        c.inbox_capacity = inbox_capacity;
+        c.fail_on_decode = fail_on_decode;
+        c
+    }
+}
+
+#[cfg(feature = "nats")]
+impl NatsSinkSpec {
+    pub fn client_config(&self) -> sparrow_connectors::NatsClientConfig {
+        nats_client(
+            &self.servers,
+            &self.token_secret,
+            self.reconnect_attempts,
+            self.connect_timeout_ms,
+            self.max_payload_bytes,
+            self.client_capacity,
+        )
+    }
+
+    pub fn connector_config(&self, outbox_capacity: usize) -> sparrow_connectors::NatsSinkConfig {
+        let mut c =
+            sparrow_connectors::NatsSinkConfig::new(self.servers.clone(), self.subject.clone());
+        c.client = self.client_config();
+        if let Some(ms) = self.publish_timeout_ms {
+            c.publish_timeout = std::time::Duration::from_millis(ms);
+        }
+        if let Some(ms) = self.flush_timeout_ms {
+            c.flush_timeout = std::time::Duration::from_millis(ms);
+        }
+        c.outbox_capacity = outbox_capacity;
+        c
     }
 }
 
@@ -305,6 +451,9 @@ impl HttpPollSpec {
 pub struct SinkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<sparrow_expr::plugins::extension::Binding>,
+    /// Required exclusively for `kind = "nats"` (NATS Core publish).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nats: Option<NatsSinkSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Box<sparrow_formats::action::ActionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -686,6 +835,7 @@ impl PipelineSpec {
                 "HTTP poll is live_best_effort/restart_fresh only (replay=unsupported); no checkpoint or restore",
             ));
         }
+        self.check_nats()?;
         if self
             .source
             .jetstream
@@ -838,6 +988,87 @@ impl PipelineSpec {
                     "exactly one of `sql` or `graph` is required",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// NATS Core is live, at-most-once: refuse JetStream-like claims and
+    /// mixed connector fields on either side.
+    fn check_nats(&self) -> Result<()> {
+        if self.source.nats.is_some() != (self.source.kind == "nats")
+            || self.sink.nats.is_some() != (self.sink.kind == "nats")
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "source.nats / sink.nats are required exclusively for kind=nats",
+            ));
+        }
+        let source = self.source.kind == "nats";
+        let sink = self.sink.kind == "nats";
+        if !source && !sink {
+            return Ok(());
+        }
+        if !cfg!(feature = "nats") {
+            return Err(SparrowError::new(
+                ErrorCode::FeatureUnavailable,
+                "NATS Core support requires the nats build feature",
+            ));
+        }
+        if source
+            && (self.source.jetstream.is_some()
+                || self.source.http_poll.is_some()
+                || self.source.plugin.is_some()
+                || self.source.host.is_some()
+                || self.source.port.is_some()
+                || self.source.path.is_some()
+                || self.source.bind.is_some()
+                || self.source.client_id.is_some()
+                || self.source.username_secret.is_some()
+                || self.source.password_secret.is_some()
+                || self.source.use_demo_io
+                || self.source.tls
+                || self.source.skip_verify
+                || self.source.file_contract.is_some()
+                || self.source.qos != 0
+                || !self.source.clean_session
+                || self.source.topic != default_topic())
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "NATS options belong in source.nats (TLS follows tls:// servers); mixed connector fields refused",
+            ));
+        }
+        if sink
+            && (self.sink.plugin.is_some()
+                || self.sink.action.is_some()
+                || self.sink.file.is_some()
+                || self.sink.url.is_some()
+                || self.sink.skip_verify
+                || self.sink.use_demo_io
+                || self.sink.header_secret.is_some()
+                || self.sink.host.is_some()
+                || self.sink.port.is_some()
+                || self.sink.topic.is_some()
+                || self.sink.client_id.is_some()
+                || self.sink.qos != 0
+                || !self.sink.clean_session
+                || self.sink.tls)
+        {
+            return Err(SparrowError::new(
+                ErrorCode::InvalidArgument,
+                "NATS options belong in sink.nats (static subject, no actions); mixed connector fields refused",
+            ));
+        }
+        if self.delivery != "live_best_effort"
+            || self.recovery != "restart_fresh"
+            || self.restore.is_some()
+            || self.checkpoint.is_some()
+            || self.checkpoint_dir.is_some()
+        {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "NATS Core is live_best_effort/restart_fresh, at-most-once (no ack, no replay); use the JetStream profile for checkpointed delivery",
+            ));
         }
         Ok(())
     }

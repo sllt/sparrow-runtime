@@ -2620,6 +2620,7 @@ mod tests {
                 plugin: None,
                 jetstream: None,
                 http_poll: None,
+                nats: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
                 port: Some(1883),
@@ -2641,6 +2642,7 @@ mod tests {
                 file_contract: None,
             },
             sink: SinkSpec {
+                nats: None,
                 plugin: None,
                 action: None,
                 file: None,
