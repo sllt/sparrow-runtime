@@ -19,7 +19,8 @@
 //!   job closed (`websocket_sink_fatal`).
 //!
 //! On stop the pump queues batches already in the outbox and the writer
-//! sends the queue, both within `flush_timeout`, then sends a Close frame.
+//! sends the queue and a Close frame within the same `flush_timeout`.
+//! With no time left (or a partial frame), drop the socket instead.
 //! Whatever is left is counted `discarded_on_close`.
 
 use std::sync::atomic::Ordering;
@@ -36,12 +37,16 @@ use sparrow_model::{
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tokio_tungstenite::tungstenite::{self, Message};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use super::client::{error, reconnect_delay, BoundClient, WebSocketClientConfig, WsStream};
+use super::client::{
+    error, reconnect_delay, send_duplex, BoundClient, DuplexSent, FlushBudget, Incoming,
+    WebSocketClientConfig, WsStream, WsWrite,
+};
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
+use crate::scratch::{encode_row_charged, EncodeRejected};
 use crate::{SecretResolver, TargetPolicy};
 
 const MAX_OUTBOX: usize = 4096;
@@ -122,19 +127,21 @@ impl WebSocketSinkConfig {
         self.client.validate(policy)
     }
 
-    /// Connection buffers plus a full send queue of maximal messages.
+    /// Read-side connection buffers, the outgoing payload/formatted frame,
+    /// and a full send queue. Pending encode scratch is charged separately.
     pub fn reservation(&self) -> usize {
-        self.client.connection_reservation().saturating_add(
-            self.queue_capacity
-                .saturating_mul(self.client.max_message_bytes),
-        )
+        let max = self.client.max_message_bytes;
+        self.client
+            .connection_reservation()
+            .saturating_add(max.saturating_mul(2))
+            .saturating_add(self.queue_capacity.saturating_mul(max))
     }
 
     pub fn check_reservation_budget(&self, reservation_budget: usize) -> Result<()> {
         if self.reservation() > reservation_budget / 2 {
             return Err(error(
                 ErrorCode::BoundExceeded,
-                "WebSocket sink buffers (queue_capacity x max_message_bytes + connection) exceed half the job reservation budget; lower queue_capacity or max_message_bytes",
+                "WebSocket sink buffers ((queue_capacity + 4) x max_message_bytes + 128 KiB) exceed half the job reservation budget; lower queue_capacity or max_message_bytes",
             ));
         }
         Ok(())
@@ -145,7 +152,8 @@ pub struct WebSocketSink {
     pub config: WebSocketSinkConfig,
     pub diag: Arc<IoDiagnostics>,
     client: BoundClient,
-    _lease: MemoryLease,
+    owner: Arc<MemoryOwner>,
+    _lease: Arc<MemoryLease>,
 }
 
 impl std::fmt::Debug for WebSocketSink {
@@ -181,16 +189,17 @@ enum Queued {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Sent {
-    Ok,
-    Failed,
-    TimedOut,
-}
-
 enum SessionEnd {
     /// Queue closed and drained (or flush deadline reached): closed politely.
     Finished,
     Lost(&'static str),
+}
+
+struct QueuedMessage {
+    message: Message,
+    // Credit follows the frame, not just the actor handle. The encoding
+    // lease hands off to this prepaid slab only after successful admission.
+    _reservation: Arc<MemoryLease>,
 }
 
 impl WebSocketSink {
@@ -204,11 +213,12 @@ impl WebSocketSink {
         config.validate(policy)?;
         config.check_reservation_budget(owner.budget().reservation_bytes)?;
         let client = config.client.bind(secrets, policy)?;
-        let lease = owner.acquire(CreditKind::Reservation, config.reservation())?;
+        let lease = Arc::new(owner.acquire(CreditKind::Reservation, config.reservation())?);
         Ok(Self {
             config,
             diag,
             client,
+            owner,
             _lease: lease,
         })
     }
@@ -222,21 +232,28 @@ impl WebSocketSink {
         let mut rx = rx.into();
         let _lifecycle = self.diag.observation.lifecycle(false);
         let (queue_tx, queue_rx) = mpsc::channel(self.config.queue_capacity);
+        let flush = FlushBudget::new(self.config.flush_timeout);
         tokio::join!(
-            self.pump(&mut rx, queue_tx, &cancel, outbox.as_ref()),
-            self.writer(queue_rx, &cancel),
+            self.pump(&mut rx, queue_tx, &cancel, outbox.as_ref(), &flush),
+            self.writer(queue_rx, &cancel, &flush),
         );
-        self.diag
-            .observation
-            .health(false, HealthState::Stopped, "websocket_sink_stopped", None);
+        if self.diag.websocket_sink_fatal.load(Ordering::Relaxed) == 0 {
+            self.diag.observation.health(
+                false,
+                HealthState::Stopped,
+                "websocket_sink_stopped",
+                None,
+            );
+        }
     }
 
     async fn pump(
         &self,
         rx: &mut ObservedReceiver<RowBatch>,
-        queue: mpsc::Sender<Message>,
+        queue: mpsc::Sender<QueuedMessage>,
         cancel: &CancellationToken,
         outbox: Option<&Arc<InflightCounter>>,
+        flush: &FlushBudget,
     ) {
         loop {
             let batch = tokio::select! {
@@ -247,17 +264,20 @@ impl WebSocketSink {
             let Some(batch) = batch else {
                 return; // input ended: the writer drains the queue and closes
             };
-            if !self.queue_batch(&batch, &queue, cancel, outbox, None).await {
+            if !self
+                .queue_batch(&batch, &queue, cancel, outbox, flush)
+                .await
+            {
                 break;
             }
         }
         // Stop: queue what the outbox already holds within flush_timeout.
-        let deadline = Instant::now() + self.config.flush_timeout;
+        flush.deadline(cancel);
         rx.close();
-        while Instant::now() < deadline && !queue.is_closed() {
+        while !flush.expired(cancel) && !queue.is_closed() {
             let Ok(batch) = rx.try_recv() else { break };
             if !self
-                .queue_batch(&batch, &queue, cancel, outbox, Some(deadline))
+                .queue_batch(&batch, &queue, cancel, outbox, flush)
                 .await
             {
                 break;
@@ -277,10 +297,10 @@ impl WebSocketSink {
     async fn queue_batch(
         &self,
         batch: &RowBatch,
-        queue: &mpsc::Sender<Message>,
+        queue: &mpsc::Sender<QueuedMessage>,
         cancel: &CancellationToken,
         outbox: Option<&Arc<InflightCounter>>,
-        deadline: Option<Instant>,
+        flush: &FlushBudget,
     ) -> bool {
         let mut receipt = BatchReceipt(outbox.cloned());
         let mut delivered = self.diag.observation.delivery_guard(
@@ -291,23 +311,42 @@ impl WebSocketSink {
         let schema = batch.schema();
         let mut all = true;
         for (i, row) in batch.rows().iter().enumerate() {
+            if flush.expired(cancel) || queue.is_closed() {
+                self.diag
+                    .websocket_sink_discarded_on_close
+                    .fetch_add((batch.num_rows() - i) as u64, Ordering::Relaxed);
+                return false;
+            }
             let started = std::time::Instant::now();
-            let encoded = self.config.payload_format.encode_row(schema, row);
+            let encoded = encode_row_charged(
+                &self.owner,
+                &self.config.payload_format,
+                schema,
+                row,
+                self.config.client.max_message_bytes,
+            );
             self.diag
                 .observation
                 .record(Latency::Encode, started.elapsed());
-            let message = match encoded {
-                Ok(body) if body.len() > self.config.client.max_message_bytes => {
+            let (message, _encode_lease) = match encoded {
+                Err(EncodeRejected::Oversize) => {
                     all = false;
                     self.diag
                         .websocket_sink_dropped_oversize
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                Ok(body) => match self.config.frame {
-                    SinkFrame::Binary => Message::Binary(body.into()),
+                Err(EncodeRejected::Budget) => {
+                    all = false;
+                    self.diag
+                        .websocket_sink_dropped_budget
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Ok((body, lease)) => match self.config.frame {
+                    SinkFrame::Binary => (Message::Binary(body.into()), lease),
                     SinkFrame::Text => match String::from_utf8(body) {
-                        Ok(text) => Message::Text(text.into()),
+                        Ok(text) => (Message::Text(text.into()), lease),
                         Err(_) => {
                             all = false;
                             self.diag
@@ -317,7 +356,7 @@ impl WebSocketSink {
                         }
                     },
                 },
-                Err(_) => {
+                Err(EncodeRejected::Bad) => {
                     all = false;
                     self.diag.csv_encode_error(&self.config.payload_format);
                     self.diag
@@ -326,7 +365,7 @@ impl WebSocketSink {
                     continue;
                 }
             };
-            match self.enqueue(message, queue, cancel, deadline).await {
+            match self.enqueue(message, queue, cancel, flush).await {
                 Queued::Yes => {}
                 Queued::Dropped => all = false,
                 Queued::Closed => {
@@ -336,6 +375,9 @@ impl WebSocketSink {
                         .fetch_add(rest, Ordering::Relaxed);
                     return false;
                 }
+            }
+            if i % 16 == 15 {
+                tokio::task::yield_now().await;
             }
         }
         if all {
@@ -348,10 +390,17 @@ impl WebSocketSink {
     async fn enqueue(
         &self,
         message: Message,
-        queue: &mpsc::Sender<Message>,
+        queue: &mpsc::Sender<QueuedMessage>,
         cancel: &CancellationToken,
-        mut deadline: Option<Instant>,
+        flush: &FlushBudget,
     ) -> Queued {
+        if flush.expired(cancel) {
+            return Queued::Closed;
+        }
+        let message = QueuedMessage {
+            message,
+            _reservation: self._lease.clone(),
+        };
         let message = match queue.try_send(message) {
             Ok(()) => {
                 self.diag
@@ -362,7 +411,7 @@ impl WebSocketSink {
             Err(mpsc::error::TrySendError::Closed(_)) => return Queued::Closed,
             Err(mpsc::error::TrySendError::Full(message)) => message,
         };
-        if self.config.overflow == Overflow::DropNewest && deadline.is_none() {
+        if self.config.overflow == Overflow::DropNewest && flush.deadline(cancel).is_none() {
             self.diag
                 .websocket_sink_dropped_overflow
                 .fetch_add(1, Ordering::Relaxed);
@@ -372,9 +421,15 @@ impl WebSocketSink {
             .websocket_sink_backpressure_waits
             .fetch_add(1, Ordering::Relaxed);
         loop {
+            let deadline = flush.deadline(cancel);
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                return Queued::Closed;
+            }
             let at = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
             tokio::select! {
                 biased;
+                _ = cancel.cancelled(), if deadline.is_none() => { flush.deadline(cancel); }
+                _ = tokio::time::sleep_until(at), if deadline.is_some() => return Queued::Closed,
                 permit = queue.reserve() => {
                     let Ok(permit) = permit else { return Queued::Closed };
                     permit.send(message);
@@ -383,17 +438,16 @@ impl WebSocketSink {
                         .fetch_add(1, Ordering::Relaxed);
                     return Queued::Yes;
                 }
-                _ = cancel.cancelled(), if deadline.is_none() => {
-                    // Stop while blocked: keep waiting, but only until the
-                    // flush deadline.
-                    deadline = Some(Instant::now() + self.config.flush_timeout);
-                }
-                _ = tokio::time::sleep_until(at) => return Queued::Closed,
             }
         }
     }
 
-    async fn writer(&self, mut queue: mpsc::Receiver<Message>, cancel: &CancellationToken) {
+    async fn writer(
+        &self,
+        mut queue: mpsc::Receiver<QueuedMessage>,
+        cancel: &CancellationToken,
+        flush: &FlushBudget,
+    ) {
         let mut connected_before = false;
         let mut attempt = 0usize;
         loop {
@@ -455,7 +509,7 @@ impl WebSocketSink {
                 "websocket_sink_connected",
                 None,
             );
-            match self.session(ws, &mut queue, cancel).await {
+            match self.session(ws, &mut queue, cancel, flush).await {
                 SessionEnd::Finished => break,
                 SessionEnd::Lost(reason) => {
                     self.diag
@@ -480,43 +534,63 @@ impl WebSocketSink {
 
     async fn session(
         &self,
-        mut ws: WsStream,
-        queue: &mut mpsc::Receiver<Message>,
+        ws: WsStream,
+        queue: &mut mpsc::Receiver<QueuedMessage>,
         cancel: &CancellationToken,
+        flush: &FlushBudget,
     ) -> SessionEnd {
         enum Event {
             Stop,
             Deadline,
             Idle,
             Ping,
-            Frame(Option<std::result::Result<Message, tungstenite::Error>>),
-            Send(Option<Message>),
+            Frame(Incoming),
+            Send(Option<QueuedMessage>),
         }
+        let (mut writer, mut reader) = ws.split();
         let cfg = &self.client.config;
         let mut ping =
             tokio::time::interval_at(Instant::now() + cfg.ping_interval, cfg.ping_interval);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_frame = Instant::now();
-        // Set on stop: keep sending the queue until it closes or this passes.
-        let mut flush_deadline: Option<Instant> = None;
+        // Alternate the two ready work branches, without compromising the
+        // priority of cancellation/deadlines. Neither reverse data traffic
+        // nor a permanently full send queue may starve the other direction.
+        let mut prefer_send = false;
+        let mut rounds = 0usize;
         loop {
+            let flush_deadline = flush.deadline(cancel);
             let deadline =
                 flush_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
-            let event = tokio::select! {
-                biased;
-                _ = cancel.cancelled(), if flush_deadline.is_none() => Event::Stop,
-                _ = tokio::time::sleep_until(deadline), if flush_deadline.is_some() => Event::Deadline,
-                _ = tokio::time::sleep_until(last_frame + cfg.idle_timeout) => Event::Idle,
-                _ = ping.tick() => Event::Ping,
-                frame = ws.next() => Event::Frame(frame),
-                item = queue.recv() => Event::Send(item),
+            if flush_deadline.is_some_and(|at| Instant::now() >= at) {
+                return SessionEnd::Finished;
+            }
+            let event = if prefer_send {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if flush_deadline.is_none() => Event::Stop,
+                    _ = tokio::time::sleep_until(deadline), if flush_deadline.is_some() => Event::Deadline,
+                    _ = tokio::time::sleep_until(last_frame + cfg.idle_timeout) => Event::Idle,
+                    _ = ping.tick() => Event::Ping,
+                    item = queue.recv() => Event::Send(item),
+                    frame = reader.next() => Event::Frame(frame),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if flush_deadline.is_none() => Event::Stop,
+                    _ = tokio::time::sleep_until(deadline), if flush_deadline.is_some() => Event::Deadline,
+                    _ = tokio::time::sleep_until(last_frame + cfg.idle_timeout) => Event::Idle,
+                    _ = ping.tick() => Event::Ping,
+                    frame = reader.next() => Event::Frame(frame),
+                    item = queue.recv() => Event::Send(item),
+                }
             };
             match event {
                 Event::Stop => {
-                    flush_deadline = Some(Instant::now() + self.config.flush_timeout);
+                    flush.deadline(cancel);
                 }
                 Event::Deadline => {
-                    self.close(&mut ws, Duration::from_millis(10)).await;
                     return SessionEnd::Finished;
                 }
                 Event::Idle => {
@@ -528,70 +602,92 @@ impl WebSocketSink {
                 Event::Ping => {
                     let sent = self
                         .send_bounded(
-                            &mut ws,
+                            &mut writer,
+                            &mut reader,
                             Message::Ping(Default::default()),
                             cancel,
-                            &mut flush_deadline,
+                            flush,
+                            &mut last_frame,
                         )
                         .await;
-                    if sent != Sent::Ok {
+                    if sent == DuplexSent::Idle {
+                        self.diag
+                            .websocket_sink_heartbeat_timeouts
+                            .fetch_add(1, Ordering::Relaxed);
+                        return SessionEnd::Lost("websocket_sink_heartbeat_timeout");
+                    }
+                    if sent != DuplexSent::Ok {
+                        if flush.expired(cancel) {
+                            return SessionEnd::Finished;
+                        }
                         return SessionEnd::Lost("websocket_sink_ping_failed");
                     }
                     self.diag
                         .websocket_sink_pings_sent
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                Event::Frame(Some(Ok(message))) => {
+                Event::Frame(frame) => {
+                    prefer_send = true;
                     last_frame = Instant::now();
-                    match message {
-                        Message::Text(_) | Message::Binary(_) => {
-                            self.diag
-                                .websocket_sink_ignored_frames
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        Message::Close(_) => {
-                            return SessionEnd::Lost("websocket_sink_server_closed")
-                        }
-                        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                    if !self.observe_frame(frame) {
+                        return SessionEnd::Lost("websocket_sink_connection_lost");
                     }
                 }
-                Event::Frame(_) => return SessionEnd::Lost("websocket_sink_connection_lost"),
                 Event::Send(None) => {
                     // Pump finished and the queue is drained: close politely.
                     let budget = flush_deadline
                         .map(|at| at.saturating_duration_since(Instant::now()))
-                        .unwrap_or(self.config.flush_timeout)
-                        .max(Duration::from_millis(10));
-                    self.close(&mut ws, budget).await;
+                        .unwrap_or(self.config.flush_timeout);
+                    self.close(&mut writer, budget).await;
                     return SessionEnd::Finished;
                 }
-                Event::Send(Some(message)) => {
+                Event::Send(Some(queued)) => {
+                    prefer_send = false;
                     self.diag
                         .websocket_sink_queue_items
                         .fetch_sub(1, Ordering::Relaxed);
                     match self
-                        .send_bounded(&mut ws, message, cancel, &mut flush_deadline)
+                        .send_bounded(
+                            &mut writer,
+                            &mut reader,
+                            queued.message,
+                            cancel,
+                            flush,
+                            &mut last_frame,
+                        )
                         .await
                     {
-                        Sent::Ok => {
+                        DuplexSent::Ok => {
                             self.diag
                                 .websocket_sink_sent
                                 .fetch_add(1, Ordering::Relaxed);
                             self.diag.observation.progress(false, 1);
                         }
-                        Sent::Failed => {
+                        DuplexSent::Failed | DuplexSent::ReadClosed | DuplexSent::Cancelled => {
                             self.diag
                                 .websocket_sink_send_failed
                                 .fetch_add(1, Ordering::Relaxed);
+                            if flush.expired(cancel) {
+                                return SessionEnd::Finished;
+                            }
                             return SessionEnd::Lost("websocket_sink_send_failed");
                         }
-                        Sent::TimedOut => {
+                        DuplexSent::Idle => {
+                            self.diag
+                                .websocket_sink_heartbeat_timeouts
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.diag
+                                .websocket_sink_send_failed
+                                .fetch_add(1, Ordering::Relaxed);
+                            return SessionEnd::Lost("websocket_sink_heartbeat_timeout");
+                        }
+                        DuplexSent::TimedOut => {
                             // A partially written frame leaves the stream
                             // unusable: drop the connection (and the message).
                             self.diag
                                 .websocket_sink_send_timeouts
                                 .fetch_add(1, Ordering::Relaxed);
-                            if flush_deadline.is_some() {
+                            if flush.deadline(cancel).is_some() {
                                 self.diag
                                     .websocket_sink_discarded_on_close
                                     .fetch_add(1, Ordering::Relaxed);
@@ -602,6 +698,23 @@ impl WebSocketSink {
                     }
                 }
             }
+            rounds += 1;
+            if rounds % 16 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    fn observe_frame(&self, frame: Incoming) -> bool {
+        match frame {
+            Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+                self.diag
+                    .websocket_sink_ignored_frames
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => true,
+            _ => false,
         }
     }
 
@@ -609,29 +722,36 @@ impl WebSocketSink {
     /// job stops (a stop observed while blocked starts that deadline).
     async fn send_bounded(
         &self,
-        ws: &mut WsStream,
+        writer: &mut WsWrite,
+        reader: &mut super::client::WsRead,
         message: Message,
         cancel: &CancellationToken,
-        flush_deadline: &mut Option<Instant>,
-    ) -> Sent {
-        let send_deadline = Instant::now() + self.config.send_timeout;
-        let send = ws.send(message);
-        tokio::pin!(send);
-        loop {
-            let at = flush_deadline.map_or(send_deadline, |f| f.min(send_deadline));
-            tokio::select! {
-                biased;
-                r = &mut send => return if r.is_ok() { Sent::Ok } else { Sent::Failed },
-                _ = cancel.cancelled(), if flush_deadline.is_none() => {
-                    *flush_deadline = Some(Instant::now() + self.config.flush_timeout);
-                }
-                _ = tokio::time::sleep_until(at) => return Sent::TimedOut,
-            }
-        }
+        flush: &FlushBudget,
+        last_frame: &mut Instant,
+    ) -> DuplexSent {
+        send_duplex(
+            writer,
+            reader,
+            message,
+            cancel,
+            Some(flush),
+            self.config.send_timeout,
+            self.client.config.idle_timeout,
+            last_frame,
+            16,
+            |frame| self.observe_frame(frame),
+        )
+        .await
     }
 
-    async fn close(&self, ws: &mut WsStream, budget: Duration) {
-        match tokio::time::timeout(budget, ws.close(None)).await {
+    async fn close(&self, writer: &mut WsWrite, budget: Duration) {
+        if budget.is_zero() {
+            self.diag
+                .websocket_sink_close_failed
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        match tokio::time::timeout(budget, writer.send(Message::Close(None))).await {
             Ok(Ok(())) => {
                 self.diag
                     .websocket_sink_closes
@@ -656,5 +776,177 @@ impl WebSocketSink {
             Some(ErrorCode::JobFailed),
         );
         cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::super::tests::probe_stream;
+    use super::*;
+    use crate::MapSecretResolver;
+    use sparrow_model::ResourceBudget;
+
+    fn sink() -> (WebSocketSink, Arc<MemoryOwner>) {
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let sink = WebSocketSink::bind(
+            WebSocketSinkConfig::new("ws://127.0.0.1:9000/"),
+            &MapSecretResolver::new(Default::default()),
+            &TargetPolicy::allow("127.0.0.1", 9000),
+            owner.clone(),
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+        (sink, owner)
+    }
+
+    #[tokio::test]
+    async fn websocket_sink_ready_reverse_frames_do_not_starve_send_queue_or_controls() {
+        for opcode in [1, 9] {
+            let (sink, owner) = sink();
+            let (ws, probe) = probe_stream(opcode, 1000, false).await;
+            let (tx, mut rx) = mpsc::channel(8);
+            let cancel = CancellationToken::new();
+            let flush = FlushBudget::new(Duration::from_millis(100));
+            for _ in 0..8 {
+                assert!(matches!(
+                    sink.enqueue(Message::text("payload"), &tx, &cancel, &flush)
+                        .await,
+                    Queued::Yes
+                ));
+            }
+            drop(tx);
+            assert_eq!(
+                sink.session(ws, &mut rx, &cancel, &flush).await,
+                SessionEnd::Finished
+            );
+            assert_eq!(sink.diag.snapshot().websocket_sink_sent, 8);
+            let reads = probe.reads.load(Ordering::Relaxed);
+            assert!(
+                (8..=10).contains(&reads),
+                "both directions progress fairly: reads={reads}"
+            );
+            drop((sink, rx));
+            assert_eq!(owner.usage().physical_bytes, 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn websocket_sink_expired_flush_refuses_even_an_immediately_ready_slot() {
+        let (sink, _) = sink();
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let flush = FlushBudget::new(Duration::from_millis(100));
+        cancel.cancel();
+        let first = flush.deadline(&cancel).unwrap();
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(flush.deadline(&cancel), Some(first));
+        assert!(matches!(
+            sink.enqueue(Message::text("late"), &tx, &cancel, &flush)
+                .await,
+            Queued::Closed
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sink.diag.snapshot().websocket_sink_queue_items, 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_sink_frame_keeps_prepaid_credit_after_sink_drop() {
+        let (sink, owner) = sink();
+        let expected = sink.config.reservation();
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let flush = FlushBudget::new(Duration::from_millis(100));
+        assert!(matches!(
+            sink.enqueue(Message::text("retained"), &tx, &cancel, &flush)
+                .await,
+            Queued::Yes
+        ));
+        let frame = rx.recv().await.unwrap();
+        drop((sink, tx, rx));
+        assert_eq!(owner.usage().reservation_bytes, expected);
+        assert!(frame.message.is_text());
+        drop(frame);
+        assert_eq!(owner.usage().physical_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_sink_dynamic_bytes_escape_fallback_is_charged_and_bounded() {
+        use sparrow_model::{
+            DataType, DynamicValue, Field, FieldId, Row, RowBatchBuilder, Scalar, Schema, SchemaId,
+        };
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let mut config = WebSocketSinkConfig::new("ws://127.0.0.1:9000/");
+        config.client.max_message_bytes = 1024;
+        let sink = WebSocketSink::bind(
+            config,
+            &MapSecretResolver::new(Default::default()),
+            &TargetPolicy::allow("127.0.0.1", 9000),
+            owner.clone(),
+            IoDiagnostics::new(),
+        )
+        .unwrap();
+        let bound = owner.usage().reservation_bytes;
+        let rows_owner = MemoryOwner::new(ResourceBudget::compact());
+        let schema = Arc::new(
+            Schema::new(
+                SchemaId::new(1),
+                vec![Field::new(
+                    FieldId::new(1),
+                    "nested",
+                    DataType::Dynamic,
+                    false,
+                )],
+            )
+            .unwrap(),
+        );
+        let mut builder =
+            RowBatchBuilder::new(schema, rows_owner, CreditKind::Reservation, 1, 64 * 1024)
+                .unwrap();
+        builder
+            .push(Row {
+                values: vec![Scalar::Dynamic(DynamicValue::Array(
+                    vec![
+                        DynamicValue::utf8("\0".repeat(2000)),
+                        DynamicValue::Bytes(vec![0u8; 2000].into()),
+                    ]
+                    .into(),
+                ))],
+            })
+            .unwrap();
+        let batch = builder.finish().unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let flush = FlushBudget::new(Duration::from_millis(100));
+        let outbox = Arc::new(InflightCounter::new());
+        let hog = owner
+            .acquire(
+                CreditKind::Reservation,
+                owner.budget().reservation_bytes - bound,
+            )
+            .unwrap();
+        outbox.enqueue();
+        assert!(
+            sink.queue_batch(&batch, &tx, &cancel, Some(&outbox), &flush)
+                .await
+        );
+        assert_eq!(sink.diag.snapshot().websocket_sink_dropped_budget, 1);
+        assert_eq!(sink.diag.snapshot().websocket_sink_dropped_bad, 0);
+        assert!(rx.try_recv().is_err());
+        drop(hog);
+        outbox.enqueue();
+        assert!(
+            sink.queue_batch(&batch, &tx, &cancel, Some(&outbox), &flush)
+                .await
+        );
+        assert_eq!(sink.diag.snapshot().websocket_sink_dropped_oversize, 1);
+        assert_eq!(outbox.failed(), 2, "neither rejected row was acknowledged");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            owner.usage().reservation_bytes,
+            bound,
+            "fallback scratch/output credit returned"
+        );
+        drop((sink, tx, rx, batch));
+        assert_eq!(owner.usage().physical_bytes, 0);
     }
 }

@@ -11,13 +11,107 @@ use sparrow_model::{
     RestoreClaim, Row, RowBatch, RowBatchBuilder, Scalar, Schema, SchemaId,
 };
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
+
+/// A finite, immediately readable frame burst and independently gated writes.
+/// No socket buffer sizes or random network scheduling are needed for the
+/// fairness, duplex and cancellation regressions.
+pub(super) struct Probe {
+    pub(super) remaining: AtomicUsize,
+    pub(super) reads: AtomicUsize,
+    pub(super) write_attempts: AtomicUsize,
+    pub(super) blocked: AtomicBool,
+    writes: Mutex<Vec<u8>>,
+}
+
+struct ProbeIo {
+    state: Arc<Probe>,
+    frame: [u8; 3],
+    offset: usize,
+}
+
+impl AsyncRead for ProbeIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.state.remaining.load(Ordering::Relaxed) == 0 {
+            return Poll::Pending;
+        }
+        let size = buf.remaining().min(3 - self.offset);
+        buf.put_slice(&self.frame[self.offset..self.offset + size]);
+        self.offset += size;
+        if self.offset == 3 {
+            self.offset = 0;
+            self.state.remaining.fetch_sub(1, Ordering::Relaxed);
+            self.state.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for ProbeIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.state.write_attempts.fetch_add(1, Ordering::Relaxed);
+        if self.state.blocked.load(Ordering::Relaxed) {
+            return Poll::Pending;
+        }
+        self.state.writes.lock().unwrap().extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.state.blocked.load(Ordering::Relaxed) {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+pub(super) async fn probe_stream(
+    opcode: u8,
+    frames: usize,
+    blocked: bool,
+) -> (client::WsStream, Arc<Probe>) {
+    let state = Arc::new(Probe {
+        remaining: AtomicUsize::new(frames),
+        reads: AtomicUsize::new(0),
+        write_attempts: AtomicUsize::new(0),
+        blocked: AtomicBool::new(blocked),
+        writes: Mutex::new(Vec::new()),
+    });
+    let io: Pin<Box<dyn client::WsIo>> = Box::pin(ProbeIo {
+        state: state.clone(),
+        frame: [0x80 | opcode, 1, b'x'],
+        offset: 0,
+    });
+    let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        io,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        Some(WebSocketClientConfig::new("ws://localhost/").protocol_config()),
+    )
+    .await;
+    (ws, state)
+}
 
 fn schema() -> Schema {
     Schema::new(
@@ -231,6 +325,9 @@ fn websocket_source_and_sink_config_gates() {
     );
     type S = fn(&mut WebSocketSourceConfig);
     let cases: Vec<(S, ErrorCode)> = vec![
+        (|c| c.prefetch_capacity = 0, ErrorCode::BoundExceeded),
+        (|c| c.prefetch_capacity = 65, ErrorCode::BoundExceeded),
+        (|c| c.prefetch_capacity = 64, ErrorCode::BoundExceeded),
         (|c| c.inbox_capacity = 0, ErrorCode::BoundExceeded),
         (
             |c| c.inbox_bytes = 4 * 1024 * 1024,
@@ -387,6 +484,14 @@ async fn websocket_source_binary_decode_and_fail_on_decode() {
         .unwrap()
         .unwrap();
     assert!(r.unwrap_err().message.contains("fail_on_decode"));
+    let health = run.diag.observation.endpoints().unwrap().0;
+    assert_eq!(
+        health.state,
+        sparrow_model::observation::HealthState::Failed
+    );
+    assert_eq!(health.reason, "websocket_decode_failed");
+    assert_eq!(health.failures, 1);
+    assert_eq!(health.last_error_code, Some(ErrorCode::CodecViolation));
 }
 
 #[tokio::test]
@@ -577,6 +682,10 @@ async fn websocket_wss_custom_ca_auth_header_and_subprotocol() {
         "{e}"
     );
     assert_eq!(run.diag.snapshot().websocket_source_connect_failures, 2);
+    let health = run.diag.observation.endpoints().unwrap().0;
+    assert_eq!(health.reason, "websocket_connect_exhausted");
+    assert_eq!(health.failures, 1);
+    assert_eq!(health.last_error_code, Some(ErrorCode::JobFailed));
 
     // Without the private CA the built-in web PKI roots refuse the server.
     let run = start_source(server.url(), &server.policy(), |c| {
@@ -877,4 +986,162 @@ async fn websocket_sink_reconnects_after_server_restart_then_fails_closed_when_e
     let snap = diag.snapshot();
     assert_eq!(snap.websocket_sink_fatal, 1);
     assert_eq!(snap.websocket_sink_connect_failures, 3);
+    let health = diag.observation.endpoints().unwrap().1;
+    assert_eq!(
+        health.state,
+        sparrow_model::observation::HealthState::Failed
+    );
+    assert_eq!(health.reason, "websocket_sink_connect_exhausted");
+    assert_eq!(health.failures, 1);
+}
+
+#[tokio::test]
+async fn websocket_source_full_inbox_keeps_heartbeats_and_drops_whole_prefetch_messages() {
+    let server = Listener::plain().await;
+    let mut run = start_source(server.url(), &server.policy(), |c| {
+        c.inbox_capacity = 1;
+        c.prefetch_capacity = 2;
+        c.framing = WebSocketFraming::Ndjson;
+        c.client.ping_interval = Duration::from_millis(100);
+        c.client.idle_timeout = Duration::from_millis(400);
+    });
+    let mut peer = server.accept().await;
+    peer.send(json_row(1)).await.unwrap();
+    until(Duration::from_secs(2), || {
+        run.diag.snapshot().websocket_source_rows == 1
+    })
+    .await;
+    peer.send(json_row(2)).await.unwrap();
+    until(Duration::from_secs(2), || {
+        run.diag.snapshot().websocket_source_backpressure_waits == 1
+    })
+    .await;
+    for v in [3, 4] {
+        peer.send(json_row(v)).await.unwrap();
+    }
+    until(Duration::from_secs(2), || {
+        run.diag.snapshot().websocket_source_received == 4
+    })
+    .await;
+    // Both rows in this one complete data message are dropped as one overflow.
+    peer.send(Message::text(
+        "{\"device_id\":\"d\",\"v\":5}\n{\"device_id\":\"d\",\"v\":6}",
+    ))
+    .await
+    .unwrap();
+    until(Duration::from_secs(2), || {
+        run.diag.snapshot().websocket_source_dropped_overflow == 1
+    })
+    .await;
+    peer.send(Message::Ping(b"probe".to_vec().into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match peer.next().await {
+                Some(Ok(Message::Pong(bytes))) if bytes.as_ref() == b"probe" => break,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                other => panic!("heartbeat peer ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // Keep answering our Source's Pings while admission remains blocked for
+    // longer than idle_timeout. No extra data traffic is necessary.
+    let _ = tokio::time::timeout(Duration::from_millis(650), async {
+        while let Some(Ok(_)) = peer.next().await {}
+        panic!("Source closed despite answered heartbeats");
+    })
+    .await;
+    let snap = run.diag.snapshot();
+    assert_eq!(snap.websocket_source_rows, 1);
+    assert_eq!(snap.websocket_source_dropped_overflow, 1);
+    assert_eq!(snap.websocket_source_disconnects, 0);
+    assert_eq!(snap.websocket_source_heartbeat_timeouts, 0);
+    assert!(snap.websocket_source_pings_sent >= 2);
+    assert_eq!(run.take(4).await, [1, 2, 3, 4]);
+    let owner = run.owner.clone();
+    run.stop().await.unwrap();
+    assert_eq!(owner.usage().physical_bytes, 0);
+}
+
+#[tokio::test]
+async fn websocket_wire_message_retains_credit_after_actor_and_receiver_close() {
+    let server = Listener::plain().await;
+    let config = WebSocketSourceConfig::new(server.url(), schema());
+    let reservation = config.reservation();
+    let source = Arc::new(
+        WebSocketSource::bind(config, &secrets(), &server.policy(), IoDiagnostics::new()).unwrap(),
+    );
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let mut wire = source::Wire::start(source, owner.clone(), CancellationToken::new()).unwrap();
+    let mut peer = server.accept().await;
+    peer.send(json_row(7)).await.unwrap();
+    let message = wire.messages.recv().await.unwrap();
+    wire.close().await.unwrap();
+    assert_eq!(owner.usage().reservation_bytes, reservation);
+    assert!(message.payload.starts_with(b"{"));
+    drop(message);
+    assert_eq!(owner.usage().physical_bytes, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn websocket_source_ping_pending_write_observes_cancel_without_connect_timeout() {
+    let (ws, probe) = probe_stream(10, 0, true).await;
+    let (mut writer, mut reader) = ws.split();
+    let cancel = CancellationToken::new();
+    let child = cancel.clone();
+    let task = tokio::spawn(async move {
+        let mut last = tokio::time::Instant::now();
+        client::send_duplex(
+            &mut writer,
+            &mut reader,
+            Message::Ping(Default::default()),
+            &child,
+            None,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            &mut last,
+            16,
+            |_| true,
+        )
+        .await
+    });
+    until(Duration::from_secs(1), || {
+        probe.write_attempts.load(Ordering::Relaxed) > 0
+    })
+    .await;
+    let at = tokio::time::Instant::now();
+    cancel.cancel();
+    assert_eq!(task.await.unwrap(), client::DuplexSent::Cancelled);
+    assert_eq!(tokio::time::Instant::now(), at);
+}
+
+#[tokio::test]
+async fn websocket_duplex_write_pending_still_reads_control_frames() {
+    let (ws, probe) = probe_stream(10, 2, true).await;
+    let (mut writer, mut reader) = ws.split();
+    let mut last = tokio::time::Instant::now();
+    let cancel = CancellationToken::new();
+    let result = client::send_duplex(
+        &mut writer,
+        &mut reader,
+        Message::text("payload"),
+        &cancel,
+        None,
+        Duration::from_millis(200),
+        Duration::from_secs(600),
+        &mut last,
+        16,
+        |_| {
+            if probe.reads.load(Ordering::Relaxed) == 2 {
+                probe.blocked.store(false, Ordering::Relaxed);
+            }
+            true
+        },
+    )
+    .await;
+    assert_eq!(result, client::DuplexSent::Ok);
+    assert_eq!(probe.reads.load(Ordering::Relaxed), 2);
 }

@@ -205,12 +205,45 @@ fn websocket_spec_matrix_rejects_mixed_fields_and_durable_claims() {
     );
     // Each endpoint fits half the reservation, but the pair must fit 3/4.
     let mut v = base.clone();
-    v["source"]["websocket"]["max_message_bytes"] = json!(512 * 1024);
-    v["sink"]["websocket"]["max_message_bytes"] = json!(512 * 1024);
+    v["source"]["websocket"]["max_message_bytes"] = json!(256 * 1024);
+    v["source"]["websocket"]["prefetch_capacity"] = json!(1);
+    v["sink"]["websocket"]["max_message_bytes"] = json!(256 * 1024);
     v["sink"]["websocket"]["queue_capacity"] = json!(1);
     code(&v).unwrap();
-    v["sink"]["websocket"]["queue_capacity"] = json!(2);
+    v["sink"]["websocket"]["queue_capacity"] = json!(3);
     assert_eq!(code(&v), Err(BoundExceeded), "sum of WebSocket buffers");
+    for capacity in [0, 65, usize::MAX] {
+        let mut v = base.clone();
+        v["source"]["websocket"]["prefetch_capacity"] = json!(capacity);
+        assert_eq!(code(&v), Err(BoundExceeded));
+    }
+    let parsed = parse(&base).unwrap();
+    let config =
+        parsed
+            .source
+            .websocket
+            .as_ref()
+            .unwrap()
+            .connector_config(schema.clone(), 8, false);
+    assert_eq!(config.prefetch_capacity, 4);
+    let mut upper = base.clone();
+    upper["source"]["websocket"]["prefetch_capacity"] = json!(64);
+    // The supported upper capacity still has to fit the real reservation;
+    // lower the message ceiling, not the job budget, for this positive case.
+    upper["source"]["websocket"]["max_message_bytes"] = json!(1024);
+    code(&upper).unwrap();
+    let upper = parse(&upper).unwrap();
+    let config =
+        upper
+            .source
+            .websocket
+            .as_ref()
+            .unwrap()
+            .connector_config(schema.clone(), 8, false);
+    assert_eq!(
+        config.prefetch_capacity, 64,
+        "explicit capacity must not be clamped"
+    );
 
     // Frames x formats.
     let mut v = base.clone();
@@ -262,18 +295,27 @@ mod live {
     use tokio_tungstenite::tungstenite::Message;
 
     /// Feeds `rows` to every client that connects (one text frame per row).
-    async fn feeder(rows: Vec<String>) -> (u16, mpsc::UnboundedReceiver<()>) {
+    async fn feeder(
+        rows: Vec<String>,
+        paced: bool,
+    ) -> (u16, mpsc::UnboundedReceiver<()>, mpsc::UnboundedSender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = mpsc::unbounded_channel();
+        let (permit, permits) = mpsc::unbounded_channel();
+        let permits = Arc::new(tokio::sync::Mutex::new(permits));
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let rows = rows.clone();
                 let tx = tx.clone();
+                let permits = permits.clone();
                 tokio::spawn(async move {
                     let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
                     let _ = tx.send(());
                     for row in rows {
+                        if paced && permits.lock().await.recv().await.is_none() {
+                            break;
+                        }
                         ws.send(Message::text(row)).await.unwrap();
                     }
                     // Keep the session open (answering pings) until the client leaves.
@@ -281,7 +323,7 @@ mod live {
                 });
             }
         });
-        (port, rx)
+        (port, rx, permit)
     }
 
     /// Collects every text frame received from any client.
@@ -343,7 +385,7 @@ mod live {
         let kernel = Arc::new(crate::host_kernel().unwrap());
         kernel.block_on(async {
             const N: usize = 200;
-            let (src_port, mut connected) = feeder(rows("d", N)).await;
+            let (src_port, mut connected, permits) = feeder(rows("d", N), true).await;
             let (sink_port, mut out) = collector().await;
             let store = Arc::new(Store::open_memory().unwrap());
             store.put_stream("telemetry", TELEMETRY_SCHEMA).unwrap();
@@ -353,6 +395,17 @@ mod live {
             store.put_pipeline("ws", &spec, None).unwrap();
             request_start(&store, "ws", "test").unwrap();
             let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+            wait_for(&sup, &store, "ws", |io| io.websocket_source_connects == 1).await;
+            // Loss is intentional on prefetch overflow. Pace this exact-count
+            // test by actual pipeline progress instead of relying on burst timing.
+            for n in 1..=N {
+                permits.send(()).unwrap();
+                wait_for(&sup, &store, "ws", |io| {
+                    io.websocket_source_rows == n as u64
+                        && io.websocket_sink_sent == n.div_ceil(2) as u64
+                })
+                .await;
+            }
             let io = wait_for(&sup, &store, "ws", |io| {
                 io.websocket_source_rows == N as u64 && io.websocket_sink_sent == (N / 2) as u64
             })
@@ -363,6 +416,7 @@ mod live {
             assert_eq!(flow.sink_kind, "websocket");
             assert_eq!(io.websocket_source_received, N as u64, "{io:?}");
             assert_eq!(io.websocket_source_dropped_bad, 0);
+            assert_eq!(io.websocket_source_dropped_overflow, 0);
             assert_eq!(io.websocket_source_connects, 1);
             assert_eq!(io.websocket_sink_connects, 1);
             let mut got = Vec::new();
@@ -394,10 +448,16 @@ mod live {
     fn websocket_graph_io_sources_are_budgeted_and_deliver() {
         let kernel = Arc::new(crate::host_kernel().unwrap());
         kernel.block_on(async {
-            let (a_port, _a) =
-                feeder(vec![json!({"device_id":"a","temperature":-3.0}).to_string()]).await;
-            let (b_port, _b) =
-                feeder(vec![json!({"device_id":"b","temperature":-3.0}).to_string()]).await;
+            let (a_port, _a, _a_permits) = feeder(
+                vec![json!({"device_id":"a","temperature":-3.0}).to_string()],
+                false,
+            )
+            .await;
+            let (b_port, _b, _b_permits) = feeder(
+                vec![json!({"device_id":"b","temperature":-3.0}).to_string()],
+                false,
+            )
+            .await;
             let (sink_port, mut out) = collector().await;
             let store = Arc::new(Store::open_memory().unwrap());
             store.put_stream("telemetry", TELEMETRY_SCHEMA).unwrap();

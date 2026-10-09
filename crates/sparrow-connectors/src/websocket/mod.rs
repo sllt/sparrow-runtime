@@ -13,7 +13,10 @@ pub use client::{
     reconnect_delay, BoundClient, WebSocketAuth, WebSocketClientConfig, WebSocketHeader,
 };
 pub use sink::{Overflow, SinkFrame, WebSocketSink, WebSocketSinkConfig};
-pub use source::{BinaryFrames, WebSocketFraming, WebSocketSource, WebSocketSourceConfig};
+pub use source::{
+    BinaryFrames, WebSocketFraming, WebSocketSource, WebSocketSourceConfig,
+    DEFAULT_PREFETCH_CAPACITY,
+};
 
 #[cfg(test)]
 #[path = "../mqtt/tls_fixture.rs"]

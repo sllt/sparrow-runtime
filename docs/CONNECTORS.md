@@ -263,14 +263,14 @@ Control crate：
 | 合同项 | WebSocket 的实现 |
 |---|---|
 | 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`，at-most-once、无应用层确认；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
-| 内存 | 每连接 128 KiB + 2 × `max_message_bytes`（1 KiB..1 MiB，默认 64 KiB），Sink 加 `queue_capacity × max_message_bytes`；在 bind 时记入 job reservation（单个 ≤ 1/2，与 NATS/JetStream/DataBus 合计 ≤ 3/4）；Source inbox 按 `inbox_bytes` 计入 queue 账本 |
-| 大小上限 | 帧/消息上限在帧头处拒绝，不先缓冲；超大消息计 `dropped_oversize` 并重连；单条记录另受 64 KiB 解码上限 |
-| 背压 | Source inbox 满时停止读 socket（TCP 背压）；Sink 有界发送队列，`block` / `drop_newest`，`send_timeout_ms` 超时断开重连 |
-| 心跳 / 重连 | Ping 每 `ping_interval_ms`，`idle_timeout_ms` 无帧即重连；指数退避（100 ms → `reconnect_max_ms`，抖动取 [d/2, d]），每次断线 ≤ `reconnect_attempts`（拒绝 0）；耗尽后 Source 可重试失败，Sink fail closed（`websocket_sink_fatal`） |
-| 认证 / TLS | bearer / basic / 自定义头，仅 secret 引用且需 `wss://`；保留头和重复头拒绝；rustls 强制校验，`tls_ca_pem` 替换信任根；错误中不出现 URL、头值、凭据 |
+| 内存 | 读方向 128 KiB + 2 × `max_message_bytes`（1 KiB..1 MiB，默认 64 KiB）；Source 加 `(prefetch_capacity + 1) × (max_message_bytes + 256 B) + 8 KiB`；Sink 加发送中消息与写缓冲帧 2 × `max_message_bytes` 和 `queue_capacity × max_message_bytes`。同 job owner 静态预扣，actor / 消息共享 Arc lease 随真实 backing 生命周期保留（单个 ≤ 1/2，与 NATS/JetStream/DataBus 合计 ≤ 3/4，饱和算术）；inbox 按 `inbox_bytes` 计 Queue；decode scratch / bounded encode 先预扣，预算不足不解析 / 不编码 |
+| 大小上限 | 单帧超限在帧头处拒绝，不预留载荷；分片消息按累计长度在追加下一分片前拒绝；超大消息计 `dropped_oversize` 并重连；单条记录另按长度受格式解码上限（JSON 64 KiB / CSV `max_record_bytes`）；Sink 编码输出有上限 |
+| 背压 | Source pump 等待 inbox 额度 / slot，wire actor 持续读控制帧；prefetch 默认4、1..=64，满时 drop newest 并计 `websocket_source_dropped_overflow`（完整消息数，不是 NDJSON 行数）。Sink 有界发送队列，`block` / `drop_newest`，`send_timeout_ms` 超时断开重连；反向读帧与发送公平轮转 |
+| 心跳 / 重连 | Ping 每 `ping_interval_ms`，`idle_timeout_ms` 无帧即重连；Source admission 背压 / Sink pending send 不暂停读控制帧；指数退避（100 ms → `reconnect_max_ms`，抖动取 [d/2, d]），每次断线 ≤ `reconnect_attempts`（拒绝 0）；耗尽后 Source 可重试失败，Sink fail closed（`websocket_sink_fatal`） |
+| 认证 / TLS | bearer / basic 和认证类头（Authorization / Proxy-Authorization / Cookie）必须 auth / SecretRef + `wss://`，其他字面头可用 ws；头名≤128 B、完整 upgrade 请求≤16 KiB，保留头和重复头拒绝；TCP+TLS+upgrade 共用 connect deadline；rustls 强制校验，`tls_ca_pem` 替换信任根；错误中不出现 URL、头值、凭据 |
 | 白名单 | host:port 经 `TargetPolicy`（默认端口 80/443），与 HTTP 相同 |
 | 格式 | JSON 文本帧（或 `binary_frames: decode`）、NDJSON 文本帧；CSV 只走文本帧且一条消息一条记录，与 ndjson / 二进制帧组合拒绝 |
-| 关闭 | Sink 在 `flush_timeout_ms` 内发完 outbox 与队列并发送 Close，剩余计 `discarded_on_close` |
+| 关闭 | Sink 的当前批次、outbox、在途发送、队列及 Close 共用一个 stop deadline（`flush_timeout_ms`），不逐批 / 逐消息重置；剩余计 `discarded_on_close`，未全部入队的 batch receipt 失败；实际 actor / backing 退出前不提前退款 |
 | 指标 | `websocket_source_*` / `websocket_sink_*`，pipeline status 中的 `websocket_source` / `websocket_sink` 对象 |
 
 ## 附：负载格式矩阵（`source.format` / `sink.format`）

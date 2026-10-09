@@ -658,6 +658,9 @@ pub struct WebSocketSourceSpec {
     /// Decoded-row Queue credit for the inbox; default 256 KiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbox_bytes: Option<usize>,
+    /// Complete-message wire prefetch (default 4, 1..=64); full = drop newest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch_capacity: Option<usize>,
 }
 
 /// WebSocket client Sink: one message per row, live and at-most-once.
@@ -764,6 +767,13 @@ fn websocket_client(
 
 #[cfg(feature = "websocket")]
 impl WebSocketSourceSpec {
+    pub fn reservation(&self) -> usize {
+        sparrow_connectors::WebSocketSourceConfig::reservation_for(
+            &self.client_config(),
+            self.prefetch_capacity.unwrap_or(sparrow_connectors::websocket::DEFAULT_PREFETCH_CAPACITY),
+        )
+    }
+
     pub fn client_config(&self) -> sparrow_connectors::websocket::WebSocketClientConfig {
         websocket_client(
             &self.url,
@@ -799,6 +809,9 @@ impl WebSocketSourceSpec {
         };
         if let Some(n) = self.inbox_bytes {
             c.inbox_bytes = n;
+        }
+        if let Some(n) = self.prefetch_capacity {
+            c.prefetch_capacity = n;
         }
         c.inbox_capacity = inbox_capacity;
         c.fail_on_decode = fail_on_decode;

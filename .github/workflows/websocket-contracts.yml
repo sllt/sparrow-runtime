@@ -1,0 +1,73 @@
+name: websocket-contracts
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  websocket:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [standalone, jetstream]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: websocket-contracts-${{ runner.os }}-1.98.0-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}
+      - name: Production feature combinations and WebSocket loopback contracts
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          git rev-parse HEAD > artifacts/commit.txt
+          features=sparrow-server/websocket
+          if [[ "$PROFILE" == jetstream ]]; then
+            features+=,sparrow-server/jetstream
+          fi
+          if ! cargo test --locked --release --quiet --no-default-features --message-format=json \
+            -p sparrow-connectors -p sparrow-control -p sparrow-server \
+            --features "$features" \
+            > artifacts/tests.jsonl 2> artifacts/build.log; then
+            tail -n 60 artifacts/build.log
+            jq -Rr 'fromjson?|select(.reason=="compiler-message" and .message.level=="error")|.message.rendered' artifacts/tests.jsonl || true
+            grep -A 20 -B 3 -E 'FAILED|panicked|test result: FAILED' artifacts/tests.jsonl || true
+            exit 1
+          fi
+          jq -Rn '[inputs|fromjson?|select(.reason=="compiler-artifact" and .profile.test and .executable!=null)|{name:.target.name,exe:.executable}]' \
+            artifacts/tests.jsonl > artifacts/test-binaries.json
+          connector=$(jq -er '.[]|select(.name=="sparrow_connectors")|.exe' artifacts/test-binaries.json)
+          control=$(jq -er '.[]|select(.name=="sparrow_control")|.exe' artifacts/test-binaries.json)
+          sha256sum "$connector" "$control" > artifacts/test-binaries.sha256
+          # Repeat the exact compiled binaries: no extra build and no external
+          # broker. Fixtures bind ephemeral loopback ports and use a test CA.
+          run_contracts() {
+            local binary=$1 filter=$2 label=$3
+            "$binary" "$filter" --list > "artifacts/$label.list"
+            grep -q ': test$' "artifacts/$label.list"
+            if ! timeout 240s "$binary" "$filter" --include-ignored --test-threads=1 \
+              > "artifacts/$label.log" 2>&1; then
+              tail -n 80 "artifacts/$label.log"
+              exit 1
+            fi
+            tail -n 3 "artifacts/$label.log"
+          }
+          for round in 1 2; do
+            run_contracts "$connector" 'websocket::' "websocket-connector-$round"
+            run_contracts "$control" 'websocket_tests::' "websocket-control-$round"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: websocket-contracts-${{ matrix.profile }}
+          path: artifacts/

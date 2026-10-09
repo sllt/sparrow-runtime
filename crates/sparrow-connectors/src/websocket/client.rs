@@ -8,19 +8,24 @@
 
 use std::hash::{BuildHasher, Hasher};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use sparrow_model::{ErrorCode, Result, SparrowError};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::WebSocketStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::{SecretResolver, TargetPolicy};
 
@@ -31,6 +36,8 @@ pub const MAX_RECONNECT_ATTEMPTS: usize = 1000;
 pub const DEFAULT_RECONNECT_ATTEMPTS: usize = 10;
 pub const MAX_HEADERS: usize = 16;
 pub const MAX_SUBPROTOCOLS: usize = 8;
+pub const MAX_HEADER_NAME_BYTES: usize = 128;
+pub const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const MAX_URL_BYTES: usize = 4096;
 const MAX_SECRET_BYTES: usize = 4096;
 const MAX_CA_PEM_BYTES: usize = 64 * 1024;
@@ -86,7 +93,7 @@ pub struct WebSocketClientConfig {
     /// PEM CA bundle that *replaces* the built-in web PKI roots for `wss://`
     /// (private CA / self-signed server). Certificate verification stays on.
     pub tls_ca_pem: Option<String>,
-    /// TCP connect + TLS + HTTP upgrade, each bounded by this.
+    /// One total deadline for TCP connect + TLS + HTTP upgrade.
     pub connect_timeout: Duration,
     /// Send a Ping when nothing was sent for this long.
     pub ping_interval: Duration,
@@ -139,6 +146,15 @@ impl WebSocketClientConfig {
             return Err(error(
                 ErrorCode::BoundExceeded,
                 "WebSocket bounds: connect_timeout_ms 100..=60000, ping_interval_ms 100..=300000, idle_timeout_ms 200..=600000 and > ping_interval_ms, reconnect_max_ms 100..=300000, reconnect_attempts 1..=1000, max_message_bytes 1024..=1048576, <=16 headers, <=8 subprotocols",
+            ));
+        }
+        if self.headers.iter().any(|h| {
+            h.name.len() > MAX_HEADER_NAME_BYTES
+                || h.value.as_ref().is_some_and(|v| v.len() > MAX_SECRET_BYTES)
+        }) {
+            return Err(error(
+                ErrorCode::BoundExceeded,
+                "WebSocket header names must be <=128 bytes; values <=4096 bytes",
             ));
         }
         let target = self.target()?;
@@ -218,7 +234,7 @@ impl WebSocketClientConfig {
         WebSocketConfig::default()
             .read_buffer_size(READ_BUFFER_BYTES)
             .write_buffer_size(0)
-            .max_write_buffer_size(self.max_message_bytes + READ_BUFFER_BYTES)
+            .max_write_buffer_size(self.max_message_bytes.saturating_add(READ_BUFFER_BYTES))
             .max_message_size(Some(self.max_message_bytes))
             .max_frame_size(Some(self.max_message_bytes))
     }
@@ -303,6 +319,71 @@ fn reserved_header(name: &HeaderName) -> bool {
     )
 }
 
+fn credential_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "authorization" | "proxy-authorization" | "cookie"
+    )
+}
+
+/// Count the actual request line and connector-managed headers. The SDK's
+/// frame/message bounds do not apply to the HTTP upgrade request.
+fn handshake_base_bytes(config: &WebSocketClientConfig) -> Result<usize> {
+    let request = config.url.as_str().into_client_request().map_err(|_| {
+        error(
+            ErrorCode::InvalidArgument,
+            "invalid WebSocket handshake URL",
+        )
+    })?;
+    let mut bytes = 15usize
+        .saturating_add(
+            request
+                .uri()
+                .path_and_query()
+                .map_or(1, |p| p.as_str().len()),
+        )
+        .saturating_add(2);
+    for (name, value) in request.headers() {
+        bytes = bytes
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.as_bytes().len())
+            .saturating_add(4);
+    }
+    if !config.subprotocols.is_empty() {
+        bytes = bytes
+            .saturating_add("sec-websocket-protocol".len() + 4)
+            .saturating_add(
+                config
+                    .subprotocols
+                    .iter()
+                    .map(String::len)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                config
+                    .subprotocols
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_mul(2),
+            );
+    }
+    Ok(bytes)
+}
+
+fn admit_header(bytes: &mut usize, name: &HeaderName, value: &HeaderValue) -> Result<()> {
+    *bytes = bytes
+        .saturating_add(name.as_str().len())
+        .saturating_add(value.as_bytes().len())
+        .saturating_add(4);
+    if *bytes > MAX_HANDSHAKE_BYTES {
+        return Err(error(
+            ErrorCode::BoundExceeded,
+            "WebSocket complete upgrade request exceeds 16 KiB",
+        ));
+    }
+    Ok(())
+}
+
 fn checked_secret(secrets: &dyn SecretResolver, name: &str) -> Result<String> {
     if name.is_empty() || name.len() > 128 {
         return Err(error(
@@ -338,6 +419,7 @@ fn build_headers(
     secrets: &dyn SecretResolver,
 ) -> Result<Vec<(HeaderName, HeaderValue)>> {
     let mut out = Vec::with_capacity(config.headers.len() + 1);
+    let mut bytes = handshake_base_bytes(config)?;
     match &config.auth {
         WebSocketAuth::None => {}
         WebSocketAuth::Bearer { token_secret } => {
@@ -367,6 +449,9 @@ fn build_headers(
             ));
         }
     }
+    for (name, value) in &out {
+        admit_header(&mut bytes, name, value)?;
+    }
     let mut seen: std::collections::HashSet<HeaderName> =
         out.iter().map(|(name, _)| name.clone()).collect();
     for header in &config.headers {
@@ -386,6 +471,12 @@ fn build_headers(
         }
         let value = match (&header.value, &header.value_secret) {
             (Some(value), None) => {
+                if credential_header(&name) {
+                    return Err(error(
+                        ErrorCode::InvalidArgument,
+                        "WebSocket authentication headers require auth or value_secret over wss://",
+                    ));
+                }
                 if value.len() > MAX_SECRET_BYTES {
                     return Err(error(
                         ErrorCode::BoundExceeded,
@@ -409,6 +500,7 @@ fn build_headers(
                 ))
             }
         };
+        admit_header(&mut bytes, &name, &value)?;
         out.push((name, value));
     }
     Ok(out)
@@ -417,6 +509,110 @@ fn build_headers(
 pub(crate) trait WsIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> WsIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 pub(crate) type WsStream = WebSocketStream<Pin<Box<dyn WsIo>>>;
+pub(crate) type WsRead = SplitStream<WsStream>;
+pub(crate) type WsWrite = SplitSink<WsStream, Message>;
+pub(crate) type Incoming = Option<std::result::Result<Message, tungstenite::Error>>;
+
+/// The first observer of cancellation fixes one deadline for both the pump
+/// and the writer, including any send already in flight.
+pub(crate) struct FlushBudget {
+    timeout: Duration,
+    deadline: OnceLock<Instant>,
+}
+
+impl FlushBudget {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            deadline: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn deadline(&self, cancel: &CancellationToken) -> Option<Instant> {
+        if cancel.is_cancelled() {
+            Some(*self.deadline.get_or_init(|| Instant::now() + self.timeout))
+        } else {
+            self.deadline.get().copied()
+        }
+    }
+
+    pub(crate) fn expired(&self, cancel: &CancellationToken) -> bool {
+        self.deadline(cancel).is_some_and(|at| Instant::now() >= at)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DuplexSent {
+    Ok,
+    Failed,
+    ReadClosed,
+    TimedOut,
+    Idle,
+    Cancelled,
+}
+
+/// A blocked write must not stop reading control frames. SplitStream's
+/// protocol reader also flushes automatic Pong replies without blocking its
+/// reads; the split lock is released whenever either poll returns Pending.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_duplex(
+    writer: &mut WsWrite,
+    reader: &mut WsRead,
+    message: Message,
+    cancel: &CancellationToken,
+    flush: Option<&FlushBudget>,
+    timeout: Duration,
+    idle_timeout: Duration,
+    last_frame: &mut Instant,
+    read_quota: usize,
+    mut on_frame: impl FnMut(Incoming) -> bool,
+) -> DuplexSent {
+    let send_deadline = Instant::now() + timeout;
+    let send = writer.send(message);
+    tokio::pin!(send);
+    let mut reads = 0usize;
+    loop {
+        let flush_deadline = flush.and_then(|budget| budget.deadline(cancel));
+        let at = flush_deadline.map_or(send_deadline, |f| f.min(send_deadline));
+        if flush.is_none() && cancel.is_cancelled() {
+            return DuplexSent::Cancelled;
+        }
+        if Instant::now() >= at {
+            return DuplexSent::TimedOut;
+        }
+        let idle = *last_frame + idle_timeout;
+        if Instant::now() >= idle {
+            return DuplexSent::Idle;
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled(), if flush_deadline.is_none() => {
+                if let Some(budget) = flush {
+                    budget.deadline(cancel);
+                } else {
+                    return DuplexSent::Cancelled;
+                }
+            }
+            _ = tokio::time::sleep_until(at) => return DuplexSent::TimedOut,
+            _ = tokio::time::sleep_until(idle) => return DuplexSent::Idle,
+            result = &mut send => return if result.is_ok() { DuplexSent::Ok } else { DuplexSent::Failed },
+            frame = reader.next() => {
+                if matches!(&frame, Some(Ok(_))) {
+                    *last_frame = Instant::now();
+                }
+                if !on_frame(frame) {
+                    return DuplexSent::ReadClosed;
+                }
+                reads += 1;
+                // Also cooperate with timers/cancellation for an in-memory
+                // transport whose reads are forever immediately Ready.
+                if reads % read_quota.clamp(1, 16) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+}
 
 /// A validated client with credentials resolved into redacted header values.
 #[derive(Clone)]
@@ -468,9 +664,9 @@ impl ConnectFailure {
 impl BoundClient {
     /// One bounded connect attempt: TCP, TLS (wss), HTTP upgrade.
     pub(crate) async fn connect(&self) -> std::result::Result<WsStream, ConnectFailure> {
-        let timeout = self.config.connect_timeout;
-        let tcp = tokio::time::timeout(
-            timeout,
+        let deadline = tokio::time::Instant::now() + self.config.connect_timeout;
+        let tcp = tokio::time::timeout_at(
+            deadline,
             TcpStream::connect((self.target.host.as_str(), self.target.port)),
         )
         .await
@@ -480,7 +676,7 @@ impl BoundClient {
         let io: Pin<Box<dyn WsIo>> = match &self.tls {
             None => Box::pin(tcp),
             Some((connector, name)) => Box::pin(
-                tokio::time::timeout(timeout, connector.connect(name.clone(), tcp))
+                tokio::time::timeout_at(deadline, connector.connect(name.clone(), tcp))
                     .await
                     .map_err(|_| ConnectFailure::Timeout)?
                     .map_err(|_| ConnectFailure::Tls)?,
@@ -502,8 +698,8 @@ impl BoundClient {
                 HeaderValue::from_str(&offered).map_err(|_| ConnectFailure::Handshake)?,
             );
         }
-        let (ws, _response) = tokio::time::timeout(
-            timeout,
+        let (ws, _response) = tokio::time::timeout_at(
+            deadline,
             tokio_tungstenite::client_async_with_config(
                 request,
                 io,
@@ -682,5 +878,71 @@ mod tests {
         let spread: std::collections::HashSet<_> =
             (0..32).map(|_| reconnect_delay(6, max)).collect();
         assert!(spread.len() > 1, "jitter must vary the delay");
+    }
+
+    #[test]
+    fn websocket_auth_headers_cannot_bypass_secretref_or_tls_and_handshake_is_bounded() {
+        let policy = TargetPolicy::allow("127.0.0.1", 9000);
+        for name in ["Authorization", "pRoXy-AuThOrIzAtIoN", "Cookie"] {
+            for scheme in ["ws", "wss"] {
+                let mut c = WebSocketClientConfig::new(format!("{scheme}://127.0.0.1:9000/"));
+                c.headers.push(WebSocketHeader {
+                    name: name.into(),
+                    value: Some("Bearer hunter2".into()),
+                    value_secret: None,
+                });
+                let e = c.bind(&secrets(), &policy).unwrap_err();
+                assert_eq!(e.code, ErrorCode::InvalidArgument);
+                assert!(!e.message.contains("hunter2"));
+            }
+            let mut c = WebSocketClientConfig::new("ws://127.0.0.1:9000/");
+            c.headers.push(WebSocketHeader {
+                name: name.into(),
+                value: None,
+                value_secret: Some("tok".into()),
+            });
+            assert_eq!(
+                c.bind(&secrets(), &policy).unwrap_err().code,
+                ErrorCode::PolicyDenied
+            );
+            c.url = "wss://127.0.0.1:9000/".into();
+            let bound = c.bind(&secrets(), &policy).unwrap();
+            assert!(!format!("{bound:?}").contains("hunter2"));
+            assert!(build_headers(&c, &secrets()).unwrap()[0].1.is_sensitive());
+        }
+        let mut c = WebSocketClientConfig::new("ws://127.0.0.1:9000/");
+        c.headers.push(WebSocketHeader {
+            name: "x".repeat(MAX_HEADER_NAME_BYTES + 1),
+            value: Some("v".into()),
+            value_secret: None,
+        });
+        assert_eq!(
+            c.bind(&secrets(), &policy).unwrap_err().code,
+            ErrorCode::BoundExceeded
+        );
+        c.headers = (0..4)
+            .map(|i| WebSocketHeader {
+                name: format!("x-{i}"),
+                value: Some("x".repeat(MAX_SECRET_BYTES)),
+                value_secret: None,
+            })
+            .collect();
+        assert_eq!(
+            c.bind(&secrets(), &policy).unwrap_err().code,
+            ErrorCode::BoundExceeded
+        );
+        let secret = MapSecretResolver::new(std::collections::HashMap::from([(
+            "big".into(),
+            "s".repeat(MAX_SECRET_BYTES),
+        )]));
+        c.url = "wss://127.0.0.1:9000/".into();
+        for header in &mut c.headers {
+            header.value = None;
+            header.value_secret = Some("big".into());
+        }
+        assert_eq!(
+            c.bind(&secret, &policy).unwrap_err().code,
+            ErrorCode::BoundExceeded
+        );
     }
 }

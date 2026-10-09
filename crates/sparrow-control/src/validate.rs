@@ -475,7 +475,7 @@ fn websocket_reservation(sources: &[&SourceSpec], sinks: &[&SinkSpec]) -> usize 
         sources
             .iter()
             .filter_map(|s| s.websocket.as_ref())
-            .map(|w| w.client_config().connection_reservation())
+            .map(|w| w.reservation())
             .chain(
                 sinks
                     .iter()

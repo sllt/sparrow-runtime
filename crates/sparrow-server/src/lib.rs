@@ -1012,16 +1012,16 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
     }
     if s.source_kind == "websocket" {
         value["websocket_source"] = json!({"received":io.websocket_source_received,"rows":io.websocket_source_rows,"dropped_bad":io.websocket_source_dropped_bad,
-            "dropped_oversize":io.websocket_source_dropped_oversize,"dropped_binary":io.websocket_source_dropped_binary,"dropped_budget":io.websocket_source_dropped_budget,
+            "dropped_oversize":io.websocket_source_dropped_oversize,"dropped_binary":io.websocket_source_dropped_binary,"dropped_budget":io.websocket_source_dropped_budget,"dropped_overflow":io.websocket_source_dropped_overflow,
             "backpressure_waits":io.websocket_source_backpressure_waits,"connects":io.websocket_source_connects,"reconnects":io.websocket_source_reconnects,
             "disconnects":io.websocket_source_disconnects,"connect_failures":io.websocket_source_connect_failures,"heartbeat_timeouts":io.websocket_source_heartbeat_timeouts,
             "pings_sent":io.websocket_source_pings_sent,"inbox_items":io.websocket_source_inbox_items,"inbox_bytes":io.websocket_source_inbox_bytes,
             "semantics":"live_best_effort_at_most_once_no_replay_no_ack",
-            "scope":"this_attempt; dropped_oversize=messages_rejected_by_size_limit_plus_records_over_decode_limit"});
+            "scope":"this_attempt; dropped_overflow=complete_data_messages_dropped_at_prefetch; dropped_oversize=messages_rejected_by_size_limit_plus_records_over_decode_limit"});
     }
     if s.sink_kind == "websocket" {
         value["websocket_sink"] = json!({"sent":io.websocket_sink_sent,"dropped_bad":io.websocket_sink_dropped_bad,"dropped_oversize":io.websocket_sink_dropped_oversize,
-            "dropped_overflow":io.websocket_sink_dropped_overflow,"backpressure_waits":io.websocket_sink_backpressure_waits,"send_failed":io.websocket_sink_send_failed,
+            "dropped_overflow":io.websocket_sink_dropped_overflow,"dropped_budget":io.websocket_sink_dropped_budget,"backpressure_waits":io.websocket_sink_backpressure_waits,"send_failed":io.websocket_sink_send_failed,
             "send_timeouts":io.websocket_sink_send_timeouts,"discarded_on_close":io.websocket_sink_discarded_on_close,"connects":io.websocket_sink_connects,
             "reconnects":io.websocket_sink_reconnects,"disconnects":io.websocket_sink_disconnects,"connect_failures":io.websocket_sink_connect_failures,
             "heartbeat_timeouts":io.websocket_sink_heartbeat_timeouts,"pings_sent":io.websocket_sink_pings_sent,"ignored_frames":io.websocket_sink_ignored_frames,
@@ -1340,6 +1340,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "websocket_source_dropped_budget",
             io.websocket_source_dropped_budget,
         ),
+        ("websocket_source_dropped_overflow", io.websocket_source_dropped_overflow),
         (
             "websocket_source_backpressure_waits",
             io.websocket_source_backpressure_waits,
@@ -1366,6 +1367,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             io.websocket_source_pings_sent,
         ),
         ("websocket_sink_sent", io.websocket_sink_sent),
+        ("websocket_sink_dropped_budget", io.websocket_sink_dropped_budget),
         ("websocket_sink_dropped_bad", io.websocket_sink_dropped_bad),
         (
             "websocket_sink_dropped_oversize",

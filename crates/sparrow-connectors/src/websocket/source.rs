@@ -4,22 +4,20 @@
 //!   header) or, with `framing = ndjson`, newline-delimited JSON objects.
 //!   Binary messages are dropped and counted unless `binary_frames = decode`
 //!   (JSON only; CSV is text and refuses binary decoding).
-//! - The protocol layer rejects a frame/message above `max_message_bytes`
-//!   from its header, before buffering or decoding the payload; the
-//!   connection is then closed (counted `dropped_oversize`) and reconnected.
-//!   Records above the 64 KiB decode limit inside an accepted NDJSON message
-//!   are dropped and counted the same way.
-//! - Rows enter the byte-accounted Kernel ingress one at a time; while the
-//!   bounded inbox is full the Source stops reading the socket (TCP
-//!   backpressure on the server). Time blocked on our own ingress does not
-//!   count as connection idleness.
+//! - The protocol layer rejects an oversized frame before reserving its
+//!   payload; accumulated fragmented messages are checked after reading each
+//!   bounded frame. Records also have a format-specific pre-decode limit.
+//! - A separate wire actor continues reading and answering heartbeats while
+//!   the decode/admission pump waits on its inbox. Complete data messages
+//!   enter a reservation-charged bounded prefetch queue; a full queue drops
+//!   the newest message and counts `dropped_overflow` (not rows).
 //! - A Ping is sent every `ping_interval`; no frame within `idle_timeout`
 //!   while waiting to read closes the connection. Reconnect uses capped,
 //!   jittered backoff; `reconnect_attempts` consecutive failures fail the
 //!   Source retryably and the supervisor restart policy applies.
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -27,19 +25,24 @@ use sparrow_formats::{JsonLimits, PayloadFormat};
 use sparrow_io::observed::Sender as ObservedSender;
 use sparrow_model::observation::{HealthState, Latency, OriginSpan};
 use sparrow_model::{
-    CreditKind, ErrorCode, MemoryOwner, QueuedRow, RestoreClaim, Result, Row, Schema,
+    CreditKind, ErrorCode, MemoryLease, MemoryOwner, QueuedRow, RestoreClaim, Result, Row, Schema,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_util::sync::CancellationToken;
 
-use super::client::{error, reconnect_delay, BoundClient, WebSocketClientConfig, WsStream};
+use super::client::{
+    error, reconnect_delay, send_duplex, BoundClient, DuplexSent, Incoming, WebSocketClientConfig,
+    WsStream,
+};
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
 use crate::{SecretResolver, TargetPolicy};
 
 pub const DEFAULT_INBOX_BYTES: usize = 256 * 1024;
+pub const DEFAULT_PREFETCH_CAPACITY: usize = 4;
+const MAX_PREFETCH_CAPACITY: usize = 64;
 const MAX_INBOX: usize = 4096;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -71,6 +74,9 @@ pub struct WebSocketSourceConfig {
     pub inbox_capacity: usize,
     /// Decoded-row Queue credit for the inbox.
     pub inbox_bytes: usize,
+    /// Complete messages waiting for decode. Full = drop newest, never stop
+    /// servicing the WebSocket control frames. Explicit capacities are not clamped.
+    pub prefetch_capacity: usize,
     pub schema: Schema,
     pub json_limits: JsonLimits,
     pub fail_on_decode: bool,
@@ -86,6 +92,7 @@ impl WebSocketSourceConfig {
             binary_frames: BinaryFrames::Drop,
             inbox_capacity: 16,
             inbox_bytes: DEFAULT_INBOX_BYTES,
+            prefetch_capacity: DEFAULT_PREFETCH_CAPACITY,
             schema,
             json_limits: JsonLimits::default(),
             fail_on_decode: false,
@@ -111,11 +118,13 @@ impl WebSocketSourceConfig {
             }
             csv.check_schema(&self.schema)?;
         }
-        if !(1..=MAX_INBOX).contains(&self.inbox_capacity) || self.json_limits.max_bytes > 64 * 1024
+        if !(1..=MAX_INBOX).contains(&self.inbox_capacity)
+            || !(1..=MAX_PREFETCH_CAPACITY).contains(&self.prefetch_capacity)
+            || self.json_limits.max_bytes > 64 * 1024
         {
             return Err(error(
                 ErrorCode::BoundExceeded,
-                "WebSocket inbox_capacity must be 1..=4096; records remain <=64KiB",
+                "WebSocket inbox_capacity must be 1..=4096, prefetch_capacity 1..=64; JSON records remain <=64KiB",
             ));
         }
         self.check_inbox_budget(sparrow_model::ResourceBudget::compact().queue_bytes)?;
@@ -141,7 +150,19 @@ impl WebSocketSourceConfig {
     }
 
     pub fn reservation(&self) -> usize {
-        self.client.connection_reservation()
+        Self::reservation_for(&self.client, self.prefetch_capacity)
+    }
+
+    /// Queue capacity plus one pump-held message. A permit is acquired
+    /// before copying the SDK payload to an exact-size owned buffer, so no
+    /// extra pending copy exists when the prefetch queue is full.
+    pub fn reservation_for(client: &WebSocketClientConfig, prefetch_capacity: usize) -> usize {
+        client.connection_reservation().saturating_add(
+            prefetch_capacity
+                .saturating_add(1)
+                .saturating_mul(client.max_message_bytes.saturating_add(256))
+                .saturating_add(8192),
+        )
     }
 
     /// One connector may use at most half the job reservation budget.
@@ -149,7 +170,7 @@ impl WebSocketSourceConfig {
         if self.reservation() > reservation_budget / 2 {
             return Err(error(
                 ErrorCode::BoundExceeded,
-                "WebSocket connection buffers (2 x max_message_bytes + 128 KiB) exceed half the job reservation budget; lower max_message_bytes",
+                "WebSocket connection/prefetch buffers exceed half the job reservation budget; lower max_message_bytes or prefetch_capacity",
             ));
         }
         Ok(())
@@ -160,6 +181,7 @@ pub struct WebSocketSource {
     pub config: WebSocketSourceConfig,
     pub diag: Arc<IoDiagnostics>,
     client: BoundClient,
+    failed: Mutex<bool>,
 }
 
 impl std::fmt::Debug for WebSocketSource {
@@ -185,6 +207,93 @@ enum SessionEnd {
     Lost(&'static str),
 }
 
+/// A payload cannot outlive its reservation, even when the caller drops the
+/// receiving Wire while the transport actor is still closing its socket.
+pub(super) struct WireMessage {
+    pub(super) payload: Box<[u8]>,
+    pub(super) received_at: std::time::Instant,
+    _reservation: Arc<MemoryLease>,
+}
+
+pub(super) struct Wire {
+    pub(super) messages: mpsc::Receiver<WireMessage>,
+    task: tokio::task::JoinHandle<Result<()>>,
+    stop: CancellationToken,
+    _reservation: Arc<MemoryLease>,
+    source: Arc<WebSocketSource>,
+}
+
+impl Wire {
+    pub(super) fn start(
+        source: Arc<WebSocketSource>,
+        owner: Arc<MemoryOwner>,
+        stop: CancellationToken,
+    ) -> Result<Self> {
+        Self::start_actor(
+            source,
+            owner,
+            stop,
+            |source, tx, stop, reservation| async move {
+                source.wire_loop(&tx, &stop, &reservation).await
+            },
+        )
+    }
+
+    fn start_actor<A, F>(
+        source: Arc<WebSocketSource>,
+        owner: Arc<MemoryOwner>,
+        stop: CancellationToken,
+        actor: A,
+    ) -> Result<Self>
+    where
+        A: FnOnce(
+                Arc<WebSocketSource>,
+                mpsc::Sender<WireMessage>,
+                CancellationToken,
+                Arc<MemoryLease>,
+            ) -> F
+            + Send
+            + 'static,
+        F: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let reservation =
+            Arc::new(owner.acquire(CreditKind::Reservation, source.config.reservation())?);
+        let (tx, messages) = mpsc::channel(source.config.prefetch_capacity);
+        let actor_stop = stop.clone();
+        let actor_reservation = reservation.clone();
+        let actor_source = source.clone();
+        let task = tokio::spawn(async move {
+            // Also interrupt a pump waiting on ingress if the actor panics.
+            let _cancel_on_exit = actor_stop.clone().drop_guard();
+            let _lifecycle = actor_source.diag.observation.lifecycle(true);
+            actor(actor_source, tx, actor_stop, actor_reservation).await
+        });
+        Ok(Self {
+            messages,
+            task,
+            stop,
+            _reservation: reservation,
+            source,
+        })
+    }
+
+    pub(super) async fn close(mut self) -> Result<()> {
+        self.stop.cancel();
+        self.messages.close();
+        (&mut self.task).await.map_err(|_| {
+            self.source
+                .fail_once("websocket_wire_panicked", ErrorCode::JobFailed);
+            error(ErrorCode::JobFailed, "WebSocket wire task panicked")
+        })?
+    }
+}
+
+impl Drop for Wire {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
 impl WebSocketSource {
     pub fn bind(
         config: WebSocketSourceConfig,
@@ -198,6 +307,7 @@ impl WebSocketSource {
             config,
             diag,
             client,
+            failed: Mutex::new(false),
         })
     }
 
@@ -220,7 +330,6 @@ impl WebSocketSource {
         self.config.check_inbox_budget(owner.budget().queue_bytes)?;
         self.config
             .check_reservation_budget(owner.budget().reservation_bytes)?;
-        let _connection = owner.acquire(CreditKind::Reservation, self.config.reservation())?;
         let mut budget = owner.budget();
         budget.queue_bytes = self.config.inbox_bytes;
         let queue = MemoryOwner::child(owner.clone(), budget, "websocket-inbox");
@@ -230,10 +339,50 @@ impl WebSocketSource {
             queue: &queue,
             max_row_bytes,
         };
-        let _lifecycle = self.diag.observation.lifecycle(true);
+        let source = Arc::new(self);
+        let child = cancel.child_token();
+        let _cancel_on_drop = child.clone().drop_guard();
+        let mut wire = match Wire::start(source.clone(), owner.clone(), child.clone()) {
+            Ok(wire) => wire,
+            Err(e) => {
+                source.fail_once("websocket_budget_failed", e.code);
+                return Err(e);
+            }
+        };
+        let result = loop {
+            let message = tokio::select! {
+                biased;
+                _ = child.cancelled() => break Ok(()),
+                message = wire.messages.recv() => message,
+            };
+            let Some(message) = message else { break Ok(()) };
+            match source
+                .ingest(&message.payload, &ingress, &child, message.received_at)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        let result = result.and(wire.close().await);
+        if let Err(e) = &result {
+            source.fail_once("websocket_source_failed", e.code);
+        } else {
+            source.health(HealthState::Stopped, "websocket_stopped");
+        }
+        result
+    }
+
+    async fn wire_loop(
+        &self,
+        messages: &mpsc::Sender<WireMessage>,
+        cancel: &CancellationToken,
+        reservation: &Arc<MemoryLease>,
+    ) -> Result<()> {
         let mut connected_before = false;
         loop {
-            let Some(ws) = self.connect(&cancel, connected_before).await? else {
+            let Some(ws) = self.connect(cancel, connected_before).await? else {
                 return Ok(());
             };
             if connected_before {
@@ -242,23 +391,15 @@ impl WebSocketSource {
                     .fetch_add(1, Ordering::Relaxed);
             }
             connected_before = true;
-            match self.session(ws, &ingress, &cancel).await? {
+            match self.session(ws, messages, reservation, cancel).await {
                 SessionEnd::Stop => {
-                    self.diag.observation.health(
-                        true,
-                        HealthState::Stopped,
-                        "websocket_stopped",
-                        None,
-                    );
                     return Ok(());
                 }
                 SessionEnd::Lost(reason) => {
                     self.diag
                         .websocket_source_disconnects
                         .fetch_add(1, Ordering::Relaxed);
-                    self.diag
-                        .observation
-                        .health(true, HealthState::Reconnecting, reason, None);
+                    self.health(HealthState::Reconnecting, reason);
                 }
             }
         }
@@ -282,15 +423,13 @@ impl WebSocketSource {
                     _ = tokio::time::sleep(delay) => {}
                 }
             }
-            self.diag.observation.health(
-                true,
+            self.health(
                 if reconnecting || attempt > 0 {
                     HealthState::Reconnecting
                 } else {
                     HealthState::Connecting
                 },
                 "websocket_connecting",
-                None,
             );
             let attempted = tokio::select! {
                 biased;
@@ -302,12 +441,7 @@ impl WebSocketSource {
                     self.diag
                         .websocket_source_connects
                         .fetch_add(1, Ordering::Relaxed);
-                    self.diag.observation.health(
-                        true,
-                        HealthState::Ready,
-                        "websocket_connected",
-                        None,
-                    );
+                    self.health(HealthState::Ready, "websocket_connected");
                     return Ok(Some(ws));
                 }
                 Err(failure) => {
@@ -316,12 +450,7 @@ impl WebSocketSource {
                         .fetch_add(1, Ordering::Relaxed);
                     attempt += 1;
                     if attempt >= self.client.config.reconnect_attempts {
-                        self.diag.observation.health(
-                            true,
-                            HealthState::Failed,
-                            "websocket_connect_exhausted",
-                            Some(ErrorCode::JobFailed),
-                        );
+                        self.fail_once("websocket_connect_exhausted", ErrorCode::JobFailed);
                         return Err(error(
                             ErrorCode::JobFailed,
                             format!(
@@ -338,103 +467,160 @@ impl WebSocketSource {
 
     async fn session(
         &self,
-        mut ws: WsStream,
-        ingress: &Ingress<'_>,
+        ws: WsStream,
+        messages: &mpsc::Sender<WireMessage>,
+        reservation: &Arc<MemoryLease>,
         cancel: &CancellationToken,
-    ) -> Result<SessionEnd> {
+    ) -> SessionEnd {
         enum Event {
             Stop,
             Idle,
             Ping,
-            Frame(Option<std::result::Result<Message, tungstenite::Error>>),
+            Frame(Incoming),
         }
+        let (mut writer, mut reader) = ws.split();
         let cfg = &self.client.config;
         let mut ping =
             tokio::time::interval_at(Instant::now() + cfg.ping_interval, cfg.ping_interval);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_frame = Instant::now();
+        let mut rounds = 0usize;
         loop {
             let event = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => Event::Stop,
+                _ = messages.closed() => Event::Stop,
                 _ = tokio::time::sleep_until(last_frame + cfg.idle_timeout) => Event::Idle,
                 _ = ping.tick() => Event::Ping,
-                frame = ws.next() => Event::Frame(frame),
+                frame = reader.next() => Event::Frame(frame),
             };
-            let message = match event {
+            match event {
                 Event::Stop => {
-                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, ws.close(None)).await;
-                    return Ok(SessionEnd::Stop);
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, writer.send(Message::Close(None)))
+                        .await;
+                    return SessionEnd::Stop;
                 }
                 Event::Idle => {
                     self.diag
                         .websocket_source_heartbeat_timeouts
                         .fetch_add(1, Ordering::Relaxed);
-                    return Ok(SessionEnd::Lost("websocket_heartbeat_timeout"));
+                    return SessionEnd::Lost("websocket_heartbeat_timeout");
                 }
                 Event::Ping => {
-                    match tokio::time::timeout(
+                    match send_duplex(
+                        &mut writer,
+                        &mut reader,
+                        Message::Ping(Default::default()),
+                        cancel,
+                        None,
                         cfg.connect_timeout,
-                        ws.send(Message::Ping(Default::default())),
+                        cfg.idle_timeout,
+                        &mut last_frame,
+                        self.config.prefetch_capacity.min(16),
+                        |frame| self.forward(frame, messages, reservation),
                     )
                     .await
                     {
-                        Ok(Ok(())) => {
+                        DuplexSent::Ok => {
                             self.diag
                                 .websocket_source_pings_sent
                                 .fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        _ => return Ok(SessionEnd::Lost("websocket_ping_failed")),
+                        DuplexSent::Cancelled => return SessionEnd::Stop,
+                        DuplexSent::Idle => {
+                            self.diag
+                                .websocket_source_heartbeat_timeouts
+                                .fetch_add(1, Ordering::Relaxed);
+                            return SessionEnd::Lost("websocket_heartbeat_timeout");
+                        }
+                        _ => return SessionEnd::Lost("websocket_ping_failed"),
                     }
                 }
-                Event::Frame(None) => return Ok(SessionEnd::Lost("websocket_closed")),
-                Event::Frame(Some(Err(tungstenite::Error::Capacity(_)))) => {
-                    // Rejected from the frame header / running message size,
-                    // before the payload was buffered or decoded.
-                    self.diag
-                        .websocket_source_dropped_oversize
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(SessionEnd::Lost("websocket_message_too_big"));
-                }
-                Event::Frame(Some(Err(_))) => {
-                    return Ok(SessionEnd::Lost("websocket_protocol_error"))
-                }
-                Event::Frame(Some(Ok(message))) => message,
-            };
-            let received_at = std::time::Instant::now();
-            let admitted = match message {
-                Message::Text(text) => {
-                    self.diag
-                        .websocket_source_received
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.ingest(text.as_bytes(), ingress, cancel, received_at)
-                        .await?
-                }
-                Message::Binary(bytes) => {
-                    self.diag
-                        .websocket_source_received
-                        .fetch_add(1, Ordering::Relaxed);
-                    if self.config.binary_frames == BinaryFrames::Drop {
-                        self.diag
-                            .websocket_source_dropped_binary
-                            .fetch_add(1, Ordering::Relaxed);
-                        true
-                    } else {
-                        self.ingest(&bytes, ingress, cancel, received_at).await?
+                Event::Frame(frame) => {
+                    if !self.forward(frame, messages, reservation) {
+                        return SessionEnd::Lost("websocket_connection_lost");
                     }
+                    last_frame = Instant::now();
                 }
-                Message::Close(_) => return Ok(SessionEnd::Lost("websocket_server_closed")),
-                // Pings are answered by the protocol layer; Pongs only prove
-                // liveness.
-                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => true,
             };
-            if !admitted {
-                let _ = tokio::time::timeout(CLOSE_TIMEOUT, ws.close(None)).await;
-                return Ok(SessionEnd::Stop);
+            rounds += 1;
+            if rounds % self.config.prefetch_capacity.min(16) == 0 {
+                tokio::task::yield_now().await;
             }
-            // Time spent blocked on our own bounded ingress is not idleness.
-            last_frame = Instant::now();
+        }
+    }
+
+    fn forward(
+        &self,
+        frame: Incoming,
+        messages: &mpsc::Sender<WireMessage>,
+        reservation: &Arc<MemoryLease>,
+    ) -> bool {
+        let payload = match frame {
+            Some(Ok(Message::Text(text))) => {
+                self.diag
+                    .websocket_source_received
+                    .fetch_add(1, Ordering::Relaxed);
+                text.into()
+            }
+            Some(Ok(Message::Binary(bytes))) => {
+                self.diag
+                    .websocket_source_received
+                    .fetch_add(1, Ordering::Relaxed);
+                if self.config.binary_frames == BinaryFrames::Drop {
+                    self.diag
+                        .websocket_source_dropped_binary
+                        .fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                bytes
+            }
+            Some(Ok(Message::Close(_))) | None => return false,
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => return true,
+            Some(Err(tungstenite::Error::Capacity(_))) => {
+                self.diag
+                    .websocket_source_dropped_oversize
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            Some(Err(_)) => return false,
+        };
+        let received_at = std::time::Instant::now();
+        match messages.try_reserve() {
+            Ok(permit) => {
+                // SDK Bytes may retain an entire backing frame/read slab.
+                // Copy only after obtaining a slot, under its prepaid credit.
+                permit.send(WireMessage {
+                    payload: payload.as_ref().to_vec().into_boxed_slice(),
+                    received_at,
+                    _reservation: reservation.clone(),
+                });
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.diag
+                    .websocket_source_dropped_overflow
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+        true
+    }
+
+    fn fail_once(&self, reason: &'static str, code: ErrorCode) {
+        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        if !*failed {
+            *failed = true;
+            self.diag
+                .observation
+                .health(true, HealthState::Failed, reason, Some(code));
+        }
+    }
+
+    fn health(&self, state: HealthState, reason: &'static str) {
+        let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        if !*failed {
+            self.diag.observation.health(true, state, reason, None);
         }
     }
 
@@ -454,7 +640,10 @@ impl WebSocketSource {
             WebSocketFraming::Ndjson => {
                 for line in payload.split(|&b| b == b'\n') {
                     let line = line.strip_suffix(b"\r").unwrap_or(line);
-                    if line.iter().all(u8::is_ascii_whitespace) {
+                    if line
+                        .iter()
+                        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                    {
                         continue;
                     }
                     if !self
@@ -476,12 +665,20 @@ impl WebSocketSource {
         cancel: &CancellationToken,
         received_at: std::time::Instant,
     ) -> Result<bool> {
-        if record.len() > self.config.json_limits.max_bytes {
+        let format = &self.config.payload_format;
+        if record.len() > format.max_message_bytes(&self.config.json_limits) {
             self.diag
                 .websocket_source_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
+        let estimate = format.decode_scratch(&self.config.schema, record.len());
+        let Ok(_scratch) = ingress.owner.acquire(CreditKind::Reservation, estimate) else {
+            self.diag
+                .websocket_source_dropped_budget
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
+        };
         let started = std::time::Instant::now();
         let decoded = self.config.payload_format.decode_row(
             &self.config.schema,
@@ -501,12 +698,7 @@ impl WebSocketSource {
                     .fetch_add(1, Ordering::Relaxed);
                 self.diag.decode_errors.fetch_add(1, Ordering::Relaxed);
                 if self.config.fail_on_decode {
-                    self.diag.observation.health(
-                        true,
-                        HealthState::Failed,
-                        "websocket_decode_failed",
-                        Some(e.code),
-                    );
+                    self.fail_once("websocket_decode_failed", e.code);
                     return Err(error(
                         e.code,
                         "WebSocket record decode failed (fail_on_decode)",
@@ -597,5 +789,81 @@ impl WebSocketSource {
                 } => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::super::tests::probe_stream;
+    use super::*;
+    use crate::MapSecretResolver;
+    use sparrow_model::{DataType, Field, FieldId, ResourceBudget, SchemaId};
+
+    #[tokio::test(start_paused = true)]
+    async fn websocket_wire_close_awaiter_abort_keeps_actor_lifecycle_and_credit() {
+        let schema = Schema::new(
+            SchemaId::new(1),
+            vec![Field::new(FieldId::new(1), "v", DataType::Int64, false)],
+        )
+        .unwrap();
+        let source = Arc::new(
+            WebSocketSource::bind(
+                WebSocketSourceConfig::new("ws://127.0.0.1:9000/", schema),
+                &MapSecretResolver::new(Default::default()),
+                &TargetPolicy::allow("127.0.0.1", 9000),
+                IoDiagnostics::new(),
+            )
+            .unwrap(),
+        );
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        source.diag.observation.initialize(&owner).unwrap();
+        let (ws, probe) = probe_stream(10, 0, true).await;
+        let wire = Wire::start_actor(
+            source.clone(),
+            owner.clone(),
+            CancellationToken::new(),
+            move |source, tx, stop, lease| async move {
+                source.health(HealthState::Ready, "websocket_connected");
+                source.session(ws, &tx, &lease, &stop).await;
+                Ok(())
+            },
+        )
+        .unwrap();
+        let task = tokio::spawn(wire.close());
+        for _ in 0..16 {
+            if probe.write_attempts.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            probe.write_attempts.load(Ordering::Relaxed) > 0,
+            "Close must reach the gated writer"
+        );
+        assert_eq!(
+            source.diag.observation.endpoints().unwrap().0.state,
+            HealthState::Ready
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            source.diag.observation.endpoints().unwrap().0.state,
+            HealthState::Ready
+        );
+        assert!(owner.usage().reservation_bytes > 0);
+        tokio::time::advance(CLOSE_TIMEOUT).await;
+        for _ in 0..16 {
+            if owner.usage().reservation_bytes == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(owner.usage().reservation_bytes, 0);
+        assert_eq!(
+            source.diag.observation.endpoints().unwrap().0.state,
+            HealthState::Stopped
+        );
+        drop(source);
+        assert_eq!(owner.usage().physical_bytes, 0);
     }
 }
