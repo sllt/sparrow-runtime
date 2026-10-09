@@ -63,6 +63,7 @@ pub const CONNECTION_RESERVATION: usize = 128 * 1024;
 /// Longest bulk reply the Sink accepts (an XADD stream id).
 const REPLY_BULK_LIMIT: usize = 256;
 const ACK_SLOT: usize = std::mem::size_of::<Arc<BatchAck>>();
+const ACK_STATE: usize = std::mem::size_of::<BatchAck>() + 2 * std::mem::size_of::<usize>();
 const CMD_SLOT: usize = std::mem::size_of::<CmdSlot>();
 pub const MAX_TTL_MS: u64 = 315_360_000_000;
 pub const MAX_STREAM_LEN: u64 = 1_000_000_000;
@@ -119,6 +120,15 @@ pub enum RedisCommand {
 }
 
 impl RedisCommand {
+    /// Template/index/key storage and transient compilation workspace.
+    pub fn workspace_bytes(&self, schema: &Schema) -> usize {
+        schema.fields.iter().fold(16 * 1024usize, |bytes, field| {
+            bytes
+                .saturating_add(field.name.len().saturating_mul(4))
+                .saturating_add(128)
+        })
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             RedisCommand::Set { .. } => "SET",
@@ -132,7 +142,12 @@ impl RedisCommand {
 
     /// Re-sending after an unknown outcome leaves the same final state.
     pub fn idempotent(&self) -> bool {
-        matches!(self, RedisCommand::Set { .. } | RedisCommand::Hset { .. })
+        // Replaying SET PX would restart its TTL, potentially resurrecting
+        // an expired value. Only a SET without relative expiry is repeatable.
+        matches!(
+            self,
+            RedisCommand::Set { ttl: None, .. } | RedisCommand::Hset { .. }
+        )
     }
 
     fn value(&self) -> Option<&RedisValue> {
@@ -532,8 +547,9 @@ impl RedisSinkConfig {
             .checked_add(self.pipeline_bytes)?
             .checked_add(
                 self.pipeline_rows
-                    .checked_mul(CMD_SLOT.checked_add(ACK_SLOT)?)?,
+                    .checked_mul(CMD_SLOT.checked_add(ACK_SLOT)?.checked_add(ACK_STATE)?)?,
             )?
+            .checked_add(ACK_STATE)?
             .checked_add(PIPELINE_OVERHEAD)?;
         if self.command.value() == Some(&RedisValue::Json) {
             peak = peak.checked_add(self.pipeline_bytes)?;
@@ -554,6 +570,19 @@ impl RedisSinkConfig {
                 ),
             )),
         }
+    }
+
+    pub fn check_schema_budget(&self, schema: &Schema, reservation_bytes: usize) -> Result<()> {
+        let need = self
+            .peak_bytes()
+            .and_then(|n| n.checked_add(self.command.workspace_bytes(schema)));
+        if need.is_none_or(|n| n > reservation_bytes / 2) {
+            return Err(err(
+                ErrorCode::BoundExceeded,
+                "Redis pipeline and compiled command exceed half the job reservation budget",
+            ));
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -588,6 +617,7 @@ struct BatchAck {
     guard: Option<DeliveryGuard>,
     encoded: AtomicBool,
     failed: AtomicBool,
+    _lease: MemoryLease,
 }
 
 impl Drop for BatchAck {
@@ -619,13 +649,13 @@ struct CmdSlot {
 /// One pipeline under construction or in flight.
 struct Pipeline {
     body: Vec<u8>,
-    lease: MemoryLease,
     credit: EncodedGuard,
     cmds: Vec<CmdSlot>,
     acks: Vec<Arc<BatchAck>>,
     first: Instant,
     /// Commands `..settled` have their outcome recorded.
     settled: usize,
+    lease: MemoryLease,
 }
 
 impl Pipeline {
@@ -649,11 +679,12 @@ impl Pipeline {
         &mut self,
         len: usize,
         limit: usize,
+        max_rows: usize,
         ack: &Arc<BatchAck>,
         write: impl FnOnce(&mut Vec<u8>),
     ) -> std::result::Result<(), bool> {
         let end = self.body.len().saturating_add(len);
-        if end > limit {
+        if end > limit || self.cmds.len() >= max_rows {
             return Err(true);
         }
         let new_ack = !self.acks.last().is_some_and(|a| Arc::ptr_eq(a, ack));
@@ -669,12 +700,12 @@ impl Pipeline {
             }
         };
         let body_cap = grow(self.body.capacity(), end, 4096, limit);
-        let cmd_cap = grow(self.cmds.capacity(), self.cmds.len() + 1, 16, usize::MAX);
+        let cmd_cap = grow(self.cmds.capacity(), self.cmds.len() + 1, 16, max_rows);
         let ack_cap = grow(
             self.acks.capacity(),
             self.acks.len() + usize::from(new_ack),
             4,
-            usize::MAX,
+            max_rows,
         );
         if (body_cap, cmd_cap, ack_cap)
             != (
@@ -698,6 +729,12 @@ impl Pipeline {
                     .acks
                     .try_reserve_exact(ack_cap - self.acks.len())
                     .is_err()
+            {
+                return Err(false);
+            }
+            if self.body.capacity() > body_cap
+                || self.cmds.capacity() > cmd_cap
+                || self.acks.capacity() > ack_cap
             {
                 return Err(false);
             }
@@ -792,11 +829,16 @@ pub fn backoff(initial: Duration, max: Duration, attempt: u32, random: u64) -> D
 
 struct State {
     pending: Option<Pipeline>,
-    compiled: Option<(Arc<Schema>, Arc<CompiledCommand>)>,
+    compiled: Option<(Arc<Schema>, Arc<CompiledState>)>,
     conn: Option<Connection>,
     reader: Reader,
     deadline: Option<Instant>,
     fatal: bool,
+}
+
+struct CompiledState {
+    command: CompiledCommand,
+    _lease: MemoryLease,
 }
 
 impl RedisSink {
@@ -810,6 +852,9 @@ impl RedisSink {
         config.validate()?;
         config.check_reservation_budget(owner.budget().reservation_bytes)?;
         let target = config.target.bind(secrets, policy)?;
+        let mut budget = owner.budget();
+        budget.reservation_bytes /= 2;
+        let owner = MemoryOwner::child(owner, budget, "redis-sink");
         let connection_lease = owner.acquire(CreditKind::Reservation, CONNECTION_RESERVATION)?;
         Ok(Self {
             config,
@@ -931,32 +976,70 @@ impl RedisSink {
         cancel: &CancellationToken,
         outbox: Option<&Arc<InflightCounter>>,
     ) {
+        let guard = self.diag.observation.delivery_guard(
+            batch.num_rows(),
+            batch.tracked_bytes(),
+            batch.origin(),
+        );
+        self.observe_stop(state, cancel);
+        if state.fatal || state.deadline.is_some_and(|at| Instant::now() >= at) {
+            self.diag
+                .redis_sink_discarded_on_close
+                .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+            if let Some(outbox) = outbox {
+                outbox.fail();
+            }
+            return;
+        }
+        let Ok(lease) = self.owner.acquire(CreditKind::Reservation, ACK_STATE) else {
+            self.diag
+                .redis_sink_dropped_budget
+                .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+            if let Some(outbox) = outbox {
+                outbox.fail();
+            }
+            return;
+        };
         let ack = Arc::new(BatchAck {
             outbox: outbox.cloned(),
-            guard: Some(self.diag.observation.delivery_guard(
-                batch.num_rows(),
-                batch.tracked_bytes(),
-                batch.origin(),
-            )),
+            guard: Some(guard),
             encoded: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            _lease: lease,
         });
         if batch.output_sequence().is_some() {
             self.diag
                 .redis_sink_dropped_bad
                 .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-            self.diag.observation.health(
-                false,
-                HealthState::Failed,
+            self.fatal(
+                state,
+                cancel,
                 "redis_reliable_output_rejected",
-                Some(ErrorCode::UnsupportedRestore),
+                ErrorCode::UnsupportedRestore,
             );
             return;
         }
         let schema = batch.schema_arc();
         if state.compiled.as_ref().is_none_or(|(s, _)| **s != *schema) {
+            let Ok(lease) = self.owner.acquire(
+                CreditKind::Reservation,
+                self.config.command.workspace_bytes(&schema),
+            ) else {
+                self.diag
+                    .redis_sink_dropped_budget
+                    .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                return;
+            };
             match self.config.command.compile(&schema) {
-                Ok(compiled) => state.compiled = Some((schema.clone(), Arc::new(compiled))),
+                Ok(command) => {
+                    state.compiled = Some((
+                        schema.clone(),
+                        Arc::new(CompiledState {
+                            command,
+                            _lease: lease,
+                        }),
+                    ))
+                }
                 Err(e) => {
                     self.fatal(state, cancel, "redis_schema_mismatch", e.code);
                     return;
@@ -964,6 +1047,10 @@ impl RedisSink {
             }
         }
         for (i, row) in batch.rows().iter().enumerate() {
+            if i % 16 == 15 {
+                tokio::task::yield_now().await;
+            }
+            self.observe_stop(state, cancel);
             if state.fatal || state.deadline.is_some_and(|d| Instant::now() >= d) {
                 self.diag
                     .redis_sink_discarded_on_close
@@ -974,7 +1061,7 @@ impl RedisSink {
             let started = std::time::Instant::now();
             let compiled = state.compiled.as_ref().expect("compiled above").1.clone();
             // JSON values: charge the encoder and its output before encoding.
-            let json = if compiled.needs_json() {
+            let json = if compiled.command.needs_json() {
                 match encode_json_row_charged(&self.owner, &schema, row, self.config.pipeline_bytes)
                 {
                     Ok(pair) => Some(pair),
@@ -993,7 +1080,7 @@ impl RedisSink {
                 None
             };
             let json_bytes: &[u8] = json.as_ref().map_or(&[], |(b, _)| b.as_slice());
-            let len = match compiled.encoded_len(row, json_bytes) {
+            let len = match compiled.command.encoded_len(row, json_bytes) {
                 Ok(len) => len,
                 Err(_) => {
                     self.diag
@@ -1015,9 +1102,13 @@ impl RedisSink {
                     ack.failed.store(true, Ordering::Relaxed);
                     break;
                 };
-                let outcome = pipeline.push(len, self.config.pipeline_bytes, &ack, |out| {
-                    compiled.write(row, json_bytes, out)
-                });
+                let outcome = pipeline.push(
+                    len,
+                    self.config.pipeline_bytes,
+                    self.config.pipeline_rows,
+                    &ack,
+                    |out| compiled.command.write(row, json_bytes, out),
+                );
                 match outcome {
                     Ok(()) => {
                         if pipeline.cmds.len() >= self.config.pipeline_rows {
@@ -1083,6 +1174,14 @@ impl RedisSink {
         }
     }
 
+    fn observe_stop(&self, state: &mut State, cancel: &CancellationToken) {
+        if cancel.is_cancelled() {
+            state
+                .deadline
+                .get_or_insert_with(|| Instant::now() + self.config.flush_timeout);
+        }
+    }
+
     fn fatal(
         &self,
         state: &mut State,
@@ -1112,6 +1211,10 @@ impl RedisSink {
         let idempotent = self.config.command.idempotent();
         let mut attempt = 0u32;
         loop {
+            self.observe_stop(state, cancel);
+            if state.deadline.is_some_and(|at| Instant::now() >= at) {
+                return Sent::Deadline;
+            }
             // A connection idle since the last pipeline may have been closed
             // by the server; probe it so that is found before anything is
             // written (nothing sent, any command may then be retried).
@@ -1273,14 +1376,22 @@ impl RedisSink {
     ) -> Option<F::Output> {
         tokio::pin!(fut);
         loop {
+            if cancel.is_cancelled() {
+                deadline.get_or_insert_with(|| Instant::now() + self.config.flush_timeout);
+            }
             match *deadline {
-                Some(at) => return tokio::time::timeout_at(at, fut.as_mut()).await.ok(),
+                Some(at) => {
+                    if Instant::now() >= at {
+                        return None;
+                    }
+                    return tokio::time::timeout_at(at, fut.as_mut()).await.ok();
+                }
                 None => tokio::select! {
                     biased;
-                    out = fut.as_mut() => return Some(out),
                     _ = cancel.cancelled() => {
                         *deadline = Some(Instant::now() + self.config.flush_timeout);
                     }
+                    out = fut.as_mut() => return Some(out),
                 },
             }
         }
@@ -1334,15 +1445,20 @@ async fn exchange(
             (Frame::Simple(r), RedisCommand::Set { .. }) if reader.bytes(r.clone()) == b"OK" => {
                 true
             }
-            (Frame::Integer(_), RedisCommand::Hset { .. } | RedisCommand::Push { .. }) => true,
-            (Frame::Integer(n), RedisCommand::Publish { .. }) => {
+            (Frame::Integer(n), RedisCommand::Hset { .. }) if *n >= 0 => true,
+            (Frame::Integer(n), RedisCommand::Push { .. }) if *n > 0 => true,
+            (Frame::Integer(n), RedisCommand::Publish { .. }) if *n >= 0 => {
                 if *n == 0 {
                     diag.redis_sink_publish_no_receivers
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 true
             }
-            (Frame::Bulk(Some(_)), RedisCommand::Xadd { .. }) => true,
+            (Frame::Bulk(Some(r)), RedisCommand::Xadd { .. })
+                if valid_stream_id(reader.bytes(r.clone())) =>
+            {
+                true
+            }
             _ => return Exchange::Broken("redis_unexpected_reply"),
         };
         if ok {
@@ -1352,3 +1468,19 @@ async fn exchange(
     }
     Exchange::Done
 }
+
+fn valid_stream_id(bytes: &[u8]) -> bool {
+    let mut parts = bytes.split(|&b| b == b'-');
+    let valid = |part: Option<&[u8]>| {
+        part.is_some_and(|p| {
+            !p.is_empty()
+                && p.iter().all(u8::is_ascii_digit)
+                && std::str::from_utf8(p).is_ok_and(|s| s.parse::<u64>().is_ok())
+        })
+    };
+    valid(parts.next()) && valid(parts.next()) && parts.next().is_none() && bytes != b"0-0"
+}
+
+#[cfg(test)]
+#[path = "sink_contract_tests.rs"]
+mod contract_tests;

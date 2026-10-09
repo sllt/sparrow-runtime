@@ -41,7 +41,7 @@ pub const REDIS_LOOKUP_MAX_VALUE_BYTES: usize = 64 * 1024;
 pub const REDIS_LOOKUP_MAX_ROW_BYTES: usize = 64 * 1024;
 /// Application scratch per key: request, the exchange's read buffer (64 KiB
 /// + line), one JSON parse (flat object, <= 64 members) and the row.
-pub const REDIS_LOOKUP_SCRATCH_BYTES: usize = 256 * 1024;
+pub const REDIS_LOOKUP_SCRATCH_BYTES: usize = 384 * 1024;
 pub const REDIS_LOOKUP_MAX_BATCH: usize = 64;
 const MAX_JSON_MEMBERS: usize = 64;
 
@@ -438,21 +438,33 @@ impl RedisLookup {
                 }
                 (RedisLookupFormat::Hash, Frame::Array(Some(n))) if n == self.value_index.len() => {
                     let mut values: Vec<Option<Scalar>> = Vec::with_capacity(n);
+                    let mut reply_bytes = 0usize;
                     for &i in &self.value_index {
                         let field = &self.schema.fields[i];
                         match reader.next(&mut conn.io).await.map_err(lost)? {
                             Frame::Bulk(None) => values.push(None),
-                            Frame::Bulk(Some(r)) => values.push(Some(
-                                parse_text(reader.bytes(r), &field.data_type).ok_or_else(|| {
-                                    Trip::Failed(err(
-                                        ErrorCode::CodecViolation,
-                                        format!(
-                                            "Redis hash field `{}` is not a valid {:?}",
-                                            field.name, field.data_type
-                                        ),
-                                    ))
-                                })?,
-                            )),
+                            Frame::Bulk(Some(r)) => {
+                                reply_bytes = reply_bytes.saturating_add(r.len());
+                                if reply_bytes > REDIS_LOOKUP_MAX_VALUE_BYTES {
+                                    return Err(Trip::Failed(err(
+                                        ErrorCode::BoundExceeded,
+                                        "Redis hash lookup total field payload exceeds 64 KiB",
+                                    )));
+                                }
+                                values.push(Some(
+                                    parse_text(reader.bytes(r), &field.data_type).ok_or_else(
+                                        || {
+                                            Trip::Failed(err(
+                                                ErrorCode::CodecViolation,
+                                                format!(
+                                                    "Redis hash field `{}` is not a valid {:?}",
+                                                    field.name, field.data_type
+                                                ),
+                                            ))
+                                        },
+                                    )?,
+                                ));
+                            }
                             _ => {
                                 return Err(Trip::Failed(err(
                                     ErrorCode::CodecViolation,
@@ -620,5 +632,10 @@ pub fn decode_json(schema: &Schema, body: &[u8]) -> Result<Row> {
             max_depth: 1,
         },
     )
-    .map_err(|e| err(e.code, format!("Redis JSON value: {}", e.message)))
+    .map_err(|_| {
+        err(
+            ErrorCode::CodecViolation,
+            "Redis JSON value cannot be decoded to the lookup schema",
+        )
+    })
 }

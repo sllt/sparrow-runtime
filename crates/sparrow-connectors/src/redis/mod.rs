@@ -19,8 +19,7 @@ pub use sink::{HashFields, RedisCommand, RedisSink, RedisSinkConfig, RedisValue}
 pub use template::Template;
 
 #[cfg(test)]
-#[path = "../mqtt/tls_fixture.rs"]
-mod tls_fixture;
+use crate::http::observation_tls_fixture as tls_fixture;
 
 #[cfg(test)]
 mod tests;

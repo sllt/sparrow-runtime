@@ -1107,6 +1107,78 @@ fn bind_lookup(config: RedisLookupConfig) -> RedisLookup {
 }
 
 #[tokio::test]
+async fn hash_lookup_bounds_the_sum_of_fields_before_decoding_them() {
+    for (width, accepted) in [(16 * 1024, true), (40 * 1024, false)] {
+        let value = "x".repeat(width);
+        let reply = hash3(&value, Some(&value), Some(&value));
+        let mock = Mock::start(false, move |_, _| reply.clone()).await;
+        let mut cfg = lookup_config(
+            format!("redis://127.0.0.1:{}", mock.port),
+            RedisLookupFormat::Hash,
+        );
+        for field in &mut cfg.schema.fields[2..] {
+            field.data_type = DataType::Utf8;
+        }
+        let lookup = bind_lookup(cfg);
+        let result = lookup.lookup(key("a", 1), CancellationToken::new()).await;
+        if accepted {
+            assert!(
+                result.unwrap().unwrap().resident_bytes() <= lookup::REDIS_LOOKUP_MAX_ROW_BYTES
+            );
+        } else {
+            assert_eq!(result.unwrap_err().code, ErrorCode::BoundExceeded);
+        }
+    }
+}
+
+#[tokio::test]
+async fn relative_ttl_set_is_not_replayed_after_an_unknown_outcome() {
+    let mock = Mock::start(false, |_, _| Act::Close).await;
+    let mut command = set_cmd();
+    if let RedisCommand::Set { ttl, .. } = &mut command {
+        *ttl = Some(Duration::from_secs(1));
+    }
+    assert!(!command.idempotent());
+    assert!(set_cmd().idempotent());
+    let h = Harness::start(config(mock.port, command), owner());
+    h.send(vec![row("ttl", 1, 1.0)]).await;
+    let (outbox, diag) = h.finish().await;
+    assert_eq!(outbox.failed(), 1);
+    assert_eq!(diag.redis_sink_unknown_outcome, 1);
+    assert_eq!(diag.redis_sink_retries, 0);
+    assert_eq!(mock.names().len(), 1, "resending PX would restart the TTL");
+}
+
+#[tokio::test]
+async fn idle_probe_rejects_partial_unsolicited_replies() {
+    let (io, mut peer) = tokio::io::duplex(64);
+    peer.write_all(b"+O").await.unwrap();
+    let mut conn = conn::Connection { io: Box::pin(io) };
+    let mut reader = resp::Reader::new(64, 1);
+    assert!(!conn.probe_alive(&mut reader).await);
+    assert!(reader.has_buffered());
+}
+
+#[tokio::test]
+async fn resp_line_limit_is_inclusive_and_size_math_saturates() {
+    for size in [resp::MAX_LINE, resp::MAX_LINE + 1] {
+        let wire = format!("+{}\r\n", "x".repeat(size));
+        let mut input = wire.as_bytes();
+        let mut reader = resp::Reader::new(1, 1);
+        let result = reader.next(&mut input).await;
+        if size == resp::MAX_LINE {
+            let resp::Frame::Simple(range) = result.unwrap() else {
+                panic!("simple reply")
+            };
+            assert_eq!(reader.bytes(range).len(), size);
+        } else {
+            assert!(matches!(result, Err(resp::ReadError::Protocol(_))));
+        }
+    }
+    assert_eq!(resp::bulk_len(usize::MAX), usize::MAX);
+}
+
+#[tokio::test]
 async fn hash_lookup_pipelines_batches_and_types_values() {
     let mut store = HashMap::new();
     store.insert("lim:a:1", hash3("2.5", Some("pump"), Some("1")));

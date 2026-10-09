@@ -559,7 +559,9 @@ fn validate_sink_format(sink: &SinkSpec, schema: &Schema) -> Result<()> {
 /// `msg_id_column` must be a utf8/integer column of the sink's input.
 fn validate_sink_schema(sink: &SinkSpec, schema: &Schema) -> Result<()> {
     if sink.redis.is_some() {
-        redis_sink_config(sink)?.command.compile(schema)?;
+        let config = redis_sink_config(sink)?;
+        config.check_schema_budget(schema, sparrow_model::ResourceBudget::compact().reservation_bytes)?;
+        config.command.compile(schema)?;
     }
     if sink.influxdb.is_some() {
         let config = influxdb_sink_config(sink)?;
