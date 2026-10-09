@@ -1022,7 +1022,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
     }
     if s.sink_kind == "websocket" {
         value["websocket_sink"] = json!({"sent":io.websocket_sink_sent,"dropped_bad":io.websocket_sink_dropped_bad,"dropped_oversize":io.websocket_sink_dropped_oversize,
-            "dropped_overflow":io.websocket_sink_dropped_overflow,"backpressure_waits":io.websocket_sink_backpressure_waits,"send_failed":io.websocket_sink_send_failed,
+            "dropped_overflow":io.websocket_sink_dropped_overflow,"dropped_budget":io.websocket_sink_dropped_budget,"backpressure_waits":io.websocket_sink_backpressure_waits,"send_failed":io.websocket_sink_send_failed,
             "send_timeouts":io.websocket_sink_send_timeouts,"discarded_on_close":io.websocket_sink_discarded_on_close,"connects":io.websocket_sink_connects,
             "reconnects":io.websocket_sink_reconnects,"disconnects":io.websocket_sink_disconnects,"connect_failures":io.websocket_sink_connect_failures,
             "heartbeat_timeouts":io.websocket_sink_heartbeat_timeouts,"pings_sent":io.websocket_sink_pings_sent,"ignored_frames":io.websocket_sink_ignored_frames,
@@ -1379,6 +1379,10 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         (
             "websocket_sink_dropped_overflow",
             io.websocket_sink_dropped_overflow,
+        ),
+        (
+            "websocket_sink_dropped_budget",
+            io.websocket_sink_dropped_budget,
         ),
         (
             "websocket_sink_backpressure_waits",

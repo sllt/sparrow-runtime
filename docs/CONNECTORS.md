@@ -268,8 +268,8 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | 合同项 | WebSocket 的实现 |
 |---|---|
 | 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`，at-most-once、无应用层确认；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
-| 内存 | 每连接 128 KiB + 2 × `max_message_bytes`（1 KiB..1 MiB，默认 64 KiB），Sink 加 `queue_capacity × max_message_bytes`；在 bind 时记入 job reservation（单个 ≤ 1/2，与 NATS/JetStream/DataBus 合计 ≤ 3/4）；Source inbox 按 `inbox_bytes` 计入 queue 账本 |
-| 大小上限 | 帧/消息上限在帧头处拒绝，不先缓冲；超大消息计 `dropped_oversize` 并重连；单条记录另受 64 KiB 解码上限 |
+| 内存 | 每连接读方向 128 KiB + 2 × `max_message_bytes`（1 KiB..1 MiB，默认 64 KiB），Sink 加发送中消息与写缓冲帧 2 × `max_message_bytes` 和 `queue_capacity × max_message_bytes`；在 bind 时记入 job reservation（单个 ≤ 1/2，与 NATS/JetStream/DataBus 合计 ≤ 3/4，饱和算术）；Source inbox 按 `inbox_bytes` 计入 queue 账本；Source 解码与 Sink 编码前先预扣临时额度（不足计 `dropped_budget`，不解析 / 不编码） |
+| 大小上限 | 单帧超限在帧头处拒绝，不预留载荷；分片消息按累计长度在追加下一分片前拒绝；超大消息计 `dropped_oversize` 并重连；单条记录另按长度受格式解码上限（JSON 64 KiB / CSV `max_record_bytes`）；Sink 编码输出有上限 |
 | 背压 | Source inbox 满时停止读 socket（TCP 背压）；Sink 有界发送队列，`block` / `drop_newest`，`send_timeout_ms` 超时断开重连 |
 | 心跳 / 重连 | Ping 每 `ping_interval_ms`，`idle_timeout_ms` 无帧即重连；指数退避（100 ms → `reconnect_max_ms`，抖动取 [d/2, d]），每次断线 ≤ `reconnect_attempts`（拒绝 0）；耗尽后 Source 可重试失败，Sink fail closed（`websocket_sink_fatal`） |
 | 认证 / TLS | bearer / basic / 自定义头，仅 secret 引用且需 `wss://`；保留头和重复头拒绝；rustls 强制校验，`tls_ca_pem` 替换信任根；错误中不出现 URL、头值、凭据 |

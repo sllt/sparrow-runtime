@@ -204,12 +204,15 @@ fn websocket_spec_matrix_rejects_mixed_fields_and_durable_claims() {
         "sink queue x message must fit half the compact reservation"
     );
     // Each endpoint fits half the reservation, but the pair must fit 3/4.
+    // Source: 128 KiB + 2 x 640 KiB = 1.375 MiB. Sink: 128 KiB + (4 + q) x
+    // 256 KiB = 1.375 / 1.875 MiB for q = 1 / 3 (each <= 2 MiB, sum 2.75 /
+    // 3.25 MiB against 3 MiB).
     let mut v = base.clone();
-    v["source"]["websocket"]["max_message_bytes"] = json!(512 * 1024);
-    v["sink"]["websocket"]["max_message_bytes"] = json!(512 * 1024);
+    v["source"]["websocket"]["max_message_bytes"] = json!(640 * 1024);
+    v["sink"]["websocket"]["max_message_bytes"] = json!(256 * 1024);
     v["sink"]["websocket"]["queue_capacity"] = json!(1);
     code(&v).unwrap();
-    v["sink"]["websocket"]["queue_capacity"] = json!(2);
+    v["sink"]["websocket"]["queue_capacity"] = json!(3);
     assert_eq!(code(&v), Err(BoundExceeded), "sum of WebSocket buffers");
 
     // Frames x formats.

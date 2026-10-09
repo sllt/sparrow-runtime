@@ -111,19 +111,25 @@ Sink 专有：`frame`（`text` 默认 / `binary`）、`queue_capacity`（默认 
 
 ## 大小上限
 
-`max_message_bytes` 同时设置 tungstenite 的 `max_frame_size` 与 `max_message_size`：
-超大的帧在读到帧头时即被拒绝，不会先缓冲再判断。Source 遇到超大消息计
-`websocket_source_dropped_oversize`，并且由于协议层已无法继续该连接，断开后重连。
-解码前每条记录还受 64 KiB 解码上限约束，超过的记录同样计入 `dropped_oversize`
-（连接保留）。Sink 编码后超过 `max_message_bytes` 的行计 `websocket_sink_dropped_oversize`
-并丢弃。
+`max_message_bytes` 同时设置 tungstenite 的 `max_frame_size` 与 `max_message_size`
+（已对照锁定的 tungstenite 0.30 源码 `FrameCodec::read_frame` / `IncompleteMessage::extend`）：
+
+- 单帧超限：读到帧头即拒绝，不为载荷预留缓冲。
+- 分片消息超限：每追加一个分片前按累计长度检查，超限即拒绝；被拒的那个分片本身
+  （≤ `max_message_bytes`）已经读入。
+
+Source 遇到超大消息计 `websocket_source_dropped_oversize`，并且由于协议层已无法继续该连接，
+断开后重连。解码前每条记录还按长度受格式的解码上限约束（JSON 64 KiB、CSV
+`max_record_bytes`），超过的记录不解码、同样计入 `dropped_oversize`（连接保留）。
+Sink 编码时输出有上限：超过 `max_message_bytes` 的行在增长越界前停止编码，计
+`websocket_sink_dropped_oversize` 并丢弃。
 
 ## 帧与格式
 
 | 方向 | 帧 | `json` | `csv` |
 |---|---|---|---|
 | Source | 文本帧，`framing: message` | 一条消息 = 一个 JSON 对象 | 一条消息 = （表头 +）一条记录，同 MQTT |
-| Source | 文本帧，`framing: ndjson` | 一条消息 = 多行 NDJSON，空行跳过 | **拒绝** |
+| Source | 文本帧，`framing: ndjson` | 一条消息 = 多行 NDJSON，空行跳过（只由 JSON 空白：空格、`\t`、`\r`、`\n` 组成的行；含 `\f` / `\v` 的行按记录解码） | **拒绝** |
 | Source | 二进制帧 | `binary_frames: drop`（默认）计 `dropped_binary`；`decode` 时按 JSON 解码 | **拒绝** `decode`；只能 `drop` |
 | Sink | `frame: text`（默认） | 每行一个 JSON 文本帧 | 每行一条（表头 +）记录，文本帧 |
 | Sink | `frame: binary` | 每行一个 JSON 二进制帧 | **拒绝** |
@@ -139,6 +145,10 @@ Sink 中 `frame: text` 但编码结果不是合法 UTF-8 的行计 `dropped_bad`
 等待期间不读 socket，压力通过 TCP 窗口传回服务器；单行大于整个预算时计
 `dropped_budget`。inbox 占用见 `websocket_source_inbox_items` / `inbox_bytes`。
 
+解码前，先按长度拒绝，再把该格式的解码工作集估算（`decode_scratch`，JSON 与 CSV
+各自的估算）记入 job reservation，持有到该行入队或丢弃；额度不足时该记录不解析，
+计 `dropped_budget`（有测试：额度不足的畸形记录不计 `dropped_bad`）。
+
 ## Sink：发送队列、溢出、停止
 
 - 结构：pump（从 outbox 取批次、编码、放入有界队列）与 writer（持有连接、
@@ -150,15 +160,23 @@ Sink 中 `frame: text` 但编码结果不是合法 UTF-8 的行计 `dropped_bad`
 - 单条发送超过 `send_timeout_ms`（对端不读、TCP 窗口塞满）计 `send_timeouts`，
   断开并重连；该消息丢失。发送错误计 `send_failed`。
 - 服务器发给 Sink 的数据帧计 `ignored_frames` 并丢弃。
+- 编码前先把编码临时额度记入 job reservation，输出每次扩容也先记账，并且有
+  `max_message_bytes` 上限；额度不足的行不编码，计 `dropped_budget`，所在批次不回执。
+  该额度持有到消息进入（已预扣的）发送队列为止。
 - 停止：在 `flush_timeout_ms` 内把 outbox 和队列中剩余的行发完，然后发 Close 帧
   （计 `closes`，失败计 `close_failed`）；超时后剩余的计 `discarded_on_close`。
   停止发生在某次被阻塞的发送中时，该次发送也只等到 flush 截止时间。
 
 ## 内存
 
-- 每个连接：128 KiB 固定开销 + 2 × `max_message_bytes`（读缓冲与一条在组装的消息），
-  必须 ≤ job reservation 的一半。
-- Sink 另加 `queue_capacity × max_message_bytes`。默认（16 × 64 KiB）+ 连接 ≈ 1.25 MiB。
+- 每个连接的读方向：128 KiB 固定开销 + 2 × `max_message_bytes`（读缓冲中的一帧载荷与
+  一条在组装的分片消息；依据 tungstenite 0.30 的读路径）。Source 只发 Ping，按此记账。
+- Sink 另加 2 × `max_message_bytes`（正在发送的消息，以及 tungstenite 把它复制进写缓冲
+  后的帧）和 `queue_capacity × max_message_bytes`。默认 128 KiB + (2 + 2 + 16) × 64 KiB
+  ≈ 1.4 MiB。单个端点必须 ≤ job reservation 的一半。
+- 已编码但尚未进入队列的行由它的编码额度单独记账（见上）。
+- 这些是账本估算，不是 RSS 上限（TLS、内核 socket 缓冲等不在内）。所有算术饱和，
+  超大配置值在校验时以 `BoundExceeded` 拒绝（有测试）。
 - 在 `bind` 时记入 job reservation；pipeline 中所有 WebSocket / NATS / JetStream /
   DataBus 端点合计 ≤ reservation 的 3/4，超出在校验时返回 `BoundExceeded`。
 - Source 的 inbox 按 `inbox_bytes` 计入 queue 账本。
@@ -176,7 +194,7 @@ capability `websocket` / `websocket_sink`：delivery `live_best_effort`、recove
 pipeline status 中的 `websocket_source` / `websocket_sink` 对象，`/metrics` 的 io 字段：
 
 - Source：`websocket_source_{received,rows,dropped_bad,dropped_oversize,dropped_binary,dropped_budget,backpressure_waits,connects,reconnects,disconnects,connect_failures,heartbeat_timeouts,pings_sent,inbox_items,inbox_bytes}`
-- Sink：`websocket_sink_{sent,dropped_bad,dropped_oversize,dropped_overflow,backpressure_waits,send_failed,send_timeouts,discarded_on_close,connects,reconnects,disconnects,connect_failures,heartbeat_timeouts,pings_sent,ignored_frames,closes,close_failed,fatal,queue_items}`
+- Sink：`websocket_sink_{sent,dropped_bad,dropped_oversize,dropped_overflow,dropped_budget,backpressure_waits,send_failed,send_timeouts,discarded_on_close,connects,reconnects,disconnects,connect_failures,heartbeat_timeouts,pings_sent,ignored_frames,closes,close_failed,fatal,queue_items}`
 
 健康状态：断线时为 `Reconnecting`（原因如 `websocket_heartbeat_timeout`），
 重连耗尽或 `fail_on_decode` 时为 `Failed`。

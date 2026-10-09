@@ -39,7 +39,7 @@ const DELIVERY_OVERHEAD: usize = 512;
 
 #[cfg(test)]
 #[path = "mqtt/tls_fixture.rs"]
-mod observation_tls_fixture;
+pub(crate) mod observation_tls_fixture;
 
 #[derive(Clone, Debug)]
 pub struct HttpSinkConfig {

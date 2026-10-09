@@ -97,8 +97,11 @@ pub struct WebSocketClientConfig {
     pub reconnect_max: Duration,
     /// Consecutive failed connects per outage before the connector gives up.
     pub reconnect_attempts: usize,
-    /// Largest WebSocket message (and frame) accepted or sent; enforced by
-    /// the protocol layer before the payload is buffered or decoded.
+    /// Largest WebSocket message (and frame) accepted or sent. The protocol
+    /// layer (tungstenite 0.30 `FrameCodec::read_frame`) refuses a frame from
+    /// its header before reserving its payload; a fragmented message is
+    /// refused by its running size before the next fragment is appended (that
+    /// fragment, itself <= this bound, has been read).
     pub max_message_bytes: usize,
 }
 
@@ -208,8 +211,10 @@ impl WebSocketClientConfig {
         Ok(Target { host, port, tls })
     }
 
-    /// Per-connection ledger charge: fixed state, one assembling message,
-    /// one outgoing message.
+    /// Per-connection read-side ledger charge: fixed state plus, from the
+    /// pinned tungstenite 0.30 read path, one frame payload in the read buffer
+    /// and one assembling fragmented message (each <= `max_message_bytes`).
+    /// Outgoing data frames are charged by the Sink on top of this.
     pub fn connection_reservation(&self) -> usize {
         CONNECTION_FIXED_RESERVATION.saturating_add(self.max_message_bytes.saturating_mul(2))
     }
@@ -218,7 +223,7 @@ impl WebSocketClientConfig {
         WebSocketConfig::default()
             .read_buffer_size(READ_BUFFER_BYTES)
             .write_buffer_size(0)
-            .max_write_buffer_size(self.max_message_bytes + READ_BUFFER_BYTES)
+            .max_write_buffer_size(self.max_message_bytes.saturating_add(READ_BUFFER_BYTES))
             .max_message_size(Some(self.max_message_bytes))
             .max_frame_size(Some(self.max_message_bytes))
     }

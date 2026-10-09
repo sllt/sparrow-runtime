@@ -4,11 +4,15 @@
 //!   header) or, with `framing = ndjson`, newline-delimited JSON objects.
 //!   Binary messages are dropped and counted unless `binary_frames = decode`
 //!   (JSON only; CSV is text and refuses binary decoding).
-//! - The protocol layer rejects a frame/message above `max_message_bytes`
-//!   from its header, before buffering or decoding the payload; the
-//!   connection is then closed (counted `dropped_oversize`) and reconnected.
-//!   Records above the 64 KiB decode limit inside an accepted NDJSON message
-//!   are dropped and counted the same way.
+//! - The protocol layer rejects a frame above `max_message_bytes` from its
+//!   header, before reserving its payload, and a fragmented message once its
+//!   running size would pass the bound; the connection is then closed
+//!   (counted `dropped_oversize`) and reconnected. A record above the format's
+//!   decode limit (64 KiB JSON / `max_record_bytes` CSV) is dropped by length
+//!   and counted the same way, without decoding.
+//! - Each record's format-specific decode working set is charged to the job
+//!   reservation before decoding and held until the row is admitted;
+//!   without credit the record is counted `dropped_budget` and not parsed.
 //! - Rows enter the byte-accounted Kernel ingress one at a time; while the
 //!   bounded inbox is full the Source stops reading the socket (TCP
 //!   backpressure on the server). Time blocked on our own ingress does not
@@ -454,7 +458,11 @@ impl WebSocketSource {
             WebSocketFraming::Ndjson => {
                 for line in payload.split(|&b| b == b'\n') {
                     let line = line.strip_suffix(b"\r").unwrap_or(line);
-                    if line.iter().all(u8::is_ascii_whitespace) {
+                    // JSON whitespace only (RFC 8259: space, tab, LF, CR).
+                    if line
+                        .iter()
+                        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                    {
                         continue;
                     }
                     if !self
@@ -476,12 +484,22 @@ impl WebSocketSource {
         cancel: &CancellationToken,
         received_at: std::time::Instant,
     ) -> Result<bool> {
-        if record.len() > self.config.json_limits.max_bytes {
+        let format = &self.config.payload_format;
+        if record.len() > format.max_message_bytes(&self.config.json_limits) {
             self.diag
                 .websocket_source_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
+        // Format-specific parser + Row working set, charged before decoding
+        // and held until the row is admitted (or dropped).
+        let estimate = format.decode_scratch(&self.config.schema, record.len());
+        let Ok(_scratch) = ingress.owner.acquire(CreditKind::Reservation, estimate) else {
+            self.diag
+                .websocket_source_dropped_budget
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
+        };
         let started = std::time::Instant::now();
         let decoded = self.config.payload_format.decode_row(
             &self.config.schema,

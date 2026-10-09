@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 use super::client::{error, reconnect_delay, BoundClient, WebSocketClientConfig, WsStream};
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
+use crate::scratch::{encode_row_charged, EncodeRejected};
 use crate::{SecretResolver, TargetPolicy};
 
 const MAX_OUTBOX: usize = 4096;
@@ -122,19 +123,23 @@ impl WebSocketSinkConfig {
         self.client.validate(policy)
     }
 
-    /// Connection buffers plus a full send queue of maximal messages.
+    /// Connection read side, the message being sent plus its formatted frame
+    /// in the write buffer (tungstenite copies the payload into
+    /// `out_buffer`), and a full send queue of maximal messages. A row
+    /// encoded but not yet queued is charged separately by its encode lease.
     pub fn reservation(&self) -> usize {
-        self.client.connection_reservation().saturating_add(
-            self.queue_capacity
-                .saturating_mul(self.client.max_message_bytes),
-        )
+        let max = self.client.max_message_bytes;
+        self.client
+            .connection_reservation()
+            .saturating_add(max.saturating_mul(2))
+            .saturating_add(self.queue_capacity.saturating_mul(max))
     }
 
     pub fn check_reservation_budget(&self, reservation_budget: usize) -> Result<()> {
         if self.reservation() > reservation_budget / 2 {
             return Err(error(
                 ErrorCode::BoundExceeded,
-                "WebSocket sink buffers (queue_capacity x max_message_bytes + connection) exceed half the job reservation budget; lower queue_capacity or max_message_bytes",
+                "WebSocket sink buffers ((queue_capacity + 4) x max_message_bytes + 128 KiB) exceed half the job reservation budget; lower queue_capacity or max_message_bytes",
             ));
         }
         Ok(())
@@ -145,6 +150,7 @@ pub struct WebSocketSink {
     pub config: WebSocketSinkConfig,
     pub diag: Arc<IoDiagnostics>,
     client: BoundClient,
+    owner: Arc<MemoryOwner>,
     _lease: MemoryLease,
 }
 
@@ -209,6 +215,7 @@ impl WebSocketSink {
             config,
             diag,
             client,
+            owner,
             _lease: lease,
         })
     }
@@ -292,22 +299,38 @@ impl WebSocketSink {
         let mut all = true;
         for (i, row) in batch.rows().iter().enumerate() {
             let started = std::time::Instant::now();
-            let encoded = self.config.payload_format.encode_row(schema, row);
+            // Scratch and every output growth are charged first; output is
+            // capped at max_message_bytes. The lease covers the bytes until
+            // they sit in the (pre-charged) send queue.
+            let encoded = encode_row_charged(
+                &self.owner,
+                &self.config.payload_format,
+                schema,
+                row,
+                self.config.client.max_message_bytes,
+            );
             self.diag
                 .observation
                 .record(Latency::Encode, started.elapsed());
-            let message = match encoded {
-                Ok(body) if body.len() > self.config.client.max_message_bytes => {
+            let (message, _encode_lease) = match encoded {
+                Err(EncodeRejected::Oversize) => {
                     all = false;
                     self.diag
                         .websocket_sink_dropped_oversize
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                Ok(body) => match self.config.frame {
-                    SinkFrame::Binary => Message::Binary(body.into()),
+                Err(EncodeRejected::Budget) => {
+                    all = false;
+                    self.diag
+                        .websocket_sink_dropped_budget
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Ok((body, lease)) => match self.config.frame {
+                    SinkFrame::Binary => (Message::Binary(body.into()), lease),
                     SinkFrame::Text => match String::from_utf8(body) {
-                        Ok(text) => Message::Text(text.into()),
+                        Ok(text) => (Message::Text(text.into()), lease),
                         Err(_) => {
                             all = false;
                             self.diag
@@ -317,7 +340,7 @@ impl WebSocketSink {
                         }
                     },
                 },
-                Err(_) => {
+                Err(EncodeRejected::Bad) => {
                     all = false;
                     self.diag.csv_encode_error(&self.config.payload_format);
                     self.diag
