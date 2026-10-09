@@ -286,7 +286,7 @@ exactly-once 认证。仍为 Preview，当前候选需独立专项验证，10k/2
 | 合同项 | TCP 的实现 |
 |---|---|
 | 语义 | Source / Sink 都是 `live_best_effort` / `restart_fresh` / replay `unsupported`，at-most-once、无应用层确认；拒绝 restore、checkpoint、aligned（Sink 单独出现也拒绝） |
-| 分帧 | `lines`（`\n`，接受 `\r\n`，空行及只含空格 / `\t` / `\r` 的行跳过）或 `length_prefixed`（大端 2/4 字节长度）；Sink 自己添加换行 / 前缀 |
+| 分帧 | `lines`（`\n`，接受 `\r\n`，空行跳过；JSON 额外跳过纯空白行，CSV 保留空白字段）或 `length_prefixed`（大端 2/4 字节长度）；Sink 自己添加换行 / 前缀 |
 | 内存 | 每连接 64 KiB + 固定读缓冲（`max_frame_bytes` + 16 KiB）+ 一帧，Sink 加 `(queue_capacity + 1) × 帧`（CSV over lines 再加表头槽位），饱和运算；解码 / 编码工作集在解析 / 编码前按条记账，额度不足计 `dropped_budget`；在 bind 时记入 job reservation（单个 ≤ 1/2，与 NATS/JetStream/DataBus/WebSocket 合计 ≤ 3/4）；Source inbox 按 `inbox_bytes` 计入 queue 账本 |
 | 大小上限 | `max_frame_bytes`（16..=65536；`length_bytes: 2` 时默认 65535，显式更大值拒绝而非截断）在解码前检查；Sink 编码在上限处截停；长度前缀在分配前拒绝；超长按 `oversize: resync`（跳过）或 `disconnect`（重连）处理，计 `dropped_oversize`；断线时的残缺记录计 `dropped_partial`，不解码 |
 | 背压 | Source inbox 满时停止读 socket（TCP 背压）；Sink 有界发送队列，`block` / `drop_newest`；一帧写入（含部分写）超过 `send_timeout_ms` 即断开重连 |
