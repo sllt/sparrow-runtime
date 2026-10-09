@@ -16,6 +16,9 @@ pub mod http;
 pub mod http_lookup;
 pub mod http_poll;
 pub mod http_push;
+#[cfg(feature = "kafka")]
+pub mod kafka;
+pub mod kafka_diag;
 #[cfg(feature = "jetstream")]
 pub mod jetstream;
 pub mod log;
@@ -45,6 +48,9 @@ pub use http_poll::{
     HttpPollAuth, HttpPollFormat, HttpPollHeader, HttpPollSource, HttpPollSourceConfig,
 };
 pub use http_push::{HttpPushSource, HttpPushSourceConfig};
+#[cfg(feature = "kafka")]
+pub use kafka::{KafkaClientConfig, KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
+pub use kafka_diag::{KafkaCounters, KafkaSnapshot};
 pub use log::{LogSink, LogSinkConfig};
 #[cfg(feature = "demo-io")]
 pub use mqtt::{publish_qos0, publish_qos0_many, EmbeddedBroker, MqttPublisher};

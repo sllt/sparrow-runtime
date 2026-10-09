@@ -105,3 +105,5 @@ mod nats_tests;
 mod reference_completion_tests;
 #[cfg(test)]
 mod websocket_tests;
+#[cfg(test)]
+mod kafka_tests;

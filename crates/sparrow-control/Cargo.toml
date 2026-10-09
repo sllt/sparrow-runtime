@@ -11,6 +11,7 @@ demo-io = ["sparrow-connectors/demo-io"]
 nats = ["sparrow-connectors/nats"]
 jetstream = ["nats", "sparrow-connectors/jetstream"]
 websocket = ["sparrow-connectors/websocket"]
+kafka = ["sparrow-connectors/kafka"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }

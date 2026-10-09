@@ -175,6 +175,7 @@ pub struct IoDiagnostics {
     pub file_segments: AtomicU64,
     pub file_syncs: AtomicU64,
     pub file_failed: AtomicU64,
+    pub kafka: crate::kafka_diag::KafkaCounters,
 }
 
 impl IoDiagnostics {
@@ -450,6 +451,7 @@ impl IoDiagnostics {
             file_segments: self.file_segments.load(Ordering::Relaxed),
             file_syncs: self.file_syncs.load(Ordering::Relaxed),
             file_failed: self.file_failed.load(Ordering::Relaxed),
+            kafka: self.kafka.snapshot(),
         }
     }
 }
@@ -625,6 +627,7 @@ pub struct IoSnapshot {
     pub file_segments: u64,
     pub file_syncs: u64,
     pub file_failed: u64,
+    pub kafka: crate::kafka_diag::KafkaSnapshot,
 }
 
 impl std::fmt::Display for IoSnapshot {
@@ -821,6 +824,7 @@ impl IoSnapshot {
         self.file_segments += other.file_segments;
         self.file_syncs += other.file_syncs;
         self.file_failed += other.file_failed;
+        self.kafka.add_assign(&other.kafka);
     }
 }
 

@@ -294,7 +294,7 @@ pub fn replay_label_for_source(kind: &str) -> &'static str {
         "file" | "file_replay" | "replay" => "replayable",
         "jetstream" if cfg!(feature = "jetstream") => "replayable",
         "mqtt" | "mqtt_source" | "http_push" | "http_poll" | "nats" | "databus" | "websocket"
-        | "http" | "plugin" => "unsupported",
+        | "kafka" | "http" | "plugin" => "unsupported",
         _ => sparrow_plan::REPLAY_UNBOUND,
     }
 }
@@ -435,7 +435,8 @@ fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
         .filter_map(|d| d.subscription().ok())
         .map(|c| c.reservation())
         .fold(0usize, usize::saturating_add)
-        .saturating_add(websocket_reservation(&sources, &sinks));
+        .saturating_add(websocket_reservation(&sources, &sinks))
+        .saturating_add(kafka_reservation(&sources, &sinks));
     #[cfg(not(feature = "nats"))]
     let total = databus;
     #[cfg(feature = "nats")]
@@ -461,7 +462,7 @@ fn check_nats_reservation_total(spec: &PipelineSpec) -> Result<()> {
         return Err(SparrowError::new(
             ErrorCode::BoundExceeded,
             format!(
-                "NATS SDK / DataBus / WebSocket buffers of all endpoints ({total} bytes) exceed 3/4 of the job reservation budget ({budget}); lower subscription_capacity/client_capacity/buffer_bytes/queue_capacity or max_payload_bytes/max_message_bytes"
+                "NATS SDK / DataBus / WebSocket / Kafka buffers of all endpoints ({total} bytes) exceed 3/4 of the job reservation budget ({budget}); lower subscription_capacity/client_capacity/buffer_bytes/queue_capacity/prefetch_bytes/queue_bytes or max_payload_bytes/max_message_bytes"
             ),
         ));
     }
@@ -485,6 +486,29 @@ fn websocket_reservation(sources: &[&SourceSpec], sinks: &[&SinkSpec]) -> usize 
             .fold(0usize, usize::saturating_add)
     }
     #[cfg(not(feature = "websocket"))]
+    {
+        let _ = (sources, sinks);
+        0
+    }
+}
+
+/// librdkafka buffers (prefetch/fetch or producer queue) of all endpoints.
+fn kafka_reservation(sources: &[&SourceSpec], sinks: &[&SinkSpec]) -> usize {
+    #[cfg(feature = "kafka")]
+    {
+        sources
+            .iter()
+            .filter_map(|s| s.kafka.as_ref())
+            .map(|k| k.reservation())
+            .chain(
+                sinks
+                    .iter()
+                    .filter_map(|s| s.kafka.as_ref())
+                    .map(|k| k.connector_config(1).reservation()),
+            )
+            .fold(0usize, usize::saturating_add)
+    }
+    #[cfg(not(feature = "kafka"))]
     {
         let _ = (sources, sinks);
         0
@@ -618,6 +642,15 @@ fn validate_source_io(
             databus_source_config(source, schema.clone(), spec.effective_fail_on_decode())?
                 .validate()?;
         }
+        #[cfg(feature = "kafka")]
+        "kafka" => {
+            refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
+            let kafka = kafka_source_config(source, schema.clone(), spec.effective_fail_on_decode())?;
+            kafka.validate(policy)?;
+            let compact = sparrow_model::ResourceBudget::compact();
+            kafka.check_inbox_budget(compact.queue_bytes)?;
+            kafka.check_reservation_budget(compact.reservation_bytes)?;
+        }
         #[cfg(feature = "websocket")]
         "websocket" => {
             refuse_durable_recovery(&spec.restore_claim()?).map_err(io)?;
@@ -663,7 +696,7 @@ fn validate_source_io(
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
                 format!(
-                    "source kind `{other}` is not supported (mqtt|http_push|http_poll|nats|websocket|databus|file)"
+                    "source kind `{other}` is not supported (mqtt|http_push|http_poll|nats|websocket|kafka|databus|file)"
                 ),
             ));
         }
@@ -738,6 +771,14 @@ fn validate_sink_io(
             )?;
         }
         "databus" => databus_sink_config(sink)?.validate()?,
+        #[cfg(feature = "kafka")]
+        "kafka" => {
+            let kafka = kafka_sink_config(sink)?;
+            kafka.validate(policy)?;
+            kafka.check_reservation_budget(
+                sparrow_model::ResourceBudget::compact().reservation_bytes,
+            )?;
+        }
         #[cfg(feature = "websocket")]
         "websocket" => {
             let ws = websocket_sink_config(sink)?;
@@ -767,7 +808,7 @@ fn validate_sink_io(
         other => {
             return Err(SparrowError::new(
                 ErrorCode::FeatureUnavailable,
-                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|websocket|databus|file)"),
+                format!("sink kind `{other}` is not supported (http|log|mqtt|nats|jetstream|websocket|kafka|databus|file)"),
             ));
         }
     }
@@ -1088,6 +1129,34 @@ pub fn jetstream_sink_config(
                 "JetStream sink requires sink.jetstream",
             )
         })?
+        .connector_config(sink.outbox_capacity);
+    config.payload_format = sink.payload_format()?;
+    Ok(config)
+}
+
+#[cfg(feature = "kafka")]
+pub fn kafka_source_config(
+    source: &SourceSpec,
+    schema: Schema,
+    fail_on_decode: bool,
+) -> Result<sparrow_connectors::KafkaSourceConfig> {
+    let mut config = source
+        .kafka
+        .as_ref()
+        .ok_or_else(|| {
+            SparrowError::new(ErrorCode::InvalidArgument, "Kafka source requires source.kafka")
+        })?
+        .connector_config(schema, source.inbox_capacity, fail_on_decode);
+    config.payload_format = source.payload_format()?;
+    Ok(config)
+}
+
+#[cfg(feature = "kafka")]
+pub fn kafka_sink_config(sink: &SinkSpec) -> Result<sparrow_connectors::KafkaSinkConfig> {
+    let mut config = sink
+        .kafka
+        .as_ref()
+        .ok_or_else(|| SparrowError::new(ErrorCode::InvalidArgument, "Kafka sink requires sink.kafka"))?
         .connector_config(sink.outbox_capacity);
     config.payload_format = sink.payload_format()?;
     Ok(config)
@@ -1866,6 +1935,8 @@ pub fn capabilities_json() -> serde_json::Value {
     let bus_source = ConnectorCapabilities::DATABUS_SOURCE;
     let ws = ConnectorCapabilities::WEBSOCKET_SOURCE;
     let ws_sink = ConnectorCapabilities::WEBSOCKET_SINK;
+    let kafka = ConnectorCapabilities::KAFKA_SOURCE;
+    let kafka_sink = ConnectorCapabilities::KAFKA_SINK;
     let bus_sink = ConnectorCapabilities::DATABUS_SINK;
     let file = ConnectorCapabilities::FILE_REPLAY;
     serde_json::json!({
@@ -1964,6 +2035,33 @@ pub fn capabilities_json() -> serde_json::Value {
                 "default_overflow": "block",
                 "maturity": "preview",
                 "contract": "websocket_client_at_most_once; one_message_per_row; bounded_send_queue; sent_means_written_to_socket; flush_on_stop; fail_closed_after_reconnect_attempts",
+            },
+            {
+                "kind": kafka.kind,
+                "roles": ["source"],
+                "enabled_by_build": cfg!(feature = "kafka"),
+                "replay": kafka.replay.as_str(),
+                "delivery": kafka.delivery.as_str(),
+                "recovery": kafka.recovery.as_str(),
+                "acknowledgement": "group_offset_commit_after_inbox_admission",
+                "auto_offset_reset": ["earliest", "latest", "error"],
+                "poison": ["skip", "fail"],
+                "client": "librdkafka 2.12.1 (rdkafka 0.39.0); plaintext only",
+                "maturity": "preview",
+                "contract": "consumer_group_cooperative_sticky; commit_only_admitted_or_skipped_poison; commit_before_revoke; identity_bound_commits_refuse_mismatch; at_least_once_into_inbox; admitted_rows_lost_on_crash; bounded_prefetch_charged; allowlist_bootstrap_and_advertised",
+            },
+            {
+                "kind": kafka_sink.kind,
+                "roles": ["sink"],
+                "enabled_by_build": cfg!(feature = "kafka"),
+                "replay": kafka_sink.replay.as_str(),
+                "delivery": kafka_sink.delivery.as_str(),
+                "recovery": kafka_sink.recovery.as_str(),
+                "acknowledgement": "delivery_report_per_record_before_batch_ack",
+                "default_acks": "all",
+                "idempotence": "default_on; off_means_no_retries",
+                "maturity": "preview",
+                "contract": "one_record_per_row; bounded_in_flight_and_queue; fail_closed_on_unconfirmed_delivery; stop_deadline_purges; duplicates_possible_on_job_restart",
             },
             {
                 "kind": bus_source.kind,
@@ -2738,6 +2836,7 @@ mod tests {
                 nats: None,
                 databus: None,
                 websocket: None,
+                kafka: None,
                 kind: "mqtt".into(),
                 host: Some("127.0.0.1".into()),
                 port: Some(1883),
@@ -2765,6 +2864,7 @@ mod tests {
                 nats: None,
                 databus: None,
                 websocket: None,
+                kafka: None,
                 jetstream: None,
                 plugin: None,
                 action: None,
@@ -2835,6 +2935,7 @@ mod tests {
             nats: None,
             databus: None,
             websocket: None,
+            kafka: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),
@@ -2886,6 +2987,7 @@ mod tests {
             nats: None,
             databus: None,
             websocket: None,
+            kafka: None,
             kind: "mqtt".into(),
             host: Some("127.0.0.1".into()),
             port: Some(1883),
@@ -2932,6 +3034,7 @@ mod tests {
                 nats: None,
                 databus: None,
                 websocket: None,
+                kafka: None,
                 jetstream: None,
                 plugin: None,
             action: None,

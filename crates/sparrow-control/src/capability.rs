@@ -19,18 +19,26 @@ pub fn inventory() -> Value {
     } else {
         &[]
     };
+    // The Kafka Source/Sink needs the `kafka` feature.
+    let kafka: &[&str] = if cfg!(feature = "kafka") {
+        &["kafka"]
+    } else {
+        &[]
+    };
     // The in-process Local DataBus is always built (no SDK).
     let sinks: Vec<&str> = ["http", "mqtt", "log", "databus"]
         .iter()
         .chain(nats)
         .chain(jetstream_sink)
         .chain(websocket)
+        .chain(kafka)
         .copied()
         .collect();
     let mut combinations: Vec<_> = ["mqtt", "http_push", "http_poll", "file", "databus"]
         .iter()
         .chain(nats)
         .chain(websocket)
+        .chain(kafka)
         .copied()
         .flat_map(|source| {
             sinks.clone().into_iter().map(move |sink| {
@@ -220,14 +228,17 @@ mod tests {
         // 5 live/file sources (mqtt, http_push, http_poll, file, databus) x 4 sinks
         // (http, mqtt, log, databus), plus NATS Core as both a source and a sink
         // when the `nats` feature is built, plus the JetStream Sink (live matrix +
-        // one aligned File profile) with `jetstream`, plus WebSocket as both a
-        // source and a sink with `websocket`.
-        let (nats, jetstream, websocket) = (
+        // one aligned File profile) with `jetstream`, plus WebSocket / Kafka as
+        // both a source and a sink with `websocket` / `kafka`.
+        let (nats, jetstream, websocket, kafka) = (
             usize::from(cfg!(feature = "nats")),
             usize::from(cfg!(feature = "jetstream")),
             usize::from(cfg!(feature = "websocket")),
+            usize::from(cfg!(feature = "kafka")),
         );
-        let expected = (5 + nats + websocket) * (4 + nats + jetstream + websocket) + jetstream;
+        let expected = (5 + nats + websocket + kafka)
+            * (4 + nats + jetstream + websocket + kafka)
+            + jetstream;
         assert_eq!(value["combinations"].as_array().unwrap().len(), expected);
         assert!(value["combinations"]
             .as_array()
@@ -237,6 +248,8 @@ mod tests {
                 || c["sink"] == "nats"
                 || c["source"] == "websocket"
                 || c["sink"] == "websocket"
+                || c["source"] == "kafka"
+                || c["sink"] == "kafka"
                 || c["source"] == "databus"
                 || c["sink"] == "databus"
                 || (c["sink"] == "jetstream" && c["source"] != "file"))

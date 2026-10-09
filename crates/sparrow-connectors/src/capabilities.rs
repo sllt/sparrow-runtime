@@ -116,6 +116,25 @@ impl ConnectorCapabilities {
         recovery: RecoveryPolicy::RestartFresh,
     };
 
+    /// Kafka consumer-group Source. Live at the Sparrow level (no Sparrow
+    /// checkpoint or restore); the resume position is the group's committed
+    /// offset, written only past rows admitted into the job inbox.
+    pub const KAFKA_SOURCE: Self = Self {
+        kind: "kafka",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
+    /// Kafka producer Sink. A batch is acknowledged after every record's
+    /// broker delivery report; no Sparrow checkpoint participation.
+    pub const KAFKA_SINK: Self = Self {
+        kind: "kafka_sink",
+        replay: ReplaySupport::Unsupported,
+        delivery: DeliveryGuarantee::LiveBestEffort,
+        recovery: RecoveryPolicy::RestartFresh,
+    };
+
     pub const MQTT_SINK: Self = Self {
         kind: "mqtt_sink",
         replay: ReplaySupport::Unsupported,

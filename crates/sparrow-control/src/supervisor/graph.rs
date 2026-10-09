@@ -41,6 +41,11 @@ enum Input {
         source: HttpPollSource,
         tx: observed::Sender<sparrow_model::QueuedRow>,
     },
+    #[cfg(feature = "kafka")]
+    Kafka {
+        source: sparrow_connectors::KafkaSource,
+        tx: observed::Sender<sparrow_model::QueuedRow>,
+    },
     #[cfg(feature = "websocket")]
     WebSocket {
         source: sparrow_connectors::WebSocketSource,
@@ -446,6 +451,21 @@ impl Supervisor {
                     binding.budgeted = Some(rx);
                     Input::HttpPoll { source, tx }
                 }
+                #[cfg(feature = "kafka")]
+                "kafka" => {
+                    let cfg = crate::validate::kafka_source_config(
+                        source_spec,
+                        schema,
+                        spec.effective_fail_on_decode(),
+                    )?;
+                    cfg.check_inbox_budget(self.kernel.job_budget().queue_bytes)?;
+                    cfg.check_reservation_budget(self.kernel.job_budget().reservation_bytes)?;
+                    let source = sparrow_connectors::KafkaSource::bind(cfg, policy, diag.clone())?;
+                    let (tx, rx) = observed::channel(source_spec.inbox_capacity);
+                    diag.observe_source(&tx);
+                    binding.budgeted = Some(rx);
+                    Input::Kafka { source, tx }
+                }
                 #[cfg(feature = "websocket")]
                 "websocket" => {
                     let cfg = crate::validate::websocket_source_config(
@@ -641,6 +661,12 @@ impl Supervisor {
                             .run_budgeted(tx, child.clone(), owner, max_row_bytes)
                             .await
                             .map_err(SparrowError::from),
+                        #[cfg(feature = "kafka")]
+                        Input::Kafka { source, tx } => {
+                            source
+                                .run_budgeted(tx, child.clone(), owner, max_row_bytes)
+                                .await
+                        }
                         #[cfg(feature = "websocket")]
                         Input::WebSocket { source, tx } => {
                             source
