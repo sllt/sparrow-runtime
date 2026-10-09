@@ -112,6 +112,12 @@ impl WebSocketSinkConfig {
                 "WebSocket CSV is sent as text frames; frame=binary is JSON-only",
             ));
         }
+        if self.payload_format.as_protobuf().is_some() && self.frame != SinkFrame::Binary {
+            return Err(error(
+                ErrorCode::InvalidArgument,
+                "WebSocket protobuf is sent as binary frames; set frame=binary",
+            ));
+        }
         let window = Duration::from_millis(10)..=Duration::from_secs(60);
         if !(1..=MAX_OUTBOX).contains(&self.outbox_capacity)
             || !(1..=MAX_QUEUE).contains(&self.queue_capacity)
@@ -363,7 +369,7 @@ impl WebSocketSink {
                 },
                 Err(EncodeRejected::Bad) => {
                     all = false;
-                    self.diag.csv_encode_error(&self.config.payload_format);
+                    self.diag.format_encode_error(&self.config.payload_format);
                     self.diag
                         .websocket_sink_dropped_bad
                         .fetch_add(1, Ordering::Relaxed);

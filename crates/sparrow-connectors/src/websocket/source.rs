@@ -68,7 +68,8 @@ pub enum BinaryFrames {
     /// Count (`dropped_binary`) and skip.
     #[default]
     Drop,
-    /// Decode like a text message (JSON only; strict UTF-8 JSON parsing).
+    /// Decode like a text message (JSON: strict UTF-8 JSON parsing;
+    /// required for protobuf; refused for CSV).
     Decode,
 }
 
@@ -123,6 +124,16 @@ impl WebSocketSourceConfig {
                 ));
             }
             csv.check_schema(&self.schema)?;
+        }
+        if self.payload_format.as_protobuf().is_some() {
+            if self.framing != WebSocketFraming::Message || self.binary_frames != BinaryFrames::Decode
+            {
+                return Err(error(
+                    ErrorCode::InvalidArgument,
+                    "WebSocket protobuf takes one message per WebSocket message: set framing=message and binary_frames=decode",
+                ));
+            }
+            self.payload_format.check_schema(&self.schema)?;
         }
         if !(1..=MAX_INBOX).contains(&self.inbox_capacity)
             || !(1..=MAX_PREFETCH_CAPACITY).contains(&self.prefetch_capacity)
@@ -701,7 +712,7 @@ impl WebSocketSource {
         let row = match decoded {
             Ok(row) => row,
             Err(e) => {
-                self.diag.csv_decode_error(&self.config.payload_format, &e);
+                self.diag.format_decode_error(&self.config.payload_format, &e);
                 self.diag
                     .websocket_source_dropped_bad
                     .fetch_add(1, Ordering::Relaxed);

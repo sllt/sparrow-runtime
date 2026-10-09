@@ -1327,6 +1327,11 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         ("csv_type_errors", io.csv_type_errors),
         ("csv_header_errors", io.csv_header_errors),
         ("csv_encode_errors", io.csv_encode_errors),
+        ("protobuf_malformed", io.protobuf_malformed),
+        ("protobuf_oversize", io.protobuf_oversize),
+        ("protobuf_type_errors", io.protobuf_type_errors),
+        ("protobuf_unknown_fields", io.protobuf_unknown_fields),
+        ("protobuf_encode_errors", io.protobuf_encode_errors),
         ("websocket_source_received", io.websocket_source_received),
         ("websocket_source_rows", io.websocket_source_rows),
         (

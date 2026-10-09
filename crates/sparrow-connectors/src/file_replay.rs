@@ -131,12 +131,25 @@ impl FileReplayConfig {
         check_recovery_capabilities("file", true, self.recovery, &self.restore)
             .map_err(|e| ConnectorError::new(e.code, e.to_string()))?;
         crate::policy::check_data_path(&self.path)?;
+        refuse_protobuf(&self.format)?;
         if let Some(csv) = self.format.as_csv() {
             csv.check_schema(&self.schema)
                 .map_err(|e| ConnectorError::new(e.code, e.message))?;
         }
         Ok(())
     }
+}
+
+/// File sources read newline-framed records; protobuf messages need
+/// length-delimited framing, which File does not offer, so it is refused.
+fn refuse_protobuf(format: &PayloadFormat) -> Result<()> {
+    if format.as_protobuf().is_some() {
+        return Err(ConnectorError::new(
+            ErrorCode::FeatureUnavailable,
+            "File sources do not read protobuf (newline-framed records; no length-delimited framing)",
+        ));
+    }
+    Ok(())
 }
 
 /// CSV reading state. The header is the first non-blank record of the file;
@@ -204,6 +217,7 @@ impl FileReplaySource {
                 format!("rewind {}: {e}", path.display()),
             )
         })?;
+        refuse_protobuf(&cfg.format)?;
         let format_identity = cfg.format.identity_bytes();
         let fingerprint = bind_format(fingerprint, format_identity.as_deref());
         let identity = SourceIdentity::file(path.to_string_lossy().into_owned(), size, fingerprint);
@@ -247,7 +261,7 @@ impl FileReplaySource {
 
     fn csv_fault(&self, error: &SparrowError) {
         if let (Some(diag), Some(csv)) = (&self.diag, &self.csv) {
-            diag.csv_decode_error(&PayloadFormat::Csv(csv.format.clone()), error);
+            diag.format_decode_error(&PayloadFormat::Csv(csv.format.clone()), error);
         }
     }
 

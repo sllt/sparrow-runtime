@@ -305,7 +305,7 @@ impl NatsSink {
                     if e.code == ErrorCode::ResourceExhausted {
                         self.diag.nats_sink_failed.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        self.diag.csv_encode_error(&self.config.payload_format);
+                        self.diag.format_encode_error(&self.config.payload_format);
                         self.diag
                             .nats_sink_dropped_bad
                             .fetch_add(1, Ordering::Relaxed);

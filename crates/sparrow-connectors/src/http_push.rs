@@ -293,7 +293,7 @@ async fn handle_push(
     let received_at=std::time::Instant::now();
     diag.observation.progress(true,1);
     let frame = SourceFrame::new(body, 0);
-    let decoded=codec.decode_frame_with(&frame, |e| diag.csv_decode_error(&codec.format, e));
+    let decoded=codec.decode_frame_with(&frame, |e| diag.format_decode_error(&codec.format, e));
     diag.observation.record(Latency::Decode,received_at.elapsed());
     match decoded {
         Ok(Some(row)) => match tx.try_send_with_origin(row,OriginSpan::at(received_at)) {
@@ -310,10 +310,10 @@ async fn handle_push(
         },
         Ok(None) | Err(_) => {
             diag.http_dropped.fetch_add(1, Ordering::Relaxed);
-            let reason: &[u8] = if codec.format.as_csv().is_some() {
-                b"bad csv"
-            } else {
-                b"bad json"
+            let reason: &[u8] = match codec.format.name() {
+                "csv" => b"bad csv",
+                "protobuf" => b"bad protobuf",
+                _ => b"bad json",
             };
             let _ = write_status(stream, 422, reason).await;
         }

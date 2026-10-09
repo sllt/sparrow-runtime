@@ -191,9 +191,11 @@ struct Delivery {
     rows: usize,
     receipts: Receipts,
     first: tokio::time::Instant,
-    /// CSV only: byte length of the leading header line (0 without one).
-    /// A merge keeps the first body's header and drops the next one's.
-    csv_header: Option<usize>,
+    /// CSV and protobuf bodies (which concatenate): byte length of the
+    /// leading CSV header line (0 without one, and always 0 for a protobuf
+    /// length-delimited stream). A merge keeps the first body's header and
+    /// drops the next one's. `None`: a JSON array.
+    concat_header: Option<usize>,
 }
 enum MergeFailure {
     Separate(Delivery),
@@ -206,13 +208,13 @@ impl Delivery {
         cap: usize,
         target_rows: usize,
     ) -> std::result::Result<(), MergeFailure> {
-        let comma = usize::from(self.csv_header.is_none() && self.rows > 0 && next.rows > 0);
-        let size = match next.csv_header {
+        let comma = usize::from(self.concat_header.is_none() && self.rows > 0 && next.rows > 0);
+        let size = match next.concat_header {
             Some(header) => self.bytes.len() + next.bytes.len() - header,
             None => self.bytes.len() + next.bytes.len() - 2 + comma,
         };
         if size > cap
-            || self.csv_header != next.csv_header
+            || self.concat_header != next.concat_header
             || self.rows.saturating_add(next.rows) > target_rows
             || self.schema != next.schema
             || !Arc::ptr_eq(self.lease.owner(), next.lease.owner())
@@ -252,7 +254,7 @@ impl Delivery {
             }
             self.encoded_credit.resize(self.lease.bytes());
         }
-        if let Some(header) = next.csv_header {
+        if let Some(header) = next.concat_header {
             self.bytes.extend_from_slice(&next.bytes[header..]);
         } else {
             self.bytes.pop();
@@ -288,10 +290,13 @@ impl HttpSink {
         if action.topic.is_some() || (action.per_row_http() && (config.max_inflight!=1 || config.batch_rows!=1 || !config.linger.is_zero())) {
             return Err(ConnectorError::new(ErrorCode::InvalidArgument,"HTTP action options: no topic; per-row requires serial/no linger/no coalescing"));
         }
-        if config.payload_format.as_csv().is_some() && (action.body.is_some() || action.single) {
+        if !config.payload_format.is_json() && (action.body.is_some() || action.single) {
             return Err(ConnectorError::new(
                 ErrorCode::InvalidArgument,
-                "HTTP CSV bodies take no action.body or action.single (the row is the CSV record)",
+                format!(
+                    "HTTP {} bodies take no action.body or action.single (the row is the record)",
+                    config.payload_format.name()
+                ),
             ));
         }
         Ok(())
@@ -322,10 +327,17 @@ impl HttpSink {
                 let encoded=(||->sparrow_model::Result<_>{
                     if batch.output_sequence().is_some(){return Err(sparrow_model::SparrowError::new(ErrorCode::UnsupportedRestore,"HTTP actions are live-only"));}
                     let mut lease=batch.lease().owner().acquire(CreditKind::Reservation,32*1024)?;
-                    let bytes=match self.config.payload_format.as_csv() {
-                        Some(csv)=>csv.encode_rows_bounded_with_capacity(batch.schema(),std::slice::from_ref(row),self.config.batch_bytes,|cap|lease.grow_to(cap+32*1024)),
-                        None=>action.encode(batch.schema(),std::slice::from_ref(row),!action.single,self.config.batch_bytes,|cap|lease.grow_to(cap+32*1024)),
-                    }.inspect_err(|e|if e.code!=ErrorCode::ResourceExhausted {self.diag.csv_encode_error(&self.config.payload_format)})?;
+                    let format=&self.config.payload_format;
+                    let bytes=if format.is_json() {
+                        action.encode(batch.schema(),std::slice::from_ref(row),!action.single,self.config.batch_bytes,|cap|lease.grow_to(cap+32*1024))
+                    } else {
+                        // CSV (<=8x row) and protobuf (<1 KiB/column plan +
+                        // per-column state) encoder scratch fit the 32 KiB
+                        // base charge only for small rows; grow it first.
+                        let scratch=format.encode_scratch(batch.schema(),row).max(32*1024);
+                        lease.grow_to(scratch)?;
+                        format.encode_document_bounded_with_capacity(batch.schema(),std::slice::from_ref(row),self.config.batch_bytes,|cap|lease.grow_to(cap+scratch))
+                    }.inspect_err(|e|if e.code!=ErrorCode::ResourceExhausted {self.diag.format_encode_error(&self.config.payload_format)})?;
                     let mut url=url::Url::parse(&self.config.url).map_err(|_|sparrow_model::SparrowError::new(ErrorCode::InvalidArgument,"invalid action base URL"))?;
                     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
                         return Err(sparrow_model::SparrowError::new(ErrorCode::PolicyDenied,"action URL forbids userinfo and fragments"));
@@ -508,10 +520,21 @@ impl HttpSink {
         };
         // Keep the input lease alive and bill each encoded capacity increase
         // before allocation. Small bodies no longer reserve batch_bytes.
+        // Protobuf also holds its per-row encoder working set (column wire
+        // values + message sizes, freed per row) for the whole body.
+        let encode_scratch = match &self.config.payload_format {
+            sparrow_formats::PayloadFormat::Protobuf(format) => batch
+                .rows()
+                .iter()
+                .map(|row| format.encode_scratch(row))
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        };
         let mut lease = batch
             .lease()
             .owner()
-            .acquire(CreditKind::Reservation, DELIVERY_OVERHEAD)
+            .acquire(CreditKind::Reservation, DELIVERY_OVERHEAD + encode_scratch)
             .map_err(|error| {
                 self.diag.observation.health(false,HealthState::Failed,"http_encode_budget",Some(error.code));
                 self.diag.http_budget_drops.fetch_add(1, Ordering::Relaxed);
@@ -519,20 +542,23 @@ impl HttpSink {
             })
             .ok()?;
         let mut encoded_credit=self.diag.observation.encoded_credit(lease.bytes());
-        let csv = self.config.payload_format.as_csv();
-        let encoded = if let Some(csv) = csv {
+        let format = &self.config.payload_format;
+        let encoded = if !format.is_json() {
             if batch.output_sequence().is_some() {
                 Err(sparrow_model::SparrowError::new(
                     ErrorCode::UnsupportedRestore,
-                    "CSV bodies cannot carry reliable output identity",
+                    format!(
+                        "{} bodies cannot carry reliable output identity",
+                        format.name()
+                    ),
                 ))
             } else {
-                csv.encode_rows_bounded_with_capacity(
+                format.encode_document_bounded_with_capacity(
                     batch.schema(),
                     batch.rows(),
                     self.config.batch_bytes,
                     |capacity| {
-                        lease.grow_to(capacity + DELIVERY_OVERHEAD)?;
+                        lease.grow_to(capacity + DELIVERY_OVERHEAD + encode_scratch)?;
                         encoded_credit.resize(lease.bytes());
                         Ok(())
                     },
@@ -540,7 +566,7 @@ impl HttpSink {
             }
             .inspect_err(|e| {
                 if e.code != ErrorCode::ResourceExhausted {
-                    self.diag.csv_encode_error(&self.config.payload_format)
+                    self.diag.format_encode_error(&self.config.payload_format)
                 }
             })
         } else if let Some(action)=&self.action {
@@ -565,12 +591,16 @@ impl HttpSink {
             error
         })
         .ok()?;
-        let csv_header = match csv {
+        let concat_header = match format {
+            sparrow_formats::PayloadFormat::Json => None,
             // Column names may be quoted and contain line breaks, so the
             // header length comes from the encoder, not a newline search.
-            Some(csv) if csv.header() => Some(csv.header_len(batch.schema()).unwrap_or(0)),
-            Some(_) => Some(0),
-            None => None,
+            sparrow_formats::PayloadFormat::Csv(csv) if csv.header() => {
+                Some(csv.header_len(batch.schema()).unwrap_or(0))
+            }
+            // Headerless CSV records and protobuf delimited messages
+            // concatenate as they are.
+            _ => Some(0),
         };
         Some(Delivery {
             encoded_credit,
@@ -580,7 +610,7 @@ impl HttpSink {
             rows: batch.num_rows(),
             receipts,
             first,
-            csv_header,
+            concat_header,
         })
     }
 

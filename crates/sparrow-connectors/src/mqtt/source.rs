@@ -474,7 +474,7 @@ impl MqttSource {
                             };
                             let frame = SourceFrame::new(payload, 0);
                             let decoded = self.codec.decode_frame_with(&frame, |e| {
-                                self.diag.csv_decode_error(&self.codec.format, e)
+                                self.diag.format_decode_error(&self.codec.format, e)
                             });
                             self.diag.observation.record(Latency::Decode,received_at.elapsed());
                             drop(frame);

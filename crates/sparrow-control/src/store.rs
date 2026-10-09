@@ -2644,6 +2644,7 @@ mod tests {
                 file_contract: None,
                 format: None,
                 csv: None,
+                protobuf: None,
             },
             sink: SinkSpec {
                 nats: None,
@@ -2672,6 +2673,7 @@ mod tests {
                 tls: false,
                 format: None,
                 csv: None,
+                protobuf: None,
             },
             delivery: "live_best_effort".into(),
             recovery: "restart_fresh".into(),

@@ -386,3 +386,15 @@ fn csv_checkpoint_identity_binds_format_and_options() {
         fs::remove_file(path).unwrap();
     }
 }
+
+#[test]
+fn protobuf_is_refused_by_file_sources() {
+    let path = tmp("protobuf");
+    std::fs::write(&path, b"").unwrap();
+    let mut cfg = FileReplayConfig::new(&path, schema());
+    cfg.format = crate::protobuf_test_support::format(CsvRole::Decode, |_| {});
+    assert_eq!(cfg.validate().unwrap_err().code, ErrorCode::FeatureUnavailable);
+    let err = FileReplaySource::open(&cfg).err().expect("open must refuse");
+    assert_eq!(err.code, ErrorCode::FeatureUnavailable);
+    std::fs::remove_file(&path).unwrap();
+}

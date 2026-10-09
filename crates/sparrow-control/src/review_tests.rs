@@ -254,6 +254,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
             file_contract: None,
             format: None,
             csv: None,
+            protobuf: None,
         },
         sink: SinkSpec {
             nats: None,
@@ -282,6 +283,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
             tls: false,
             format: None,
             csv: None,
+            protobuf: None,
         },
         delivery: "live_best_effort".into(),
         recovery: recovery.into(),
@@ -422,6 +424,7 @@ fn mqtt_aligned_still_rejected() {
             file_contract: None,
             format: None,
             csv: None,
+            protobuf: None,
         },
         sink: SinkSpec {
             nats: None,
@@ -450,6 +453,7 @@ fn mqtt_aligned_still_rejected() {
             tls: false,
             format: None,
             csv: None,
+            protobuf: None,
         },
         delivery: "live_best_effort".into(),
         recovery: "aligned".into(),

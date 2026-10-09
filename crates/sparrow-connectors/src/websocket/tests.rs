@@ -372,6 +372,31 @@ fn websocket_source_and_sink_config_gates() {
             },
             ErrorCode::InvalidArgument,
         ),
+        // Protobuf needs binary_frames=decode and one message per message.
+        (
+            |c| c.payload_format = protobuf_format(sparrow_formats::CsvRole::Decode),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            |c| {
+                c.payload_format = protobuf_format(sparrow_formats::CsvRole::Decode);
+                c.binary_frames = BinaryFrames::Decode;
+                c.framing = WebSocketFraming::Ndjson;
+            },
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            |c| {
+                c.payload_format = crate::protobuf_test_support::format(
+                    sparrow_formats::CsvRole::Decode,
+                    |o| {
+                        o.fields.remove("v");
+                    },
+                );
+                c.binary_frames = BinaryFrames::Decode;
+            },
+            ErrorCode::InvalidSchema,
+        ),
     ];
     for (i, (mutate, code)) in cases.iter().enumerate() {
         let mut c = base.clone();
@@ -410,6 +435,10 @@ fn websocket_source_and_sink_config_gates() {
                 c.payload_format = csv_format(sparrow_formats::CsvRole::Encode);
                 c.frame = SinkFrame::Binary;
             },
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            |c| c.payload_format = protobuf_format(sparrow_formats::CsvRole::Encode),
             ErrorCode::InvalidArgument,
         ),
         (
@@ -539,6 +568,48 @@ async fn websocket_csv_over_text_frames_source_and_sink() {
     cancel.cancel();
     task.await.unwrap();
     assert_eq!(diag.snapshot().websocket_sink_sent, 2);
+}
+
+fn protobuf_format(role: sparrow_formats::CsvRole) -> sparrow_formats::PayloadFormat {
+    crate::protobuf_test_support::format(role, |_| {})
+}
+
+#[tokio::test]
+async fn websocket_protobuf_over_binary_frames_source_and_sink() {
+    use crate::protobuf_test_support::reading;
+    let server = Listener::plain().await;
+    let mut run = start_source(server.url(), &server.policy(), |c| {
+        c.payload_format = protobuf_format(sparrow_formats::CsvRole::Decode);
+        c.binary_frames = BinaryFrames::Decode;
+    });
+    let mut ws = server.accept().await;
+    ws.send(Message::binary(reading("a", 1))).await.unwrap();
+    // Malformed: truncated string.
+    ws.send(Message::binary(vec![0x0a, 0x09, b'x'])).await.unwrap();
+    // Text frames carry bytes too and are decoded the same way.
+    ws.send(Message::text("\n\u{1}b\u{10}\u{2}")).await.unwrap();
+    ws.send(Message::binary(reading("c", 3))).await.unwrap();
+    assert_eq!(run.take(3).await, vec![1, 2, 3]);
+    let snap = run.diag.snapshot();
+    assert_eq!(snap.websocket_source_dropped_bad, 1);
+    assert_eq!(snap.protobuf_malformed, 1);
+    run.stop().await.unwrap();
+
+    let sink_server = Listener::plain().await;
+    let (_owner, diag, tx, cancel, task) = start_sink(&sink_server, |c| {
+        c.payload_format = protobuf_format(sparrow_formats::CsvRole::Encode);
+        c.frame = SinkFrame::Binary;
+    });
+    let mut peer = sink_server.accept().await;
+    tx.send(batch(&_owner, 1, 2)).await.unwrap();
+    for v in 1..=2 {
+        let m = next_data(&mut peer).await;
+        assert_eq!(m, Message::binary(reading("s", v)));
+    }
+    cancel.cancel();
+    task.await.unwrap();
+    assert_eq!(diag.snapshot().websocket_sink_sent, 2);
+    assert_eq!(diag.snapshot().protobuf_encode_errors, 0);
 }
 
 #[tokio::test]

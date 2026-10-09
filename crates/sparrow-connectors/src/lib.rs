@@ -84,6 +84,8 @@ pub fn sensor_json(
 }
 
 #[cfg(test)]
+pub(crate) mod protobuf_test_support;
+#[cfg(test)]
 mod a6_tests {
     #[cfg(feature = "demo-io")]
     #[test]

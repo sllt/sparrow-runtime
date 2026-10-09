@@ -1,0 +1,20 @@
+device: "dev-1"
+seq: -42
+value: 0
+status: STATUS_FAILED
+ok: true
+blob: "\x00\xff\x10"
+u32: 4294967295
+u64: 18446744073709551615
+s32: -2147483648
+s64: -9223372036854775808
+f32: 4294967295
+f64: 18446744073709551615
+sf32: -2147483648
+sf64: -9223372036854775808
+ratio: 0.5
+at { seconds: 1700000000 nanos: 123456000 }
+location { lat: 31.23 lon: 121.47 label: "上海" inner { level: 0 } }
+text: "hello"
+maybe: 0
+i32: -1

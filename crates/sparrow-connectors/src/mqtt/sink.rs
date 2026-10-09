@@ -125,6 +125,31 @@ mod observation_tests {
         }
     }
     #[tokio::test]
+    async fn actions_mqtt_protobuf_body_is_the_encoded_row_on_the_action_topic() {
+        use sparrow_model::{Schema,SchemaId,Field,FieldId,DataType,Scalar,Row,RowBatchBuilder,CreditKind};
+        let schema=Arc::new(Schema::new(SchemaId::new(1),vec![
+            Field::new(FieldId::new(1),"device_id",DataType::Utf8,false),
+            Field::new(FieldId::new(2),"v",DataType::Int64,false)]).unwrap());
+        let owner=MemoryOwner::new(ResourceBudget::compact());let diag=IoDiagnostics::new();
+        let mut cfg=MqttSinkConfig::demo("127.0.0.1",1883);
+        cfg.payload_format=crate::protobuf_test_support::format(sparrow_formats::CsvRole::Encode,|_|{});
+        let action=serde_json::from_value(serde_json::json!({"topic":["site/",{"$field":"device_id"}]})).unwrap();
+        let sink=MqttSink::bind(cfg,&MapSecretResolver::empty(),&TargetPolicy::allow("127.0.0.1",1883),diag.clone()).unwrap().with_action(Some(Box::new(action))).unwrap();
+        let mut builder=RowBatchBuilder::new(schema.clone(),owner.clone(),CreditKind::Reservation,2,65536).unwrap();
+        builder.push(Row{values:vec![Scalar::utf8("a"),Scalar::Int64(300)]}).unwrap();
+        let batch=builder.finish().unwrap();
+        let(left,right)=tokio::io::duplex(65536);let mut writer:super::super::io::MqttStream=Box::pin(left);let mut reader:super::super::io::MqttStream=Box::pin(right);
+        assert!(sink.publish_action(&batch,&batch.rows()[0],&mut writer,&CancellationToken::new()).await.unwrap());
+        let Packet::Publish(packet)=read_packet(&mut MqttFramedReader::new(),&mut reader).await.unwrap() else {panic!("expected publish")};
+        assert_eq!(packet.topic,"site/a");
+        assert_eq!(&packet.payload[..],&crate::protobuf_test_support::reading("a",300)[..]);
+        // A value that does not match the column type is an encode error.
+        let bad=Row{values:vec![Scalar::utf8("b"),Scalar::utf8("not an int")]};
+        assert!(!sink.publish_action(&batch,&bad,&mut writer,&CancellationToken::new()).await.unwrap());
+        assert_eq!(diag.snapshot().protobuf_encode_errors,1);
+        drop(batch);assert_eq!(owner.usage().physical_bytes,0);
+    }
+    #[tokio::test]
     async fn obs_mqtt_sink_idle_ping_and_disconnect_are_observed() {
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
         let (done_tx,done_rx)=tokio::sync::oneshot::channel();
@@ -168,15 +193,17 @@ impl MqttSink {
         let action=self.action.as_ref().expect("action");
         let prepared=(||->sparrow_model::Result<_>{
             if batch.output_sequence().is_some(){return Err(sparrow_model::SparrowError::new(ErrorCode::UnsupportedRestore,"MQTT action has no reliable receipt"));}
-            // CSV: its encoder scratch, then every output growth, is charged
-            // before allocation; the message is bounded at 64KiB.
-            let scratch=self.config.payload_format.as_csv().map_or(8192,|csv|csv.encode_scratch(row).max(8192));
+            // CSV / protobuf: the format's encoder scratch, then every output
+            // growth, is charged before allocation; the message is bounded at 64KiB.
+            let format=&self.config.payload_format;
+            let scratch=if format.is_json() {8192} else {format.encode_scratch(batch.schema(),row).max(8192)};
             let mut lease=batch.lease().owner().acquire(sparrow_model::CreditKind::Reservation,scratch)?;
-            // CSV sinks accept only `action.topic` (validated); the body is the CSV message.
-            let body=match self.config.payload_format.as_csv() {
-                Some(csv)=>csv.encode_message_bounded_with_capacity(batch.schema(),row,JsonLimits::default().max_bytes,|cap|lease.grow_to(cap.saturating_add(scratch)))
-                    .inspect_err(|e|if e.code!=ErrorCode::ResourceExhausted {self.diag.csv_encode_error(&self.config.payload_format)})?,
-                None=>action.encode(batch.schema(),std::slice::from_ref(row),false,JsonLimits::default().max_bytes,|cap|lease.grow_to(cap+8192))?,
+            // CSV / protobuf sinks accept only `action.topic` (validated); the body is the encoded row.
+            let body=if format.is_json() {
+                action.encode(batch.schema(),std::slice::from_ref(row),false,JsonLimits::default().max_bytes,|cap|lease.grow_to(cap+8192))?
+            } else {
+                format.encode_row_bounded_with_capacity(batch.schema(),row,JsonLimits::default().max_bytes,|cap|lease.grow_to(cap.saturating_add(scratch)))
+                    .inspect_err(|e|if e.code!=ErrorCode::ResourceExhausted {self.diag.format_encode_error(format)})?
             };
             let topic=if let Some(parts)=&action.topic {
                 // A variable occupies one topic level; only configured literals
@@ -338,7 +365,7 @@ impl MqttSink {
                                     Err(rejected) => {
                                         all_encoded=false;
                                         let code=if rejected==crate::scratch::EncodeRejected::Budget {ErrorCode::ResourceExhausted} else {
-                                            if rejected==crate::scratch::EncodeRejected::Bad {self.diag.csv_encode_error(&self.config.payload_format);}
+                                            if rejected==crate::scratch::EncodeRejected::Bad {self.diag.format_encode_error(&self.config.payload_format);}
                                             ErrorCode::CodecViolation
                                         };
                                         self.diag.observation.health(false,HealthState::Failed,"mqtt_sink_encode_failed",Some(code));
