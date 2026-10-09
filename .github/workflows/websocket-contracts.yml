@@ -17,6 +17,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Verify independent Protobuf fixtures with pinned protoc
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/protoc"
+          curl --fail --location --retry 3 \
+            https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-x86_64.zip \
+            -o "$RUNNER_TEMP/protoc/release.zip"
+          printf '%s  %s\n' 121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278 \
+            "$RUNNER_TEMP/protoc/release.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/protoc/release.zip" -d "$RUNNER_TEMP/protoc"
+          export SPARROW_PROTOC="$RUNNER_TEMP/protoc/bin/protoc"
+          bash scripts/protobuf-fixtures.sh --check
+          printf 'SPARROW_PROTOC=%s\n' "$SPARROW_PROTOC" >> "$GITHUB_ENV"
       - uses: actions/cache@v4
         with:
           path: ~/.cache/sparrow-services/postgresql-16.15
@@ -107,7 +120,7 @@ jobs:
             features+=,sparrow-server/jetstream
           fi
           if ! cargo test --locked --release --quiet --no-default-features --message-format=json \
-            -p sparrow-connectors -p sparrow-control -p sparrow-server \
+            -p sparrow-connectors -p sparrow-control -p sparrow-server -p sparrow-formats \
             --features "$features" \
             > artifacts/tests.jsonl 2> artifacts/build.log; then
             tail -n 60 artifacts/build.log
@@ -119,7 +132,9 @@ jobs:
             artifacts/tests.jsonl > artifacts/test-binaries.json
           connector=$(jq -er '.[]|select(.name=="sparrow_connectors")|.exe' artifacts/test-binaries.json)
           control=$(jq -er '.[]|select(.name=="sparrow_control")|.exe' artifacts/test-binaries.json)
-          sha256sum "$connector" "$control" > artifacts/test-binaries.sha256
+          formats=$(jq -er '.[]|select(.name=="sparrow_formats")|.exe' artifacts/test-binaries.json)
+          allocation=$(jq -er '.[]|select(.name=="protobuf_alloc")|.exe' artifacts/test-binaries.json)
+          sha256sum "$connector" "$control" "$formats" "$allocation" > artifacts/test-binaries.sha256
           # Repeat the exact compiled binaries: no extra build and no external
           # broker. Fixtures bind ephemeral loopback ports and use a test CA.
           run_contracts() {
@@ -134,6 +149,9 @@ jobs:
             tail -n 3 "artifacts/$label.log"
           }
           for round in 1 2; do
+            run_contracts "$formats" 'protobuf::' "protobuf-formats-$round"
+            run_contracts "$allocation" '' "protobuf-allocation-$round"
+            run_contracts "$control" 'protobuf_tests::' "protobuf-control-$round"
             run_contracts "$connector" 'websocket::' "websocket-connector-$round"
             run_contracts "$control" 'websocket_tests::' "websocket-control-$round"
             run_contracts "$connector" 'tcp::' "tcp-connector-$round"

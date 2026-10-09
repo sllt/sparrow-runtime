@@ -2,7 +2,7 @@
 # Regenerate the protobuf golden fixtures with a pinned, checksum-verified
 # protoc (36.2, linux-x86_64). Usage: scripts/protobuf-fixtures.sh [--check]
 #   --check  regenerate into a temp dir and fail if any committed fixture
-#            differs (the binaries are committed; CI does not need protoc).
+#            differs. SPARROW_PROTOC can reuse a pinned installation.
 set -euo pipefail
 
 VERSION=36.2
@@ -15,11 +15,16 @@ fixtures="$root/crates/sparrow-formats/tests/fixtures/protobuf"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-curl -fsSL "$URL" -o "$work/$ZIP"
-echo "$SHA256  $work/$ZIP" | sha256sum -c -
-unzip -q "$work/$ZIP" -d "$work/protoc"
-protoc="$work/protoc/bin/protoc"
-inc="$work/protoc/include"
+if [[ -n "${SPARROW_PROTOC:-}" ]]; then
+  protoc="$SPARROW_PROTOC"
+else
+  curl -fsSL "$URL" -o "$work/$ZIP"
+  echo "$SHA256  $work/$ZIP" | sha256sum -c -
+  unzip -q "$work/$ZIP" -d "$work/protoc"
+  protoc="$work/protoc/bin/protoc"
+fi
+[[ "$("$protoc" --version)" == "libprotoc $VERSION" ]]
+inc="$(dirname "$protoc")/../include"
 
 out="$fixtures"
 if [[ "${1:-}" == "--check" ]]; then

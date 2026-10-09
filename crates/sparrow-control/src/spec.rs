@@ -2491,6 +2491,7 @@ impl PipelineSpec {
                 || sink.max_inflight.is_some()
                 || sink.format.is_some()
                 || sink.csv.is_some()
+                || sink.protobuf.is_some()
             {
                 return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
@@ -2561,6 +2562,7 @@ impl PipelineSpec {
                 || source.inbox_bytes.is_some()
                 || source.format.is_some()
                 || source.csv.is_some()
+                || source.protobuf.is_some()
             {
                 return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
@@ -2593,6 +2595,7 @@ impl PipelineSpec {
                 || sink.max_inflight.is_some()
                 || sink.format.is_some()
                 || sink.csv.is_some()
+                || sink.protobuf.is_some()
             {
                 return Err(SparrowError::new(
                     ErrorCode::InvalidArgument,
@@ -2652,6 +2655,7 @@ impl PipelineSpec {
                 || sink.tcp.is_some()
                 || sink.format.is_some()
                 || sink.csv.is_some()
+                || sink.protobuf.is_some()
                 || sink.batch_rows.is_some()
                 || sink.batch_bytes.is_some()
                 || sink.linger_ms.is_some()
