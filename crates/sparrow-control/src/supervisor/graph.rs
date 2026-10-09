@@ -632,7 +632,8 @@ impl Supervisor {
                             .run_budgeted(tx, child.clone(), owner, max_row_bytes)
                             .await
                             .map_err(SparrowError::from),
-                        Input::Http { source, tx } => {
+                        Input::Http { mut source, tx } => {
+                            source.charge_decode_to(owner);
                             source.run(tx, child.clone()).await;
                             Ok(())
                         }

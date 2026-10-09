@@ -586,14 +586,33 @@ async fn websocket_protobuf_over_binary_frames_source_and_sink() {
     ws.send(Message::binary(reading("a", 1))).await.unwrap();
     // Malformed: truncated string.
     ws.send(Message::binary(vec![0x0a, 0x09, b'x'])).await.unwrap();
-    // Text frames carry bytes too and are decoded the same way.
-    ws.send(Message::text("\n\u{1}b\u{10}\u{2}")).await.unwrap();
+    // A text message is refused as bad even when its bytes are a valid
+    // message (here exactly `reading("b", 2)`): never decoded.
+    let text = String::from_utf8(reading("b", 2)).unwrap();
+    ws.send(Message::text(text.clone())).await.unwrap();
     ws.send(Message::binary(reading("c", 3))).await.unwrap();
-    assert_eq!(run.take(3).await, vec![1, 2, 3]);
+    assert_eq!(run.take(2).await, vec![1, 3]);
     let snap = run.diag.snapshot();
-    assert_eq!(snap.websocket_source_dropped_bad, 1);
-    assert_eq!(snap.protobuf_malformed, 1);
+    assert_eq!(snap.websocket_source_dropped_bad, 2);
+    assert_eq!(snap.protobuf_malformed, 2);
+    assert_eq!(snap.decode_errors, 2);
     run.stop().await.unwrap();
+
+    // With fail_on_decode a text message fails the source.
+    let server = Listener::plain().await;
+    let run = start_source(server.url(), &server.policy(), |c| {
+        c.payload_format = protobuf_format(sparrow_formats::CsvRole::Decode);
+        c.binary_frames = BinaryFrames::Decode;
+        c.fail_on_decode = true;
+    });
+    let mut ws = server.accept().await;
+    ws.send(Message::text(text)).await.unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(5), run.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.unwrap_err().code, ErrorCode::CodecViolation);
+    assert_eq!(run.diag.snapshot().protobuf_malformed, 1);
 
     let sink_server = Listener::plain().await;
     let (_owner, diag, tx, cancel, task) = start_sink(&sink_server, |c| {

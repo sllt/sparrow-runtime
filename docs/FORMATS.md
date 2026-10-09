@@ -229,7 +229,7 @@
 |---|---|---|---|
 | `mqtt` / `nats` / `jetstream` | ✓ | ✓ | 一条消息 = 一条 protobuf 消息（无长度前缀） |
 | `http_push` | ✓ | — | 一个请求体 = 一条消息 |
-| `websocket` | ✓ | ✓ | 一帧 = 一条消息；Source 必须 `framing: message` 且 `binary_frames: decode`（文本帧也按字节解码）；Sink 必须 `frame: binary` |
+| `websocket` | ✓ | ✓ | 一帧 = 一条消息；Source 必须 `framing: message` 且 `binary_frames: decode`；文本帧不解码，按坏记录计数（`dropped_bad`、`protobuf_malformed`，`fail_on_decode` 时失败）；Sink 必须 `frame: binary` |
 | `http` | — | ✓ | 请求体 = 长度前缀消息流（每条前面一个 varint 长度，即 `writeDelimitedTo` 格式），`Content-Type: application/x-protobuf`；多个批次合并时直接拼接 |
 | `http_poll` | ✓ | — | 响应 = 长度前缀消息流，请求带 `Accept: application/x-protobuf`；`http_poll.format` 必须为空；长度前缀本身损坏或截断时整个响应视为坏响应，单条坏消息按坏记录处理 |
 | `file` / `file_replay` / `replay` | ✗ | ✗ | 拒绝（`feature_unavailable`）：没有带恢复语义的长度前缀文件格式 |
@@ -256,4 +256,4 @@
 
 - 解码 scratch（`ProtobufFormat::decode_scratch`，饱和运算）：线路字节数（Utf8 / Bytes 输出总量不超过它）+ 每列状态 + 映射计划估算 + 4 KiB。解码器只分配输出行与每列状态，不建消息树；计数分配器测试在 7 种 64 KiB 对抗输入下峰值不超过该估算。
 - 编码：先算出精确输出长度，超过上限直接拒绝，再按 `encode_scratch`（每列状态 + 计划 + 4 KiB）与精确输出长度一次记账，`try_reserve_exact` 分配。
-- 先按长度拒绝、再记账、最后解码 / 编码的连接器与 CSV 相同（NATS、JetStream、HTTP Poll、MQTT budgeted ingress、WebSocket；HTTP、NATS、JetStream、MQTT、WebSocket Sink）。HTTP Push 只做长度检查，不额外记解码 scratch。
+- 先按长度拒绝、再记账、最后解码 / 编码的连接器与 CSV 相同（NATS、JetStream、HTTP Poll、MQTT budgeted ingress、WebSocket；HTTP、NATS、JetStream、MQTT、WebSocket Sink）。HTTP Push 在解码前按 `decode_scratch` 记账并持有到行交给 inbox；额度不足时回 503、计 `http_dropped`，不解码（JSON / CSV 请求体仍不记账，与以前相同）。

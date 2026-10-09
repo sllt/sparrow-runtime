@@ -1406,9 +1406,10 @@ impl Supervisor {
                 }
                 "http_push" => {
                     let cfg = http_push_config(&spec.source, schema)?;
-                    let push = HttpPushSource::bind(cfg, &self.secrets, policy, Arc::clone(&diag))
+                    let mut push = HttpPushSource::bind(cfg, &self.secrets, policy, Arc::clone(&diag))
                         .await
                         .map_err(SparrowError::from)?;
+                    push.charge_decode_to(job.memory_owner());
                     let cancel_src = cancel.clone();
                     self.kernel.handle().spawn(async move {
                         push.run(tx_in.expect("HTTP ingress"), cancel_src).await;
