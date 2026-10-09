@@ -681,7 +681,9 @@ impl CheckpointStore {
                 }
                 if bytes.starts_with(MAGIC) && bytes.len()>=6 && bytes[4..6]!=version.to_le_bytes() {
                     return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-                        "checkpoint source profile mismatch: File/v3, JetStream/v4, DAG/v5, IoT/v6, ReliableIoT/v7, Reference/v8-v11, Hysteresis/v12-v13 and PausedTime/v14-v15 require separate directories; retain original history"));
+                        "checkpoint source profile mismatch: every outer profile (e.g. File/v3, JetStream/v4, DAG/v5, IoT/v6, ReliableIoT/v7, Reference/v8-v11, Hysteresis/v12-v13, PausedTime/v14-v15, extended aggregates File/v29 and JetStream/v30) requires a separate directory; retain original history")
+                        .context("checkpoint_found_version", u16::from_le_bytes([bytes[4], bytes[5]]).to_string())
+                        .context("checkpoint_expected_version", version.to_string()));
                 }
             }
         }

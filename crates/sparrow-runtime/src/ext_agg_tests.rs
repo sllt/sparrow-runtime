@@ -623,3 +623,27 @@ fn first_last_on_nested_or_dynamic_rejected_and_ext_profile_bounds() {
     assert_eq!(crate::pipeline_checkpoint::snapshot_version_for(&plan, "file").unwrap(), crate::EXT_AGG_FILE_SNAPSHOT_VERSION);
     assert_eq!(crate::pipeline_checkpoint::snapshot_version_for(&plan, "jetstream-v1").unwrap(), crate::EXT_AGG_RELIABLE_SNAPSHOT_VERSION);
 }
+
+#[test]
+fn profile_mismatch_error_names_extended_versions() {
+    for (found, open_reliable) in [(crate::EXT_AGG_FILE_SNAPSHOT_VERSION, false), (crate::EXT_AGG_RELIABLE_SNAPSHOT_VERSION, true)] {
+        let dir = tmp();
+        fs::create_dir_all(dir.join("chk-00000001")).unwrap();
+        let mut chunk = crate::checkpoint::MAGIC.to_vec();
+        chunk.extend_from_slice(&found.to_le_bytes());
+        fs::write(dir.join("chk-00000001").join("0000.bin"), chunk).unwrap();
+        let e = if open_reliable {
+            CheckpointStore::open_reliable_exclusive(&dir, 1024, Default::default())
+        } else {
+            CheckpointStore::open_pipeline_exclusive(&dir, 1024, Default::default())
+        }
+        .err()
+        .unwrap();
+        assert_eq!(e.code, ErrorCode::UnsupportedRestore);
+        assert!(e.message.contains("checkpoint source profile mismatch"), "{e:?}");
+        assert!(e.message.contains("File/v29") && e.message.contains("JetStream/v30"), "{e:?}");
+        let found_ctx = e.context.iter().find(|(k, _)| k == "checkpoint_found_version").map(|(_, v)| v.clone());
+        assert_eq!(found_ctx, Some(found.to_string()), "{e:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
