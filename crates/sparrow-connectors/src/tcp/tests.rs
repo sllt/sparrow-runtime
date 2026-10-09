@@ -348,6 +348,7 @@ async fn tcp_source_length_prefixed_u16_and_u32() {
         let mut run = start_source(&server, |c| {
             c.client.framing = TcpFraming::LengthPrefixed;
             c.client.prefix_width = width;
+            c.client.max_frame_bytes = width.max_len().min(c.client.max_frame_bytes);
         });
         let mut conn = server.accept().await;
         let mut wire = Vec::new();
@@ -857,4 +858,121 @@ async fn tcp_sink_fails_closed_after_reconnect_attempts() {
     assert_eq!(snap.tcp_sink_fatal, 1);
     assert_eq!(snap.tcp_sink_connect_failures, 2);
     assert_eq!(snap.tcp_sink_queue_items, 0);
+}
+
+/// Take every free Reservation byte of `owner` (after the connector charged
+/// its fixed buffers) so the next decode/encode charge is refused.
+fn hog(owner: &Arc<MemoryOwner>) -> sparrow_model::MemoryLease {
+    let free = owner.budget().reservation_bytes - owner.usage().reservation_bytes;
+    owner.acquire(CreditKind::Reservation, free).unwrap()
+}
+
+#[tokio::test]
+async fn tcp_source_decode_scratch_is_charged_before_parsing() {
+    // JSON: without credit for the parse working set the record is counted
+    // dropped_budget and never parsed; the connection survives.
+    let server = Server::plain().await;
+    let mut run = start_source(&server, |_| {});
+    let mut conn = server.accept().await;
+    until(Duration::from_secs(5), || {
+        run.owner.usage().reservation_bytes > 0
+    })
+    .await;
+    let held = hog(&run.owner);
+    conn.write_all(format!("{}\n", json(1)).as_bytes())
+        .await
+        .unwrap();
+    until(Duration::from_secs(5), || {
+        run.diag.snapshot().tcp_source_dropped_budget == 1
+    })
+    .await;
+    assert_eq!(run.diag.snapshot().tcp_source_dropped_bad, 0);
+    drop(held);
+    conn.write_all(format!("{}\n", json(2)).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(run.take(1).await, vec![2]);
+    assert_eq!(run.diag.snapshot().tcp_source_disconnects, 0);
+    run.stop().await.unwrap();
+
+    // CSV over lines: an uncharged header ends the connection, so the next
+    // line is never taken for the header; the new connection starts over.
+    let server = Server::plain().await;
+    let mut run = start_source(&server, |c| {
+        c.payload_format = csv_format(sparrow_formats::CsvRole::Decode, true, false);
+        c.client.reconnect_max = Duration::from_millis(100);
+    });
+    let mut conn = server.accept().await;
+    until(Duration::from_secs(5), || {
+        run.owner.usage().reservation_bytes > 0
+    })
+    .await;
+    let held = hog(&run.owner);
+    conn.write_all(b"device_id,v\nz,9\n").await.unwrap();
+    assert!(read_to_eof(&mut conn).await.is_empty(), "client hung up");
+    let snap = run.diag.snapshot();
+    assert_eq!(snap.tcp_source_dropped_budget, 1, "{snap:?}");
+    assert_eq!(snap.tcp_source_dropped_bad, 0, "{snap:?}");
+    drop(held);
+    let mut conn = server.accept().await;
+    conn.write_all(b"v,device_id\n4,z\n").await.unwrap();
+    assert_eq!(run.take(1).await, vec![4]);
+    assert_eq!(run.diag.snapshot().tcp_source_disconnects, 1);
+    run.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn tcp_sink_encode_scratch_is_charged_before_encoding() {
+    for framing in [TcpFraming::Lines, TcpFraming::LengthPrefixed] {
+        let server = Server::plain().await;
+        let outbox = Arc::new(sparrow_model::InflightCounter::new());
+        let (owner, diag, tx, cancel, task) = start_sink(&server, Some(outbox.clone()), |c| {
+            c.client.framing = framing
+        });
+        let mut conn = server.accept().await;
+        let refused = batch(&owner, 1, 2);
+        let sent = batch(&owner, 3, 3);
+        let held = hog(&owner);
+        outbox.enqueue();
+        tx.send(refused).await.unwrap();
+        until(Duration::from_secs(5), || {
+            diag.snapshot().tcp_sink_dropped_budget == 2
+        })
+        .await;
+        drop(held);
+        outbox.enqueue();
+        tx.send(sent).await.unwrap();
+        drop(tx);
+        let wire = read_to_eof(&mut conn).await;
+        let expected = match framing {
+            TcpFraming::Lines => format!("{}\n", json_s(3)).into_bytes(),
+            TcpFraming::LengthPrefixed => prefixed(json_s(3).as_bytes(), PrefixWidth::U32),
+        };
+        assert_eq!(wire, expected, "{framing:?}");
+        task.await.unwrap();
+        let snap = diag.snapshot();
+        assert_eq!(snap.tcp_sink_sent, 1, "{framing:?}");
+        assert_eq!(snap.tcp_sink_dropped_bad, 0, "{framing:?}");
+        assert_eq!(outbox.acked(), 1, "the refused batch is not acknowledged");
+        drop(cancel);
+    }
+}
+
+#[test]
+fn tcp_sink_reservation_saturates_and_counts_writer_frame_and_header() {
+    let mut huge = TcpSinkConfig::new("127.0.0.1", 1);
+    huge.client.max_frame_bytes = usize::MAX;
+    huge.queue_capacity = usize::MAX;
+    assert_eq!(huge.reservation(), usize::MAX);
+    assert!(huge.check_reservation_budget(usize::MAX).is_err());
+
+    let json = TcpSinkConfig::new("127.0.0.1", 1);
+    let frame = json.client.frame_bytes();
+    assert_eq!(
+        json.reservation(),
+        json.client.connection_reservation() + (json.queue_capacity + 1) * frame
+    );
+    let mut csv = json.clone();
+    csv.payload_format = csv_format(sparrow_formats::CsvRole::Encode, true, false);
+    assert_eq!(csv.reservation(), json.reservation() + frame, "header slot");
 }

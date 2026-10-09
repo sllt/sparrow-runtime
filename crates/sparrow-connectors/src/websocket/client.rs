@@ -387,10 +387,11 @@ impl std::fmt::Debug for BoundClient {
 }
 
 impl BoundClient {
-    /// One bounded connect attempt: TCP, TLS (wss), HTTP upgrade.
+    /// One connect attempt: TCP, TLS (wss) and the HTTP upgrade together
+    /// within `connect_timeout`.
     pub(crate) async fn connect(&self) -> std::result::Result<WsStream, ConnectFailure> {
-        let timeout = self.config.connect_timeout;
-        let io = connect_stream(&self.target, self.tls.as_ref(), timeout, None).await?;
+        let deadline = tokio::time::Instant::now() + self.config.connect_timeout;
+        let io = connect_stream(&self.target, self.tls.as_ref(), deadline, None).await?;
         let mut request = self
             .config
             .url
@@ -407,8 +408,8 @@ impl BoundClient {
                 HeaderValue::from_str(&offered).map_err(|_| ConnectFailure::Handshake)?,
             );
         }
-        let (ws, _response) = tokio::time::timeout(
-            timeout,
+        let (ws, _response) = tokio::time::timeout_at(
+            deadline,
             tokio_tungstenite::client_async_with_config(
                 request,
                 io,

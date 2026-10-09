@@ -1042,7 +1042,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
     }
     if s.sink_kind == "tcp" {
         value["tcp_sink"] = json!({"sent":io.tcp_sink_sent,"bytes_written":io.tcp_sink_bytes_written,"dropped_bad":io.tcp_sink_dropped_bad,
-            "dropped_oversize":io.tcp_sink_dropped_oversize,"dropped_overflow":io.tcp_sink_dropped_overflow,"backpressure_waits":io.tcp_sink_backpressure_waits,
+            "dropped_oversize":io.tcp_sink_dropped_oversize,"dropped_budget":io.tcp_sink_dropped_budget,"dropped_overflow":io.tcp_sink_dropped_overflow,"backpressure_waits":io.tcp_sink_backpressure_waits,
             "send_failed":io.tcp_sink_send_failed,"send_timeouts":io.tcp_sink_send_timeouts,"discarded_on_close":io.tcp_sink_discarded_on_close,
             "connects":io.tcp_sink_connects,"reconnects":io.tcp_sink_reconnects,"disconnects":io.tcp_sink_disconnects,
             "connect_failures":io.tcp_sink_connect_failures,"ignored_bytes":io.tcp_sink_ignored_bytes,"closes":io.tcp_sink_closes,
@@ -1473,6 +1473,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
         ("tcp_sink_bytes_written", io.tcp_sink_bytes_written),
         ("tcp_sink_dropped_bad", io.tcp_sink_dropped_bad),
         ("tcp_sink_dropped_oversize", io.tcp_sink_dropped_oversize),
+        ("tcp_sink_dropped_budget", io.tcp_sink_dropped_budget),
         ("tcp_sink_dropped_overflow", io.tcp_sink_dropped_overflow),
         (
             "tcp_sink_backpressure_waits",

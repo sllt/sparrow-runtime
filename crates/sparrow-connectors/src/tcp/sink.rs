@@ -43,6 +43,7 @@ use super::framing::{PrefixWidth, TcpFraming};
 use crate::capabilities::{refuse_durable_recovery, ConnectorCapabilities};
 use crate::diag::IoDiagnostics;
 use crate::net::{reconnect_delay, NetStream};
+use crate::scratch::{encode_csv_record_charged, encode_row_charged, EncodeRejected};
 use crate::TargetPolicy;
 
 const MAX_OUTBOX: usize = 4096;
@@ -108,15 +109,20 @@ impl TcpSinkConfig {
         self.client.validate(policy)
     }
 
-    fn frame_bytes(&self) -> usize {
-        self.client.max_frame_bytes + self.client.prefix_width.bytes()
-    }
-
-    /// Connection buffers plus a full send queue of maximal frames.
+    /// Connection buffers, a full send queue of maximal frames, the frame
+    /// the writer is sending, and (CSV over lines) the cached header line.
+    /// The frame being encoded is charged separately while it is built.
     pub fn reservation(&self) -> usize {
+        let frame = self.client.frame_bytes();
+        let header = if self.per_connection_header() {
+            frame
+        } else {
+            0
+        };
         self.client
             .connection_reservation()
-            .saturating_add(self.queue_capacity.saturating_mul(self.frame_bytes()))
+            .saturating_add(self.queue_capacity.saturating_add(1).saturating_mul(frame))
+            .saturating_add(header)
     }
 
     pub fn check_reservation_budget(&self, reservation_budget: usize) -> Result<()> {
@@ -130,7 +136,7 @@ impl TcpSinkConfig {
     }
 
     /// CSV over lines writes a header per connection.
-    fn per_connection_header(&self) -> bool {
+    pub(crate) fn per_connection_header(&self) -> bool {
         self.client.framing == TcpFraming::Lines
             && self.payload_format.as_csv().is_some_and(|c| c.header())
     }
@@ -140,7 +146,10 @@ pub struct TcpSink {
     pub config: TcpSinkConfig,
     pub diag: Arc<IoDiagnostics>,
     client: BoundTcp,
-    /// CSV header line, set by the pump from the first batch schema.
+    /// Job ledger: per-row encode scratch and the frame being built.
+    owner: Arc<MemoryOwner>,
+    /// CSV header line, set by the pump from the first batch schema (at most
+    /// `max_frame_bytes`, charged in the static reservation).
     header: OnceLock<Vec<u8>>,
     _lease: MemoryLease,
 }
@@ -175,6 +184,25 @@ impl Drop for BatchReceipt {
 enum Rejected {
     Bad,
     Oversize,
+    /// The job reservation could not cover the encode working set.
+    Budget,
+}
+
+impl From<EncodeRejected> for Rejected {
+    fn from(e: EncodeRejected) -> Self {
+        match e {
+            EncodeRejected::Bad => Self::Bad,
+            EncodeRejected::Oversize => Self::Oversize,
+            EncodeRejected::Budget => Self::Budget,
+        }
+    }
+}
+
+/// Grow `lease` by `extra` bytes before allocating them.
+fn charge_more(lease: &mut MemoryLease, extra: usize) -> std::result::Result<(), Rejected> {
+    lease
+        .grow_to(lease.bytes().saturating_add(extra))
+        .map_err(|_| Rejected::Budget)
 }
 
 enum Queued {
@@ -211,6 +239,7 @@ impl TcpSink {
             config,
             diag,
             client,
+            owner,
             header: OnceLock::new(),
             _lease: lease,
         })
@@ -276,20 +305,31 @@ impl TcpSink {
         }
     }
 
-    /// Encode one row into a complete wire frame.
+    /// Encode one row into a complete wire frame. The encoder scratch and
+    /// every output growth are charged before allocating, the encoded output
+    /// is capped at `max_frame_bytes` (plus a line terminator), and the
+    /// returned lease covers the frame until it sits in the pre-charged
+    /// send queue.
     fn frame(
         &self,
         schema: &Schema,
         row: &sparrow_model::Row,
-    ) -> std::result::Result<Vec<u8>, Rejected> {
+    ) -> std::result::Result<(Vec<u8>, MemoryLease), Rejected> {
         let cfg = &self.client.config;
-        let encoded = match (self.config.payload_format.as_csv(), cfg.framing) {
-            (Some(csv), TcpFraming::Lines) => csv.encode_record(schema, row),
-            _ => self.config.payload_format.encode_row(schema, row),
-        }
-        .map_err(|_| {
-            self.diag.csv_encode_error(&self.config.payload_format);
-            Rejected::Bad
+        let limit = cfg.frame_limit();
+        let format = &self.config.payload_format;
+        let encoded = match (format.as_csv(), cfg.framing) {
+            // The record terminator (`\n` or `\r\n`) is stripped below.
+            (Some(csv), TcpFraming::Lines) => {
+                encode_csv_record_charged(&self.owner, csv, schema, row, limit.saturating_add(2))
+            }
+            _ => encode_row_charged(&self.owner, format, schema, row, limit),
+        };
+        let (encoded, mut lease) = encoded.map_err(|e| {
+            if e == EncodeRejected::Bad {
+                self.diag.csv_encode_error(format);
+            }
+            Rejected::from(e)
         })?;
         match cfg.framing {
             TcpFraming::Lines => {
@@ -300,7 +340,7 @@ impl TcpSink {
                 if line.last() == Some(&b'\r') {
                     line.pop();
                 }
-                if line.len() > cfg.frame_limit() {
+                if line.len() > limit {
                     return Err(Rejected::Oversize);
                 }
                 if line.contains(&b'\n') || line.last() == Some(&b'\r') {
@@ -308,20 +348,38 @@ impl TcpSink {
                     // would split it on the wire.
                     return Err(Rejected::Bad);
                 }
+                if line.len() == line.capacity() {
+                    // Charge the reallocation (old + new buffer) first.
+                    charge_more(&mut lease, line.len().saturating_add(1))?;
+                    line.try_reserve_exact(1).map_err(|_| Rejected::Budget)?;
+                }
                 line.push(b'\n');
-                Ok(line)
+                Ok((line, lease))
             }
             TcpFraming::LengthPrefixed => {
-                if encoded.len() > cfg.frame_limit() {
+                if encoded.len() > limit {
                     return Err(Rejected::Oversize);
                 }
-                let mut frame = Vec::with_capacity(cfg.prefix_width.bytes() + encoded.len());
+                let total = cfg.prefix_width.bytes().saturating_add(encoded.len());
+                charge_more(&mut lease, total)?;
+                let mut frame = Vec::new();
+                frame
+                    .try_reserve_exact(total)
+                    .map_err(|_| Rejected::Budget)?;
+                // `limit` never exceeds what the prefix can express
+                // (validate refuses it), so these conversions are exact.
                 match cfg.prefix_width {
-                    PrefixWidth::U16 => frame.extend((encoded.len() as u16).to_be_bytes()),
-                    PrefixWidth::U32 => frame.extend((encoded.len() as u32).to_be_bytes()),
+                    PrefixWidth::U16 => {
+                        let n = u16::try_from(encoded.len()).map_err(|_| Rejected::Oversize)?;
+                        frame.extend(n.to_be_bytes())
+                    }
+                    PrefixWidth::U32 => {
+                        let n = u32::try_from(encoded.len()).map_err(|_| Rejected::Oversize)?;
+                        frame.extend(n.to_be_bytes())
+                    }
                 }
-                frame.extend(encoded);
-                Ok(frame)
+                frame.extend_from_slice(&encoded);
+                Ok((frame, lease))
             }
         }
     }
@@ -342,18 +400,17 @@ impl TcpSink {
             batch.origin(),
         );
         let schema = batch.schema();
-        if self.config.per_connection_header() && self.header.get().is_none() {
-            if let Some(Ok(mut header)) = self
-                .config
-                .payload_format
-                .as_csv()
-                .map(|c| c.encode_header(schema))
-            {
-                if header.last() != Some(&b'\n') {
-                    header.push(b'\n');
-                }
-                let _ = self.header.set(header);
+        if let Err(kind) = self.ensure_header(schema) {
+            // Without its header a CSV document is unusable: the batch is
+            // not sent (and not acknowledged).
+            let rows = batch.num_rows() as u64;
+            match kind {
+                Rejected::Oversize => &self.diag.tcp_sink_dropped_oversize,
+                Rejected::Bad => &self.diag.tcp_sink_dropped_bad,
+                Rejected::Budget => &self.diag.tcp_sink_dropped_budget,
             }
+            .fetch_add(rows, Ordering::Relaxed);
+            return true;
         }
         let mut all = true;
         for (i, row) in batch.rows().iter().enumerate() {
@@ -362,19 +419,18 @@ impl TcpSink {
             self.diag
                 .observation
                 .record(Latency::Encode, started.elapsed());
-            let frame = match framed {
-                Ok(frame) => frame,
+            // The lease covers the frame until it is in the queue (whose
+            // slots are part of the static reservation).
+            let (frame, _frame_lease) = match framed {
+                Ok(framed) => framed,
                 Err(kind) => {
                     all = false;
-                    if kind == Rejected::Oversize {
-                        self.diag
-                            .tcp_sink_dropped_oversize
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        self.diag
-                            .tcp_sink_dropped_bad
-                            .fetch_add(1, Ordering::Relaxed);
+                    match kind {
+                        Rejected::Oversize => &self.diag.tcp_sink_dropped_oversize,
+                        Rejected::Bad => &self.diag.tcp_sink_dropped_bad,
+                        Rejected::Budget => &self.diag.tcp_sink_dropped_budget,
                     }
+                    .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             };
@@ -395,6 +451,29 @@ impl TcpSink {
             receipt.ack();
         }
         true
+    }
+
+    /// CSV over lines: build the per-connection header line once. Its length
+    /// is computed without allocating and must fit `max_frame_bytes`, which
+    /// is the header slot charged in [`TcpSinkConfig::reservation`].
+    fn ensure_header(&self, schema: &Schema) -> std::result::Result<(), Rejected> {
+        if !self.config.per_connection_header() || self.header.get().is_some() {
+            return Ok(());
+        }
+        let Some(csv) = self.config.payload_format.as_csv() else {
+            return Ok(());
+        };
+        let len = csv.header_len(schema).map_err(|_| Rejected::Bad)?;
+        if len > self.client.config.frame_limit() {
+            return Err(Rejected::Oversize);
+        }
+        let mut header = csv.encode_header(schema).map_err(|_| Rejected::Bad)?;
+        while matches!(header.last(), Some(b'\n' | b'\r')) {
+            header.pop();
+        }
+        header.push(b'\n');
+        let _ = self.header.set(header);
+        Ok(())
     }
 
     async fn enqueue(
@@ -576,21 +655,23 @@ impl TcpSink {
                         .tcp_sink_queue_items
                         .fetch_sub(1, Ordering::Relaxed);
                     // CSV over lines: the connection's header goes out with
-                    // its first record, in one bounded write.
-                    let frame = match self.header.get().filter(|_| header_pending) {
-                        Some(header) => [header.as_slice(), &frame].concat(),
-                        None => frame,
-                    };
+                    // its first record, in the same bounded send (no copy).
+                    let head = self
+                        .header
+                        .get()
+                        .filter(|_| header_pending)
+                        .map(Vec::as_slice);
                     header_pending = false;
                     match self
-                        .send_bounded(&mut stream, &frame, cancel, &mut flush_deadline)
+                        .send_bounded(&mut stream, head, &frame, cancel, &mut flush_deadline)
                         .await
                     {
                         Sent::Ok => {
+                            let written = frame.len().saturating_add(head.map_or(0, <[u8]>::len));
                             self.diag.tcp_sink_sent.fetch_add(1, Ordering::Relaxed);
                             self.diag
                                 .tcp_sink_bytes_written
-                                .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                .fetch_add(written as u64, Ordering::Relaxed);
                             self.diag.observation.progress(false, 1);
                         }
                         Sent::Failed => {
@@ -619,17 +700,21 @@ impl TcpSink {
         }
     }
 
-    /// Write one frame within `send_timeout`, cut short by the flush
-    /// deadline once the job stops.
+    /// Write one frame (after `head`, the connection's CSV header) within
+    /// `send_timeout`, cut short by the flush deadline once the job stops.
     async fn send_bounded(
         &self,
         stream: &mut NetStream,
+        head: Option<&[u8]>,
         frame: &[u8],
         cancel: &CancellationToken,
         flush_deadline: &mut Option<Instant>,
     ) -> Sent {
         let send_deadline = Instant::now() + self.config.send_timeout;
         let send = async {
+            if let Some(head) = head {
+                stream.write_all(head).await?;
+            }
             stream.write_all(frame).await?;
             stream.flush().await
         };

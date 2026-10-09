@@ -135,16 +135,17 @@ impl ConnectFailure {
     }
 }
 
-/// One bounded TCP connect (+ TLS when `tls` is set). `keepalive` enables
+/// One TCP connect (+ TLS when `tls` is set), all steps within one
+/// `deadline` (a caller's later handshake may share it). `keepalive` enables
 /// TCP keepalive probes after that much idle time.
 pub(crate) async fn connect_stream(
     endpoint: &Endpoint,
     tls: Option<&TlsClient>,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
     keepalive: Option<Duration>,
 ) -> std::result::Result<NetStream, ConnectFailure> {
-    let tcp = tokio::time::timeout(
-        timeout,
+    let tcp = tokio::time::timeout_at(
+        deadline,
         TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
     )
     .await
@@ -162,7 +163,7 @@ pub(crate) async fn connect_stream(
     match tls {
         None => Ok(Box::pin(tcp)),
         Some(tls) => Ok(Box::pin(
-            tokio::time::timeout(timeout, tls.connector.connect(tls.name.clone(), tcp))
+            tokio::time::timeout_at(deadline, tls.connector.connect(tls.name.clone(), tcp))
                 .await
                 .map_err(|_| ConnectFailure::Timeout)?
                 .map_err(|_| ConnectFailure::Tls)?,
@@ -180,7 +181,7 @@ pub fn reconnect_delay(attempt: usize, max: Duration) -> Duration {
         .max(Duration::from_millis(1));
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
     hasher.write_usize(attempt);
-    let half = delay.as_nanos() as u64 / 2;
+    let half = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX) / 2;
     Duration::from_nanos(half + hasher.finish() % (half + 1))
 }
 
@@ -199,6 +200,13 @@ mod tests {
         let spread: std::collections::HashSet<_> =
             (0..32).map(|_| reconnect_delay(6, max)).collect();
         assert!(spread.len() > 1, "jitter must vary the delay");
+        // Huge inputs saturate instead of overflowing or panicking.
+        let capped = Duration::from_millis(100 << 16);
+        for attempt in [usize::MAX, usize::MAX - 1, 1 << 40] {
+            let d = reconnect_delay(attempt, Duration::MAX);
+            assert!(d >= capped / 2 && d <= capped, "{d:?}");
+        }
+        assert!(reconnect_delay(1, Duration::ZERO) <= Duration::from_millis(1));
     }
 
     #[test]

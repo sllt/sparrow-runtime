@@ -216,6 +216,24 @@ fn tcp_spec_matrix_rejects_mixed_fields_and_durable_claims() {
     v["source"]["tcp"]["oversize"] = json!("disconnect");
     v["source"]["tcp"]["keepalive_ms"] = json!(30000);
     code(&v).unwrap();
+    // length_bytes 2: an omitted max_frame_bytes defaults to what the
+    // prefix can express; an explicit larger value is refused, not clamped.
+    let spec = parse(&v).unwrap();
+    let sink = spec.sink.tcp.as_ref().unwrap().connector_config(8).client;
+    assert_eq!(sink.max_frame_bytes, 65535);
+    let source = spec.source.tcp.as_ref().unwrap().client_config();
+    assert_eq!(
+        source.max_frame_bytes,
+        sparrow_connectors::tcp::MAX_FRAME_BYTES
+    );
+    v["sink"]["tcp"]["max_frame_bytes"] = json!(65536);
+    assert_eq!(
+        code(&v),
+        Err(BoundExceeded),
+        "u16 prefix cannot express 65536"
+    );
+    v["sink"]["tcp"]["max_frame_bytes"] = json!(65535);
+    code(&v).unwrap();
 
     // Framing x formats.
     let mut v = base.clone();

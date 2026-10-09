@@ -32,7 +32,7 @@ pub struct TcpClientConfig {
     /// built-in web PKI roots.
     pub tls: bool,
     pub tls_ca_pem: Option<String>,
-    /// TCP connect and TLS handshake, each bounded by this.
+    /// TCP connect and TLS handshake together, bounded by this.
     pub connect_timeout: Duration,
     /// TCP keepalive idle time; `None` = off.
     pub keepalive: Option<Duration>,
@@ -79,6 +79,16 @@ impl TcpClientConfig {
                 "TCP bounds: connect_timeout_ms 100..=60000, keepalive_ms 1000..=7200000, reconnect_max_ms 100..=300000, reconnect_attempts 1..=1000, max_frame_bytes 16..=65536",
             ));
         }
+        if self.framing == TcpFraming::LengthPrefixed
+            && self.max_frame_bytes > self.prefix_width.max_len()
+        {
+            // Refused, never clamped: the configured limit must be one the
+            // prefix can express.
+            return Err(error(
+                ErrorCode::BoundExceeded,
+                "TCP max_frame_bytes exceeds what length_bytes can express (length_bytes 2: <=65535)",
+            ));
+        }
         let valid_host = !self.host.is_empty()
             && self.host.len() <= 253
             && (self.host.parse::<std::net::IpAddr>().is_ok()
@@ -107,21 +117,24 @@ impl TcpClientConfig {
         Ok(())
     }
 
-    /// Effective record limit: `max_frame_bytes`, capped by what a 2-byte
-    /// prefix can express.
+    /// Record limit: `max_frame_bytes` (validate refuses a value the prefix
+    /// cannot express; nothing is clamped).
     pub fn frame_limit(&self) -> usize {
-        match self.framing {
-            TcpFraming::Lines => self.max_frame_bytes,
-            TcpFraming::LengthPrefixed => self.max_frame_bytes.min(self.prefix_width.max_len()),
-        }
+        self.max_frame_bytes
+    }
+
+    /// Largest wire frame: a record plus its prefix or `\r\n` terminator.
+    pub fn frame_bytes(&self) -> usize {
+        self.max_frame_bytes
+            .saturating_add(self.prefix_width.bytes().max(2))
     }
 
     /// Per-connection ledger charge: fixed state, the fixed read buffer and
-    /// one frame being written.
+    /// one frame being written. Saturating.
     pub fn connection_reservation(&self) -> usize {
         CONNECTION_FIXED_RESERVATION
             .saturating_add(FrameReader::capacity(self.frame_limit(), self.prefix_width))
-            .saturating_add(self.max_frame_bytes + self.prefix_width.bytes())
+            .saturating_add(self.frame_bytes())
     }
 
     /// Validate and pre-build the TLS settings.
@@ -166,12 +179,13 @@ impl std::fmt::Debug for BoundTcp {
 }
 
 impl BoundTcp {
-    /// One bounded connect attempt (TCP, then TLS when configured).
+    /// One connect attempt (TCP, then TLS when configured) within
+    /// `connect_timeout` in total.
     pub(crate) async fn connect(&self) -> std::result::Result<NetStream, ConnectFailure> {
         connect_stream(
             &self.endpoint,
             self.tls.as_ref(),
-            self.config.connect_timeout,
+            tokio::time::Instant::now() + self.config.connect_timeout,
             self.config.keepalive,
         )
         .await
@@ -245,9 +259,43 @@ mod tests {
         );
         ca.tls_ca_pem = Some(String::from_utf8(super::super::tls_fixture::CA.to_vec()).unwrap());
         ca.validate(&p).unwrap();
+        // length_bytes 2 with a limit above 65535 is refused, not clamped.
         let mut narrow = ok.clone();
         narrow.framing = TcpFraming::LengthPrefixed;
         narrow.prefix_width = PrefixWidth::U16;
+        narrow.max_frame_bytes = 65536;
+        let e = narrow.validate(&p).unwrap_err();
+        assert_eq!(e.code, ErrorCode::BoundExceeded);
+        assert!(e.message.contains("length_bytes"), "{e}");
+        narrow.max_frame_bytes = 65535;
+        narrow.validate(&p).unwrap();
         assert_eq!(narrow.frame_limit(), 65535);
+        // The same limit is fine for 4-byte prefixes and lines.
+        narrow.max_frame_bytes = 65536;
+        narrow.prefix_width = PrefixWidth::U32;
+        narrow.validate(&p).unwrap();
+        narrow.framing = TcpFraming::Lines;
+        narrow.prefix_width = PrefixWidth::U16;
+        narrow.validate(&p).unwrap();
+    }
+
+    #[test]
+    fn tcp_reservation_math_saturates_on_huge_values() {
+        let p = TargetPolicy::allow("127.0.0.1", 9000);
+        let mut huge = TcpClientConfig::new("127.0.0.1", 9000);
+        huge.max_frame_bytes = usize::MAX;
+        for framing in [TcpFraming::Lines, TcpFraming::LengthPrefixed] {
+            huge.framing = framing;
+            assert_eq!(huge.frame_bytes(), usize::MAX);
+            assert_eq!(huge.connection_reservation(), usize::MAX);
+            assert_eq!(
+                huge.validate(&p).unwrap_err().code,
+                ErrorCode::BoundExceeded
+            );
+        }
+        for width in [PrefixWidth::U16, PrefixWidth::U32] {
+            assert_eq!(FrameReader::capacity(usize::MAX, width), usize::MAX);
+            assert_eq!(FrameReader::capacity(usize::MAX - 1, width), usize::MAX);
+        }
     }
 }

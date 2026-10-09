@@ -65,13 +65,13 @@ listen 模式单独立项。现在需要被推送时，可让推送方使用 `ht
 | `port` | 必填 | 1..=65535 | |
 | `tls` | `false` | | rustls，强制证书与主机名校验，没有“跳过校验”选项 |
 | `tls_ca_pem` | 无 | 内联 PEM，1..=16 张证书，≤ 64 KiB | **替换**内置 web PKI 根（私有 CA / 自签名）；需要 `tls: true` |
-| `connect_timeout_ms` | 5000 | 100..=60000 | TCP 连接与 TLS 握手各自的时限 |
+| `connect_timeout_ms` | 5000 | 100..=60000 | TCP 连接 + TLS 握手的总时限（一个截止时间，两步共用） |
 | `keepalive_ms` | 无（关闭） | 1000..=7200000 | 开启 TCP keepalive，空闲这么久后开始探测（探测间隔取 min(该值, 75 s)） |
 | `reconnect_max_ms` | 5000 | 100..=300000 | 重连退避上限 |
 | `reconnect_attempts` | 10 | 1..=1000（拒绝 0 = 无限） | 一次断线内连续失败的次数上限；连接成功后清零 |
 | `framing` | `lines` | `lines` / `length_prefixed` | 见“分帧” |
 | `length_bytes` | 4 | 2 / 4 | 长度前缀宽度（大端），只能与 `length_prefixed` 一起写 |
-| `max_frame_bytes` | 65536 | 16..=65536 | 单条记录上限（行不含换行符 / 帧不含前缀）；`length_bytes: 2` 时实际上限为 65535 |
+| `max_frame_bytes` | 65536（`length_prefixed` + `length_bytes: 2` 时 65535） | 16..=65536 | 单条记录上限（行不含换行符 / 帧不含前缀）；`length_bytes: 2` 时显式写大于 65535 的值以 `BoundExceeded` **拒绝**，不会被静默截到 65535 |
 
 Source 专有：`oversize`（`resync` 默认 / `disconnect`）、`idle_timeout_ms`
 （默认 60000，100..=86400000）、`inbox_bytes`（默认 256 KiB）。Source 级的 `format`、
@@ -90,7 +90,8 @@ Sink 专有：`queue_capacity`（默认 16，1..=1024）、`overflow`（`block` 
 ### `lines`
 
 - 一条记录 = 以 `\n` 结尾的一行；行尾的 `\r` 一并去掉（接受 `\r\n`）。
-- 空行和只含空白的行跳过，不计数。
+- 空行和只含 JSON 空白（空格、`\t`、`\r`）的行跳过，不计数；其他字节（如 `\x0b`、
+  `\x0c`、Unicode 空白）不算空白，按记录解码（通常计 `dropped_bad`）。
 - 长度检查在解码之前：缓冲区中超过 `max_frame_bytes` 仍没有换行即判为超长，
   不会继续缓冲（读缓冲是固定大小的，不会增长）。
 - 超长处理：`resync` 计 `dropped_oversize`，丢弃到下一个 `\n` 后继续；
@@ -114,8 +115,15 @@ Sink 专有：`queue_capacity`（默认 16，1..=1024）、`overflow`（`block` 
 
 - `lines`：编码结果去掉末尾的 `\n` / `\r` 后加一个 `\n`。编码结果中间含 `\n`
   或以 `\r` 结尾（去掉 `\n` 后）的行计 `dropped_bad` 并丢弃——否则会在对端被切成两条。
-- `length_prefixed`：大端长度 + 负载；超过 `max_frame_bytes`（或 2 字节前缀可表达的上限）
-  的行计 `dropped_oversize` 并丢弃。
+- `length_prefixed`：大端长度 + 负载；超过 `max_frame_bytes` 的行计 `dropped_oversize`
+  并丢弃（`max_frame_bytes` 不会超过前缀可表达的上限，见上表）。
+- 编码前先把编码器工作集记入 job reservation，输出缓冲每次扩容也先记账，输出在
+  `max_frame_bytes`（行模式另加换行符）处截停，不会先完整编码再检查长度；额度不足的行计
+  `tcp_sink_dropped_budget` 并丢弃，该批次不回执。这份额度一直持有到帧放进发送队列
+  （队列槽位本身在静态 reservation 里）。
+- CSV over `lines` 的表头：长度先不分配地算出，超过 `max_frame_bytes` 时整批计
+  `dropped_oversize`、不发送、不回执（没有表头的 CSV 文档无法使用）。表头与该连接的第一条
+  记录在同一次有界发送中先后写出，不拼接复制。
 
 ## 格式
 
@@ -129,6 +137,12 @@ Sink 专有：`queue_capacity`（默认 16，1..=1024）、`overflow`（`block` 
 Source 中表头无效（与 schema 不符等）计 `dropped_bad`（及 `csv_*` 细分），并断开重连，
 以便在新连接上拿到新的表头。解码失败计 `tcp_source_dropped_bad`（及 `csv_*` 细分），
 `fail_on_decode: true` 时 job 失败。所有记录另受 64 KiB 解码上限约束。
+
+解码顺序：先按长度（不分配）检查格式上限（JSON 为 `max_bytes`，CSV 另受
+`max_record_bytes` 约束），再把该格式的解码工作集记入 job reservation，然后才解析
+（表头和记录都一样）。额度不足的记录计 `tcp_source_dropped_budget`、不解析；
+如果是 CSV over `lines` 的表头拿不到额度，则断开重连（原因 `tcp_csv_header_budget`），
+避免把下一行误当成表头。
 
 ## 空闲、keepalive 与重连
 
@@ -177,7 +191,10 @@ Source 中表头无效（与 schema 不符等）计 `dropped_bad`（及 `csv_*` 
 
 - 每个连接：64 KiB 固定开销 + 固定读缓冲（`max_frame_bytes` + 前缀 + 16 KiB）
   + 一帧（`max_frame_bytes` + 前缀），必须 ≤ job reservation 的一半。默认约 208 KiB。
-- Sink 另加 `queue_capacity × (max_frame_bytes + 前缀)`。默认（16 × 64 KiB）+ 连接 ≈ 1.2 MiB。
+- Sink 另加 `(queue_capacity + 1) × (max_frame_bytes + 前缀)`（满队列 + writer 正在写的一帧），
+  CSV over `lines` 再加一帧大小的表头槽位。默认 JSON：17 × 64 KiB + 连接 ≈ 1.27 MiB。
+  正在编码的那一帧不在静态额度里，而是按行单独记账（见上文 Sink）。
+- 所有额度计算都是饱和运算（`usize::MAX` 有测试），溢出只会导致校验拒绝，不会回绕。
 - 在 `bind` / 运行时记入 job reservation；pipeline 中所有 TCP / WebSocket / NATS /
   JetStream / DataBus 端点合计 ≤ reservation 的 3/4，超出在校验时返回 `BoundExceeded`。
 - Source 的 inbox 按 `inbox_bytes` 计入 queue 账本。
@@ -195,7 +212,7 @@ replay `unsupported`。spec 中的 `aligned`、`checkpoint`、`checkpoint_dir`�
 pipeline status 中的 `tcp_source` / `tcp_sink` 对象，`/metrics` 的 io 字段：
 
 - Source：`tcp_source_{received,rows,bytes_read,dropped_bad,dropped_oversize,dropped_partial,dropped_budget,backpressure_waits,connects,reconnects,disconnects,connect_failures,idle_timeouts,inbox_items,inbox_bytes}`
-- Sink：`tcp_sink_{sent,bytes_written,dropped_bad,dropped_oversize,dropped_overflow,backpressure_waits,send_failed,send_timeouts,discarded_on_close,connects,reconnects,disconnects,connect_failures,ignored_bytes,closes,close_failed,fatal,queue_items}`
+- Sink：`tcp_sink_{sent,bytes_written,dropped_bad,dropped_oversize,dropped_budget,dropped_overflow,backpressure_waits,send_failed,send_timeouts,discarded_on_close,connects,reconnects,disconnects,connect_failures,ignored_bytes,closes,close_failed,fatal,queue_items}`
 
 健康状态：断线时为 `Reconnecting`，重连耗尽或 `fail_on_decode` 时为 `Failed`。
 

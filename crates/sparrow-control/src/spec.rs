@@ -1005,9 +1005,15 @@ fn tcp_client(
         Some(2) => PrefixWidth::U16,
         _ => PrefixWidth::U32,
     };
-    if let Some(n) = max_frame_bytes {
-        c.max_frame_bytes = n;
-    }
+    // An omitted limit defaults to what the prefix can express (65535 for
+    // length_bytes 2); an explicit value above it is refused by validate.
+    c.max_frame_bytes = match max_frame_bytes {
+        Some(n) => n,
+        None if c.framing == TcpFraming::LengthPrefixed => {
+            c.max_frame_bytes.min(c.prefix_width.max_len())
+        }
+        None => c.max_frame_bytes,
+    };
     c
 }
 

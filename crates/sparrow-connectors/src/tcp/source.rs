@@ -10,6 +10,11 @@
 //!   counted `dropped_oversize` and skipped (`resync`) or close the
 //!   connection (`disconnect`). A record cut off by EOF is counted
 //!   `dropped_partial`, never decoded.
+//! - Before a record (or CSV header) is parsed, its length is checked against
+//!   the format limit without allocating, then the decode working set is
+//!   charged to the job Reservation ledger; without credit the record is
+//!   counted `dropped_budget` and not parsed (an uncharged CSV header ends
+//!   the connection so the next line is not mistaken for it).
 //! - Rows enter the byte-accounted Kernel ingress one at a time; while the
 //!   inbox is full the Source stops reading (TCP backpressure on the peer).
 //!   No bytes within `idle_timeout` while waiting to read closes the
@@ -167,8 +172,9 @@ enum SessionEnd {
 enum Ingested {
     Continue,
     Stop,
-    /// The connection's CSV header is unusable: reconnect for a new one.
-    BadHeader,
+    /// The connection's CSV header is unusable (or could not be charged):
+    /// reconnect so the next line is never mistaken for the header.
+    Lost(&'static str),
 }
 
 impl TcpSource {
@@ -369,7 +375,7 @@ impl TcpSource {
                         let _ = tokio::time::timeout(CLOSE_TIMEOUT, stream.shutdown()).await;
                         return Ok(SessionEnd::Stop);
                     }
-                    Ingested::BadHeader => return Ok(SessionEnd::Lost("tcp_csv_header_invalid")),
+                    Ingested::Lost(reason) => return Ok(SessionEnd::Lost(reason)),
                 }
             }
             // Time spent blocked on our own bounded ingress is not idleness.
@@ -427,17 +433,36 @@ impl TcpSource {
         cancel: &CancellationToken,
         received_at: std::time::Instant,
     ) -> Result<Ingested> {
-        if record.len() > self.config.json_limits.max_bytes {
+        let format = &self.config.payload_format;
+        // Allocation-free length check first.
+        if record.len() > format.max_message_bytes(&self.config.json_limits) {
             self.diag
                 .tcp_source_dropped_oversize
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(Ingested::Continue);
         }
-        let started = std::time::Instant::now();
-        let lines_csv = match self.config.payload_format.as_csv() {
+        let lines_csv = match format.as_csv() {
             Some(csv) if self.client.config.framing == TcpFraming::Lines => Some(csv),
             _ => None,
         };
+        // Format-specific parser + Row working set, charged before parsing
+        // (header or record) and held until the row is admitted or dropped.
+        let estimate = match lines_csv {
+            Some(csv) => csv.decode_scratch(&self.config.schema, record.len()),
+            None => format.decode_scratch(&self.config.schema, record.len()),
+        };
+        let Ok(_scratch) = ingress.owner.acquire(CreditKind::Reservation, estimate) else {
+            self.diag
+                .tcp_source_dropped_budget
+                .fetch_add(1, Ordering::Relaxed);
+            if lines_csv.is_some() && mapping.is_none() {
+                // The header was not parsed; the next line must not be
+                // taken for it.
+                return Ok(Ingested::Lost("tcp_csv_header_budget"));
+            }
+            return Ok(Ingested::Continue);
+        };
+        let started = std::time::Instant::now();
         let decoded = match (lines_csv, mapping.as_ref()) {
             (Some(csv), None) => {
                 // First line of the connection: the CSV header.
@@ -448,17 +473,14 @@ impl TcpSource {
                     }
                     Err(e) => {
                         self.bad(&e)?;
-                        return Ok(Ingested::BadHeader);
+                        return Ok(Ingested::Lost("tcp_csv_header_invalid"));
                     }
                 }
             }
             (Some(csv), Some(m)) => csv.decode_record(&self.config.schema, m, record, None),
-            (None, _) => self.config.payload_format.decode_row(
-                &self.config.schema,
-                record,
-                &self.config.json_limits,
-                None,
-            ),
+            (None, _) => {
+                format.decode_row(&self.config.schema, record, &self.config.json_limits, None)
+            }
         };
         self.diag
             .observation

@@ -177,6 +177,7 @@ pub struct IoDiagnostics {
     pub tcp_sink_bytes_written: AtomicU64,
     pub tcp_sink_dropped_bad: AtomicU64,
     pub tcp_sink_dropped_oversize: AtomicU64,
+    pub tcp_sink_dropped_budget: AtomicU64,
     pub tcp_sink_dropped_overflow: AtomicU64,
     pub tcp_sink_backpressure_waits: AtomicU64,
     pub tcp_sink_send_failed: AtomicU64,
@@ -466,6 +467,7 @@ impl IoDiagnostics {
             tcp_sink_bytes_written: self.tcp_sink_bytes_written.load(Ordering::Relaxed),
             tcp_sink_dropped_bad: self.tcp_sink_dropped_bad.load(Ordering::Relaxed),
             tcp_sink_dropped_oversize: self.tcp_sink_dropped_oversize.load(Ordering::Relaxed),
+            tcp_sink_dropped_budget: self.tcp_sink_dropped_budget.load(Ordering::Relaxed),
             tcp_sink_dropped_overflow: self.tcp_sink_dropped_overflow.load(Ordering::Relaxed),
             tcp_sink_backpressure_waits: self.tcp_sink_backpressure_waits.load(Ordering::Relaxed),
             tcp_sink_send_failed: self.tcp_sink_send_failed.load(Ordering::Relaxed),
@@ -668,6 +670,7 @@ pub struct IoSnapshot {
     pub tcp_sink_bytes_written: u64,
     pub tcp_sink_dropped_bad: u64,
     pub tcp_sink_dropped_oversize: u64,
+    pub tcp_sink_dropped_budget: u64,
     pub tcp_sink_dropped_overflow: u64,
     pub tcp_sink_backpressure_waits: u64,
     pub tcp_sink_send_failed: u64,
@@ -891,6 +894,7 @@ impl IoSnapshot {
         self.tcp_sink_bytes_written += other.tcp_sink_bytes_written;
         self.tcp_sink_dropped_bad += other.tcp_sink_dropped_bad;
         self.tcp_sink_dropped_oversize += other.tcp_sink_dropped_oversize;
+        self.tcp_sink_dropped_budget += other.tcp_sink_dropped_budget;
         self.tcp_sink_dropped_overflow += other.tcp_sink_dropped_overflow;
         self.tcp_sink_backpressure_waits += other.tcp_sink_backpressure_waits;
         self.tcp_sink_send_failed += other.tcp_sink_send_failed;

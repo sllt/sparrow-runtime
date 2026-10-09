@@ -112,9 +112,12 @@ impl FrameReader {
         }
     }
 
-    /// The fixed per-connection buffer size.
+    /// The fixed per-connection buffer size (saturating; `limit` is
+    /// validated to <= 64 KiB before a reader is built).
     pub(crate) fn capacity(limit: usize, width: PrefixWidth) -> usize {
-        limit + width.bytes().max(2) + READ_CHUNK
+        limit
+            .saturating_add(width.bytes().max(2))
+            .saturating_add(READ_CHUNK)
     }
 
     pub(crate) fn bytes(&self, range: Range<usize>) -> &[u8] {
@@ -134,7 +137,7 @@ impl FrameReader {
         if self.buf.len() - self.end < READ_CHUNK && self.start > 0 {
             self.buf.copy_within(self.start..self.end, 0);
             self.end -= self.start;
-            self.scanned -= self.start.min(self.scanned);
+            // `scanned` is relative to `start`, so it survives the move.
             self.start = 0;
         }
         debug_assert!(self.end < self.buf.len(), "drain frames before reading");
@@ -204,9 +207,11 @@ impl FrameReader {
             if line_end - line_start > self.limit {
                 return Some(Frame::Oversize);
             }
+            // Blank = only JSON whitespace (space, tab, CR; LF ends the
+            // line). Form feed / vertical tab are record bytes.
             if self.buf[line_start..line_end]
                 .iter()
-                .all(u8::is_ascii_whitespace)
+                .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
             {
                 continue;
             }
@@ -309,6 +314,47 @@ mod tests {
             got.extend(drain(&mut r));
         }
         assert_eq!(got, vec![ok("a"), ok("bb"), ok("cc")]);
+    }
+
+    #[test]
+    fn lines_blank_is_json_whitespace_only() {
+        let mut r = FrameReader::new(
+            TcpFraming::Lines,
+            PrefixWidth::U32,
+            8,
+            OversizePolicy::Resync,
+        );
+        r.push(b" \t\r\n\x0c\n\x0b\nok\n");
+        assert_eq!(drain(&mut r), vec![ok("\x0c"), ok("\x0b"), ok("ok")]);
+    }
+
+    #[tokio::test]
+    async fn lines_scan_position_survives_compaction() {
+        // A long unterminated line whose newline arrives after the buffer
+        // was compacted by `fill` is still one record.
+        let mut r = FrameReader::new(
+            TcpFraming::Lines,
+            PrefixWidth::U32,
+            48 * 1024,
+            OversizePolicy::Resync,
+        );
+        let body = vec![b'x'; 45 * 1024];
+        let mut first = b"a\n".repeat(5000);
+        first.extend(&body);
+        let mut src: &[u8] = &first;
+        while !src.is_empty() {
+            r.fill(&mut src).await.unwrap();
+            assert!(drain(&mut r).iter().all(|f| f == &ok("a")));
+        }
+        assert!(
+            r.start > 0 && r.buf.len() - r.end < READ_CHUNK,
+            "compaction due"
+        );
+        let mut src: &[u8] = b"\n";
+        r.fill(&mut src).await.unwrap();
+        assert_eq!(r.start, 0, "compacted");
+        assert_eq!(drain(&mut r), vec![Ok(body)]);
+        assert!(!r.has_partial());
     }
 
     #[test]

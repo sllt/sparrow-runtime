@@ -16,8 +16,7 @@ pub use sink::{TcpOverflow, TcpSink, TcpSinkConfig};
 pub use source::{TcpSource, TcpSourceConfig};
 
 #[cfg(test)]
-#[path = "../mqtt/tls_fixture.rs"]
-mod tls_fixture;
+use crate::http::observation_tls_fixture as tls_fixture;
 
 #[cfg(test)]
 mod tests;
