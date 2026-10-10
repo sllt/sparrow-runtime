@@ -636,6 +636,7 @@ type env struct {
 	root, serverBin, natsBin string
 	a                        api
 	serverPort               int
+	serverPortHold           net.Listener
 	server                   *child
 	sink                     *capture
 	producer                 *nats
@@ -647,6 +648,10 @@ type env struct {
 }
 
 func (v *env) start(binary string) {
+	if v.serverPortHold != nil {
+		must(v.serverPortHold.Close())
+		v.serverPortHold = nil
+	}
 	v.server = launch(binary, filepath.Join(v.root, "server.log"), []string{"SPARROW_TOKEN=" + token, "SPARROW_SECRETS_KEY=0123456789abcdef0123456789abcdef", "SPARROW_REQUIRE_SECRETS_KEY=1", "SPARROW_DATA_ROOTS=" + v.root, "SPARROW_FAULT_MARKER_DIR=" + v.faults},
 		"--bind", fmt.Sprintf("127.0.0.1:%d", v.serverPort), "--catalog", filepath.Join(v.root, "catalog.db"), "--max-jobs", "1", "--safe-mode")
 	eventually("server health", func() bool { _, s := v.a.call("GET", "/v1/health", nil); return s == 200 })
@@ -739,7 +744,13 @@ func (v *env) spec(source, shape string, ext bool) map[string]any {
 
 func setup(root, source, serverBin, natsBin string) *env {
 	must(os.MkdirAll(root, 0700))
-	v := &env{root: root, serverBin: serverBin, natsBin: natsBin, serverPort: port(), sink: newCapture(),
+	// Keep the chosen server port bound while allocating the HTTP sink,
+	// broker and proxy. A find-free-then-close port can otherwise be handed
+	// straight back to one of those fixtures before Sparrow is launched.
+	hold, e := net.Listen("tcp", "127.0.0.1:0")
+	must(e)
+	v := &env{root: root, serverBin: serverBin, natsBin: natsBin,
+		serverPort: hold.Addr().(*net.TCPAddr).Port, serverPortHold: hold, sink: newCapture(),
 		file: filepath.Join(root, "input.ndjson"), checkpoint: filepath.Join(root, "checkpoint"), faults: filepath.Join(root, "faults")}
 	must(os.MkdirAll(v.faults, 0700))
 	v.a = api{fmt.Sprintf("http://127.0.0.1:%d", v.serverPort), &http.Client{Timeout: 5 * time.Second}}
@@ -778,6 +789,10 @@ func (v *env) captureFailure() {
 }
 
 func (v *env) close() {
+	if v.serverPortHold != nil {
+		_ = v.serverPortHold.Close()
+		v.serverPortHold = nil
+	}
 	v.server.stop(syscall.SIGKILL)
 	if v.proxy != nil {
 		v.proxy.close()

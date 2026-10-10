@@ -2,9 +2,24 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"net"
 	"os"
 	"testing"
 )
+
+func TestServerPortRemainsReservedUntilStartup(t *testing.T) {
+	v := setup(t.TempDir(), "file", "unused-server", "")
+	t.Cleanup(v.close)
+	if v.serverPort == v.sink.port() {
+		t.Fatal("server and HTTP sink share the same port")
+	}
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", v.serverPort))
+	if err == nil {
+		_ = l.Close()
+		t.Fatal("another fixture could reuse the server port before startup")
+	}
+}
 
 func TestFileFixtureExistsBeforeStartingTheServer(t *testing.T) {
 	v := setup(t.TempDir(), "file", "unused-server", "")
