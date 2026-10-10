@@ -202,6 +202,9 @@ async fn publish_draft(
         if d.etag != b.draft_etag.trim_matches('"') {
             return Err(ApiError::from(cat::conflict("draft changed since review; reload and review again", Some(d.etag))));
         }
+        if d.text.contains(crate::bundles::FILL_IN) {
+            return Err(bad("draft still contains fields marked for manual fill-in (imported bundle); fill them before publishing"));
+        }
         let spec = PipelineSpec::from_json(d.text.as_bytes()).map_err(ApiError::from)?;
         if serde_json::to_vec(&spec).map(|v| v.len()).unwrap_or(usize::MAX) > MAX_BODY {
             return Err(ApiError::from(SparrowError::new(ErrorCode::BoundExceeded, "published PipelineSpec exceeds 64 KiB")));

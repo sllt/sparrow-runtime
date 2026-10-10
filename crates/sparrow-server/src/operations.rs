@@ -99,12 +99,24 @@ pub(super) async fn diagnose(
         let audit = state.store.list_audit(64).map_err(ApiError::from)?;
         let events: Vec<_> = audit.into_iter().filter(|e|e.target.as_deref()==Some(&name)).take(32)
             .map(|e|json!({"at_ms":e.at_ms,"action":e.action,"outcome":e.outcome})).collect();
+        // K5.6: structured, redacted config summary (kinds/flags only; no
+        // destinations, topics, SQL text or paths) and the error-code history.
+        let config_summary = state.store.get_pipeline(&name).ok().map(|row| {
+            let s = &row.spec;
+            json!({"latest_revision": row.latest_revision, "mode": if s.graph.is_some() {"graph"} else {"sql"},
+                "source_kind": s.source.kind, "sink_kind": s.sink.kind, "delivery": s.delivery, "recovery": s.recovery,
+                "checkpoint_policy_present": s.checkpoint.is_some(), "graph_nodes": s.graph.as_ref().map(|g| g.nodes.len()),
+                "graph_node_kinds": s.graph.as_ref().map(|g| g.nodes.iter().map(|n| n.kind.clone()).collect::<std::collections::BTreeSet<_>>()),
+                "reference_tables": s.reference_tables.len(), "external_lookups": s.external_lookups.len()})
+        });
         // Allowlist fields. Raw specs/SQL, destinations, SecretRefs, last_error
         // strings and audit details can contain user data and are not exported.
         let value = json!({"format":"sparrow-diagnostic-v1","name":name,
             "build":{"package":env!("CARGO_PKG_VERSION"),"commit":option_env!("SPARROW_BUILD_COMMIT").unwrap_or("unknown"),
                 "demo_enabled":cfg!(feature="demo-io")},
             "revision":body["revision"],
+            "config_summary":config_summary,
+            "error_codes":{"last_error_code":body["actual"]["last_error_code"],"checkpoint_last_error_code":body["checkpoint"]["last_error_code"]},
             "actual":{"revision":body["actual"]["revision"],"status":body["actual"]["status"],
                 "consecutive_failures":body["actual"]["consecutive_failures"],"restart_blocked":body["actual"]["restart_blocked"]},
             "effective":{"aligned_eligible":body["effective"]["aligned_eligible"],"recovery":body["effective"]["recovery"]},

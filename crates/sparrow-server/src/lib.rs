@@ -31,6 +31,7 @@ mod reference_tables;
 pub mod auth;
 pub mod ui;
 mod authoring;
+mod bundles;
 pub use auth::{Auth, Principal, Role};
 pub use ui::UiAssets;
 
@@ -130,6 +131,7 @@ fn build_router(state: AppState, ui_assets: Option<Arc<UiAssets>>) -> Router {
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
         .merge(plugins::router())
         .merge(authoring::router())
+        .merge(bundles::router())
         .merge(
             Router::<AppState>::new()
                 .route("/v1/preview", post(preview))
