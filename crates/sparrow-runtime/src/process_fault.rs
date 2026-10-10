@@ -6,7 +6,9 @@
 //! A point pauses only when `SPARROW_FAULT_MARKER_DIR` is set and the file
 //! `<dir>/<point>.arm` exists at the moment the point is reached. The thread
 //! then writes `<dir>/<point>.reached` (synced) and parks until the harness
-//! SIGKILLs the process. Nothing here returns an error or changes state.
+//! SIGKILLs the process. Nothing here returns an error or changes state, except
+//! `restore_pressure`, which holds real reservation credit on the restoring Job
+//! owner (low-budget restore evidence) and is released when restore returns.
 
 #[cfg(feature = "process-fault-pause")]
 mod imp {
@@ -29,6 +31,25 @@ mod imp {
         loop {
             std::thread::park();
         }
+    }
+
+    /// `restore_pressure.arm` holds N: leave only N reservation bytes free on
+    /// the restoring Job owner while owned restore runs (real credit path).
+    pub fn restore_pressure(
+        owner: &std::sync::Arc<sparrow_model::MemoryOwner>,
+    ) -> Option<sparrow_model::MemoryLease> {
+        let dir = dir()?;
+        let text = std::fs::read_to_string(dir.join("restore_pressure.arm")).ok()?;
+        let free = text.trim().parse::<usize>().ok()?;
+        let available = owner
+            .budget()
+            .reservation_bytes
+            .saturating_sub(owner.usage().reservation_bytes);
+        let lease = owner
+            .acquire(sparrow_model::CreditKind::Reservation, available.saturating_sub(free).max(1))
+            .ok()?;
+        let _ = std::fs::write(dir.join("restore_pressure.reached"), format!("{}\n", std::process::id()));
+        Some(lease)
     }
 
     pub fn pause(point: &str) {
@@ -55,7 +76,7 @@ mod imp {
 }
 
 #[cfg(feature = "process-fault-pause")]
-pub use imp::{pause, window_rows_applied};
+pub use imp::{pause, restore_pressure, window_rows_applied};
 
 #[cfg(not(feature = "process-fault-pause"))]
 #[inline(always)]
@@ -64,3 +85,11 @@ pub fn pause(_point: &str) {}
 #[cfg(not(feature = "process-fault-pause"))]
 #[inline(always)]
 pub fn window_rows_applied(_rows: usize) {}
+
+#[cfg(not(feature = "process-fault-pause"))]
+#[inline(always)]
+pub fn restore_pressure(
+    _owner: &std::sync::Arc<sparrow_model::MemoryOwner>,
+) -> Option<sparrow_model::MemoryLease> {
+    None
+}

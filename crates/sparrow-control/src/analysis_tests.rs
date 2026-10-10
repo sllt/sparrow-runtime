@@ -282,6 +282,20 @@ fn sliding_count_recovery_gate_admits_only_the_strict_profile() {
             "{label}: {error:?}"
         );
     }
+    // JetStream v32 passes the control replay gate (regression: Phase B found
+    // the JetStream gate still admitted only tumbling Count windows).
+    #[cfg(feature = "jetstream")]
+    {
+        let js = json!({"kind":"jetstream","jetstream":{"servers":["nats://127.0.0.1:4222"],"namespace":"sc","stream":"INPUT","consumer":"c","ownership_bucket":"OWNERS"}});
+        let value = json!({"version":1,"stream":"l","sql":count,"source":js,"sink":http,"recovery":"aligned",
+            "delivery":"checkpointed_at_least_once","checkpoint_dir":root.join("js").to_string_lossy(),
+            "checkpoint":{"interval_ms":60000,"timeout_ms":3000,"resume_latest":true}});
+        let spec = PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_or_else(|e| panic!("{e:?}"));
+        let plan = bind_plan_with_store(&store, &spec, "sc", 1).unwrap();
+        validate_aligned_plan(&spec, &plan).unwrap_or_else(|e| panic!("JetStream v32: {e:?}"));
+        let guarantees = effective_guarantees_with_plan(&spec, &plan);
+        assert_eq!(guarantees["windows"]["sliding_count"]["snapshot_version"], 32, "{guarantees}");
+    }
     let mut fresh = spec_for("SELECT LAST(items) AS l FROM l GROUP BY COUNT_WINDOW(5, 2)", file.clone(), http.clone(), None);
     fresh.recovery = "restart_fresh".into();
     let plan = bind_plan_with_store(&store, &fresh, "sc", 1).unwrap();

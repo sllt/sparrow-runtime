@@ -1828,8 +1828,8 @@ fn validate_aligned_plan_inner(
         sparrow_plan::CheckpointPlan::from_physical(plan)?;
     }
     if spec.source.kind=="jetstream" && !plan.has_processing_time_state() && plan.stages.iter().any(|stage|
-        matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}))) {
-        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state or one/two Count windows only; event/processing-time replay context not verified"));
+        matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}|sparrow_model::WindowKind::SlidingCount{..}))) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state, one/two Count windows, or one sliding count window (v32) only; event/processing-time replay context not verified"));
     }
     Ok(())
 }

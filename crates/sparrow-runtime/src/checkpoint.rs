@@ -1050,6 +1050,9 @@ impl CheckpointStore {
         requested: Option<u64>,
         owner: &Arc<MemoryOwner>,
     ) -> Result<(PipelineSnapshot, RestoreCredit)> {
+        // Process-test hook (feature process-fault-pause): real reservation
+        // pressure on this Job owner for the low-budget restore case.
+        let _pressure = crate::process_fault::restore_pressure(owner);
         let (snapshot, credit) = match requested {
             Some(id) => self.recover_any_id_with(id, LoadMode::Owned(owner))?,
             None => self
