@@ -4,7 +4,20 @@
 
 本页说明当前实现合同，不是目标设备认证或正式发行公告。Linux x86_64、Rust 1.98.0、锁定 Cargo.lock；Row/prepared/fusion，支持线性和显式DAG Preview，恢复按独立profile准入。Arrow/JIT、HA、可靠MQTT均未开启。可选 [持久 HTTP outbox 与输出 DLQ](DURABLE_OUTPUT.md) 提供本地落盘确认（不是远端 2xx）、有界重试和人工处置；启用后必须同时备份 catalog/checkpoint/outbox，且 pipeline stop 不停止积压投递。版本号仍为0.1.0，tag/push另行授权。最新时间图见 [v18/v19 验收](#time-graph-validation)，线性时间组合见 [v16/v17 验收](#linear-time-validation)，单个时间算子历史批次见 [v14/v15 验收](#paused-time-validation)，静态表/迟滞见 [组合证据](#k1-k4-reference-validation)；历史门禁不自动代表新增能力。
 
-新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
+新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`。当前包始终附带合同文档，feature 是否启用以 `build.json` 和实际 capabilities 为准。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
+
+<a id="release-readiness-validation"></a>
+## 第12批：代码与交付收尾（2026-10-10）
+
+**本轮收尾通过，仍不是正式 tag/生产放行。** 独立只读 review 加主线复核确认并修复一处资源合同问题：`commit_prepared` 在第二次及后续提交中重验旧 CURRENT 时曾额外读取整份未计费 payload。现在 CURRENT 及两条 fallback 都先从相同 Job/Process owner 扣额度；额度不足不修改旧 CURRENT/PUBLISHED/STATE_GENERATION、不创建新代，临时额度归还后可重试。磁盘格式、旧恢复语义与默认额度均未更改。
+
+- [核心回归及 no-demo/生产包验证](https://github.com/sllt/sparrow-runtime/actions/runs/38052635778)：`223b72d`，全部通过；包含三分支额度回归和现有安装、周期 checkpoint、取消、备份与旧版本拒绝验证。本机未 Rust/Go/C 编译。
+- [交付验证](https://github.com/sllt/sparrow-runtime/actions/runs/38053210965)：复用基线 `fe4976b` 与候选 `223b72d` 的真实包，v39 固定参考表＋ET 图一次冷备份→升级续读→整套副本回退，通过；回退重放的数据与输出 ID 相同，原备份 checksum 不变，最终 pipeline stopped。远端输出确实会重复，不把回退说成撤销外部副作用；没有 generic codec/schema 转换。
+- 同次运行构建 `254305a` 的 NATS＋JetStream＋WebSocket＋Postgres 组合包（六个生产二进制、无 demo），包校验和、公开运行文档/持久输出模板、源码指纹与实际 capability inventory 均通过。默认包仍全部关闭这些可选 feature。`254305a` 相比已测 `223b72d` 只有 workflow 差异，校验器实际核对非-workflow diff 为空；没有重编默认包，也没有运行新的 broker 压力矩阵。
+- 证据在 `release-readiness-evidence` artifact：`candidate-run.json`、`baseline-run.json`、`binaries.sha256`、`upgrade/upgrade/{backup-sha256,upgrade-summary,outputs,status}.json`、`package-check/`、`connectors-check/` 和完整 `connectors-package/`。组合包的 `build_mode=release` 只表示干净源码与固定构建，不表示已发布版本或认证；正式 tag 尚未创建。
+- **保留未完成项：** `.21` 本轮 SSH 超时，验证来自 GitHub Linux runner，不是目标服务器性能证据。目标环境 TLS/RTT/容量、24/72 h 长稳、介质掉电未测；历史 Hysteresis v12 首次 checkpoint 超时仍未归因，本次旧快照计费修复不能解释首次提交。Kafka、JetStream 10k/20k 继续暂缓，K5 继续后置。
+
+持久输出模板使用 `/var/lib/sparrow/outboxes/telemetry`；部署时须显式把该目录（以及使用时的 input DLQ/replay artifact 目录）加入 `SPARROW_DATA_ROOTS`，并创建服务用户可写目录。默认环境模板仅授权 data/checkpoints，不为未启用功能自动扩大文件访问范围。
 
 <a id="live-lookup-validation"></a>
 ## 动态参考表与 HTTP Lookup：2026-10-05
