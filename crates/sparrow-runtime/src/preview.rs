@@ -245,8 +245,11 @@ pub fn execute(
             Ok(())
         };
         let outcome = run.await;
-        drop(tx);
+        // Cancel BEFORE closing the input: operators treat a closed input
+        // without cancellation as a failure ("input closed without shutdown"),
+        // so dropping `tx` first raced with the stop (flaky in CI).
         let stop = job.stop().await;
+        drop(tx);
         while received.try_recv().is_ok() { inflight.ack(); }
         // A job failure closes the output first; report the job's own error.
         if let (Err(o), Err(e)) = (&outcome, &stop) {
