@@ -1736,6 +1736,7 @@ fn validate_aligned_plan_inner(
         ));
     }
     if plan.has_extended_aggs()
+        && !is_sliding_count_plan(plan)
         && (recovery.is_aligned()
             || spec.restore.is_some()
             || spec.checkpoint.is_some()
@@ -1749,7 +1750,11 @@ fn validate_aligned_plan_inner(
             || spec.checkpoint.is_some()
             || spec.checkpoint_dir.is_some())
     {
-        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"new hopping-PT/sliding/session windows currently require restart_fresh without checkpoint or restore"));
+        if is_sliding_count_plan(plan) {
+            validate_sliding_count_profile(spec, plan, recovery)?;
+        } else {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"new hopping-PT/ET-PT sliding/session windows currently require restart_fresh without checkpoint or restore (only sliding count has the v31/v32 profile)"));
+        }
     }
     let has_actions = spec.sink.action.is_some()
         || spec.sink.kind == "file"
@@ -1849,8 +1854,8 @@ fn validate_aligned_plan_inner(
         sparrow_plan::CheckpointPlan::from_physical(plan)?;
     }
     if spec.source.kind=="jetstream" && !plan.has_processing_time_state() && plan.stages.iter().any(|stage|
-        matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}))) {
-        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state or one/two Count windows only; event/processing-time replay context not verified"));
+        matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}|sparrow_model::WindowKind::SlidingCount{..}))) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state, one/two Count windows, or one sliding count window (v32) only; event/processing-time replay context not verified"));
     }
     Ok(())
 }
@@ -1858,6 +1863,86 @@ fn validate_aligned_plan_inner(
 /// FIRST/LAST/VAR_*/STDDEV_* recovery (codec 3): strict linear File (v29) or
 /// reliable JetStream Count (v30) into a required HTTP sink. Everything else
 /// that asks for checkpoint/restore is rejected before any history is touched.
+/// Every new-kind window in the plan is a sliding count window.
+fn is_sliding_count_plan(plan: &PhysicalPlan) -> bool {
+    let mut any = false;
+    for stage in &plan.stages {
+        if let sparrow_plan::PhysicalStage::WindowAgg { spec, .. } = stage {
+            if spec.kind.is_new_window() {
+                if !matches!(spec.kind, sparrow_model::WindowKind::SlidingCount { .. }) {
+                    return false;
+                }
+                any = true;
+            }
+        }
+    }
+    any
+}
+
+/// Sliding count (codec 4) is recoverable only as the single state of a strict
+/// linear File v31 or JetStream v32 plan with the required HTTP sink.
+fn validate_sliding_count_profile(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+    recovery: RecoveryPolicy,
+) -> Result<()> {
+    let reject = |message: &str| {
+        Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            format!("sliding count window checkpoint profile v31/v32: {message}"),
+        ))
+    };
+    if !recovery.is_aligned() {
+        return reject("checkpoint/restore requires recovery=aligned");
+    }
+    if spec.graph_io.is_some() || plan.edges.is_some() {
+        return reject("DAG plans are not supported; use a linear plan");
+    }
+    if !spec.reference_tables.is_empty() || spec.has_live_lookups() {
+        return reject("reference/Lookup tables are not supported");
+    }
+    if plan.has_iot() || plan.has_processing_time_state() || plan.has_event_time_window() {
+        return reject("IoT, event-time and processing-time state are not supported (sub-batch 2b/2c)");
+    }
+    if !plan.side_outputs.is_empty() || !plan.source_times.is_empty() {
+        return reject("side outputs and source-time bindings are not supported");
+    }
+    let windows = plan
+        .stages
+        .iter()
+        .filter(|s| matches!(s, sparrow_plan::PhysicalStage::WindowAgg { .. }))
+        .count();
+    if windows != 1 {
+        return reject("exactly one sliding count window and no other window state is supported");
+    }
+    let file = matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay");
+    let jetstream = cfg!(feature = "jetstream") && spec.source.kind == "jetstream";
+    if !file && !jetstream {
+        return reject("source must be File or (feature jetstream) JetStream");
+    }
+    if spec.sink.kind != "http" {
+        return reject("sink must be the required HTTP sink");
+    }
+    if spec.checkpoint_dir.as_deref().is_none_or(str::is_empty) {
+        return reject("an explicit checkpoint_dir is required");
+    }
+    let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    let version = sparrow_runtime::snapshot_version_for(
+        &manifest,
+        if jetstream { "jetstream-v1" } else { "file" },
+    )?;
+    if version
+        != if jetstream {
+            sparrow_runtime::SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
+        } else {
+            sparrow_runtime::SLIDING_COUNT_FILE_SNAPSHOT_VERSION
+        }
+    {
+        return reject("plan does not select the sliding count profile");
+    }
+    Ok(())
+}
+
 fn validate_extended_aggregate_profile(
     spec: &PipelineSpec,
     plan: &PhysicalPlan,
@@ -2543,6 +2628,40 @@ fn effective_guarantees_with_plan_inner(
         value["aligned_eligible"] = serde_json::json!(false);
         value["aligned_eligibility_reason"] = serde_json::json!("plugin functions have no recovery profile");
         value["plugins"] = serde_json::json!({"recovery":"restart_fresh_only","trusted_native":native||external,"preemptible":!native,"external_process":external,"os_sandbox":false,"durable_ack":false});
+        return value;
+    }
+    if is_sliding_count_plan(plan) && !plan.has_analysis() {
+        let mut candidate = spec.clone();
+        candidate.recovery = "aligned".into();
+        let checked = validate_sliding_count_profile(&candidate, plan, RecoveryPolicy::Aligned)
+            .and_then(|_| validate_aligned_plan(&candidate, plan));
+        let jetstream = spec.source.kind == "jetstream";
+        let version = sparrow_plan::CheckpointPlan::from_physical(plan)
+            .ok()
+            .and_then(|p| {
+                sparrow_runtime::snapshot_version_for(&p, if jetstream { "jetstream-v1" } else { "file" }).ok()
+            });
+        value["aligned_eligible"] = serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
+        value["windows"] = serde_json::json!({
+            "maturity":"development_preview","certified":false,
+            "recovery": if spec.recovery == "aligned" { "aligned" } else { "restart_fresh" },
+            "aligned_profile":"sliding_count_v31_v32",
+            "sliding_count":{"snapshot_version":version,"state_codec":4,
+                "scope":"linear_File_v31_or_JetStream_v32; single_sliding_count_window; required_HTTP_sink",
+                "stored_state":"evaluated_aggregate_inputs_of_last_size_arrivals_per_key",
+                "key_expiry":"none; bounded_only_by_max_keys",
+                "restore_compatibility":"strict_full_computation_semantics; incompatible_is_rejected_without_state_reset_or_old_checkpoint_fallback"},
+            "not_enabled":["sliding_or_session_event_time(2b)","processing_time_hopping_sliding_session(2c)","DAG","references","IoT","side_outputs","multiple_windows","nested_or_Dynamic_inputs"],
+            "buffered_rows_per_key_default":1024,"buffered_rows_per_key_max":16384
+        });
+        value["recovery_risk"] = serde_json::json!(if spec.recovery != "aligned" {
+            "restart_fresh_loses_window_state"
+        } else if jetstream {
+            "required_HTTP_may_repeat_before_CURRENT; deduplicate_by_OutputSequence; no_exactly_once"
+        } else {
+            "required_HTTP_may_repeat_uncommitted_suffix; File_v31_has_no_stable_output_id; no_exactly_once"
+        });
         return value;
     }
     if plan.has_extended_aggs() && !plan.has_analysis() {

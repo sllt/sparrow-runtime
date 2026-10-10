@@ -62,7 +62,14 @@ fn windows_control_fresh_only_admission_and_honest_guarantees() {
         crate::validate_aligned_plan(&spec, &plan).unwrap();
         let guarantee = crate::effective_guarantees_with_plan(&spec, &plan);
         assert_eq!(guarantee["aligned_eligible"], false);
-        assert_eq!(guarantee["windows"]["recovery"], "restart_fresh_only");
+        if assigner.starts_with("COUNT_WINDOW") {
+            // Sub-batch 2a: sliding count has the v31/v32 profile, but this
+            // Action sink is restart_fresh only, so it is still not eligible.
+            assert_eq!(guarantee["windows"]["recovery"], "restart_fresh");
+            assert_eq!(guarantee["windows"]["aligned_profile"], "sliding_count_v31_v32");
+        } else {
+            assert_eq!(guarantee["windows"]["recovery"], "restart_fresh_only");
+        }
         for mutation in 0..4 {
             let mut wrong = spec.clone();
             match mutation {

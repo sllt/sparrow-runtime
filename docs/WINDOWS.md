@@ -10,7 +10,7 @@
 | 类型 | SQL GROUP BY窗口项 | Graph `window.kind` | 本批恢复范围 |
 |---|---|---|---|
 | PT跳跃 | `HOP(PROCESSING_TIME, slide, size)` | `hop_pt` | restart_fresh |
-| 滑动计数 | `COUNT_WINDOW(size, step)` | `sliding_count` | restart_fresh |
+| 滑动计数 | `COUNT_WINDOW(size, step)` | `sliding_count` | restart_fresh；第11批子批2a起线性单窗口 aligned File v31 / JetStream v32（见PRODUCTION矩阵） |
 | PT逐事件滑动 | `SLIDING(PROCESSING_TIME, size[, delay])` | `sliding_pt` | restart_fresh |
 | ET逐事件滑动 | `SLIDING(ts, size[, delay])` | `sliding_et` | restart_fresh |
 | PT会话 | `SESSION(PROCESSING_TIME, gap, max_duration)` | `session_pt` | restart_fresh |
@@ -101,7 +101,12 @@ sliding_pt/sliding_et使用`size_micros/delay_micros`，delay缺省0。
 
 ## 恢复、验收与后续
 
-新族尚未发布checkpoint codec/profile。Control拒绝aligned、restore、checkpoint、checkpoint_dir；
+**第11批子批2a：**滑动计数（`COUNT_WINDOW(size, step)`）作为线性管道唯一状态时，可用 aligned 恢复：
+participant codec 4（`BWF1`，保存每key到达序号和最近size条已求值聚合输入），File v31 / JetStream v32，
+完整语义严格匹配；格式、限制、恢复额度规则和验证状态以 [PRODUCTION.md](PRODUCTION.md) 矩阵为准。
+滑动计数key不过期，仅受max_keys约束。以下段落适用于其余新族（ET滑动/会话为子批2b，PT三类为子批2c）。
+
+其余新族尚未发布checkpoint codec/profile。Control拒绝aligned、restore、checkpoint、checkpoint_dir；
 CheckpointPlan、旧PlanLayout复用判定和Kernel也分别拒绝，不能绕过控制层直接创建假恢复承诺。
 新的buffered族通过Kernel执行；旧WindowOperator raw freeze helper不是这些新族的公共执行/恢复接口。
 旧StateSemantics和旧窗口freeze编码不改；给新类型编码参数不等于已支持快照。

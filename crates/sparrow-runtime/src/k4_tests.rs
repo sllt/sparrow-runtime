@@ -70,7 +70,7 @@ fn aligned(
     };
     AlignedJob {
         restore: None,
-        pipeline: Some(PipelineRestore {
+        pipeline: Some(PipelineRestore { buffered: Vec::new(),
             sink: None,
             plan: manifest,
             generation,

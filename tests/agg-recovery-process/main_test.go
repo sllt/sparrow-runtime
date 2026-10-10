@@ -41,3 +41,21 @@ func TestFileFixtureExistsBeforeStartingTheServer(t *testing.T) {
 		t.Fatalf("publish must append to the provisioned input: %q", got)
 	}
 }
+
+// The sliding-count oracle's state cuts sit where the driver claims.
+func TestSlidingCountOracleCuts(t *testing.T) {
+	if n := len(oracle("slide", 4)); n != 0 {
+		t.Fatalf("not_full: %d outputs before any key reaches size", n)
+	}
+	if len(oracle("slide", 8)) != 2 || len(oracle("slide", 7)) != 1 {
+		t.Fatal("at_boundary must sit exactly on a trigger")
+	}
+	if len(oracle("slide", 14)) != len(oracle("slide", 12)) {
+		t.Fatal("input_after (slide) must not complete a window")
+	}
+	for _, e := range oracle("slide", 36) {
+		if e.C != 3 || e.Win == "" {
+			t.Fatalf("every sliding output covers the last 3 rows with a window: %+v", e)
+		}
+	}
+}

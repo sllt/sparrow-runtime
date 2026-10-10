@@ -74,12 +74,14 @@ fn windows_sql_binds_six_new_families_and_rejects_restore_manifest() {
             window(&plan).event_time_field.as_deref(),
             expected.uses_event_time().then_some("ts")
         );
-        assert_eq!(
-            sparrow_plan::CheckpointPlan::from_physical(&plan)
-                .unwrap_err()
-                .code,
-            ErrorCode::UnsupportedRestore
-        );
+        // Sub-batch 2a: only sliding count has a participant codec (4, v31/v32).
+        match sparrow_plan::CheckpointPlan::from_physical(&plan) {
+            Ok(manifest) if matches!(expected, WindowKind::SlidingCount { .. }) => {
+                assert_eq!(manifest.states[0].codec, sparrow_plan::checkpoint::BUFFERED_WINDOW_STATE_CODEC);
+                assert_eq!(manifest.recovery_prefix_len, None);
+            }
+            result => assert_eq!(result.unwrap_err().code, ErrorCode::UnsupportedRestore, "{sql}"),
+        }
     }
     assert_eq!(
         window(&bind("SLIDING(ts, INTERVAL '2' SECOND, INTERVAL '1' MILLISECOND)").unwrap()).kind,

@@ -145,7 +145,7 @@ impl Supervisor {
         let owner = admission.owner();
         let restore_owner = owner.clone();
         let reference_profile = prepared_references.is_some();
-        let extended_profile = manifest.has_extended_state();
+        let extended_profile = manifest.has_extended_state() || manifest.has_buffered_state();
         let (store,snapshot,generation,output,binding,restore_credit)=self.store.run_blocking(move || {
             sparrow_connectors::check_data_path(Path::new(&dir))?;
             let mut store=if reference_profile || extended_profile {
@@ -211,9 +211,9 @@ impl Supervisor {
         .await?;
         let ingested = snapshot.as_ref().map_or(0, |s| s.ingested_rows);
         let restored_from = snapshot.as_ref().map(|s| s.checkpoint_id);
-        let (restore, restore_iot) = snapshot
-            .map(|s| (Some(s.windows), s.iot))
-            .unwrap_or_else(|| (None, Vec::new()));
+        let (restore, restore_iot, restore_buffered) = snapshot
+            .map(|s| (Some(s.windows), s.iot, s.buffered))
+            .unwrap_or_else(|| (None, Vec::new(), Vec::new()));
         let revision = plan.revision.raw();
         let (tx, rx) = observed::channel(spec.source.inbox_capacity);
         let (tx_out, rx_out) = observed::channel(spec.sink.outbox_capacity);
@@ -229,7 +229,7 @@ impl Supervisor {
             .with_observation(diag.observation.clone())
             .with_aligned(AlignedJob {
                 restore: None,
-                pipeline: Some(PipelineRestore {
+                pipeline: Some(PipelineRestore { buffered: restore_buffered,
                     sink: None,
                     plan: manifest.clone(),
                     generation,
