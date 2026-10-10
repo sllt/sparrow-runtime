@@ -41,10 +41,18 @@ fn validate_analysis_profile(plan: &PhysicalPlan, references: bool) -> Result<()
             analyses += 1;
             match analysis.as_ref() {
                 crate::AnalysisPlan::External { .. } => return Err(rejected("external Transform has no recovery codec")),
-                crate::AnalysisPlan::Join { left, right, .. } => {
+                crate::AnalysisPlan::Join { spec, left, right, .. } => {
                     joins += 1;
                     validate_time_input_schema(left)?;
                     validate_time_input_schema(right)?;
+                    for (id, field) in [(spec.left_input, &spec.left_time), (spec.right_input, &spec.right_time)] {
+                        let binding = plan.source_times.iter().find(|(source, _)| source.raw() == id)
+                            .map(|(_, binding)| binding).ok_or_else(|| rejected("recoverable Join requires both source-time bindings"))?;
+                        if &binding.field != field || binding.out_of_orderness_micros < 0
+                            || binding.max_future_skew_micros.is_none_or(|v| v < 0 || v > sparrow_model::DEFAULT_MAX_FUTURE_SKEW_MICROS) {
+                            return Err(rejected("recoverable Join source-time policy differs from its input contract"));
+                        }
+                    }
                 }
                 crate::AnalysisPlan::Unnest { .. } => {}
             }

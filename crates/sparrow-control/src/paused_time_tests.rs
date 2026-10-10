@@ -245,7 +245,7 @@ fn outputs(http: &sparrow_connectors::HttpCapture) -> Vec<Value> {
         .flat_map(|b| serde_json::from_slice::<Vec<Value>>(b).unwrap())
         .collect()
 }
-fn snapshot(dir: &std::path::Path) -> sparrow_runtime::PipelineSnapshot { analysis: Vec::new(),
+fn snapshot(dir: &std::path::Path) -> sparrow_runtime::PipelineSnapshot {
     sparrow_runtime::CheckpointStore::open_readonly(dir.join("checkpoints"))
         .unwrap()
         .recover_pipeline_required()

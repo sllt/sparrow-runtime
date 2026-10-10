@@ -391,6 +391,11 @@ func scenario(root, kind, bin, natsBin string) {
 		}
 	}
 	a.ok("POST", "/v1/pipelines/p/stop", map[string]any{})
+	until("pipeline stopped", func() bool {
+		status, code := a.call("GET", "/v1/pipelines/p/status", nil)
+		actual, _ := status["actual"].(map[string]any)
+		return code == 200 && actual["status"] == "stopped"
+	})
 	save(filepath.Join(root, "outputs.json"), c.all())
 	save(filepath.Join(root, "status.json"), a.ok("GET", "/v1/pipelines/p/status", nil))
 	fmt.Println("ANALYSIS_RECOVERY_OK", kind)

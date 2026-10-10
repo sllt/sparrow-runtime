@@ -459,7 +459,8 @@ pub(super) fn validate_request(req: &JobRequest) -> Result<()> {
             return Err(invalid("invalid source event-time column type"));
         }
     }
-    if req.plan.has_event_time_window() && time_sources != sources {
+    if (req.plan.has_event_time_window() || (req.aligned.is_some() && req.plan.recovery_event_time()))
+        && time_sources != sources {
         return Err(invalid(
             "all event-time graph sources require explicit time bindings",
         ));
