@@ -657,6 +657,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 | 单 UNNEST（JSON → required HTTP） | codec 5 `ANF1`，来源输入序号 | File v36 / JetStream v37 | 已验证（子批3限定范围）：保留空数组序号与展开 ordinal，未提交展开重放；v37 输出 ID 稳定。实现与验证记录见 [ANALYSIS](ANALYSIS.md#第11批子批3恢复范围)。 |
 | 多 File UNNEST/Union；单个直接双源 Interval/Window inner/left Join | codec 5 `ANF1`；GTC1 源位置/时间/EOF 与各 Sink 游标 | File 分析图 v38 | 已验证（子批3限定范围）：持久决策顺序，Join matched/unmatched 行与序号恢复，真实水位/EOF 关闭 unmatched；Join 暂限标量源字段。含嵌套输入的多源 UNNEST 使用独立行指纹。不是任意窗口/Lookup/告警组合或 JetStream DAG；见同上范围。 |
 | IoT change/deadband/hysteresis/alarm/silence/resample | codec 2 | 各自 profile | 已验证（既有批次）；与新聚合组合暂不支持 |
+| 业务组合：分析图接 Count/既有 ET 窗口/TTL=0 IoT；固定参考表接时间图/paused Alarm | 复用 codec 1/2/3/5，CPL3 固定参考依赖，GTC1/GTD1 有序决策 | File v39 | 限定子批4范围，非任意组合；需要独立目录、JSON 与 required HTTP。完整范围见 [ANALYSIS](ANALYSIS.md#第11批子批4业务组合恢复v39)。测试结果随本批验证记录更新，不据此宣称长稳/容量认证。 |
 | Dedup | — | — | 暂不支持 |
 
 **时间域**

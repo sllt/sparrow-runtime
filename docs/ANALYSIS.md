@@ -4,6 +4,18 @@
 
 **状态：限定 Preview，尚未发行。** 第11批子批3增加下述 UNNEST / Join 恢复；未声明的组合仍拒绝 aligned/checkpoint/restore。补充聚合与窗口的覆盖见[恢复支持矩阵](PRODUCTION.md#recovery-support-matrix)。不改旧状态 codec，无新的吞吐、长稳或生产认证结论。
 
+### 第11批子批4：业务组合恢复（v39）
+
+使用显式 Graph 和独立 checkpoint 目录，保留 v38 的有序 File 决策、每 Sink 输出 ID 与全部 required HTTP 完成后发布 CURRENT 的规则。不是给所有算子组合统一打开 aligned：
+
+- `File×N → Union/UNNEST → Count → TTL=0 Change/Deadband/Hysteresis`；Count 可使用 FIRST/LAST/VAR/STDDEV（标量输入，codec 3）。
+- `File×2 → 单个直接双源 Join → Count 或既有 ET 滚动/跳跃窗口 → TTL=0 IoT`。Join 的未匹配行、水位，以及下游窗口/IoT 状态在同一个提交切点恢复。
+- 上述分析图可插入固定版本 Lookup；既有 PT/ET 时间图可组合固定参考表。`多 File → Union → 固定 Lookup → paused-PT Alarm` 保留告警阶段、逻辑截止时间、generation/episode 和输出游标，停机时间不推进 PT。
+- 参考表必须钉住 revision、规范内容 SHA-256 和运行时 CRC32；恢复加载实际表后再次核验。`TIME_PENDING` 从第一笔（即使尚无 CURRENT）就绑定完整 manifest，不能换表后重放旧决策。发布新表版本不会改变已绑定版本。
+- 不支持 PT/ET 混合、Join/UNNEST 接 timed IoT/Alarm、buffered/new window 图、扩展 ET/PT 聚合、live/follow_latest/远程 Lookup、JetStream DAG、插件、输入 DLQ、持久 outbox 或历史快照回放。旧 v8～v38 字节/默认运行路径不变，不自动迁移目录。
+
+v39 仍是有界、小状态、逐决策持久化链路；不代表高吞吐或 exactly-once。范围由每条管线的 `aligned_eligible` / `business_recovery` 返回。验证入口为 `business_recovery_` 和现有进程驱动的 `business-count`、`business-alarm`、`business-etref`，不新增默认重复门禁。
+
 ## 纯函数
 
 SQL 与 Graph 共用类型检查、函数 registry、NULL/错误和分配额度：

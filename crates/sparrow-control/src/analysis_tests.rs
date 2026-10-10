@@ -214,6 +214,40 @@ fn analysis_recovery_control_profiles_and_declared_limits() {
     assert_eq!(validate_aligned_plan(&spec, &plan).unwrap_err().code, sparrow_model::ErrorCode::UnsupportedRestore);
 }
 
+#[test]
+fn business_recovery_control_admits_composition_without_widening_buffered_or_live_scope() {
+    let store = store();
+    store.put_stream("items", r#"{"fields":[{"name":"items","type":"array<int64>","nullable":false}]}"#).unwrap();
+    let root = sparrow_connectors::ensure_default_data_root().join("business-profile-validation");
+    let source = json!({"kind":"file","path":root.join("in.ndjson"),"file_contract":"append_only"});
+    let sink = json!({"kind":"http","url":"http://127.0.0.1:9/out"});
+    let mut value = json!({"version":1,"stream":"items","source":source,"sink":sink,"recovery":"aligned","fail_on_decode":true,
+        "checkpoint_dir":root.join("checkpoints"),"checkpoint":{"resume_latest":true,"interval_ms":100,"timeout_ms":5000},
+        "graph_io":{"sources":{"1":source,"2":source},"sinks":{"6":sink}},
+        "graph":{"version":1,"pipeline_id":7,"revision_id":1,"nodes":[
+            {"id":1,"kind":"memory_source","table":"items","out":[3]},
+            {"id":2,"kind":"memory_source","table":"items","out":[3]},
+            {"id":3,"kind":"union_all","out":[4]},
+            {"id":4,"kind":"unnest","unnest":{"expr":{"k":"col","name":"items"}},"out":[5]},
+            {"id":5,"kind":"window_agg","window":{"kind":"count","size":3},"keys":["unnest_source"],
+                "aggs":[{"fn":"last","expr":{"k":"col","name":"item"},"alias":"last"}],"out":[6]},
+            {"id":6,"kind":"capture_sink"}]}});
+    let inspect = |value: &Value| {
+        let spec = PipelineSpec::from_json(&serde_json::to_vec(value).unwrap()).unwrap();
+        let plan = bind_plan_with_store(&store, &spec, "business", 1).unwrap();
+        (spec, plan)
+    };
+    let (spec, plan) = inspect(&value);
+    validate_aligned_plan(&spec,&plan).unwrap();
+    let effective = effective_guarantees_with_plan(&spec,&plan);
+    assert_eq!(effective["aligned_eligible"],true);
+    assert_eq!(effective["business_recovery"]["snapshot_version"],39);
+    assert_eq!(crate::capability::inventory()["analysis"]["aligned_profiles"]["business_file_graph"],39);
+    value["graph"]["nodes"][4]["window"] = json!({"kind":"sliding_count","size":3,"step":1});
+    let (spec,plan) = inspect(&value);
+    assert!(validate_aligned_plan(&spec,&plan).is_err());
+}
+
 /// Sub-batch 1 gate: FIRST/LAST/VAR/STDDEV admit aligned recovery only through
 /// the strict linear v29 (File) profile here; every other combination is
 /// rejected at validate time, before any checkpoint history or input I/O.

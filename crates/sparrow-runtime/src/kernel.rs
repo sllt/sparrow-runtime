@@ -834,6 +834,14 @@ impl Kernel {
 
     pub fn submit(&self, mut req: JobRequest) -> Result<JobHandle> {
         validate_lookup_request(&req, &self.process_owner)?;
+        let checkpoint_plan = || {
+            if req.tables.is_empty() {
+                sparrow_plan::CheckpointPlan::from_physical(&req.plan)
+            } else {
+                sparrow_plan::CheckpointPlan::from_physical_with_references(
+                    &req.plan, verified_reference_dependencies(&req.tables)?)
+            }
+        };
         let mut plugin_count = 0usize;
         req.plan.visit_plugins(&mut |_| plugin_count += 1);
         if plugin_count > 64 {
@@ -849,7 +857,7 @@ impl Kernel {
             ));
         }
         if req.plan.has_analysis() && req.aligned.is_some() {
-            let manifest = sparrow_plan::CheckpointPlan::from_physical(&req.plan)?;
+            let manifest = checkpoint_plan()?;
             if !manifest.has_analysis_state() || req.aligned.as_ref().is_none_or(|a| a.pipeline.is_none()) {
                 return Err(crate::analysis_state::mismatch("analysis requires its participant recovery profile"));
             }
@@ -859,7 +867,7 @@ impl Kernel {
         if req.plan.has_extended_aggs()
             && req.aligned.as_ref().is_some_and(|aligned| {
                 aligned.pipeline.is_none()
-                    || sparrow_plan::CheckpointPlan::from_physical(&req.plan).is_err()
+                    || checkpoint_plan().is_err()
             })
         {
             return Err(SparrowError::new(
@@ -909,10 +917,10 @@ impl Kernel {
                 || req.plan.has_timed_iot()
                 || (req.aligned.is_some() && req.plan.has_processing_time_state()));
         if ordered_time {
-            let manifest = sparrow_plan::CheckpointPlan::from_physical(&req.plan)?;
+            let manifest = checkpoint_plan()?;
             let ingress = if durable_graph {
                 graph_time.as_ref().is_some_and(|g| {
-                    g.check_plan(&req.plan).is_ok() && g.initial.micros == req.clock.now_micros()
+                    g.check_plan_with_manifest(&req.plan, &manifest).is_ok() && g.initial.micros == req.clock.now_micros()
                 }) && req.live_events.is_none()
                     && req.graph_inputs.len() == manifest.source_ids().len()
                     && req.graph_inputs.values().all(|s| {

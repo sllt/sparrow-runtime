@@ -28,10 +28,11 @@ pub const ANALYSIS_STATE_CODEC: u16 = 5;
 
 fn validate_analysis_profile(plan: &PhysicalPlan, references: bool) -> Result<()> {
     if !plan.has_analysis() { return Ok(()); }
-    if references || !plan.side_outputs.is_empty() || plan.stages.iter().any(|s| matches!(s,
-        PhysicalStage::WindowAgg { .. } | PhysicalStage::Iot { .. }
-        | PhysicalStage::Lookup { .. } | PhysicalStage::Deduplicate { .. })) {
-        return Err(rejected("analysis recovery excludes window/IoT/Lookup/Dedup combinations and side outputs"));
+    if !plan.side_outputs.is_empty() || plan.has_processing_time_state()
+        || plan.stages.iter().any(|s| matches!(s, PhysicalStage::Deduplicate { .. }))
+        || (plan.edges.is_none() && (references || plan.has_iot()
+            || plan.stages.iter().any(|s| matches!(s, PhysicalStage::WindowAgg { .. })))) {
+        return Err(rejected("analysis combinations require an ordered File graph; PT/timed IoT, Dedup and side outputs remain unsupported"));
     }
     let mut joins = 0;
     let mut analyses = 0;
@@ -216,6 +217,16 @@ impl CheckpointPlan {
         if plan.has_plugins() {return Err(rejected("plugin functions have no checkpoint/restore profile"));}
         validate_analysis_profile(plan, !reference_tables.is_empty())?;
         let extended = plan.has_extended_aggs();
+        let business = plan.is_recovery_time_graph() && (!reference_tables.is_empty()
+            || (plan.has_analysis() && plan.stages.iter().any(|s| matches!(s,
+                PhysicalStage::WindowAgg { .. } | PhysicalStage::Iot { .. }))));
+        // v39 deliberately composes existing unbuffered operators. Buffered
+        // windows and extended ET/PT aggregates need their own round protocol.
+        if business && plan.stages.iter().any(|s| matches!(s,
+            PhysicalStage::WindowAgg { spec, .. } if spec.kind.is_new_window()
+                || (spec.has_extended_aggs() && !matches!(spec.kind, WindowKind::Count { .. })))) {
+            return Err(rejected("business recovery admits legacy Count/ET/PT windows and extended Count, not buffered/new windows or extended time aggregates"));
+        }
         // v34/v35: exactly one window stage, a PT profile window, and no
         // other state (no TTL/HoldFor/IoT), DAG, references or side inputs.
         let windows = plan.stages.iter().filter(|s| matches!(s, PhysicalStage::WindowAgg { .. })).count();
@@ -234,6 +245,7 @@ impl CheckpointPlan {
         }
         if extended
             && !pt_profile
+            && !business
             && (plan.edges.is_some()
                 || !reference_tables.is_empty()
                 || plan.has_processing_time_state()
@@ -282,7 +294,7 @@ impl CheckpointPlan {
                 "paused-time checkpoint excludes source-time and side-output plans",
             ));
         }
-        if has_references && (!plan.side_outputs.is_empty() || !plan.source_times.is_empty()) {
+        if has_references && (!plan.side_outputs.is_empty() || (!business && !plan.source_times.is_empty())) {
             return Err(rejected(
                 "reference checkpoint excludes source-time and side-output plans",
             ));
@@ -623,6 +635,12 @@ impl CheckpointPlan {
     pub fn has_analysis_state(&self) -> bool {
         self.states.iter().any(|s| s.codec == ANALYSIS_STATE_CODEC)
     }
+    /// v39: pinned references in a time graph, or analysis composed with
+    /// windows / TTL=0 IoT. Pure v38 analysis graphs keep their original version.
+    pub fn is_business_graph(&self) -> bool {
+        self.is_time_graph() && (self.has_references()
+            || (self.has_analysis_state() && self.states.iter().any(|s| s.codec != ANALYSIS_STATE_CODEC)))
+    }
     /// Codec 4 ET sliding (kind 7) / ET session (kind 9): File v33 only.
     pub fn has_buffered_event_time_state(&self) -> bool {
         self.states
@@ -744,12 +762,11 @@ impl CheckpointPlan {
             ));
         }
         if time_graph
-            && (!reference_tables.is_empty()
-                || (plan.recovery_event_time() && plan.has_processing_time_state())
+            && ((plan.recovery_event_time() && plan.has_processing_time_state())
                 || (!plan.recovery_event_time() && !plan.source_times.is_empty()))
         {
             return Err(rejected(
-                "durable time DAG excludes references and mixed processing/event-time domains",
+                "durable time DAG excludes mixed processing/event-time domains",
             ));
         }
         if plan.stages.len() < 2 || plan.stages.len() > MAX_CHECKPOINT_STAGES {
@@ -809,9 +826,9 @@ impl CheckpointPlan {
                         if ty.is_nested()||*ty==sparrow_model::DataType::Dynamic{return Err(rejected("graph checkpoint key codec excludes nested/Dynamic"));}
                     }
                     for agg in &spec.aggs {
-                        if matches!(agg.func,sparrow_model::AggFn::Min|sparrow_model::AggFn::Max){let ty=agg.input_type(input)?;if ty.is_nested()||ty==sparrow_model::DataType::Dynamic{return Err(rejected("graph checkpoint MIN/MAX codec excludes nested/Dynamic"));}}
+                        if matches!(agg.func,sparrow_model::AggFn::Min|sparrow_model::AggFn::Max|sparrow_model::AggFn::First|sparrow_model::AggFn::Last){let ty=agg.input_type(input)?;if ty.is_nested()||ty==sparrow_model::DataType::Dynamic{return Err(rejected("graph checkpoint value codec excludes nested/Dynamic"));}}
                     }
-                    states.push(StateParticipant { id: ParticipantId::window(*operator), codec: WINDOW_STATE_CODEC, window_kind: crate::compat::window_kind_tag(spec.kind) });
+                    states.push(StateParticipant { id: ParticipantId::window(*operator), codec: if spec.has_extended_aggs() { WINDOW_EXT_STATE_CODEC } else { WINDOW_STATE_CODEC }, window_kind: crate::compat::window_kind_tag(spec.kind) });
                 }
                 PhysicalStage::Iot { operator, spec, input, output } => {
                     if !time_graph && spec.ttl_micros != 0 {
@@ -975,7 +992,22 @@ impl CheckpointPlan {
 
     pub fn validate(&self) -> Result<()> {
         validate_references(&self.reference_tables)?;
-        if self.has_analysis_state() && (self.has_references() || self.recovery_prefix_len.is_some()
+        let business = self.is_business_graph();
+        if business && (self.recovery_prefix_len.is_some()
+            || self.states.iter().any(|s| match s.codec {
+                WINDOW_STATE_CODEC => !matches!(s.window_kind, 0..=3),
+                WINDOW_EXT_STATE_CODEC => s.window_kind != 1,
+                IOT_STATE_CODEC => !matches!(s.window_kind, 4..=11),
+                ANALYSIS_STATE_CODEC => !matches!(s.window_kind, 10 | 11),
+                _ => true,
+            })
+            || (self.has_analysis_state() && self.states.iter().any(|s|
+                (s.codec == WINDOW_STATE_CODEC && s.window_kind == 0)
+                || (s.codec == IOT_STATE_CODEC && s.window_kind >= 7)))) {
+            return Err(rejected("unsupported business graph participant/domain contract")
+                .context("checkpoint_guard", "business_profile_mismatch"));
+        }
+        if self.has_analysis_state() && !business && (self.has_references() || self.recovery_prefix_len.is_some()
             || self.states.iter().any(|s| s.codec != ANALYSIS_STATE_CODEC)
             || (self.is_graph() && !self.is_time_graph())
             || (!self.is_graph() && (self.states.len() != 1 || self.states[0].window_kind != 10))) {
@@ -996,6 +1028,7 @@ impl CheckpointPlan {
         }
         if self.has_extended_state()
             && !self.has_pt_window_state()
+            && !business
             && (self.is_graph()
                 || self.has_references()
                 || self.has_iot()
@@ -1029,7 +1062,7 @@ impl CheckpointPlan {
             return Err(rejected("paused-time recovery requires a linear plan without references, event time or relaxed semantics"));
         }
         if self.is_time_graph() && !self.has_analysis_state()
-            && (self.has_references()
+            && ((self.has_references() && !business)
                 || self.recovery_prefix_len.is_some()
                 || (self.has_event_time_state()
                     && self
@@ -1124,6 +1157,7 @@ impl CheckpointPlan {
             return Err(rejected("unsupported multi-state time policy"));
         }
         if self.has_references()
+            && !business
             && self
                 .states
                 .iter()

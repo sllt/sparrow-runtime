@@ -300,7 +300,15 @@ func scenario(root, kind, bin, natsBin string) {
 	spec := map[string]any{"version": 1, "stream": "l", "recovery": "aligned", "fail_on_decode": true, "checkpoint_dir": checkpoint, "checkpoint": map[string]any{"interval_ms": 100, "timeout_ms": 5000, "resume_latest": true}, "source": source(0), "sink": sink}
 	startServer()
 	a.ok("PUT", "/v1/allowlist", map[string]any{"host": "127.0.0.1", "port": c.port()})
-	if kind == "multi" {
+	if strings.HasPrefix(kind, "business-") {
+		businessScenario(kind, a, spec, paths, c, source, sink, start, func() {
+			server.stop()
+			startServer()
+			start()
+		}, waitCut, waitRows)
+		version, _ := cut(checkpoint)
+		require(version == 39, "business graph snapshot version")
+	} else if kind == "multi" {
 		a.ok("PUT", "/v1/streams/l", map[string]any{"fields": []any{map[string]any{"name": "items", "type": "dynamic", "nullable": true}}})
 		spec["graph"] = map[string]any{"version": 1, "pipeline_id": 7, "revision_id": 1, "nodes": []any{
 			map[string]any{"id": 1, "kind": "memory_source", "table": "l", "out": []int{3}},
@@ -434,6 +442,113 @@ func scenario(root, kind, bin, natsBin string) {
 	save(filepath.Join(root, "status.json"), a.ok("GET", "/v1/pipelines/p/status", nil))
 	fmt.Println("ANALYSIS_RECOVERY_OK", kind)
 }
+
+// Each composition has one crash and an independent small output oracle.
+func businessScenario(kind string, a api, spec map[string]any, paths []string, c *capture,
+	source func(int) map[string]any, sink map[string]any, start, restart func(), waitCut func(uint64), waitRows func(int)) {
+	col := func(name string) map[string]any { return map[string]any{"k": "col", "name": name} }
+	field := func(name, typ string) map[string]any {
+		return map[string]any{"name": name, "type": typ, "nullable": false}
+	}
+	nodes := []any{
+		map[string]any{"id": 1, "kind": "memory_source", "table": "l", "out": []int{3}},
+		map[string]any{"id": 2, "kind": "memory_source", "table": "l", "out": []int{3}},
+		map[string]any{"id": 3, "kind": "union_all", "out": []int{4}},
+	}
+	var fields []any
+	var binding map[string]any
+	publish := func(threshold int, expected any) map[string]any {
+		return a.ok("PUT", "/v1/tables/limits", map[string]any{"expected_revision": expected, "table": map[string]any{
+			"fields": []any{field("k", "utf8"), field("threshold", "int64")}, "keys": []string{"k"}, "rows": []any{[]any{"a", threshold}},
+		}})
+	}
+	change := func(key, value string) map[string]any {
+		return map[string]any{"id": 6, "kind": "change_detect", "iot": map[string]any{"keys": []string{key}, "fields": []string{value}, "emit_first": true, "ttl_micros": 0, "max_keys": 16, "invalid": "error"}, "out": []int{7}}
+	}
+	if kind == "business-count" {
+		fields = []any{field("items", "array<int64>")}
+		nodes = append(nodes,
+			map[string]any{"id": 4, "kind": "unnest", "unnest": map[string]any{"expr": col("items")}, "out": []int{5}},
+			map[string]any{"id": 5, "kind": "window_agg", "window": map[string]any{"kind": "count", "size": 3}, "keys": []string{"unnest_source"},
+				"aggs": []any{map[string]any{"fn": "first", "expr": col("item"), "alias": "first"}, map[string]any{"fn": "last", "expr": col("item"), "alias": "last"}}, "out": []int{6}}, change("unnest_source", "last"))
+	} else {
+		binding = publish(10, 0)
+		spec["reference_tables"] = map[string]any{"limits": map[string]any{"revision": binding["revision"], "sha256": binding["sha256"]}}
+		nodes = append(nodes, map[string]any{"id": 4, "kind": "lookup", "table": "limits", "on": []any{map[string]any{"stream": "k", "table": "k"}}, "keep": []string{"threshold"}, "out": []int{5}})
+		if kind == "business-alarm" {
+			fields = []any{field("k", "utf8"), field("enter", "bool"), field("clear", "bool")}
+			nodes = append(nodes, map[string]any{"id": 5, "kind": "alarm", "iot": map[string]any{"keys": []string{"k"}, "fields": []string{"enter", "clear"}, "emit_first": false, "ttl_micros": 0, "max_keys": 16, "invalid": "error",
+				"timing": map[string]any{"kind": "alarm", "clock": "paused", "activate_micros": 1500000, "resolve_micros": 200000, "cooldown_micros": 10000000, "notification_max_age_micros": 20000000}}, "out": []int{7}})
+		} else {
+			fields = []any{field("k", "utf8"), field("v", "int64"), field("ts", "int64")}
+			for _, node := range nodes[:2] {
+				node.(map[string]any)["event_time_field"] = "ts"
+				node.(map[string]any)["out_of_orderness_micros"] = 0
+			}
+			nodes = append(nodes, map[string]any{"id": 5, "kind": "window_agg", "window": map[string]any{"kind": "event_time", "size_micros": 100, "event_time_field": "ts", "lateness_micros": 0}, "keys": []string{"k", "threshold"},
+				"aggs": []any{map[string]any{"fn": "sum", "expr": col("v"), "alias": "total"}}, "out": []int{6}}, change("k", "total"))
+		}
+	}
+	nodes = append(nodes, map[string]any{"id": 7, "kind": "capture_sink"})
+	spec["graph"] = map[string]any{"version": 1, "pipeline_id": 7, "revision_id": 1, "nodes": nodes}
+	spec["graph_io"] = map[string]any{"sources": map[string]any{"1": source(0), "2": source(1)}, "sinks": map[string]any{"7": sink}}
+	a.ok("PUT", "/v1/streams/l", map[string]any{"fields": fields})
+	a.ok("PUT", "/v1/pipelines/p", spec)
+	start()
+	switch kind {
+	case "business-count":
+		appendRow(paths[0], map[string]any{"items": []int{7, 8, 9}})
+		waitRows(1)
+		waitCut(1)
+		appendRow(paths[1], map[string]any{"items": []int{}})
+		waitCut(2)
+		appendRow(paths[0], map[string]any{"items": []int{7, 8}})
+		waitCut(3)
+		restart()
+		appendRow(paths[0], map[string]any{"items": []int{9}})
+		waitCut(4) // Identical LAST must be suppressed by the restored Change state.
+		appendRow(paths[1], map[string]any{"items": []int{10, 11, 12}})
+		waitRows(2)
+		waitCut(5)
+		rows := c.all()
+		require(len(rows) == 2 && rows[0].Data["first"] == float64(7) && rows[0].Data["last"] == float64(9) && rows[1].Data["first"] == float64(10) && rows[1].Data["last"] == float64(12), fmt.Sprint(rows))
+	case "business-alarm":
+		appendRow(paths[0], map[string]any{"k": "a", "enter": true, "clear": false})
+		waitCut(1)
+		publish(1000, binding["revision"]) // Latest changes; the running/restored binding must not.
+		restart()
+		waitRows(1)
+		appendRow(paths[1], map[string]any{"k": "a", "enter": false, "clear": true})
+		waitCut(2)
+		waitRows(2)
+		rows := c.all()
+		require(len(rows) == 2, fmt.Sprint(rows))
+		for _, r := range rows {
+			require(r.Data["threshold"] == float64(10) && r.Data["sparrow_alarm_episode"] == float64(1), fmt.Sprint(r))
+		}
+	case "business-etref":
+		emit := func(side, v, ts int) { appendRow(paths[side], map[string]any{"k": "a", "v": v, "ts": ts}) }
+		emit(0, 1, 12)
+		waitCut(1)
+		emit(1, 2, 14)
+		waitCut(2)
+		publish(1000, binding["revision"])
+		restart()
+		emit(0, 4, 120)
+		waitCut(3)
+		emit(1, 8, 120)
+		waitRows(1)
+		waitCut(4)
+		rows := c.all()
+		require(len(rows) == 1 && rows[0].Data["threshold"] == float64(10) && rows[0].Data["total"] == float64(3), fmt.Sprint(rows))
+	}
+	seen := make(map[string]bool)
+	for _, r := range c.all() {
+		require(r.ID != "" && !seen[r.ID], "missing or colliding business output ID")
+		seen[r.ID] = true
+	}
+}
+
 func main() {
 	bin := flag.String("server-bin", "", "server with jetstream feature")
 	broker := flag.String("nats-server", "", "nats-server binary")
@@ -441,7 +556,7 @@ func main() {
 	flag.Parse()
 	require(*bin != "" && *broker != "" && *out != "", "--server-bin --nats-server --out required")
 	must(os.Mkdir(*out, 0700))
-	for _, kind := range []string{"file", "jetstream", "join", "multi"} {
+	for _, kind := range []string{"file", "jetstream", "join", "multi", "business-count", "business-alarm", "business-etref"} {
 		scenario(filepath.Join(*out, kind), kind, *bin, *broker)
 	}
 }

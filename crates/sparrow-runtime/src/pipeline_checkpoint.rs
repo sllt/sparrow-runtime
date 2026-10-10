@@ -77,6 +77,14 @@ pub const PT_WINDOW_RELIABLE_SNAPSHOT_VERSION: u16 = 35;
 pub const ANALYSIS_FILE_SNAPSHOT_VERSION: u16 = 36;
 pub const ANALYSIS_RELIABLE_SNAPSHOT_VERSION: u16 = 37;
 pub const ANALYSIS_GRAPH_SNAPSHOT_VERSION: u16 = 38;
+/// Ordered File business graph: analysis + windows/IoT, or pinned references
+/// with a single time domain. Existing participant codecs retain their bytes.
+pub const BUSINESS_GRAPH_SNAPSHOT_VERSION: u16 = 39;
+
+fn business_mismatch(message: &str) -> SparrowError {
+    SparrowError::new(ErrorCode::UnsupportedRestore, message)
+        .context("checkpoint_guard", "business_profile_mismatch")
+}
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
 
 pub(crate) const EXTENDED_PROFILE_GUARD: &str = "extended_profile_mismatch";
@@ -220,6 +228,12 @@ pub fn snapshot_version_for(
     let graph = plan.is_graph();
     let references = plan.has_references();
     let hysteresis = plan.has_hysteresis();
+
+    if plan.is_business_graph() {
+        return if source_kind == crate::graph_cut::KIND {
+            Ok(BUSINESS_GRAPH_SNAPSHOT_VERSION)
+        } else { Err(business_mismatch("business recovery requires ordered File graph input")) };
+    }
 
     if plan.has_analysis_state() {
         return match (plan.is_graph(), source_kind) {
@@ -824,6 +838,7 @@ impl PipelineSnapshot {
                 | PT_WINDOW_FILE_SNAPSHOT_VERSION
                 | PT_WINDOW_RELIABLE_SNAPSHOT_VERSION
                 | ANALYSIS_FILE_SNAPSHOT_VERSION | ANALYSIS_RELIABLE_SNAPSHOT_VERSION | ANALYSIS_GRAPH_SNAPSHOT_VERSION
+                | BUSINESS_GRAPH_SNAPSHOT_VERSION
         ) {
             return Err(invalid("unsupported pipeline snapshot version"));
         }
@@ -879,9 +894,12 @@ impl PipelineSnapshot {
             PT_WINDOW_FILE_SNAPSHOT_VERSION | PT_WINDOW_RELIABLE_SNAPSHOT_VERSION
         );
         let analysis_version = matches!(version, ANALYSIS_FILE_SNAPSHOT_VERSION | ANALYSIS_RELIABLE_SNAPSHOT_VERSION | ANALYSIS_GRAPH_SNAPSHOT_VERSION);
+        let business_version = version == BUSINESS_GRAPH_SNAPSHOT_VERSION;
         // v29-v35 envelopes are complete, checksummed records: identity and
         // profile disagreements are incompatibilities, never corruption.
-        let strict = |message: &str| if analysis_version {
+        let strict = |message: &str| if business_version {
+            business_mismatch(message)
+        } else if analysis_version {
             crate::analysis_state::mismatch(message)
         } else if pt_version {
             pt_mismatch(message)
@@ -915,7 +933,9 @@ impl PipelineSnapshot {
         }
         let length = u32_value(&mut bytes)?;
         let plan = CheckpointPlan::decode(take(&mut bytes, length)?).map_err(|error| {
-            if analysis_version && error.code == ErrorCode::UnsupportedRestore {
+            if business_version && error.code == ErrorCode::UnsupportedRestore {
+                error.context("checkpoint_guard", "business_profile_mismatch")
+            } else if analysis_version && error.code == ErrorCode::UnsupportedRestore {
                 error.context("checkpoint_guard", "analysis_profile_mismatch")
             } else if pt_version && error.code == ErrorCode::UnsupportedRestore {
                 error.context("checkpoint_guard", PT_PROFILE_GUARD)
@@ -925,7 +945,13 @@ impl PipelineSnapshot {
                 error.context("checkpoint_guard", BUFFERED_PROFILE_GUARD)
             } else { error }
         })?;
-        if analysis_version != plan.has_analysis_state() {
+        if business_version != plan.is_business_graph() {
+            return Err(business_mismatch("business outer version and participant profile disagree"));
+        }
+        if business_version && snapshot_version_for(&plan, &source.identity.kind)? != version {
+            return Err(business_mismatch("business source/profile mismatch"));
+        }
+        if analysis_version != (plan.has_analysis_state() && !business_version) {
             return Err(crate::analysis_state::mismatch("analysis outer version and participant codec disagree"));
         }
         if analysis_version {
@@ -956,7 +982,7 @@ impl PipelineSnapshot {
                 ));
             }
         }
-        if extended_version != (plan.has_extended_state() && !pt_state) {
+        if extended_version != (plan.has_extended_state() && !pt_state && !business_version) {
             return Err(extended_mismatch(
                 "checkpoint outer version and extended aggregate state codec disagree",
             ));
@@ -1017,7 +1043,7 @@ impl PipelineSnapshot {
                 | REFERENCE_GRAPH_SNAPSHOT_VERSION
         ) && plan.has_references();
         let combined_time_version = matches!(version, PAUSED_COMBINED_FILE_SNAPSHOT_VERSION | PAUSED_COMBINED_RELIABLE_SNAPSHOT_VERSION | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION | ALARM_FILE_SNAPSHOT_VERSION | ALARM_RELIABLE_SNAPSHOT_VERSION | ALARM_GRAPH_SNAPSHOT_VERSION | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION | RESAMPLE_FILE_SNAPSHOT_VERSION | RESAMPLE_RELIABLE_SNAPSHOT_VERSION);
-        if !reference_stateful_version && !combined_time_version && mandatory_iot_version != plan.has_iot() {
+        if !business_version && !reference_stateful_version && !combined_time_version && mandatory_iot_version != plan.has_iot() {
             return Err(invalid("IoT checkpoint version/manifest mismatch"));
         }
         if version == REFERENCE_SNAPSHOT_VERSION
@@ -1084,6 +1110,7 @@ impl PipelineSnapshot {
             ));
         }
         if version != REFERENCE_SNAPSHOT_VERSION
+            && !business_version
             && !matches!(
                 version,
                 REFERENCE_LINEAR_SNAPSHOT_VERSION
@@ -1125,6 +1152,7 @@ impl PipelineSnapshot {
                 | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION
                 | ALARM_GRAPH_SNAPSHOT_VERSION
                 | ANALYSIS_GRAPH_SNAPSHOT_VERSION
+                | BUSINESS_GRAPH_SNAPSHOT_VERSION
         ) && plan.is_graph()
         {
             return Err(invalid("graph checkpoint version/manifest mismatch"));
@@ -1329,7 +1357,7 @@ impl StoredSnapshot {
         materialize: bool,
         meter: &mut RestoreMeter,
     ) -> Result<Self> {
-        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35|36|37|38,0])) {
+        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35|36|37|38|39,0])) {
             Ok(Self::Pipeline(PipelineSnapshot::decode_metered(
                 bytes,
                 max_keys,

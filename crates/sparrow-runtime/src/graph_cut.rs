@@ -364,8 +364,14 @@ impl GraphCut {
         Ok(cut)
     }
     pub fn check_plan(&self, plan: &PhysicalPlan) -> Result<()> {
+        self.check_plan_with_manifest(plan, &CheckpointPlan::from_physical(plan)?)
+    }
+    pub fn check_plan_with_manifest(&self, plan: &PhysicalPlan, manifest: &CheckpointPlan) -> Result<()> {
         self.validate()?;
-        let manifest = CheckpointPlan::from_physical(plan)?;
+        let live = if manifest.has_references() {
+            CheckpointPlan::from_physical_with_references(plan, manifest.reference_tables.clone())?
+        } else { CheckpointPlan::from_physical(plan)? };
+        manifest.check_compatible(&live)?;
         if !manifest.is_time_graph()
             || self.sources.keys().copied().collect::<Vec<_>>()
                 != manifest
@@ -511,7 +517,7 @@ pub struct GraphRuntime {
     pub initial: GraphCut,
     pub event_time: bool,
     pub generation: [u8; 16],
-    semantics: Vec<u8>,
+    manifest: CheckpointPlan,
     unions: Mutex<BTreeMap<u32, (u64, UnionProgress)>>,
     outputs: Mutex<BTreeMap<u32, (u64, u64)>>,
     observed: std::sync::atomic::AtomicI64,
@@ -525,20 +531,28 @@ impl GraphRuntime {
         generation: [u8; 16],
         owner: &Arc<MemoryOwner>,
     ) -> Result<Arc<Self>> {
-        initial.check_plan(plan)?;
+        Self::new_with_manifest(initial, plan, &CheckpointPlan::from_physical(plan)?, generation, owner)
+    }
+    pub fn new_with_manifest(
+        initial: GraphCut,
+        plan: &PhysicalPlan,
+        manifest: &CheckpointPlan,
+        generation: [u8; 16],
+        owner: &Arc<MemoryOwner>,
+    ) -> Result<Arc<Self>> {
+        initial.check_plan_with_manifest(plan, manifest)?;
         if generation == [0; 16] {
             return Err(invalid("missing generation"));
         }
         let credit = owner.acquire(CreditKind::Reservation, MAX_BYTES * 8)?;
         let sequence = initial.sequence;
         let micros = initial.micros;
-        let semantics = CheckpointPlan::from_physical(plan)?.semantics;
         let observed = std::sync::atomic::AtomicI64::new(initial.observed_micros);
         Ok(Arc::new(Self {
             initial,
             event_time: plan.recovery_event_time(),
             generation,
-            semantics,
+            manifest: manifest.clone(),
             unions: Mutex::new(BTreeMap::new()),
             outputs: Mutex::new(BTreeMap::new()),
             observed,
@@ -571,11 +585,11 @@ impl GraphRuntime {
         Arc::ptr_eq(self._credit.owner(), owner)
     }
     pub fn check_plan(&self, plan: &PhysicalPlan) -> Result<()> {
-        self.initial.check_plan(plan)?;
-        if self.semantics != CheckpointPlan::from_physical(plan)?.semantics {
-            return Err(invalid("runtime graph semantics changed"));
-        }
-        Ok(())
+        self.check_plan_with_manifest(plan, &self.manifest)
+    }
+    pub fn check_plan_with_manifest(&self, plan: &PhysicalPlan, manifest: &CheckpointPlan) -> Result<()> {
+        self.manifest.check_compatible(manifest)?;
+        self.initial.check_plan_with_manifest(plan, manifest)
     }
     pub fn source_kind(&self) -> &'static str {
         KIND

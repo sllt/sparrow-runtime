@@ -40,6 +40,12 @@ impl Supervisor {
         crate::validate::validate_time_graph_profile(spec, &plan)?;
         let io = spec.graph_io.as_ref().expect("validated graph I/O");
         let admission = self.kernel.prepare_source_admission(plan.pipeline)?;
+        let (admission, prepared_references) = if spec.reference_tables.is_empty() {
+            (admission, None)
+        } else {
+            let (admission, prepared) = self.prepare_reference_tables_with_admission(spec, admission).await?;
+            (admission, Some(prepared))
+        };
         let owner = admission.owner();
         // Cold File readers, log/checksum buffers, bounded graph cuts and their
         // temporary clones stay admitted for the actor's complete lifetime.
@@ -48,8 +54,14 @@ impl Supervisor {
             512 * 1024 + io.sources.len() * 128 * 1024,
         )?);
         let startup_guard = Arc::new((admission.lifecycle_guard(), workspace.clone()));
-        let manifest = Arc::new(CheckpointPlan::from_physical(&plan)?);
-        let semantics = digest(&manifest.semantics);
+        let manifest = Arc::new(crate::validate::checkpoint_plan_with_references(
+            spec, &plan, prepared_references.as_ref().map_or(&[], |p| p.dependencies.as_slice()))?);
+        // A crash can precede the first CURRENT. Bind TIME_PENDING to pinned
+        // table revisions/digests as well as computation, even in that case.
+        // Preserve every existing v18/v19/v22/v38 decision-log fingerprint.
+        let semantics = if manifest.is_business_graph() {
+            digest(&manifest.encode()?)
+        } else { digest(&manifest.semantics) };
         let checkpoint_policy = spec.checkpoint.clone().expect("time graph checkpoint");
         let directory = spec.checkpoint_dir.clone().expect("time graph directory");
         let max_keys = self.kernel.job_budget().max_state_keys;
@@ -163,6 +175,9 @@ impl Supervisor {
         };
         let mut request = JobRequest::new(plan.clone(), vec![], SharedCapture::disabled())
             .with_observation(diag.observation.clone());
+        if let Some(prepared) = prepared_references {
+            request = request.with_tables(prepared.tables);
+        }
         let mut inputs = Vec::new();
         for (&id, source_spec) in &io.sources {
             let schema = Arc::new(
@@ -268,11 +283,11 @@ impl Supervisor {
                     .map(|(_, binding)| binding.clone()),
             });
         }
-        cut.check_plan(&plan)?;
+        cut.check_plan_with_manifest(&plan, &manifest)?;
         if let Some(p) = &pending {
             p.check(generation, semantics, &cut)?;
         }
-        let graph = GraphRuntime::new(cut.clone(), &plan, generation, &owner)?;
+        let graph = GraphRuntime::new_with_manifest(cut.clone(), &plan, &manifest, generation, &owner)?;
         let acks = AlignedAcks::default().with_graph_time(graph.clone())?;
         let mut outputs = Vec::new();
         let mut outboxes = Vec::new();

@@ -1583,6 +1583,14 @@ fn validate_reference_checkpoint_profile(spec: &PipelineSpec, plan: &PhysicalPla
     if spec.reference_tables.is_empty() {
         return Ok(());
     }
+    if plan.is_recovery_time_graph() {
+        validate_time_graph_profile(spec, plan)?;
+        let manifest = checkpoint_plan_with_references(spec, plan, &reference_dependency_shape(spec)?)?;
+        if sparrow_runtime::snapshot_version_for(&manifest, sparrow_runtime::graph_cut::KIND)? != 39 {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "reference time graph requires business profile v39"));
+        }
+        return Ok(());
+    }
     if spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
         || spec.sink.kind != "http"
         || !plan.side_outputs.is_empty()
@@ -1760,6 +1768,7 @@ fn validate_aligned_plan_inner(
         && !is_sliding_count_plan(plan)
         && !is_buffered_et_plan(plan)
         && !is_pt_window_plan(plan)
+        && !plan.is_recovery_time_graph()
         && (recovery.is_aligned()
             || spec.restore.is_some()
             || spec.checkpoint.is_some()
@@ -2352,14 +2361,14 @@ fn validate_analysis_recovery_profile(spec: &PipelineSpec, plan: &PhysicalPlan, 
     }
     if !recovery.is_aligned() || spec.sink.kind != "http"
         || spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
-        || !spec.reference_tables.is_empty() || spec.has_live_lookups()
+        || (plan.edges.is_none() && !spec.reference_tables.is_empty()) || spec.has_live_lookups()
         || spec.source.input_dlq.is_some() || spec.source.replay_start.is_some()
         || spec.sink.durable_outbox.is_some() || spec.sink.action.is_some()
         || (plan.edges.is_none() && spec.graph_io.is_some()) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-            "analysis recovery requires aligned, independent directory and required HTTP; no Lookup/DLQ/outbox/replay-operation combinations"));
+            "analysis recovery requires aligned, independent directory and required HTTP; no live Lookup/DLQ/outbox/replay-operation combinations"));
     }
-    let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    let manifest = checkpoint_plan_with_references(spec, plan, &reference_dependency_shape(spec)?)?;
     if !manifest.has_analysis_state() { return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "analysis profile missing")); }
     if plan.edges.is_some() { validate_time_graph_profile(spec, plan)?; }
     else if !matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay")
@@ -2378,7 +2387,7 @@ pub(crate) fn validate_time_graph_profile(spec: &PipelineSpec, plan: &PhysicalPl
     };
     if spec.recovery != "aligned"
         || plan.edges.is_none()
-        || !spec.reference_tables.is_empty()
+        || spec.has_live_lookups()
         || !plan.side_outputs.is_empty()
         || !spec.fail_on_decode
         || spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
@@ -2394,15 +2403,29 @@ pub(crate) fn validate_time_graph_profile(spec: &PipelineSpec, plan: &PhysicalPl
         || io
             .sources
             .values()
-            .any(|s| !matches!(s.kind.as_str(), "file" | "file_replay" | "replay"))
-        || io.sinks.values().any(|s| s.kind != "http" || s.skip_verify)
+            .any(|s| !matches!(s.kind.as_str(), "file" | "file_replay" | "replay")
+                || s.input_dlq.is_some() || s.replay_start.is_some())
+        || io.sinks.values().any(|s| s.kind != "http" || s.skip_verify
+            || s.durable_outbox.is_some() || s.action.is_some())
         || io
             .idle_after_ms
             .is_some_and(|n| !(100..=86400000).contains(&n))
     {
-        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"durable time graph requires File inputs, verified required HTTP, independent directory, fail_on_decode, resume_latest and 100..1000 ms decisions; optional idle_after_ms=100..86400000; no historical replay/references/side outputs"));
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"durable time graph requires File inputs, verified required HTTP, independent directory, fail_on_decode, resume_latest and 100..1000 ms decisions; optional idle_after_ms=100..86400000; no historical replay/live references/side outputs/DLQ/outbox"));
     }
-    let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    let manifest = checkpoint_plan_with_references(spec, plan, &reference_dependency_shape(spec)?)?;
+    if manifest.is_business_graph() {
+        for source in io.sources.values() {
+            if !source.payload_format()?.is_json() {
+                return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "business graph input requires JSON"));
+            }
+        }
+        for sink in io.sinks.values() {
+            if !sink.payload_format()?.is_json() {
+                return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "business graph output requires JSON"));
+            }
+        }
+    }
     if !manifest.is_time_graph() {
         return Err(SparrowError::new(
             ErrorCode::UnsupportedRestore,
@@ -2842,6 +2865,25 @@ fn effective_guarantees_with_plan_inner(
         value["aligned_eligible"] = serde_json::json!(false);
         value["aligned_eligibility_reason"] = serde_json::json!("plugin functions have no recovery profile");
         value["plugins"] = serde_json::json!({"recovery":"restart_fresh_only","trusted_native":native||external,"preemptible":!native,"external_process":external,"os_sandbox":false,"durable_ack":false});
+        return value;
+    }
+    if plan.is_recovery_time_graph() && (!spec.reference_tables.is_empty()
+        || (plan.has_analysis() && plan.stages.iter().any(|s| matches!(s,
+            sparrow_plan::PhysicalStage::WindowAgg { .. } | sparrow_plan::PhysicalStage::Iot { .. })))) {
+        let mut candidate = spec.clone();
+        candidate.recovery = "aligned".into();
+        let checked = validate_aligned_plan(&candidate, plan);
+        value["aligned_eligible"] = serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
+        value["business_recovery"] = serde_json::json!({
+            "snapshot_version":39,"maturity":"development_preview","certified":false,
+            "active":spec.recovery == "aligned",
+            "scope":"ordered_JSON_File_HTTP_graph; pinned_references_or_analysis_with_Count_ET_TTL0_state",
+            "references":"exact_revision_canonical_SHA256_runtime_CRC32; never_follow_latest",
+            "time":"PT_or_ET_not_mixed; Join_analysis_excludes_timed_IoT; alarm_uses_paused_PT",
+            "output":"generation_and_sink_scoped_OutputSequence; uncommitted_outputs_may_repeat",
+            "not_enabled":["buffered_windows","extended_time_aggregates","live_Lookup","JetStream_DAG","DLQ","durable_outbox","historical_replay"]});
+        value["recovery_risk"] = serde_json::json!("HTTP_may_repeat_before_CURRENT; deduplicate_by_output_identity; no_exactly_once_or_cross_sink_rollback");
         return value;
     }
     if is_sliding_count_plan(plan) && !plan.has_analysis() {

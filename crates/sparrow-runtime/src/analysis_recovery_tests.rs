@@ -8,6 +8,9 @@ use sparrow_model::{InflightCounter, OperatorId, OutputSequence, SharedVirtualCl
 use sparrow_plan::{CheckpointPlan, PhysicalPlan, PhysicalStage, UnnestSpec};
 use std::{collections::BTreeMap, sync::Arc};
 
+#[path = "business_recovery_tests.rs"]
+mod business_recovery_tests;
+
 fn unnest_plan() -> PhysicalPlan {
     let input = Schema::new(1, vec![Field::new(1, "items", DataType::Dynamic, true)]).unwrap();
     let analysis = AnalysisPlan::unnest(
@@ -220,8 +223,7 @@ fn end(id: u32) -> Decision {
         idle: None,
     }
 }
-fn initial(plan: &PhysicalPlan) -> GraphCut {
-    let manifest = CheckpointPlan::from_physical(plan).unwrap();
+fn initial(plan: &PhysicalPlan, manifest: &CheckpointPlan) -> GraphCut {
     GraphCut {
         sequence: 0,
         micros: 0,
@@ -285,27 +287,70 @@ fn graph_segment(
     decisions: &[Decision],
     reverse: bool,
 ) -> (PipelineSnapshot, Output) {
+    graph_segment_with_table(plan, restored, decisions, reverse, None)
+}
+fn graph_segment_with_table(
+    plan: PhysicalPlan,
+    restored: Option<PipelineSnapshot>,
+    decisions: &[Decision],
+    reverse: bool,
+    reference: Option<(Schema, Vec<Row>)>,
+) -> (PipelineSnapshot, Output) {
     let mut options = KernelOptions::default();
     options.mailbox.max_items = 1;
     options.mailbox.max_bytes = 4096;
     options.rows_per_batch = 1;
     let kernel = Kernel::new(options).unwrap();
     kernel.block_on(async {
-        let manifest = Arc::new(CheckpointPlan::from_physical(&plan).unwrap());
+        let admission = kernel.prepare_source_admission(plan.pipeline).unwrap();
+        let owner = admission.owner();
+        let tables: HashMap<_, _> = reference
+            .into_iter()
+            .map(|(schema, rows)| {
+                let table = crate::ReferenceTable::snapshot_owned_verified(
+                    "limits",
+                    1,
+                    schema,
+                    vec!["k".into()],
+                    rows,
+                    16,
+                    owner.budget().retention_bytes,
+                    [42; 32],
+                    &owner,
+                )
+                .unwrap();
+                ("limits".into(), table)
+            })
+            .collect();
+        let manifest = Arc::new(if tables.is_empty() {
+            CheckpointPlan::from_physical(&plan).unwrap()
+        } else {
+            CheckpointPlan::from_physical_with_references(
+                &plan,
+                tables
+                    .values()
+                    .map(|t| t.verified_dependency().unwrap())
+                    .collect(),
+            )
+            .unwrap()
+        });
+        if let Some(saved) = &restored {
+            saved.check_compatible(&manifest).unwrap();
+        }
         let mut cut = restored
             .as_ref()
             .map(|s| GraphCut::unwrap(&s.source).unwrap())
-            .unwrap_or_else(|| initial(&plan));
-        let admission = kernel.prepare_source_admission(plan.pipeline).unwrap();
-        let owner = admission.owner();
-        let graph = GraphRuntime::new(cut.clone(), &plan, [7; 16], &owner).unwrap();
+            .unwrap_or_else(|| initial(&plan, &manifest));
+        let graph = GraphRuntime::new_with_manifest(cut.clone(), &plan, &manifest, [7; 16], &owner)
+            .unwrap();
         let acks = AlignedAcks::default()
             .with_graph_time(graph.clone())
             .unwrap();
-        let (windows, analysis) = restored
-            .map(|s| (Some(s.windows), s.analysis))
-            .unwrap_or((None, vec![]));
+        let (windows, analysis, iot) = restored
+            .map(|s| (Some(s.windows), s.analysis, s.iot))
+            .unwrap_or((None, vec![], vec![]));
         let mut request = JobRequest::new(plan.clone(), vec![], SharedCapture::disabled())
+            .with_tables(tables)
             .with_source_admission(admission)
             .with_clock(RuntimeClock::virtual_clock(SharedVirtualClock::new(
                 cut.micros,
@@ -318,7 +363,7 @@ fn graph_segment(
                     restore: windows,
                     analysis,
                     buffered: vec![],
-                    iot: vec![],
+                    iot,
                     sink: None,
                 }),
                 acks: acks.clone(),
@@ -432,7 +477,7 @@ fn graph_segment(
             }
             let frozen = req.wait_participants(Duration::from_secs(3)).await.unwrap();
             graph.complete(cut.sequence, &mut cut).unwrap();
-            cut.check_plan(&plan).unwrap();
+            cut.check_plan_with_manifest(&plan, &manifest).unwrap();
             let bytes = PipelineSnapshot::encode_frozen(
                 cut.sequence,
                 &cut.wrap().unwrap(),
@@ -444,7 +489,20 @@ fn graph_segment(
                 1024,
             )
             .unwrap();
-            assert_eq!(&bytes.bytes()[4..6], &38u16.to_le_bytes());
+            let version = if manifest.is_business_graph() {
+                39u16
+            } else {
+                38u16
+            };
+            assert_eq!(&bytes.bytes()[4..6], &version.to_le_bytes());
+            if manifest.is_business_graph() {
+                let mut foreign = bytes.bytes().to_vec();
+                foreign[4..6].copy_from_slice(&38u16.to_le_bytes());
+                assert_eq!(
+                    PipelineSnapshot::decode(&foreign, 1024).unwrap_err().code,
+                    ErrorCode::UnsupportedRestore
+                );
+            }
             let dir = tmp();
             let mut store = CheckpointStore::open_for_plan_exclusive(
                 &dir,
@@ -456,7 +514,10 @@ fn graph_segment(
             .unwrap();
             store.commit_prepared(&bytes).unwrap();
             let (decoded, credit) = store.recover_pipeline_owned(None, &owner).unwrap();
-            assert_eq!(decoded.analysis.len(), manifest.states.len());
+            assert_eq!(
+                decoded.analysis.len() + decoded.windows.len() + decoded.iot.len(),
+                manifest.states.len()
+            );
             snapshot = Some(decoded);
             drop((credit, store));
             std::fs::remove_dir_all(dir).unwrap();
