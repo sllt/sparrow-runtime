@@ -2874,6 +2874,26 @@ pub fn request_start_at(
     Ok(())
 }
 
+/// K5.5 conditional start; see `Store::request_start_conditional`.
+pub fn request_start_if(
+    store: &Store,
+    name: &str,
+    actor: &str,
+    revision: Option<u64>,
+    expected_etag: Option<&str>,
+    expected_desired: Option<(&str, Option<u64>)>,
+) -> Result<u64> {
+    let rev = store.request_start_conditional(name, revision, expected_etag, expected_desired)?;
+    store.audit(
+        actor,
+        "start",
+        Some(name),
+        Some(&format!("desired=running; revision={rev}; conditional; catalog committed before I/O")),
+        "accepted",
+    )?;
+    Ok(rev)
+}
+
 pub fn request_stop(store: &Store, name: &str, actor: &str) -> Result<()> {
     let _ = store.get_pipeline(name)?;
     store.set_desired(name, "stopped", None)?;

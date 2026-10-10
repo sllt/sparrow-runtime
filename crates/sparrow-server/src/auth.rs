@@ -244,6 +244,7 @@ pub const ACTIONS: &[(&str, &str, &str, Role)] = &[
     ("GET", "/v1/publications/{}", "publication.read", Role::Operator),
     ("GET", "/v1/pipelines/{}/revisions", "pipeline.revisions", Role::Operator),
     ("GET", "/v1/pipelines/{}/revisions/{}", "pipeline.revision", Role::Operator),
+    ("POST", "/v1/pipelines/{}/rollback", "pipeline.rollback", Role::Operator),
     ("GET", "/v1/secrets", "secrets.names", Role::Operator),
     ("GET", "/v1/connections", "connections.list", Role::Operator),
     ("GET", "/v1/connections/{}", "connection.read", Role::Operator),

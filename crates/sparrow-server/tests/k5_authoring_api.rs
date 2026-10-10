@@ -354,3 +354,49 @@ async fn k54_preview_iot_change_and_debounce() {
     assert_eq!(steps(&r), vec![0, 0, 0, 0, 1], "{}", r.v);
     assert_eq!(r.v["steps"][4]["rows"][0]["v"], 2);
 }
+
+#[tokio::test]
+async fn k55_rollback_new_revision_and_conditional_start() {
+    let s = setup().await;
+    let stream: Value = serde_json::from_str(STREAM).unwrap();
+    assert_eq!(call(&s, Method::PUT, "/v1/streams/sensors", OPERATOR, None, stream).await.st, StatusCode::CREATED);
+    let v1: Value = serde_json::from_str(&spec_text("10")).unwrap();
+    let v2: Value = serde_json::from_str(&spec_text("20")).unwrap();
+    let r = call(&s, Method::PUT, "/v1/pipelines/rb", OPERATOR, None, v1).await;
+    assert!(r.st.is_success(), "{}", r.v);
+    let r = call(&s, Method::PUT, "/v1/pipelines/rb", OPERATOR, Some("rev-1"), v2).await;
+    assert!(r.st.is_success(), "{}", r.v);
+    let body = |op: &str, etag: &str| json!({"operation_id": op, "from_revision": 1, "expected_etag": etag, "reason": "threshold regression"});
+    // Stale ETag: refused, nothing published.
+    let r = call(&s, Method::POST, "/v1/pipelines/rb/rollback", OPERATOR, None, body("rb-op-0001", "rev-1")).await;
+    assert_eq!(r.st, StatusCode::PRECONDITION_FAILED, "{}", r.v);
+    assert_eq!(r.v["error"]["context"][0]["value"], "rev-2", "{}", r.v);
+    let r = call(&s, Method::POST, "/v1/pipelines/rb/rollback", OPERATOR, None, body("rb-op-0002", "rev-2")).await;
+    assert_eq!(r.st, StatusCode::CREATED, "{}", r.v);
+    assert_eq!(r.v["receipt"]["revision"], 3);
+    assert_eq!(r.v["receipt"]["draft_id"], "rollback:r1");
+    assert_eq!(r.v["started"], false);
+    // Retry with the same operation id: same receipt, no fourth revision.
+    let r = call(&s, Method::POST, "/v1/pipelines/rb/rollback", OPERATOR, None, body("rb-op-0002", "rev-2")).await;
+    assert_eq!(r.st, StatusCode::OK);
+    assert_eq!(r.v["receipt"]["revision"], 3);
+    let r3 = call(&s, Method::GET, "/v1/pipelines/rb/revisions/3", OPERATOR, None, Value::Null).await;
+    let r1 = call(&s, Method::GET, "/v1/pipelines/rb/revisions/1", OPERATOR, None, Value::Null).await;
+    assert_eq!(r3.v["spec"]["sql"], r1.v["spec"]["sql"]);
+    assert_eq!(call(&s, Method::POST, "/v1/pipelines/rb/rollback", VIEWER, None, body("rb-op-0003", "rev-3")).await.st, StatusCode::FORBIDDEN);
+    // Conditional start: stale ETag or changed desired state leaves the state untouched.
+    let start = |b: Value| call(&s, Method::POST, "/v1/pipelines/rb/start", OPERATOR, None, b);
+    let r = start(json!({"revision": 1, "expected_etag": "rev-2", "expected_desired": {"status":"stopped","revision":null}})).await;
+    assert_eq!(r.st, StatusCode::PRECONDITION_FAILED, "{}", r.v);
+    let r = start(json!({"revision": 1, "expected_etag": "rev-3", "expected_desired": {"status":"running","revision":1}})).await;
+    assert_eq!(r.st, StatusCode::PRECONDITION_FAILED, "{}", r.v);
+    let st = call(&s, Method::GET, "/v1/pipelines/rb/status", OPERATOR, None, Value::Null).await;
+    assert_eq!(st.v["desired"]["status"], "stopped", "{}", st.v);
+    let r = start(json!({"revision": 1, "expected_etag": "rev-3", "expected_desired": {"status":"stopped","revision":null}})).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+    let st = call(&s, Method::GET, "/v1/pipelines/rb/status", OPERATOR, None, Value::Null).await;
+    assert_eq!(st.v["desired"]["revision"], 1, "{}", st.v);
+    let r = start(json!({"revision": 9, "expected_etag": "rev-3"})).await;
+    assert_eq!(r.st, StatusCode::NOT_FOUND, "{}", r.v);
+    let _ = call(&s, Method::POST, "/v1/pipelines/rb/stop", OPERATOR, None, json!({})).await;
+}

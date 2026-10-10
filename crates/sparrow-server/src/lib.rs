@@ -1893,6 +1893,17 @@ async fn list_pipelines(
 #[derive(Deserialize, Default)]
 struct StartBody {
     revision: Option<u64>,
+    /// K5.5: optional conditions, checked atomically with the state change.
+    #[serde(default)]
+    expected_etag: Option<String>,
+    #[serde(default)]
+    expected_desired: Option<ExpectedDesired>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectedDesired {
+    status: String,
+    revision: Option<u64>,
 }
 
 async fn start_pipeline(
@@ -1903,27 +1914,22 @@ async fn start_pipeline(
 ) -> ApiResult<Json<Value>> {
     let actor = require_auth(&state, &headers)?;
     blocking_api(move || {
-        if let Some(tag) = if_match(&headers) {
-            let row = state.store.get_pipeline(&name).map_err(ApiError::from)?;
-            if tag != row.etag {
-                return Err(ApiError {
-                    status: StatusCode::PRECONDITION_FAILED,
-                    err: SparrowError::new(ErrorCode::InvalidArgument, "If-Match does not match etag"),
-                });
-            }
-        }
-        let revision = if body.is_empty() {
-            None
+        let parsed: StartBody = if body.is_empty() {
+            StartBody::default()
         } else {
-            let parsed: StartBody = serde_json::from_slice(&body).map_err(|e| {
-                ApiError::from(SparrowError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("start body JSON: {e}"),
-                ))
-            })?;
-            parsed.revision
+            serde_json::from_slice(&body).map_err(|e| {
+                ApiError::from(SparrowError::new(ErrorCode::InvalidArgument, format!("start body JSON: {e}")))
+            })?
         };
-        request_start_at(&state.store, &name, &actor, revision).map_err(ApiError::from)?;
+        let header = if_match(&headers);
+        let etag = header.as_deref().or(parsed.expected_etag.as_deref());
+        if etag.is_some() || parsed.expected_desired.is_some() {
+            let desired = parsed.expected_desired.as_ref().map(|d| (d.status.as_str(), d.revision));
+            sparrow_control::supervisor::request_start_if(&state.store, &name, &actor, parsed.revision, etag, desired)
+                .map_err(ApiError::from)?;
+        } else {
+            request_start_at(&state.store, &name, &actor, parsed.revision).map_err(ApiError::from)?;
+        }
         state.supervisor.wake();
         let mut body = status_body(&state, &name)?;
         if let Value::Object(map) = &mut body {

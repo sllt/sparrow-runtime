@@ -335,6 +335,55 @@ impl Store {
         })
     }
 
+    /// K5.5 configuration rollback: republish the spec of `from_revision` as
+    /// a NEW revision (history is never rewritten), CAS on the pipeline ETag,
+    /// idempotent by `operation_id`. Does not start anything.
+    pub fn rollback_pipeline(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        actor: &str,
+        pipeline: &str,
+        from_revision: u64,
+        expected_etag: &str,
+    ) -> Result<Receipt> {
+        check_operation_id(operation_id)?;
+        let source = self.get_pipeline_revision(pipeline, from_revision)?;
+        let spec = source.spec;
+        let plugin_refs = plugin_catalog::references(&spec)?;
+        let origin = format!("rollback:r{from_revision}");
+        self.write(|c| {
+            if let Some((r, digest)) = load_receipt(c, operation_id)? {
+                if digest != request_digest {
+                    return Err(conflict("operation_id was already used for a different request", None));
+                }
+                return Ok(Receipt { replayed: true, ..r });
+            }
+            let current: Option<String> = c.query_row("SELECT etag FROM pipelines WHERE name=?1", [pipeline], |r| r.get(0)).optional().map_err(db)?;
+            let cur = current.ok_or_else(|| not_found("pipeline", pipeline))?;
+            if expected_etag.trim_matches('"') != cur {
+                return Err(conflict(format!("pipeline changed: reviewed `{expected_etag}` is not current `{cur}`"), Some(cur)));
+            }
+            let row = self.put_pipeline_in(c, pipeline, &spec, Some(&cur), false, None, &plugin_refs)?;
+            let now = now_ms();
+            c.execute(
+                "INSERT INTO publication_receipts(operation_id,request_digest,actor,pipeline,revision,etag,draft_id,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![operation_id, request_digest, actor, pipeline, row.latest_revision as i64, row.etag, origin, now],
+            )
+            .map_err(db)?;
+            Ok(Receipt {
+                operation_id: operation_id.into(),
+                actor: actor.into(),
+                pipeline: pipeline.into(),
+                revision: row.latest_revision,
+                etag: row.etag,
+                draft_id: Some(origin.clone()),
+                created_at: now,
+                replayed: false,
+            })
+        })
+    }
+
     pub fn list_pipeline_revisions(&self, name: &str, before: Option<u64>, limit: usize) -> Result<Vec<RevisionMeta>> {
         let limit = limit.clamp(1, 100) as i64;
         self.read(|c| {

@@ -1239,6 +1239,55 @@ impl Store {
         self.write(|c| Self::start_revision(c, name, revision))
     }
 
+    /// K5.5: conditional start. The pipeline ETag, the expected desired
+    /// state and the target revision are checked in the same write
+    /// transaction that flips desired state, so a concurrent publish/start
+    /// can never slip between "confirm" and "commit".
+    pub(crate) fn request_start_conditional(
+        &self,
+        name: &str,
+        revision: Option<u64>,
+        expected_etag: Option<&str>,
+        expected_desired: Option<(&str, Option<u64>)>,
+    ) -> Result<u64> {
+        self.write(|c| {
+            let (latest, etag): (i64, String) = c
+                .query_row("SELECT latest_revision, etag FROM pipelines WHERE name=?1", params![name], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()
+                .map_err(db)?
+                .ok_or_else(|| SparrowError::new(ErrorCode::NotFound, format!("unknown pipeline `{name}`")))?;
+            if let Some(want) = expected_etag {
+                if want != etag && want != format!("\"{etag}\"") {
+                    return Err(self::authoring::conflict(format!("If-Match `{want}` does not match current `{etag}`"), Some(etag)));
+                }
+            }
+            if let Some((status, rev)) = expected_desired {
+                let (cur_status, cur_rev): (String, Option<i64>) = c
+                    .query_row("SELECT desired_status, desired_revision FROM desired_state WHERE name=?1", params![name], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(db)?;
+                let cur_rev = cur_rev.map(|v| v as u64);
+                if cur_status != status || cur_rev != rev {
+                    return Err(SparrowError::new(ErrorCode::Conflict, "desired state changed since it was reviewed")
+                        .context("desired_status", cur_status)
+                        .context("desired_revision", cur_rev.map_or("none".into(), |v| v.to_string())));
+                }
+            }
+            let rev = match revision {
+                Some(r) => {
+                    let found: Option<i64> = c
+                        .query_row("SELECT revision FROM pipeline_revisions WHERE name=?1 AND revision=?2", params![name, r as i64], |row| row.get(0))
+                        .optional()
+                        .map_err(db)?;
+                    found.ok_or_else(|| SparrowError::new(ErrorCode::NotFound, format!("unknown revision {r} of `{name}`")))?;
+                    r
+                }
+                None => latest as u64,
+            };
+            Self::start_revision(c, name, rev)?;
+            Ok(rev)
+        })
+    }
+
     fn start_revision(c: &Connection, name: &str, revision: u64) -> Result<()> {
         let changed = c
             .execute(
