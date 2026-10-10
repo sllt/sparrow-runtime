@@ -21,6 +21,9 @@ use sparrow_plan::{CheckpointPlan, ParticipantId};
 pub struct EncodedFreeze {
     pub(crate) bytes: Vec<u8>,
     pub(crate) lease: sparrow_model::MemoryLease,
+    /// Frame written with participant codec 3 (accumulator tags 8/9 allowed).
+    /// The envelope encoder requires this to equal the manifest codec.
+    pub(crate) ext: bool,
 }
 
 impl EncodedFreeze {
@@ -45,17 +48,18 @@ impl EncodedFreeze {
         max_keys: usize,
     ) -> Result<Self> {
         op.check_freeze_encode_bound(max_keys)?;
-        let capacity = op.estimated_freeze_bytes().saturating_add(256);
+        let capacity = op.try_estimated_freeze_bytes()?.saturating_add(256);
         let lease = owner.acquire(sparrow_model::CreditKind::Reservation, capacity)?;
         let mut bytes = Vec::with_capacity(capacity);
-        op.encode_freeze_into(&mut bytes, max_keys)?;
+        let codec = op.accumulator_codec();
+        op.encode_freeze_into_codec(&mut bytes, max_keys, codec)?;
         if bytes.len() > capacity {
             return Err(SparrowError::new(
                 ErrorCode::Internal,
                 "freeze size estimate underflow",
             ));
         }
-        Ok(Self { bytes, lease })
+        Ok(Self { bytes, lease, ext: codec == crate::aggregate::AccumulatorCodec::WindowExt })
     }
 
     pub fn from_iot(op: &crate::iot::IotOperator, owner: &Arc<MemoryOwner>, max_keys: usize) -> Result<Self> {
@@ -69,7 +73,7 @@ impl EncodedFreeze {
         if bytes.len() > capacity {
             return Err(SparrowError::new(ErrorCode::Internal, "IoT freeze estimate underflow"));
         }
-        Ok(Self { bytes, lease })
+        Ok(Self { bytes, lease, ext: false })
     }
 }
 
@@ -133,12 +137,23 @@ pub(crate) struct RestoreState {
     _lease: sparrow_model::MemoryLease,
 }
 impl RuntimeAligned {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn adopt(job: AlignedJob, owner: &Arc<sparrow_model::MemoryOwner>) -> Result<Arc<Self>> {
+        Self::adopt_with_credit(job, owner, None)
+    }
+
+    fn adopt_with_credit(
+        job: AlignedJob,
+        owner: &Arc<sparrow_model::MemoryOwner>,
+        mut credit: Option<crate::checkpoint::RestoreCredit>,
+    ) -> Result<Arc<Self>> {
         let restore = job
             .restore
             .map(|freeze| {
-                let lease = owner.acquire(
-                    sparrow_model::CreditKind::Reservation,
+                let lease = restore_lease(
+                    &mut credit,
+                    owner,
+                    ParticipantId::State { operator: freeze.operator, slot: freeze.slot, shard: 0 },
                     freeze.resident_bytes(),
                 )?;
                 Ok::<_, SparrowError>(RestoreState {
@@ -160,6 +175,7 @@ impl RuntimeAligned {
 
     /// Validate and restore every participant before any stage/source is spawned.
     /// All decoded state shares one admission budget and is released per instance.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn prepare(
         job: AlignedJob,
         plan: &sparrow_plan::PhysicalPlan,
@@ -169,8 +185,30 @@ impl RuntimeAligned {
         max_timers: usize,
         processing_time: Option<i64>,
     ) -> Result<Arc<Self>> {
+        Self::prepare_with_credit(job, plan, owner, attempt, max_keys, max_timers, processing_time, None)
+    }
+
+    /// `credit` is Store-reserved restore memory on `owner`; each restored
+    /// participant consumes exactly its own lease (no second acquisition).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_with_credit(
+        job: AlignedJob,
+        plan: &sparrow_plan::PhysicalPlan,
+        owner: &Arc<sparrow_model::MemoryOwner>,
+        attempt: u64,
+        max_keys: usize,
+        max_timers: usize,
+        processing_time: Option<i64>,
+        mut credit: Option<crate::checkpoint::RestoreCredit>,
+    ) -> Result<Arc<Self>> {
+        if credit.as_ref().is_some_and(|credit| !credit.belongs_to(owner)) {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "restore credit belongs to another Job owner",
+            ));
+        }
         let Some(pipeline) = job.pipeline else {
-            return Self::adopt(job, owner);
+            return Self::adopt_with_credit(job, owner, credit);
         };
         if job.restore.is_some() {
             return Err(SparrowError::new(
@@ -225,10 +263,7 @@ impl RuntimeAligned {
                         "unknown or duplicate restored participant",
                     ));
                 }
-                let lease = owner.acquire(
-                    sparrow_model::CreditKind::Reservation,
-                    freeze.resident_bytes(),
-                )?;
+                let lease = restore_lease(&mut credit, owner, participant, freeze.resident_bytes())?;
                 restored.insert(
                     freeze.operator,
                     RestoreState {
@@ -245,7 +280,7 @@ impl RuntimeAligned {
                     || restored_iot.contains_key(&freeze.operator) {
                     return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "unknown or duplicate restored IoT participant"));
                 }
-                let lease = owner.acquire(sparrow_model::CreditKind::Reservation, freeze.resident_bytes())?;
+                let lease = restore_lease(&mut credit, owner, participant, freeze.resident_bytes())?;
                 restored_iot.insert(freeze.operator, (freeze, lease));
             }
         }
@@ -269,7 +304,7 @@ impl RuntimeAligned {
                 )?;
                 if let Some(restored) = restored.remove(operator) {
                     window.validate_participant_restore(&restored.freeze)?;
-                    window.restore_freeze(&restored.freeze)?;
+                    window.restore_participant_freeze(&restored.freeze)?;
                 }
                 if let Some(now) = processing_time { window.validate_processing_cut(now)?; }
                 windows.insert(*operator, window);
@@ -302,6 +337,26 @@ impl RuntimeAligned {
             _sink_binding: pipeline.sink,
         }))
     }
+}
+
+/// Use the Store-reserved lease for a participant when present; otherwise
+/// (embedders/tests without an owned Store decode) reserve before adoption.
+fn restore_lease(
+    credit: &mut Option<crate::checkpoint::RestoreCredit>,
+    owner: &Arc<MemoryOwner>,
+    participant: ParticipantId,
+    resident: usize,
+) -> Result<sparrow_model::MemoryLease> {
+    if let Some(lease) = credit.as_mut().and_then(|credit| credit.take(participant)) {
+        if lease.bytes() < resident || !Arc::ptr_eq(lease.owner(), owner) {
+            return Err(SparrowError::new(
+                ErrorCode::Internal,
+                "restored participant exceeds its reserved restore credit",
+            ));
+        }
+        return Ok(lease);
+    }
+    owner.acquire(sparrow_model::CreditKind::Reservation, resident)
 }
 
 pub struct PipelineRestore {
@@ -1165,6 +1220,7 @@ mod tests {
                 lease: owner
                     .acquire(sparrow_model::CreditKind::Reservation, 128)
                     .unwrap(),
+                ext: false,
             },
         }
     }
@@ -1277,7 +1333,7 @@ mod tests {
                 bytes.capacity().max(1),
             )
             .unwrap();
-        EncodedFreeze { bytes, lease }
+        EncodedFreeze { bytes, lease, ext: false }
     }
 
     fn empty_freeze() -> WindowFreeze {

@@ -56,12 +56,13 @@ impl Supervisor {
         let layout = manifest.clone();
         let retention = checkpoint_policy.retention();
         let opening_guard = startup_guard.clone();
-        let (opened, snapshot, generation, pending) = self
+        let restore_owner = owner.clone();
+        let (opened, snapshot, generation, pending, restore_credit) = self
             .store
             .run_blocking(move || {
                 let _startup = opening_guard;
                 sparrow_connectors::check_data_path(Path::new(&directory))?;
-                let store = CheckpointStore::open_for_plan_exclusive(
+                let mut store = CheckpointStore::open_for_plan_exclusive(
                     &directory, max_keys, retention, &layout, KIND,
                 )?;
                 let inventory = store.inventory()?;
@@ -72,10 +73,12 @@ impl Supervisor {
                 if !has_current && !inventory.generations.is_empty() {
                     return Err(fail("graph history without CURRENT"));
                 }
-                let snapshot = if has_current {
-                    Some(store.recover_pipeline_required()?)
+                // Q3 owned decode on the admitted Job owner.
+                let (snapshot, restore_credit) = if has_current {
+                    let (snapshot, credit) = store.recover_pipeline_owned(None, &restore_owner)?;
+                    (Some(snapshot), Some(credit))
                 } else {
-                    None
+                    (None, None)
                 };
                 let pending = log::read(store.dir())?;
                 let generation = if let Some(snapshot) = &snapshot {
@@ -107,7 +110,7 @@ impl Supervisor {
                     value
                 };
                 store.activate_state_generation(generation)?;
-                Ok((store, snapshot, generation, pending))
+                Ok((store, snapshot, generation, pending, restore_credit))
             })
             .await?;
         let restored_from = snapshot.as_ref().map(|s| s.checkpoint_id);
@@ -315,6 +318,10 @@ impl Supervisor {
                 acks: acks.clone(),
                 outbox: Arc::new(InflightCounter::new()),
             });
+        let request = match restore_credit {
+            Some(credit) => request.with_restore_credit(credit),
+            None => request,
+        };
         let job = self.kernel.submit(request)?;
         let cancel = job.cancellation();
         let mut sinks = Vec::new();

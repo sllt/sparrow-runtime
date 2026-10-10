@@ -2,7 +2,7 @@
 
 第 7 批增加集合/编码函数、多行展开、两路事件时间关联、补充聚合和独立有限查询。它们不是完整 SQL 引擎，也不代表与 eKuiper 的全部语义/配置兼容。
 
-**状态：2026-09-27 限定实现、自查与服务器集中验证完成，尚未发行。** 新 UNNEST、Join 和补充聚合只开放 `restart_fresh`；aligned/checkpoint/restore 显式拒绝，不改旧状态 codec。无新的吞吐、长稳或生产认证结论。
+**状态：2026-09-27 限定实现、自查与服务器集中验证完成，尚未发行。** 新 UNNEST、Join 只开放 `restart_fresh`。补充聚合在限定组合下可恢复（见下文与 [恢复支持矩阵](PRODUCTION.md#recovery-support-matrix)）；其余组合 aligned/checkpoint/restore 显式拒绝，不改旧状态 codec。无新的吞吐、长稳或生产认证结论。
 
 ## 纯函数
 
@@ -59,7 +59,9 @@ AND INTERVAL_MATCH(a.ts, b.ts, 3000000, 5000000, 1000000)
 
 `FIRST`、`LAST`、`VAR_POP`、`VAR_SAMP`、`STDDEV_POP`、`STDDEV_SAMP` 支持一个表达式，不支持 DISTINCT/星号。First/Last 跳过 SQL NULL，遵循所属窗口的既定顺序：增量 Count/PT/滚动窗口按接收顺序，有缓冲 ET Sliding/Session 按事件时间再按到达序号；聚合函数本身不另外排序。全 NULL 返回 NULL。动态值里的 null 不等同 SQL NULL。
 
-方差/标准差使用顺序 Welford f64 算法，人口口径空集返回 NULL，样本口径不足 2 个非 NULL 数值返回 NULL；拒绝非有限数或累积溢出。Int64/UInt64 转 f64 在超过 2^53 时可能失精度。没有新增并行 merge、近似聚合、UDAF ABI 或恢复 codec，旧聚合/旧 codec 保持原合同。
+方差/标准差使用顺序 Welford f64 算法，人口口径空集返回 NULL，样本口径不足 2 个非 NULL 数值返回 NULL；拒绝非有限数或累积溢出。Int64/UInt64 转 f64 在超过 2^53 时可能失精度。没有新增并行 merge、近似聚合或 UDAF ABI，旧聚合/旧 codec 保持原合同。
+
+补充聚合恢复（第11批子批1）：独立 participant codec 3 与 snapshot v29（File 线性，Count/ET 滚动/ET 跳跃，≤2 窗口，required HTTP JSON）、v30（JetStream 线性，≤2 Count 窗口，required HTTP JSON）。FIRST/LAST 保存“是否有值 + 原始类型化值”（Float64 原始 bits，NaN/Inf/-0.0 原样）；方差/标准差保存 n、mean、m2 及口径，恢复后继续累积，与不中断运行逐位一致（同一 key 内顺序不变）。codec 3 绑定当前顺序 Welford 算法，算法变化需新 codec/profile。nested/Dynamic 输入的 FIRST/LAST、PT 窗口、IoT、参考表、DAG、JetStream Sink、新窗口族与 Join/UNNEST 组合仍拒绝。须使用新目录，不迁移 v3/v4 历史；旧 binary 在目录层拒绝 v29/v30。解码恢复先按 Job owner 预留额度，额度不足明确失败，不回退旧代。不是 exactly-once；File 仍只保证未提交后缀重放。
 
 ## 独立有限查询
 
@@ -83,4 +85,4 @@ SQL 使用已登记的 Stream schema；也可改用 `graph`（二选一，允许
 
 已验证：独立 Join 双重循环 oracle（两种到达顺序/inner/left/interval/window）、边界水位/unmatched、NULL key、fan-out/额度退款、UNNEST 顺序/空值/typed timestamp/取消、不同时间字段的 Join→ET Window、聚合独立数值答案、SQL/Graph 拒绝矩阵、有限查询限额/响应 admission、真实双 File→required HTTP 与 API 认证隔离。最终默认12成员/JetStream Release **957 passed / 21 ignored**，无 demo Server/CLI **45 passed**，新增20项重复5轮 **100 passed**。源码指纹、命令、初轮失败和未测项见[匹配证据](PRODUCTION.md#analysis-validation)。
 
-后续仍有：Join/新聚合恢复、任意上游/多 Join 组合、近似聚合/UDAF、服务端历史文件查询和本批容量/长稳。这些不由“函数/SQL 可调用”自动视作完成。
+后续仍有：Join 恢复、新聚合与 PT/新窗口族/JetStream ET 的恢复组合、任意上游/多 Join 组合、近似聚合/UDAF、服务端历史文件查询和本批容量/长稳。这些不由“函数/SQL 可调用”自动视作完成。

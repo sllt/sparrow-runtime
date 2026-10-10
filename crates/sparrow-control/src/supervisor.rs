@@ -1906,8 +1906,29 @@ impl Supervisor {
         let sink_identity = prepared_sink.identity();
         let restore_sink = sink_identity.clone();
         let source_guard = prepared_sink.lifecycle_guard();
-        let restore_guard = source_guard.clone();
-        let profile_specific = reference_profile || layout.has_hysteresis() || sink_identity.is_some();
+        // Q3: every restore is billed to the admitted Job owner before any
+        // checkpoint payload is read. Reuse the sink/reference admission that
+        // the request will carry; otherwise admit the Job now.
+        let own_admission = if prepared_sink.owner().is_none() && prepared_references.is_none() {
+            match self.kernel.prepare_source_admission(plan.pipeline) {
+                Ok(admission) => Some(admission),
+                Err(error) => return Err(prepared_sink.cleanup_error(error).await),
+            }
+        } else {
+            None
+        };
+        let restore_owner = prepared_sink
+            .owner()
+            .or_else(|| prepared_references.as_ref().map(|(admission, _)| admission.owner()))
+            .or_else(|| own_admission.as_ref().map(|admission| admission.owner()))
+            .expect("restore owner admitted");
+        let restore_guard = source_guard
+            .clone()
+            .or_else(|| own_admission.as_ref().map(|admission| admission.lifecycle_guard()));
+        let profile_specific = reference_profile
+            || layout.has_hysteresis()
+            || layout.has_extended_state()
+            || sink_identity.is_some();
         // Fingerprinting, bounded snapshot reads and cursor verification are
         // cold filesystem work; never block a Tokio executor worker on them.
         let restored = self
@@ -1958,6 +1979,8 @@ impl Supervisor {
                         "required sink checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else if reference_profile {
                         "reference checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
+                    } else if restore_layout.has_extended_state() {
+                        "extended aggregate (v29) checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else {
                         "hysteresis checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     };
@@ -1972,21 +1995,25 @@ impl Supervisor {
                         "checkpoint history exists without CURRENT; refusing automatic fresh start",
                     ));
                 }
-                let (restore_freeze, restore_iot, ingested0, restored_from, state_generation, downstream_changed, saved_plan, saved_sink) = if restore {
+                let (restore_freeze, restore_iot, ingested0, restored_from, state_generation, downstream_changed, saved_plan, saved_sink, restore_credit) = if restore {
                     let requested = selected
                         .as_ref()
                         .and_then(|s| s.snapshot_id.as_deref())
                         .filter(|s| !s.is_empty() && *s != "aligned");
-                    let snap = if let Some(id) = requested {
-                        store.recover_pipeline_id(id.parse().map_err(|_| {
-                            SparrowError::new(
-                                sparrow_model::ErrorCode::InvalidArgument,
-                                "snapshot_id must be aligned or an integer",
-                            )
-                        })?)?
-                    } else {
-                        store.recover_pipeline_required()?
-                    };
+                    let requested = requested
+                        .map(|id| {
+                            id.parse::<u64>().map_err(|_| {
+                                SparrowError::new(
+                                    sparrow_model::ErrorCode::InvalidArgument,
+                                    "snapshot_id must be aligned or an integer",
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    // Owned decode: payload, scratch and every participant
+                    // are reserved on the Job owner before materialization;
+                    // an explicit id is verified once and pinned.
+                    let (snap, restore_credit) = store.recover_pipeline_owned(requested, &restore_owner)?;
                     let saved_sink = if let Some(sink) = &restore_sink {
                         snap.check_compatible_with_sink(&restore_layout, sink.identity())?;
                         Some(sparrow_io::OwnedSinkIdentity::new(
@@ -1998,9 +2025,6 @@ impl Supervisor {
                         None
                     };
                     source.seek(&snap.source)?;
-                    if requested.is_some() {
-                        store.pin_recovery_point(snap.checkpoint_id)?;
-                    }
                     (
                         Some(snap.windows),
                         snap.iot,
@@ -2010,12 +2034,13 @@ impl Supervisor {
                         snap.plan.semantics != restore_layout.semantics,
                         Arc::new(snap.plan),
                         saved_sink,
+                        Some(restore_credit),
                     )
                 } else {
                     use ring::rand::{SecureRandom,SystemRandom};
                     let mut generation=[0u8;16];
                     SystemRandom::new().fill(&mut generation).map_err(|_|SparrowError::new(sparrow_model::ErrorCode::Internal,"state generation randomness unavailable"))?;
-                    (None, Vec::new(), 0, None, generation, false, Arc::clone(&restore_layout), None)
+                    (None, Vec::new(), 0, None, generation, false, Arc::clone(&restore_layout), None, None)
                 };
                 // Durable before Kernel/source activation. Fresh/reset gets a new
                 // random 128-bit identity; compatible recovery preserves its ID.
@@ -2033,10 +2058,11 @@ impl Supervisor {
                     downstream_changed,
                     saved_plan,
                     saved_sink,
+                    restore_credit,
                 ))
             })
             .await;
-        let (source, store, restore_freeze, restore_iot, ingested0, restored_from, inventory, state_generation, downstream_changed, saved_plan, saved_sink) =
+        let (source, store, restore_freeze, restore_iot, ingested0, restored_from, inventory, state_generation, downstream_changed, saved_plan, saved_sink, restore_credit) =
             match restored {
                 Ok(restored) => restored,
                 Err(error) => return Err(prepared_sink.cleanup_error(error).await),
@@ -2083,6 +2109,12 @@ impl Supervisor {
         }
         if let Some(admission) = prepared_sink.take_admission() {
             request = request.with_source_admission(admission);
+        }
+        if let Some(admission) = own_admission {
+            request = request.with_source_admission(admission);
+        }
+        if let Some(credit) = restore_credit {
+            request = request.with_restore_credit(credit);
         }
         let job = match self.kernel.submit(request) {
             Ok(job) => job,

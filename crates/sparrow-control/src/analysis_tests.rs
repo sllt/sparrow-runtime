@@ -167,3 +167,68 @@ fn analysis_control_two_real_files_join_to_required_http() {
         sup.stop_all().await;http.stop().await;
     });
 }
+
+/// Sub-batch 1 gate: FIRST/LAST/VAR/STDDEV admit aligned recovery only through
+/// the strict linear v29 (File) profile here; every other combination is
+/// rejected at validate time, before any checkpoint history or input I/O.
+#[test]
+fn extended_aggregate_recovery_gate_admits_only_the_strict_profile() {
+    let store = store();
+    let root = sparrow_connectors::ensure_default_data_root()
+        .join(format!("ext-agg-gate-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let spec_for = |sql: &str, source: Value, sink: Value, dir: Option<&str>| {
+        let mut value = json!({"version":1,"stream":"l","sql":sql,"source":source,"sink":sink,"recovery":"aligned"});
+        if let Some(dir) = dir {
+            value["checkpoint_dir"] = json!(root.join(dir).to_string_lossy());
+        }
+        PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()).unwrap()
+    };
+    let file = json!({"kind":"file","path":root.join("in.ndjson").to_string_lossy(),"file_contract":"sealed"});
+    let http = json!({"kind":"http","url":"http://127.0.0.1:9/"});
+    let all = "FIRST(v) AS f,LAST(k) AS l,VAR_POP(v) AS vp,VAR_SAMP(v) AS vs,STDDEV_POP(v) AS sp,STDDEV_SAMP(v) AS ss,SUM(v) AS s";
+    for window in ["COUNT_WINDOW(3)", "TUMBLE(ts, 1000)", "HOP(ts, 1000, 2000)"] {
+        let sql = format!("SELECT {all} FROM l GROUP BY {window}");
+        let spec = spec_for(&sql, file.clone(), http.clone(), Some("ok"));
+        let plan = bind_plan_with_store(&store, &spec, "ext", 1).unwrap();
+        validate_aligned_plan(&spec, &plan).unwrap_or_else(|e| panic!("{window}: {e:?}"));
+        let guarantees = effective_guarantees_with_plan(&spec, &plan);
+        assert_eq!(guarantees["aligned_eligible"], true, "{window}");
+        assert_eq!(guarantees["extended_aggregates"]["snapshot_version"], 29, "{window}");
+        assert_eq!(guarantees["extended_aggregates"]["state_codec"], 3, "{window}");
+    }
+    let count = format!("SELECT {all} FROM l GROUP BY COUNT_WINDOW(3)");
+    let rejected: Vec<(&str, PipelineSpec)> = vec![
+        (
+            "processing-time window",
+            spec_for("SELECT FIRST(v) AS f FROM l GROUP BY TUMBLE(PROCESSING_TIME, 1000)", file.clone(), http.clone(), Some("pt")),
+        ),
+        (
+            "Dynamic FIRST input",
+            spec_for("SELECT FIRST(items) AS f FROM l GROUP BY COUNT_WINDOW(2)", file.clone(), http.clone(), Some("dyn")),
+        ),
+        ("missing checkpoint_dir", spec_for(&count, file.clone(), http.clone(), None)),
+        ("non-HTTP sink", spec_for(&count, file.clone(), json!({"kind":"log"}), Some("log"))),
+        (
+            "live MQTT source",
+            spec_for(&count, json!({"kind":"mqtt","host":"127.0.0.1","port":1883,"topic":"t"}), http.clone(), Some("mqtt")),
+        ),
+    ];
+    for (label, spec) in rejected {
+        // Rejection at bind or validate is before any history/input I/O.
+        let error = match bind_plan_with_store(&store, &spec, "ext", 1) {
+            Ok(plan) => validate_aligned_plan(&spec, &plan).expect_err(label),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error.code, sparrow_model::ErrorCode::UnsupportedRestore | sparrow_model::ErrorCode::InvalidArgument),
+            "{label}: {error:?}"
+        );
+    }
+    // restart_fresh keeps working for every combination (not tightened).
+    let mut fresh = spec_for("SELECT FIRST(items) AS f FROM l GROUP BY COUNT_WINDOW(2)", file.clone(), http.clone(), None);
+    fresh.recovery = "restart_fresh".into();
+    let plan = bind_plan_with_store(&store, &fresh, "ext", 1).unwrap();
+    validate_aligned_plan(&fresh, &plan).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}

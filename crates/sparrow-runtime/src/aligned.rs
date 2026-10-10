@@ -129,10 +129,21 @@ impl AlignedSession {
         source: &mut dyn ReplayableSource,
         table: Option<TableRevisionBind>,
     ) -> Result<Self> {
-        let mut store = store;
-        store.set_max_state_keys(budget.max_state_keys);
-        let snap = store.recover_required()?;
+        // Q3 common restore entry: the session owner exists before any
+        // payload is read; the Store reserves payload/scratch/state on it
+        // and only then materializes. Failure drops the session (refund).
         let live = Self::layout_for(operator, &spec, &input, table.as_ref());
+        let mut session = Self::open_with_table(
+            store,
+            spec,
+            input,
+            operator,
+            budget,
+            source.position(),
+            table,
+        )?;
+        let owner = session.operator.memory_owner();
+        let (snap, _credit) = session.store.recover_required_owned(&owner)?;
         snap.check_compatible(&live)?;
         if snap.window.operator != operator {
             return Err(SparrowError::new(
@@ -141,15 +152,6 @@ impl AlignedSession {
             ));
         }
         source.seek(&snap.source)?;
-        let mut session = Self::open_with_table(
-            store,
-            spec,
-            input,
-            operator,
-            budget,
-            snap.source.clone(),
-            table,
-        )?;
         session.operator.restore_freeze(&snap.window)?;
         session.ingested = snap.ingested_rows;
         session.next_checkpoint = snap.checkpoint_id.saturating_add(1);

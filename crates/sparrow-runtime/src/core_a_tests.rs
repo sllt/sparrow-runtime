@@ -389,7 +389,7 @@ fn encoded_iot(
     let lease = owner
         .acquire(CreditKind::Reservation, bytes.capacity().max(1))
         .unwrap();
-    crate::barrier::EncodedFreeze { bytes, lease }
+    crate::barrier::EncodedFreeze { bytes, lease, ext: false }
 }
 
 fn encoded_count(
@@ -410,7 +410,7 @@ fn encoded_count(
     let lease = owner
         .acquire(CreditKind::Reservation, bytes.capacity().max(1))
         .unwrap();
-    crate::barrier::EncodedFreeze { bytes, lease }
+    crate::barrier::EncodedFreeze { bytes, lease, ext: false }
 }
 
 #[test]

@@ -166,6 +166,12 @@ impl IotFreeze {
     }
 
     pub(crate) fn decode_at_cut(src: &mut &[u8], max_keys: usize, materialize: bool, now: Option<i64>) -> Result<Self> {
+        Self::decode_metered(src, max_keys, materialize, now, &mut 0)
+    }
+
+    /// As [`Self::decode_at_cut`]; `resident` receives the exact
+    /// [`Self::resident_bytes`] of the materialized frame, also in scan mode.
+    pub(crate) fn decode_metered(src: &mut &[u8], max_keys: usize, materialize: bool, now: Option<i64>, resident: &mut usize) -> Result<Self> {
         if src.len() > MAX_IOT_FREEZE_BYTES {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -183,6 +189,9 @@ impl IotFreeze {
         *src = &src[11..];
         let mut entries = Vec::with_capacity(if materialize { header.entries } else { 0 });
         let mut seen = BTreeSet::new();
+        // Scan-mode resident: every key/value is one Scalar plus the heap of
+        // Utf8/Bytes payloads (all IoT vectors are allocated exactly).
+        let mut metered = 128usize.saturating_add(header.entries.saturating_mul(size_of::<IotEntry>()));
         for _ in 0..header.entries {
             let key_len = take_u16(src, "IoT freeze key arity")? as usize;
             if key_len == 0 || key_len > MAX_IOT_ARITY
@@ -210,6 +219,10 @@ impl IotFreeze {
                     Scalar::skip_encoded_value(src)?;
                     let consumed = before.len().saturating_sub(src.len());
                     validate_encoded_scalar(&before[..consumed], true)?;
+                    metered = metered.saturating_add(
+                        crate::aggregate::encoded_scalar_resident(&before[..consumed])
+                            .saturating_sub(size_of::<Scalar>()),
+                    );
                     key_bytes.extend_from_slice(&before[..consumed]);
                     key_bytes.push(0xff);
                 }
@@ -227,6 +240,9 @@ impl IotFreeze {
                     "IoT freeze value arity is invalid",
                 ));
             }
+            metered = metered.saturating_add(
+                key_len.saturating_add(value_len).saturating_mul(size_of::<Scalar>()),
+            );
             let timed = matches!(header.kind,7|8);
             let ttl = matches!(header.kind,9|10);
             let mut values = Vec::with_capacity(if materialize { value_len } else { 0 });
@@ -320,6 +336,10 @@ impl IotFreeze {
                     if !(matches!(header.kind,7|8|11) && before[..consumed]==[0]) {
                         validate_encoded_scalar(&before[..consumed], false)?;
                     }
+                    metered = metered.saturating_add(
+                        crate::aggregate::encoded_scalar_resident(&before[..consumed])
+                            .saturating_sub(size_of::<Scalar>()),
+                    );
                 }
                 ensure_decoded_size(input_len.saturating_sub(src.len()))?;
             }
@@ -327,12 +347,14 @@ impl IotFreeze {
                 entries.push(IotEntry { key, values });
             }
         }
-        Ok(Self {
+        let freeze = Self {
             operator: header.operator,
             slot: header.slot,
             kind: header.kind,
             entries,
-        })
+        };
+        *resident = if materialize { freeze.resident_bytes() } else { metered };
+        Ok(freeze)
     }
 
     pub fn header(src: &[u8]) -> Result<IotFreezeHeader> {

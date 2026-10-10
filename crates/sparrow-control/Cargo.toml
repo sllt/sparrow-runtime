@@ -12,6 +12,7 @@ nats = ["sparrow-connectors/nats"]
 jetstream = ["nats", "sparrow-connectors/jetstream"]
 websocket = ["sparrow-connectors/websocket"]
 postgres = ["sparrow-connectors/postgres"]
+process-fault-pause = ["sparrow-runtime/process-fault-pause"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }

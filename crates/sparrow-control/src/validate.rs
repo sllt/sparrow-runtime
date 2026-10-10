@@ -1698,7 +1698,7 @@ fn validate_aligned_plan_inner(
     if plan.has_plugins() && (recovery.is_aligned()||spec.restore.is_some()||spec.checkpoint.is_some()||spec.checkpoint_dir.is_some()) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"native functions require restart_fresh without checkpoint or restore"));
     }
-    if (plan.has_analysis() || plan.has_extended_aggs())
+    if plan.has_analysis()
         && (recovery.is_aligned()
             || spec.restore.is_some()
             || spec.checkpoint.is_some()
@@ -1708,6 +1708,14 @@ fn validate_aligned_plan_inner(
             ErrorCode::UnsupportedRestore,
             "UNNEST/stream Join are restart_fresh only, without checkpoint or restore",
         ));
+    }
+    if plan.has_extended_aggs()
+        && (recovery.is_aligned()
+            || spec.restore.is_some()
+            || spec.checkpoint.is_some()
+            || spec.checkpoint_dir.is_some())
+    {
+        validate_extended_aggregate_profile(spec, plan, recovery)?;
     }
     if plan.has_new_windows()
         && (recovery.is_aligned()
@@ -1817,6 +1825,63 @@ fn validate_aligned_plan_inner(
     if spec.source.kind=="jetstream" && !plan.has_processing_time_state() && plan.stages.iter().any(|stage|
         matches!(stage,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}))) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"JetStream replay currently admits zero state or one/two Count windows only; event/processing-time replay context not verified"));
+    }
+    Ok(())
+}
+
+/// FIRST/LAST/VAR_*/STDDEV_* recovery (codec 3): strict linear File (v29) or
+/// reliable JetStream Count (v30) into a required HTTP sink. Everything else
+/// that asks for checkpoint/restore is rejected before any history is touched.
+fn validate_extended_aggregate_profile(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+    recovery: RecoveryPolicy,
+) -> Result<()> {
+    let reject = |message: &str| {
+        Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            format!("extended aggregates (FIRST/LAST/VAR/STDDEV) checkpoint profile v29/v30: {message}"),
+        ))
+    };
+    if !recovery.is_aligned() {
+        return reject("checkpoint/restore requires recovery=aligned");
+    }
+    if spec.graph_io.is_some() || plan.edges.is_some() {
+        return reject("DAG plans are not supported; use a linear plan");
+    }
+    if !spec.reference_tables.is_empty() || spec.has_live_lookups() {
+        return reject("reference/Lookup tables are not supported");
+    }
+    if plan.has_iot() || plan.has_processing_time_state() {
+        return reject("IoT and processing-time windows/state are not supported (sub-batch 2)");
+    }
+    if !plan.side_outputs.is_empty() || !plan.source_times.is_empty() {
+        return reject("side outputs and source-time bindings are not supported");
+    }
+    let file = matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay");
+    let jetstream = cfg!(feature = "jetstream") && spec.source.kind == "jetstream";
+    if !file && !jetstream {
+        return reject("source must be File or (feature jetstream) JetStream");
+    }
+    if spec.sink.kind != "http" {
+        return reject("sink must be the required HTTP sink");
+    }
+    if spec.checkpoint_dir.as_deref().is_none_or(str::is_empty) {
+        return reject("an explicit checkpoint_dir is required");
+    }
+    let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    let version = sparrow_runtime::snapshot_version_for(
+        &manifest,
+        if jetstream { "jetstream-v1" } else { "file" },
+    )?;
+    if version
+        != if jetstream {
+            sparrow_runtime::EXT_AGG_RELIABLE_SNAPSHOT_VERSION
+        } else {
+            sparrow_runtime::EXT_AGG_FILE_SNAPSHOT_VERSION
+        }
+    {
+        return reject("plan does not select the extended aggregate profile");
     }
     Ok(())
 }
@@ -2421,6 +2486,38 @@ pub fn effective_guarantees_with_plan(
         value["aligned_eligible"] = serde_json::json!(false);
         value["aligned_eligibility_reason"] = serde_json::json!("plugin functions have no recovery profile");
         value["plugins"] = serde_json::json!({"recovery":"restart_fresh_only","trusted_native":native||external,"preemptible":!native,"external_process":external,"os_sandbox":false,"durable_ack":false});
+        return value;
+    }
+    if plan.has_extended_aggs() && !plan.has_analysis() {
+        let mut candidate = spec.clone();
+        candidate.recovery = "aligned".into();
+        let checked = validate_extended_aggregate_profile(&candidate, plan, RecoveryPolicy::Aligned)
+            .and_then(|_| validate_aligned_plan(&candidate, plan));
+        let jetstream = spec.source.kind == "jetstream";
+        let version = sparrow_plan::CheckpointPlan::from_physical(plan)
+            .ok()
+            .and_then(|p| {
+                sparrow_runtime::snapshot_version_for(&p, if jetstream { "jetstream-v1" } else { "file" }).ok()
+            });
+        value["aligned_eligible"] = serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
+        value["extended_aggregates"] = serde_json::json!({
+            "functions":["first","last","var_pop","var_samp","stddev_pop","stddev_samp"],
+            "maturity":"development_preview","certified":false,
+            "snapshot_version":version,"state_codec":3,
+            "scope":"linear_File_v29_Count_or_event_time_windows; linear_JetStream_v30_Count_windows; required_HTTP_sink",
+            "not_enabled":["processing_time_windows","DAG","references","IoT","JetStream_sink","side_outputs","nested_or_Dynamic_FIRST_LAST"],
+            "restore_compatibility":"strict_full_computation_semantics_and_dependencies; incompatible_is_rejected_without_state_reset_or_old_checkpoint_fallback",
+            "first_last":"arrival_order_within_window; NULL_skipped; all_NULL_is_NULL",
+            "variance":"sequential_Welford_f64; samp_needs_two_values; exact_f64_bits_restored"
+        });
+        value["recovery_risk"] = serde_json::json!(if spec.recovery != "aligned" {
+            "restart_fresh_loses_window_state"
+        } else if jetstream {
+            "required_HTTP_may_repeat_before_CURRENT; deduplicate_by_OutputSequence; no_exactly_once"
+        } else {
+            "required_HTTP_may_repeat_uncommitted_suffix; File_v29_has_no_stable_output_id; no_exactly_once"
+        });
         return value;
     }
     if plan.has_analysis() || plan.has_extended_aggs() {

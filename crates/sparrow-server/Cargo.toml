@@ -12,6 +12,8 @@ nats = ["sparrow-control/nats", "sparrow-connectors/nats"]
 jetstream = ["nats", "sparrow-control/jetstream", "sparrow-connectors/jetstream"]
 websocket = ["sparrow-control/websocket", "sparrow-connectors/websocket"]
 postgres = ["sparrow-control/postgres", "sparrow-connectors/postgres"]
+# SIGKILL evidence harness only; see sparrow-runtime/src/process_fault.rs.
+process-fault-pause = ["sparrow-control/process-fault-pause"]
 
 [dependencies]
 sparrow-model = { path = "../sparrow-model" }
