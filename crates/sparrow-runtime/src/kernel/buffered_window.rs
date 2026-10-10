@@ -3,21 +3,25 @@ use super::*;
 use crate::buffered_window::{BufferedWindow, Ingest};
 
 #[cold]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn task<'a>(
     ctx: &'a JobCtx,
+    operator: sparrow_model::OperatorId,
+    prepared: Option<BufferedWindow>,
     spec: sparrow_plan::WindowSpec,
     input: sparrow_model::Schema,
     rx: &'a mut MailboxRx,
     tx: &'a MailboxTx,
     capture: &'a SharedCapture,
 ) -> Result<ChargedWindowFuture<impl std::future::Future<Output = Result<usize>> + 'a>> {
-    if ctx.aligned.is_some() || ctx.ordered_time {
+    // Only the prepared v31/v32 sliding count participant runs aligned.
+    if ctx.ordered_time || ctx.aligned.is_some() != prepared.is_some() {
         return Err(SparrowError::new(
             ErrorCode::UnsupportedRestore,
-            "buffered windows require restart_fresh without a durable clock",
+            "buffered windows other than v31/v32 sliding count require restart_fresh without a durable clock",
         ));
     }
-    let future = run(ctx, spec, input, rx, tx, capture);
+    let future = run(ctx, operator, prepared, spec, input, rx, tx, capture);
     let credit = ctx.owner.acquire(
         sparrow_model::CreditKind::Reservation,
         std::mem::size_of_val(&future).saturating_add(64),
@@ -88,22 +92,30 @@ async fn progress(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     ctx: &JobCtx,
+    operator: sparrow_model::OperatorId,
+    prepared: Option<BufferedWindow>,
     spec: sparrow_plan::WindowSpec,
     input: sparrow_model::Schema,
     rx: &mut MailboxRx,
     tx: &MailboxTx,
     capture: &SharedCapture,
 ) -> Result<usize> {
-    let mut op = BufferedWindow::new(
-        spec,
-        input.clone(),
-        ctx.owner.clone(),
-        ctx.max_state_keys,
-        ctx.max_timers,
-        ctx.graph_mode,
-    )?;
+    let mut op = match prepared {
+        Some(op) => op,
+        None => BufferedWindow::new(
+            spec,
+            input.clone(),
+            ctx.owner.clone(),
+            ctx.max_state_keys,
+            ctx.max_timers,
+            ctx.graph_mode,
+        )?,
+    };
+    ctx.metrics
+        .record_state(op.key_count() as u64, op.retention_bytes() as u64);
     let mut timers = TimerReporter {
         ctx,
         live: 0,
@@ -183,6 +195,20 @@ async fn run(
                         }
                     }
                 }
+                StreamControl::CheckpointBarrier { checkpoint_id } if op.is_sliding_count() => {
+                    // Rows of every earlier envelope are fully applied; the
+                    // frame is the exact state at this barrier.
+                    if let Some(aj) = &ctx.aligned {
+                        if aj.acks.is_active(checkpoint_id) {
+                            let frozen = crate::barrier::EncodedFreeze::from_buffered(
+                                &op, operator, &ctx.owner, ctx.max_state_keys);
+                            aj.acks.state_frozen(checkpoint_id, operator, frozen).await;
+                        }
+                    }
+                    if !tx.send_control(StreamControl::CheckpointBarrier { checkpoint_id }).await? {
+                        break;
+                    }
+                }
                 _ => {
                     return Err(SparrowError::new(
                         ErrorCode::UnsupportedRestore,
@@ -257,6 +283,8 @@ async fn run(
                     return Ok(n);
                 }
             }
+            // Process-test hook (feature process-fault-pause): input_after cut.
+            crate::process_fault::window_rows_applied(batch.num_rows());
             ctx.metrics
                 .record_state(op.key_count() as u64, op.retention_bytes() as u64);
         }

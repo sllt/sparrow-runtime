@@ -1928,6 +1928,7 @@ impl Supervisor {
         let profile_specific = reference_profile
             || layout.has_hysteresis()
             || layout.has_extended_state()
+            || layout.has_buffered_state()
             || sink_identity.is_some();
         // Fingerprinting, bounded snapshot reads and cursor verification are
         // cold filesystem work; never block a Tokio executor worker on them.
@@ -1981,6 +1982,8 @@ impl Supervisor {
                         "reference checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else if restore_layout.has_extended_state() {
                         "extended aggregate (v29) checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
+                    } else if restore_layout.has_buffered_state() {
+                        "sliding count (v31) checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else {
                         "hysteresis checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     };
@@ -2027,7 +2030,7 @@ impl Supervisor {
                     source.seek(&snap.source)?;
                     (
                         Some(snap.windows),
-                        snap.iot,
+                        (snap.iot, snap.buffered),
                         snap.ingested_rows,
                         Some(snap.checkpoint_id),
                         snap.generation,
@@ -2040,7 +2043,7 @@ impl Supervisor {
                     use ring::rand::{SecureRandom,SystemRandom};
                     let mut generation=[0u8;16];
                     SystemRandom::new().fill(&mut generation).map_err(|_|SparrowError::new(sparrow_model::ErrorCode::Internal,"state generation randomness unavailable"))?;
-                    (None, Vec::new(), 0, None, generation, false, Arc::clone(&restore_layout), None, None)
+                    (None, (Vec::new(), Vec::new()), 0, None, generation, false, Arc::clone(&restore_layout), None, None)
                 };
                 // Durable before Kernel/source activation. Fresh/reset gets a new
                 // random 128-bit identity; compatible recovery preserves its ID.
@@ -2089,11 +2092,11 @@ impl Supervisor {
             .with_live_out(tx_out)
             .with_aligned(AlignedJob {
                 restore: None,
-                pipeline: Some(PipelineRestore {
+                pipeline: Some(PipelineRestore { buffered: restore_iot.1,
                     // v27/v28 independently verify the saved full semantics at
                     // Kernel admission, rather than comparing live to itself.
                     plan: if sink_identity.is_some() { saved_plan } else { layout.clone() },
-                    generation:state_generation,restore:restore_freeze,iot:restore_iot,
+                    generation:state_generation,restore:restore_freeze,iot:restore_iot.0,
                     sink: sink_identity.as_ref().map(|live| match saved_sink {
                         Some(saved) => sparrow_runtime::SinkRestoreBinding::restored(Arc::clone(live), saved),
                         None => sparrow_runtime::SinkRestoreBinding::fresh(Arc::clone(live)),

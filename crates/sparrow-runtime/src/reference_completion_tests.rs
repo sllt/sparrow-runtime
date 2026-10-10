@@ -311,6 +311,7 @@ fn completion_hysteresis_snapshot_decode_rejects_legacy_profile_downgrade() {
                 bytes: frame,
                 lease,
                 ext: false,
+                buffered: false,
             }],
             next_output: (kind == "jetstream-v1")
                 .then(|| OutputSequence::new([0x73; 16], 1).unwrap()),

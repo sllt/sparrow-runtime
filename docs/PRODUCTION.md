@@ -591,6 +591,8 @@ K1 支持单 File/replay → 线性计算 → 单 required Sink 的零状态、�
 
 **v29/v30（补充聚合，第11批子批1）：**外层沿用 CPL1，含 FIRST/LAST/VAR_*/STDDEV_* 的窗口参与者使用 participant codec 3；窗口 frame 与 v3 相同，累加器新增 tag 8（Value：mode、has、值）和 tag 9（Moment：mode、n、mean、m2）。v29 = File 线性、1～2 个 Count/ET 滚动/ET 跳跃窗口；v30 = JetStream 线性、1～2 个 Count 窗口，输出游标与状态同切点。完整计算语义及依赖严格匹配，**不适用 RCP2 下游放宽**；不兼容明确拒绝，不自动清空状态、不回退旧 checkpoint。codec 1 frame 在编码、解码和仅校验扫描三条路径都拒绝 tag 8/9。目录 profile 隔离与 v3～v28 相同：v29/v30 不与旧版本混写，不从 v3/v4 迁移，旧二进制在 profile 层拒绝。codec 3 绑定当前顺序 Welford 算术；算术改动必须换 codec/profile。
 
+**v31/v32（滑动计数，第11批子批2a）：**外层沿用 CPL1，滑动计数 `COUNT_WINDOW(size, step)` 的窗口参与者使用 participant codec 4（`BWF1`）：头部与窗口 frame 相同（operator、slot=1、kind=5、key 数），之后为 `BWF1` 标记与 size，再逐 key 写 key 值、该 key 的到达序号 n 以及最近 min(n, size) 条已求值、已分离的聚合输入（序号 + 值），**不存累加器、不存原始行**。解码在扫描和物化两条路径都校验：key 数 ≤ max_state_keys、保留条数 = min(n, size)、序号为以 n 结尾的连续尾段、标量 tag 合法；恢复时再按活动算子校验 operator/size/key 与输入类型、key 严格有序无重复。v31 = File 线性；v32 = JetStream 线性 + 输出游标（epoch = state generation）。仅允许**单个**滑动计数窗口作为唯一状态；DAG、参考表、IoT、ET/PT 状态、侧路、source-time、nested/Dynamic 聚合输入均拒绝。完整计算语义严格匹配（size/step/聚合/下游别名任一变化即拒绝），**不适用 RCP2**；不兼容和额度不足带 `checkpoint_guard`，不回退旧代。目录 profile 与其他版本隔离。滑动计数 key 不过期，仅受 max_keys 约束（Q7）。恢复额度 = 每 key（4096 + 4×key 值驻留）+ 每条输入（1024 + 值个数×Scalar + 值驻留）+ 128，扫描阶段由编码字节精确算出；v31/v32 运行中同一算子按同一规则持有 Retention（先按求值前估算准入，求值后调整为精确值），所以恢复后的占用与切点时相同（Q4）。
+
 **恢复内存预留（第11批 Q3，适用全部版本）：**所有 Server 恢复入口统一经 Store 的 owned 解码入口：读 chunk 前按 MANIFEST 字节取 payload 额度 → 有界扫描与校验（逐 frame 计入解码临时数据）→ 按扫描得到的每个参与者精确驻留字节（状态、索引、key/值）预留 → 物化 → 额度随 `RestoreCredit` 移交给 Kernel 的同一 Job owner，所有参与者准备成功后才激活输入。任一步失败完整退款，CURRENT 不变、不启动输入、不产生输出；额度不足（`checkpoint_guard=restore_credit`）与 profile/codec 不兼容一样属于不可回退错误，不当作损坏去选更老的代。旧格式和计算语义不变；低预算下比以前更早拒绝属于预算修复。已审计入口：File 线性 v3～v28、paused/observed/graph 时间 profile、File DAG、JetStream 各 profile、legacy SPV1 `restore_with_table`、可靠 Sink 目录历史扫描（计入 Sink owner）。剩余缺口：提交前读取旧 CURRENT 的校验扫描不是恢复入口，仍只做有界读取；嵌入方自行解码后调用 legacy Kernel `adopt` 的路径在解码后才取额度（Server 不使用）。
 
 历史 K1 plain `CP01` 快照仍可读取，但保持原来的**完整计算严格匹配**合同；需要下游更新时，先用原计算在本版本提交一个 RCP2 恢复点，再更新配置。旧 K1 可以完整解析新 CURRENT 的外层结构，但必须在计算兼容检查明确拒绝，不把未知 manifest 当损坏、偷偷回退到更老的 plain CP01。未发布的 R11 开发 CPL2 不属于支持格式，R12 移除该只读分支。R10 SPV1 v1/v2 不自动迁移，Server 在输入激活和 generation 写入前拒绝向含旧格式历史的目录写 v3，包括 `resume_latest=false`。不要靠删除旧代绕过检查；选择新目录 fresh 或恢复原二进制和同一备份时点的整套目录。
@@ -641,7 +643,9 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 | ET 窗口 + 新聚合 | — | JetStream | 暂不支持（子批2 单独验证） |
 | PT 窗口 + 新聚合 | — | — | 暂不支持（子批2） |
 | FIRST/LAST 输入为 nested/Dynamic | — | — | 暂不支持（validate/start 拒绝，与 MIN/MAX 同规则） |
-| 滑动计数、ET 滑动/会话、PT 跳跃/滑动/会话 | buffered | — | 暂不支持（子批2，按此顺序） |
+| 滑动计数（单窗口，可含旧聚合与新聚合） | codec 4 `BWF1` | File v31、JetStream v32 | 已实现（子批2a：codec 黄金字节/逐前缀截断/结构不变量、恢复等价独立 oracle、Kernel 级 v31/v32 恢复含 OutputSequence 连续、owned 额度与低预算退款、不兼容不回退、Supervisor File v31 checkpoint→kill→恢复与 oracle 一致；进程级 SIGKILL 证据待 Phase B） |
+| ET 滑动/会话 | buffered | — | 暂不支持（子批2b，v33） |
+| PT 跳跃/滑动/会话 | buffered | — | 暂不支持（子批2c，v34/v35） |
 | Join / UNNEST | 有界分析状态 | — | 暂不支持（子批3） |
 | IoT change/deadband/hysteresis/alarm/silence/resample | codec 2 | 各自 profile | 已验证（既有批次）；与新聚合组合暂不支持 |
 | Dedup | — | — | 暂不支持 |
@@ -659,11 +663,11 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 
 | 端点 | 恢复位置与确认 | 状态 |
 |---|---|---|
-| File / replay | 身份 kind/path/size/指纹 + offset/record_index；CURRENT 即切点；只承诺未提交后缀重放 | 已验证（既有）；v29 已验证（子批1 进程级 SIGKILL） |
-| JetStream Source | BND1/JOW1 绑定 + consumer 序号 + OutputSequence；HTTP 2xx 且 CURRENT 落盘后才 ACK | 已验证（既有）；v30 已验证（子批1 真实 NATS 进程级 SIGKILL） |
+| File / replay | 身份 kind/path/size/指纹 + offset/record_index；CURRENT 即切点；只承诺未提交后缀重放 | 已验证（既有）；v29 已验证（子批1 进程级 SIGKILL）；v31 已实现（子批2a） |
+| JetStream Source | BND1/JOW1 绑定 + consumer 序号 + OutputSequence；HTTP 2xx 且 CURRENT 落盘后才 ACK | 已验证（既有）；v30 已验证（子批1 真实 NATS 进程级 SIGKILL）；v32 已实现（子批2a，Kernel 级；真实 NATS 待 Phase B） |
 | MQTT / NATS Core / WS / TCP / HTTP Poll/Push / DataBus | 无可重放身份 | 暂不支持（restart_fresh；不因下游支持 checkpoint 获得重放） |
 | Kafka / Redis / Postgres | 尚未通过自身恢复协议验收 | 暂不支持 |
-| required HTTP JSON | v29 无稳定 ID；v30 带 OutputSequence | 已验证（既有 v3/v4）；v29/v30 已验证（含请求在途时 SIGKILL；子批1） |
+| required HTTP JSON | v29/v31 无稳定 ID；v30/v32 带 OutputSequence | 已验证（既有 v3/v4）；v29/v30 已验证（含请求在途时 SIGKILL；子批1）；v31/v32 已实现（子批2a） |
 | HTTP CSV（aligned） | — | 暂不支持 |
 | JetStream Sink v27/v28 | 线性 File | 已验证（既有）；与新聚合组合暂不支持 |
 | File/Action Sink 等其他 Sink | — | 暂不支持（子批5 outbox） |
@@ -672,14 +676,14 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 
 | 拓扑 | 状态 |
 |---|---|
-| 线性 ≤2 状态 | 已验证（既有）；v29/v30 只开放线性，已验证（子批1） |
+| 线性 ≤2 状态 | 已验证（既有）；v29/v30 只开放线性，已验证（子批1）；v31/v32 只开放线性单状态，已实现（子批2a） |
 | File DAG ≤16 状态 / ≤16 required HTTP Sink | 已验证（既有）；含新聚合暂不支持 |
 | 双输入 / Join | 暂不支持（子批3） |
 | 侧路、有损边、source-time、参考表/Lookup + 新聚合 | 暂不支持 |
 
 **版本 / 依赖 / 恢复语义**
 
-- 一个目录只允许一种外层 profile；SPV1 v1/v2 不迁移；只有 v3 带 RCP2 下游前缀放宽，v29/v30 及 v8 之后的新 profile 严格匹配规范化语义与依赖身份（不是配置文本或 revision 号）。JetStream 改语义直接拒绝，无 fork/migration（子批7）。
+- 一个目录只允许一种外层 profile；SPV1 v1/v2 不迁移；只有 v3 带 RCP2 下游前缀放宽，v29～v32 及 v8 之后的新 profile 严格匹配规范化语义与依赖身份（不是配置文本或 revision 号）。JetStream 改语义直接拒绝，无 fork/migration（子批7）。
 - 恢复语义：File 为未提交后缀重放（at-least-once，无稳定输出 ID）；JetStream 为稳定 ID 的 at-least-once，ACK 不越过 CURRENT。都不是 exactly-once；SIGKILL 证据不等于断电/介质故障认证。
 - 恢复内存预留适用全部版本（见上节）；额度不足、profile/codec/语义不兼容均为不可回退错误。
 - 子批1 进程证据切点：输入已入窗口未输出、输出已确认未提交、输出请求在途、CURRENT 发布失败、MANIFEST 已改名但 CURRENT 未更新（该代不被提升）、提交后、恢复中（已预留额度未物化）、JetStream 提交后 ACK 丢失。旧二进制（424cf95）拒绝启动 v29 目录且不改 CURRENT/不输出；新二进制可继续旧 v3 目录。未覆盖：断电/介质故障、JetStream + ET、PT 窗口、恢复中其他位置。

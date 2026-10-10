@@ -1,4 +1,9 @@
-//! Bounded, final-only sliding/session windows. No legacy checkpoint codec.
+//! Bounded, final-only sliding/session windows.
+//!
+//! Sliding count state has the codec 4 (`BWF1`) participant frame used only by
+//! the strict File v31 / JetStream v32 profiles. Other buffered kinds remain
+//! restart_fresh. The frame stores evaluated, detached aggregate inputs, never
+//! raw rows or accumulators, and is rebuilt by the same push-path rules.
 //!
 //! Store detached aggregate inputs, not input batches. Each group and event
 //! owns its credit; the deadline index shares the credited group key. Retained
@@ -77,6 +82,189 @@ pub(crate) struct BufferedWindow {
     bytes: usize,
     last_now: i64,
     max_group_rows_seen: usize,
+    /// v31/v32 checkpointed job: event credit is the exact stored-value rule
+    /// ([`event_credit`]) shared with restore, not the pre-eval estimate.
+    durable: bool,
+}
+
+/// Codec 4 frame grammar marker, after the shared 11-byte freeze header.
+pub(crate) const BWF_MAGIC: &[u8; 4] = b"BWF1";
+/// Freeze header kind for a sliding count frame (= window kind tag 5).
+pub(crate) const SLIDING_COUNT_FREEZE_KIND: u8 = 5;
+const KEY_FIXED: usize = 4096;
+const EVENT_FIXED: usize = 1024;
+const MAX_ARITY: usize = 64;
+
+/// Retention credit of one group key: fixed node/Arc/container slack plus the
+/// actual detached key values (both B-trees may hold a copy of the bytes).
+pub(crate) fn key_credit(values: &[Scalar]) -> usize {
+    values.iter().fold(KEY_FIXED, |n, v| {
+        n.saturating_add(v.resident_bytes().saturating_mul(4))
+    })
+}
+
+/// Retention credit of one retained input (v31+ live and restore): fixed
+/// event/B-tree overhead plus the actual stored values.
+pub(crate) fn event_credit(values: &[Scalar]) -> usize {
+    values.iter().fold(
+        EVENT_FIXED.saturating_add(values.len().saturating_mul(std::mem::size_of::<Scalar>())),
+        |n, v| n.saturating_add(v.resident_bytes()),
+    )
+}
+
+fn codec(message: &str) -> SparrowError {
+    SparrowError::new(ErrorCode::CodecViolation, message)
+}
+
+#[derive(Debug, PartialEq)]
+pub struct BufferedGroupFreeze {
+    pub key: Vec<Scalar>,
+    /// Arrival count of this key (the last retained event's sequence).
+    pub sequence: u64,
+    /// Retained inputs, oldest first: (sequence, evaluated agg inputs).
+    pub events: Vec<(u64, Vec<Scalar>)>,
+}
+
+/// Decoded codec 4 participant. `resident` is the exact Retention the rebuild
+/// acquires (sum of [`key_credit`] + [`event_credit`]), computed identically by
+/// the bounded scan pass so the Store can reserve it before materializing.
+#[derive(Debug, PartialEq)]
+pub struct BufferedFreeze {
+    pub operator: sparrow_model::OperatorId,
+    pub slot: sparrow_model::StateSlotId,
+    pub kind: u8,
+    pub size: u64,
+    pub groups: Vec<BufferedGroupFreeze>,
+    resident: usize,
+}
+
+impl BufferedFreeze {
+    pub fn resident_bytes(&self) -> usize {
+        self.resident
+    }
+
+    /// Bounded scan (materialize=false) or decode of one codec 4 frame.
+    /// Structural invariants are checked in both passes; type/spec checks
+    /// happen at restore against the live operator.
+    pub(crate) fn decode_metered(
+        src: &mut &[u8],
+        max_groups: usize,
+        materialize: bool,
+        resident: &mut usize,
+    ) -> Result<Self> {
+        let header = crate::checkpoint::FreezeHeader::parse(src)?;
+        *src = &src[11..];
+        let take = |src: &mut &[u8], n: usize| -> Result<Vec<u8>> {
+            if src.len() < n {
+                return Err(codec("truncated buffered window freeze"));
+            }
+            let (head, tail) = src.split_at(n);
+            *src = tail;
+            Ok(head.to_vec())
+        };
+        let u16v = |src: &mut &[u8]| -> Result<usize> {
+            Ok(u16::from_le_bytes(take(src, 2)?.try_into().unwrap()) as usize)
+        };
+        let u32v = |src: &mut &[u8]| -> Result<usize> {
+            Ok(u32::from_le_bytes(take(src, 4)?.try_into().unwrap()) as usize)
+        };
+        let u64v = |src: &mut &[u8]| -> Result<u64> {
+            Ok(u64::from_le_bytes(take(src, 8)?.try_into().unwrap()))
+        };
+        if header.kind != SLIDING_COUNT_FREEZE_KIND || header.slot.raw() != 1 {
+            return Err(codec("buffered window freeze kind/slot is not sliding count"));
+        }
+        if header.entries > max_groups {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "buffered window freeze group count exceeds max_state_keys",
+            ));
+        }
+        if take(src, 4)? != BWF_MAGIC {
+            return Err(codec("buffered window freeze lacks BWF1 grammar"));
+        }
+        let size = u64v(src)?;
+        if size == 0 || size > i64::MAX as u64 {
+            return Err(codec("invalid sliding count size in freeze"));
+        }
+        // Minimum per group: arity + sequence + event count + one event.
+        if src.len() < header.entries.saturating_mul(2 + 8 + 4 + 8 + 2) {
+            return Err(codec("declared buffered group count exceeds remaining bytes"));
+        }
+        let mut groups = Vec::with_capacity(if materialize { header.entries } else { 0 });
+        let mut total = 0usize;
+        let value = |src: &mut &[u8], out: &mut Vec<Scalar>, n: &mut usize, key: bool| -> Result<()> {
+            let before = *src;
+            if materialize {
+                out.push(Scalar::decode_value(src)?);
+            } else {
+                Scalar::skip_encoded_value(src)?;
+            }
+            if before.first().is_some_and(|tag| *tag > 7) {
+                return Err(codec("unsupported scalar in buffered window freeze"));
+            }
+            let r = crate::aggregate::encoded_scalar_resident(&before[..before.len() - src.len()]);
+            *n = n.saturating_add(if key { r.saturating_mul(4) } else { r });
+            Ok(())
+        };
+        for _ in 0..header.entries {
+            let nk = u16v(src)?;
+            if nk > MAX_ARITY {
+                return Err(SparrowError::new(ErrorCode::BoundExceeded, "buffered freeze key arity exceeds 64"));
+            }
+            let mut key = Vec::with_capacity(if materialize { nk } else { 0 });
+            let mut key_bytes = KEY_FIXED;
+            for _ in 0..nk {
+                value(src, &mut key, &mut key_bytes, true)?;
+            }
+            total = total.saturating_add(key_bytes);
+            let sequence = u64v(src)?;
+            let ne = u32v(src)?;
+            // Exactly the last min(sequence, size) arrivals are retained.
+            if sequence == 0
+                || sequence > i64::MAX as u64
+                || ne as u64 != sequence.min(size)
+            {
+                return Err(codec("buffered window retained input count disagrees with its sequence"));
+            }
+            if src.len() < ne.saturating_mul(8 + 2) {
+                return Err(codec("declared buffered event count exceeds remaining bytes"));
+            }
+            let mut events = Vec::with_capacity(if materialize { ne } else { 0 });
+            let first = sequence - ne as u64 + 1;
+            for i in 0..ne {
+                let seq = u64v(src)?;
+                if seq != first + i as u64 {
+                    return Err(codec("buffered window event sequences are not the contiguous tail"));
+                }
+                let nv = u16v(src)?;
+                if nv > MAX_ARITY {
+                    return Err(SparrowError::new(ErrorCode::BoundExceeded, "buffered freeze value arity exceeds 64"));
+                }
+                let mut values = Vec::with_capacity(if materialize { nv } else { 0 });
+                let mut bytes = EVENT_FIXED.saturating_add(nv.saturating_mul(std::mem::size_of::<Scalar>()));
+                for _ in 0..nv {
+                    value(src, &mut values, &mut bytes, false)?;
+                }
+                total = total.saturating_add(bytes);
+                if materialize {
+                    events.push((seq, values));
+                }
+            }
+            if materialize {
+                groups.push(BufferedGroupFreeze { key, sequence, events });
+            }
+        }
+        *resident = total.saturating_add(128);
+        Ok(Self {
+            operator: header.operator,
+            slot: header.slot,
+            kind: header.kind,
+            size,
+            groups,
+            resident: *resident,
+        })
+    }
 }
 
 fn invalid(message: &str) -> SparrowError {
@@ -156,7 +344,190 @@ impl BufferedWindow {
             bytes: 0,
             last_now: 0,
             max_group_rows_seen: 0,
+            durable: false,
         })
+    }
+
+    pub(crate) fn is_sliding_count(&self) -> bool {
+        matches!(self.spec.kind, WindowKind::SlidingCount { .. })
+    }
+
+    /// Checkpointed (v31/v32) operation; only sliding count has a codec.
+    pub(crate) fn set_durable(&mut self) -> Result<()> {
+        if !self.is_sliding_count() || self.external {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "only linear sliding count windows have a buffered checkpoint codec",
+            ));
+        }
+        self.durable = true;
+        Ok(())
+    }
+
+    fn sliding_size(&self) -> Result<u64> {
+        match self.spec.kind {
+            WindowKind::SlidingCount { size, .. } => Ok(size),
+            _ => Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "buffered window kind has no checkpoint codec",
+            )),
+        }
+    }
+
+    pub(crate) fn check_freeze_bound(&self, max_keys: usize) -> Result<()> {
+        if self.groups.len() > max_keys {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "buffered freeze group count exceeds max_state_keys; refusing encode",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Upper bound of the encoded frame (resident bytes bound every scalar's
+    /// value encoding), so the caller can admit it before allocating.
+    pub(crate) fn estimated_freeze_bytes(&self) -> usize {
+        self.groups.iter().fold(11 + 4 + 8 + 64, |n, (key, group)| {
+            let n = key
+                .values
+                .iter()
+                .fold(n.saturating_add(2 + 8 + 4), |n, v| n.saturating_add(v.resident_bytes()));
+            group.events.values().fold(n, |n, e| {
+                e.values
+                    .iter()
+                    .fold(n.saturating_add(8 + 2), |n, v| n.saturating_add(v.resident_bytes()))
+            })
+        })
+    }
+
+    /// Encode the codec 4 frame. Header layout matches `FreezeHeader`.
+    pub(crate) fn encode_freeze_into(
+        &self,
+        operator: sparrow_model::OperatorId,
+        out: &mut Vec<u8>,
+        max_keys: usize,
+    ) -> Result<()> {
+        self.check_freeze_bound(max_keys)?;
+        let size = self.sliding_size()?;
+        out.extend_from_slice(&operator.raw().to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.push(SLIDING_COUNT_FREEZE_KIND);
+        out.extend_from_slice(&(self.groups.len() as u32).to_le_bytes());
+        out.extend_from_slice(BWF_MAGIC);
+        out.extend_from_slice(&size.to_le_bytes());
+        for (key, group) in &self.groups {
+            out.extend_from_slice(&(key.values.len() as u16).to_le_bytes());
+            for value in &key.values {
+                value.encode_value(out)?;
+            }
+            out.extend_from_slice(&group.sequence.to_le_bytes());
+            out.extend_from_slice(&(group.events.len() as u32).to_le_bytes());
+            for (&(_, seq), event) in &group.events {
+                out.extend_from_slice(&seq.to_le_bytes());
+                out.extend_from_slice(&(event.values.len() as u16).to_le_bytes());
+                for value in &event.values {
+                    value.encode_value(out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a decoded frame against this live operator without mutating.
+    pub(crate) fn validate_restore(
+        &self,
+        operator: sparrow_model::OperatorId,
+        freeze: &BufferedFreeze,
+    ) -> Result<()> {
+        let mismatch = |m: &str| {
+            SparrowError::new(ErrorCode::UnsupportedRestore, m.to_owned())
+                .context("checkpoint_guard", "buffered_state_mismatch")
+        };
+        if !self.groups.is_empty() {
+            return Err(mismatch("buffered restore requires an empty operator"));
+        }
+        if freeze.operator != operator
+            || freeze.kind != SLIDING_COUNT_FREEZE_KIND
+            || freeze.size != self.sliding_size()?
+        {
+            return Err(mismatch("buffered freeze operator/kind/size differs from the live window"));
+        }
+        if freeze.groups.len() > self.max_keys {
+            return Err(SparrowError::new(
+                ErrorCode::BoundExceeded,
+                "restored buffered groups exceed max_state_keys",
+            ));
+        }
+        let key_types: Vec<_> = self.keys.iter().map(|i| &self.input.fields[*i].data_type).collect();
+        let value_types = self
+            .spec
+            .aggs
+            .iter()
+            .map(|a| a.input.as_ref().map(|_| a.input_type(&self.input)).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        let mut previous: Option<Vec<u8>> = None;
+        for group in &freeze.groups {
+            if group.key.len() != key_types.len()
+                || group.key.iter().zip(&key_types).any(|(v, t)| !v.is_null() && !v.matches_type(t))
+            {
+                return Err(mismatch("buffered freeze key arity/type differs from the live window"));
+            }
+            let mut encoded = Vec::new();
+            for value in &group.key {
+                value.encode_key(&mut encoded);
+                encoded.push(0xff);
+            }
+            if previous.as_ref().is_some_and(|p| *p >= encoded) {
+                return Err(codec("buffered freeze keys are duplicated or out of order"));
+            }
+            previous = Some(encoded);
+            for (_, values) in &group.events {
+                if values.len() != value_types.len()
+                    || values.iter().zip(&value_types).any(|(v, t)| match t {
+                        Some(t) => !v.is_null() && !v.matches_type(t),
+                        None => !matches!(v, Scalar::Null),
+                    })
+                {
+                    return Err(mismatch("buffered freeze input arity/type differs from the live aggregates"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild state from a validated frame, consuming it (values move, not
+    /// copy). Each key/event takes exactly the credit the live v31 path takes.
+    pub(crate) fn restore_freeze(
+        &mut self,
+        operator: sparrow_model::OperatorId,
+        freeze: BufferedFreeze,
+    ) -> Result<()> {
+        self.validate_restore(operator, &freeze)?;
+        for group in freeze.groups {
+            let mut encoded = Vec::new();
+            for value in &group.key {
+                value.encode_key(&mut encoded);
+                encoded.push(0xff);
+            }
+            let credit = self.owner.acquire(CreditKind::Retention, key_credit(&group.key))?;
+            self.bytes = self.bytes.saturating_add(credit.bytes());
+            let key = Arc::new(Key { encoded, values: group.key, credit });
+            let mut events = BTreeMap::new();
+            for (seq, values) in group.events {
+                let credit = self.owner.acquire(CreditKind::Retention, event_credit(&values))?;
+                self.bytes = self.bytes.saturating_add(credit.bytes());
+                events.insert((seq as i64, seq), Event { values, pending: true, credit });
+            }
+            self.max_group_rows_seen = self.max_group_rows_seen.max(events.len());
+            if self
+                .groups
+                .insert(key, Group { events, sequence: group.sequence, deadline: None })
+                .is_some()
+            {
+                return Err(codec("duplicate buffered freeze key"));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn is_et(&self) -> bool {
@@ -221,7 +592,7 @@ impl BufferedWindow {
 
     fn key(&self, row: &Row) -> Result<Arc<Key>> {
         // Conservative singleton-node slack for both group/index B-trees.
-        let bytes = self.keys.iter().fold(4096usize, |n, i| {
+        let bytes = self.keys.iter().fold(KEY_FIXED, |n, i| {
             n.saturating_add(row.values[*i].resident_bytes().saturating_mul(4))
         });
         let credit = self.owner.acquire(CreditKind::Retention, bytes)?;
@@ -278,6 +649,16 @@ impl BufferedWindow {
                 None => Ok(Scalar::Null),
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut credit = credit;
+        if self.durable {
+            // Same rule as restore: actual stored values plus fixed overhead.
+            let exact = event_credit(&values);
+            if exact > credit.bytes() {
+                credit.grow_to(exact)?;
+            } else {
+                credit.shrink_to(exact)?;
+            }
+        }
         Ok(Event {
             values,
             pending: true,

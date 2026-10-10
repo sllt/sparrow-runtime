@@ -877,10 +877,18 @@ impl Kernel {
                 }
             }
         }
-        if req.plan.has_new_windows() && req.aligned.is_some() {
+        // Only a strict v31/v32 participant manifest (codec 4 sliding count)
+        // may run a new-kind window aligned; the rest stay restart_fresh.
+        if req.plan.has_new_windows()
+            && req.aligned.as_ref().is_some_and(|aligned| {
+                aligned.pipeline.as_ref().is_none_or(|p| !p.plan.has_buffered_state())
+                    || !sparrow_plan::CheckpointPlan::from_physical(&req.plan)
+                        .is_ok_and(|live| live.has_buffered_state())
+            })
+        {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                "new hopping-PT/sliding/session windows are restart_fresh only",
+                "new hopping-PT/ET-PT sliding/session windows are restart_fresh only (sliding count requires the v31/v32 profile)",
             ));
         }
         graph::validate_request(&req)?;
@@ -1086,6 +1094,7 @@ impl Kernel {
                         | crate::pipeline_checkpoint::OBSERVED_FILE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::RESAMPLE_FILE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::EXT_AGG_RELIABLE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
                 ) && aligned
                     .acks
                     .output_sequence()
@@ -2151,7 +2160,10 @@ async fn stage_loop(
                 .as_mut()
                 .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "window missing rx"))?;
             if spec.kind.is_buffered() {
-                return buffered_window::task(&ctx, spec, input, rx, &tx, &capture)?
+                let prepared = ctx.aligned.as_ref().and_then(|a| {
+                    a.buffered.lock().expect("prepared buffered windows").remove(&operator)
+                });
+                return buffered_window::task(&ctx, operator, prepared, spec, input, rx, &tx, &capture)?
                     .await
                     .map_err(|e| e.at_operator(operator));
             }

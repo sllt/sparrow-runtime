@@ -24,6 +24,8 @@ pub struct EncodedFreeze {
     /// Frame written with participant codec 3 (accumulator tags 8/9 allowed).
     /// The envelope encoder requires this to equal the manifest codec.
     pub(crate) ext: bool,
+    /// Codec 4 (`BWF1`) sliding count frame; must equal the manifest codec.
+    pub(crate) buffered: bool,
 }
 
 impl EncodedFreeze {
@@ -59,7 +61,27 @@ impl EncodedFreeze {
                 "freeze size estimate underflow",
             ));
         }
-        Ok(Self { bytes, lease, ext: codec == crate::aggregate::AccumulatorCodec::WindowExt })
+        Ok(Self { bytes, lease, ext: codec == crate::aggregate::AccumulatorCodec::WindowExt, buffered: false })
+    }
+
+    pub(crate) fn from_buffered(
+        op: &crate::buffered_window::BufferedWindow,
+        operator: sparrow_model::OperatorId,
+        owner: &Arc<MemoryOwner>,
+        max_keys: usize,
+    ) -> Result<Self> {
+        op.check_freeze_bound(max_keys)?;
+        let capacity = op.estimated_freeze_bytes().saturating_add(256);
+        if capacity as u64 > crate::checkpoint::MAX_SNAPSHOT_BYTES {
+            return Err(SparrowError::new(ErrorCode::BoundExceeded, "buffered freeze exceeds snapshot bound"));
+        }
+        let lease = owner.acquire(sparrow_model::CreditKind::Reservation, capacity)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        op.encode_freeze_into(operator, &mut bytes, max_keys)?;
+        if bytes.len() > capacity {
+            return Err(SparrowError::new(ErrorCode::Internal, "buffered freeze estimate underflow"));
+        }
+        Ok(Self { bytes, lease, ext: false, buffered: true })
     }
 
     pub fn from_iot(op: &crate::iot::IotOperator, owner: &Arc<MemoryOwner>, max_keys: usize) -> Result<Self> {
@@ -73,7 +95,7 @@ impl EncodedFreeze {
         if bytes.len() > capacity {
             return Err(SparrowError::new(ErrorCode::Internal, "IoT freeze estimate underflow"));
         }
-        Ok(Self { bytes, lease, ext: false })
+        Ok(Self { bytes, lease, ext: false, buffered: false })
     }
 }
 
@@ -127,6 +149,8 @@ pub(crate) struct RuntimeAligned {
     pub restore: Mutex<Option<RestoreState>>,
     pub windows: Mutex<BTreeMap<sparrow_model::OperatorId, crate::window::WindowOperator>>,
     pub iot: Mutex<BTreeMap<sparrow_model::OperatorId, crate::iot::IotOperator>>,
+    /// Prepared v31/v32 sliding count operators (restored or fresh-durable).
+    pub(crate) buffered: Mutex<BTreeMap<sparrow_model::OperatorId, crate::buffered_window::BufferedWindow>>,
     pub acks: AlignedAcks,
     pub outbox: Arc<InflightCounter>,
     _sink_binding: Option<SinkRestoreBinding>,
@@ -166,6 +190,7 @@ impl RuntimeAligned {
             participant_mode: false,
             restore: Mutex::new(restore),
             windows: Mutex::new(BTreeMap::new()),
+            buffered: Mutex::new(BTreeMap::new()),
             iot: Mutex::new(BTreeMap::new()),
             acks: job.acks,
             outbox: job.outbox,
@@ -236,13 +261,15 @@ impl RuntimeAligned {
         }
         let mut restored = BTreeMap::new();
         let mut restored_iot = BTreeMap::new();
-        if pipeline.restore.is_none() && !pipeline.iot.is_empty() {
+        let mut restored_buffered = BTreeMap::new();
+        if pipeline.restore.is_none() && (!pipeline.iot.is_empty() || !pipeline.buffered.is_empty()) {
             return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "IoT state supplied without restored participant envelope"));
         }
         if let Some(states) = pipeline.restore {
             if states.iter().any(|s| s.entries.len() > max_keys)
                 || pipeline.iot.iter().any(|s| s.entries.len() > max_keys)
-                || states.len().saturating_add(pipeline.iot.len()) != pipeline.plan.states.len()
+                || pipeline.buffered.iter().any(|s| s.groups.len() > max_keys)
+                || states.len().saturating_add(pipeline.iot.len()).saturating_add(pipeline.buffered.len()) != pipeline.plan.states.len()
             {
                 return Err(SparrowError::new(
                     ErrorCode::BoundExceeded,
@@ -283,10 +310,41 @@ impl RuntimeAligned {
                 let lease = restore_lease(&mut credit, owner, participant, freeze.resident_bytes())?;
                 restored_iot.insert(freeze.operator, (freeze, lease));
             }
+            for freeze in pipeline.buffered {
+                let participant = ParticipantId::State { operator: freeze.operator, slot: freeze.slot, shard: 0 };
+                if !pipeline.plan.states.iter().any(|s| s.id == participant
+                    && s.codec == sparrow_plan::checkpoint::BUFFERED_WINDOW_STATE_CODEC
+                    && s.freeze_kind() == freeze.kind)
+                    || restored_buffered.contains_key(&freeze.operator) {
+                    return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "unknown or duplicate restored buffered participant"));
+                }
+                let lease = restore_lease(&mut credit, owner, participant, freeze.resident_bytes())?;
+                restored_buffered.insert(freeze.operator, (freeze, lease));
+            }
         }
         let mut windows = BTreeMap::new();
         let mut iot = BTreeMap::new();
+        let mut buffered = BTreeMap::new();
         for stage in &plan.stages {
+            if let sparrow_plan::PhysicalStage::WindowAgg { operator, spec, input, .. } = stage {
+                if spec.kind.is_buffered() {
+                    let participant = ParticipantId::window(*operator);
+                    if !pipeline.plan.states.iter().any(|s| s.id == participant
+                        && s.codec == sparrow_plan::checkpoint::BUFFERED_WINDOW_STATE_CODEC) {
+                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+                            "buffered window has no checkpoint participant in this profile"));
+                    }
+                    let mut op = crate::buffered_window::BufferedWindow::new(
+                        spec.clone(), input.clone(), owner.clone(), max_keys, max_timers, false)?;
+                    op.set_durable()?;
+                    if let Some((freeze, lease)) = restored_buffered.remove(operator) {
+                        op.restore_freeze(*operator, freeze).map_err(|e| e.at_operator(*operator))?;
+                        drop(lease);
+                    }
+                    buffered.insert(*operator, op);
+                    continue;
+                }
+            }
             if let sparrow_plan::PhysicalStage::WindowAgg {
                 operator,
                 spec,
@@ -322,7 +380,7 @@ impl RuntimeAligned {
                 iot.insert(*operator, op);
             }
         }
-        if !restored.is_empty() || !restored_iot.is_empty() {
+        if !restored.is_empty() || !restored_iot.is_empty() || !restored_buffered.is_empty() {
             return Err(SparrowError::new(ErrorCode::Internal, "unconsumed restored participant"));
         }
         job.acks
@@ -331,6 +389,7 @@ impl RuntimeAligned {
             participant_mode: true,
             restore: Mutex::new(None),
             windows: Mutex::new(windows),
+            buffered: Mutex::new(buffered),
             iot: Mutex::new(iot),
             acks: job.acks,
             outbox: job.outbox,
@@ -367,6 +426,8 @@ pub struct PipelineRestore {
     /// IoT frames are separate codecs; Some(empty) windows plus these frames
     /// represents a restored IoT-only plan, never a fresh reset.
     pub iot: Vec<crate::iot::IotFreeze>,
+    /// Codec 4 sliding count frames (v31/v32); restore is Some(empty) then.
+    pub buffered: Vec<crate::buffered_window::BufferedFreeze>,
     /// v27/v28 carry a Job-owned saved/live output target. `plan` must be
     /// the saved plan on restore, not a substituted live manifest.
     pub sink: Option<SinkRestoreBinding>,
@@ -1221,6 +1282,7 @@ mod tests {
                     .acquire(sparrow_model::CreditKind::Reservation, 128)
                     .unwrap(),
                 ext: false,
+                buffered: false,
             },
         }
     }
@@ -1333,7 +1395,7 @@ mod tests {
                 bytes.capacity().max(1),
             )
             .unwrap();
-        EncodedFreeze { bytes, lease, ext: false }
+        EncodedFreeze { bytes, lease, ext: false, buffered: false }
     }
 
     fn empty_freeze() -> WindowFreeze {

@@ -681,7 +681,7 @@ impl CheckpointStore {
                 }
                 if bytes.starts_with(MAGIC) && bytes.len()>=6 && bytes[4..6]!=version.to_le_bytes() {
                     return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-                        "checkpoint source profile mismatch: every outer profile (e.g. File/v3, JetStream/v4, DAG/v5, IoT/v6, ReliableIoT/v7, Reference/v8-v11, Hysteresis/v12-v13, PausedTime/v14-v15, extended aggregates File/v29 and JetStream/v30) requires a separate directory; retain original history")
+                        "checkpoint source profile mismatch: every outer profile (e.g. File/v3, JetStream/v4, DAG/v5, IoT/v6, ReliableIoT/v7, Reference/v8-v11, Hysteresis/v12-v13, PausedTime/v14-v15, extended aggregates File/v29 and JetStream/v30, sliding count File/v31 and JetStream/v32) requires a separate directory; retain original history")
                         .context("checkpoint_found_version", u16::from_le_bytes([bytes[4], bytes[5]]).to_string())
                         .context("checkpoint_expected_version", version.to_string()));
                 }
@@ -711,7 +711,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30) {
+        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {
@@ -1400,6 +1400,8 @@ fn incompatible_or_credit(error: &SparrowError) -> bool {
                 value.as_str(),
                 crate::pipeline_checkpoint::EXTENDED_PROFILE_GUARD
                     | crate::pipeline_checkpoint::RESTORE_CREDIT_GUARD
+                    | crate::pipeline_checkpoint::BUFFERED_PROFILE_GUARD
+                    | "buffered_state_mismatch"
                     | "extended_codec_mismatch"
                     | "extended_state_mismatch"
             )
@@ -2775,7 +2777,7 @@ mod tests {
             snap.ingested_rows,
             &snap.layout,
             snap.table.as_ref(),
-            crate::barrier::EncodedFreeze { bytes, lease, ext: false },
+            crate::barrier::EncodedFreeze { bytes, lease, ext: false, buffered: false },
         )
         .unwrap();
         assert_eq!(encoded.bytes, snap.encode().unwrap());
@@ -3376,3 +3378,7 @@ mod tests {
 #[cfg(test)]
 #[path = "ext_agg_tests.rs"]
 mod ext_agg_tests;
+
+#[cfg(test)]
+#[path = "sliding_count_tests.rs"]
+mod sliding_count_tests;
