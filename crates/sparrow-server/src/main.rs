@@ -13,7 +13,7 @@ use sparrow_control::{
     secrets_key_required, Store,
 };
 use sparrow_model::{ErrorCode, SparrowError};
-use sparrow_server::{boot, serve, DEFAULT_BIND};
+use sparrow_server::{boot_with_auth, serve_with_ui, Auth, UiAssets, DEFAULT_BIND};
 
 struct Opts {
     bind: SocketAddr,
@@ -23,6 +23,8 @@ struct Opts {
     demo_io: bool,
     allow_remote: bool,
     max_jobs: Option<usize>,
+    auth_file: Option<PathBuf>,
+    ui_dir: Option<PathBuf>,
 }
 
 fn parse_opts() -> Result<Opts, SparrowError> {
@@ -33,6 +35,8 @@ fn parse_opts() -> Result<Opts, SparrowError> {
     let mut demo_io = false;
     let mut allow_remote = false;
     let mut max_jobs = None;
+    let mut auth_file = std::env::var_os("SPARROW_AUTH_FILE").map(PathBuf::from);
+    let mut ui_dir = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -51,6 +55,8 @@ fn parse_opts() -> Result<Opts, SparrowError> {
                 }
             }
             "--demo-io" => demo_io = true,
+            "--auth-file" => auth_file = Some(PathBuf::from(args.next().ok_or_else(|| arg("--auth-file needs a value"))?)),
+            "--ui-dir" => ui_dir = Some(PathBuf::from(args.next().ok_or_else(|| arg("--ui-dir needs a value"))?)),
             "--allow-remote" => allow_remote = true,
             "--version" => {
                 println!(
@@ -68,13 +74,21 @@ fn parse_opts() -> Result<Opts, SparrowError> {
             other => return Err(arg(format!("unknown argument {other}"))),
         }
     }
-    if token.is_empty() {
+    if auth_file.is_some() && !token.is_empty() {
+        // No silent legacy admin backdoor next to a role file.
+        return Err(arg(
+            "--auth-file and SPARROW_TOKEN/--token are mutually exclusive; list the compatibility identity in the auth file",
+        ));
+    }
+    if auth_file.is_none() && token.is_empty() {
         return Err(SparrowError::new(
             ErrorCode::SecretMissing,
             "management token required (--token or SPARROW_TOKEN); unauthenticated mutating calls are refused",
         ));
     }
-    validate_management_token(&token, demo_io)?;
+    if auth_file.is_none() {
+        validate_management_token(&token, demo_io)?;
+    }
     let addr: SocketAddr = bind.parse().map_err(|e| {
         SparrowError::new(
             ErrorCode::InvalidArgument,
@@ -95,6 +109,8 @@ fn parse_opts() -> Result<Opts, SparrowError> {
         demo_io,
         allow_remote,
         max_jobs,
+        auth_file,
+        ui_dir,
     })
 }
 
@@ -131,6 +147,12 @@ sparrow-server — Sparrow V0.1 control plane
                       also requires SPARROW_DATA_ROOTS for file/checkpoint paths
   --demo-io           start in-process MQTT broker + HTTP capture
   --allow-remote      allow a non-loopback bind
+  --auth-file PATH    static role tokens (viewer/operator/admin) as JSON
+                      {{version: 1, principals: [{{actor, role, token_sha256}}]}};
+                      must be chmod 600; any anomaly refuses startup. Mutually
+                      exclusive with SPARROW_TOKEN (legacy single token = admin).
+                      Also SPARROW_AUTH_FILE.
+  --ui-dir PATH       serve the static K5 workbench at /ui/ (opt-in)
 
   SPARROW_DATA_ROOTS  colon-separated file/checkpoint allowlist. When unset,
                       only {{temp_dir}}/sparrow is allowed (never cwd, never /tmp
@@ -336,12 +358,19 @@ fn run() -> Result<(), SparrowError> {
         None => host_kernel()?,
     });
     let bind = opts.bind;
-    let token = opts.token.clone();
+    let auth = match &opts.auth_file {
+        Some(path) => Auth::load_file(path)?,
+        None => Auth::legacy(&opts.token),
+    };
+    let ui = match &opts.ui_dir {
+        Some(dir) => Some(Arc::new(UiAssets::load(dir)?)),
+        None => None,
+    };
     let safe = opts.safe_mode;
     let demo = opts.demo_io;
     let rt = kernel.handle();
     rt.block_on(async move {
-        let (state, harness) = boot(store, kernel, token, safe, demo).await?;
+        let (state, harness) = boot_with_auth(store, kernel, auth, safe, demo).await?;
         println!("sparrow-server listening on http://{bind}");
         println!("delivery=live_best_effort recovery=restart_fresh replay=unsupported");
         if safe {
@@ -361,6 +390,9 @@ fn run() -> Result<(), SparrowError> {
         if opts.allow_remote {
             println!("warning: non-loopback bind; mutating calls still require a bearer token");
         }
-        serve(state, bind).await
+        if ui.is_some() {
+            println!("ui: http://{bind}/ui/");
+        }
+        serve_with_ui(state, bind, ui).await
     })
 }

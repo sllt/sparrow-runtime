@@ -28,6 +28,10 @@ mod outbox;
 mod input_recovery;
 mod plugins;
 mod reference_tables;
+pub mod auth;
+pub mod ui;
+pub use auth::{Auth, Principal, Role};
+pub use ui::UiAssets;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:43180";
 pub const MAX_BODY: usize = 64 * 1024;
@@ -38,12 +42,23 @@ static API_REQUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 pub struct AppState {
     pub store: Arc<Store>,
     pub supervisor: Arc<Supervisor>,
-    pub token: Arc<String>,
+    /// Authentication/authorization config. Named `token` for source
+    /// compatibility: `Arc::new("tok".into())` builds legacy single-token admin.
+    pub token: Arc<Auth>,
     pub safe_mode: bool,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    build_router(state, None)
+}
+
+fn build_router(state: AppState, ui_assets: Option<Arc<UiAssets>>) -> Router {
+    let ui_public = ui_assets.is_some();
+    let base: Router<AppState> = match ui_assets {
+        Some(assets) => ui::router(assets),
+        None => Router::new(),
+    };
+    base
         .route("/", get(root))
         .route("/v1/health", get(health))
         .route("/v1/capabilities", get(capabilities))
@@ -105,6 +120,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/allowlist", put(put_allow))
         .route("/v1/secrets/{name}", put(put_secret))
         .route("/v1/audit", get(list_audit))
+        .route("/v1/auth/me", get(auth_me))
         .route("/v1/metrics", get(metrics))
         .route("/v1/demo/io", get(demo_io))
         .route("/v1/demo/publish-fixture", post(demo_publish))
@@ -113,21 +129,48 @@ pub fn router(state: AppState) -> Router {
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
         .merge(plugins::router())
         .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
+            (state.clone(), ui_public),
             management_guard,
         ))
         .with_state(state)
 }
 
 async fn management_guard(
-    State(state): State<AppState>,
+    State((state, ui_public)): State<(AppState, bool)>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let path = request.uri().path();
+    if ui_public && (path == "/ui" || path.starts_with("/ui/")) {
+        // Static workbench assets are anonymous; they carry their own
+        // security headers. No management data is served under /ui/.
+        return next.run(request).await;
+    }
+    let mut request = request;
     if !matches!(request.uri().path(), "/" | "/v1/health") {
-        if let Err(error) = require_auth(&state, request.headers()) {
-            return error.into_response();
+        let principal = match authenticate(&state, request.headers()) {
+            Ok(p) => p,
+            Err(error) => return no_store(error.into_response()),
+        };
+        let (action, needed) = auth::required(request.method(), request.uri().path());
+        if principal.role < needed {
+            // Authorization failures, like authentication failures, do not touch SQLite.
+            return no_store(
+                ApiError {
+                    status: StatusCode::FORBIDDEN,
+                    err: SparrowError::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "forbidden: role {} may not perform {action} (requires {})",
+                            principal.role.as_str(),
+                            needed.as_str()
+                        ),
+                    ),
+                }
+                .into_response(),
+            );
         }
+        request.extensions_mut().insert(principal);
     }
     let read_only = matches!(
         *request.method(),
@@ -155,7 +198,7 @@ async fn management_guard(
         .into_response();
     };
     match tokio::time::timeout(Duration::from_secs(125), next.run(request)).await {
-        Ok(response) => response,
+        Ok(response) => no_store(response),
         Err(_) => ApiError {
             status: StatusCode::GATEWAY_TIMEOUT,
             err: SparrowError::new(
@@ -307,33 +350,74 @@ where
     })?
 }
 
-fn require_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
+fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+fn authenticate(state: &AppState, headers: &HeaderMap) -> ApiResult<Principal> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let token = raw.strip_prefix("Bearer ").unwrap_or("");
-    if !tokens_equal(token, &state.token) {
-        // P1-29: do not touch SQLite on auth failure (sync audit is a DoS / wipe vector).
-        return Err(ApiError {
-            status: StatusCode::UNAUTHORIZED,
-            err: SparrowError::new(
-                ErrorCode::PolicyDenied,
-                "unauthorized: bearer token required",
-            ),
-        });
-    }
-    Ok("token".into())
+    // P1-29: do not touch SQLite on auth failure (sync audit is a DoS / wipe vector).
+    state.token.authenticate(token).ok_or_else(|| ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        err: SparrowError::new(ErrorCode::PolicyDenied, "unauthorized: bearer token required"),
+    })
 }
 
-fn tokens_equal(a: &str, b: &str) -> bool {
-    if a.len() != b.len() || a.is_empty() {
-        return false;
-    }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+/// Returns the authenticated actor. Role checks happen centrally in
+/// `management_guard`; handlers use this for the audit identity.
+fn require_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
+    authenticate(state, headers).map(|p| p.actor)
+}
+
+async fn auth_me(
+    axum::Extension(p): axum::Extension<Principal>,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    Json(json!({
+        "actor": p.actor,
+        "role": p.role.as_str(),
+        "allowed_actions": auth::allowed_actions(p.role),
+        "auth_mode": state.token.mode(),
+        "safe_mode": state.safe_mode,
+        "draining": state.supervisor.is_draining(),
+        "status_projection": if p.role == Role::Viewer { "viewer_safe" } else { "full" },
+    }))
+}
+
+/// Server-side viewer projection: the same allowlist as the diagnostic
+/// bundle. No spec, SQL, destinations, SecretRefs or free-form error text.
+fn viewer_status(body: &Value) -> Value {
+    json!({
+        "name": body["name"],
+        "revision": body["revision"],
+        "projection": "viewer_safe",
+        "safe_mode": body["safe_mode"],
+        "desired": body["desired"],
+        "actual": if body["actual"].is_null() { Value::Null } else { json!({
+            "revision": body["actual"]["revision"],
+            "status": body["actual"]["status"],
+            "attempt_id": body["actual"]["attempt_id"],
+            "consecutive_failures": body["actual"]["consecutive_failures"],
+            "restart_blocked": body["actual"]["restart_blocked"],
+            "has_error": !body["actual"]["last_error"].is_null(),
+        })},
+        "delivery": body["delivery"],
+        "replay": body["replay"],
+        "effective": {"aligned_eligible": body["effective"]["aligned_eligible"], "recovery": body["effective"]["recovery"]},
+        "observation": body["observation"],
+        "mailboxes": body["mailboxes"],
+        "checkpoint": body["checkpoint"],
+        "histogram_contract": body["histogram_contract"],
+        "redaction": "allowlisted_fields_no_raw_spec_sql_destinations_secrets_or_free_form_errors",
+    })
 }
 
 fn if_match(headers: &HeaderMap) -> Option<String> {
@@ -406,7 +490,7 @@ async fn validate(
         let report = run_validate(&state, &spec)?;
         let _ = state
             .store
-            .audit(&actor, "validate", spec.sql.as_deref(), None, "ok");
+            .audit(&actor, "validate", None, Some("sql_not_recorded"), "ok");
         Ok(Json(report))
     })
     .await
@@ -728,11 +812,14 @@ async fn get_pipeline(
 
 async fn pipeline_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    axum::Extension(p): axum::Extension<Principal>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    require_auth(&state, &headers)?;
-    blocking_api(move || Ok(Json(status_body(&state, &name)?))).await
+    blocking_api(move || {
+        let body = status_body(&state, &name)?;
+        Ok(Json(if p.role == Role::Viewer { viewer_status(&body) } else { body }))
+    })
+    .await
 }
 
 fn reference_tables_status(
@@ -1994,8 +2081,11 @@ async fn put_secret(
     .await
 }
 
-async fn list_audit(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    require_auth(&state, &headers)?;
+async fn list_audit(
+    State(state): State<AppState>,
+    axum::Extension(p): axum::Extension<Principal>,
+) -> ApiResult<Json<Value>> {
+    let viewer = p.role == Role::Viewer;
     blocking_api(move || {
         let rows = state.store.list_audit(50).map_err(ApiError::from)?;
         Ok(Json(json!({
@@ -2004,8 +2094,8 @@ async fn list_audit(State(state): State<AppState>, headers: HeaderMap) -> ApiRes
                 "at_ms": r.at_ms,
                 "actor": r.actor,
                 "action": r.action,
-                "target": r.target,
-                "detail": r.detail,
+                "target": if viewer && r.action == "validate" { None } else { r.target.clone() },
+                "detail": if viewer { None } else { r.detail.clone() },
                 "outcome": r.outcome,
             })).collect::<Vec<_>>(),
             "cap": 200,
@@ -2082,6 +2172,16 @@ pub async fn boot(
     safe_mode: bool,
     demo_io: bool,
 ) -> Result<(AppState, Option<DemoIo>), SparrowError> {
+    boot_with_auth(store, kernel, Auth::legacy(&token), safe_mode, demo_io).await
+}
+
+pub async fn boot_with_auth(
+    store: Arc<Store>,
+    kernel: Arc<Kernel>,
+    auth: Auth,
+    safe_mode: bool,
+    demo_io: bool,
+) -> Result<(AppState, Option<DemoIo>), SparrowError> {
     #[cfg(feature = "demo-io")]
     let demo = if demo_io {
         let h = Arc::new(DemoHarness::start().await?);
@@ -2110,7 +2210,7 @@ pub async fn boot(
     let state = AppState {
         store,
         supervisor: Arc::clone(&supervisor),
-        token: Arc::new(token),
+        token: Arc::new(auth),
         safe_mode,
     };
     tokio::spawn(supervisor.run_loop());
@@ -2118,12 +2218,27 @@ pub async fn boot(
 }
 
 pub async fn serve(state: AppState, addr: SocketAddr) -> Result<(), SparrowError> {
+    serve_with_ui(state, addr, None).await
+}
+
+/// Management router plus the optional `/ui/` static workbench. UI routes sit
+/// outside the management guard (static assets are anonymous; all data still
+/// requires authentication). Without assets this is exactly `router`.
+pub fn router_with_ui(state: AppState, ui: Option<Arc<UiAssets>>) -> Router {
+    build_router(state, ui)
+}
+
+pub async fn serve_with_ui(
+    state: AppState,
+    addr: SocketAddr,
+    ui: Option<Arc<UiAssets>>,
+) -> Result<(), SparrowError> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| SparrowError::new(ErrorCode::Internal, format!("bind {addr}: {e}")))?;
     let supervisor = state.supervisor.clone();
     let stopping = supervisor.clone();
-    let result = axum::serve(listener, router(state))
+    let result = axum::serve(listener, router_with_ui(state, ui))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             // Completing this future stops accept first. Do not hide a long

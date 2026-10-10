@@ -52,13 +52,14 @@ async fn list(
 async fn install(
     State(state): State<AppState>,
     Extension(permit): Extension<Permit>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     blocking_api(move || {
         let _permit = permit;
         let info = control::install(&state.store, &body)?;
         state.store.audit(
-            "token",
+            &principal.actor,
             "plugin_install",
             Some(&info.manifest_sha256),
             None,
@@ -77,6 +78,7 @@ async fn enable(
     State(state): State<AppState>,
     Path(digest): Path<String>,
     Extension(permit): Extension<Permit>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     let approval: Approval = serde_json::from_slice(&body).map_err(|_| {
@@ -108,7 +110,7 @@ async fn enable(
         // Constructors may fail or terminate the process. Record intent before
         // crossing the trusted machine-code boundary, never just afterwards.
         state.store.audit(
-            "token",
+            &principal.actor,
             "plugin_enable_attempt",
             Some(&digest),
             None,
@@ -119,13 +121,13 @@ async fn enable(
             Err(error) => {
                 let _ = state
                     .store
-                    .audit("token", "plugin_enable", Some(&digest), None, "failed");
+                    .audit(&principal.actor, "plugin_enable", Some(&digest), None, "failed");
                 return Err(ApiError::from(error));
             }
         };
         state
             .store
-            .audit("token", "plugin_enable", Some(&digest), None, "ok")?;
+            .audit(&principal.actor, "plugin_enable", Some(&digest), None, "ok")?;
         Ok(Json(json!(info)))
     })
     .await
@@ -134,13 +136,14 @@ async fn disable(
     State(state): State<AppState>,
     Path(digest): Path<String>,
     Extension(permit): Extension<Permit>,
+    Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<Value>> {
     blocking_api(move || {
         let _permit = permit;
         let info = control::manager(&state.store)?.disable(&digest)?;
         state
             .store
-            .audit("token", "plugin_disable", Some(&digest), None, "ok")?;
+            .audit(&principal.actor, "plugin_disable", Some(&digest), None, "ok")?;
         Ok(Json(json!(info)))
     })
     .await
@@ -149,13 +152,14 @@ async fn uninstall(
     State(state): State<AppState>,
     Path(digest): Path<String>,
     Extension(permit): Extension<Permit>,
+    Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<Value>> {
     blocking_api(move || {
         let _permit = permit;
         state.store.uninstall_plugin(&digest)?;
         state
             .store
-            .audit("token", "plugin_uninstall", Some(&digest), None, "ok")?;
+            .audit(&principal.actor, "plugin_uninstall", Some(&digest), None, "ok")?;
         Ok(Json(json!({"uninstalled":digest})))
     })
     .await
@@ -164,6 +168,7 @@ async fn attest(
     State(state): State<AppState>,
     Path(digest): Path<String>,
     Extension(permit): Extension<Permit>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     let signature = serde_json::from_slice(&body).map_err(|_| {
@@ -177,7 +182,7 @@ async fn attest(
         let info = control::manager(&state.store)?.attest(&digest, signature)?;
         state
             .store
-            .audit("token", "plugin_attest", Some(&digest), None, "ok")?;
+            .audit(&principal.actor, "plugin_attest", Some(&digest), None, "ok")?;
         Ok(Json(json!(info)))
     })
     .await
@@ -202,6 +207,7 @@ async fn retire(
     State(state): State<AppState>,
     Path(name): Path<String>,
     Extension(permit): Extension<Permit>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
     let approval: Retirement = serde_json::from_slice(&body).map_err(|_| {
@@ -215,7 +221,7 @@ async fn retire(
         state.store.retire_pipeline(&name, &approval.approve_etag)?;
         state
             .store
-            .audit("token", "pipeline_retire", Some(&name), None, "ok")?;
+            .audit(&principal.actor, "pipeline_retire", Some(&name), None, "ok")?;
         Ok(Json(json!({"retired":name,"external_files_deleted":false})))
     })
     .await

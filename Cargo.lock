@@ -2420,6 +2420,7 @@ dependencies = [
  "sparrow-io",
  "sparrow-model",
  "sparrow-plan",
+ "sparrow-plugin",
  "sparrow-runtime",
  "tokio",
  "tower",
