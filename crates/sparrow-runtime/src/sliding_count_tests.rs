@@ -716,3 +716,114 @@ fn plan_and_profile_gates_for_sliding_count() {
     let want = crate::buffered_window::key_credit(&row.values[..1]) + crate::buffered_window::event_credit(&values);
     assert_eq!(op.retention_bytes(), want);
 }
+
+// ------------------------------------------- review gap classes from #29 (f719890)
+
+/// Legacy/untagged encoders must refuse codec 4 even for an empty window, and
+/// a non-durable (restart_fresh) window never publishes a frame.
+#[test]
+fn review_legacy_and_nondurable_encoders_refuse_codec4_even_when_empty() {
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let mut fresh = BufferedWindow::new(spec("l"), schema(), owner.clone(), 1024, 1024, false).unwrap();
+    let mut out = vec![0xAA];
+    let e = fresh.encode_freeze_into(OperatorId::new(10), &mut out, 1024).unwrap_err();
+    assert_eq!(guard(&e), Some("buffered_profile_mismatch"));
+    assert_eq!(out, vec![0xAA]);
+    feed(&mut fresh, 1..=5);
+    assert!(fresh.encode_freeze_into(OperatorId::new(10), &mut out, 1024).is_err());
+    assert_eq!(out, vec![0xAA]);
+    let layout = sparrow_plan::PlanLayout::from_window(10.into(), 1.into(), &spec("l"))
+        .with_where(None)
+        .with_input_schema(&schema());
+    let source = SourcePosition::start(SourceIdentity::memory("fixture", 0, 0));
+    for rows in [0i64, 5] {
+        let mut op = operator(&owner);
+        feed(&mut op, 1..=rows);
+        let encoded = crate::barrier::EncodedFreeze::from_buffered(&op, OperatorId::new(10), &owner, 1024).unwrap();
+        assert!(encoded.buffered);
+        let e = match CheckpointSnapshot::encode_frozen(1, &source, rows as u64, &layout, None, encoded) {
+            Ok(_) => panic!("legacy SPV1 accepted a codec 4 ACK, rows={rows}"),
+            Err(e) => e,
+        };
+        assert_eq!(guard(&e), Some("buffered_profile_mismatch"), "rows={rows}");
+        drop(op);
+    }
+    drop(fresh);
+    assert_eq!(owner.usage().physical_bytes, 0);
+}
+
+/// A complete, checksummed v32 envelope with a foreign/zero output identity
+/// or a foreign source kind is incompatible, never corruption fallback.
+#[test]
+fn review_v32_output_identity_mismatch_is_not_corruption_fallback() {
+    for mutation in ["foreign_epoch", "zero_epoch", "zero_ordinal", "foreign_source"] {
+        let dir = tmp();
+        let physical = sliding_plan("l");
+        let plan = CheckpointPlan::from_physical(&physical).unwrap();
+        let k = kernel(ResourceBudget::compact());
+        let head = k.block_on(segment(&k, &physical, true, 1..=7, Some(7), None)).unwrap();
+        let encoded = head.snapshot.unwrap();
+        let mut store = CheckpointStore::open_for_plan_exclusive(&dir, 1024, Default::default(), &plan, "jetstream-v1").unwrap();
+        store.commit_prepared(&encoded).unwrap();
+        let mut bytes = encoded.bytes().to_vec();
+        drop(encoded);
+        let plan_start = bytes.windows(4).position(|b| b == b"CPL1").unwrap();
+        let epoch_start = plan_start - 4 - 24;
+        assert_eq!(&bytes[epoch_start..epoch_start + 16], &[5; 16]);
+        match mutation {
+            "foreign_epoch" => bytes[epoch_start] ^= 1,
+            "zero_epoch" => bytes[epoch_start..epoch_start + 16].fill(0),
+            "zero_ordinal" => bytes[epoch_start + 16..epoch_start + 24].fill(0),
+            "foreign_source" => {
+                let at = bytes.windows(12).position(|b| b == b"jetstream-v1").unwrap();
+                bytes[at] = b'x';
+            }
+            _ => unreachable!(),
+        }
+        bytes[6..14].copy_from_slice(&2u64.to_le_bytes());
+        write_generation(&store, 2, &bytes);
+        let current = fs::read(dir.join("CURRENT")).unwrap();
+        let owner = MemoryOwner::new(ResourceBudget::compact());
+        let e = store.recover_pipeline_owned(None, &owner).expect_err("cannot replay an older cut");
+        assert_eq!(e.code, ErrorCode::UnsupportedRestore, "{mutation}: {e:?}");
+        assert_eq!(guard(&e), Some("buffered_profile_mismatch"), "{mutation}: {e:?}");
+        assert_eq!(fs::read(dir.join("CURRENT")).unwrap(), current);
+        assert_eq!(owner.usage().physical_bytes, 0);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// A v31 envelope whose manifest carries an RCP2 prefix (relaxed semantics)
+/// violates the strict profile; it must not fall back to chk-1.
+#[test]
+fn review_relaxed_codec4_manifest_is_not_corruption_fallback() {
+    let dir = tmp();
+    let (plan, mut bytes) = committed_v31(&dir);
+    let start = bytes.windows(4).position(|b| b == b"CPL1").unwrap();
+    let old_len = u32::from_le_bytes(bytes[start - 4..start].try_into().unwrap()) as usize;
+    // Forge the RCP2 prefix marker onto the strict codec 4 manifest bytes
+    // (encode() itself refuses this combination).
+    let mut manifest = plan.encode().unwrap();
+    let sem = plan.semantics.len();
+    let at = manifest.len() - sem - 4;
+    manifest[at..at + 4].copy_from_slice(&((sem + 13) as u32).to_le_bytes());
+    let mut marker = b"CP01\0RCP2".to_vec();
+    marker.extend_from_slice(&(sem as u32).to_le_bytes());
+    manifest.splice(at + 4..at + 4, marker);
+    bytes[start - 4..start].copy_from_slice(&(manifest.len() as u32).to_le_bytes());
+    bytes.splice(start..start + old_len, manifest);
+    bytes[6..14].copy_from_slice(&2u64.to_le_bytes());
+    let mut store = CheckpointStore::open_for_plan_exclusive(&dir, 1024, Default::default(), &plan, "file").unwrap();
+    write_generation(&store, 2, &bytes);
+    let current = fs::read(dir.join("CURRENT")).unwrap();
+    let owner = MemoryOwner::new(ResourceBudget::compact());
+    let e = store.recover_pipeline_owned(None, &owner).expect_err("cannot roll back to chk-1");
+    assert_eq!(e.code, ErrorCode::UnsupportedRestore, "{e:?}");
+    assert_eq!(guard(&e), Some("buffered_profile_mismatch"), "{e:?}");
+    assert!(e.message.contains("RCP2 prefix"), "rejected for the prefix, not framing: {e:?}");
+    assert_eq!(fs::read(dir.join("CURRENT")).unwrap(), current);
+    assert_eq!(owner.usage().physical_bytes, 0);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}

@@ -804,6 +804,17 @@ impl PipelineSnapshot {
             version,
             EXT_AGG_FILE_SNAPSHOT_VERSION | EXT_AGG_RELIABLE_SNAPSHOT_VERSION
         );
+        let buffered_version = matches!(
+            version,
+            SLIDING_COUNT_FILE_SNAPSHOT_VERSION | SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
+        );
+        // v29-v32 envelopes are complete, checksummed records: identity and
+        // profile disagreements are incompatibilities, never corruption.
+        let strict = |message: &str| if extended_version {
+            extended_mismatch(message)
+        } else if buffered_version {
+            buffered_mismatch(message)
+        } else { invalid(message) };
         let next_output=if matches!(
             version,
             RELIABLE_SNAPSHOT_VERSION
@@ -820,20 +831,17 @@ impl PipelineSnapshot {
         ) {
             let epoch=take(&mut bytes,16)?.try_into().unwrap();
             Some(sparrow_model::OutputSequence::new(epoch,u64_value(&mut bytes)?)
-                .map_err(|_| if extended_version {
-                    extended_mismatch("invalid reliable output position")
-                } else { invalid("invalid reliable output position") })?)
+                .map_err(|_| strict("invalid reliable output position"))?)
         } else {None};
         if next_output.is_some() != output_profile(&source.identity.kind) {
-            return Err(if extended_version {
-                extended_mismatch("reliable snapshot lacks source/output identity")
-            } else { invalid("reliable snapshot lacks source/output identity") });
+            return Err(strict("reliable snapshot lacks source/output identity"));
         }
         let length = u32_value(&mut bytes)?;
         let plan = CheckpointPlan::decode(take(&mut bytes, length)?).map_err(|error| {
-            if matches!(version, EXT_AGG_FILE_SNAPSHOT_VERSION | EXT_AGG_RELIABLE_SNAPSHOT_VERSION)
-                && error.code == ErrorCode::UnsupportedRestore {
+            if extended_version && error.code == ErrorCode::UnsupportedRestore {
                 error.context("checkpoint_guard", EXTENDED_PROFILE_GUARD)
+            } else if buffered_version && error.code == ErrorCode::UnsupportedRestore {
+                error.context("checkpoint_guard", BUFFERED_PROFILE_GUARD)
             } else { error }
         })?;
         // Codec 3 and the v29/v30 envelopes select each other exactly. A
@@ -844,10 +852,6 @@ impl PipelineSnapshot {
                 "checkpoint outer version and extended aggregate state codec disagree",
             ));
         }
-        let buffered_version = matches!(
-            version,
-            SLIDING_COUNT_FILE_SNAPSHOT_VERSION | SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
-        );
         if buffered_version != plan.has_buffered_state() {
             return Err(buffered_mismatch(
                 "checkpoint outer version and sliding count state codec disagree",
@@ -863,7 +867,7 @@ impl PipelineSnapshot {
             if version == SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
                 && next_output.is_none_or(|position| position.epoch() != generation)
             {
-                return Err(invalid(
+                return Err(buffered_mismatch(
                     "v32 checkpoint lacks a stable output identity for its state generation",
                 ));
             }

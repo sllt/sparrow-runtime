@@ -918,9 +918,6 @@ func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
 	if reliable {
 		eventually("durable empty bootstrap", func() bool { return number(v.status(), "checkpoint", "last_success_id") >= 1 })
 	}
-	if p1 == 0 && !reliable {
-		must(os.WriteFile(v.file, nil, 0600))
-	}
 	v.publish(1, p1, shape)
 	eventually("phase-1 outputs", func() bool { return v.sink.count() == outputsAt(p1) })
 	eventually("phase-1 input applied", func() bool {
@@ -1327,6 +1324,7 @@ func compat(root, serverBin, oldBin string) map[string]any {
 func compatSlide(root, serverBin, oldBin, prevBin string) map[string]any {
 	v := setup(root, "file", serverBin, "")
 	defer v.close()
+	defer v.captureFailure()
 	result := map[string]any{}
 	cur := func() string { return hash(filepath.Join(v.checkpoint, "CURRENT")) }
 	// (1) New binary writes a v31 directory.

@@ -97,6 +97,15 @@ const MAX_ARITY: usize = 64;
 
 /// Retention credit of one group key: fixed node/Arc/container slack plus the
 /// actual detached key values (both B-trees may hold a copy of the bytes).
+/// Legacy SPV1 / untagged encoders cannot carry codec 4.
+pub(crate) fn codec4_legacy() -> SparrowError {
+    SparrowError::new(
+        ErrorCode::UnsupportedRestore,
+        "legacy checkpoint encoders cannot carry sliding count codec 4 state; v31/v32 is required",
+    )
+    .context("checkpoint_guard", "buffered_profile_mismatch")
+}
+
 pub(crate) fn key_credit(values: &[Scalar]) -> usize {
     values.iter().fold(KEY_FIXED, |n, v| {
         n.saturating_add(v.resident_bytes().saturating_mul(4))
@@ -407,6 +416,15 @@ impl BufferedWindow {
         out: &mut Vec<u8>,
         max_keys: usize,
     ) -> Result<()> {
+        // Only a durable (v31/v32) window holds the exact restore credit; a
+        // restart_fresh window's accounting differs, so never publish it.
+        if !self.durable {
+            return Err(SparrowError::new(
+                ErrorCode::UnsupportedRestore,
+                "sliding count window is not checkpointable (restart_fresh); codec 4 requires v31/v32",
+            )
+            .context("checkpoint_guard", "buffered_profile_mismatch"));
+        }
         self.check_freeze_bound(max_keys)?;
         let size = self.sliding_size()?;
         out.extend_from_slice(&operator.raw().to_le_bytes());

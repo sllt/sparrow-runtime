@@ -984,7 +984,8 @@ impl CheckpointPlan {
         {
             return Err(rejected(
                 "sliding count (codec 4) requires one strict linear state without references or RCP2 prefix",
-            ));
+            )
+            .context("checkpoint_guard", "buffered_profile_mismatch"));
         }
         Ok(())
     }

@@ -158,6 +158,11 @@ impl CheckpointSnapshot {
         if freeze.ext {
             return Err(crate::aggregate::codec1_extended());
         }
+        // Legacy SPV1 has no participant codec: codec 4 (sliding count)
+        // frames are refused here even when the window is empty.
+        if freeze.buffered {
+            return Err(crate::buffered_window::codec4_legacy());
+        }
         if freeze.bytes.len() < 11 {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
