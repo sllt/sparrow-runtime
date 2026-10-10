@@ -168,6 +168,48 @@ fn analysis_control_two_real_files_join_to_required_http() {
     });
 }
 
+#[test]
+fn analysis_recovery_control_profiles_and_declared_limits() {
+    let store = store();
+    let root = sparrow_connectors::ensure_default_data_root().join("analysis-profile-validation");
+    let source = |name: &str| json!({"kind":"file","path":root.join(format!("{name}.ndjson")),"file_contract":"append_only"});
+    let sink = json!({"kind":"http","url":"http://127.0.0.1:9/out"});
+    let mut value = json!({"version":1,"stream":"l","recovery":"aligned","fail_on_decode":true,
+        "sql":"SELECT to_int64(u.item) AS item,u.unnest_input,u.unnest_ordinal FROM l CROSS JOIN UNNEST(items) AS u(item)",
+        "source":source("l"),"sink":sink,"checkpoint_dir":root.join("unnest"),"checkpoint":{"resume_latest":true}});
+    let check = |value: &Value| {
+        let spec = PipelineSpec::from_json(&serde_json::to_vec(value).unwrap()).unwrap();
+        let plan = bind_plan_with_store(&store, &spec, "analysis", 1).unwrap();
+        validate_aligned_plan(&spec, &plan).unwrap();
+        assert_eq!(effective_guarantees_with_plan(&spec, &plan)["aligned_eligible"], true);
+        (spec, plan)
+    };
+    let (_, plan) = check(&value);
+    assert_eq!(sparrow_runtime::snapshot_version_for(&sparrow_plan::CheckpointPlan::from_physical(&plan).unwrap(), "file").unwrap(), 36);
+    #[cfg(feature = "jetstream")]
+    {
+        let mut js = value.clone();
+        js["source"] = json!({"kind":"jetstream","jetstream":{"servers":["nats://127.0.0.1:4222"],"namespace":"analysis","stream":"INPUT","consumer":"rows","ownership_bucket":"OWNERS"}});
+        js["delivery"] = json!("checkpointed_at_least_once");
+        let (_, plan) = check(&js);
+        assert_eq!(sparrow_runtime::snapshot_version_for(&sparrow_plan::CheckpointPlan::from_physical(&plan).unwrap(), "jetstream-v1").unwrap(), 37);
+    }
+    for name in ["a", "b"] {
+        store.put_stream(name, r#"{"fields":[{"name":"k","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false},{"name":"ts","type":"int64","nullable":false}]}"#).unwrap();
+    }
+    value["stream"] = json!("a");
+    value["sql"] = json!("SELECT a.v AS lv,b.v AS rv FROM a LEFT JOIN b ON a.k=b.k AND INTERVAL_MATCH(a.ts,b.ts,3,5,10)");
+    value["source"] = source("a");
+    value["graph_io"] = json!({"sources":{"1":source("a"),"2":source("b")},"sinks":{"6":sink}});
+    value["checkpoint"] = json!({"resume_latest":true,"interval_ms":100,"timeout_ms":5000});
+    let (_, plan) = check(&value);
+    assert_eq!(sparrow_runtime::snapshot_version_for(&sparrow_plan::CheckpointPlan::from_physical(&plan).unwrap(), sparrow_runtime::graph_cut::KIND).unwrap(), 38);
+    value["checkpoint"]["resume_latest"] = json!(false);
+    let spec = PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let plan = bind_plan_with_store(&store, &spec, "analysis", 1).unwrap();
+    assert_eq!(validate_aligned_plan(&spec, &plan).unwrap_err().code, sparrow_model::ErrorCode::UnsupportedRestore);
+}
+
 /// Sub-batch 1 gate: FIRST/LAST/VAR/STDDEV admit aligned recovery only through
 /// the strict linear v29 (File) profile here; every other combination is
 /// rejected at validate time, before any checkpoint history or input I/O.

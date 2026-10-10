@@ -448,7 +448,7 @@ impl GraphCut {
         // operators transform watermark values but not idle/permanent EOF.
         // Pending decisions deliberately use `validate`, NOT this check: they
         // contain new source observations and the previous runtime Union cut.
-        let mut activity = BTreeMap::new();
+        let mut activity: BTreeMap<usize, (bool, bool)> = BTreeMap::new();
         let edges = plan.edges.as_ref().expect("time graph edges");
         for _ in 0..plan.stages.len() {
             let mut changed = false;
