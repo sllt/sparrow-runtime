@@ -130,6 +130,12 @@ fn build_router(state: AppState, ui_assets: Option<Arc<UiAssets>>) -> Router {
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
         .merge(plugins::router())
         .merge(authoring::router())
+        .merge(
+            Router::<AppState>::new()
+                .route("/v1/preview", post(preview))
+                .layer(DefaultBodyLimit::max(sparrow_control::preview::MAX_PREVIEW_BODY))
+                .layer(RequestBodyLimitLayer::new(sparrow_control::preview::MAX_PREVIEW_BODY)),
+        )
         .layer(axum::middleware::from_fn_with_state(
             (state.clone(), ui_public),
             management_guard,
@@ -548,6 +554,15 @@ async fn query(
         Bytes::from_owner(output),
     )
         .into_response())
+}
+
+/// K5.4: controlled-time preview; shares finite admission with `/v1/query`.
+async fn preview(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResult<Response> {
+    require_auth(&state, &headers)?;
+    let output = sparrow_control::preview::execute(state.store.clone(), body.to_vec())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], Bytes::from(output)).into_response())
 }
 
 fn run_validate(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {

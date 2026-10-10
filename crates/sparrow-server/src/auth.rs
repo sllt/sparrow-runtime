@@ -207,6 +207,7 @@ pub const ACTIONS: &[(&str, &str, &str, Role)] = &[
     ("POST", "/v1/graphs/explain", "graph.explain", Role::Operator),
     ("POST", "/v1/test", "plan.test", Role::Operator),
     ("POST", "/v1/query", "query.preview", Role::Operator),
+    ("POST", "/v1/preview", "preview.run", Role::Operator),
     ("GET", "/v1/streams", "streams.list", Role::Operator),
     ("GET", "/v1/streams/{}", "stream.read", Role::Operator),
     ("PUT", "/v1/streams/{}", "stream.write", Role::Operator),

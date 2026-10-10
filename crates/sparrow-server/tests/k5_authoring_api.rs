@@ -274,3 +274,83 @@ async fn k53_structured_bound_nodes_for_designer() {
     assert_eq!(r.v["graph"]["ok"], false);
     assert!(r.v["graph"]["error"]["message"].as_str().unwrap().contains("node 3"), "{}", r.v);
 }
+
+#[tokio::test]
+async fn k54_preview_controlled_time_and_rejections() {
+    let s = setup().await;
+    let stream: Value = serde_json::from_str(STREAM).unwrap();
+    assert_eq!(call(&s, Method::PUT, "/v1/streams/sensors", OPERATOR, None, stream).await.st, StatusCode::CREATED);
+    let d = |id: &str, t: f64, ts: i64| json!({"type":"data","row":{"device_id":id,"temperature":t,"ts":ts}});
+    // PT tumbling: fires only on the advance that crosses the boundary; no wall time.
+    let req = json!({"sql":"SELECT device_id, COUNT(*) AS n FROM sensors GROUP BY device_id, TUMBLE(PROCESSING_TIME, INTERVAL '1' SECOND)",
+        "start_micros": 0, "events":[d("a",1.0,1), d("a",2.0,2), {"type":"advance_clock","to_micros":999_999},
+        {"type":"advance_clock","to_micros":1_000_000}, d("b",3.0,3), {"type":"advance_clock","to_micros":2_000_000}]});
+    for _ in 0..2 {
+        let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, req.clone()).await;
+        assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+        let n: Vec<u64> = r.v["steps"].as_array().unwrap().iter().map(|x| x["output_rows"].as_u64().unwrap()).collect();
+        assert_eq!(n, vec![0, 0, 0, 1, 0, 1]);
+        assert_eq!(r.v["steps"][3]["rows"][0]["n"], 2);
+        assert_eq!(r.v["final_clock_micros"], 2_000_000);
+        assert_eq!(r.v["side_effects"], false);
+        assert_eq!(r.v["time"]["clock"], "virtual");
+    }
+    // ET tumbling: watermark drives output; EOF closes remaining windows.
+    let req = json!({"sql":"SELECT device_id, COUNT(*) AS n FROM sensors GROUP BY device_id, TUMBLE(ts, INTERVAL '1' SECOND)",
+        "events":[d("a",1.0,100), d("a",1.0,200), {"type":"watermark","micros":1_000_000}, d("a",1.0,1_500_000), {"type":"eof"}]});
+    let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, req).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+    let n: Vec<u64> = r.v["steps"].as_array().unwrap().iter().map(|x| x["output_rows"].as_u64().unwrap()).collect();
+    assert_eq!(n, vec![0, 0, 1, 0, 1], "{}", r.v);
+    assert_eq!(r.v["eof"], true);
+    // Real PipelineSpec: server swaps the I/O and lists what did not take part.
+    let spec: Value = serde_json::from_str(&spec_text("1.5")).unwrap();
+    let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, json!({"spec": spec, "events":[d("a",1.0,1), d("b",2.0,2)]})).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+    assert_eq!(r.v["output_rows"], 1);
+    assert!(r.v["ignored_fields"].as_array().unwrap().iter().any(|x| x == "source"));
+    // Timeline rules, unsupported shapes, roles, caps.
+    let bad = |events: Value| json!({"sql":"SELECT * FROM sensors","events":events});
+    for (events, code) in [
+        (json!([{"type":"advance_clock","to_micros":5},{"type":"advance_clock","to_micros":4}]), "invalid_argument"),
+        (json!([{"type":"eof"}, d("a",1.0,1)]), "invalid_argument"),
+        (json!([{"type":"data","source":"other","row":{"device_id":"a","temperature":1.0,"ts":1}}]), "invalid_argument"),
+        (json!([]), "bound_exceeded"),
+    ] {
+        let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, bad(events)).await;
+        assert_eq!(r.v["error"]["code"], code, "{}", r.v);
+    }
+    let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, json!({"sql":"SELECT * FROM sensors","events":[d("a",1.0,1)],"limits":{"timeout_ms":60000}})).await;
+    assert_eq!(r.v["error"]["code"], "bound_exceeded");
+    let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, json!({"sql":"SELECT * FROM sensors","events":[d("a",1.0,1)],"oops":1})).await;
+    assert_eq!(r.v["error"]["code"], "invalid_argument");
+    assert_eq!(call(&s, Method::POST, "/v1/preview", VIEWER, None, bad(json!([d("a",1.0,1)]))).await.st, StatusCode::FORBIDDEN);
+    // Bodies above the generic 64KiB API cap are allowed here up to 256KiB only.
+    let many: Vec<Value> = (0..400).map(|i| d(&format!("device-{i:04}-padding-padding-padding-padding"), 1.0, i)).collect();
+    let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, json!({"sql":"SELECT device_id FROM sensors WHERE temperature > 5","events":many,"limits":{"events":512}})).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+}
+
+#[tokio::test]
+async fn k54_preview_iot_change_and_debounce() {
+    let s = setup().await;
+    let cat = json!([{"name":"m","fields":[{"name":"device_id","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false}]}]);
+    let iot = |kind: &str, timing: Value| {
+        let mut n = json!({"id":2,"kind":kind,"iot":{"keys":["device_id"],"fields":["v"],"emit_first":true,"ttl_micros":0,"max_keys":16,"invalid":"error"},"out":[3]});
+        if !timing.is_null() { n["iot"]["timing"] = timing; n["iot"]["emit_first"] = json!(false); }
+        json!({"version":1,"pipeline_id":5,"revision_id":1,"catalog":cat,"nodes":[
+            {"id":1,"kind":"memory_source","table":"m","out":[2]}, n, {"id":3,"kind":"capture_sink","name":"out"}]})
+    };
+    let d = |v: i64| json!({"type":"data","row":{"device_id":"a","v":v}});
+    let steps = |r: &R| r.v["steps"].as_array().unwrap().iter().map(|x| x["output_rows"].as_u64().unwrap()).collect::<Vec<_>>();
+    let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, json!({"graph": iot("change_detect", Value::Null), "events":[d(1), d(1), d(2), d(2)]})).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+    assert_eq!(steps(&r), vec![1, 0, 1, 0]);
+    // Debounce on the paused clock: quiet period elapses only via advance_clock.
+    let timing = json!({"kind":"debounce","clock":"paused","quiet_micros":1000,"max_wait_micros":10000,"leading":false,"trailing":true,"reset_on_repeat":true});
+    let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, json!({"graph": iot("debounce", timing), "events":[
+        d(1), {"type":"advance_clock","to_micros":500}, d(2), {"type":"advance_clock","to_micros":1499}, {"type":"advance_clock","to_micros":1500}]})).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+    assert_eq!(steps(&r), vec![0, 0, 0, 0, 1], "{}", r.v);
+    assert_eq!(r.v["steps"][4]["rows"][0]["v"], 2);
+}

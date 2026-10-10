@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 use tokio_util::sync::CancellationToken;
-static QUERY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+pub(crate) static QUERY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

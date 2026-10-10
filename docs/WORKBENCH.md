@@ -120,3 +120,16 @@ Graph-mode drafts open in a three-pane designer: node palette, canvas (React Flo
 - Types and port schemas come from the server: `/v1/graphs/validate`, `/v1/graphs/explain` and draft check (`graph.bound_nodes`) return `{id, bound_kind, downstream, output_schema}` per node. Locally the designer only gives quick hints (cycles, arity, dangling outputs). A server error of the form `node N: …` highlights node N.
 - Undo/redo (Ctrl Z / Ctrl Shift Z), Ctrl D to duplicate, Del to delete, layered auto-layout, zoom and fit.
 - SQL and Graph are separate authoring modes, chosen when a draft is created. SQL is never reverse-edited into a graph. Publishing still runs full PipelineSpec validation.
+
+## K5.4 Bounded Preview with controlled time
+
+`POST /v1/preview` (operator+) runs one bounded, synchronous request on the real Kernel and existing operators. Nothing is simulated in the browser.
+
+- **Request:** exactly one of `spec` (a full PipelineSpec), `sql`, or `graph`. Plus `start_micros` (logical start, default 0, never the host clock), `events`, and optional `limits`.
+- **Events:** `{"type":"data","row":{…},"source"?}`, `{"type":"advance_clock","to_micros":N}`, `{"type":"watermark","micros":N}`, `{"type":"eof"}`. The clock and watermark are monotonic. Nothing may follow `eof`. A named `source` must match the plan's single source.
+- **Determinism:** the job runs on a virtual clock. Processing time moves only through in-band controls, the same mechanism as the paused-time production profile. After every event the server sends an in-memory barrier and waits for every stage to acknowledge it, so each step's output (including due timers) is complete before the next event. There are no sleeps. Snapshots are never encoded or stored.
+- **Supported (tested):** linear plans with one source and one capture. Filter/Project, PT tumbling, ET tumbling with watermark/EOF, count windows, IoT `change_detect` and paused-clock `debounce`. Other IoT kinds and windows run if the checkpoint planner accepts them, but they are not individually covered by tests.
+- **Refused with a reason:** DAG/Branch/Union/Join, side outputs, Lookup/reference tables, analysis stages, native/external/non-preemptible plugins, and streams with Dynamic/nested columns (`preview cannot step this plan: …`). A PipelineSpec's connectors are never opened: the server binds only the plan and lists `ignored_fields` and `not_verified`.
+- **Hard caps:** 256 KiB body (its own route, so the global 64 KiB API cap is unchanged), ≤512 events, ≤5000 output rows, ≤2 MiB output, ≤10 s, bounded work units, 2 MiB decoded input. Exceeding a cap is an error, never a partial "success". It shares the two-slot finite admission with `/v1/query`. A disconnect cancels the worker.
+- **Response:** `schema`, per-step `{clock_micros, watermark_micros, output_rows, rows}`, final clock/watermark, `eof`, `future_dropped`, `side_effects:false`, `ignored_fields`, `not_verified`.
+- **UI:** the draft editor's "受控预览" panel has an event timeline editor (data / clock +1s / watermark / EOF, reorder, local monotonic checks) and a per-step result table. Samples and results stay in page memory only: they are cleared after 5 idle minutes, on navigation and on logout, and are never saved into the draft. Export asks for confirmation that the file contains business data.

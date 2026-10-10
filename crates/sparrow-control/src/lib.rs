@@ -11,6 +11,7 @@ mod plugin_tests;
 mod extension_tests;
 pub mod capability;
 pub mod checkpoint;
+pub mod preview;
 pub mod query;
 pub mod lookup;
 pub mod plugins;
