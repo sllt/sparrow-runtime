@@ -50,6 +50,7 @@ mod observed_time_log;
 mod graph_time;
 mod graph_time_log;
 mod prepared_sink;
+mod outbox;
 
 /// Per-pipeline backoff, capped at 32 seconds; never sleep in converge.
 /// A successful launch is not a stable recovery: reset after 30s running.
@@ -486,6 +487,7 @@ impl RunningJob {
 }
 
 pub struct Supervisor {
+    outbox_workers: Mutex<HashMap<String, outbox::OutboxWorker>>,
     pub(crate) checkpoint_timeout: Duration,
     pub(crate) stable_run: Duration,
     store: Arc<Store>,
@@ -532,6 +534,7 @@ impl Supervisor {
             transition: Mutex::new(()),
             transition_work: Arc::new(tokio::sync::Semaphore::new(128)),
             shutdown: CancellationToken::new(),
+            outbox_workers: Mutex::new(HashMap::new()),
             next_retry_at: Mutex::new(HashMap::new()),
             capacity_retries: Mutex::new(HashMap::new()),
             wake: Notify::new(),
@@ -711,6 +714,10 @@ impl Supervisor {
                 j.diag.snapshot()
             };
             acc.add_assign(&snapshot);
+        }
+        drop(g);
+        for worker in self.outbox_workers.lock().await.values() {
+            acc.add_assign(&worker.diag.snapshot());
         }
         acc
     }
@@ -1218,6 +1225,7 @@ impl Supervisor {
         .await?;
         let recovery = RecoveryPolicy::parse(&spec.recovery)?;
 
+        self.ensure_outbox_sender(name, &spec, &policy).await?;
         let job = if plan.has_silence() && spec.source.kind == "mqtt" {
             self.start_live_silence(name, &spec, schema, plan, demo.as_ref(), &policy).await?
         } else if plan.has_silence() {
@@ -2485,6 +2493,9 @@ impl Supervisor {
                 let http_cfg = http_config(&spec.sink, demo)?;
                 let sink = HttpSink::bind(http_cfg, &self.secrets, policy, diag).and_then(|sink|sink.with_action(spec.sink.action.clone(),policy))
                     .map_err(SparrowError::from)?;
+                let sink = if let Some(config)=&spec.sink.durable_outbox {
+                    sink.with_durable_queue(crate::outbox::Outbox::prepared(config)?).map_err(SparrowError::from)?
+                }else{sink};
                 self.kernel.handle().spawn(sink.run(rx_out, cancel, outbox))
             }
         })
@@ -2729,6 +2740,9 @@ impl Supervisor {
                 })
                 .await;
         }
+        let workers:Vec<_>=self.outbox_workers.lock().await.drain().map(|(_,worker)|worker).collect();
+        for worker in &workers {worker.cancel.cancel();}
+        for worker in workers {let _=worker.task.await;}
     }
 }
 

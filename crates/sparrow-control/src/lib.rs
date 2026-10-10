@@ -14,6 +14,7 @@ pub mod checkpoint;
 pub mod query;
 pub mod lookup;
 pub mod plugins;
+pub mod outbox;
 pub mod postgres_spec;
 pub mod reference_table;
 pub mod spec;

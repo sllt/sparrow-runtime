@@ -1,6 +1,6 @@
 # 当前生产化候选：安装、恢复与回退
 
-本页说明当前实现合同，不是目标设备认证或正式发行公告。Linux x86_64、Rust 1.98.0、锁定 Cargo.lock；Row/prepared/fusion，支持线性和显式DAG Preview，恢复按独立profile准入。Arrow/JIT、HA、可靠MQTT、持久HTTP outbox均未开启。版本号仍为0.1.0，tag/push另行授权。最新时间图见 [v18/v19 验收](#time-graph-validation)，线性时间组合见 [v16/v17 验收](#linear-time-validation)，单个时间算子历史批次见 [v14/v15 验收](#paused-time-validation)，静态表/迟滞见 [组合证据](#k1-k4-reference-validation)；历史门禁不自动代表新增能力。
+本页说明当前实现合同，不是目标设备认证或正式发行公告。Linux x86_64、Rust 1.98.0、锁定 Cargo.lock；Row/prepared/fusion，支持线性和显式DAG Preview，恢复按独立profile准入。Arrow/JIT、HA、可靠MQTT均未开启。可选 [持久 HTTP outbox 与输出 DLQ](DURABLE_OUTPUT.md) 提供本地落盘确认（不是远端 2xx）、有界重试和人工处置；启用后必须同时备份 catalog/checkpoint/outbox，且 pipeline stop 不停止积压投递。版本号仍为0.1.0，tag/push另行授权。最新时间图见 [v18/v19 验收](#time-graph-validation)，线性时间组合见 [v16/v17 验收](#linear-time-validation)，单个时间算子历史批次见 [v14/v15 验收](#paused-time-validation)，静态表/迟滞见 [组合证据](#k1-k4-reference-validation)；历史门禁不自动代表新增能力。
 
 新增 K2 **可选 JetStream Preview**：`SPARROW_JETSTREAM=1` 仅为 Server 启用 SDK，默认构建及 HTTP CLI 不链接它。合同、v4 与 File/v3 的目录隔离、资源限制和未验证边界见源码 `docs/JETSTREAM.md`（启用 feature 的包内同时提供）。不要将 R11 的 File/MQTT 数据或下面的默认部署合同直接当成 NATS/TLS/WAN/长稳认证。
 

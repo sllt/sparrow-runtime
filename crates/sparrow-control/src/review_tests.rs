@@ -259,6 +259,7 @@ fn file_spec(path: &str, sql: &str, recovery: &str, chk: Option<&str>) -> Pipeli
             protobuf: None,
         },
         sink: SinkSpec {
+            durable_outbox: None,
             nats: None,
             databus: None,
             influxdb: None,
@@ -435,6 +436,7 @@ fn mqtt_aligned_still_rejected() {
             protobuf: None,
         },
         sink: SinkSpec {
+            durable_outbox: None,
             nats: None,
             databus: None,
             influxdb: None,

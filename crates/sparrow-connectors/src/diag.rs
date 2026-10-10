@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 /// checkpoint or delivery receipt.
 #[derive(Debug, Default)]
 pub struct IoDiagnostics {
+    pub durable_outbox_enabled: std::sync::atomic::AtomicBool,
     pub lookup_update_failed: AtomicU64,
     pub plugin_source_rows: AtomicU64,
     pub plugin_sink_rows: AtomicU64,
@@ -34,6 +35,7 @@ pub struct IoDiagnostics {
     pub mqtt_quickack_errors: AtomicU64,
     pub http_posted: AtomicU64,
     pub http_acked_batches: AtomicU64,
+    pub outbox_persisted_batches: AtomicU64,
     pub http_encode_errors: AtomicU64,
     pub http_budget_drops: AtomicU64,
     pub http_failed: AtomicU64,
@@ -347,6 +349,7 @@ impl IoDiagnostics {
             mqtt_quickack_errors: self.mqtt_quickack_errors.load(Ordering::Relaxed),
             http_posted: self.http_posted.load(Ordering::Relaxed),
             http_acked_batches: self.http_acked_batches.load(Ordering::Relaxed),
+            outbox_persisted_batches: self.outbox_persisted_batches.load(Ordering::Relaxed),
             http_encode_errors: self.http_encode_errors.load(Ordering::Relaxed),
             http_budget_drops: self.http_budget_drops.load(Ordering::Relaxed),
             http_failed: self.http_failed.load(Ordering::Relaxed),
@@ -701,6 +704,7 @@ pub struct IoSnapshot {
     pub mqtt_quickack_errors: u64,
     pub http_posted: u64,
     pub http_acked_batches: u64,
+    pub outbox_persisted_batches: u64,
     pub http_encode_errors: u64,
     pub http_budget_drops: u64,
     pub http_failed: u64,
@@ -989,6 +993,7 @@ impl IoSnapshot {
         self.mqtt_quickack_errors += other.mqtt_quickack_errors;
         self.http_posted += other.http_posted;
         self.http_acked_batches += other.http_acked_batches;
+        self.outbox_persisted_batches += other.outbox_persisted_batches;
         self.http_encode_errors += other.http_encode_errors;
         self.http_budget_drops += other.http_budget_drops;
         self.http_failed += other.http_failed;

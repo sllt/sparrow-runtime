@@ -37,6 +37,9 @@ const MAX_OUTBOX: usize = 1024;
 const MAX_RETRIES: u32 = 8;
 const DELIVERY_OVERHEAD: usize = 512;
 
+#[path = "http_durable.rs"]
+mod durable;
+
 #[cfg(test)]
 #[path = "mqtt/tls_fixture.rs"]
 pub(crate) mod observation_tls_fixture;
@@ -148,6 +151,7 @@ pub struct HttpSink {
     auth: Option<String>,
     action: Option<Box<sparrow_formats::action::ActionSpec>>,
     action_policy: Option<TargetPolicy>,
+    durable: Option<Arc<dyn sparrow_io::durable::DurableHttpQueue>>,
 }
 
 struct Receipts {
@@ -388,16 +392,20 @@ impl HttpSink {
             auth,
             action: None,
             action_policy: None,
+            durable: None,
         })
     }
 
     pub async fn run(
-        self,
+        mut self,
         rx: impl Into<ObservedReceiver<RowBatch>>,
         cancel: CancellationToken,
         outbox: Option<Arc<InflightCounter>>,
     ) {
         let mut rx=rx.into();
+        if let Some(queue) = self.durable.take() {
+            return self.run_durable_ingress(rx, cancel, outbox, queue).await;
+        }
         if self.action.as_ref().is_some_and(|a|a.per_row_http()) {
             return Box::pin(self.run_row_actions(rx,cancel,outbox)).await;
         }

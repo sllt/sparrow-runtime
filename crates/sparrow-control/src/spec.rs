@@ -1569,6 +1569,9 @@ impl RedisSinkSpec {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SinkSpec {
+    /// Opt-in durable HTTP output; its acknowledgement is local persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_outbox: Option<Box<crate::outbox::OutboxSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<sparrow_expr::plugins::extension::Binding>,
     /// Required exclusively for `kind = "nats"` (NATS Core publish).
@@ -1663,7 +1666,8 @@ impl SinkSpec {
 impl SinkSpec {
     /// HTTP/MQTT/File/plugin/action fields (on a sink of another kind).
     pub(crate) fn has_foreign_fields(&self) -> bool {
-        self.plugin.is_some()
+        self.durable_outbox.is_some()
+            || self.plugin.is_some()
             || self.action.is_some()
             || self.file.is_some()
             || self.url.is_some()

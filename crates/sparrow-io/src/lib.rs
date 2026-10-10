@@ -18,6 +18,7 @@ pub mod observed;
 
 pub mod fs_lock;
 pub mod sink_identity;
+pub mod durable;
 pub use sink_identity::{CsvEncodeIdentity, OwnedSinkIdentity, SinkEncoding, SinkIdentity};
 
 pub use replay::{
