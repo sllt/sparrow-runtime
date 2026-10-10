@@ -3,6 +3,7 @@
 // re-serialise; unknown fields are carried through untouched.
 import { stringify } from "lossless-json";
 import { parseJson, obj, str, type Json } from "../api/json";
+import { emptyGraph } from "./graphModel";
 
 export type ParseResult = { ok: true; value: Record<string, Json> } | { ok: false; error: string };
 
@@ -54,4 +55,15 @@ export const emptySpec = (stream: string) => indent({
   sink: { kind: "log" },
   delivery: "live_best_effort",
   recovery: "restart_fresh",
+});
+
+/** Graph-mode starter: legacy source/sink bind to the lowest graph operator ids. */
+export const emptyGraphSpec = (stream: string) => indent({
+  version: 1,
+  stream,
+  source: { kind: "mqtt", topic: "sensors/json", client_id: "sparrow" },
+  sink: { kind: "log" },
+  delivery: "live_best_effort",
+  recovery: "restart_fresh",
+  graph: emptyGraph(stream),
 });

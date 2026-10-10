@@ -637,6 +637,27 @@ fn run_explain(state: &AppState, spec: &PipelineSpec) -> ApiResult<Value> {
     }))
 }
 
+/// K5.3 additive: structured per-node binding (id, bound kind, downstream
+/// order, output schema) so the designer never parses `physical` strings.
+pub(crate) fn bound_nodes_json(b: &sparrow_plan::BoundLogicalPlan) -> Value {
+    Value::Array(
+        b.nodes
+            .iter()
+            .map(|n| {
+                let dbg = format!("{:?}", n.kind);
+                let kind = dbg.split(['(', ' ', '{']).next().unwrap_or("").to_string();
+                let schema = n.kind.output_schema();
+                json!({
+                    "id": n.id.raw(),
+                    "bound_kind": kind,
+                    "downstream": n.downstream.iter().map(|d| d.raw()).collect::<Vec<_>>(),
+                    "output_schema": schema.fields.iter().map(|f| json!({"name": f.name, "type": f.data_type.name(), "nullable": f.nullable})).collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
+}
+
 async fn graph_validate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -656,6 +677,7 @@ async fn graph_validate(
         Ok(Json(json!({
             "accepted": true,
             "nodes": bound.nodes.len(),
+            "bound_nodes": bound_nodes_json(&bound),
             "honesty": HONESTY,
         })))
     })
@@ -678,7 +700,9 @@ async fn graph_explain(
         let spec = sparrow_plan::GraphSpec::from_json(text).map_err(ApiError::from)?;
         let catalog = binder_catalog(&state.store).map_err(ApiError::from)?;
         let report = sparrow_plan::explain_graph(&spec, &catalog).map_err(ApiError::from)?;
+        let bound = sparrow_plan::validate_graph(&spec, &catalog).ok();
         Ok(Json(json!({
+            "bound_nodes": bound.as_ref().map(bound_nodes_json),
             "accepted": report.accepted,
             "stages": report.stages,
             "physical": report.physical,

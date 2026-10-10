@@ -148,6 +148,12 @@ async fn check_draft(State(state): State<AppState>, Path(id): Path<String>) -> A
             Ok(spec) => {
                 out["parse"] = json!({"ok": true, "authoring_mode": if spec.graph.is_some() { "graph" } else { "sql" }});
                 out["validate"] = match run_validate(&state, &spec) { Ok(v) => json!({"ok": true, "report": v}), Err(e) => json!({"ok": false, "error": error_json(&e)}) };
+                if let Some(graph) = &spec.graph {
+                    out["graph"] = match sparrow_control::binder_catalog(&state.store).and_then(|c| sparrow_plan::validate_graph(graph, &c)) {
+                        Ok(b) => json!({"ok": true, "bound_nodes": bound_nodes_json(&b)}),
+                        Err(e) => json!({"ok": false, "error": error_json(&ApiError::from(e))}),
+                    };
+                }
                 out["explain"] = match run_explain(&state, &spec) { Ok(v) => json!({"ok": true, "report": v}), Err(e) => json!({"ok": false, "error": error_json(&e)}) };
                 if let Ok(cur) = state.store.get_pipeline(&d.pipeline) {
                     out["current"] = json!({"revision": cur.latest_revision, "etag": cur.etag, "spec": cur.spec});

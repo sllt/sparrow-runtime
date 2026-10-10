@@ -8,7 +8,7 @@ import { Card, ErrorView, Pill, Skeleton, StateView } from "../../components/ui"
 import { Icon } from "../../components/Icon";
 import { Modal } from "../../components/Modal";
 import { fmtAgo, fmtBytes } from "../../lib/format";
-import { emptySpec, pretty } from "../../lib/specText";
+import { emptyGraphSpec, emptySpec, pretty } from "../../lib/specText";
 import { MODE_LABEL, parseSummary } from "./model";
 
 const NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
@@ -69,6 +69,7 @@ function NewDraft({ pipes, streams, onClose, onCreated }: { pipes: string[]; str
   const [from, setFrom] = useState<string>("");
   const [pipeline, setPipeline] = useState("");
   const [id, setId] = useState("");
+  const [mode, setMode] = useState<"sql" | "graph">("sql");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const target = from || pipeline;
@@ -78,14 +79,17 @@ function NewDraft({ pipes, streams, onClose, onCreated }: { pipes: string[]; str
     if (!client || !valid) return;
     setBusy(true); setErr(null);
     try {
-      let text = emptySpec(streams[0] ?? "events");
+      const stream = streams[0] ?? "events";
+      let text = mode === "graph" ? emptyGraphSpec(stream) : emptySpec(stream);
       let base: string | null = null;
+      let m: string = mode;
       if (from) {
         const cur = obj(await client.get(`/v1/pipelines/${enc(from)}`));
         text = pretty(cur?.spec ?? {});
         base = str(cur?.etag);
+        m = obj(obj(cur?.spec)?.graph) ? "graph" : "sql";
       }
-      await client.request("PUT", `/v1/drafts/${enc(id)}`, { body: { pipeline: target, mode: "sql", text, metadata: {}, base_etag: base } });
+      await client.request("PUT", `/v1/drafts/${enc(id)}`, { body: { pipeline: target, mode: m, text, metadata: {}, base_etag: base } });
       onCreated(id);
     } catch (e) {
       const a = asApiError(e);
@@ -103,6 +107,15 @@ function NewDraft({ pipes, streams, onClose, onCreated }: { pipes: string[]; str
             {pipes.map((p) => <option key={p} value={p}>基于现有流水线：{p}</option>)}
           </select>
         </label>
+        {!from && (
+          <div role="radiogroup" aria-label="编辑方式" className="seg">
+            {(["sql", "graph"] as const).map((k) => (
+              <button key={k} role="radio" aria-checked={mode === k} className={`seg-btn${mode === k ? " on" : ""}`} onClick={() => setMode(k)}>
+                <Icon name={k === "sql" ? "code" : "branch"} size={15} />{k === "sql" ? "SQL" : "Graph 设计器"}
+              </button>
+            ))}
+          </div>
+        )}
         {!from && <label><span className="field-label">目标流水线名称</span><input className="input" value={pipeline} onChange={(e) => setPipeline(e.target.value)} placeholder="例如 temperature-alerts" /></label>}
         <label><span className="field-label">草稿名称</span><input className="input" value={id} onChange={(e) => setId(e.target.value)} placeholder="例如 alerts-v2" /></label>
         {from && <div className="hint">将复制该流水线当前最新版本的完整配置，并记录其 ETag 作为发布基线；期间若有人发布新版本，发布会以冲突拒绝。</div>}

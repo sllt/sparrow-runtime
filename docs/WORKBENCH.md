@@ -108,3 +108,15 @@ K5.2 未覆盖：网络握手探测（所有类型 `probe_unavailable`）；模�
 ## 未覆盖
 
 第二浏览器、移动端、高 DPI 未验证；尚无写操作页面；无 TLS 反向代理实测；角色文件不支持热加载（修改后需重启）。
+
+## K5.3 Graph Designer
+
+Graph-mode drafts open in a three-pane designer: node palette, canvas (React Flow) and an inspector with the server-bound output schema plus a lossless JSON sub-editor for node parameters. Check/Explain results sit below the canvas.
+
+- The canvas is a view over `graph.nodes[].out`. Every gesture (connect, disconnect, delete, duplicate, add, edit) is a pure edit on the GraphSpec JSON. Unknown fields, number literals and key order are kept. There is no second edge protocol.
+- Deleting an edge or node also removes the `routes`, `default_out`, `side_output` and `best_effort` references to it, and prunes `graph_io` bindings for removed nodes. Wiring into a Join fills an unset `stream_join.left_input`/`right_input` and never reassigns a bound slot.
+- Edge labels come only from explicit fields: `case N`, `default`, `side: <kind>`, `best-effort` (dashed), `left`/`right`.
+- Node positions are stored in draft `metadata.layout` by node id, never in the spec. Moving a node never changes the pipeline spec.
+- Types and port schemas come from the server: `/v1/graphs/validate`, `/v1/graphs/explain` and draft check (`graph.bound_nodes`) return `{id, bound_kind, downstream, output_schema}` per node. Locally the designer only gives quick hints (cycles, arity, dangling outputs). A server error of the form `node N: …` highlights node N.
+- Undo/redo (Ctrl Z / Ctrl Shift Z), Ctrl D to duplicate, Del to delete, layered auto-layout, zoom and fit.
+- SQL and Graph are separate authoring modes, chosen when a draft is created. SQL is never reverse-edited into a graph. Publishing still runs full PipelineSpec validation.
