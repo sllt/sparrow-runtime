@@ -9,10 +9,31 @@ on:
         description: Run only the bounded analysis process recovery cases (no repetitions)
         type: boolean
         default: false
+      release_candidate_run:
+        description: Optional successful production-gates run; run release checks instead of broker tests
+        type: string
+        default: ''
+      release_baseline_run:
+        description: Successful v39-capable baseline production-gates run
+        type: string
+        default: ''
+      release_connectors:
+        description: Also build/check one combined optional Connector package
+        type: boolean
+        default: false
 permissions:
   contents: read
+  actions: read
 jobs:
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_candidate_run != '' }}
+    uses: ./.github/workflows/release-readiness.yml
+    with:
+      candidate_run: ${{ inputs.release_candidate_run }}
+      baseline_run: ${{ inputs.release_baseline_run }}
+      build_connectors: ${{ inputs.release_connectors }}
   connectors:
+    if: ${{ !inputs.release_candidate_run }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:

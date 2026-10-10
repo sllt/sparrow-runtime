@@ -1,9 +1,20 @@
 name: release-readiness
 on:
+  workflow_call:
+    inputs:
+      candidate_run:
+        required: true
+        type: string
+      baseline_run:
+        required: true
+        type: string
+      build_connectors:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       candidate_run:
-        description: Successful production-gates run for this exact ref
+        description: Successful production-gates run (only workflow-only descendants allowed)
         required: true
         type: string
       baseline_run:
@@ -23,6 +34,8 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Reuse matching production packages (no rebuild)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -34,7 +47,13 @@ jobs:
           mkdir -p artifacts
           gh run view "$CANDIDATE" --json headSha,conclusion,name > artifacts/candidate-run.json
           gh run view "$BASELINE" --json headSha,conclusion,name > artifacts/baseline-run.json
-          jq -e --arg sha "$GITHUB_SHA" '.headSha==$sha and .conclusion=="success" and .name=="production-gates"' artifacts/candidate-run.json
+          jq -e '.conclusion=="success" and .name=="production-gates"' artifacts/candidate-run.json
+          candidate_sha=$(jq -r .headSha artifacts/candidate-run.json)
+          git merge-base --is-ancestor "$candidate_sha" "$GITHUB_SHA"
+          # Bootstrap/maintain this opt-in validator without rebuilding all
+          # application binaries. No code, template, script or docs drift.
+          git diff --exit-code "$candidate_sha" "$GITHUB_SHA" -- . ':!.github/workflows' > artifacts/candidate-source-diff.txt
+          git rev-parse HEAD > artifacts/validation-commit.txt
           jq -e '.conclusion=="success" and .name=="production-gates"' artifacts/baseline-run.json
           gh run download "$CANDIDATE" -n production-evidence -D "$RUNNER_TEMP/candidate"
           gh run download "$BASELINE" -n production-evidence -D "$RUNNER_TEMP/baseline"
