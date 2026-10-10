@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 /// checkpoint or delivery receipt.
 #[derive(Debug, Default)]
 pub struct IoDiagnostics {
+    pub input_quarantined: AtomicU64,
     pub durable_outbox_enabled: std::sync::atomic::AtomicBool,
     pub lookup_update_failed: AtomicU64,
     pub plugin_source_rows: AtomicU64,
@@ -320,6 +321,7 @@ impl IoDiagnostics {
 
     pub fn snapshot(&self) -> IoSnapshot {
         IoSnapshot {
+            input_quarantined: self.input_quarantined.load(Ordering::Relaxed),
             lookup_update_failed: self.lookup_update_failed.load(Ordering::Relaxed),
             plugin_source_rows: self.plugin_source_rows.load(Ordering::Relaxed),
             plugin_sink_rows: self.plugin_sink_rows.load(Ordering::Relaxed),
@@ -675,6 +677,7 @@ impl IoDiagnostics {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IoSnapshot {
+    pub input_quarantined: u64,
     pub lookup_update_failed: u64,
     pub plugin_source_rows: u64,
     pub plugin_sink_rows: u64,
@@ -965,6 +968,7 @@ impl std::fmt::Display for IoSnapshot {
 impl IoSnapshot {
     pub fn add_assign(&mut self, other: &IoSnapshot) {
         self.lookup_update_failed += other.lookup_update_failed;
+        self.input_quarantined += other.input_quarantined;
         self.plugin_source_rows += other.plugin_source_rows;
         self.plugin_sink_rows += other.plugin_sink_rows;
         self.plugin_polls += other.plugin_polls;

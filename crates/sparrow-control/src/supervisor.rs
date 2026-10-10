@@ -51,6 +51,7 @@ mod graph_time;
 mod graph_time_log;
 mod prepared_sink;
 mod outbox;
+mod input_recovery;
 
 /// Per-pipeline backoff, capped at 32 seconds; never sleep in converge.
 /// A successful launch is not a stable recovery: reset after 30s running.
@@ -1173,6 +1174,7 @@ impl Supervisor {
                 let demo = demo.clone();
                 move |s| {
                     let row = s.get_pipeline_revision(&name, revision)?;
+                    crate::recovery_ops::validate_start(s,&name,&row.spec)?;
                     let stream = s.get_stream(&row.spec.stream)?;
                     let schema = stream_to_schema(&stream)?;
                     let policy = store_policy(s, demo.as_ref())?;
@@ -1238,7 +1240,7 @@ impl Supervisor {
             self.start_graph(&spec, plan, &policy).await?
         } else { match spec.source.kind.as_str() {
             #[cfg(feature="jetstream")]
-            "jetstream" => self.start_jetstream(&spec,schema,plan,&policy).await?,
+            "jetstream" => self.start_jetstream(name,&spec,schema,plan,&policy).await?,
             "file" | "file_replay" | "replay" => {
                 self.start_file(name, &spec, schema, plan, recovery, &policy)
                     .await?
@@ -1853,7 +1855,7 @@ impl Supervisor {
 
     async fn start_file_aligned(
         &self,
-        _name: &str,
+        name: &str,
         spec: &crate::spec::PipelineSpec,
         schema: sparrow_model::Schema,
         plan: PhysicalPlan,
@@ -1861,6 +1863,7 @@ impl Supervisor {
         target_policy: &sparrow_connectors::TargetPolicy,
     ) -> Result<RunningJob> {
         crate::validate::validate_aligned_plan(spec, &plan)?;
+        let input_dlq=self.prepare_input_dlq(name,spec).await?;
         // Reference-dependent aligned recovery must resolve and materialize
         // the exact table revisions before touching checkpoint history.  The
         // no-reference path intentionally retains the old v3 behavior.
@@ -1900,6 +1903,7 @@ impl Supervisor {
         let contract = crate::validate::resolve_file_contract(spec, RecoveryPolicy::Aligned)?;
         cfg.contract = contract;
         let selected = spec.restore.clone();
+        let replay_start=spec.source.replay_start.clone();
         let restore_layout = layout.clone();
         let restore_policy = policy.clone();
         let max_keys = self.kernel.job_budget().max_state_keys;
@@ -2057,6 +2061,12 @@ impl Supervisor {
                 };
                 // Durable before Kernel/source activation. Fresh/reset gets a new
                 // random 128-bit identity; compatible recovery preserves its ID.
+                if let Some(replay)=replay_start {
+                    if restored_from.is_none() {source.seek(&replay.start.source())?;}
+                    if source.position().offset_bytes<replay.start.offset {return Err(SparrowError::new(sparrow_model::ErrorCode::UnsupportedRestore,"checkpoint precedes lineage start"));}
+                    source.set_replay_end(replay.end)?;
+                }
+                if let Some(queue)=input_dlq {source.set_quarantine(queue)?;}
                 store.activate_state_generation(state_generation)?;
                 let inventory = store.inventory()?;
                 Ok((

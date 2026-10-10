@@ -237,6 +237,7 @@ impl Store {
                 if size<0||size as usize>crate::spec::MAX_SPEC_BYTES {return Err(plugin_error("retained spec exceeds retirement bound"));}
                 let raw:String=row.get(1).map_err(db)?;
                 let spec:PipelineSpec=serde_json::from_str(&raw).map_err(|_|plugin_error("invalid retained spec"))?;
+                if spec.source.input_dlq.is_some() {return Err(plugin_error("input DLQ lineage/history must be retained; retirement is not an implicit purge"));}
                 if spec.sink.durable_outbox.is_some() {
                     let namespace:Option<String>=c.query_row("SELECT value FROM meta WHERE key='outbox_namespace'",[],|r|r.get(0)).optional().map_err(db)?;
                     let identity:Option<String>=c.query_row("SELECT value FROM meta WHERE key=?1",[format!("outbox_uuid:{name}")],|r|r.get(0)).optional().map_err(db)?;

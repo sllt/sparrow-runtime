@@ -62,7 +62,7 @@ pub(super) fn checkpoint_status(state: &AppState, name: &str) -> Value {
         };
         value["reliable_source"]["ack_basis"]=json!(ack_basis);
         value["restore_compatibility"] = json!(
-            "full_computation_and_source_reader_binding; semantic_fork_and_fixed_replay_rejected"
+            "full_computation_and_source_reader_binding; in_place_semantic_fork_rejected; explicit_new_lineage_via_recovery_operations"
         );
     }
     value["contract"] = json!({"missed_ticks":"skip","interval_is_rpo_guarantee":false,

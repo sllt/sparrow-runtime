@@ -68,6 +68,7 @@ fn drain(source: &mut FileReplaySource) -> usize {
     let mut rows = 0;
     loop {
         match source.poll_decoded().unwrap() {
+            FilePoll::Quarantined | FilePoll::QuarantineFull => panic!("quarantine is not configured for this feed fixture"),
             FilePoll::Row(_) => rows += 1,
             FilePoll::Pending => continue,
             FilePoll::DecodeError => {}

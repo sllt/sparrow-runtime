@@ -47,6 +47,7 @@ fn drain(src: &mut FileReplaySource) -> Vec<(Seen, SourcePosition)> {
     let mut out = Vec::new();
     loop {
         match src.poll_decoded().unwrap() {
+            FilePoll::Quarantined | FilePoll::QuarantineFull => panic!("CSV quarantine is not enabled"),
             FilePoll::Row(row) => out.push((Seen::Row(row.values), src.position())),
             FilePoll::DecodeError => out.push((Seen::Bad, src.position())),
             FilePoll::Pending => continue,

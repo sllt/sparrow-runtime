@@ -24,6 +24,8 @@ pub const CATALOG_SCHEMA_VERSION: u32 = 4;
 mod plugin_catalog;
 #[path = "store_reference_mutations.rs"]
 mod reference_mutations;
+#[path = "store_recovery.rs"]
+mod recovery_operations;
 pub const FORMAT_VERSION: u32 = 1;
 const AUDIT_CAP: usize = 200;
 const ATTEMPT_CAP: usize = 100;
@@ -117,6 +119,17 @@ pub struct AuditRow {
 }
 
 impl Store {
+    pub fn input_dlq_identity(&self,name:&str)->Result<Option<String>> {
+        self.read(|c|c.query_row("SELECT value FROM meta WHERE key=?1",[format!("input_dlq_uuid:{name}")],|r|r.get(0)).optional().map_err(db))
+    }
+    pub fn pin_input_dlq_identity(&self,name:&str,uuid:&str)->Result<()> {
+        self.write(|c| {
+            let key=format!("input_dlq_uuid:{name}");
+            c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?1,?2)",params![key,uuid]).map_err(db)?;
+            let saved:String=c.query_row("SELECT value FROM meta WHERE key=?1",[key],|r|r.get(0)).map_err(db)?;
+            if saved!=uuid {return Err(SparrowError::new(ErrorCode::CodecViolation,"input DLQ UUID differs from catalog"));}Ok(())
+        })
+    }
     pub fn outbox_identity(&self, name: &str) -> Result<Option<String>> {
         self.read(|c|c.query_row("SELECT value FROM meta WHERE key=?1",[format!("outbox_uuid:{name}")],|r|r.get(0)).optional().map_err(db))
     }
@@ -824,7 +837,7 @@ impl Store {
         spec: &PipelineSpec,
         expected_etag: Option<&str>,
     ) -> Result<PipelineRow> {
-        self.put_pipeline_with_activation(name, spec, expected_etag, false)
+        self.put_pipeline_with_activation(name, spec, expected_etag, false, None)
     }
 
     /// Restore publishes its configuration and desired revision atomically.
@@ -836,7 +849,7 @@ impl Store {
         spec: &PipelineSpec,
         expected_etag: Option<&str>,
     ) -> Result<PipelineRow> {
-        self.put_pipeline_with_activation(name, spec, expected_etag, true)
+        self.put_pipeline_with_activation(name, spec, expected_etag, true, None)
     }
 
     fn put_pipeline_with_activation(
@@ -845,10 +858,12 @@ impl Store {
         spec: &PipelineSpec,
         expected_etag: Option<&str>,
         activate: bool,
+        recovery_operation: Option<&str>,
     ) -> Result<PipelineRow> {
         check_name(name)?;
         let plugin_refs=plugin_catalog::references(spec)?;
         self.write(|c| {
+            recovery_operations::publication_guard(c,name,spec,recovery_operation)?;
             let current: Option<(u64, String)> = c
                 .query_row(
                     "SELECT latest_revision, etag FROM pipelines WHERE name=?1",
@@ -880,6 +895,14 @@ impl Store {
                 let raw:String=c.query_row("SELECT spec_json FROM pipeline_revisions WHERE name=?1 AND revision=?2",params![name,*revision as i64],|r|r.get(0)).map_err(db)?;
                 let old:PipelineSpec=serde_json::from_str(&raw).map_err(|_|SparrowError::new(ErrorCode::CodecViolation,"stored pipeline spec"))?;
                 crate::outbox::check_update(&old,spec)?;
+                crate::input_dlq::check_update(&old,spec)?;
+                if old.source.replay_start!=spec.source.replay_start {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"lineage replay anchor is immutable"));}
+                if old.source.replay_start.is_some() {
+                    let mut compatible=old.clone();compatible.checkpoint=spec.checkpoint.clone();
+                    if compatible!=*spec || !spec.checkpoint.as_ref().is_some_and(|p|p.resume_latest) {
+                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"managed replay keeps computation, source, sink and checkpoint binding immutable; use a new recovery operation for semantic changes or rewind"));
+                    }
+                }
             }
             if let Some(config)=&spec.sink.durable_outbox {
                 config.validate()?;
@@ -950,6 +973,7 @@ impl Store {
             )
             .map_err(db)?;
             if activate {Self::start_revision(c,name,next)?;}
+            if let Some(operation)=recovery_operation {recovery_operations::publication_finished(c,operation,next,spec)?;}
             Ok(PipelineRow {
                 name: name.to_string(),
                 latest_revision: next,
@@ -2663,6 +2687,8 @@ mod tests {
             sql: Some("SELECT device_id FROM sensors".into()),
             graph: None,
             source: SourceSpec {
+                input_dlq: None,
+                replay_start: None,
                 plugin: None,
                 jetstream: None,
                 http_poll: None,

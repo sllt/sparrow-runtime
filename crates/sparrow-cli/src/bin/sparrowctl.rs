@@ -115,6 +115,27 @@ fn parse(args: &[String]) -> Result<Command> {
     }
     let mut query=Vec::new();
     let (method, segments, body) = match positional.as_slice() {
+        ["recovery-preview",id,file] | ["recovery-execute",id,file] => {
+            let action=if positional[0]=="recovery-preview"{"preview"}else{"execute"};
+            (Method::POST,vec!["pipelines".into(),name(id)?,"recovery".into(),action.into()],Some(read_input(file)?))
+        },
+        ["recovery-operations",id] => (Method::GET,vec!["pipelines".into(),name(id)?,"recovery".into(),"operations".into()],None),
+        ["recovery-operation",id,operation] => (Method::GET,vec!["pipelines".into(),name(id)?,"recovery".into(),"operations".into(),name(operation)?],None),
+        ["recovery-finish",id,operation] => (Method::POST,vec!["pipelines".into(),name(id)?,"recovery".into(),"operations".into(),name(operation)?,"finish".into()],Some(json!({}))),
+        ["recovery-abort",id,operation,file] => (Method::POST,vec!["pipelines".into(),name(id)?,"recovery".into(),"operations".into(),name(operation)?,"abort".into()],Some(read_input(file)?)),
+        ["input-dlq",id] => (Method::GET,vec!["pipelines".into(),name(id)?,"input-dlq".into()],None),
+        ["input-dlq-entry",id,position] => {
+            position.parse::<u64>().map_err(|_|"invalid position")?;
+            (Method::GET,vec!["pipelines".into(),name(id)?,"input-dlq".into(),"entries".into(),position.to_string()],None)
+        },
+        ["input-dlq-entries",id,after,limit] => {
+            let after=after.parse::<u64>().map_err(|_|"invalid cursor")?;
+            let limit=limit.parse::<usize>().map_err(|_|"invalid limit")?;
+            if after>i64::MAX as u64 || !(1..=100).contains(&limit) {return Err("cursor or limit out of bounds".into());}
+            query=vec![("after".into(),after.to_string()),("limit".into(),limit.to_string())];
+            (Method::GET,vec!["pipelines".into(),name(id)?,"input-dlq".into(),"entries".into()],None)
+        },
+        ["input-dlq-purge",id,file] => (Method::POST,vec!["pipelines".into(),name(id)?,"input-dlq".into(),"purge".into()],Some(read_input(file)?)),
         ["outbox",id] => (Method::GET,vec!["pipelines".into(),name(id)?,"outbox".into()],None),
         ["outbox-entry",id,entry] => (Method::GET,vec!["pipelines".into(),name(id)?,"outbox".into(),"entries".into(),name(entry)?],None),
         ["outbox-entries",id,state,after,limit] => {
@@ -337,6 +358,11 @@ commands: health | capabilities | streams | pipelines\n\
   status NAME | diagnose NAME [--output NEW_FILE] | checkpoints NAME\n\
   outbox NAME | outbox-entries NAME pending|dlq|blocked AFTER LIMIT\n\
   outbox-entry NAME UUID-SEQUENCE | outbox-command NAME COMMAND_JSON\n\
+  input-dlq NAME | input-dlq-entries NAME AFTER LIMIT\n\
+  input-dlq-entry NAME POSITION | input-dlq-purge NAME COMMAND_JSON\n\
+  recovery-preview NAME REQUEST_JSON | recovery-execute NAME REQUEST_JSON\n\
+  recovery-operations NAME | recovery-operation NAME OPERATION\n\
+  recovery-finish NAME OPERATION | recovery-abort NAME OPERATION REASON_JSON\n\
   start NAME [--revision N] | stop NAME | kill NAME\n\
   checkpoint NAME | restore NAME [--snapshot-id N]\n\
 options: --url ORIGIN (or SPARROW_URL), --timeout-ms 100..125000, --allow-insecure-http\n\

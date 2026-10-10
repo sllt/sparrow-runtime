@@ -90,7 +90,7 @@ sparrowctl outbox-command telemetry command.json
 
 必须把 **catalog + checkpoint + outbox 目录** 作为同一离线备份集：正常停止 Server，确认进程/sender 退出后复制完整目录，保存匹配的二进制、配置和凭据。不能只还原 checkpoint、只回滚 catalog 或在线复制 SQLite 主文件。UUID 校验无法区分同一 UUID 的旧副本，仍须保证备份集一致。回退旧版本应使用启用前的完整备份，不能消费当前恢复点。
 
-本批交付 **HTTP outbox + 输出侧 DLQ + 对应运维操作**，不包含输入毒消息 DLQ、通用状态迁移、多 Sink 原子提交、其他 connector 的持久 outbox，以及另一子批的新窗口恢复。
+本批交付 **HTTP outbox + 输出侧 DLQ + 对应运维操作**。后续的输入 DLQ、兼容续跑和显式新 lineage 重放工作流见 [RECOVERY_OPERATIONS](RECOVERY_OPERATIONS.md)；不是通用快照转换。多 Sink 原子提交、其他 connector 的持久 outbox，以及另一子批的新窗口恢复不由本合同覆盖。
 
 针对性测试为 `crates/sparrow-control/src/outbox_tests.rs` 和 `tests/durable-output-process/main.go`。后者各跑一次真实 File/JetStream → Count → HTTP，覆盖远端失败时 checkpoint/来源 ACK、SIGKILL 后续投、重试状态、DLQ 重放/清除和实际 Server/CLI。没有 20 轮重复矩阵，也不把 SIGKILL 等同掉电/长稳认证。
 
