@@ -77,6 +77,7 @@ fn ext_review_legacy_prepared_encoder_refuses_codec3_even_for_empty_state() {
             bytes,
             lease,
             ext: true,
+            buffered: false,
         };
         let result = CheckpointSnapshot::encode_frozen(1, &source, 2, &layout, None, encoded);
         let error = match result {

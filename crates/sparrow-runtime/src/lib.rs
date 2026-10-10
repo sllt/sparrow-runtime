@@ -22,7 +22,7 @@ pub use resample_iot::ResampleStats;
 #[cfg(test)]
 mod analysis_tests;
 mod bounded_join;
-mod buffered_window;
+pub mod buffered_window;
 pub mod external_lookup;
 #[cfg(test)]
 mod external_lookup_tests;
@@ -49,9 +49,12 @@ pub mod window;
 #[cfg(test)]
 mod window_completion_tests;
 pub use iot::{IotFreeze, IotOperator};
+pub use buffered_window::{BufferedFreeze, BufferedGroupFreeze};
 pub use pipeline_checkpoint::{
     sink_snapshot_version_for, snapshot_version_for, PipelineSnapshot,
     EXT_AGG_FILE_SNAPSHOT_VERSION, EXT_AGG_RELIABLE_SNAPSHOT_VERSION,
+    SLIDING_COUNT_FILE_SNAPSHOT_VERSION, SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION,
+    BUFFERED_ET_FILE_SNAPSHOT_VERSION, PT_WINDOW_FILE_SNAPSHOT_VERSION, PT_WINDOW_RELIABLE_SNAPSHOT_VERSION,
 };
 #[cfg(test)]
 mod sink_checkpoint_tests;

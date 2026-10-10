@@ -128,7 +128,7 @@ fn kernel() -> Kernel {
 fn aligned_job(plan: Arc<CheckpointPlan>, restored: bool, acks: AlignedAcks) -> AlignedJob {
     AlignedJob {
         restore: None,
-        pipeline: Some(PipelineRestore {
+        pipeline: Some(PipelineRestore { buffered: Vec::new(),
             sink: None,
             plan,
             generation: [0x42; 16],

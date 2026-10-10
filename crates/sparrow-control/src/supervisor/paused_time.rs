@@ -227,9 +227,10 @@ impl Supervisor {
                 return Err(e);
             }
         }
-        let (restore, iot) = snapshot
-            .map(|s| (Some(s.windows), s.iot))
-            .unwrap_or((None, Vec::new()));
+        // v34/v35 PT sliding/session restore their codec 4 frames here too.
+        let (restore, iot, buffered) = snapshot
+            .map(|s| (Some(s.windows), s.iot, s.buffered))
+            .unwrap_or((None, Vec::new(), Vec::new()));
         let (tx, rx) = observed::channel(spec.source.inbox_capacity.max(1));
         let (tx_out, rx_out) = observed::channel(spec.sink.outbox_capacity.max(1));
         let outbox = Arc::new(InflightCounter::new());
@@ -248,7 +249,7 @@ impl Supervisor {
             )))
             .with_aligned(AlignedJob {
                 restore: None,
-                pipeline: Some(PipelineRestore {
+                pipeline: Some(PipelineRestore { buffered,
                     sink: None,
                     plan: manifest.clone(),
                     generation,

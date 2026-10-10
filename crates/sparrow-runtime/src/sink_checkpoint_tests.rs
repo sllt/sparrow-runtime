@@ -697,7 +697,7 @@ fn kernel_rejects_v27_memory_paths_missing_admission_cursor_and_saved_semantic_c
             .with_live_out(outgoing)
             .with_aligned(AlignedJob {
                 restore: None,
-                pipeline: Some(PipelineRestore {
+                pipeline: Some(PipelineRestore { buffered: Vec::new(),
                     plan: saved,
                     generation: [7; 16],
                     restore: Some(vec![]),
@@ -755,7 +755,7 @@ fn runtime_aligned_independently_rejects_saved_plan_target_and_foreign_owner() {
         };
         let job = AlignedJob {
             restore: None,
-            pipeline: Some(PipelineRestore {
+            pipeline: Some(PipelineRestore { buffered: Vec::new(),
                 plan: saved.clone(),
                 generation: [7; 16],
                 restore: Some(vec![]),
@@ -800,7 +800,7 @@ fn admitted_v27_kernel_barrier_and_owner_lifetime_use_existing_puback_receipts()
                     .with_live_out(outgoing)
                     .with_aligned(AlignedJob {
                         restore: None,
-                        pipeline: Some(PipelineRestore {
+                        pipeline: Some(PipelineRestore { buffered: Vec::new(),
                             plan: manifest.clone(),
                             generation: [7; 16],
                             restore: None,

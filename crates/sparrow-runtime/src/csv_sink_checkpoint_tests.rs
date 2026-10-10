@@ -297,7 +297,7 @@ fn v28_binds_each_encode_option_and_full_output_semantics_at_both_checks() {
                 .code,
             ErrorCode::UnsupportedRestore
         );
-        let restored = PipelineRestore {
+        let restored = PipelineRestore { buffered: Vec::new(),
             plan: manifest.clone(),
             generation: [7; 16],
             restore: Some(vec![]),
@@ -320,7 +320,7 @@ fn v28_binds_each_encode_option_and_full_output_semantics_at_both_checks() {
     assert!(snapshot
         .check_compatible_with_sink(&changed, &target)
         .is_err());
-    let restored = PipelineRestore {
+    let restored = PipelineRestore { buffered: Vec::new(),
         plan: manifest,
         generation: [7; 16],
         restore: Some(vec![]),
@@ -340,7 +340,7 @@ fn v28_identity_credit_covers_csv_capacity_and_shares_the_exact_owner() {
     assert_eq!(owner.usage().physical_bytes, baseline);
     let other = MemoryOwner::new(ResourceBudget::compact());
     assert!(!target.belongs_to(&other));
-    let restored = PipelineRestore {
+    let restored = PipelineRestore { buffered: Vec::new(),
         plan: Arc::new(CheckpointPlan::from_physical(&plan(true)).unwrap()),
         generation: [7; 16],
         restore: Some(vec![]),

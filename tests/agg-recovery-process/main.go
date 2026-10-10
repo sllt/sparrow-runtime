@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,7 +119,13 @@ func row(i int, shape string) input {
 	// Dyadic inputs isolate checkpoint fidelity from cross-parser JSON
 	// rounding differences without changing production parsing semantics.
 	r := input{Device: fmt.Sprintf("d%d", i%2), X: float64(i)*0.375 - 2.0, Ts: int64(i)*100 + 50}
-	if shape != "count" {
+	if isETBuffered(shape) {
+		// v33: three interleaved keys, out-of-order (late) rows, equal-gap
+		// merges and max_duration caps; same fixture as buffered_et_tests.
+		jitter := []int64{0, -1700, 300, -400, 0, -2600, 900}
+		r.Device = fmt.Sprintf("d%d", (i+i/4)%3)
+		r.Ts = max(int64(i)*1000+jitter[i%7], 0)
+	} else if shape != "count" && shape != "slide" {
 		r.Device = "d0"
 	}
 	if i%4 != 0 {
@@ -172,6 +179,7 @@ type expected struct {
 	F, L   *int64
 	Vp, Vs *float64
 	Sp, Ss *float64
+	Win    string // sliding count: "start|end" (empty for other shapes)
 }
 
 func moment(a *acc, sample, sqrt bool) *float64 {
@@ -205,7 +213,7 @@ func moment(a *acc, sample, sqrt bool) *float64 {
 	return &v
 }
 func finish(key string, a *acc) expected {
-	return expected{key, a.c, a.f, a.l, moment(a, false, false), moment(a, true, false), moment(a, false, true), moment(a, true, true)}
+	return expected{key, a.c, a.f, a.l, moment(a, false, false), moment(a, true, false), moment(a, false, true), moment(a, true, true), ""}
 }
 
 // oracle: full uninterrupted output for rows 1..n. Count: per key every 3rd
@@ -228,6 +236,42 @@ func oracle(shape string, n int) []expected {
 				keys[r.Device] = &acc{}
 			}
 		}
+		return out
+	}
+	if shape == "slide" {
+		// COUNT_WINDOW(3, 2): per key keep the last 3 raw rows; on the n-th
+		// arrival with n >= 3 and n % 2 == 0 emit [n-3, n) over those rows.
+		type ring struct {
+			n    int
+			rows []input
+		}
+		keys := map[string]*ring{}
+		for i := 1; i <= n; i++ {
+			r := row(i, shape)
+			k := keys[r.Device]
+			if k == nil {
+				k = &ring{}
+				keys[r.Device] = k
+			}
+			k.n++
+			k.rows = append(k.rows, r)
+			if len(k.rows) > 3 {
+				k.rows = k.rows[1:]
+			}
+			if k.n >= 3 && k.n%2 == 0 {
+				a := &acc{}
+				for _, x := range k.rows {
+					a.add(x)
+				}
+				e := finish(r.Device, a)
+				e.Win = fmt.Sprintf("%d|%d", k.n-3, k.n)
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+	if isETBuffered(shape) {
+		out, _ := etSim(shape, n)
 		return out
 	}
 	if shape == "hop" {
@@ -291,8 +335,173 @@ func floatText(v *float64) string {
 	}
 	return fmt.Sprintf("%016x", math.Float64bits(*v))
 }
+
+// ---------------------------------------------------- v33 ET sliding/session
+
+const (
+	sessGap   = 3500 // SESSION(ts, 3500, 7000)
+	sessMax   = 7000
+	slideSize = 4000 // SLIDING(ts, 4000, 700)
+	slideDel  = 700
+)
+
+func isETBuffered(shape string) bool { return shape == "sess" || shape == "etslide" }
+
+type etEvent struct {
+	ts  int64
+	seq int
+	r   input
+}
+
+// etInfo describes the operator state right after row i (index i-1).
+type etInfo struct {
+	late, merged bool
+	open         int   // keys with retained events
+	minGap       int64 // smallest (output deadline - watermark) over open keys
+}
+
+func sessionEnd(ev []etEvent) int64 {
+	first := ev[0].ts
+	end := min(first+sessGap, first+sessMax)
+	for _, e := range ev {
+		if e.ts >= end {
+			break
+		}
+		end = min(e.ts+sessGap, first+sessMax)
+	}
+	return end
+}
+
+// etSim is an independent simulation of linear ET sliding/session with
+// out_of_orderness 0: the watermark is the max accepted event time, a row
+// older than it is late (dropped), and after every accepted row all windows
+// whose end <= watermark close in (end, key) order. No EOF is ever seen on
+// an append-only File, so open windows at the end never emit.
+func etSim(shape string, n int) ([]expected, []etInfo) {
+	var out []expected
+	var info []etInfo
+	wm := int64(-1)
+	seq := map[string]int{}
+	events := map[string][]etEvent{}
+	type trig struct {
+		end int64
+		key string
+		ts  int64
+		seq int
+	}
+	var pending []trig
+	emit := func(key string, start, end int64, ev []etEvent) {
+		sort.Slice(ev, func(a, b int) bool { return ev[a].ts < ev[b].ts || (ev[a].ts == ev[b].ts && ev[a].seq < ev[b].seq) })
+		a := &acc{}
+		for _, e := range ev {
+			a.add(e.r)
+		}
+		x := finish(key, a)
+		x.Win = fmt.Sprintf("%d|%d", start, end)
+		out = append(out, x)
+	}
+	for i := 1; i <= n; i++ {
+		r := row(i, shape)
+		in := etInfo{minGap: math.MaxInt64}
+		if wm >= 0 && r.Ts < wm {
+			in.late = true
+		} else {
+			if ev := events[r.Device]; shape == "sess" && len(ev) > 0 && r.Ts < sessionEnd(ev) && r.Ts >= ev[0].ts {
+				in.merged = true
+			}
+			seq[r.Device]++
+			ev := append(events[r.Device], etEvent{r.Ts, seq[r.Device], r})
+			sort.SliceStable(ev, func(a, b int) bool { return ev[a].ts < ev[b].ts })
+			events[r.Device] = ev
+			if shape == "etslide" {
+				pending = append(pending, trig{r.Ts + slideDel + 1, r.Device, r.Ts, seq[r.Device]})
+			}
+			wm = max(wm, r.Ts)
+			if shape == "etslide" {
+				sort.Slice(pending, func(a, b int) bool {
+					x, y := pending[a], pending[b]
+					if x.end != y.end {
+						return x.end < y.end
+					}
+					if x.key != y.key {
+						return x.key < y.key
+					}
+					return x.ts < y.ts || (x.ts == y.ts && x.seq < y.seq)
+				})
+				var keep []trig
+				for _, t := range pending {
+					if t.end > wm {
+						keep = append(keep, t)
+						continue
+					}
+					start := t.ts - slideSize + 1
+					var w []etEvent
+					for _, e := range events[t.key] {
+						if e.ts >= start && e.ts < t.end {
+							w = append(w, e)
+						}
+					}
+					emit(t.key, start, t.end, w)
+				}
+				pending = keep
+			} else {
+				for {
+					bestKey, bestEnd := "", int64(math.MaxInt64)
+					for k, ev := range events {
+						if len(ev) == 0 {
+							continue
+						}
+						if e := sessionEnd(ev); e <= wm && (e < bestEnd || (e == bestEnd && k < bestKey)) {
+							bestKey, bestEnd = k, e
+						}
+					}
+					if bestKey == "" {
+						break
+					}
+					ev := events[bestKey]
+					var closed, rest []etEvent
+					for _, e := range ev {
+						if e.ts < bestEnd {
+							closed = append(closed, e)
+						} else {
+							rest = append(rest, e)
+						}
+					}
+					events[bestKey] = rest
+					emit(bestKey, closed[0].ts, bestEnd, closed)
+				}
+			}
+		}
+		for k, ev := range events {
+			if len(ev) == 0 {
+				continue
+			}
+			deadline := int64(math.MaxInt64)
+			if shape == "sess" {
+				deadline = sessionEnd(ev)
+			} else {
+				for _, t := range pending {
+					if t.key == k && t.end < deadline {
+						deadline = t.end
+					}
+				}
+			}
+			in.open++
+			if deadline != math.MaxInt64 && deadline-wm < in.minGap {
+				in.minGap = deadline - wm
+			}
+		}
+		info = append(info, in)
+	}
+	return out, info
+}
+
 func (e expected) text() string {
-	return strings.Join([]string{e.Device, strconv.FormatInt(e.C, 10), intText(e.F), intText(e.L), floatText(e.Vp), floatText(e.Vs), floatText(e.Sp), floatText(e.Ss)}, "|")
+	parts := []string{e.Device, strconv.FormatInt(e.C, 10), intText(e.F), intText(e.L), floatText(e.Vp), floatText(e.Vs), floatText(e.Sp), floatText(e.Ss)}
+	if e.Win != "" {
+		parts = append(parts, e.Win)
+	}
+	return strings.Join(parts, "|")
 }
 
 // render one received payload with the same canonical text (exact float bits).
@@ -317,7 +526,14 @@ func render(data map[string]any) string {
 		return fmt.Sprintf("%016x", math.Float64bits(x))
 	}
 	d, _ := data["device_id"].(string)
-	return strings.Join([]string{d, i("c"), i("f"), i("l"), f("vp"), f("vs"), f("sp"), f("ss")}, "|")
+	parts := []string{d, i("c"), i("f"), i("l"), f("vp"), f("vs"), f("sp"), f("ss")}
+	if _, ok := data["count_start"]; ok {
+		parts = append(parts, i("count_start")+"|"+i("count_end"))
+	}
+	if _, ok := data["window_start"]; ok {
+		parts = append(parts, i("window_start")+"|"+i("window_end"))
+	}
+	return strings.Join(parts, "|")
 }
 
 // ------------------------------------------------------------------ fixtures
@@ -621,6 +837,9 @@ func aggs() []any {
 }
 func graph(shape string, ext bool) map[string]any {
 	window := map[string]any{"kind": "count", "size": 3}
+	if shape == "slide" {
+		window = map[string]any{"kind": "sliding_count", "size": 3, "step": 2}
+	}
 	source := map[string]any{"id": 1, "kind": "memory_source", "table": "sensors", "out": []int{10}}
 	node := map[string]any{"id": 10, "kind": "window_agg", "keys": []string{"device_id"}, "out": []int{20}}
 	node["window"] = window
@@ -719,17 +938,22 @@ func (v *env) spec(source, shape string, ext bool) map[string]any {
 		"sink":     map[string]any{"kind": "http", "url": fmt.Sprintf("http://127.0.0.1:%d/output", v.sink.port()), "batch_rows": 8, "linger_ms": 2},
 		"recovery": "aligned", "checkpoint_dir": v.checkpoint,
 		"checkpoint": map[string]any{"interval_ms": 86400000, "timeout_ms": 3000, "resume_latest": true}}
-	if shape == "count" {
+	if shape == "count" || shape == "slide" {
 		spec["graph"] = graph(shape, ext)
 	} else {
 		// Event-time windows go through the SQL front end (single-source
 		// linear graphs with an event-time source binding are DAG-only).
 		require(ext, "plain ET spec not used")
-		window := "TUMBLE(ts, 300)"
-		if shape == "hop" {
+		window, bounds := "TUMBLE(ts, 300)", ""
+		switch shape {
+		case "hop":
 			window = "HOP(ts, 300, 600)" // slide 300us, size 600us, lateness 0
+		case "sess":
+			window, bounds = fmt.Sprintf("SESSION(ts, %d, %d)", sessGap, sessMax), "window_start, window_end, "
+		case "etslide":
+			window, bounds = fmt.Sprintf("SLIDING(ts, %d, %d)", slideSize, slideDel), "window_start, window_end, "
 		}
-		spec["sql"] = "SELECT device_id, COUNT(*) AS c, FIRST(v) AS f, LAST(v) AS l, VAR_POP(x) AS vp, VAR_SAMP(x) AS vs, " +
+		spec["sql"] = "SELECT device_id, " + bounds + "COUNT(*) AS c, FIRST(v) AS f, LAST(v) AS l, VAR_POP(x) AS vp, VAR_SAMP(x) AS vs, " +
 			"STDDEV_POP(x) AS sp, STDDEV_SAMP(x) AS ss FROM sensors GROUP BY device_id, " + window
 	}
 	if source == "jetstream" {
@@ -838,7 +1062,27 @@ func decode(raw []byte, reliable bool) (string, string) {
 // committed checkpoint C1; P2 depends on the cut; then SIGKILL; restart and
 // append to N=36; final commit.
 func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
-	const n, p1 = 36, 12
+	const n = 36
+	p1 := 12
+	if isETBuffered(shape) {
+		p1 = 13 // the next row (14) completes no ET window: room for input_after
+	}
+	// Sliding count state-shape cuts: C1 itself is the cut (killed after
+	// commit, no phase 2). empty: no input; not_full: every key has 2 < size
+	// arrivals and nothing was emitted; at_boundary: every key is exactly at
+	// a trigger (n=4, output just emitted, the 3 retained rows still needed).
+	stateCut := cut == "empty" || cut == "not_full" || cut == "at_boundary" ||
+		cut == "about_to_close" || cut == "ooo_merged" || cut == "no_new_input"
+	switch cut {
+	case "empty":
+		p1 = 0
+	case "not_full":
+		p1 = 4
+	case "at_boundary":
+		p1 = 8
+	case "about_to_close", "ooo_merged":
+		p1 = etStateCut(shape, cut)
+	}
 	reliable := source == "jetstream"
 	v := setup(root, source, serverBin, natsBin)
 	defer v.close()
@@ -863,23 +1107,41 @@ func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
 	v.publish(1, p1, shape)
 	eventually("phase-1 outputs", func() bool { return v.sink.count() == outputsAt(p1) })
 	eventually("phase-1 input applied", func() bool {
-		return number(v.status(), "observation", "runtime_progress", "ingested_rows") == p1
+		return number(v.status(), "observation", "runtime_progress", "ingested_rows") == float64(p1)
 	})
 	v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
 	expectVersion := 29
 	if reliable {
 		expectVersion = 30
 	}
+	if shape == "slide" {
+		expectVersion += 2
+	}
+	if isETBuffered(shape) {
+		expectVersion = 33
+	}
 	require(snapshotVersion(v.checkpoint) == expectVersion, fmt.Sprintf("CURRENT outer version want %d", expectVersion))
 	c1 := hash(filepath.Join(v.checkpoint, "CURRENT"))
 	committedRows := p1
 	p2 := 18
+	if stateCut {
+		p2 = p1
+		switch cut {
+		case "not_full":
+			require(outputsAt(p1) == 0, "not_full cut must precede every output")
+		case "at_boundary":
+			require(outputsAt(p1) == 2 && outputsAt(p1-1) == 1, "at_boundary must sit exactly on a trigger")
+		}
+	}
 	if cut == "input_after" {
 		// Rows applied to window state, no window completes: Count +2 rows
 		// per key (one short of 3); ET/HOP ts 1450 < next end 1500.
 		p2 = 16
 		if shape != "count" {
-			p2 = 14
+			p2 = 14 // ET/HOP: ts 1450 < next end; slide: each key at n=7 (odd)
+		}
+		if isETBuffered(shape) {
+			p2 = etInputAfter(shape, p1)
 		}
 		require(outputsAt(p2) == outputsAt(p1), "input_after must not complete a window")
 	}
@@ -913,7 +1175,8 @@ func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
 		oldReader = v.readerName()
 	}
 	switch cut {
-	case "input_after", "output_after", "output_inflight", "restore_kill":
+	case "input_after", "output_after", "output_inflight", "restore_kill", "empty", "not_full", "at_boundary", "low_budget",
+		"about_to_close", "ooo_merged", "no_new_input":
 		require(hash(currentPath) == c1, "no commit expected before this cut")
 	case "commit_before":
 		must(os.Mkdir(filepath.Join(v.checkpoint, "CURRENT.tmp"), 0700))
@@ -1001,8 +1264,38 @@ func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
 		require(hash(currentPath) == currentBeforeKill, "SIGKILL during restore changed CURRENT")
 		checkBroker("broker_after_restore_kill")
 	}
+	if cut == "low_budget" {
+		// Real reservation pressure on the restoring Job owner: owned restore
+		// must refuse (restore_credit), refund, leave CURRENT and outputs alone.
+		v.arm("restore_pressure", "1024")
+		v.start(serverBin)
+		_, code := v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
+		st := v.refused("low-budget restore", "")
+		detail["low_budget_start_code"] = code
+		detail["low_budget_status"] = st
+		_, e := os.Stat(filepath.Join(v.faults, "restore_pressure.reached"))
+		require(e == nil, "restore pressure hook did not engage")
+		require(v.sink.count() == preKill, "output emitted by refused low-budget restore")
+		require(hash(currentPath) == currentBeforeKill, "refused low-budget restore changed CURRENT")
+		metrics := v.a.ok("GET", "/v1/metrics", nil)
+		detail["low_budget_metrics"] = metrics
+		v.server.stop(syscall.SIGKILL)
+		v.disarm("restore_pressure")
+		checkBroker("broker_after_low_budget")
+	}
 	v.start(serverBin)
 	v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
+	if cut == "no_new_input" {
+		// No input after restore. A committed checkpoint barrier has passed
+		// the window stage after restore, so any timer due at the restored
+		// watermark would already have been emitted: linear File has no idle
+		// generator and ET windows close only on a new event or EOF.
+		eventually("restored job running", func() bool { return nested(v.status(), "actual", "status") == "running" })
+		v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
+		require(v.sink.count() == preKill, "restore without new input emitted output")
+		require(snapshotVersion(v.checkpoint) == expectVersion, "post-restore CURRENT outer version")
+		detail["post_restore_commit"] = currentName(v.checkpoint)
+	}
 	if reliable {
 		eventually("restore committed cut", func() bool {
 			return number(v.status(), "checkpoint", "reliable_source", "restored_cut") == float64(committedRows)
@@ -1098,6 +1391,41 @@ func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
 		"scope": "isolated_process_sigkill_not_power_loss"}
 	save(filepath.Join(root, "summary.json"), summary)
 	return summary
+}
+
+// etStateCut picks C1 for the v33 state cuts from the independent simulation.
+// about_to_close: >= 2 keys open, an output deadline within 1500us of the
+// watermark, and the very next row closes a window. ooo_merged (session): the
+// row merged into the open session and the next row is an out-of-order
+// bridge attempt that must stay late after restore.
+func etStateCut(shape, cut string) int {
+	_, info := etSim(shape, 36)
+	for k := 3; k < 30; k++ {
+		in := info[k-1]
+		switch cut {
+		case "about_to_close":
+			if in.open >= 2 && in.minGap <= 1500 && len(oracle(shape, k+1)) > len(oracle(shape, k)) {
+				return k
+			}
+		case "ooo_merged":
+			if shape == "sess" && in.merged && info[k].late {
+				return k
+			}
+		}
+	}
+	panic("no " + cut + " cut in the fixture for " + shape)
+}
+
+// etInputAfter: the last row after p1 (<= 18) before the next output, so the
+// applied rows change window state without completing a window.
+func etInputAfter(shape string, p1 int) int {
+	at := len(oracle(shape, p1))
+	p2 := 0
+	for k := p1 + 1; k <= 18 && len(oracle(shape, k)) == at; k++ {
+		p2 = k
+	}
+	require(p2 > p1, "no input_after cut for "+shape)
+	return p2
 }
 
 // refused waits (no fixed sleep) until the start attempt is held as failed
@@ -1229,13 +1557,272 @@ func compat(root, serverBin, oldBin string) map[string]any {
 	return result
 }
 
+// compatSlide: v31 (sliding count) against older binaries and neighbouring
+// profiles. old = pre-v29 (424cf95), prev = #29 (v29/v30, pre-v31). Nothing
+// refused may change CURRENT or emit output.
+func compatSlide(root, serverBin, oldBin, prevBin string) map[string]any {
+	v := setup(root, "file", serverBin, "")
+	defer v.close()
+	defer v.captureFailure()
+	result := map[string]any{}
+	cur := func() string { return hash(filepath.Join(v.checkpoint, "CURRENT")) }
+	// (1) New binary writes a v31 directory.
+	v.start(serverBin)
+	v.register()
+	slide := v.spec("file", "slide", true)
+	v.a.ok("PUT", "/v1/pipelines/check", slide)
+	v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
+	v.publish(1, 12, "slide")
+	eventually("v31 outputs", func() bool { return v.sink.count() == len(oracle("slide", 12)) })
+	eventually("v31 applied", func() bool { return number(v.status(), "observation", "runtime_progress", "ingested_rows") == 12 })
+	v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
+	require(snapshotVersion(v.checkpoint) == 31, "v31 expected")
+	v31Current := cur()
+	v.server.stop(syscall.SIGTERM)
+	outputs := v.sink.count()
+	// (2) Older binaries on the same catalog + v31 directory refuse, and
+	// refuse the sliding-count aligned spec on a fresh directory.
+	for label, bin := range map[string]string{"old_424cf95": oldBin, "prev_29": prevBin} {
+		if bin == "" {
+			continue
+		}
+		v.start(bin)
+		resp, code := v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
+		st := v.refused(label+" on v31", "")
+		result[label+"_on_v31"] = map[string]any{"start_code": code, "start": resp, "status": st, "binary_sha256": hash(bin)}
+		require(cur() == v31Current, label+" changed v31 CURRENT")
+		require(v.sink.count() == outputs, label+" produced output from v31 history")
+		fresh := v.spec("file", "slide", true)
+		fresh["checkpoint_dir"] = filepath.Join(root, label+"-fresh")
+		_, vcode := v.a.call("POST", "/v1/validate", fresh)
+		result[label+"_validate_slide_code"] = vcode
+		require(vcode >= 400, label+" accepted sliding-count aligned spec")
+		_, e := os.Stat(fresh["checkpoint_dir"].(string))
+		require(os.IsNotExist(e), label+" created a checkpoint directory for a refused spec")
+		v.server.stop(syscall.SIGTERM)
+	}
+	// (3) #29 binary writes a v29 directory; the new binary keeps it v29.
+	if prevBin != "" {
+		v.checkpoint = filepath.Join(root, "checkpoint-v29")
+		ext := v.spec("file", "count", true)
+		v.start(prevBin)
+		_, _ = v.a.call("POST", "/v1/pipelines/check/stop", map[string]any{})
+		v.a.ok("PUT", "/v1/pipelines/check", ext)
+		v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
+		before := v.sink.count()
+		eventually("prev v29 outputs", func() bool { return v.sink.count() == before+len(oracle("count", 12)) })
+		eventually("prev applied", func() bool { return number(v.status(), "observation", "runtime_progress", "ingested_rows") == 12 })
+		v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
+		require(snapshotVersion(v.checkpoint) == 29, "#29 binary should write v29")
+		v.server.stop(syscall.SIGKILL)
+		// New binary: sliding-count plan on the v29 directory is refused.
+		v.start(serverBin)
+		v.a.ok("PUT", "/v1/pipelines/check", v.spec("file", "slide", true))
+		v29Current := cur()
+		before = v.sink.count()
+		_, code := v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
+		result["slide_on_v29"] = map[string]any{"start_code": code, "status": v.refused("slide plan on v29", "profile mismatch")}
+		require(cur() == v29Current && v.sink.count() == before, "slide-on-v29 refusal changed state")
+		// The original v29 plan continues on the new binary and stays v29.
+		v.a.ok("PUT", "/v1/pipelines/check", ext)
+		v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
+		v.publish(13, 18, "slide")
+		eventually("v29 continues on new binary", func() bool { return v.sink.count() >= before+2 })
+		v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
+		require(snapshotVersion(v.checkpoint) == 29, "new binary must keep writing v29 for the v29 profile")
+		v.a.ok("POST", "/v1/pipelines/check/stop", map[string]any{})
+		v.server.stop(syscall.SIGTERM)
+		result["v29_dir_continued_by_new_binary"] = true
+	}
+	// (4) New binary on the v31 directory: neighbouring profiles and changed
+	// sliding-count parameters (old params vs new) are refused.
+	v.checkpoint = filepath.Join(root, "checkpoint")
+	v.start(serverBin)
+	_, _ = v.a.call("POST", "/v1/pipelines/check/stop", map[string]any{})
+	param := func(size, step int) map[string]any {
+		sp := v.spec("file", "slide", true)
+		w := sp["graph"].(map[string]any)["nodes"].([]any)[1].(map[string]any)["window"].(map[string]any)
+		w["size"], w["step"] = size, step
+		return sp
+	}
+	cases := []struct {
+		label, reason string
+		spec          map[string]any
+	}{
+		{"ext Count plan on v31", "profile mismatch", v.spec("file", "count", true)},
+		{"slide size 4 on v31 (saved size 3)", "semantics changed", param(4, 2)},
+		{"slide step 3 on v31 (saved step 2)", "semantics changed", param(3, 3)},
+	}
+	for _, c := range cases {
+		v.a.ok("PUT", "/v1/pipelines/check", c.spec)
+		before := v.sink.count()
+		_, code := v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
+		result[c.label] = map[string]any{"start_code": code, "status": v.refused(c.label, c.reason)}
+		require(cur() == v31Current, c.label+" changed v31 CURRENT")
+		require(v.sink.count() == before, c.label+" produced output")
+	}
+	// (5) Original plan still restores from the untouched v31 history and
+	// continues exactly where C1 left off (rows 13..18 in this directory's
+	// source file were already appended by step 3; replay from the cut).
+	v.a.ok("PUT", "/v1/pipelines/check", slide)
+	before := v.sink.count()
+	v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
+	if prevBin == "" {
+		v.publish(13, 18, "slide")
+	}
+	want := oracle("slide", 18)
+	eventually("original v31 plan resumes", func() bool { return v.sink.count() == before+len(want)-len(oracle("slide", 12)) })
+	tail := v.sink.rows()[before:]
+	for i, r := range tail {
+		text, _ := decode(r, false)
+		require(text == want[len(oracle("slide", 12))+i].text(), "resumed v31 output differs from oracle")
+	}
+	v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
+	require(snapshotVersion(v.checkpoint) == 31, "v31 profile kept")
+	v.server.stop(syscall.SIGTERM)
+	result["valid"] = true
+	save(filepath.Join(root, "summary.json"), result)
+	return result
+}
+
+// compatET: v33 (ET sliding/session) against older binaries and neighbouring
+// profiles. old = pre-v29 (424cf95), main = #29-merged main (v29/v30), prev =
+// #30 (v31/v32, pre-v33). Nothing refused may change CURRENT or emit output.
+func compatET(root, serverBin, oldBin, mainBin, prevBin string) map[string]any {
+	v := setup(root, "file", serverBin, "")
+	defer v.close()
+	defer v.captureFailure()
+	result := map[string]any{}
+	cur := func() string { return hash(filepath.Join(v.checkpoint, "CURRENT")) }
+	const shape = "sess"
+	// (1) New binary writes a v33 directory.
+	v.start(serverBin)
+	v.register()
+	sess := v.spec("file", shape, true)
+	v.a.ok("PUT", "/v1/pipelines/check", sess)
+	v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
+	v.publish(1, 12, shape)
+	eventually("v33 outputs", func() bool { return v.sink.count() == len(oracle(shape, 12)) })
+	eventually("v33 applied", func() bool { return number(v.status(), "observation", "runtime_progress", "ingested_rows") == 12 })
+	v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
+	require(snapshotVersion(v.checkpoint) == 33, "v33 expected")
+	v33Current := cur()
+	v.server.stop(syscall.SIGTERM)
+	outputs := v.sink.count()
+	// (2) Every older binary refuses the v33 directory and the ET aligned spec.
+	for _, b := range []struct{ label, bin string }{{"old_424cf95", oldBin}, {"main_29_merged", mainBin}, {"prev_30", prevBin}} {
+		if b.bin == "" {
+			continue
+		}
+		v.start(b.bin)
+		resp, code := v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
+		st := v.refused(b.label+" on v33", "")
+		result[b.label+"_on_v33"] = map[string]any{"start_code": code, "start": resp, "status": st, "binary_sha256": hash(b.bin)}
+		require(cur() == v33Current, b.label+" changed v33 CURRENT")
+		require(v.sink.count() == outputs, b.label+" produced output from v33 history")
+		for _, sh := range []string{"sess", "etslide"} {
+			fresh := v.spec("file", sh, true)
+			fresh["checkpoint_dir"] = filepath.Join(root, b.label+"-fresh-"+sh)
+			_, vcode := v.a.call("POST", "/v1/validate", fresh)
+			result[b.label+"_validate_"+sh+"_code"] = vcode
+			require(vcode >= 400, b.label+" accepted ET "+sh+" aligned spec")
+			_, e := os.Stat(fresh["checkpoint_dir"].(string))
+			require(os.IsNotExist(e), b.label+" created a checkpoint directory for a refused spec")
+		}
+		v.server.stop(syscall.SIGTERM)
+	}
+	// (3) #30 binary writes a v31 directory; the new binary keeps it v31 and
+	// refuses the ET plan there.
+	if prevBin != "" {
+		v.checkpoint = filepath.Join(root, "checkpoint-v31")
+		slide := v.spec("file", "slide", true)
+		v.start(prevBin)
+		_, _ = v.a.call("POST", "/v1/pipelines/check/stop", map[string]any{})
+		v.a.ok("PUT", "/v1/pipelines/check", slide)
+		v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
+		before := v.sink.count()
+		// The shared input file holds 12 sess-shaped rows: slide oracle on the
+		// same rows is not needed, only the profile behaviour; wait for apply.
+		eventually("prev applied", func() bool { return number(v.status(), "observation", "runtime_progress", "ingested_rows") == 12 })
+		v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
+		require(snapshotVersion(v.checkpoint) == 31, "#30 binary should write v31")
+		v.server.stop(syscall.SIGKILL)
+		v.start(serverBin)
+		v31Current := cur()
+		before = v.sink.count()
+		v.a.ok("PUT", "/v1/pipelines/check", v.spec("file", shape, true))
+		_, code := v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
+		result["sess_on_v31"] = map[string]any{"start_code": code, "status": v.refused("session plan on v31", "profile mismatch")}
+		require(cur() == v31Current && v.sink.count() == before, "sess-on-v31 refusal changed state")
+		v.a.ok("PUT", "/v1/pipelines/check", slide)
+		v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
+		eventually("v31 restored on new binary", func() bool { return nested(v.status(), "actual", "status") == "running" })
+		v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
+		require(snapshotVersion(v.checkpoint) == 31, "new binary must keep writing v31 for the v31 profile")
+		v.a.ok("POST", "/v1/pipelines/check/stop", map[string]any{})
+		v.server.stop(syscall.SIGTERM)
+		result["v31_dir_continued_by_new_binary"] = true
+	}
+	// (4) New binary on the v33 directory: neighbouring profiles and old vs
+	// new parameters are refused.
+	v.checkpoint = filepath.Join(root, "checkpoint")
+	v.start(serverBin)
+	_, _ = v.a.call("POST", "/v1/pipelines/check/stop", map[string]any{})
+	withSQL := func(from, to string) map[string]any {
+		sp := v.spec("file", shape, true)
+		sp["sql"] = strings.Replace(sp["sql"].(string), from, to, 1)
+		require(sp["sql"] != v.spec("file", shape, true)["sql"], "variant did not change SQL")
+		return sp
+	}
+	cases := []struct {
+		label, reason string
+		spec          map[string]any
+	}{
+		{"sliding count plan on v33", "profile mismatch", v.spec("file", "slide", true)},
+		{"ext Count plan on v33", "profile mismatch", v.spec("file", "count", true)},
+		{"session gap 3600 on v33 (saved 3500)", "semantics changed", withSQL("SESSION(ts, 3500, 7000)", "SESSION(ts, 3600, 7000)")},
+		{"session max 8000 on v33 (saved 7000)", "semantics changed", withSQL("SESSION(ts, 3500, 7000)", "SESSION(ts, 3500, 8000)")},
+		{"ET sliding plan on v33 session history", "semantics changed", v.spec("file", "etslide", true)},
+		{"FIRST/LAST swap on v33", "semantics changed", withSQL("FIRST(v) AS f, LAST(v) AS l", "LAST(v) AS f, FIRST(v) AS l")},
+	}
+	for _, c := range cases {
+		v.a.ok("PUT", "/v1/pipelines/check", c.spec)
+		before := v.sink.count()
+		_, code := v.a.call("POST", "/v1/pipelines/check/start", map[string]any{})
+		result[c.label] = map[string]any{"start_code": code, "status": v.refused(c.label, c.reason)}
+		require(cur() == v33Current, c.label+" changed v33 CURRENT")
+		require(v.sink.count() == before, c.label+" produced output")
+	}
+	// (5) The original plan restores the untouched v33 history and continues
+	// exactly like the oracle from the cut.
+	v.a.ok("PUT", "/v1/pipelines/check", sess)
+	before := v.sink.count()
+	v.a.ok("POST", "/v1/pipelines/check/start", map[string]any{})
+	v.publish(13, 24, shape)
+	want := oracle(shape, 24)
+	from := len(oracle(shape, 12))
+	eventually("original v33 plan resumes", func() bool { return v.sink.count() == before+len(want)-from })
+	for i, r := range v.sink.rows()[before:] {
+		text, _ := decode(r, false)
+		require(text == want[from+i].text(), "resumed v33 output differs from oracle")
+	}
+	v.a.ok("POST", "/v1/pipelines/check/checkpoint", map[string]any{})
+	require(snapshotVersion(v.checkpoint) == 33, "v33 profile kept")
+	v.server.stop(syscall.SIGTERM)
+	result["valid"] = true
+	save(filepath.Join(root, "summary.json"), result)
+	return result
+}
+
 func main() {
 	server := flag.String("server-bin", "", "Sparrow server (jetstream feature for JetStream runs)")
 	natsBin := flag.String("nats-server", "", "pinned NATS server (JetStream runs)")
 	oldBin := flag.String("old-server-bin", "", "pre-v29 server for rollback/upgrade")
+	prevBin := flag.String("prev-server-bin", "", "v29/v30-capable (#29) server, pre-v31, for compat_slide")
 	out := flag.String("out", "", "new evidence directory")
 	source := flag.String("source", "file", "file or jetstream")
-	shape := flag.String("shape", "count", "count, et (tumbling) or hop")
+	shape := flag.String("shape", "count", "count, et (tumbling), hop, slide (COUNT_WINDOW(3,2)), sess (SESSION(ts,3500,7000)) or etslide (SLIDING(ts,4000,700))")
+	mainBin := flag.String("main-server-bin", "", "#29-merged main server (v29-v30, pre-v31) for compat_et")
 	cut := flag.String("cut", "", "input_after|output_after|output_inflight|commit_before|manifest_renamed|commit_after|restore_kill|ack_lost|compat")
 	flag.Parse()
 	require(*server != "" && *out != "" && *cut != "", "server-bin, out and cut required")
@@ -1255,7 +1842,27 @@ func main() {
 		return
 	}
 	require(*source == "file" || *source == "jetstream", "source")
-	require(*shape == "count" || ((*shape == "et" || *shape == "hop") && *source == "file"), "shape")
+	if *cut == "compat_et" {
+		compatET(filepath.Join(root, "compat"), *server, *oldBin, *mainBin, *prevBin)
+		fmt.Println("AGG_RECOVERY_COMPAT_ET_OK")
+		return
+	}
+	if *cut == "compat_slide" {
+		compatSlide(filepath.Join(root, "compat"), *server, *oldBin, *prevBin)
+		fmt.Println("AGG_RECOVERY_COMPAT_SLIDE_OK")
+		return
+	}
+	require(*shape == "count" || *shape == "slide" || ((*shape == "et" || *shape == "hop" || isETBuffered(*shape)) && *source == "file"), "shape")
+	switch *cut {
+	case "not_full", "at_boundary":
+		require(*shape == "slide", *cut+" is a sliding-count cut")
+	case "empty", "low_budget":
+		require(*shape == "slide" || isETBuffered(*shape), *cut+" is a buffered-window cut")
+	case "about_to_close", "no_new_input":
+		require(isETBuffered(*shape), *cut+" is a v33 cut")
+	case "ooo_merged":
+		require(*shape == "sess", "ooo_merged is a session cut")
+	}
 	s := run(filepath.Join(root, "run"), *source, *shape, *cut, *server, *natsBin)
 	fmt.Println("AGG_RECOVERY_PROCESS_OK", *source, *shape, *cut, s["outputs"])
 }

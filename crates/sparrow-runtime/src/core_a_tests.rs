@@ -113,7 +113,7 @@ fn aligned_job(
     };
     AlignedJob {
         restore: None,
-        pipeline: Some(PipelineRestore {
+        pipeline: Some(PipelineRestore { buffered: Vec::new(),
             sink: None,
             plan,
             generation,
@@ -389,7 +389,7 @@ fn encoded_iot(
     let lease = owner
         .acquire(CreditKind::Reservation, bytes.capacity().max(1))
         .unwrap();
-    crate::barrier::EncodedFreeze { bytes, lease, ext: false }
+    crate::barrier::EncodedFreeze { bytes, lease, ext: false, buffered: false }
 }
 
 fn encoded_count(
@@ -410,7 +410,7 @@ fn encoded_count(
     let lease = owner
         .acquire(CreditKind::Reservation, bytes.capacity().max(1))
         .unwrap();
-    crate::barrier::EncodedFreeze { bytes, lease, ext: false }
+    crate::barrier::EncodedFreeze { bytes, lease, ext: false, buffered: false }
 }
 
 #[test]

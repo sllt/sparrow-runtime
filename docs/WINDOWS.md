@@ -9,12 +9,12 @@
 
 | 类型 | SQL GROUP BY窗口项 | Graph `window.kind` | 本批恢复范围 |
 |---|---|---|---|
-| PT跳跃 | `HOP(PROCESSING_TIME, slide, size)` | `hop_pt` | restart_fresh |
-| 滑动计数 | `COUNT_WINDOW(size, step)` | `sliding_count` | restart_fresh |
-| PT逐事件滑动 | `SLIDING(PROCESSING_TIME, size[, delay])` | `sliding_pt` | restart_fresh |
-| ET逐事件滑动 | `SLIDING(ts, size[, delay])` | `sliding_et` | restart_fresh |
-| PT会话 | `SESSION(PROCESSING_TIME, gap, max_duration)` | `session_pt` | restart_fresh |
-| ET会话 | `SESSION(ts, gap, max_duration)` | `session_et` | restart_fresh |
+| PT跳跃 | `HOP(PROCESSING_TIME, slide, size)` | `hop_pt` | restart_fresh；第11批子批2c起线性单窗口 aligned paused File v34 / JetStream v35（见PRODUCTION矩阵） |
+| 滑动计数 | `COUNT_WINDOW(size, step)` | `sliding_count` | restart_fresh；第11批子批2a起线性单窗口 aligned File v31 / JetStream v32（见PRODUCTION矩阵） |
+| PT逐事件滑动 | `SLIDING(PROCESSING_TIME, size[, delay])` | `sliding_pt` | restart_fresh；第11批子批2c起 v34/v35（同上） |
+| ET逐事件滑动 | `SLIDING(ts, size[, delay])` | `sliding_et` | restart_fresh；第11批子批2b起线性单窗口 aligned File v33（见PRODUCTION矩阵） |
+| PT会话 | `SESSION(PROCESSING_TIME, gap, max_duration)` | `session_pt` | restart_fresh；第11批子批2c起 v34/v35（同上） |
+| ET会话 | `SESSION(ts, gap, max_duration)` | `session_et` | restart_fresh；第11批子批2b起线性单窗口 aligned File v33（见PRODUCTION矩阵） |
 
 保留已有PT/ET tumbling、ET hopping、单参数`COUNT_WINDOW(size)`及其原有恢复profile。
 新窗口支持COUNT/SUM/AVG/MIN/MAX，沿用NULL和整数溢出报错规则。不产生空窗口。
@@ -101,7 +101,27 @@ sliding_pt/sliding_et使用`size_micros/delay_micros`，delay缺省0。
 
 ## 恢复、验收与后续
 
-新族尚未发布checkpoint codec/profile。Control拒绝aligned、restore、checkpoint、checkpoint_dir；
+**第11批子批2a：**滑动计数（`COUNT_WINDOW(size, step)`）作为线性管道唯一状态时，可用 aligned 恢复：
+participant codec 4（`BWF1`，保存每key到达序号和最近size条已求值聚合输入），File v31 / JetStream v32，
+完整语义严格匹配；格式、限制、恢复额度规则和验证状态以 [PRODUCTION.md](PRODUCTION.md) 矩阵为准。
+滑动计数key不过期，仅受max_keys约束。
+
+**第11批子批2b：**ET滑动/ET会话作为File线性管道唯一状态时，可用 aligned 恢复：participant codec 4
+（`BWF1` kind 7/9，保存每key到达序号、按(事件时间,序号)排序的已求值聚合输入及滑动的pending标记，
+外加单输入水位生成器状态），File v33，完整语义严格匹配；JetStream + ET 仍拒绝。timer/deadline不单独持久，
+恢复时由状态按在线规则重建，并校验“切点时无到期项”。线性ET的out_of_orderness恒为0（只有图source_time可设置），
+因此比水位更早的乱序行一律late，ET会话的“乱序桥接”只发生在图路径；恢复后同样的乱序行仍判late。
+线性File没有idle生成器：**ET窗口只在新事件推进水位或EOF时关闭**，恢复后无新输入不会输出。
+future-skew用重放时墙钟比较（已知限制，与v3/v29一致）。会话保持final-only、L=0。
+
+**第11批子批2c：**PT跳跃/PT滑动/PT会话及PT滚动+新聚合作为线性管道唯一状态时，可用 aligned 恢复：
+paused File v34 / JetStream v35，时钟为v16/v17持久逻辑钟（每次决策一个ProcessingTime + 至多一行，随后提交；
+不读墙钟，停机与pending重放不推进时间，无追赶）。PT跳跃窗口start可为负；PT滑动/会话的BWF1尾部保存冻结时逻辑钟，
+恢复时必须等于快照切点。恢复后无新输入时tick照常触发窗口。不与TTL/HoldFor等第二状态组合；PT滚动+旧聚合仍为v16/v17。
+
+以下段落适用于其余新族的 restart_fresh 行为。
+
+其余新族尚未发布checkpoint codec/profile。Control拒绝aligned、restore、checkpoint、checkpoint_dir；
 CheckpointPlan、旧PlanLayout复用判定和Kernel也分别拒绝，不能绕过控制层直接创建假恢复承诺。
 新的buffered族通过Kernel执行；旧WindowOperator raw freeze helper不是这些新族的公共执行/恢复接口。
 旧StateSemantics和旧窗口freeze编码不改；给新类型编码参数不等于已支持快照。
