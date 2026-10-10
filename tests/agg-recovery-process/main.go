@@ -115,7 +115,9 @@ type input struct {
 }
 
 func row(i int, shape string) input {
-	r := input{Device: fmt.Sprintf("d%d", i%2), X: float64(i)*0.37 - 2.0, Ts: int64(i)*100 + 50}
+	// Dyadic inputs isolate checkpoint fidelity from cross-parser JSON
+	// rounding differences without changing production parsing semantics.
+	r := input{Device: fmt.Sprintf("d%d", i%2), X: float64(i)*0.375 - 2.0, Ts: int64(i)*100 + 50}
 	if shape != "count" {
 		r.Device = "d0"
 	}

@@ -1091,11 +1091,12 @@ with `event_time > now + skew` is dropped, counted as
 ## 补充聚合恢复 profile v29/v30（开发 Preview）
 
 - 常量：`WINDOW_EXT_STATE_CODEC = 3`、`EXT_AGG_FILE_SNAPSHOT_VERSION = 29`、`EXT_AGG_RELIABLE_SNAPSHOT_VERSION = 30`。只有含扩展聚合的 WindowAgg 参与者用 codec 3，其余窗口仍为 codec 1。
-- 字节布局（小端）：tag 8 = `[8][mode 0=FIRST,1=LAST][has 0/1][Scalar 值，tag 1..7，Bool 必须 0/1]`；tag 9 = `[9][sample | sqrt<<1][n u64][mean f64 bits][m2 f64 bits]`，固定 26 字节。Moment 校验：n=0 时 mean/m2 bits 为 0；n≥1 时有限；n=1 时 m2 bits 为 +0.0。编码端使用同一验证器，不发布自己解不开的状态。
+- 字节布局（小端）：tag 8 = `[8][mode 0=FIRST,1=LAST][has 0/1][Scalar 值，tag 1..7，Bool 必须 0/1]`；tag 9 = `[9][sample | sqrt<<1][n u64][mean f64 bits][m2 f64 bits]`，固定 26 字节。Moment 校验：n=0 时 mean/m2 bits 为 0；n≥1 时有限且 m2 非负；n=1 时 m2 bits 为 +0.0。编码端使用同一验证器，不发布自己解不开的状态。
 - `AccumulatorCodec::{Window, WindowExt}` 由参与者 codec 选择；codec 1 在 encode、decode、skip（仅校验扫描）都拒绝 tag 8/9（`UnsupportedRestore`，`checkpoint_guard=extended_codec_mismatch`）。`EncodedFreeze.ext` 在编码侧核对参与者 codec。
 - 计划：`CheckpointPlan` 对扩展计划要求非 graph、无引用/IoT/PT 状态/侧路/source_times、`recovery_prefix_len=None`；`snapshot_version_for` 选 v29（`file`）或 v30（`jetstream-v1` 且全部为 Count），其他组合 `extended_profile_mismatch`。解码时外层版本与 `plan.has_extended_state()` 不一致即拒绝。
 - 恢复所有权：`CheckpointStore::recover_pipeline_owned(requested, owner)` / `recover_required_owned(owner)` 是统一入口。`LoadMode::Owned` 先按 MANIFEST 字节取 payload lease、再取 header lease，`RestoreMeter` 逐 frame 计 scratch（IoT `5×frame+72×entries+1024`，窗口 `frame+1024`），扫描得到每参与者精确驻留字节后分别取 lease，物化时核对实际 ≤ 预留。`RestoreCredit` 经 `JobRequest::with_restore_credit` 交给 `RuntimeAligned::prepare_with_credit`，owner 不一致即拒绝；无二次计费也无未计费空窗。
 - 不可回退错误：`extended_profile_mismatch`、`extended_codec_mismatch`、`extended_state_mismatch`、`restore_credit` 与既有 Sink guard 一样不触发“损坏回退到更老代”。
+- 旧 SPV1 的 live/prepared 编码入口及无 codec 标签的 `encode_freeze_into` 一律拒绝扩展计划，空窗口也不例外。v29/v30 的 RCP2 manifest、来源与输出身份不匹配均不可回退。`ScanOwned` 也为物化的 envelope 预留额度，并持有到扫描结果释放。
 - 证据与支持边界见 [恢复支持矩阵](PRODUCTION.md#recovery-support-matrix)。
 
 ## 重采样 profile v25/v26（开发 Preview）

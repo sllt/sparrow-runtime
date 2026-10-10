@@ -766,6 +766,10 @@ impl PipelineSnapshot {
                 "JetStream sink checkpoint cannot adopt a non-File source profile")
                 .context("checkpoint_guard", "sink_profile_mismatch"));
         }
+        let extended_version = matches!(
+            version,
+            EXT_AGG_FILE_SNAPSHOT_VERSION | EXT_AGG_RELIABLE_SNAPSHOT_VERSION
+        );
         let next_output=if matches!(
             version,
             RELIABLE_SNAPSHOT_VERSION
@@ -781,20 +785,25 @@ impl PipelineSnapshot {
         ) {
             let epoch=take(&mut bytes,16)?.try_into().unwrap();
             Some(sparrow_model::OutputSequence::new(epoch,u64_value(&mut bytes)?)
-                .map_err(|_|invalid("invalid reliable output position"))?)
+                .map_err(|_| if extended_version {
+                    extended_mismatch("invalid reliable output position")
+                } else { invalid("invalid reliable output position") })?)
         } else {None};
         if next_output.is_some() != output_profile(&source.identity.kind) {
-            return Err(invalid("reliable snapshot lacks source/output identity"));
+            return Err(if extended_version {
+                extended_mismatch("reliable snapshot lacks source/output identity")
+            } else { invalid("reliable snapshot lacks source/output identity") });
         }
         let length = u32_value(&mut bytes)?;
-        let plan = CheckpointPlan::decode(take(&mut bytes, length)?)?;
+        let plan = CheckpointPlan::decode(take(&mut bytes, length)?).map_err(|error| {
+            if matches!(version, EXT_AGG_FILE_SNAPSHOT_VERSION | EXT_AGG_RELIABLE_SNAPSHOT_VERSION)
+                && error.code == ErrorCode::UnsupportedRestore {
+                error.context("checkpoint_guard", EXTENDED_PROFILE_GUARD)
+            } else { error }
+        })?;
         // Codec 3 and the v29/v30 envelopes select each other exactly. A
         // mismatch is a version/profile incompatibility from a complete,
         // checksummed record; never classify it as corruption fallback.
-        let extended_version = matches!(
-            version,
-            EXT_AGG_FILE_SNAPSHOT_VERSION | EXT_AGG_RELIABLE_SNAPSHOT_VERSION
-        );
         if extended_version != plan.has_extended_state() {
             return Err(extended_mismatch(
                 "checkpoint outer version and extended aggregate state codec disagree",
@@ -810,7 +819,7 @@ impl PipelineSnapshot {
             if version == EXT_AGG_RELIABLE_SNAPSHOT_VERSION
                 && next_output.is_none_or(|position| position.epoch() != generation)
             {
-                return Err(invalid(
+                return Err(extended_mismatch(
                     "v30 checkpoint lacks a stable output identity for its state generation",
                 ));
             }

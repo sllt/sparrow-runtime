@@ -589,7 +589,7 @@ K1 支持单 File/replay → 线性计算 → 单 required Sink 的零状态、�
 
 快照 v3 保持 `CPL1` 外层参与者清单，在旧 reader 可读取的 `CP01` 语义字段中使用 `RCP2` 封套保存完整诊断计算和状态依赖前缀；其余包含 source cut、各 state frame、attempt/revision/generation。恢复必须匹配 Source 身份/schema、每个状态实例及其全部上游计算（仍保留全局函数语义版本检查）；线性管道比较到最后一个窗口。末端下游 Filter/Map/Project 可以调整，零状态管道可调整过滤/投影而不重放文件头，状态中暴露 `downstream_semantics_changed`。两窗口之间的计算仍影响第二窗口，窗口参数/schema/参与者变化仍拒绝。改变输出逻辑不撤销已发送的 HTTP 副作用，也不提供 exactly-once。
 
-**v29/v30（补充聚合，第11批子批1）：**外层沿用 CPL1，含 FIRST/LAST/VAR_*/STDDEV_* 的窗口参与者使用 participant codec 3；窗口 frame 与 v3 相同，累加器新增 tag 8（Value：mode、has、值）和 tag 9（Moment：mode、n、mean、m2）。v29 = File 线性、1～2 个 Count/ET 滚动/ET 跳跃窗口；v30 = JetStream 线性、1～2 个 Count 窗口，输出游标与状态同切点。完整计算语义及依赖严格匹配，**不适用 RCP2 下游放宽**；不兼容明确拒绝，不自动清空状态、不回退旧 checkpoint。codec 1 frame 在编码、解码和仅校验扫描三条路径都拒绝 tag 8/9。目录 profile 隔离与 v3～v28 相同：v29/v30 不与旧版本混写，不从 v3/v4 迁移，旧二进制在 profile 层拒绝。codec 3 绑定当前顺序 Welford 算术；算术改动必须换 codec/profile。
+**v29/v30（补充聚合，第11批子批1）：**外层沿用 CPL1，含 FIRST/LAST/VAR_*/STDDEV_* 的窗口参与者使用 participant codec 3；窗口 frame 与 v3 相同，累加器新增 tag 8（Value：mode、has、值）和 tag 9（Moment：mode、n、mean、m2）。v29 = File 线性、单个 Count/ET 滚动/ET 跳跃窗口，或两个 Count 窗口；v30 = JetStream 线性、1～2 个 Count 窗口，输出游标与状态同切点。两个窗口中含 ET 的组合暂不支持。完整计算语义及依赖严格匹配，**不适用 RCP2 下游放宽**；不兼容明确拒绝，不自动清空状态、不回退旧 checkpoint。codec 1 frame 在编码、解码和仅校验扫描三条路径都拒绝 tag 8/9。目录 profile 隔离与 v3～v28 相同：v29/v30 不与旧版本混写，不从 v3/v4 迁移，旧二进制在 profile 层拒绝。codec 3 绑定当前顺序 Welford 算术；算术改动必须换 codec/profile。
 
 **恢复内存预留（第11批 Q3，适用全部版本）：**所有 Server 恢复入口统一经 Store 的 owned 解码入口：读 chunk 前按 MANIFEST 字节取 payload 额度 → 有界扫描与校验（逐 frame 计入解码临时数据）→ 按扫描得到的每个参与者精确驻留字节（状态、索引、key/值）预留 → 物化 → 额度随 `RestoreCredit` 移交给 Kernel 的同一 Job owner，所有参与者准备成功后才激活输入。任一步失败完整退款，CURRENT 不变、不启动输入、不产生输出；额度不足（`checkpoint_guard=restore_credit`）与 profile/codec 不兼容一样属于不可回退错误，不当作损坏去选更老的代。旧格式和计算语义不变；低预算下比以前更早拒绝属于预算修复。已审计入口：File 线性 v3～v28、paused/observed/graph 时间 profile、File DAG、JetStream 各 profile、legacy SPV1 `restore_with_table`、可靠 Sink 目录历史扫描（计入 Sink owner）。剩余缺口：提交前读取旧 CURRENT 的校验扫描不是恢复入口，仍只做有界读取；嵌入方自行解码后调用 legacy Kernel `adopt` 的路径在解码后才取额度（Server 不使用）。
 
@@ -632,9 +632,10 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 
 **窗口 / 聚合**
 
-| 状态 | 组合 | 外层版本 / codec | 状态 |
+| 窗口 / 聚合 | 状态编码 | 外层版本 | 验证状态 |
 |---|---|---|---|
-| Count、ET 滚动、ET 跳跃 + COUNT/SUM/AVG/MIN/MAX | codec 1，tag 1..7 | File v3、JetStream v4 及各组合 profile | 已验证（既有批次） |
+| Count + COUNT/SUM/AVG/MIN/MAX | codec 1，tag 1..7 | File v3、JetStream v4 及明确开放的组合 profile | 已验证（既有批次） |
+| ET 滚动、ET 跳跃 + 旧聚合 | codec 1，tag 1..7 | File v3 及明确开放的图 profile；不含 JetStream v4 | 已验证（既有批次） |
 | PT 滚动 + 旧聚合 | codec 1 | paused v16/v17、图 v18 | 已验证（既有批次） |
 | Count/ET 滚动/ET 跳跃 + FIRST/LAST/VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP（可与旧聚合混用） | codec 3，tag 1..9 | File v29 | 已验证（子批1：Kernel 级恢复等价单元测试 + 进程级 SIGKILL：Count、ET 滚动、ET 跳跃各 7 个可确认切点 ×20 轮，独立 oracle 逐位比对；证据二进制含测试专用 `process-fault-pause` 特性，非发行包字节；不含断电/介质故障） |
 | Count + 新聚合 | codec 3 | JetStream v30 | 已验证（子批1：真实 NATS JetStream → Count → required HTTP，8 个可确认切点含 ACK 丢失 ×20 轮；校验值、顺序、OutputSequence ID、ACK 不越过 CURRENT；同上限定） |
@@ -672,7 +673,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 
 | 拓扑 | 状态 |
 |---|---|
-| 线性 ≤2 状态 | 已验证（既有）；v29/v30 只开放线性，已验证（子批1） |
+| 线性 ≤2 状态 | 已验证（既有）；v29 仅单 Count/ET 窗口或双 Count，v30 仅单/双 Count；双 Count 不以单窗口进程用例替代组合验收 |
 | File DAG ≤16 状态 / ≤16 required HTTP Sink | 已验证（既有）；含新聚合暂不支持 |
 | 双输入 / Join | 暂不支持（子批3） |
 | 侧路、有损边、source-time、参考表/Lookup + 新聚合 | 暂不支持 |
@@ -683,7 +684,9 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 - 恢复语义：File 为未提交后缀重放（at-least-once，无稳定输出 ID）；JetStream 为稳定 ID 的 at-least-once，ACK 不越过 CURRENT。都不是 exactly-once；SIGKILL 证据不等于断电/介质故障认证。
 - 恢复内存预留适用全部版本（见上节）；额度不足、profile/codec/语义不兼容均为不可回退错误。
 - 子批1 进程证据切点：输入已入窗口未输出、输出已确认未提交、输出请求在途、CURRENT 发布失败、MANIFEST 已改名但 CURRENT 未更新（该代不被提升）、提交后、恢复中（已预留额度未物化）、JetStream 提交后 ACK 丢失。旧二进制（424cf95）拒绝启动 v29 目录且不改 CURRENT/不输出；新二进制可继续旧 v3 目录。未覆盖：断电/介质故障、JetStream + ET、PT 窗口、恢复中其他位置。
-- JSON 输入的 float64 按最近舍入解析（serde_json `float_roundtrip`）；此前默认解析可能差 1 ulp，子批1 oracle 发现后修复。
+- 本批保持既有 JSON 浮点解析语义，不启用全局 `serde_json/float_roundtrip`。进程测试改用可精确表示的二进制分数输入（步长 `0.375`），仍逐位核对恢复状态和输出；这是隔离解析器差异，不代表已修复十进制解析精度。
+
+**待单独修复：JSON 浮点解析精度与恢复兼容。** 原子批1 oracle 观察到默认解析与正确舍入可能差 1 ulp。2026-10-10 决定从 #29 撤出全局 feature 变更，不将数值正确性问题登记为普通性能优化。独立修复必须包含十进制/极值回归、旧 checkpoint 后缀续读的明确兼容或拒绝策略、File/JetStream 输入语义一致性，以及相同负载下解码吞吐/延迟对比；未验证前不能声称已解决。
 
 ## 升级、备份与回退
 

@@ -1348,7 +1348,12 @@ impl WindowOperator {
     /// into `out`. Peak is live retention + the output buffer — no
     /// `Vec<FrozenEntry>` clone of all accs/keys (P1-14).
     pub fn encode_freeze_into(&self, out: &mut Vec<u8>, max_entries: usize) -> Result<()> {
-        self.encode_freeze_into_codec(out, max_entries, self.accumulator_codec())
+        // This public legacy API has no codec field. The participant path
+        // explicitly selects codec 3 and returns an EncodedFreeze tagged ext.
+        if self.accumulator_codec() != crate::aggregate::AccumulatorCodec::Window {
+            return Err(crate::aggregate::codec1_extended());
+        }
+        self.encode_freeze_into_codec(out, max_entries, crate::aggregate::AccumulatorCodec::Window)
     }
 
     pub(crate) fn encode_freeze_into_codec(

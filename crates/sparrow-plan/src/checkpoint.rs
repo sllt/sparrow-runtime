@@ -805,7 +805,7 @@ impl CheckpointPlan {
         {
             return Err(rejected(
                 "extended aggregate manifest requires strict linear Count/event-time windows without references or IoT",
-            ));
+            ).context("checkpoint_guard", "extended_profile_mismatch"));
         }
         if self.has_resample()
             && (self.is_graph()
