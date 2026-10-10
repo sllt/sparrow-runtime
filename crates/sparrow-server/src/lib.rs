@@ -400,6 +400,7 @@ async fn auth_me(
         "role": p.role.as_str(),
         "allowed_actions": auth::allowed_actions(p.role),
         "auth_mode": state.token.mode(),
+        "ui_contract": ui::UI_CONTRACT,
         "safe_mode": state.safe_mode,
         "draining": state.supervisor.is_draining(),
         "status_projection": if p.role == Role::Viewer { "viewer_safe" } else { "full" },

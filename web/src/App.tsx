@@ -15,6 +15,7 @@ const DraftEditor = lazy(() => import("./features/drafts/DraftEditorPage"));
 const Streams = lazy(() => import("./features/streams/StreamsPage"));
 const Connections = lazy(() => import("./features/connections/ConnectionsPage"));
 const Resources = lazy(() => import("./features/resources/ResourcesPage"));
+const Bundles = lazy(() => import("./features/bundles/BundlesPage"));
 
 function Routed() {
   const { me } = useAuth();
@@ -33,6 +34,7 @@ function Routed() {
           <Route path="/streams" element={<Streams />} />
           <Route path="/connections" element={<Connections />} />
           <Route path="/resources" element={<Resources />} />
+          <Route path="/bundles" element={<Bundles />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Suspense>

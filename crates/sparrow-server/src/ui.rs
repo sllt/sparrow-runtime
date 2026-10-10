@@ -19,6 +19,10 @@ const MAX_FILES: usize = 2048;
 const MAX_TOTAL: u64 = 64 * 1024 * 1024;
 const MAX_DEPTH: usize = 8;
 
+/// Bumped when a UI-visible management contract changes incompatibly. A UI
+/// built for another contract stays read-only (see web/src/auth).
+pub const UI_CONTRACT: u32 = 1;
+
 pub const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
 img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; \
 frame-ancestors 'none'; form-action 'self'";

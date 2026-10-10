@@ -16,6 +16,7 @@ const ALL_NAV: NavItem[] = [
   { to: "/streams", label: "Stream", icon: "stream", key: "6", section: "author", need: "streams.list" },
   { to: "/connections", label: "连接模板", icon: "plug", key: "7", section: "author", need: "connections.list" },
   { to: "/resources", label: "参考表与插件", icon: "puzzle", key: "8", section: "author", need: "tables.list" },
+  { to: "/bundles", label: "导入导出", icon: "upload", key: "9", section: "author", need: "bundle.export" },
 ];
 
 const ROLE_LABEL = { viewer: "只读观察者", operator: "操作员", admin: "管理员" } as const;
@@ -31,6 +32,7 @@ function crumbs(path: string): { label: string; to?: string }[] {
   if (path === "/streams") return [{ label: "Stream 与 Schema" }];
   if (path === "/connections") return [{ label: "连接模板" }];
   if (path === "/resources") return [{ label: "参考表与插件" }];
+  if (path === "/bundles") return [{ label: "配置导入导出" }];
   return [];
 }
 
@@ -126,6 +128,7 @@ export function Shell({ children }: { children: ReactNode }) {
             </button>
           </div>
         </header>
+        {me?.contractMismatch && <div className="banner tone-warn" role="alert" style={{ margin: "12px 24px 0" }}><Icon name="alert" /><div>{me.contractMismatch}</div></div>}
         <main id="main" className="content">{children}</main>
       </div>
       {palette && <CommandPalette onClose={() => setPalette(false)} nav={NAV} />}
