@@ -30,6 +30,7 @@ mod external_lookup_tests;
 #[cfg(test)]
 mod external_lookup_batch_tests;
 pub mod finite;
+pub mod preview;
 pub mod graph_cut;
 pub mod kernel;
 pub mod linear;
