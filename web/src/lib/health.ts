@@ -18,6 +18,27 @@ export type Health =
   | "stale" // last data too old / polling failing
   | "denied"; // not authorised to read
 
+/** Server diagnosis reasons (flow_snapshot_json) that indicate trouble. */
+const DEGRADING = new Set([
+  "cancellation_requested", "execution_ended", "source_connection_or_failure",
+  "sink_retry_or_failure", "delivery_failures_recorded_this_attempt",
+]);
+export const REASON_LABEL: Record<string, string> = {
+  cancellation_requested: "已请求取消",
+  execution_ended: "执行已结束",
+  source_connection_or_failure: "Source 连接异常或失败",
+  sink_retry_or_failure: "Sink 重试或失败",
+  delivery_failures_recorded_this_attempt: "本 attempt 有交付失败",
+  source_queue_nonempty: "Source 队列有积压",
+  sink_queue_nonempty: "Sink 队列有积压",
+  source_admission_pending: "Source 准入等待",
+  http_delivery_inflight: "HTTP 交付进行中",
+  no_current_pressure_evidence: "当前无压力迹象",
+};
+export function reasonTone(r: string): "bad" | "warn" | "ok" {
+  return DEGRADING.has(r) ? "bad" : r === "no_current_pressure_evidence" ? "ok" : "warn";
+}
+
 export const STALE_AFTER_MS = 25_000;
 
 export interface PipelineView {
@@ -59,7 +80,7 @@ export function deriveView(name: string, body: Json, fresh: boolean): PipelineVi
   else if (actualStatus === "starting") health = "starting";
   else if (actualStatus === "running") {
     if (obs?.available !== true) health = "unavailable";
-    else if (reasons.length > 0) health = "degraded";
+    else if (reasons.some((r) => DEGRADING.has(r))) health = "degraded";
     else health = "running";
   } else health = "unknown";
   return {

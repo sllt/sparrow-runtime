@@ -11,7 +11,7 @@ export function PipelineTable({ views, rates, errors }: { views: PipelineView[];
       <table className="table">
         <thead>
           <tr>
-            <th>流水线</th><th>状态</th><th>版本（最新 / 运行）</th><th>输入速率</th><th>输出速率</th><th>Checkpoint</th><th className="num">连续失败</th>
+            <th>流水线</th><th>状态</th><th>版本</th><th>输入速率</th><th>输出速率</th><th>Checkpoint</th><th className="num">连续失败</th>
           </tr>
         </thead>
         <tbody>

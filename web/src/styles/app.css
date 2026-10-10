@@ -15,7 +15,7 @@ h1, h2, h3 { margin: 0; letter-spacing: -.01em; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 
 /* ---------- layout ---------- */
-.app { display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: 100%; }
+.app { background: linear-gradient(to right, var(--bg-elev) calc(var(--sidebar-w) - 1px), var(--border) calc(var(--sidebar-w) - 1px), var(--border) var(--sidebar-w), var(--bg) var(--sidebar-w)); display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: 100%; }
 .app.collapsed { --sidebar-w: 68px; }
 .sidebar {
   position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: var(--sp-1);
@@ -105,7 +105,7 @@ h1, h2, h3 { margin: 0; letter-spacing: -.01em; }
 
 .table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: var(--fs-sm); }
 .table th { text-align: left; font-weight: 600; color: var(--text-3); font-size: var(--fs-xs); text-transform: none; letter-spacing: .02em;
-  padding: 10px var(--sp-4); border-bottom: 1px solid var(--border); background: var(--bg-sunken); position: sticky; top: 0; }
+  padding: 10px var(--sp-4); border-bottom: 1px solid var(--border); background: var(--bg-sunken); white-space: nowrap; }
 .table th:first-child { border-top-left-radius: var(--r-lg); } .table th:last-child { border-top-right-radius: var(--r-lg); }
 .table td { padding: 12px var(--sp-4); border-bottom: 1px solid var(--border); vertical-align: middle; }
 .table tr:last-child td { border-bottom: 0; }
@@ -113,7 +113,8 @@ h1, h2, h3 { margin: 0; letter-spacing: -.01em; }
 .table tbody tr.clickable { cursor: pointer; }
 .table tbody tr.clickable:hover, .table tbody tr.clickable:focus-visible { background: var(--bg-hover); }
 .table .num { text-align: right; font-variant-numeric: tabular-nums; }
-.row-name { font-weight: 600; color: var(--text); }
+.row-name { font-weight: 600; color: var(--text); white-space: nowrap; }
+.table td { white-space: nowrap; }
 .row-meta { color: var(--text-3); font-size: var(--fs-xs); }
 
 .tabs { display: flex; gap: var(--sp-1); border-bottom: 1px solid var(--border); margin-bottom: var(--sp-5); }

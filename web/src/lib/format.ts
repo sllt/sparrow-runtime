@@ -40,3 +40,9 @@ export function fmtTime(ms: unknown): string {
   const d = new Date(Number(t));
   return d.toLocaleString("zh-CN", { hour12: false });
 }
+
+export function fmtClock(ms: unknown): string {
+  const t = numText(ms);
+  if (t === null) return "—";
+  return new Date(Number(t)).toLocaleTimeString("zh-CN", { hour12: false });
+}

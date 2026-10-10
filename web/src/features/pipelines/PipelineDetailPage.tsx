@@ -6,7 +6,7 @@ import { enc } from "../../api/client";
 import { approx, bigint, numText, obj, str, type Json } from "../../api/json";
 import { Card, ErrorView, HealthPill, LiveIndicator, Pill, Skeleton, Sparkline, StaleBanner, StateView, Tabs, type Tone } from "../../components/ui";
 import { Icon } from "../../components/Icon";
-import { checkpointRisk, deriveView, isFresh } from "../../lib/health";
+import { checkpointRisk, deriveView, isFresh, REASON_LABEL, reasonTone } from "../../lib/health";
 import { fmtBytes, fmtInt, fmtRate } from "../../lib/format";
 import { p99, quantileText, fmtUs } from "../../lib/histogram";
 import { RateSeries, type Rate } from "../../lib/rates";
@@ -144,7 +144,7 @@ export default function PipelineDetailPage() {
       <Tabs<TabKey> value={tab} onChange={setTab} tabs={[
         { key: "overview", label: "概览" },
         { key: "traffic", label: "流量与背压" },
-        { key: "errors", label: "错误", badge: view.hasError || view.reasons.length ? <Pill tone="bad">!</Pill> : undefined },
+        { key: "errors", label: "错误", badge: view.hasError || view.health === "degraded" ? <Pill tone="bad">!</Pill> : undefined },
         { key: "checkpoint", label: "Checkpoint 风险" },
         { key: "diagnostics", label: "诊断" },
       ]} />
@@ -210,7 +210,7 @@ export default function PipelineDetailPage() {
             <dl className="kv">
               <dt>最近错误</dt><dd>{view.hasError ? <Pill tone="bad">有错误记录</Pill> : actual ? <Pill tone="ok">无</Pill> : <Pill tone="muted">未知</Pill>}</dd>
               {me?.role !== "viewer" && str(actual?.last_error) && <><dt>错误信息</dt><dd className="mono small">{str(actual?.last_error)}</dd></>}
-              <dt>诊断原因</dt><dd>{view.reasons.length ? view.reasons.map((r) => <span key={r} className="chip" style={{ marginRight: 4 }}>{r}</span>) : obs?.available === true ? "无" : "—"}</dd>
+              <dt>诊断原因</dt><dd>{view.reasons.length ? <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>{view.reasons.map((r) => <Pill key={r} tone={reasonTone(r)} title={r}>{REASON_LABEL[r] ?? r}</Pill>)}</div> : obs?.available === true ? "无" : "—"}</dd>
             </dl>
             {me?.role === "viewer" && view.hasError && <p className="hint" style={{ marginTop: 12 }}>只读角色看不到原始错误文本（可能含敏感信息）；可下载脱敏诊断包或联系操作员。</p>}
           </Card>

@@ -3,8 +3,9 @@ import { useAuth } from "../../auth/AuthContext";
 import { usePoll } from "../../api/usePoll";
 import { obj, str, type Json } from "../../api/json";
 import { Card, ErrorView, LiveIndicator, Pill, Skeleton, Sparkline, StaleBanner, StateView } from "../../components/ui";
+import { fmtTime } from "../../lib/format";
 import { Icon } from "../../components/Icon";
-import { fmtRate, fmtTime } from "../../lib/format";
+import { fmtClock, fmtRate } from "../../lib/format";
 import { MAX_OVERVIEW } from "../../api/overview";
 import { PipelineTable } from "../pipelines/PipelineTable";
 import { useOverview } from "../pipelines/useOverview";
@@ -91,7 +92,7 @@ export default function DashboardPage() {
                           <span className="mono">{str(o.action)}</span>
                           <span className="muted small" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{str(o.target) ?? ""}</span>
                           <span className="spacer" />
-                          <span className="small muted">{str(o.actor)} · {fmtTime(o.at_ms)}</span>
+                          <span className="small muted" style={{ whiteSpace: "nowrap" }} title={fmtTime(o.at_ms)}>{str(o.actor)} · {fmtClock(o.at_ms)}</span>
                         </li>
                       );
                     })}
