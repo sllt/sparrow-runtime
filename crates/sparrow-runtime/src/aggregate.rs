@@ -93,7 +93,7 @@ pub(crate) const ACC_BASE_BYTES: usize = 48;
 pub(crate) const EXT_ACC_BASE_BYTES: usize = 128;
 const MOMENT_ENCODED_BYTES: usize = 1 + 1 + 8 + 8 + 8;
 
-fn codec1_extended() -> SparrowError {
+pub(crate) fn codec1_extended() -> SparrowError {
     SparrowError::new(
         ErrorCode::UnsupportedRestore,
         "window state codec 1 cannot carry FIRST/LAST/VAR/STDDEV accumulator tags 8/9; codec 3 (v29/v30) is required",
@@ -137,7 +137,7 @@ impl ExtendedAccumulator {
         let valid = if n == 0 {
             mean.to_bits() == 0 && m2.to_bits() == 0
         } else {
-            mean.is_finite() && m2.is_finite() && (n != 1 || m2.to_bits() == 0)
+            mean.is_finite() && m2.is_finite() && m2 >= 0.0 && (n != 1 || m2.to_bits() == 0)
         };
         if !valid {
             return Err(ext_invalid("invalid VAR/STDDEV moment state"));

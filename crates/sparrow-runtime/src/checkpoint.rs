@@ -134,6 +134,9 @@ impl CheckpointSnapshot {
         op: &crate::window::WindowOperator,
         max_state_keys: usize,
     ) -> Result<Vec<u8>> {
+        if op.accumulator_codec() != crate::aggregate::AccumulatorCodec::Window {
+            return Err(crate::aggregate::codec1_extended());
+        }
         let cap = freeze_entry_cap(max_state_keys);
         let mut out = Vec::new();
         write_snapshot_prefix(&mut out, checkpoint_id, ingested_rows, source)?;
@@ -152,6 +155,9 @@ impl CheckpointSnapshot {
         table: Option<&TableRevisionBind>,
         mut freeze: crate::barrier::EncodedFreeze,
     ) -> Result<EncodedSnapshot> {
+        if freeze.ext {
+            return Err(crate::aggregate::codec1_extended());
+        }
         if freeze.bytes.len() < 11 {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
@@ -1255,11 +1261,23 @@ impl CheckpointStore {
             ));
         }
         self.check_sink_payload(&payload)?;
+        // Scan-only history validation still materializes the bounded
+        // envelope (source strings, plan semantics, sink identity). Charge
+        // it just like full restore, and retain credit with the result.
+        let header = match mode {
+            LoadMode::Owned(owner) | LoadMode::ScanOwned(owner) => Some(
+                owner.acquire(sparrow_model::CreditKind::Reservation,
+                    payload.len().saturating_mul(2).min(MAX_RESTORE_ENVELOPE_BYTES).saturating_add(4096))
+                    .map_err(crate::pipeline_checkpoint::restore_credit_error)?,
+            ),
+            _ => None,
+        };
         let (snapshot, credit) = match mode {
             LoadMode::Scan => (StoredSnapshot::decode(&payload, self.max_state_keys, false)?, None),
             LoadMode::ScanOwned(owner) => {
                 let mut meter = crate::pipeline_checkpoint::RestoreMeter::billed(owner.clone());
-                (StoredSnapshot::decode_metered(&payload, self.max_state_keys, false, &mut meter)?, None)
+                (StoredSnapshot::decode_metered(&payload, self.max_state_keys, false, &mut meter)?,
+                    Some(RestoreCredit { owner: owner.clone(), _header: header, participants: Vec::new() }))
             }
             LoadMode::Materialize => (StoredSnapshot::decode(&payload, self.max_state_keys, true)?, None),
             LoadMode::Owned(owner) => {
@@ -1268,15 +1286,6 @@ impl CheckpointStore {
                         .acquire(sparrow_model::CreditKind::Reservation, bytes.max(1))
                         .map_err(crate::pipeline_checkpoint::restore_credit_error)
                 };
-                // Envelope copies (manifest semantics, source strings, sink
-                // identity) are bounded by the payload and by fixed limits.
-                let header = charge(
-                    payload
-                        .len()
-                        .saturating_mul(2)
-                        .min(MAX_RESTORE_ENVELOPE_BYTES)
-                        .saturating_add(4096),
-                )?;
                 let mut meter = crate::pipeline_checkpoint::RestoreMeter::billed(owner.clone());
                 let scanned = StoredSnapshot::decode_metered(&payload, self.max_state_keys, false, &mut meter)?;
                 let ids = scanned.credit_participants();
@@ -1296,7 +1305,7 @@ impl CheckpointStore {
                     snapshot,
                     Some(RestoreCredit {
                         owner: owner.clone(),
-                        _header: Some(header),
+                        _header: header,
                         participants,
                     }),
                 )

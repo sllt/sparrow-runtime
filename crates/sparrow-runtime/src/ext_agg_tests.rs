@@ -647,3 +647,6 @@ fn profile_mismatch_error_names_extended_versions() {
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[path = "ext_agg_review_tests.rs"]
+mod review;
