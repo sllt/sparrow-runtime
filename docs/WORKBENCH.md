@@ -133,3 +133,19 @@ Graph-mode drafts open in a three-pane designer: node palette, canvas (React Flo
 - **Hard caps:** 256 KiB body (its own route, so the global 64 KiB API cap is unchanged), ≤512 events, ≤5000 output rows, ≤2 MiB output, ≤10 s, bounded work units, 2 MiB decoded input. Exceeding a cap is an error, never a partial "success". It shares the two-slot finite admission with `/v1/query`. A disconnect cancels the worker.
 - **Response:** `schema`, per-step `{clock_micros, watermark_micros, output_rows, rows}`, final clock/watermark, `eof`, `future_dropped`, `side_effects:false`, `ignored_fields`, `not_verified`.
 - **UI:** the draft editor's "受控预览" panel has an event timeline editor (data / clock +1s / watermark / EOF, reorder, local monotonic checks) and a per-step result table. Samples and results stay in page memory only: they are cleared after 5 idle minutes, on navigation and on logout, and are never saved into the draft. Export asks for confirmation that the file contains business data.
+
+## K5.5 Publish rollback, failure handling and admin operations
+
+- **Config rollback:** `POST /v1/pipelines/{name}/rollback` (operator+) takes `{operation_id, from_revision, expected_etag, reason}`. It re-validates the old spec against the current catalog and policy, then publishes it as a **new** revision; history is never rewritten. The CAS check on the pipeline ETag and the receipt write (`draft_id = "rollback:rN"`) happen in one transaction. Retrying the same `operation_id` returns the original receipt. Nothing is started or stopped.
+- **Conditional start:** `POST /v1/pipelines/{name}/start` also accepts `expected_etag` and `expected_desired: {status, revision}` (the `If-Match` header still works). They are checked in the same write transaction that changes desired state. A mismatch returns 412 and leaves desired state untouched, so the old job is never stopped before a conflict is found.
+- **UI:**
+  - The revision history has "回退" and "启动" dialogs. They show the target, latest/ETag, desired and actual state, and risks: replacing the running revision; stop does not pause the outbox; HTTP already sent is not undone.
+  - Network failures show "结果待确认" and the action is never auto-retried.
+  - The checkpoint tab can request a checkpoint.
+  - The "运维处置" tab holds:
+    - safe-mode and restart-blocked explanations (no unblock button; only the existing allowed actions);
+    - outbox status for operators, plus pause/resume, entry lists, explicit raw view and DLQ replay/purge for admins, all bound to the outbox UUID and generation and requiring a reason;
+    - input DLQ status, plus entries, explicit raw view and purge for admins, with the floor and checkpoint approvals and the stopped-state warning;
+    - a recovery wizard: preview → `approve_digest` (any edit invalidates it) → execute → explicit start of the target → finish/abort. A backend refusal is final.
+  - Resources: reference table dependencies and revisions, admin rollback and GC; plugin signature, pins and status, admin install (raw bytes upload with a local SHA-256 display), enable with exact manifest hash approval, disable and uninstall.
+- **Not covered:** a real File→HTTP checkpoint and recovery run in the browser. The e2e fixture uses demo MQTT, so this suite only exercises the refusal paths for checkpoint and recovery. Outbox and input-DLQ success paths have backend tests only.

@@ -35,14 +35,14 @@ for (const theme of ["light", "dark"] as const) {
     await shot(page, `50-rollback-dialog-${theme}`);
     await dlg.getByRole("button", { name: "发布为新版本" }).click();
     await expect(dlg.getByText(/已发布 rev 3（内容来自 rev 1，来源记录为 rollback:r1）/)).toBeVisible();
-    await dlg.getByRole("button", { name: "关闭" }).click();
+    await dlg.getByRole("button", { name: "关闭" }).last().click();
     await expect(page.locator("tr", { hasText: "rev 3" }).getByText("latest")).toBeVisible();
     // Start rev 3, bound to rev-3 + desired stopped.
     await page.getByRole("button", { name: "启动 rev 3" }).click();
     await expect(page.getByRole("dialog").getByText("不会暂停")).toBeVisible();
     await page.getByRole("dialog").getByRole("button", { name: "确认启动" }).click();
     await expect(page.getByRole("dialog").getByText(/已提交：期望状态为 running @ rev 3/)).toBeVisible();
-    await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "关闭" }).last().click();
     // Review rev 1, then someone publishes rev 4: the confirm is refused, nothing is stopped.
     await page.getByRole("button", { name: "启动 rev 1" }).click();
     const d2 = page.getByRole("dialog");
@@ -72,11 +72,11 @@ test("link5: ops tab, checkpoint, recovery refusal and resources (admin)", async
     await expect(w.getByRole("alert")).toBeVisible();
     await expect(w.getByRole("button", { name: "按审批摘要执行" })).toHaveCount(0);
     await shot(page, `52-recovery-refused-${theme}`);
-    await w.getByRole("button", { name: "关闭" }).click();
+    await w.getByRole("button", { name: "关闭" }).last().click();
     await page.getByRole("tab", { name: "Checkpoint 风险" }).click();
     await page.getByRole("button", { name: "请求 checkpoint" }).click();
     await expect(page.getByRole("alert").first()).toBeVisible();
-    await page.goto(`/ui/resources?theme=${theme}`);
+    await page.getByRole("link", { name: /参考表与插件/ }).click();
     await expect(page.getByRole("heading", { name: "参考表与插件" })).toBeVisible();
     await page.getByRole("tab", { name: /插件/ }).click();
     await page.getByRole("button", { name: "安装插件包" }).click();
