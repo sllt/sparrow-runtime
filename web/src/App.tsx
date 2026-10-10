@@ -10,6 +10,11 @@ const PipelineList = lazy(() => import("./features/pipelines/PipelineListPage"))
 const PipelineDetail = lazy(() => import("./features/pipelines/PipelineDetailPage"));
 const Audit = lazy(() => import("./features/audit/AuditPage"));
 const Instance = lazy(() => import("./features/instance/InstancePage"));
+const Drafts = lazy(() => import("./features/drafts/DraftsPage"));
+const DraftEditor = lazy(() => import("./features/drafts/DraftEditorPage"));
+const Streams = lazy(() => import("./features/streams/StreamsPage"));
+const Connections = lazy(() => import("./features/connections/ConnectionsPage"));
+const Resources = lazy(() => import("./features/resources/ResourcesPage"));
 
 function Routed() {
   const { me } = useAuth();
@@ -23,6 +28,11 @@ function Routed() {
           <Route path="/pipelines/:name" element={<PipelineDetail />} />
           <Route path="/audit" element={<Audit />} />
           <Route path="/instance" element={<Instance />} />
+          <Route path="/drafts" element={<Drafts />} />
+          <Route path="/drafts/:id" element={<DraftEditor />} />
+          <Route path="/streams" element={<Streams />} />
+          <Route path="/connections" element={<Connections />} />
+          <Route path="/resources" element={<Resources />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Suspense>

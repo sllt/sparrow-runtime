@@ -340,7 +340,7 @@ mod tests {
         store.write(|c|{c.execute_batch("DROP TABLE pipeline_plugin_dependencies; UPDATE meta SET value='3' WHERE key='catalog_schema_version';").map_err(db)}).unwrap();
         drop(store);
         let store = Store::open(&dbfile).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), CATALOG_SCHEMA_VERSION);
         assert_eq!(store.plugin_references(&hash).unwrap()["count"], 1);
         store
             .write(|c| {

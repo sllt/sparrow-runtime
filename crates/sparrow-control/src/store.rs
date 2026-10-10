@@ -19,13 +19,16 @@ use crate::reference_table::{
 use crate::spec::PipelineSpec;
 use crate::status::PipelineStatus;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 4;
+pub const CATALOG_SCHEMA_VERSION: u32 = 5;
 #[path="store_plugins.rs"]
 mod plugin_catalog;
 #[path = "store_reference_mutations.rs"]
 mod reference_mutations;
 #[path = "store_recovery.rs"]
 mod recovery_operations;
+#[path = "store_authoring.rs"]
+pub mod authoring;
+pub use authoring::{ConnectionRow, DraftInput, DraftRow, Receipt, RevisionMeta};
 pub const FORMAT_VERSION: u32 = 1;
 const AUDIT_CAP: usize = 200;
 const ATTEMPT_CAP: usize = 100;
@@ -862,125 +865,129 @@ impl Store {
     ) -> Result<PipelineRow> {
         check_name(name)?;
         let plugin_refs=plugin_catalog::references(spec)?;
-        self.write(|c| {
-            recovery_operations::publication_guard(c,name,spec,recovery_operation)?;
-            let current: Option<(u64, String)> = c
-                .query_row(
-                    "SELECT latest_revision, etag FROM pipelines WHERE name=?1",
-                    [name],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
-                .map_err(db)?;
-            if let Some((_, etag)) = &current {
-                match expected_etag {
-                    None => {
-                        return Err(SparrowError::new(
-                            ErrorCode::InvalidArgument,
-                            "If-Match is required to update an existing pipeline",
-                        )
-                        .context("hint", "If-Match: rev-N"));
-                    }
-                    Some(want) if want != etag && want != &*format!("\"{etag}\"") => {
-                        return Err(SparrowError::new(
-                            ErrorCode::InvalidArgument,
-                            format!("If-Match `{want}` does not match current `{etag}`"),
-                        )
-                        .context("etag", etag.clone()));
-                    }
-                    Some(_) => {}
-                }
-            }
-            if let Some((revision,_))=&current {
-                let raw:String=c.query_row("SELECT spec_json FROM pipeline_revisions WHERE name=?1 AND revision=?2",params![name,*revision as i64],|r|r.get(0)).map_err(db)?;
-                let old:PipelineSpec=serde_json::from_str(&raw).map_err(|_|SparrowError::new(ErrorCode::CodecViolation,"stored pipeline spec"))?;
-                crate::outbox::check_update(&old,spec)?;
-                crate::input_dlq::check_update(&old,spec)?;
-                if old.source.replay_start!=spec.source.replay_start {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"lineage replay anchor is immutable"));}
-                if old.source.replay_start.is_some() {
-                    let mut compatible=old.clone();compatible.checkpoint=spec.checkpoint.clone();
-                    if compatible!=*spec || !spec.checkpoint.as_ref().is_some_and(|p|p.resume_latest) {
-                        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"managed replay keeps computation, source, sink and checkpoint binding immutable; use a new recovery operation for semantic changes or rewind"));
-                    }
-                }
-            }
-            if let Some(config)=&spec.sink.durable_outbox {
-                config.validate()?;
-                // Retained revisions keep a permanent directory ownership
-                // claim, just as they pin plugin/table dependencies.
-                let mut q=c.prepare("SELECT DISTINCT name,spec_json FROM pipeline_revisions WHERE name<>?1").map_err(db)?;
-                let rows=q.query_map([name],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(db)?;
-                for row in rows {
-                    let (_,raw)=row.map_err(db)?;
-                    let other:PipelineSpec=serde_json::from_str(&raw).map_err(|_|SparrowError::new(ErrorCode::CodecViolation,"stored pipeline spec"))?;
-                    if other.sink.durable_outbox.as_ref().is_some_and(|x|x.directory==config.directory) {
-                        return Err(SparrowError::new(ErrorCode::InvalidArgument,"outbox directory is already assigned to another pipeline"));
-                    }
-                }
-            }
-            let next = current.map(|(r, _)| r + 1).unwrap_or(1);
-            let etag = format!("rev-{next}");
-            let spec_json = serde_json::to_string(spec).map_err(|e| {
-                SparrowError::new(ErrorCode::InvalidArgument, format!("encode spec: {e}"))
-            })?;
-            let ts = now_ms();
-            c.execute(
-                "INSERT INTO pipelines(name, latest_revision, etag, created_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(name) DO UPDATE SET latest_revision=excluded.latest_revision, etag=excluded.etag",
-                params![name, next as i64, etag, ts],
+        self.write(|c| self.put_pipeline_in(c, name, spec, expected_etag, activate, recovery_operation, &plugin_refs))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put_pipeline_in(&self, c: &Connection, name: &str, spec: &PipelineSpec, expected_etag: Option<&str>, activate: bool, recovery_operation: Option<&str>, plugin_refs: &[sparrow_expr::plugins::PackageReference]) -> Result<PipelineRow> {
+        recovery_operations::publication_guard(c,name,spec,recovery_operation)?;
+        let current: Option<(u64, String)> = c
+            .query_row(
+                "SELECT latest_revision, etag FROM pipelines WHERE name=?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
+            .optional()
             .map_err(db)?;
+        if let Some((_, etag)) = &current {
+            match expected_etag {
+                None => {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        "If-Match is required to update an existing pipeline",
+                    )
+                    .context("hint", "If-Match: rev-N"));
+                }
+                Some(want) if want != etag && want != &*format!("\"{etag}\"") => {
+                    return Err(SparrowError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("If-Match `{want}` does not match current `{etag}`"),
+                    )
+                    .context("etag", etag.clone()));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some((revision,_))=&current {
+            let raw:String=c.query_row("SELECT spec_json FROM pipeline_revisions WHERE name=?1 AND revision=?2",params![name,*revision as i64],|r|r.get(0)).map_err(db)?;
+            let old:PipelineSpec=serde_json::from_str(&raw).map_err(|_|SparrowError::new(ErrorCode::CodecViolation,"stored pipeline spec"))?;
+            crate::outbox::check_update(&old,spec)?;
+            crate::input_dlq::check_update(&old,spec)?;
+            if old.source.replay_start!=spec.source.replay_start {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"lineage replay anchor is immutable"));}
+            if old.source.replay_start.is_some() {
+                let mut compatible=old.clone();compatible.checkpoint=spec.checkpoint.clone();
+                if compatible!=*spec || !spec.checkpoint.as_ref().is_some_and(|p|p.resume_latest) {
+                    return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"managed replay keeps computation, source, sink and checkpoint binding immutable; use a new recovery operation for semantic changes or rewind"));
+                }
+            }
+        }
+        if let Some(config)=&spec.sink.durable_outbox {
+            config.validate()?;
+            // Retained revisions keep a permanent directory ownership
+            // claim, just as they pin plugin/table dependencies.
+            let mut q=c.prepare("SELECT DISTINCT name,spec_json FROM pipeline_revisions WHERE name<>?1").map_err(db)?;
+            let rows=q.query_map([name],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(db)?;
+            for row in rows {
+                let (_,raw)=row.map_err(db)?;
+                let other:PipelineSpec=serde_json::from_str(&raw).map_err(|_|SparrowError::new(ErrorCode::CodecViolation,"stored pipeline spec"))?;
+                if other.sink.durable_outbox.as_ref().is_some_and(|x|x.directory==config.directory) {
+                    return Err(SparrowError::new(ErrorCode::InvalidArgument,"outbox directory is already assigned to another pipeline"));
+                }
+            }
+        }
+        let next = current.map(|(r, _)| r + 1).unwrap_or(1);
+        let etag = format!("rev-{next}");
+        let spec_json = serde_json::to_string(spec).map_err(|e| {
+            SparrowError::new(ErrorCode::InvalidArgument, format!("encode spec: {e}"))
+        })?;
+        let ts = now_ms();
+        c.execute(
+            "INSERT INTO pipelines(name, latest_revision, etag, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET latest_revision=excluded.latest_revision, etag=excluded.etag",
+            params![name, next as i64, etag, ts],
+        )
+        .map_err(db)?;
+        c.execute(
+            "INSERT INTO pipeline_revisions(name, revision, spec_json, etag, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, next as i64, spec_json, etag, ts],
+        )
+        .map_err(db)?;
+        if !plugin_refs.is_empty() {
+            crate::plugins::manager(self)?.with_references(plugin_refs,||plugin_catalog::insert(c,name,next,plugin_refs))?;
+        }
+        // Materialize every immutable table dependency in the same
+        // transaction as the pipeline revision.  GC therefore cannot
+        // observe a committed pipeline whose referenced revision is not
+        // yet pinned.  The helper also rechecks the digest, closing the
+        // validation-then-publish TOCTOU window.
+        for table in validate_reference_bindings(c, spec)? {
             c.execute(
-                "INSERT INTO pipeline_revisions(name, revision, spec_json, etag, created_at)
+                "INSERT INTO pipeline_reference_tables
+                    (pipeline_name, pipeline_revision, table_name, table_revision, sha256)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![name, next as i64, spec_json, etag, ts],
+                params![
+                    name,
+                    next as i64,
+                    table.name,
+                    table.revision as i64,
+                    table.sha256,
+                ],
             )
             .map_err(db)?;
-            if !plugin_refs.is_empty() {
-                crate::plugins::manager(self)?.with_references(&plugin_refs,||plugin_catalog::insert(c,name,next,&plugin_refs))?;
-            }
-            // Materialize every immutable table dependency in the same
-            // transaction as the pipeline revision.  GC therefore cannot
-            // observe a committed pipeline whose referenced revision is not
-            // yet pinned.  The helper also rechecks the digest, closing the
-            // validation-then-publish TOCTOU window.
-            for table in validate_reference_bindings(c, spec)? {
-                c.execute(
-                    "INSERT INTO pipeline_reference_tables
-                        (pipeline_name, pipeline_revision, table_name, table_revision, sha256)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        name,
-                        next as i64,
-                        table.name,
-                        table.revision as i64,
-                        table.sha256,
-                    ],
-                )
-                .map_err(db)?;
-            }
-            c.execute(
-                "INSERT OR IGNORE INTO desired_state(name, desired_revision, desired_status, updated_at)
-                 VALUES (?1, NULL, 'stopped', ?2)",
-                params![name, ts],
-            )
-            .map_err(db)?;
-            c.execute(
-                "INSERT OR IGNORE INTO actual_state(name, actual_revision, actual_status, attempt_id, consecutive_failures, last_error, updated_at)
-                 VALUES (?1, NULL, 'stopped', 0, 0, NULL, ?2)",
-                params![name, ts],
-            )
-            .map_err(db)?;
-            if activate {Self::start_revision(c,name,next)?;}
-            if let Some(operation)=recovery_operation {recovery_operations::publication_finished(c,operation,next,spec)?;}
-            Ok(PipelineRow {
-                name: name.to_string(),
-                latest_revision: next,
-                spec: spec.clone(),
-                etag,
-            })
+        }
+        c.execute(
+            "INSERT OR IGNORE INTO desired_state(name, desired_revision, desired_status, updated_at)
+             VALUES (?1, NULL, 'stopped', ?2)",
+            params![name, ts],
+        )
+        .map_err(db)?;
+        c.execute(
+            "INSERT OR IGNORE INTO actual_state(name, actual_revision, actual_status, attempt_id, consecutive_failures, last_error, updated_at)
+             VALUES (?1, NULL, 'stopped', 0, 0, NULL, ?2)",
+            params![name, ts],
+        )
+        .map_err(db)?;
+        if activate {Self::start_revision(c,name,next)?;}
+        if let Some(operation)=recovery_operation {recovery_operations::publication_finished(c,operation,next,spec)?;}
+        Ok(PipelineRow {
+            name: name.to_string(),
+            latest_revision: next,
+            spec: spec.clone(),
+            etag,
         })
+
     }
 
     pub fn get_pipeline(&self, name: &str) -> Result<PipelineRow> {
@@ -2012,11 +2019,15 @@ fn init(conn: &Connection) -> Result<()> {
             ));
         }
         if ver>=4 && !plugin_catalog::schema_complete(conn)? {return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"catalog schema v4 is missing plugin reference protection; refusing maintenance"));}
+        if ver>=5 && !authoring::schema_complete(conn)? {return Err(SparrowError::new(ErrorCode::FeatureUnavailable,"catalog schema v5 is missing authoring tables; refusing to continue"));}
         if ver < CATALOG_SCHEMA_VERSION {
-            migrate_actual_consecutive_failures(conn)?;
-            migrate_restart_blocked(conn)?;
-            migrate_reference_table_catalog(conn)?;
-            plugin_catalog::migrate(conn)?;
+            if ver < 4 {
+                migrate_actual_consecutive_failures(conn)?;
+                migrate_restart_blocked(conn)?;
+                migrate_reference_table_catalog(conn)?;
+                plugin_catalog::migrate(conn)?;
+            }
+            authoring::migrate(conn)?;
             if ver == 0 {
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES ('catalog_schema_version', ?1), ('format_version', ?2)",

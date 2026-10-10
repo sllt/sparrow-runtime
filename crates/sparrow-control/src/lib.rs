@@ -60,7 +60,8 @@ mod window_completion_tests;
 pub use checkpoint::CheckpointSpec;
 pub use status::PipelineStatus;
 pub use store::{
-    secrets_key_configured, secrets_key_required, ActualState, AuditRow, DesiredState, PipelineRow,
+    secrets_key_configured, secrets_key_required, ActualState, AuditRow, ConnectionRow, DesiredState,
+    DraftInput, DraftRow, PipelineRow, Receipt, RevisionMeta,
     Store, CATALOG_SCHEMA_VERSION, FORMAT_VERSION,
 };
 #[cfg(feature = "demo-io")]

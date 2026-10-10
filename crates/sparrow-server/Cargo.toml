@@ -33,6 +33,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 

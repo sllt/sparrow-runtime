@@ -1,4 +1,4 @@
-# Sparrow 运维工作台（K5.1）
+# Sparrow 运维工作台（K5.1–K5.2）
 
 K5.1 交付服务端角色授权、可选静态工作台和只读运维页面。本文只描述已实现并有测试覆盖的行为；后续 K5.2～K5.6 的能力（草稿、发布、Graph Designer、Preview、处置向导、导入导出）尚未实现。
 
@@ -75,6 +75,29 @@ SPARROW_AUTH_FILE=/etc/sparrow/auth.json sparrow-server --ui-dir web/dist
 - 诊断包通过 Blob 下载并立即释放 URL。
 
 页面：登录、总览（KPI、健康表、实例、最近审计）、流水线列表（筛选）、流水线详情（概览 / 流量与背压 / 错误 / Checkpoint 风险 / 诊断）、审计摘要、实例与权限。浅色/深色主题；快捷键 `1-4` 切换页面、`Ctrl+K` 或 `/` 快速跳转、`T` 切换主题、`[` 折叠侧栏、标签页左右方向键切换。
+
+## K5.2 资源管理、SQL 编辑与草稿发布
+
+Catalog 迁移 **v4 → v5**（单事务、只新增表，不改历史 pipeline JSON；旧二进制拒绝 v5 catalog；回退靠完整冷备份）：
+`authoring_drafts`、`authoring_connections`、`publication_receipts`。
+
+| 接口 | 角色 | 合同 |
+| --- | --- | --- |
+| `GET /v1/drafts`、`GET/PUT/DELETE /v1/drafts/{id}` | operator | ETag `draft-N`；PUT 无 `If-Match` 只能新建，有则 CAS；DELETE 必须带 `If-Match`。文本可暂时无效。请求上限 512 KiB，解码后文本 ≤64 KiB、metadata（JSON 对象）≤16 KiB；最多 64 份、总计 8 MiB |
+| `POST /v1/drafts/{id}/check` | operator | 对草稿当前文本做完整 validate + explain，分别给出结论；不连接端点 |
+| `POST /v1/drafts/{id}/publish` | operator | `{operation_id, draft_etag, base_etag}`；重新校验后在**同一事务**里核对回执、草稿 ETag、流水线 ETag 并写入新 revision 与回执；**不启动** |
+| `GET /v1/publications/{operation_id}` | 发布者本人 / admin | 持久回执；同 ID+同请求返回原结果（`replayed:true`），同 ID 不同请求 412。保留最近 512 条，更早的 ID 返回 404（不代表没发布过） |
+| `GET /v1/pipelines/{name}/revisions[?before=&limit=]`、`/revisions/{rev}` | operator | 有界分页 + 单版本原始配置；同时给出 latest/desired/actual |
+| `GET /v1/connections`、`GET/PUT/DELETE /v1/connections/{name}` | operator | 作者侧模板（ETag `conn-N`），按真实 `SourceSpec/SinkSpec` 严格解析；更新不改已发布 pipeline |
+| `POST /v1/connections/{name}/test` | operator / handshake: admin | `config` 只校验模板结构；`handshake` 目前对所有类型返回 `probe_unavailable`，不拨号 |
+| `GET /v1/secrets` | operator | 只返回名称/存在性，永不返回值 |
+| `PUT /v1/streams/{name}` + `If-Match` | operator | 新增条件写入（`absent` = 只新建；否则须等于 `GET` 返回的 `etag`）。**不带 `If-Match` 时保留旧的无条件 upsert 以兼容 CLI/API**；工作台始终携带 |
+
+新错误码：`conflict`（HTTP 412，`current_etag` 在 error.context 中）与 `not_found`（404）。
+
+页面：草稿列表/编辑器（CodeMirror 6 SQL/JSON、Source/Sink 表单 + 保真 JSON、模板套用、Ctrl+S 保存、Ctrl+Enter 检查、冲突横幅保留本地编辑）、发布审阅（当前 vs 目标 diff、Source/Sink/恢复变更、基线是否过期、确认勾选；超时显示“结果待确认”并查询回执，只允许以同一操作 ID 显式重试）、发布后单独“启动”、版本历史（latest/desired/actual + 对比 + 基于旧版本新建草稿）、Stream 字段表单、连接模板与 SecretRef、参考表/插件只读列表。样本查询结果只在页面内存中，闲置 5 分钟清除。
+
+K5.2 未覆盖：网络握手探测（所有类型 `probe_unavailable`）；模板没有历史版本表（只保留当前版本号）；`PUT /v1/pipelines` 的固定 `delivery/recovery` 响应字段未修改（UI 不使用它，以 validate/status 为准）；Graph 模式编辑在 K5.3。
 
 ## 测试
 
