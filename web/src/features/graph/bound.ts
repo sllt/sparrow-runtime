@@ -12,4 +12,3 @@ export function parseBoundNodes(v: Json | undefined): Map<number, BoundNodeInfo>
   }
   return m;
 }
-
