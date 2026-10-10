@@ -234,3 +234,43 @@ fn k52_catalog_v4_migrates_to_v5_and_newer_is_rejected() {
     assert!(Store::open(&path).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn k53_structured_bound_nodes_for_designer() {
+    let s = setup().await;
+    let graph: Value = serde_json::from_str(sparrow_plan::et_tumble_template()).unwrap();
+    for ep in ["/v1/graphs/validate", "/v1/graphs/explain"] {
+        let r = call(&s, Method::POST, ep, OPERATOR, None, graph.clone()).await;
+        assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+        let nodes = r.v["bound_nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), graph["nodes"].as_array().unwrap().len());
+        assert!(nodes.iter().all(|n| n["id"].is_u64() && n["output_schema"].is_array() && n["downstream"].is_array()));
+        assert!(nodes[0]["output_schema"].as_array().unwrap().iter().all(|f| f["type"].is_string()));
+        assert_eq!(call(&s, Method::POST, ep, VIEWER, None, graph.clone()).await.st, StatusCode::FORBIDDEN);
+    }
+    // Draft check of a graph-mode spec carries per-node schema; a broken node is named.
+    let stream: Value = serde_json::from_str(STREAM).unwrap();
+    assert_eq!(call(&s, Method::PUT, "/v1/streams/sensors", OPERATOR, None, stream).await.st, StatusCode::CREATED);
+    let mut spec = json!({"version":1,"stream":"sensors","source":{"kind":"mqtt","topic":"t","client_id":"c"},"sink":{"kind":"log"},
+        "delivery":"live_best_effort","recovery":"restart_fresh",
+        "graph":{"version":1,"pipeline_id":1,"revision_id":1,"nodes":[
+            {"id":1,"kind":"memory_source","table":"sensors","out":[2]},
+            {"id":2,"kind":"project","exprs":[{"expr":{"k":"col","name":"temperature"},"alias":"t"}],"out":[3]},
+            {"id":3,"kind":"capture_sink","name":"output"}]}});
+    let body = |spec: &Value| json!({"pipeline":"g","mode":"graph","text":spec.to_string(),"metadata":{"layout":{"1":{"x":0,"y":0}}}});
+    let r = call(&s, Method::PUT, "/v1/drafts/g1", OPERATOR, None, body(&spec)).await;
+    assert_eq!(r.st, StatusCode::CREATED, "{}", r.v);
+    let r = call(&s, Method::POST, "/v1/drafts/g1/check", OPERATOR, None, json!({})).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+    assert_eq!(r.v["graph"]["ok"], true, "{}", r.v);
+    let n2 = &r.v["graph"]["bound_nodes"][1];
+    assert_eq!(n2["id"], 2);
+    assert_eq!(n2["output_schema"][0]["name"], "t");
+    assert_eq!(n2["output_schema"][0]["type"], "float64");
+    spec["graph"]["nodes"][1]["out"] = json!([]);
+    let r = call(&s, Method::PUT, "/v1/drafts/g1", OPERATOR, Some("draft-1"), body(&spec)).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+    let r = call(&s, Method::POST, "/v1/drafts/g1/check", OPERATOR, None, json!({})).await;
+    assert_eq!(r.v["graph"]["ok"], false);
+    assert!(r.v["graph"]["error"]["message"].as_str().unwrap().contains("node 3"), "{}", r.v);
+}

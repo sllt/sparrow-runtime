@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../../auth/AuthContext";
 import { asApiError, useLoad } from "../../api/useLoad";
@@ -15,8 +15,11 @@ import { connectorKinds } from "./caps";
 import { CheckPanel, type CheckResult } from "./CheckPanel";
 import { SamplePanel } from "./SamplePanel";
 import { PublishDialog } from "./PublishDialog";
+import { parseBoundNodes } from "../graph/bound";
+const GraphDesigner = lazy(() => import("../graph/GraphDesigner"));
+import { errorNode, layoutJson, nodes as graphNodes, pruneGraphIo, readLayout } from "../../lib/graphModel";
 
-type Tab = "sql" | "json" | "io";
+type Tab = "sql" | "graph" | "json" | "io";
 
 export default function DraftEditorPage() {
   const { id = "" } = useParams();
@@ -39,7 +42,7 @@ function Editor({ initial, caps, conns }: { initial: Draft; caps: Json; conns: J
   const [server, setServer] = useState(initial); // last saved/loaded server copy
   const [text, setText] = useState(initial.text);
   const [meta, setMeta] = useState<Record<string, Json>>(obj(initial.metadata) ?? {});
-  const [tab, setTab] = useState<Tab>("sql");
+  const [tab, setTab] = useState<Tab>(() => { const p = parseSpec(initial.text); return p.ok && obj(p.value.graph) ? "graph" : "sql"; });
   const [saving, setSaving] = useState(false);
   const [conflict, setConflict] = useState<{ current: string | null } | null>(null);
   const [notice, setNotice] = useState<{ tone: "ok" | "bad" | "warn"; text: string } | null>(null);
@@ -49,6 +52,14 @@ function Editor({ initial, caps, conns }: { initial: Draft; caps: Json; conns: J
   const dirty = text !== server.text || JSON.stringify(meta) !== JSON.stringify(obj(server.metadata) ?? {});
   const parsed = useMemo(() => parseSpec(text), [text]);
   const sqlText = parsed.ok ? str(parsed.value.sql) : null;
+  const graphVal = parsed.ok ? obj(parsed.value.graph) : null;
+  const hasGraph = graphVal !== null || (server.mode === "graph" && !parsed.ok);
+  const graphCheck = useMemo(() => {
+    const g = obj(check?.raw.graph), v = obj(check?.raw.validate);
+    const err = obj(g?.error) ?? obj(v?.error);
+    const msg = str(err?.message);
+    return { bound: parseBoundNodes(g?.bound_nodes), errNode: errorNode(msg), errMsg: msg };
+  }, [check]);
   const kinds = useMemo(() => connectorKinds(caps), [caps]);
   const templates = useMemo(() => (Array.isArray(obj(conns)?.connections) ? (obj(conns)!.connections as Json[]) : []).map((c) => obj(c)!).filter(Boolean), [conns]);
   const canWrite = me?.role !== "viewer";
@@ -169,11 +180,11 @@ function Editor({ initial, caps, conns }: { initial: Draft; caps: Json; conns: J
       )}
       {notice && <div className={`banner tone-${notice.tone === "ok" ? "info" : notice.tone}`} role="status"><Icon name={notice.tone === "ok" ? "check" : "alert"} />{notice.text}</div>}
 
-      <div className="grid editor-grid">
+      <div className={`grid editor-grid${tab === "graph" ? " wide" : ""}`}>
         <Card pad={false}>
           <div className="editor-tabs" style={{ padding: "0 var(--sp-5)" }}>
             <Tabs<Tab> value={tab} onChange={setTab} tabs={[
-              { key: "sql", label: "SQL" },
+              ...(hasGraph ? [{ key: "graph" as Tab, label: "Graph 设计器", badge: <span className="chip">{graphNodes(graphVal).length} 节点</span> }] : [{ key: "sql" as Tab, label: "SQL" }]),
               { key: "io", label: `Source / Sink`, badge: <span className="chip">{io.source} → {io.sink}</span> },
               { key: "json", label: "完整配置 JSON" },
             ]} />
@@ -187,6 +198,15 @@ function Editor({ initial, caps, conns }: { initial: Draft; caps: Json; conns: J
                 {parsed.ok ? <>该配置没有顶层 <code>sql</code> 字段（可能是 Graph 模式）。请在“完整配置 JSON”中编辑。</> : <>完整配置 JSON 当前无法解析：<code>{parsed.error}</code>。可以先保存无效文本，修复后再使用 SQL 视图。</>}
               </div>
             ))}
+            {tab === "graph" && (parsed.ok && graphVal ? (
+              <Suspense fallback={<div className="pane-msg">正在加载画布…</div>}><GraphDesigner graph={graphVal} layout={readLayout(meta)} readOnly={!canWrite}
+                onChange={(g, l) => {
+                  let n = setField(text, "graph", g);
+                  if (n !== null && parsed.value.graph_io !== undefined) n = setField(n, "graph_io", pruneGraphIo(parsed.value.graph_io, g));
+                  if (n !== null) setText(n); setMeta((m) => ({ ...m, layout: layoutJson(l) })); }}
+                bound={graphCheck.bound} boundStale={check !== null && (check.etag !== server.etag || dirty)}
+                serverErrorNode={graphCheck.errNode} serverError={graphCheck.errMsg} /></Suspense>
+            ) : <div className="pane-msg">{parsed.ok ? <>该配置没有 <code>graph</code> 对象。</> : <>完整配置 JSON 当前无法解析：<code>{parsed.error}</code>。修复后即可回到画布。</>}</div>)}
             {tab === "json" && <CodeEditor language="json" label="完整配置 JSON 编辑器" value={text} onChange={setText} readOnly={!canWrite} onSave={() => void save()} minHeight={420} />}
             {tab === "io" && (parsed.ok ? (
               <div className="grid cols-2" style={{ padding: "var(--sp-5)", alignItems: "start" }}>
