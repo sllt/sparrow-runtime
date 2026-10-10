@@ -325,12 +325,13 @@ fn restore_validation_rejects_foreign_spec_types_and_duplicates() {
     let mut busy = operator(&owner);
     feed(&mut busy, 1..=1);
     assert!(restore(&mut busy, decode(&bytes, true).unwrap().0).is_err());
-    // PT buffered kinds have no codec (ET sliding/session are v33, 2b).
+    // A PT session frame (v34/v35, 2c) is never restorable into a sliding
+    // count operator: kind/params mismatch is a non-fallback guard.
     let session = WindowSpec::new(
         WindowKind::SessionProcessingTime { gap_micros: 10, max_duration_micros: 100 },
         vec!["device_id".into()], vec![AggCall::count_star("c")]);
     if let Ok(mut s) = BufferedWindow::new(session, schema(), owner.clone(), 16, 16, false) {
-        assert_eq!(s.set_durable().unwrap_err().code, ErrorCode::UnsupportedRestore);
+        s.set_durable().unwrap();
     }
 }
 
@@ -658,8 +659,8 @@ fn plan_and_profile_gates_for_sliding_count() {
     assert_eq!(select(&plan, "file").unwrap(), crate::SLIDING_COUNT_FILE_SNAPSHOT_VERSION);
     assert_eq!(select(&plan, "jetstream-v1").unwrap(), crate::SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION);
     assert!(select(&plan, "file-dag-v1").is_err());
-    // Still restart_fresh only: PT sliding, PT sessions, PT hopping (ET
-    // sliding/session are the v33 profile, see buffered_et_tests).
+    // PT sliding, PT sessions, PT hopping are the v34/v35 profile (2c) and
+    // never select v31/v32 (ET sliding/session are v33).
     for kind in [
         WindowKind::SlidingProcessingTime { size_micros: 10, delay_micros: 0 },
         WindowKind::SessionProcessingTime { gap_micros: 10, max_duration_micros: 100 },
@@ -678,7 +679,9 @@ fn plan_and_profile_gates_for_sliding_count() {
                 PhysicalStage::CaptureSink { operator: 20.into(), name: "out".into(), schema: output },
             ],
         };
-        assert_eq!(CheckpointPlan::from_physical(&physical).unwrap_err().code, ErrorCode::UnsupportedRestore, "{kind:?}");
+        let manifest = CheckpointPlan::from_physical(&physical).unwrap();
+        assert!(manifest.has_pt_window_state(), "{kind:?}");
+        assert!(select(&manifest, "file").is_err() && select(&manifest, "jetstream-v1").is_err(), "{kind:?}");
     }
     // Nested/Dynamic aggregate inputs have no BWF1 value encoding.
     let nested = Schema::new(1, vec![

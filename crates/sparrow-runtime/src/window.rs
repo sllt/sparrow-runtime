@@ -274,6 +274,11 @@ impl WindowOperator {
         Ok(())
     }
 
+    /// Next scheduled PT timer (process-test hooks only).
+    pub(crate) fn next_timer(&self) -> Option<i64> {
+        self.timers.peek_deadline()
+    }
+
     pub(crate) fn validate_processing_cut(&self, now: i64) -> Result<()> {
         if now < 0 || self.spec.kind.uses_event_time() {
             return Err(SparrowError::new(
@@ -281,10 +286,12 @@ impl WindowOperator {
                 "invalid ordered window time policy",
             ));
         }
+        // PT hopping (v34/v35) may hold windows that start before 0.
+        let hop = matches!(self.spec.kind, WindowKind::HoppingProcessingTime { .. });
         if let WindowStore::Tumble(store) = &self.store {
             if store
                 .iter()
-                .any(|(_, e)| e.window_start < 0 || e.window_start > now || e.window_end <= now)
+                .any(|(_, e)| (e.window_start < 0 && !hop) || e.window_start > now || e.window_end <= now)
             {
                 return Err(SparrowError::new(
                     ErrorCode::UnsupportedRestore,
@@ -1466,7 +1473,10 @@ impl WindowOperator {
 
     /// K1 participant restore after `validate_participant_restore`.
     pub(crate) fn restore_participant_freeze(&mut self, freeze: &WindowFreeze) -> Result<()> {
-        if self.spec.kind.is_new_window() {
+        // PT hopping has the v34/v35 participant profile (codec 1/3, kind 4).
+        if self.spec.kind.is_new_window()
+            && !matches!(self.spec.kind, WindowKind::HoppingProcessingTime { .. })
+        {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
                 "new window families have no published restore codec/profile",

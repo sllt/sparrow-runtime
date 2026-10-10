@@ -617,11 +617,12 @@ fn restore_validation_rejects_foreign_params_kinds_types_and_cut_invariants() {
         }
         drop(op);
     }
-    // PT buffered kinds still have no codec; graph-mode windows neither.
+    // PT buffered kinds are durable in v34/v35 (pt_window_tests); graph-mode
+    // windows still have no codec.
     for kind in [WindowKind::session(10, 100, false).unwrap(), WindowKind::sliding(10, 0, false).unwrap()] {
         let s = WindowSpec::new(kind, vec!["device_id".into()], vec![AggCall::count_star("c")]);
         let mut op = BufferedWindow::new(s, schema(), owner.clone(), 16, 16, false).unwrap();
-        assert_eq!(op.set_durable().unwrap_err().code, ErrorCode::UnsupportedRestore);
+        op.set_durable().unwrap();
     }
     let mut graph = BufferedWindow::new(spec(Session), schema(), owner.clone(), 16, 16, true).unwrap();
     assert_eq!(graph.set_durable().unwrap_err().code, ErrorCode::UnsupportedRestore);
@@ -1002,12 +1003,16 @@ fn plan_and_profile_gates_for_et_buffered() {
             window_kind: 1,
         });
         assert!(forged.validate().is_err());
-        // Codec 4 with a PT buffered kind tag is not a published participant.
+        // Codec 4 with a PT buffered kind tag is the v34/v35 participant: it
+        // never selects v33 and is refused on a non-paused File source.
         let mut pt = plan.clone();
         pt.states[0].window_kind = 8;
-        assert!(pt.validate().is_err());
+        assert!(pt.validate().is_ok() && pt.has_pt_window_state());
+        let e = crate::pipeline_checkpoint::snapshot_version_for(&pt, "file").unwrap_err();
+        assert_eq!(guard(&e), Some("pt_profile_mismatch"));
     }
-    // PT buffered kinds and PT hopping stay restart_fresh.
+    // Sub-batch 2c: PT buffered kinds and PT hopping have the v34/v35
+    // profile (codec 4 / codec 1), never v33.
     for kind in [
         WindowKind::SlidingProcessingTime { size_micros: 10, delay_micros: 0 },
         WindowKind::SessionProcessingTime { gap_micros: 10, max_duration_micros: 100 },
@@ -1023,7 +1028,8 @@ fn plan_and_profile_gates_for_et_buffered() {
                 PhysicalStage::CaptureSink { operator: 20.into(), name: "out".into(), schema: output },
             ],
         };
-        assert_eq!(CheckpointPlan::from_physical(&physical).unwrap_err().code, ErrorCode::UnsupportedRestore, "{kind:?}");
+        let manifest = CheckpointPlan::from_physical(&physical).unwrap();
+        assert!(manifest.has_pt_window_state() && !manifest.has_buffered_event_time_state(), "{kind:?}");
     }
     // Live (durable) ET event credit is the exact stored-value rule.
     let owner = MemoryOwner::new(ResourceBudget::compact());

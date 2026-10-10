@@ -692,7 +692,7 @@ impl CheckpointStore {
                 }
                 if bytes.starts_with(MAGIC) && bytes.len()>=6 && bytes[4..6]!=version.to_le_bytes() {
                     return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-                        "checkpoint source profile mismatch: every outer profile (e.g. File/v3, JetStream/v4, DAG/v5, IoT/v6, ReliableIoT/v7, Reference/v8-v11, Hysteresis/v12-v13, PausedTime/v14-v15, extended aggregates File/v29 and JetStream/v30, sliding count File/v31 and JetStream/v32, ET sliding/session File/v33) requires a separate directory; retain original history")
+                        "checkpoint source profile mismatch: every outer profile (e.g. File/v3, JetStream/v4, DAG/v5, IoT/v6, ReliableIoT/v7, Reference/v8-v11, Hysteresis/v12-v13, PausedTime/v14-v15, extended aggregates File/v29 and JetStream/v30, sliding count File/v31 and JetStream/v32, ET sliding/session File/v33, PT windows File/v34 and JetStream/v35) requires a separate directory; retain original history")
                         .context("checkpoint_found_version", u16::from_le_bytes([bytes[4], bytes[5]]).to_string())
                         .context("checkpoint_expected_version", version.to_string()));
                 }
@@ -722,7 +722,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33) {
+        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {
@@ -1418,6 +1418,7 @@ fn incompatible_or_credit(error: &SparrowError) -> bool {
                 crate::pipeline_checkpoint::EXTENDED_PROFILE_GUARD
                     | crate::pipeline_checkpoint::RESTORE_CREDIT_GUARD
                     | crate::pipeline_checkpoint::BUFFERED_PROFILE_GUARD
+                    | crate::pipeline_checkpoint::PT_PROFILE_GUARD
                     | "buffered_state_mismatch"
                     | "extended_codec_mismatch"
                     | "extended_state_mismatch"
@@ -2178,6 +2179,20 @@ pub(crate) fn decode_freeze_metered(
     codec: crate::aggregate::AccumulatorCodec,
     resident: &mut usize,
 ) -> Result<WindowFreeze> {
+    decode_freeze_metered_pt(src, max_entries, materialize, pt_cut.map(|now| (now, false)), codec, resident)
+}
+
+/// `pt_cut = (cut, hopping)`: PT tumbling windows start at >= 0; PT hopping
+/// (v34/v35) may start before 0 (`start = floor(t/slide)*slide - size + slide`).
+/// Both must contain the cut (`start <= cut < end`) and carry count 0.
+pub(crate) fn decode_freeze_metered_pt(
+    src: &mut &[u8],
+    max_entries: usize,
+    materialize: bool,
+    pt_cut: Option<(i64, bool)>,
+    codec: crate::aggregate::AccumulatorCodec,
+    resident: &mut usize,
+) -> Result<WindowFreeze> {
     let FreezeHeader {operator,slot,kind,entries:n} = FreezeHeader::parse(src)?;
     *src = &src[11..];
     const MIN_FREEZE_ENTRY: usize = 2 + 8 + 8 + 8 + 2;
@@ -2235,7 +2250,7 @@ pub(crate) fn decode_freeze_metered(
         *src = &src[8..];
         let count = u64::from_le_bytes(src[..8].try_into().unwrap());
         *src = &src[8..];
-        if pt_cut.is_some_and(|now| kind != 0 || window_start < 0 || window_start > now || window_end <= now || count != 0) {
+        if pt_cut.is_some_and(|(now, hop)| kind != 0 || (window_start < 0 && !hop) || window_start > now || window_end <= now || count != 0) {
             return Err(SparrowError::new(ErrorCode::CodecViolation,"PT window state disagrees with the processing-time cut"));
         }
         let na = u16::from_le_bytes(src[..2].try_into().unwrap()) as usize;
@@ -3402,3 +3417,6 @@ mod sliding_count_tests;
 #[cfg(test)]
 #[path = "buffered_et_tests.rs"]
 mod buffered_et_tests;
+#[cfg(test)]
+#[path = "pt_window_tests.rs"]
+mod pt_window_tests;

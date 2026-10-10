@@ -81,6 +81,12 @@ fn windows_sql_binds_six_new_families_and_rejects_restore_manifest() {
                 assert_eq!(manifest.states[0].codec, sparrow_plan::checkpoint::BUFFERED_WINDOW_STATE_CODEC);
                 assert_eq!(manifest.recovery_prefix_len, None);
             }
+            // Sub-batch 2c: PT hopping is the v34/v35 codec 1 participant.
+            Ok(manifest) if matches!(expected, WindowKind::HoppingProcessingTime { .. }) => {
+                assert_eq!(manifest.states[0].codec, sparrow_plan::checkpoint::WINDOW_STATE_CODEC);
+                assert_eq!(manifest.states[0].window_kind, 4);
+                assert!(manifest.has_pt_window_state());
+            }
             result => assert_eq!(result.unwrap_err().code, ErrorCode::UnsupportedRestore, "{sql}"),
         }
     }

@@ -337,9 +337,20 @@ impl RuntimeAligned {
                     let mut op = crate::buffered_window::BufferedWindow::new(
                         spec.clone(), input.clone(), owner.clone(), max_keys, max_timers, false)?;
                     op.set_durable()?;
-                    if let Some((freeze, lease)) = restored_buffered.remove(operator) {
+                    let restored = if let Some((freeze, lease)) = restored_buffered.remove(operator) {
                         op.restore_freeze(*operator, freeze).map_err(|e| e.at_operator(*operator))?;
                         drop(lease);
+                        true
+                    } else {
+                        false
+                    };
+                    if op.is_pt() {
+                        // v34/v35: PT buffered windows run only on the durable clock.
+                        let now = processing_time.ok_or_else(|| SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "PT buffered window requires the durable paused-time clock (v34/v35)",
+                        ))?;
+                        op.bind_processing_cut(now, restored).map_err(|e| e.at_operator(*operator))?;
                     }
                     buffered.insert(*operator, op);
                     continue;
