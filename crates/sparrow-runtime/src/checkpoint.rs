@@ -692,7 +692,7 @@ impl CheckpointStore {
                 }
                 if bytes.starts_with(MAGIC) && bytes.len()>=6 && bytes[4..6]!=version.to_le_bytes() {
                     return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
-                        "checkpoint source profile mismatch: every outer profile (e.g. File/v3, JetStream/v4, DAG/v5, IoT/v6, ReliableIoT/v7, Reference/v8-v11, Hysteresis/v12-v13, PausedTime/v14-v15, extended aggregates File/v29 and JetStream/v30, sliding count File/v31 and JetStream/v32) requires a separate directory; retain original history")
+                        "checkpoint source profile mismatch: every outer profile (e.g. File/v3, JetStream/v4, DAG/v5, IoT/v6, ReliableIoT/v7, Reference/v8-v11, Hysteresis/v12-v13, PausedTime/v14-v15, extended aggregates File/v29 and JetStream/v30, sliding count File/v31 and JetStream/v32, ET sliding/session File/v33) requires a separate directory; retain original history")
                         .context("checkpoint_found_version", u16::from_le_bytes([bytes[4], bytes[5]]).to_string())
                         .context("checkpoint_expected_version", version.to_string()));
                 }
@@ -722,7 +722,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32) {
+        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {
@@ -3399,3 +3399,6 @@ mod ext_agg_tests;
 #[cfg(test)]
 #[path = "sliding_count_tests.rs"]
 mod sliding_count_tests;
+#[cfg(test)]
+#[path = "buffered_et_tests.rs"]
+mod buffered_et_tests;

@@ -14,11 +14,11 @@ pub(super) fn task<'a>(
     tx: &'a MailboxTx,
     capture: &'a SharedCapture,
 ) -> Result<ChargedWindowFuture<impl std::future::Future<Output = Result<usize>> + 'a>> {
-    // Only the prepared v31/v32 sliding count participant runs aligned.
+    // Only a prepared codec 4 participant (v31/v32 sliding count, v33 ET) runs aligned.
     if ctx.ordered_time || ctx.aligned.is_some() != prepared.is_some() {
         return Err(SparrowError::new(
             ErrorCode::UnsupportedRestore,
-            "buffered windows other than v31/v32 sliding count require restart_fresh without a durable clock",
+            "buffered windows other than v31/v32 sliding count and v33 ET sliding/session require restart_fresh without a durable clock",
         ));
     }
     let future = run(ctx, operator, prepared, spec, input, rx, tx, capture);
@@ -195,7 +195,7 @@ async fn run(
                         }
                     }
                 }
-                StreamControl::CheckpointBarrier { checkpoint_id } if op.is_sliding_count() => {
+                StreamControl::CheckpointBarrier { checkpoint_id } if op.is_durable() => {
                     // Rows of every earlier envelope are fully applied; the
                     // frame is the exact state at this barrier.
                     if let Some(aj) = &ctx.aligned {

@@ -59,3 +59,61 @@ func TestSlidingCountOracleCuts(t *testing.T) {
 		}
 	}
 }
+
+// v33 fixture: the cut selectors find real cuts and the simulation exercises
+// late rows, merges, caps and three keys.
+func TestETBufferedOracleCuts(t *testing.T) {
+	for _, shape := range []string{"sess", "etslide"} {
+		out, info := etSim(shape, 36)
+		late, merged := 0, 0
+		keys := map[string]bool{}
+		for _, in := range info {
+			if in.late {
+				late++
+			}
+			if in.merged {
+				merged++
+			}
+		}
+		for _, e := range out {
+			keys[e.Device] = true
+			if e.Win == "" {
+				t.Fatalf("%s: output without window bounds", shape)
+			}
+		}
+		if late < 3 || len(keys) != 3 || len(out) < 6 {
+			t.Fatalf("%s: weak fixture late=%d keys=%d outputs=%d", shape, late, len(keys), len(out))
+		}
+		if shape == "sess" && merged < 2 {
+			t.Fatalf("session fixture never merges")
+		}
+		k := etStateCut(shape, "about_to_close")
+		if info[k-1].open < 2 || len(oracle(shape, k+1)) <= len(oracle(shape, k)) {
+			t.Fatalf("%s: about_to_close cut %d does not close on the next row", shape, k)
+		}
+		p2 := etInputAfter(shape, 13)
+		if p2 <= 13 || len(oracle(shape, p2)) != len(oracle(shape, 13)) || len(oracle(shape, p2+1)) == len(oracle(shape, 13)) {
+			t.Fatalf("%s: input_after %d not the last row before an output", shape, p2)
+		}
+		// Prefix property: outputs after k rows are a prefix of outputs after n.
+		for n := 0; n <= 36; n++ {
+			pre := oracle(shape, n)
+			for i := range pre {
+				if pre[i].text() != out[i].text() {
+					t.Fatalf("%s: prefix %d differs at %d", shape, n, i)
+				}
+			}
+		}
+	}
+	k := etStateCut("sess", "ooo_merged")
+	_, info := etSim("sess", 36)
+	if !info[k-1].merged || !info[k].late {
+		t.Fatalf("ooo_merged cut %d invalid", k)
+	}
+	// Hand-checked session: d? rows 1..4 -> first output is d1's session
+	// closed by row 4 (ts 4000 >= 0+3500 for key d1 at ts 0).
+	got, _ := etSim("sess", 4)
+	if len(got) == 0 || got[0].Device != "d1" || got[0].Win != "0|3500" {
+		t.Fatalf("hand-checked session close: %+v", got)
+	}
+}

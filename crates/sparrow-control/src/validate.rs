@@ -1711,6 +1711,7 @@ fn validate_aligned_plan_inner(
     }
     if plan.has_extended_aggs()
         && !is_sliding_count_plan(plan)
+        && !is_buffered_et_plan(plan)
         && (recovery.is_aligned()
             || spec.restore.is_some()
             || spec.checkpoint.is_some()
@@ -1726,8 +1727,10 @@ fn validate_aligned_plan_inner(
     {
         if is_sliding_count_plan(plan) {
             validate_sliding_count_profile(spec, plan, recovery)?;
+        } else if is_buffered_et_plan(plan) {
+            validate_buffered_et_profile(spec, plan, recovery)?;
         } else {
-            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"new hopping-PT/ET-PT sliding/session windows currently require restart_fresh without checkpoint or restore (only sliding count has the v31/v32 profile)"));
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"new hopping-PT / PT sliding/session windows currently require restart_fresh without checkpoint or restore (sliding count has v31/v32, ET sliding/session have File v33)"));
         }
     }
     let has_actions = spec.sink.action.is_some()
@@ -1851,6 +1854,85 @@ fn is_sliding_count_plan(plan: &PhysicalPlan) -> bool {
         }
     }
     any
+}
+
+/// Exactly one new-kind window, and it is ET sliding or ET session (v33).
+fn is_buffered_et_plan(plan: &PhysicalPlan) -> bool {
+    let mut any = false;
+    for stage in &plan.stages {
+        if let sparrow_plan::PhysicalStage::WindowAgg { spec, .. } = stage {
+            if spec.kind.is_new_window() {
+                if !matches!(
+                    spec.kind,
+                    sparrow_model::WindowKind::SlidingEventTime { .. }
+                        | sparrow_model::WindowKind::SessionEventTime { .. }
+                ) || any
+                {
+                    return false;
+                }
+                any = true;
+            }
+        }
+    }
+    any
+}
+
+/// ET sliding / ET session (codec 4 + restored watermark state) are
+/// recoverable only as the single state of a strict linear File v33 plan with
+/// the required HTTP sink. JetStream + event time stays refused (S2 Q6).
+/// Known limits (documented): future-skew uses the replay-time wall clock
+/// (same as v3/v29, Q3); linear File has no idle generator, so ET windows
+/// close only on a new event or EOF.
+fn validate_buffered_et_profile(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+    recovery: RecoveryPolicy,
+) -> Result<()> {
+    let reject = |message: &str| {
+        Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            format!("ET sliding/session window checkpoint profile v33: {message}"),
+        ))
+    };
+    if !recovery.is_aligned() {
+        return reject("checkpoint/restore requires recovery=aligned");
+    }
+    if spec.graph_io.is_some() || plan.edges.is_some() {
+        return reject("DAG plans are not supported; use a linear plan");
+    }
+    if !spec.reference_tables.is_empty() || spec.has_live_lookups() {
+        return reject("reference/Lookup tables are not supported");
+    }
+    if plan.has_iot() || plan.has_processing_time_state() {
+        return reject("IoT and processing-time state are not supported");
+    }
+    if !plan.side_outputs.is_empty() || !plan.source_times.is_empty() {
+        return reject("side outputs (including late side output) and source-time bindings are not supported");
+    }
+    let windows = plan
+        .stages
+        .iter()
+        .filter(|s| matches!(s, sparrow_plan::PhysicalStage::WindowAgg { .. }))
+        .count();
+    if windows != 1 {
+        return reject("exactly one ET sliding/session window and no other window state is supported");
+    }
+    if !matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay") {
+        return reject("source must be a linear File source (JetStream + event time is not supported)");
+    }
+    if spec.sink.kind != "http" {
+        return reject("sink must be the required HTTP sink");
+    }
+    if spec.checkpoint_dir.as_deref().is_none_or(str::is_empty) {
+        return reject("an explicit checkpoint_dir is required");
+    }
+    let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    if sparrow_runtime::snapshot_version_for(&manifest, "file")?
+        != sparrow_runtime::BUFFERED_ET_FILE_SNAPSHOT_VERSION
+    {
+        return reject("plan does not select the ET buffered profile");
+    }
+    Ok(())
 }
 
 /// Sliding count (codec 4) is recoverable only as the single state of a strict
@@ -2595,7 +2677,7 @@ pub fn effective_guarantees_with_plan(
                 "stored_state":"evaluated_aggregate_inputs_of_last_size_arrivals_per_key",
                 "key_expiry":"none; bounded_only_by_max_keys",
                 "restore_compatibility":"strict_full_computation_semantics; incompatible_is_rejected_without_state_reset_or_old_checkpoint_fallback"},
-            "not_enabled":["sliding_or_session_event_time(2b)","processing_time_hopping_sliding_session(2c)","DAG","references","IoT","side_outputs","multiple_windows","nested_or_Dynamic_inputs"],
+            "not_enabled":["processing_time_hopping_sliding_session(2c)","DAG","references","IoT","side_outputs","multiple_windows","nested_or_Dynamic_inputs"],
             "buffered_rows_per_key_default":1024,"buffered_rows_per_key_max":16384
         });
         value["recovery_risk"] = serde_json::json!(if spec.recovery != "aligned" {
@@ -2604,6 +2686,37 @@ pub fn effective_guarantees_with_plan(
             "required_HTTP_may_repeat_before_CURRENT; deduplicate_by_OutputSequence; no_exactly_once"
         } else {
             "required_HTTP_may_repeat_uncommitted_suffix; File_v31_has_no_stable_output_id; no_exactly_once"
+        });
+        return value;
+    }
+    if is_buffered_et_plan(plan) && !plan.has_analysis() {
+        let mut candidate = spec.clone();
+        candidate.recovery = "aligned".into();
+        let checked = validate_buffered_et_profile(&candidate, plan, RecoveryPolicy::Aligned)
+            .and_then(|_| validate_aligned_plan(&candidate, plan));
+        let version = sparrow_plan::CheckpointPlan::from_physical(plan)
+            .ok()
+            .and_then(|p| sparrow_runtime::snapshot_version_for(&p, "file").ok());
+        value["aligned_eligible"] = serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
+        value["windows"] = serde_json::json!({
+            "maturity":"development_preview","certified":false,
+            "recovery": if spec.recovery == "aligned" { "aligned" } else { "restart_fresh" },
+            "aligned_profile":"event_time_sliding_session_v33",
+            "event_time_buffered":{"snapshot_version":version,"state_codec":4,
+                "scope":"linear_File_v33; single_event_time_sliding_or_session_window; required_HTTP_sink",
+                "stored_state":"evaluated_aggregate_inputs_with_event_time_sequence_pending_per_key_plus_watermark_generator_state",
+                "session":"final_only; lateness_0; no_late_corrections_or_retractions",
+                "timers":"derived_from_state; no_idle_generator_on_linear_File; windows_close_only_on_new_event_or_EOF",
+                "future_skew":"known_limit: compared_with_replay_time_wall_clock (same as v3/v29)",
+                "restore_compatibility":"strict_full_computation_semantics; incompatible_is_rejected_without_state_reset_or_old_checkpoint_fallback"},
+            "not_enabled":["JetStream_event_time","processing_time_hopping_sliding_session(2c)","DAG","references","IoT","side_outputs","multiple_windows","nested_or_Dynamic_inputs"],
+            "buffered_rows_per_key_default":1024,"buffered_rows_per_key_max":16384
+        });
+        value["recovery_risk"] = serde_json::json!(if spec.recovery != "aligned" {
+            "restart_fresh_loses_window_state"
+        } else {
+            "required_HTTP_may_repeat_uncommitted_suffix; File_v33_has_no_stable_output_id; no_exactly_once"
         });
         return value;
     }

@@ -33,6 +33,7 @@
   - 顺序固定：补充聚合 → 新窗口（滑动计数 → ET 滑动/会话 → PT 跳跃/滑动/会话）→ Join/UNNEST/多源 → 业务组合 → 持久 outbox → 有限重试/DLQ → 重放/迁移/操作闭环。每个子批单独验收；下一批以已合并版本为基础，核心恢复/确认语义先交设计。
   - 当前覆盖与状态只在 [恢复支持矩阵](PRODUCTION.md#recovery-support-matrix) 维护，本文件不重复。
   - 子批1（补充聚合 File v29 / JetStream v30，恢复内存预留覆盖全部版本）：实现及验证见矩阵；PT 滚动 + 新聚合并入子批2。
+  - 子批2a（滑动计数 File v31 / JetStream v32）、子批2b（ET 滑动/会话 File v33，JetStream + ET 继续拒绝）：见矩阵；子批2c 为 PT 跳跃/滑动/会话（v34/v35）。
 
 - [ ] **3. 完整 IoT 业务闭环（K4；IOT-06～09）**
   - 当前主线已切到本批，先落实告警状态/episode 与通知边界，再接静默检测和采样；内部步骤见 [执行合同](IOT.md#business-loop-plan)。尚未开放的新节点不在 capabilities 中冒充支持。

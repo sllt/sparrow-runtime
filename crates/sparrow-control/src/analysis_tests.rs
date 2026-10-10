@@ -264,7 +264,6 @@ fn sliding_count_recovery_gate_admits_only_the_strict_profile() {
     }
     let count = "SELECT k,SUM(v) AS s FROM l GROUP BY k, COUNT_WINDOW(5, 2)";
     let rejected: Vec<(&str, PipelineSpec)> = vec![
-        ("ET sliding", spec_for("SELECT SUM(v) AS s FROM l GROUP BY SLIDING(ts, 10)", file.clone(), http.clone(), Some("ets"))),
         ("PT sliding", spec_for("SELECT SUM(v) AS s FROM l GROUP BY SLIDING(PROCESSING_TIME, 10)", file.clone(), http.clone(), Some("pts"))),
         ("PT hopping", spec_for("SELECT SUM(v) AS s FROM l GROUP BY HOP(PROCESSING_TIME, 5, 10)", file.clone(), http.clone(), Some("pth"))),
         ("Dynamic input", spec_for("SELECT LAST(items) AS l FROM l GROUP BY COUNT_WINDOW(5, 2)", file.clone(), http.clone(), Some("dyn"))),
@@ -299,6 +298,75 @@ fn sliding_count_recovery_gate_admits_only_the_strict_profile() {
     let mut fresh = spec_for("SELECT LAST(items) AS l FROM l GROUP BY COUNT_WINDOW(5, 2)", file.clone(), http.clone(), None);
     fresh.recovery = "restart_fresh".into();
     let plan = bind_plan_with_store(&store, &fresh, "sc", 1).unwrap();
+    validate_aligned_plan(&fresh, &plan).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Sub-batch 2b: ET sliding / ET session admit only the strict linear File
+/// v33 profile; JetStream + ET, PT buffered kinds, multiple windows, DAG,
+/// late side output and non-HTTP sinks stay refused before any history.
+#[test]
+fn et_buffered_recovery_gate_admits_only_the_strict_file_v33_profile() {
+    let store = store();
+    let root = sparrow_connectors::ensure_default_data_root()
+        .join(format!("et-buffered-gate-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let spec_for = |sql: &str, source: Value, sink: Value, dir: Option<&str>| {
+        let mut value = json!({"version":1,"stream":"l","sql":sql,"source":source,"sink":sink,"recovery":"aligned"});
+        if let Some(dir) = dir {
+            value["checkpoint_dir"] = json!(root.join(dir).to_string_lossy());
+        }
+        PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()).unwrap()
+    };
+    let file = json!({"kind":"file","path":root.join("in.ndjson").to_string_lossy(),"file_contract":"sealed"});
+    let http = json!({"kind":"http","url":"http://127.0.0.1:9/"});
+    for window in ["SLIDING(ts, 4000, 700)", "SESSION(ts, 3500, 7000)"] {
+        for aggs in ["COUNT(*) AS c,SUM(v) AS s,MIN(v) AS mn,MAX(v) AS mx", "FIRST(v) AS f,LAST(k) AS l,VAR_SAMP(v) AS vs"] {
+            let sql = format!("SELECT k,{aggs} FROM l GROUP BY k, {window}");
+            let spec = spec_for(&sql, file.clone(), http.clone(), Some("ok"));
+            let plan = bind_plan_with_store(&store, &spec, "et", 1).unwrap();
+            validate_aligned_plan(&spec, &plan).unwrap_or_else(|e| panic!("{window} {aggs}: {e:?}"));
+            let guarantees = effective_guarantees_with_plan(&spec, &plan);
+            assert_eq!(guarantees["aligned_eligible"], true, "{guarantees}");
+            assert_eq!(guarantees["windows"]["event_time_buffered"]["snapshot_version"], 33, "{guarantees}");
+            assert_eq!(guarantees["windows"]["event_time_buffered"]["state_codec"], 4);
+            assert!(guarantees["windows"]["event_time_buffered"]["future_skew"].as_str().unwrap().contains("wall_clock"));
+            assert!(guarantees["windows"]["event_time_buffered"]["timers"].as_str().unwrap().contains("no_idle_generator"));
+        }
+    }
+    let session = "SELECT k,SUM(v) AS s FROM l GROUP BY k, SESSION(ts, 3500, 7000)";
+    let rejected: Vec<(&str, PipelineSpec)> = vec![
+        ("PT sliding", spec_for("SELECT SUM(v) AS s FROM l GROUP BY SLIDING(PROCESSING_TIME, 10)", file.clone(), http.clone(), Some("pts"))),
+        ("PT session", spec_for("SELECT SUM(v) AS s FROM l GROUP BY SESSION(PROCESSING_TIME, 10, 100)", file.clone(), http.clone(), Some("ptss"))),
+        ("Dynamic input", spec_for("SELECT LAST(items) AS l FROM l GROUP BY SESSION(ts, 10, 100)", file.clone(), http.clone(), Some("dyn"))),
+        ("missing checkpoint_dir", spec_for(session, file.clone(), http.clone(), None)),
+        ("non-HTTP sink", spec_for(session, file.clone(), json!({"kind":"log"}), Some("log"))),
+        ("live MQTT source", spec_for(session, json!({"kind":"mqtt","host":"127.0.0.1","port":1883,"topic":"t"}), http.clone(), Some("mqtt"))),
+    ];
+    for (label, spec) in rejected {
+        let error = match bind_plan_with_store(&store, &spec, "et", 1) {
+            Ok(plan) => validate_aligned_plan(&spec, &plan).expect_err(label),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error.code, sparrow_model::ErrorCode::UnsupportedRestore | sparrow_model::ErrorCode::InvalidArgument),
+            "{label}: {error:?}"
+        );
+    }
+    #[cfg(feature = "jetstream")]
+    {
+        let js = json!({"kind":"jetstream","jetstream":{"servers":["nats://127.0.0.1:4222"],"namespace":"et","stream":"INPUT","consumer":"c","ownership_bucket":"OWNERS"}});
+        let value = json!({"version":1,"stream":"l","sql":session,"source":js,"sink":http,"recovery":"aligned",
+            "delivery":"checkpointed_at_least_once","checkpoint_dir":root.join("js").to_string_lossy(),
+            "checkpoint":{"interval_ms":60000,"timeout_ms":3000,"resume_latest":true}});
+        let spec = PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let plan = bind_plan_with_store(&store, &spec, "et", 1).unwrap();
+        let error = validate_aligned_plan(&spec, &plan).expect_err("JetStream + ET stays refused");
+        assert_eq!(error.code, sparrow_model::ErrorCode::UnsupportedRestore, "{error:?}");
+    }
+    let mut fresh = spec_for("SELECT LAST(items) AS l FROM l GROUP BY SESSION(ts, 10, 100)", file.clone(), http.clone(), None);
+    fresh.recovery = "restart_fresh".into();
+    let plan = bind_plan_with_store(&store, &fresh, "et", 1).unwrap();
     validate_aligned_plan(&fresh, &plan).unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }

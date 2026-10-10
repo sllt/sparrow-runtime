@@ -877,7 +877,7 @@ impl Kernel {
                 }
             }
         }
-        // Only a strict v31/v32 participant manifest (codec 4 sliding count)
+        // Only a strict v31/v32/v33 participant manifest (codec 4 buffered window)
         // may run a new-kind window aligned; the rest stay restart_fresh.
         if req.plan.has_new_windows()
             && req.aligned.as_ref().is_some_and(|aligned| {
@@ -888,7 +888,7 @@ impl Kernel {
         {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                "new hopping-PT/ET-PT sliding/session windows are restart_fresh only (sliding count requires the v31/v32 profile)",
+                "new hopping-PT / PT sliding/session windows are restart_fresh only (sliding count requires v31/v32, ET sliding/session require File v33)",
             ));
         }
         graph::validate_request(&req)?;

@@ -74,9 +74,10 @@ fn windows_sql_binds_six_new_families_and_rejects_restore_manifest() {
             window(&plan).event_time_field.as_deref(),
             expected.uses_event_time().then_some("ts")
         );
-        // Sub-batch 2a: only sliding count has a participant codec (4, v31/v32).
+        // Sub-batch 2a/2b: sliding count (v31/v32) and ET sliding/session
+        // (File v33) have participant codec 4; PT buffered kinds have none.
         match sparrow_plan::CheckpointPlan::from_physical(&plan) {
-            Ok(manifest) if matches!(expected, WindowKind::SlidingCount { .. }) => {
+            Ok(manifest) if sparrow_plan::checkpoint::checkpointable_buffered(expected) => {
                 assert_eq!(manifest.states[0].codec, sparrow_plan::checkpoint::BUFFERED_WINDOW_STATE_CODEC);
                 assert_eq!(manifest.recovery_prefix_len, None);
             }

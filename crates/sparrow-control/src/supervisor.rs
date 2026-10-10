@@ -1982,6 +1982,8 @@ impl Supervisor {
                         "reference checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else if restore_layout.has_extended_state() {
                         "extended aggregate (v29) checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
+                    } else if restore_layout.has_buffered_event_time_state() {
+                        "ET sliding/session (v33) checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else if restore_layout.has_buffered_state() {
                         "sliding count (v31) checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else {

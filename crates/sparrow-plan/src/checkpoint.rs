@@ -24,6 +24,17 @@ pub const WINDOW_EXT_STATE_CODEC: u16 = 3;
 /// inputs of the last `size` arrivals per key, never accumulators or raw rows.
 /// Only the strict single-state linear File v31 / JetStream v32 profiles.
 pub const BUFFERED_WINDOW_STATE_CODEC: u16 = 4;
+
+/// Buffered window kinds with a codec 4 profile: sliding count (v31/v32),
+/// ET sliding and ET session (File v33). PT buffered kinds stay restart_fresh.
+pub fn checkpointable_buffered(kind: WindowKind) -> bool {
+    matches!(
+        kind,
+        WindowKind::SlidingCount { .. }
+            | WindowKind::SlidingEventTime { .. }
+            | WindowKind::SessionEventTime { .. }
+    )
+}
 // Keep the CPL1 outer grammar readable by old K1 Stores. An old reader must
 // reach compatibility rejection, NOT mistake a new manifest for corruption
 // and fall back to an older published snapshot. The CP01 prefix intentionally
@@ -70,7 +81,7 @@ impl StateParticipant {
     pub fn freeze_kind(&self) -> u8 {
         match self.codec {
             WINDOW_STATE_CODEC | WINDOW_EXT_STATE_CODEC => u8::from(self.window_kind == 1),
-            BUFFERED_WINDOW_STATE_CODEC if self.window_kind == 5 => 5,
+            BUFFERED_WINDOW_STATE_CODEC if matches!(self.window_kind, 5 | 7 | 9) => self.window_kind,
             IOT_STATE_CODEC if matches!(self.window_kind, 4..=15) => self.window_kind,
             _ => 0,
         }
@@ -157,16 +168,18 @@ impl CheckpointPlan {
         {
             return Err(rejected("extended aggregate checkpoint requires a linear Count/event-time window plan without DAG, references, processing-time state, IoT, side outputs or source time"));
         }
+        // Codec 4 buffered kinds with a published profile: sliding count
+        // (v31/v32) and ET sliding / ET session (File v33).
         let sliding_count = plan.stages.iter().any(|s| {
-            matches!(s, PhysicalStage::WindowAgg { spec, .. } if matches!(spec.kind, WindowKind::SlidingCount { .. }))
+            matches!(s, PhysicalStage::WindowAgg { spec, .. } if checkpointable_buffered(spec.kind))
         });
         if plan.has_new_windows() {
             let windows = plan.stages.iter().filter(|s| matches!(s, PhysicalStage::WindowAgg { .. })).count();
             if !sliding_count
                 || windows != 1
-                || plan.stages.iter().any(|s| matches!(s, PhysicalStage::WindowAgg { spec, .. } if spec.kind.is_new_window() && !matches!(spec.kind, WindowKind::SlidingCount { .. })))
+                || plan.stages.iter().any(|s| matches!(s, PhysicalStage::WindowAgg { spec, .. } if spec.kind.is_new_window() && !checkpointable_buffered(spec.kind)))
             {
-                return Err(rejected("new hopping-PT/ET sliding/session windows are restart_fresh only; no compatible state codec/profile is published"));
+                return Err(rejected("new hopping-PT / PT sliding/session windows are restart_fresh only; no compatible state codec/profile is published"));
             }
             if plan.edges.is_some()
                 || !reference_tables.is_empty()
@@ -175,7 +188,7 @@ impl CheckpointPlan {
                 || !plan.side_outputs.is_empty()
                 || !plan.source_times.is_empty()
             {
-                return Err(rejected("sliding count checkpoint (v31/v32) requires a linear single-window plan without DAG, references, processing-time state, IoT, side outputs or source time"));
+                return Err(rejected("buffered window checkpoint (sliding count v31/v32, ET sliding/session v33) requires a linear single-window plan without DAG, references, processing-time state, IoT, side outputs or source time"));
             }
         }
         if plan.stages.iter().any(|stage| {
@@ -330,7 +343,7 @@ impl CheckpointPlan {
                     {
                         return Err(rejected("checkpoint window input/output schema mismatch"));
                     }
-                    if matches!(spec.kind, WindowKind::SlidingCount { .. }) {
+                    if checkpointable_buffered(spec.kind) {
                         // BWF1 stores evaluated inputs with the scalar value
                         // codec; nested/Dynamic inputs have no stable encoding.
                         for call in &spec.aggs {
@@ -338,7 +351,7 @@ impl CheckpointPlan {
                                 let ty = call.input_type(input)?;
                                 if ty.is_nested() || ty == sparrow_model::DataType::Dynamic {
                                     return Err(rejected(
-                                        "sliding count checkpoint excludes nested/Dynamic aggregate inputs",
+                                        "buffered window checkpoint excludes nested/Dynamic aggregate inputs",
                                     ));
                                 }
                             }
@@ -346,7 +359,7 @@ impl CheckpointPlan {
                     }
                     states.push(StateParticipant {
                         id: ParticipantId::window(*operator),
-                        codec: if matches!(spec.kind, WindowKind::SlidingCount { .. }) {
+                        codec: if checkpointable_buffered(spec.kind) {
                             BUFFERED_WINDOW_STATE_CODEC
                         } else if spec.has_extended_aggs() {
                             WINDOW_EXT_STATE_CODEC
@@ -517,9 +530,15 @@ impl CheckpointPlan {
             .iter()
             .any(|s| matches!(s.codec, WINDOW_STATE_CODEC | WINDOW_EXT_STATE_CODEC) && matches!(s.window_kind, 2 | 3))
     }
-    /// A codec 4 participant selects the strict v31/v32 profiles.
+    /// A codec 4 participant selects the strict v31/v32/v33 profiles.
     pub fn has_buffered_state(&self) -> bool {
         self.states.iter().any(|s| s.codec == BUFFERED_WINDOW_STATE_CODEC)
+    }
+    /// Codec 4 ET sliding (kind 7) / ET session (kind 9): File v33 only.
+    pub fn has_buffered_event_time_state(&self) -> bool {
+        self.states
+            .iter()
+            .any(|s| s.codec == BUFFERED_WINDOW_STATE_CODEC && matches!(s.window_kind, 7 | 9))
     }
     /// Codec 3 participants select the strict v29/v30 profiles.
     pub fn has_extended_state(&self) -> bool {
@@ -950,7 +969,7 @@ impl CheckpointPlan {
                     && matches!(state.window_kind, 1..=3));
             let valid_buffered = state.codec == BUFFERED_WINDOW_STATE_CODEC
                 && slot.raw() == 1
-                && state.window_kind == 5;
+                && matches!(state.window_kind, 5 | 7 | 9);
             let valid_iot = state.codec == IOT_STATE_CODEC
                 && slot.raw() == 3
                 && matches!(state.window_kind, 4..=15);
