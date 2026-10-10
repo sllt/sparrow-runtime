@@ -330,3 +330,27 @@ async fn k54_preview_controlled_time_and_rejections() {
     let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, json!({"sql":"SELECT device_id FROM sensors WHERE temperature > 5","events":many,"limits":{"events":512}})).await;
     assert_eq!(r.st, StatusCode::OK, "{}", r.v);
 }
+
+#[tokio::test]
+async fn k54_preview_iot_change_and_debounce() {
+    let s = setup().await;
+    let cat = json!([{"name":"m","fields":[{"name":"device_id","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false}]}]);
+    let iot = |kind: &str, timing: Value| {
+        let mut n = json!({"id":2,"kind":kind,"iot":{"keys":["device_id"],"fields":["v"],"emit_first":true,"ttl_micros":0,"max_keys":16,"invalid":"error"},"out":[3]});
+        if !timing.is_null() { n["iot"]["timing"] = timing; n["iot"]["emit_first"] = json!(false); }
+        json!({"version":1,"pipeline_id":5,"revision_id":1,"catalog":cat,"nodes":[
+            {"id":1,"kind":"memory_source","table":"m","out":[2]}, n, {"id":3,"kind":"capture_sink","name":"out"}]})
+    };
+    let d = |v: i64| json!({"type":"data","row":{"device_id":"a","v":v}});
+    let steps = |r: &R| r.v["steps"].as_array().unwrap().iter().map(|x| x["output_rows"].as_u64().unwrap()).collect::<Vec<_>>();
+    let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, json!({"graph": iot("change_detect", Value::Null), "events":[d(1), d(1), d(2), d(2)]})).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+    assert_eq!(steps(&r), vec![1, 0, 1, 0]);
+    // Debounce on the paused clock: quiet period elapses only via advance_clock.
+    let timing = json!({"kind":"debounce","clock":"paused","quiet_micros":1000,"max_wait_micros":10000,"leading":false,"trailing":true,"reset_on_repeat":true});
+    let r = call(&s, Method::POST, "/v1/preview", OPERATOR, None, json!({"graph": iot("debounce", timing), "events":[
+        d(1), {"type":"advance_clock","to_micros":500}, d(2), {"type":"advance_clock","to_micros":1499}, {"type":"advance_clock","to_micros":1500}]})).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+    assert_eq!(steps(&r), vec![0, 0, 0, 0, 1], "{}", r.v);
+    assert_eq!(r.v["steps"][4]["rows"][0]["v"], 2);
+}
