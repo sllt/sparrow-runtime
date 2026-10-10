@@ -1,0 +1,32 @@
+{
+  "name": "sparrow-workbench",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Sparrow K5 ops workbench (static, served at /ui/ by sparrow-server --ui-dir)",
+  "engines": { "node": ">=20.19.2 <21", "npm": ">=9.2.0" },
+  "packageManager": "npm@9.2.0",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc -b --noEmit",
+    "test": "vitest run",
+    "build": "tsc -b --noEmit && vite build",
+    "e2e": "playwright test"
+  },
+  "dependencies": {
+    "lossless-json": "4.3.1",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "react-router-dom": "7.9.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "@vitejs/plugin-react": "4.7.0",
+    "jsdom": "27.0.1",
+    "typescript": "5.9.3",
+    "vite": "6.4.1",
+    "vitest": "3.2.4"
+  }
+}

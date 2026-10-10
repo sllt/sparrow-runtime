@@ -1,0 +1,66 @@
+/* Sparrow workbench design tokens. One small token system, no UI framework. */
+:root {
+  --font-sans: "Inter", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+
+  --fs-xs: 12px; --fs-sm: 13px; --fs-md: 14px; --fs-lg: 16px; --fs-xl: 20px; --fs-2xl: 26px;
+  --lh: 1.55;
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 20px; --sp-6: 24px; --sp-8: 32px; --sp-10: 40px;
+  --r-sm: 6px; --r-md: 10px; --r-lg: 14px; --r-pill: 999px;
+  --sidebar-w: 232px;
+  --ease: cubic-bezier(.2,.7,.2,1);
+
+  /* light */
+  --bg: #f6f7fb;
+  --bg-elev: #ffffff;
+  --bg-sunken: #eef0f6;
+  --bg-hover: #f1f3f9;
+  --border: #e3e6ef;
+  --border-strong: #cfd4e2;
+  --text: #171a2b;
+  --text-2: #4a5068;
+  --text-3: #7a8099;
+  --accent: #4f46e5;
+  --accent-2: #6366f1;
+  --accent-soft: #eef0ff;
+  --accent-text: #ffffff;
+  --focus: 0 0 0 3px rgba(79,70,229,.35);
+  --shadow-sm: 0 1px 2px rgba(20,24,46,.06);
+  --shadow-md: 0 1px 2px rgba(20,24,46,.05), 0 8px 24px -12px rgba(20,24,46,.18);
+
+  /* status (text on soft background passes WCAG AA) */
+  --ok: #0f7b4b;      --ok-soft: #e3f6ec;    --ok-dot: #16a34a;
+  --warn: #8a5300;    --warn-soft: #fff3d6;  --warn-dot: #f59e0b;
+  --bad: #b42318;     --bad-soft: #fde7e5;   --bad-dot: #ef4444;
+  --info: #1d4ed8;    --info-soft: #e5edff;  --info-dot: #3b82f6;
+  --idle: #4a5068;    --idle-soft: #eceef4;  --idle-dot: #94a3b8;
+  --muted: #5b6178;   --muted-soft: #f0f1f5; --muted-dot: #b4b9c9;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0d0f17;
+  --bg-elev: #151824;
+  --bg-sunken: #10131d;
+  --bg-hover: #1c2030;
+  --border: #252a3b;
+  --border-strong: #343a50;
+  --text: #e8eaf3;
+  --text-2: #aab0c6;
+  --text-3: #7b829c;
+  --accent: #818cf8;
+  --accent-2: #a5b4fc;
+  --accent-soft: #1e2042;
+  --accent-text: #0d0f17;
+  --focus: 0 0 0 3px rgba(129,140,248,.45);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+  --shadow-md: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px -16px rgba(0,0,0,.7);
+
+  --ok: #5ee0a0;   --ok-soft: #0f2a1f;   --ok-dot: #34d399;
+  --warn: #fbc96b; --warn-soft: #2e2410; --warn-dot: #fbbf24;
+  --bad: #ff9b93;  --bad-soft: #351616;  --bad-dot: #f87171;
+  --info: #9db8ff; --info-soft: #172344; --info-dot: #60a5fa;
+  --idle: #b3b9cf; --idle-soft: #1e2231; --idle-dot: #64748b;
+  --muted: #9aa0b8; --muted-soft: #1a1d2a; --muted-dot: #4b5168;
+  color-scheme: dark;
+}
