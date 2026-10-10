@@ -14,12 +14,29 @@ pub(super) fn task<'a>(
     tx: &'a MailboxTx,
     capture: &'a SharedCapture,
 ) -> Result<ChargedWindowFuture<impl std::future::Future<Output = Result<usize>> + 'a>> {
-    // Only a prepared codec 4 participant (v31/v32 sliding count, v33 ET) runs aligned.
-    if ctx.ordered_time || ctx.aligned.is_some() != prepared.is_some() {
+    // Only a prepared codec 4 participant (v31/v32 sliding count, v33 ET,
+    // v34/v35 PT on the durable clock) runs aligned.
+    let pt_ordered = ctx.ordered_time && prepared.as_ref().is_some_and(|op| op.is_pt() && op.is_durable());
+    if (ctx.ordered_time && !pt_ordered)
+        || ctx.aligned.is_some() != prepared.is_some()
+        || prepared.as_ref().is_some_and(|op| op.is_pt() && !ctx.ordered_time)
+    {
         return Err(SparrowError::new(
             ErrorCode::UnsupportedRestore,
-            "buffered windows other than v31/v32 sliding count and v33 ET sliding/session require restart_fresh without a durable clock",
+            "buffered windows other than v31/v32 sliding count, v33 ET sliding/session and v34/v35 PT sliding/session require restart_fresh without a durable clock",
         ));
+    }
+    if pt_ordered {
+        let op = prepared.expect("checked");
+        let future = ordered_run(ctx, operator, op, rx, tx);
+        let credit = ctx.owner.acquire(
+            sparrow_model::CreditKind::Reservation,
+            std::mem::size_of_val(&future).saturating_add(64),
+        )?;
+        return Ok(ChargedWindowFuture {
+            future: Box::pin(OrderedOrLive::Ordered(Box::pin(future))),
+            _credit: credit,
+        });
     }
     let future = run(ctx, operator, prepared, spec, input, rx, tx, capture);
     let credit = ctx.owner.acquire(
@@ -27,9 +44,150 @@ pub(super) fn task<'a>(
         std::mem::size_of_val(&future).saturating_add(64),
     )?;
     Ok(ChargedWindowFuture {
-        future: Box::pin(future),
+        future: Box::pin(OrderedOrLive::Live(Box::pin(future))),
         _credit: credit,
     })
+}
+
+/// One concrete future type for both executors.
+enum OrderedOrLive<A, B> {
+    Ordered(std::pin::Pin<Box<A>>),
+    Live(std::pin::Pin<Box<B>>),
+}
+
+impl<A, B> std::future::Future for OrderedOrLive<A, B>
+where
+    A: std::future::Future<Output = Result<usize>>,
+    B: std::future::Future<Output = Result<usize>>,
+{
+    type Output = Result<usize>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.get_mut() {
+            OrderedOrLive::Ordered(f) => f.as_mut().poll(cx),
+            OrderedOrLive::Live(f) => f.as_mut().poll(cx),
+        }
+    }
+}
+
+/// v34/v35 PT sliding/session on the durable logical clock (v16/v17
+/// contract): never samples or sleeps on a host clock. A `ProcessingTime`
+/// control is forwarded first, then due outputs are drained in stable
+/// (deadline, key) order, then later input/barriers are handled. Restart and
+/// replay of the uncommitted suffix never advance time; there is no catch-up.
+async fn ordered_run(
+    ctx: &JobCtx,
+    operator: sparrow_model::OperatorId,
+    mut op: BufferedWindow,
+    rx: &mut MailboxRx,
+    tx: &MailboxTx,
+) -> Result<usize> {
+    let mut now = ctx.clock.now_micros();
+    // The prepared operator is already bound to the restored/initial cut.
+    if op.now(now)? != now {
+        return Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            "PT buffered clock differs from the processing-time cut",
+        ));
+    }
+    let mut n = 0usize;
+    let mut timers = TimerReporter { ctx, live: 0, cancelled: 0 };
+    crate::process_fault::pt_clock_log("start", now, 0);
+    ctx.metrics.record_state(op.key_count() as u64, op.retention_bytes() as u64);
+    loop {
+        timers.sample(op.timers(), 0);
+        let envelope = tokio::select! { biased; _ = ctx.cancel.cancelled() => break, e = rx.recv() => e? };
+        let Some(mut envelope) = envelope else {
+            if !ctx.cancel.is_cancelled() {
+                return Err(SparrowError::new(
+                    ErrorCode::JobFailed,
+                    "ordered time window input closed without shutdown",
+                ));
+            }
+            break;
+        };
+        let (batch, control) = envelope.take();
+        if let Some(batch) = batch {
+            for row in batch.rows() {
+                charge(ctx, op.work_bound()).await?;
+                let started = std::time::Instant::now();
+                let result = op.push(row, now);
+                if let Some(obs) = &ctx.observation {
+                    obs.record(Latency::Window, started.elapsed());
+                }
+                match result? {
+                    Ingest::Accepted(Some(out)) => {
+                        n += out.num_rows();
+                        if !tx.send(out).await? {
+                            return Ok(n);
+                        }
+                    }
+                    Ingest::Accepted(None) => {}
+                    Ingest::Future | Ingest::Late => {
+                        return Err(SparrowError::new(
+                            ErrorCode::Internal,
+                            "PT buffered window classified an arrival as late/future",
+                        ))
+                    }
+                }
+            }
+            crate::process_fault::pt_clock_log("rows", now, batch.num_rows());
+            crate::process_fault::window_rows_applied(batch.num_rows());
+            ctx.metrics.record_state(op.key_count() as u64, op.retention_bytes() as u64);
+        }
+        if let Some(control) = control {
+            match control {
+                StreamControl::ProcessingTime { micros } => {
+                    if micros < now {
+                        return Err(SparrowError::new(
+                            ErrorCode::UnsupportedRestore,
+                            "processing time cannot move backwards",
+                        ));
+                    }
+                    now = op.now(micros)?;
+                    crate::process_fault::pt_clock_log("tick", now, 0);
+                    if !tx.send_control(StreamControl::ProcessingTime { micros }).await? {
+                        break;
+                    }
+                    // Process-test hook: the tick is applied, its due outputs
+                    // are not yet emitted (timer-driven cuts).
+                    #[cfg(feature = "process-fault-pause")]
+                    {
+                        let next = op.output_deadline();
+                        crate::process_fault::pt_time_applied(
+                            next.is_some_and(|d| d <= now),
+                            next.map(|d| d - now),
+                        );
+                    }
+                    if !drain(ctx, &mut op, tx, now, &mut n).await? {
+                        break;
+                    }
+                }
+                StreamControl::CheckpointBarrier { checkpoint_id } => {
+                    let aligned = ctx.aligned.as_ref().expect("ordered admission");
+                    if aligned.acks.is_active(checkpoint_id) {
+                        let frozen = crate::barrier::EncodedFreeze::from_buffered(
+                            &op, operator, &ctx.owner, ctx.max_state_keys);
+                        aligned.acks.state_frozen(checkpoint_id, operator, frozen).await;
+                    }
+                    if !tx.send_control(StreamControl::CheckpointBarrier { checkpoint_id }).await? {
+                        break;
+                    }
+                }
+                _ => {
+                    return Err(SparrowError::new(
+                        ErrorCode::UnsupportedRestore,
+                        "PT buffered window on the durable clock accepts only time and barrier controls",
+                    ))
+                }
+            }
+        }
+    }
+    drop(op);
+    timers.sample(0, 0);
+    Ok(n)
 }
 
 async fn charge(ctx: &JobCtx, mut units: u64) -> Result<()> {

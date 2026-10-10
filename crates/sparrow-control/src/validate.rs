@@ -1735,9 +1735,17 @@ fn validate_aligned_plan_inner(
             "UNNEST/stream Join are restart_fresh only, without checkpoint or restore",
         ));
     }
+    let wants_checkpoint = recovery.is_aligned()
+        || spec.restore.is_some()
+        || spec.checkpoint.is_some()
+        || spec.checkpoint_dir.is_some();
+    if is_pt_window_plan(plan) && wants_checkpoint {
+        validate_pt_window_profile(spec, plan, recovery)?;
+    }
     if plan.has_extended_aggs()
         && !is_sliding_count_plan(plan)
         && !is_buffered_et_plan(plan)
+        && !is_pt_window_plan(plan)
         && (recovery.is_aligned()
             || spec.restore.is_some()
             || spec.checkpoint.is_some()
@@ -1755,8 +1763,10 @@ fn validate_aligned_plan_inner(
             validate_sliding_count_profile(spec, plan, recovery)?;
         } else if is_buffered_et_plan(plan) {
             validate_buffered_et_profile(spec, plan, recovery)?;
+        } else if is_pt_window_plan(plan) {
+            // validated above (v34/v35)
         } else {
-            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"new hopping-PT / PT sliding/session windows currently require restart_fresh without checkpoint or restore (sliding count has v31/v32, ET sliding/session have File v33)"));
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"new window kinds require restart_fresh without checkpoint or restore unless they form a published single-window profile (sliding count v31/v32, ET sliding/session File v33, PT windows v34/v35)"));
         }
     }
     let has_actions = spec.sink.action.is_some()
@@ -1880,6 +1890,72 @@ fn is_sliding_count_plan(plan: &PhysicalPlan) -> bool {
         }
     }
     any
+}
+
+/// Exactly one window stage and it has the v34/v35 PT profile: PT hopping,
+/// PT sliding, PT session, or PT tumbling with new aggregates.
+fn is_pt_window_plan(plan: &PhysicalPlan) -> bool {
+    // Any PT-profile window routes here; the validator then requires it to
+    // be the only state.
+    plan.stages.iter().any(|s| matches!(s,
+        sparrow_plan::PhysicalStage::WindowAgg { spec, .. }
+            if sparrow_plan::checkpoint::pt_window_profile(spec.kind, spec.has_extended_aggs())))
+}
+
+/// PT hopping / sliding / session and PT tumbling with new aggregates
+/// (sub-batch 2c) recover only as the single state of a linear paused-time
+/// File (v34) or JetStream (v35) plan on the durable logical clock (the v16 /
+/// v17 mechanism: one decision per tick/row, no wall-clock catch-up). Not
+/// combined with TTL/HoldFor/IoT or any second state (S2 Q5).
+fn validate_pt_window_profile(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+    recovery: RecoveryPolicy,
+) -> Result<()> {
+    let reject = |message: &str| {
+        Err(SparrowError::new(
+            ErrorCode::UnsupportedRestore,
+            format!("PT window checkpoint profile v34/v35: {message}"),
+        ))
+    };
+    if !recovery.is_aligned() {
+        return reject("checkpoint/restore requires recovery=aligned");
+    }
+    if spec.graph_io.is_some() || plan.edges.is_some() {
+        return reject("DAG plans are not supported; use a linear plan");
+    }
+    if !spec.reference_tables.is_empty() || spec.has_live_lookups() {
+        return reject("reference/Lookup tables are not supported");
+    }
+    if plan.has_iot() {
+        return reject("IoT state (TTL, HoldFor, timed operators, silence) cannot be combined with a PT window");
+    }
+    if !plan.side_outputs.is_empty() || !plan.source_times.is_empty() {
+        return reject("side outputs and source-time bindings are not supported");
+    }
+    let windows = plan
+        .stages
+        .iter()
+        .filter(|s| matches!(s, sparrow_plan::PhysicalStage::WindowAgg { .. }))
+        .count();
+    if windows != 1 {
+        return reject("exactly one PT window and no other window state is supported");
+    }
+    let kind = match spec.source.kind.as_str() {
+        "file" | "file_replay" | "replay" => sparrow_runtime::processing_cut::FILE_KIND,
+        "jetstream" => sparrow_runtime::processing_cut::JETSTREAM_KIND,
+        _ => return reject("source must be a linear append-only File or JetStream source"),
+    };
+    validate_paused_time_profile(spec, plan)?;
+    let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    let version = sparrow_runtime::snapshot_version_for(&manifest, kind)?;
+    if !matches!(
+        version,
+        sparrow_runtime::PT_WINDOW_FILE_SNAPSHOT_VERSION | sparrow_runtime::PT_WINDOW_RELIABLE_SNAPSHOT_VERSION
+    ) {
+        return reject("plan does not select the PT window profile");
+    }
+    Ok(())
 }
 
 /// Exactly one new-kind window, and it is ET sliding or ET session (v33).
@@ -2734,7 +2810,7 @@ fn effective_guarantees_with_plan_inner(
                 "stored_state":"evaluated_aggregate_inputs_of_last_size_arrivals_per_key",
                 "key_expiry":"none; bounded_only_by_max_keys",
                 "restore_compatibility":"strict_full_computation_semantics; incompatible_is_rejected_without_state_reset_or_old_checkpoint_fallback"},
-            "not_enabled":["processing_time_hopping_sliding_session(2c)","DAG","references","IoT","side_outputs","multiple_windows","nested_or_Dynamic_inputs"],
+            "not_enabled":["DAG","references","IoT","side_outputs","multiple_windows","nested_or_Dynamic_inputs"],
             "buffered_rows_per_key_default":1024,"buffered_rows_per_key_max":16384
         });
         value["recovery_risk"] = serde_json::json!(if spec.recovery != "aligned" {
@@ -2743,6 +2819,48 @@ fn effective_guarantees_with_plan_inner(
             "required_HTTP_may_repeat_before_CURRENT; deduplicate_by_OutputSequence; no_exactly_once"
         } else {
             "required_HTTP_may_repeat_uncommitted_suffix; File_v31_has_no_stable_output_id; no_exactly_once"
+        });
+        return value;
+    }
+    if is_pt_window_plan(plan) && !plan.has_analysis() {
+        let mut candidate = spec.clone();
+        candidate.recovery = "aligned".into();
+        let checked = validate_pt_window_profile(&candidate, plan, RecoveryPolicy::Aligned)
+            .and_then(|_| validate_aligned_plan(&candidate, plan));
+        let jetstream = spec.source.kind == "jetstream";
+        let version = sparrow_plan::CheckpointPlan::from_physical(plan).ok().and_then(|p| {
+            sparrow_runtime::snapshot_version_for(
+                &p,
+                if jetstream {
+                    sparrow_runtime::processing_cut::JETSTREAM_KIND
+                } else {
+                    sparrow_runtime::processing_cut::FILE_KIND
+                },
+            )
+            .ok()
+        });
+        value["aligned_eligible"] = serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
+        value["windows"] = serde_json::json!({
+            "maturity":"development_preview","certified":false,
+            "recovery": if spec.recovery == "aligned" { "aligned" } else { "restart_fresh" },
+            "aligned_profile":"processing_time_windows_v34_v35",
+            "processing_time":{"snapshot_version":version,
+                "state_codec":"hopping: 1 (3 with new aggregates); sliding/session: 4; tumbling+new aggregates: 3",
+                "scope":"linear_append_only_File_v34_or_JetStream_v35; single_PT_window; required_HTTP_sink",
+                "clock":"paused_source_ordered (v16/v17 durable logical clock, PTC1 cut, TPD1 decisions)",
+                "downtime":"paused; startup_and_pending_replay_do_not_advance_time; no_wall_clock_catch_up",
+                "timers":"derived_from_state; next_tick_from_source_tick_generator; fire_without_new_input",
+                "hopping":"windows_may_start_before_0; start<=cut<end; count==0",
+                "session":"final_only; lateness_0",
+                "restore_compatibility":"strict_full_computation_semantics; incompatible_is_rejected_without_state_reset_or_old_checkpoint_fallback"},
+            "not_enabled":["TTL_HoldFor_or_other_state_combinations","DAG","references","side_outputs","multiple_windows","nested_or_Dynamic_inputs","historical_restore"],
+            "buffered_rows_per_key_default":1024,"buffered_rows_per_key_max":16384
+        });
+        value["recovery_risk"] = serde_json::json!(if spec.recovery != "aligned" {
+            "restart_fresh_loses_window_state"
+        } else {
+            "required_HTTP_may_repeat_before_CURRENT; deduplicate_by_output_identity; no_exactly_once"
         });
         return value;
     }
@@ -2767,7 +2885,7 @@ fn effective_guarantees_with_plan_inner(
                 "timers":"derived_from_state; no_idle_generator_on_linear_File; windows_close_only_on_new_event_or_EOF",
                 "future_skew":"known_limit: compared_with_replay_time_wall_clock (same as v3/v29)",
                 "restore_compatibility":"strict_full_computation_semantics; incompatible_is_rejected_without_state_reset_or_old_checkpoint_fallback"},
-            "not_enabled":["JetStream_event_time","processing_time_hopping_sliding_session(2c)","DAG","references","IoT","side_outputs","multiple_windows","nested_or_Dynamic_inputs"],
+            "not_enabled":["JetStream_event_time","DAG","references","IoT","side_outputs","multiple_windows","nested_or_Dynamic_inputs"],
             "buffered_rows_per_key_default":1024,"buffered_rows_per_key_max":16384
         });
         value["recovery_risk"] = serde_json::json!(if spec.recovery != "aligned" {

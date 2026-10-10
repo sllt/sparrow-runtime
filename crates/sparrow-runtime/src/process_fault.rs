@@ -17,6 +17,9 @@ mod imp {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static WINDOW_ROWS: AtomicU64 = AtomicU64::new(0);
+    // A PT tick with a due deadline was applied since the last manifest
+    // rename point (v34/v35 "output delivered, checkpoint not committed").
+    static DUE_SINCE_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     fn dir() -> Option<PathBuf> {
         std::env::var_os("SPARROW_FAULT_MARKER_DIR").map(PathBuf::from)
@@ -52,9 +55,16 @@ mod imp {
         Some(lease)
     }
 
+    /// Arm content `after_due` on `checkpoint_after_manifest_rename` pauses
+    /// only at the first manifest rename following a PT tick that had a due
+    /// deadline (its outputs were emitted before that checkpoint's barrier).
     pub fn pause(point: &str) {
+        let due = point == "checkpoint_after_manifest_rename" && DUE_SINCE_COMMIT.swap(false, Ordering::SeqCst);
         let Some(dir) = dir() else { return };
-        if dir.join(format!("{point}.arm")).exists() {
+        let Ok(text) = std::fs::read_to_string(dir.join(format!("{point}.arm"))) else {
+            return;
+        };
+        if text.trim() != "after_due" || due {
             park(&dir, point);
         }
     }
@@ -73,10 +83,63 @@ mod imp {
             park(&dir, "window_rows_applied");
         }
     }
+
+    /// v34/v35 harness observation: append "<pid> <kind> <micros> <rows>" to
+    /// `<dir>/pt_clock.log` (start / tick / rows). Lets the independent
+    /// oracle replay exactly the logical arrival times the process used.
+    pub fn pt_clock_log(kind: &str, micros: i64, rows: usize) {
+        let Some(dir) = dir() else { return };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("pt_clock.log"))
+        {
+            let _ = writeln!(file, "{} {kind} {micros} {rows}", std::process::id());
+            let _ = file.sync_data();
+        }
+    }
+
+    /// Timer-driven cut after a PT tick is applied and before its due
+    /// outputs are emitted. Arm file: `due <min_rows>` pauses when a deadline
+    /// is due at this tick; `near <micros> <min_rows>` pauses when the next
+    /// deadline is still in the future but within <micros> (about to fire).
+    pub fn pt_time_applied(due: bool, until_deadline: Option<i64>) {
+        if due {
+            DUE_SINCE_COMMIT.store(true, Ordering::SeqCst);
+        }
+        let Some(dir) = dir() else { return };
+        let Ok(text) = std::fs::read_to_string(dir.join("pt_time_applied.arm")) else {
+            return;
+        };
+        let rows = WINDOW_ROWS.load(Ordering::SeqCst);
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        let hit = match parts.as_slice() {
+            ["due", min] => due && min.parse::<u64>().is_ok_and(|m| rows >= m),
+            ["near", within, min] => {
+                !due
+                    && min.parse::<u64>().is_ok_and(|m| rows >= m)
+                    && within
+                        .parse::<i64>()
+                        .is_ok_and(|w| until_deadline.is_some_and(|d| d > 0 && d <= w))
+            }
+            _ => false,
+        };
+        if hit {
+            park(&dir, "pt_time_applied");
+        }
+    }
 }
 
 #[cfg(feature = "process-fault-pause")]
-pub use imp::{pause, restore_pressure, window_rows_applied};
+pub use imp::{pause, pt_clock_log, pt_time_applied, restore_pressure, window_rows_applied};
+
+#[cfg(not(feature = "process-fault-pause"))]
+#[inline(always)]
+pub fn pt_clock_log(_kind: &str, _micros: i64, _rows: usize) {}
+
+#[cfg(not(feature = "process-fault-pause"))]
+#[inline(always)]
+pub fn pt_time_applied(_due: bool, _until_deadline: Option<i64>) {}
 
 #[cfg(not(feature = "process-fault-pause"))]
 #[inline(always)]

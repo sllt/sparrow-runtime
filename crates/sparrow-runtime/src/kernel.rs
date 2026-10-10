@@ -863,7 +863,7 @@ impl Kernel {
         {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                "extended aggregates require the strict linear v29/v30 participant checkpoint profile",
+                "extended aggregates require a strict linear participant checkpoint profile (v29/v30, or v34/v35 for PT windows)",
             ));
         }
         for stage in &req.plan.stages {
@@ -877,18 +877,20 @@ impl Kernel {
                 }
             }
         }
-        // Only a strict v31/v32/v33 participant manifest (codec 4 buffered window)
-        // may run a new-kind window aligned; the rest stay restart_fresh.
+        // Only a strict v31-v35 participant manifest (codec 4 buffered window
+        // or the v34/v35 PT window) may run a new-kind window aligned; the
+        // rest stay restart_fresh.
+        let published = |p: &sparrow_plan::CheckpointPlan| p.has_buffered_state() || p.has_pt_window_state();
         if req.plan.has_new_windows()
             && req.aligned.as_ref().is_some_and(|aligned| {
-                aligned.pipeline.as_ref().is_none_or(|p| !p.plan.has_buffered_state())
+                aligned.pipeline.as_ref().is_none_or(|p| !published(&p.plan))
                     || !sparrow_plan::CheckpointPlan::from_physical(&req.plan)
-                        .is_ok_and(|live| live.has_buffered_state())
+                        .is_ok_and(|live| published(&live))
             })
         {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                "new hopping-PT / PT sliding/session windows are restart_fresh only (sliding count requires v31/v32, ET sliding/session require File v33)",
+                "new window kinds require their strict participant profile (sliding count v31/v32, ET sliding/session File v33, PT windows v34/v35)",
             ));
         }
         graph::validate_request(&req)?;
@@ -1095,6 +1097,8 @@ impl Kernel {
                         | crate::pipeline_checkpoint::RESAMPLE_FILE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::EXT_AGG_RELIABLE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::PT_WINDOW_FILE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::PT_WINDOW_RELIABLE_SNAPSHOT_VERSION
                 ) && aligned
                     .acks
                     .output_sequence()
@@ -3091,6 +3095,7 @@ async fn ordered_window_stage(
     if !op.is_event_time() {
         op.validate_processing_cut(now)?;
     }
+    crate::process_fault::pt_clock_log("start", now, 0);
     let mut n = 0;
     let mut timers = TimerReporter {
         ctx,
@@ -3118,6 +3123,8 @@ async fn ordered_window_stage(
                 .as_ref()
                 .filter(|g| g.event_time)
                 .map_or(now, |g| g.observed_micros());
+            // Harness log first: the window_rows_applied cut parks inside on_batch.
+            crate::process_fault::pt_clock_log("rows", observation, batch.num_rows());
             let emission = op.on_batch_without_timers(&batch, observation)?;
             n += emission.finals.len();
             if !emit_window(ctx, op, tx, capture, emission, Some(scratch)).await? {
@@ -3142,6 +3149,15 @@ async fn ordered_window_stage(
                     }
                     if op.is_event_time() {
                         continue;
+                    }
+                    crate::process_fault::pt_clock_log("tick", now, 0);
+                    #[cfg(feature = "process-fault-pause")]
+                    {
+                        let next = op.next_timer();
+                        crate::process_fault::pt_time_applied(
+                            next.is_some_and(|d| d <= now),
+                            next.map(|d| d - now),
+                        );
                     }
                     op.begin_due(now);
                     while let Some(out) =

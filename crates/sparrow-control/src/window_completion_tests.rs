@@ -67,6 +67,11 @@ fn windows_control_fresh_only_admission_and_honest_guarantees() {
             // Action sink is restart_fresh only, so it is still not eligible.
             assert_eq!(guarantee["windows"]["recovery"], "restart_fresh");
             assert_eq!(guarantee["windows"]["aligned_profile"], "sliding_count_v31_v32");
+        } else if assigner.contains("PROCESSING_TIME") {
+            // Sub-batch 2c: PT hopping/sliding/session have the v34/v35
+            // profile, but this Action sink is restart_fresh only.
+            assert_eq!(guarantee["windows"]["recovery"], "restart_fresh");
+            assert_eq!(guarantee["windows"]["aligned_profile"], "processing_time_windows_v34_v35");
         } else if assigner.starts_with("SLIDING(ts") || assigner.starts_with("SESSION(ts") {
             // Sub-batch 2b: ET sliding/session have the File v33 profile, but
             // this Action sink is restart_fresh only, so still not eligible.

@@ -620,3 +620,110 @@ impl HeldHttp {
         self.task.await.unwrap();
     }
 }
+
+// ---------------------------------------------------------------- 2c v34/v35
+
+fn pt_window_configuration(dir: &std::path::Path, url: &str, group: &str, aggs: &str) -> Value {
+    let mut value = configuration(dir, url, "debounce");
+    value.as_object_mut().unwrap().remove("graph");
+    value["sql"] = json!(format!("SELECT device_id, window_start, window_end, {aggs} FROM sensors GROUP BY device_id, {group}"));
+    value
+}
+
+const PT_GROUPS: [(&str, &str); 5] = [
+    ("HOP(PROCESSING_TIME, 100000, 300000)", "COUNT(*) AS c"),
+    ("HOP(PROCESSING_TIME, 100000, 300000)", "COUNT(*) AS c, LAST(active) AS l"),
+    ("SLIDING(PROCESSING_TIME, 300000)", "COUNT(*) AS c"),
+    ("SESSION(PROCESSING_TIME, 300000, 900000)", "COUNT(*) AS c, FIRST(active) AS f"),
+    ("TUMBLE(PROCESSING_TIME, 300000)", "COUNT(*) AS c, LAST(active) AS l"),
+];
+
+#[test]
+fn pt_window_control_profile_matrix_v34_v35_and_no_ttl_combination() {
+    let dir = scratch();
+    let store = store();
+    for (group, aggs) in PT_GROUPS {
+        let spec = parse(&pt_window_configuration(&dir.0, "http://127.0.0.1:1/ingest", group, aggs));
+        let plan = crate::bind_plan_with_store(&store, &spec, "time", 1).unwrap();
+        crate::validate_aligned_plan(&spec, &plan).unwrap_or_else(|e| panic!("{group} {aggs}: {e:?}"));
+        let g = crate::effective_guarantees_with_plan(&spec, &plan);
+        assert_eq!(g["aligned_eligible"], true, "{g}");
+        assert_eq!(g["windows"]["aligned_profile"], "processing_time_windows_v34_v35", "{g}");
+        assert_eq!(g["windows"]["processing_time"]["snapshot_version"], 34, "{g}");
+        for mutation in 0..6 {
+            let mut wrong = spec.clone();
+            match mutation {
+                0 => wrong.fail_on_decode = false,
+                1 => wrong.source.file_contract = Some("sealed".into()),
+                2 => wrong.checkpoint.as_mut().unwrap().resume_latest = false,
+                3 => wrong.sink.kind = "log".into(),
+                4 => wrong.checkpoint.as_mut().unwrap().interval_ms = Some(1),
+                _ => wrong.checkpoint_dir = None,
+            }
+            assert!(crate::validate_aligned_plan(&wrong, &plan).is_err(), "{group} mutation {mutation}");
+        }
+        let mut live = spec.clone();
+        live.recovery = "restart_fresh".into();
+        live.checkpoint = None;
+        live.checkpoint_dir = None;
+        assert!(crate::validate_aligned_plan(&live, &plan).is_ok(), "{group}: restart_fresh unchanged");
+    }
+    // PT tumbling with legacy aggregates keeps the v16 profile (regression).
+    let spec = parse(&pt_window_configuration(&dir.0, "http://127.0.0.1:1/ingest", "TUMBLE(PROCESSING_TIME, 300000)", "COUNT(*) AS c"));
+    let plan = crate::bind_plan_with_store(&store, &spec, "time", 1).unwrap();
+    crate::validate_aligned_plan(&spec, &plan).unwrap();
+    assert_eq!(crate::effective_guarantees_with_plan(&spec, &plan)["iot"]["snapshot_version"], 16);
+    // PT window + TTL/HoldFor (an IoT state) is refused (S2 Q5).
+    let mut value = completion_configuration(&dir.0, "http://127.0.0.1:1/ingest", &["ttl", "pt"]);
+    value["graph"]["nodes"][2]["window"] = json!({"kind":"hopping_processing_time","size_micros":300000,"slide_micros":100000});
+    if let Ok(spec) = PipelineSpec::from_json(&serde_json::to_vec(&value).unwrap()) {
+        if let Ok(plan) = crate::bind_plan_with_store(&store, &spec, "time", 1) {
+            assert!(crate::validate_aligned_plan(&spec, &plan).is_err(), "PT window + TTL must be refused");
+        }
+    }
+}
+
+/// File v34 end to end on the supervisor: a PT session restored after a
+/// kill, downtime does not advance the logical clock, and ticks alone (no new
+/// input) close the restored window.
+#[test]
+fn pt_window_file_v34_kill_restore_fires_restored_window_on_ticks_only() {
+    for (group, aggs) in [PT_GROUPS[3], PT_GROUPS[0]] {
+        let dir = scratch();
+        std::fs::write(dir.0.join("input.ndjson"), b"{\"device_id\":\"a\",\"active\":true}\n").unwrap();
+        let kernel = Arc::new(crate::host_kernel().unwrap());
+        kernel.block_on(async {
+            let http = sparrow_connectors::HttpCapture::start().await.unwrap();
+            let store = store();
+            store.put_allow("127.0.0.1", http.port()).unwrap();
+            let spec = parse(&pt_window_configuration(&dir.0, &http.url(), group, aggs));
+            store.put_pipeline("time", &spec, None).unwrap();
+            request_start(&store, "time", "test").unwrap();
+            let sup = Supervisor::new(store.clone(), kernel.clone(), false, None).unwrap();
+            sup.converge_once().await.unwrap();
+            wait_cut(&sup, &store, &dir.0, 1).await;
+            sup.kill_named("time").await.unwrap();
+            let saved = snapshot(&dir.0);
+            assert_eq!(sparrow_runtime::snapshot_version_for(&saved.plan, &saved.source.identity.kind).unwrap(), 34);
+            let before = outputs(&http).len();
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            request_start(&store, "time", "test").unwrap();
+            sup.converge_once().await.unwrap();
+            wait_output(&sup, &store, &http, before + 1).await;
+            sup.kill_named("time").await.unwrap();
+            let out = outputs(&http);
+            assert!(out.iter().all(|o| o["id"].is_string()), "{out:?}");
+            let first = &out[0];
+            let t = |o: &Value, f: &str| o["data"][f].as_i64().unwrap_or_else(|| panic!("{f}: {o}"));
+            let (s, e) = (t(first, "window_start"), t(first, "window_end"));
+            if group.starts_with("SESSION") {
+                assert_eq!(e - s, 300_000, "downtime must not stretch the session: {out:?}");
+            } else {
+                assert_eq!(e - s, 300_000);
+                assert!(out.iter().any(|o| t(o, "window_start") < 0), "PT hopping negative start: {out:?}");
+            }
+            sup.stop_all().await;
+            http.stop().await;
+        });
+    }
+}
