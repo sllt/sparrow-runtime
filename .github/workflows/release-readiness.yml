@@ -1,0 +1,85 @@
+name: release-readiness
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run:
+        description: Successful production-gates run for this exact ref
+        required: true
+        type: string
+      baseline_run:
+        description: Successful v39-capable production-gates run to upgrade from
+        required: true
+        type: string
+      build_connectors:
+        description: Also build/check one combined NATS+JetStream+WebSocket+Postgres package
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reuse matching production packages (no rebuild)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ inputs.candidate_run }}
+          BASELINE: ${{ inputs.baseline_run }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE" =~ ^[0-9]+$ && "$BASELINE" =~ ^[0-9]+$ ]]
+          mkdir -p artifacts
+          gh run view "$CANDIDATE" --json headSha,conclusion,name > artifacts/candidate-run.json
+          gh run view "$BASELINE" --json headSha,conclusion,name > artifacts/baseline-run.json
+          jq -e --arg sha "$GITHUB_SHA" '.headSha==$sha and .conclusion=="success" and .name=="production-gates"' artifacts/candidate-run.json
+          jq -e '.conclusion=="success" and .name=="production-gates"' artifacts/baseline-run.json
+          gh run download "$CANDIDATE" -n production-evidence -D "$RUNNER_TEMP/candidate"
+          gh run download "$BASELINE" -n production-evidence -D "$RUNNER_TEMP/baseline"
+          # upload-artifact does not retain executable mode.
+          chmod +x "$RUNNER_TEMP/"{candidate,baseline}/package/bin/*
+          for variant in candidate baseline; do
+            package="$RUNNER_TEMP/$variant/package"
+            (cd "$package" && sha256sum --strict -c SHA256SUMS) > "artifacts/$variant-checksums.log"
+            jq -e --arg sha "$(jq -r .headSha "artifacts/$variant-run.json")" '.source_commit==$sha' "$package/build.json"
+            cp "$package/build.json" "artifacts/$variant-build.json"
+          done
+      - name: Package inventory, cold backup, upgrade and rollback (one case)
+        run: |
+          set -euo pipefail
+          bash scripts/production-package-check.sh "$RUNNER_TEMP/candidate/package" artifacts/package-check
+          go vet tests/analysis-recovery-process/main.go
+          go build -o "$RUNNER_TEMP/release-process" tests/analysis-recovery-process/main.go
+          sha256sum "$RUNNER_TEMP/release-process" "$RUNNER_TEMP/"{candidate,baseline}/package/bin/sparrow-server > artifacts/binaries.sha256
+          timeout 120s "$RUNNER_TEMP/release-process" \
+            --server-bin "$RUNNER_TEMP/candidate/package/bin/sparrow-server" \
+            --upgrade-from "$RUNNER_TEMP/baseline/package/bin/sparrow-server" \
+            --out "$PWD/artifacts/upgrade" > artifacts/upgrade.log 2>&1 || {
+              tail -n 60 artifacts/upgrade.log; exit 1;
+            }
+          tail -n 5 artifacts/upgrade.log
+      - uses: actions/cache@v4
+        if: inputs.build_connectors
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-connectors-${{ runner.os }}-1.98.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            production-${{ runner.os }}-1.98.0-${{ hashFiles('Cargo.lock') }}
+      - name: Combined optional Connector package (one build, no broker matrix)
+        if: inputs.build_connectors
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.0 --profile minimal
+          SPARROW_BUILD_MODE=release SPARROW_NATS=1 SPARROW_JETSTREAM=1 SPARROW_WEBSOCKET=1 SPARROW_POSTGRES=1 \
+            bash scripts/production-build.sh artifacts/connectors-package
+          bash scripts/production-package-check.sh artifacts/connectors-package artifacts/connectors-check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-readiness-evidence
+          path: artifacts/

@@ -854,7 +854,7 @@ impl CheckpointStore {
     /// Commit a pre-encoded snapshot (incremental freeze encode). Fails
     /// closed before CURRENT if the payload exceeds [`MAX_SNAPSHOT_BYTES`].
     pub fn commit_encoded(&mut self, checkpoint_id: u64, payload: &[u8]) -> Result<u64> {
-        self.commit_bytes(checkpoint_id, payload, false)
+        self.commit_bytes(checkpoint_id, payload, None)
     }
 
     pub fn commit_prepared(&mut self, snapshot: &EncodedSnapshot) -> Result<u64> {
@@ -868,10 +868,10 @@ impl CheckpointStore {
                 "prepared snapshot exceeds store max_state_keys",
             ));
         }
-        self.commit_bytes(snapshot.checkpoint_id, snapshot.bytes(), true)
+        self.commit_bytes(snapshot.checkpoint_id, snapshot.bytes(), Some(snapshot.lease.owner()))
     }
 
-    fn commit_bytes(&mut self, checkpoint_id: u64, payload: &[u8], prepared: bool) -> Result<u64> {
+    fn commit_bytes(&mut self, checkpoint_id: u64, payload: &[u8], owner: Option<&Arc<MemoryOwner>>) -> Result<u64> {
         if self.read_only {
             return Err(SparrowError::new(
                 ErrorCode::PolicyDenied,
@@ -924,18 +924,22 @@ impl CheckpointStore {
         }
         // Public pre-encoded callers must not be able to publish an arbitrary
         // id-shaped byte string. Bounds are checked before this cold decode.
-        if !prepared {
+        if owner.is_none() {
             drop(StoredSnapshot::decode(
                 payload,
                 self.max_state_keys,
                 false,
             )?);
         }
+        // A prepared payload's lease does not cover the previous generation.
+        // Verification/fallback reads must acquire their own credit from the
+        // same Job (and Process) before loading any complete old payload.
+        let scan_mode = owner.map_or(LoadMode::Scan, LoadMode::ScanOwned);
         let protected = match read_current(&self.dir) {
             Ok(Some(current)) => {
                 // Preserve publication proof for pre-marker CURRENT stores
                 // before replacing CURRENT. Never bless an unverified generation.
-                match self.load_generation_mode(current, false) {
+                match self.load_generation_with(current, scan_mode) {
                     Ok(_) => {
                         if !self.was_published(current) {
                             self.record_publication(current)?;
@@ -944,17 +948,17 @@ impl CheckpointStore {
                     }
                     Err(error) if self.nonfallback_error(&error) => return Err(error),
                     Err(error) => Some(
-                        self.load_latest_valid_except(Some(current))?
+                        self.load_latest_valid_except_with(Some(current), scan_mode)?
                             .ok_or(error)?
-                            .id(),
+                            .0.id(),
                     ),
                 }
             }
             Ok(None) => None,
             Err(error) => Some(
-                self.load_latest_valid_except(None)?
+                self.load_latest_valid_except_with(None, scan_mode)?
                     .ok_or(error)?
-                    .id(),
+                    .0.id(),
             ),
         };
         self.prune(protected, payload.len() as u64 + MAX_MANIFEST_BYTES + 4096)?;
@@ -1127,6 +1131,7 @@ impl CheckpointStore {
         }
     }
 
+    #[cfg(test)]
     fn load_latest_valid_except(&self, skip: Option<u64>) -> Result<Option<StoredSnapshot>> {
         Ok(self.load_latest_valid_except_with(skip, LoadMode::Scan)?.map(|(snapshot, _)| snapshot))
     }
@@ -1154,11 +1159,6 @@ impl CheckpointStore {
             }
         }
         Ok(None)
-    }
-
-    fn load_generation_mode(&self, id: u64, materialize: bool) -> Result<StoredSnapshot> {
-        let mode = if materialize { LoadMode::Materialize } else { LoadMode::Scan };
-        self.load_generation_with(id, mode).map(|(snapshot, _)| snapshot)
     }
 
     /// Common Store restore entry. `LoadMode::Owned` reserves the payload
@@ -3349,6 +3349,58 @@ mod tests {
             "must fall back to a verified generation"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepared_commit_bills_previous_current_and_fallback_before_publication() {
+        for history in ["current", "bad-marker", "missing-manifest"] {
+            let dir = tmp();
+            let process = MemoryOwner::new(ResourceBudget::compact());
+            let owner = MemoryOwner::child(process.clone(), ResourceBudget::compact(), "checkpoint-test");
+            let schema = Schema::new(1, vec![Field::new(1, "v", DataType::Int64, false)]).unwrap();
+            let physical = sparrow_plan::PhysicalPlan {
+                pipeline: 1.into(), revision: 1.into(), edges: None,
+                side_outputs: vec![], source_times: vec![],
+                stages: vec![
+                    sparrow_plan::PhysicalStage::MemorySource { operator: 1.into(), name: "s".into(), schema: schema.clone() },
+                    sparrow_plan::PhysicalStage::CaptureSink { operator: 2.into(), name: "out".into(), schema },
+                ],
+            };
+            let plan = sparrow_plan::CheckpointPlan::from_physical(&physical).unwrap();
+            let position = SourcePosition::start(SourceIdentity { kind: "file".into(), path: "fixture".into(), size: 0, fingerprint: 0 });
+            let encode = |id| PipelineSnapshot::encode_frozen(id, &position, 0, 1, &plan,
+                crate::ParticipantAcks { attempt: 1, generation: [7;16], freezes: vec![], next_output: None }, &owner, 16).unwrap();
+            let mut store = CheckpointStore::open_for_plan_exclusive(&dir, 16, Default::default(), &plan, "file").unwrap();
+            store.activate_state_generation([7;16]).unwrap();
+            store.commit_prepared(&encode(1)).unwrap();
+            store.commit_prepared(&encode(2)).unwrap();
+            if history == "bad-marker" { fs::write(dir.join("CURRENT"), b"invalid\n").unwrap(); }
+            if history == "missing-manifest" { fs::remove_file(dir.join("chk-00000002/MANIFEST")).unwrap(); }
+            let current = fs::read(dir.join("CURRENT")).unwrap();
+            let generation = fs::read(dir.join("STATE_GENERATION")).unwrap();
+            let publication = fs::read(dir.join("chk-00000001/PUBLISHED")).unwrap();
+            let ids = list_generation_ids(&dir).unwrap();
+            let candidate = encode(3);
+            let available = owner.budget().reservation_bytes - owner.usage().reservation_bytes;
+            let pressure = owner.acquire(CreditKind::Reservation, available - 1024).unwrap();
+            let before = process.usage().physical_bytes;
+            let error = store.commit_prepared(&candidate).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceExhausted, "{history}: {error}");
+            assert_eq!(process.usage().physical_bytes, before, "scan must refund on failure");
+            assert_eq!(fs::read(dir.join("CURRENT")).unwrap(), current);
+            assert_eq!(fs::read(dir.join("STATE_GENERATION")).unwrap(), generation);
+            assert_eq!(fs::read(dir.join("chk-00000001/PUBLISHED")).unwrap(), publication);
+            assert_eq!(list_generation_ids(&dir).unwrap(), ids);
+            assert!(!dir.join("chk-00000003").exists());
+            drop(pressure);
+            assert_eq!(store.commit_prepared(&candidate).unwrap(), 3);
+            assert_eq!(store.recover_pipeline_required().unwrap().checkpoint_id, 3);
+            drop((candidate, store));
+            assert_eq!(owner.usage().physical_bytes, 0);
+            assert_eq!(process.usage().physical_bytes, 0);
+            assert_eq!(owner.accounting_errors_total(), 0);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

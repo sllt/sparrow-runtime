@@ -9,8 +9,8 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 
 - Event-time tumbling + hopping windows, watermarks, holdback, late side output
 - Processing-time tumbling windows and count windows (arrival-order; they do **not** impersonate event-time)
-- Window completion Preview: PT hopping, sliding count, per-event PT/ET sliding and bounded PT/ET sessions; **restart_fresh only**, see [`docs/WINDOWS.md`](docs/WINDOWS.md) for semantics and validation status
-- Bounded analysis Preview: collection/encoding functions, UNNEST, two-source ET interval/window inner/left joins, six additional aggregates and an independently admitted finite-query API. See [`docs/ANALYSIS.md`](docs/ANALYSIS.md) for limits and matching validation; new operators/aggregates are **restart_fresh only**, not production-certified.
+- Window completion Preview: PT hopping, sliding count, per-event PT/ET sliding and bounded PT/ET sessions; recovery is **profile-specific**, not arbitrary combinations. See [`docs/WINDOWS.md`](docs/WINDOWS.md) and the [recovery matrix](docs/PRODUCTION.md#recovery-support-matrix).
+- Bounded analysis Preview: collection/encoding functions, UNNEST, two-source ET interval/window inner/left joins, six additional aggregates and an independently admitted finite-query API. Limited aligned profiles v29–v39 cover declared aggregates, windows, analysis and business graphs; see [`docs/ANALYSIS.md`](docs/ANALYSIS.md). Not production-certified or exactly-once.
 - Plugin Preview: native, QuickJS-ng JavaScript and fuel-bounded WASM scalar functions; standalone process SDK for Source/Sink/Transform. Immutable packages, Ed25519 publisher policy, exact dependencies, retained catalog references, explicit hash approval and management API/CLI. Backends are independently opt-in and restart-fresh only; native programs remain trusted service-UID code, not a multi-tenant sandbox. See [`docs/PLUGINS.md`](docs/PLUGINS.md) and [`docs/EXTENSIONS.md`](docs/EXTENSIONS.md).
 - Incremental COUNT/SUM/AVG/MIN/MAX (checked integer overflow)
 - Versioned as-of-event-time lookup in embedded plans (not eligible for current Server aligned restore)
@@ -20,11 +20,11 @@ distributed Flink clone and **not** a Rust eKuiper clone.
 - A default process restart is a **fresh attempt**, not restore
 - `exactly_once` and generic `at_least_once` configs are **rejected**; the optional JetStream Preview has an explicit `checkpointed_at_least_once` contract
 
-当前里程碑 / current milestone: **V1**（production aligned recovery + coordinator + observability）。
+当前里程碑 / current milestone: **0.1.0 development Preview, batch 12 release readiness**. Core feature/recovery batches are implemented in their declared scopes; a published RC/tag and deployment certification are separate steps.
 
 Runtime contracts and compatibility notes: [`docs/RUNTIME.md`](docs/RUNTIME.md).
 K3 DAG Preview (Branch/Route/UnionAll, multiple I/O, bounded side outputs and a separate File graph checkpoint profile): [`docs/DAG.md`](docs/DAG.md).
-K4 IoT Preview (change detection, deadband and hysteresis, bounded keyed state and profile-specific recovery): [`docs/IOT.md`](docs/IOT.md). Paused-time profiles v14/v15 cover one linear HoldFor or Debounce on File/JetStream with durable decision replay and required HTTP output IDs. The v16/v17 extension adds PT tumbling windows, Change/Deadband positive TTL and up to two linear state participants; see the [precise scope and matching validation status](docs/IOT.md#linear-time-completion). File time DAGs use separate v18/PT and v19/ET profiles with required HTTP outputs, deterministic rounds and bounded Union replay; see the [scope](docs/DAG.md#time-graph-recovery) and [matching validation](docs/PRODUCTION.md#time-graph-validation). These serialized, per-decision checkpoint profiles are not the high-throughput path. Advanced alarm lifecycle remains unfinished; no automatic snapshot migration or production certification is implied.
+K4 IoT Preview includes Change/Deadband/Hysteresis, HoldFor/Debounce, Alarm lifecycle, source-aware Silence and Sampling/Resample: [`docs/IOT.md`](docs/IOT.md). File/JetStream recovery uses separate linear and File graph profiles; v39 adds pinned-reference business graphs. These durable-time profiles serialize decisions and are not the high-throughput path. Consult the [recovery matrix](docs/PRODUCTION.md#recovery-support-matrix); no automatic snapshot conversion or production certification is implied.
 
 Managed reference tables Preview: immutable revisions, SHA-256 bindings, atomic CAS upsert/delete/rollback, optional per-batch hot following, and bounded asynchronous HTTP Lookup with ordered output and TTL caching. Live/remote lookups are restart-fresh only and require explicit restart after failure/process restart; they are not historical snapshots. Existing static profiles v8–v11 and dependency-aware GC remain unchanged. Catalog is v4; downgrade requires matching catalog/config backups. See [`docs/REFERENCE_TABLES.md`](docs/REFERENCE_TABLES.md) for contracts and [`docs/PRODUCTION.md`](docs/PRODUCTION.md) for matching evidence.
 Non-blocking issues and optimization backlog: [`docs/OPTIMIZATION_BACKLOG.md`](docs/OPTIMIZATION_BACKLOG.md).
@@ -35,6 +35,7 @@ Optional [durable HTTP output](docs/DURABLE_OUTPUT.md) adds bounded local persis
 finite retries, output DLQ and authenticated replay/purge. Its receipt means local
 commit, **not remote 2xx**; aligned scope is initially File/JetStream with zero
 state or one legacy Count window. Default HTTP delivery remains unchanged.
+Optional [input DLQ and recovery operations](docs/RECOVERY_OPERATIONS.md) cover the same selected zero/legacy-Count scope: explicit resume, replay, fork and corrected-message replay. They do not inherit new-window/Join recovery eligibility.
 See the runtime contracts before changing queue, body or ordering settings.
 Server MQTT byte accounting is on by default (256 KiB payload credit); Linux
 QUICKACK remains off. For latency-sensitive colocated Mosquitto deployments,
@@ -187,17 +188,18 @@ OperatorId/StateSlotKey checks, coordinator timeout/abort/stop, recover
 from committed only), Graph validate/explain, Connector SDK conformance,
 capability matrix rejects, status `effective` guarantees, `/v1/metrics`.
 
-**Not exactly-once.** MQTT restore is rejected. Session windows (L=0) and
-local parallelism shards are optional/incomplete and do not block this
-release.
+**Not exactly-once.** MQTT restore is rejected. Bounded Session windows (L=0)
+are implemented; local parallelism shards remain a deferred extension.
 
-**Not shipped:** WASM operator runtime (optional spike under
-`experiments/wasm-spike/`, off default build), Graph Designer UI, session
-late merge, retract, unrestricted/recoverable stream-stream join, distributed shuffle. Bounded fresh-only Join is described in [`docs/ANALYSIS.md`](docs/ANALYSIS.md). NATS JetStream is an optional, default-off Preview; see [`docs/JETSTREAM.md`](docs/JETSTREAM.md).
+**Not shipped:** arbitrary stateful WASM operators/UDAF, Graph Designer UI,
+session late merge, retract, unrestricted Join topologies and distributed shuffle.
+Scalar WASM and limited recoverable Join are shipped as opt-in/limited Preview;
+see [`docs/PLUGINS.md`](docs/PLUGINS.md) and [`docs/ANALYSIS.md`](docs/ANALYSIS.md).
+NATS JetStream is optional and default-off; see [`docs/JETSTREAM.md`](docs/JETSTREAM.md).
 
 See `docs/v1-report.md`.
 
-`sqlparser = "=0.62.0"` is used only by `sparrow-sql`.
+`sqlparser = "=0.62.0"` is a differential-test dependency, not the production SQL parser.
 `sparrow-runtime` does **not** depend on HTTP, SQLite, MQTT, Axum, Arrow, or SQL crates.
 
 ## Binary
@@ -216,14 +218,21 @@ Production / `--no-default-features`: `EmbeddedBroker`, `HttpCapture`, and `Demo
 
 Optional **JetStream Preview**: build with `SPARROW_JETSTREAM=1` using `scripts/production-build.sh`. It adds checkpoint-backed HTTP acceptance, stable output IDs, bounded replay and explicit failure for supported zero/Count-window pipelines; it is not a default dependency, distributed HA, a durable HTTP outbox or a production certification. See [the exact profile and recovery restrictions](docs/JETSTREAM.md).
 
+The same package builder accepts independent `SPARROW_NATS=1`, `SPARROW_WEBSOCKET=1`
+and `SPARROW_POSTGRES=1`. JetStream implies NATS Core. All flags default to `0`;
+selected features are recorded in `build.json`, not inferred from which docs are
+included. Kafka remains deferred. Package verification and cold backup/upgrade
+instructions are in [`docs/PRODUCTION.md`](docs/PRODUCTION.md#升级备份与回退).
+
 R12 adds ready-input batching, bounded asynchronous Explicit ACKs, idle pull backoff and nonfatal checkpoint timeouts. The [reproducible broker/process tests and scoped NATS benchmarks](docs/JETSTREAM.md#r12-validation) distinguish backlog-drain throughput from sustained input capacity; 10k/s paced tests still show queueing.
 
 Flags: `--bind` `--token` `--catalog` `--max-jobs` `--safe-mode` `--demo-io` `--allow-remote`.
 
 **Safe-mode restart protection:** failure holds survive history pruning and process
-restarts; an explicit `/start` clears the hold. Catalog schema v1 is automatically
-migrated to **v2** on open. Back up the catalog before upgrading; older binaries
-cannot open v2. See [`docs/RUNTIME.md`](docs/RUNTIME.md) for migration and retry semantics.
+restarts; an explicit `/start` clears the hold. Supported older catalog schemas
+are transactionally migrated to **v4** on open. Back up before upgrading;
+older readers may reject v4 or newer pipeline configuration. See
+[`docs/PRODUCTION.md`](docs/PRODUCTION.md#升级备份与回退) for whole-state rollback.
 
 **File path allowlist (N3/R3):** `check_data_path` rejects every `..` component, then canonicalizes the existing prefix before comparing roots. The original path is never used as a `starts_with` fallback. This avoids symlink-plus-parent traversal ambiguities. CWD is never a default root (systemd cwd can be `/`). When `SPARROW_DATA_ROOTS` is unset, the only default is `{temp_dir}/sparrow` — not `/tmp` as a whole. `--safe-mode` / `SPARROW_SAFE_MODE=1` without `SPARROW_DATA_ROOTS` denies file paths. Demos should export `SPARROW_DATA_ROOTS` to their workdir.
 

@@ -7,12 +7,28 @@ cd "$root"
 out=${1:?new package directory required}
 mode=${SPARROW_BUILD_MODE:-candidate}
 jetstream=${SPARROW_JETSTREAM:-0}
-case "$jetstream" in 0|1) ;; *) printf 'SPARROW_JETSTREAM must be 0 or 1\n' >&2; exit 2;; esac
+nats=${SPARROW_NATS:-0}
+websocket=${SPARROW_WEBSOCKET:-0}
+postgres=${SPARROW_POSTGRES:-0}
+for flag in SPARROW_JETSTREAM SPARROW_NATS SPARROW_WEBSOCKET SPARROW_POSTGRES; do
+    value=${!flag:-0}
+    case "$value" in 0|1) ;; *) printf '%s must be 0 or 1\n' "$flag" >&2; exit 2;; esac
+done
+# JetStream includes NATS Core; the independent NATS flag does not enable JS.
+if [[ "$jetstream" == 1 ]]; then nats=1; fi
+server_features=()
+if [[ "$jetstream" == 1 ]]; then server_features+=(jetstream);
+elif [[ "$nats" == 1 ]]; then server_features+=(nats); fi
+if [[ "$websocket" == 1 ]]; then server_features+=(websocket); fi
+if [[ "$postgres" == 1 ]]; then server_features+=(postgres); fi
 case "$mode" in candidate|release) ;; *) printf 'invalid SPARROW_BUILD_MODE\n' >&2; exit 2;; esac
 if [[ "$mode" == release ]]; then
     [[ $(git rev-parse --show-toplevel) == "$root" ]] || exit 2
     git diff --quiet HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml crates experiments scripts deploy .github tests sdk examples README.md docs
     test -z "$(git ls-files --others --exclude-standard -- Cargo.toml Cargo.lock rust-toolchain.toml crates experiments scripts deploy .github tests sdk examples README.md docs)"
+    if [[ -n ${SPARROW_BUILD_COMMIT:-} && "$SPARROW_BUILD_COMMIT" != "$(git rev-parse HEAD)" ]]; then
+        printf 'release source commit must match HEAD\n' >&2; exit 2
+    fi
 fi
 test ! -e "$out"
 [[ $(rustc --version) == 'rustc 1.98.0 '* ]] || { printf 'Rust 1.98.0 required\n' >&2; exit 2; }
@@ -20,20 +36,20 @@ host=$(rustc -vV | sed -n 's/^host: //p')
 [[ "$host" == x86_64-unknown-linux-gnu ]] || { printf 'Only Linux x86_64 is release-validated\n' >&2; exit 2; }
 mkdir -p "$out/bin" "$out/evidence" "$out/deploy" "$out/docs"
 out=$(cd "$out" && pwd)
-for source_dir in crates experiments scripts deploy .github tests sdk examples; do
+for source_dir in crates experiments scripts deploy .github tests sdk examples docs; do
     case "$out/" in "$root/$source_dir/"*) printf 'package must be outside fingerprinted source directories\n' >&2; exit 2;; esac
 done
 target=${CARGO_TARGET_DIR:-$root/target}
 mkdir -p "$target"
 target=$(cd "$target" && pwd)
-for source_dir in crates experiments scripts deploy .github tests sdk examples; do
+for source_dir in crates experiments scripts deploy .github tests sdk examples docs; do
     case "$target/" in "$root/$source_dir/"*) printf 'target must be outside fingerprinted source directories\n' >&2; exit 2;; esac
 done
 export CARGO_TARGET_DIR="$target"
 export SPARROW_BUILD_COMMIT=${SPARROW_BUILD_COMMIT:-$(git rev-parse HEAD)}
 # This is a source fingerprint, not a claim that a dirty build equals HEAD.
-{ printf '%s\n' Cargo.toml Cargo.lock rust-toolchain.toml;
-  find crates experiments scripts deploy .github tests sdk examples -type f ! -name '.DS_Store' | LC_ALL=C sort; } |
+{ printf '%s\n' Cargo.toml Cargo.lock rust-toolchain.toml README.md;
+  find crates experiments scripts deploy .github tests sdk examples docs -type f ! -name '.DS_Store' | LC_ALL=C sort; } |
     while IFS= read -r file_path; do sha256sum "$file_path"; done > "$out/evidence/source-files.sha256"
 (cd "$out" && sha256sum evidence/source-files.sha256) > "$out/evidence/source-manifest.sha256"
 # Do not silently ship raw local diffs (which can contain secrets). Source
@@ -47,7 +63,9 @@ cp Cargo.lock "$out/evidence/Cargo.lock"
 for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl sparrow-js-worker:sparrow-js-worker sparrow-wasm-worker:sparrow-wasm-worker sparrow-wasm-worker:sparrow-wasm-pack sparrow-plugin:sparrow-plugin-sign; do
     package=${pair%:*}; binary=${pair#*:}
     features=()
-    if [[ "$jetstream" == 1 && "$binary" == sparrow-server ]]; then features=(--features jetstream); fi
+    if [[ "$binary" == sparrow-server && ${#server_features[@]} -gt 0 ]]; then
+        features=(--features "$(IFS=,; printf '%s' "${server_features[*]}")")
+    fi
     cargo build --locked --release --quiet --target "$host" --no-default-features -p "$package" --bin "$binary" \
         "${features[@]}" \
         > "$out/evidence/$binary-build.log" 2>&1
@@ -81,8 +99,14 @@ for pair in sparrow-server:sparrow-server sparrow-cli:sparrowctl sparrow-js-work
     if [[ "$binary" == sparrow-wasm-* ]] && grep -Eq 'wasmi feature "(memory64|simd|wat|unstable)"' "$out/evidence/$binary-features.txt"; then
         printf 'Unexpected WASM execution proposal/input feature\n' >&2; exit 3
     fi
-    if [[ "$jetstream" == 0 || "$binary" == sparrowctl ]] && grep -q 'async-nats v' "$out/evidence/$binary-dependencies.txt"; then
+    if [[ "$nats" == 0 || "$binary" != sparrow-server ]] && grep -q 'async-nats v' "$out/evidence/$binary-dependencies.txt"; then
         printf 'NATS SDK leaked into a feature-off production binary\n' >&2; exit 3
+    fi
+    if [[ "$websocket" == 0 || "$binary" != sparrow-server ]] && grep -q 'tokio-tungstenite v' "$out/evidence/$binary-dependencies.txt"; then
+        printf 'WebSocket SDK leaked into a feature-off production binary\n' >&2; exit 3
+    fi
+    if [[ "$postgres" == 0 || "$binary" != sparrow-server ]] && grep -q 'tokio-postgres v' "$out/evidence/$binary-dependencies.txt"; then
+        printf 'PostgreSQL SDK leaked into a feature-off production binary\n' >&2; exit 3
     fi
     install -m 755 "$target/$host/release/$binary" "$out/bin/$binary"
 done
@@ -126,6 +150,15 @@ cp examples/extensions/Cargo.toml examples/extensions/Cargo.lock "$out/examples/
 cp examples/extensions/src/*.rs "$out/examples/extensions/src/"
 cp scripts/build-extension-example.sh "$out/scripts/"
 cp deploy/stream-actions.json deploy/pipeline-actions-{http,mqtt,file}.json "$out/deploy/"
+cp deploy/pipeline-durable-http.json "$out/deploy/"
+# Ship the operating contracts referred to by README/capabilities, not just
+# the old hand-picked K1/K4 pages. Root review notes and development plans are
+# deliberately not release contents.
+cp README.md "$out/"
+while IFS= read -r file_path; do
+    mkdir -p "$out/$(dirname "$file_path")"
+    cp "$file_path" "$out/$file_path"
+done < <(find docs -type f -name '*.md' ! -name 'DEVELOPMENT_*' | LC_ALL=C sort)
 if [[ "$jetstream" == 1 ]]; then
     cp deploy/pipeline-jetstream.json deploy/pipeline-jetstream-iot.json deploy/nats-jetstream-local.conf.example "$out/deploy/"
     cp docs/JETSTREAM.md "$out/docs/"
@@ -133,11 +166,14 @@ fi
 "$out/bin/sparrow-server" --version > "$out/evidence/server-version.txt"
 "$out/bin/sparrowctl" --version > "$out/evidence/cli-version.txt"
 jq -n --arg commit "$SPARROW_BUILD_COMMIT" --arg target "$host" --arg mode "$mode" \
-    --argjson jetstream "$jetstream" \
+    --argjson jetstream "$jetstream" --argjson nats "$nats" \
+    --argjson websocket "$websocket" --argjson postgres "$postgres" \
     --arg source "$(sha256sum "$out/evidence/source-files.sha256" | cut -d' ' -f1)" \
     '{format:"sparrow-build-v1",source_commit:$commit,source_manifest_sha256:$source,
       target:$target,rust:"1.98.0",profile:"release",build_mode:$mode,default_features:false,
-      jetstream_enabled:($jetstream==1),jetstream_maturity:"preview_not_profile_certified",
+      nats_enabled:($nats==1),jetstream_enabled:($jetstream==1),
+      websocket_enabled:($websocket==1),postgres_enabled:($postgres==1),
+      connector_maturity:"preview_not_profile_certified",jetstream_maturity:"preview_not_profile_certified",
       binaries:["sparrow-server","sparrowctl","sparrow-js-worker","sparrow-wasm-worker","sparrow-wasm-pack","sparrow-plugin-sign"],certification:"requires_matching_test_evidence"}' > "$out/build.json"
-(cd "$out" && find bin deploy docs evidence sdk examples scripts crates -type f -print | LC_ALL=C sort | while IFS= read -r file_path; do sha256sum "$file_path"; done; sha256sum build.json) > "$out/SHA256SUMS"
+(cd "$out" && find bin deploy docs evidence sdk examples scripts crates -type f -print | LC_ALL=C sort | while IFS= read -r file_path; do sha256sum "$file_path"; done; sha256sum build.json README.md) > "$out/SHA256SUMS"
 printf 'PRODUCTION_PACKAGE_OK %s\n' "$out"

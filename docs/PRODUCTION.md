@@ -507,6 +507,8 @@ Go driver-v5    4539f567433c161ac92b20ddc1396208f0810f7d413732e27fb5d6b52ec8c21d
 
 ## 构建与追溯
 
+生产包的可选 Connector 独立开关为 `SPARROW_NATS=1`、`SPARROW_JETSTREAM=1`、`SPARROW_WEBSOCKET=1`、`SPARROW_POSTGRES=1`，默认均为 0；JetStream 隐含 NATS Core，其他开关不相互开启。仅 Server 携带所选 SDK，CLI/worker 不继承。`build.json` 记录实际选择；包内文档覆盖全部合同不代表对应 feature 已编入。Kafka 继续暂缓。源码指纹包含 README 与 docs，release 模式不允许伪造与 HEAD 不同的 `SPARROW_BUILD_COMMIT`。
+
 ```sh
 bash scripts/production-build.sh /absolute/new/package
 cd /absolute/new/package && sha256sum -c SHA256SUMS
@@ -705,14 +707,18 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 
 **核心增强 B1 的额外 catalog 门禁：** 新候选将 catalog schema 升为 **v3**，加入不可变参考表 revision 与历史 pipeline dependency。即使当前没有 Lookup，首次打开旧 catalog 也会事务升级；旧 v2 binary 将拒绝 v3 catalog。回退必须使用停机一致的升级前 catalog 备份，不能编辑 version 数字或删除 pin 表来绕过。表发布、固定绑定、GC 和验证边界见 [REFERENCE_TABLES.md](REFERENCE_TABLES.md)。Catalog 兼容拒绝与 checkpoint codec 拒绝是两个独立检查，不能把前者当作已经验证后者。
 
-1. 保存配置 revision、capabilities、诊断与二进制/source manifest；先停 desired，再等待实际停止，关闭 Server，确认 writer lease 已释放。
-2. 在服务停止时一起备份 catalog（含存在的 `-wal/-shm`）、原 File 数据、**整个 checkpoint 目录**和对应密钥；校验备份。不要只复制 CURRENT，也不要热复制 SQLite 文件当成一致性备份。
-3. 在隔离目录用副本验证候选包启动、解密、validate/explain、指定恢复点和真实输出。只读列表不是备份可恢复验证。旧 snapshot codec 不就地升级，保留原件；不兼容时显式新 pipeline/fresh 或离线转换，不能编造恢复成功。
+**当前补充（第12批）：catalog 已为 v4（插件持久引用），上段 v3 是历史升级边界。** catalog 版本相同也不证明旧 binary 认识新的 Source/Sink 字段、恢复操作或 snapshot profile；必须对具体两包验证。部署状态还包括固定参考表版本、插件包/依赖及批准策略、input DLQ、output outbox、重放 artifact 与操作 lineage。后几项的身份相互绑定，不能只回退 catalog 或 CURRENT。
+
+1. 保存配置 revision、capabilities、诊断与二进制/source manifest；先停 desired，再等待实际停止。有持久 outbox 时同时显式 pause 投递，**pipeline stop 不会停止 sender**。关闭 Server 并等待正常退出，确认 writer lease 已释放；进程被强杀不算冷备份已就绪。
+2. 在服务停止时一起备份 catalog（含存在的 `-wal/-shm`）、原 File 数据、**整个 checkpoint 目录**、input DLQ/output outbox 的整个目录、恢复操作的 replay artifact，以及用到的插件包/依赖/信任策略；对应密钥单独受控保存。校验备份，并记录原绝对路径身份。不要只复制 CURRENT，也不要热复制 SQLite 文件当成一致性备份；JetStream 的 broker stream/KV/consumer 状态需按其协议另行保全，不在本地目录备份中。
+3. 在隔离环境用副本验证候选包启动、解密、validate/explain、适用的恢复点和真实输出。验证环境需保留记录的路径身份（例如在独立容器中挂载同一路径），不是随意改 source path 后宣称恢复。只读列表不是备份可恢复验证。旧 snapshot codec 不就地转换，保留原件；不兼容时显式新 pipeline/fresh，或在已支持范围内审批后重放重建，没有通用离线 codec 转换器。v18/v19/v22/v38/v39 等 CURRENT-only 图不能套用历史快照回放步骤。
    **配置预检覆盖全部仍会使用的 revision**：包括当前 desired、数值恢复/人工固定版本以及预定回滚版本，不只检查 latest。用候选版本对这些 spec 执行 validate/explain；source inbox / sink outbox 必须在 `1..=4096`，HTTP outbox 另限 1024。历史超限配置也会被拒绝，不在启动时静默 clamp；升级前发布兼容配置并验证流量/背压。数值恢复点进程重启后的 held 需纳入值班操作清单。
 4. 停服务后切换 `current` 到已校验的新目录再启动。确认实际 revision/attempt、输入计数与输出正确，保留旧包和升级前备份。
 5. 回退必须停服务并切回旧包；若 catalog/checkpoint 新旧格式不兼容，使用**同一备份时点的整套副本**，不混用新 CURRENT 与旧 source。先在副本验证再重开真实 Sink。
 
-配置/二进制回退不会撤销已发送 HTTP/MQTT；aligned 不等于 exactly-once，故障重放可能重复。没有持久 outbox，进程退出时尚未确认的输出不能被当作可靠提交。
+配置/二进制回退不会撤销已发送 HTTP/MQTT；aligned 不等于 exactly-once，故障或备份重放可能重复。有持久 outbox 也不能把本地入队当作远端接受；旧队列副本可能重新投递已接受请求，接收端需正确处理幂等身份。没有持久 outbox 时，进程退出时尚未确认的输出不能被当作可靠提交。
+
+交付验证入口：`scripts/production-package-check.sh PACKAGE NEW_EVIDENCE_DIR` 校验包内容/校验和与运行中 feature inventory。手动 `release-readiness` workflow 接收同一 ref 的成功 `production-gates` run 和明确基线 run，复用两份已构建包；只做一次 v39 固定表＋ET 图的冷备份、升级续读、整套副本回退和稳定 ID 重放验证。可选再构建一次全部四个 Connector 开关的组合包；不是新默认 PR 门禁，也不是 schema 转换、掉电或 soak 认证。
 
 ## 故障处置
 

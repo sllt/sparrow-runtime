@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -77,6 +78,93 @@ func (p *child) stop() {
 	}
 	_ = p.log.Close()
 	p.cmd = nil
+}
+func (p *child) shutdown() {
+	require(p != nil && p.cmd != nil, "no server to shut down")
+	must(p.cmd.Process.Signal(syscall.SIGTERM))
+	select {
+	case err := <-p.done:
+		must(err) // A failed/forced shutdown is not a cold-backup boundary.
+	case <-time.After(20 * time.Second):
+		panic("graceful shutdown deadline")
+	}
+	must(p.log.Close())
+	p.cmd = nil
+}
+
+// Test-fixture-only cold copies: no arbitrary deployment paths, symlinks or
+// live SQLite copying. All state stays at its original absolute path identity.
+var backupNames = []string{"catalog.db", "catalog.db-wal", "catalog.db-shm", "left.ndjson", "right.ndjson", "checkpoint"}
+
+func copyState(from, to string) {
+	must(os.Mkdir(to, 0700))
+	for _, name := range backupNames {
+		source := filepath.Join(from, name)
+		if _, err := os.Lstat(source); os.IsNotExist(err) {
+			require(strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-shm"), "missing backup component: "+name)
+			continue
+		} else {
+			must(err)
+		}
+		must(filepath.WalkDir(source, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(from, path)
+			if err != nil {
+				return err
+			}
+			target := filepath.Join(to, rel)
+			if entry.IsDir() {
+				return os.Mkdir(target, 0700)
+			}
+			if !entry.Type().IsRegular() {
+				return fmt.Errorf("non-regular backup entry: %s", path)
+			}
+			in, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer in.Close()
+			out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(out, in)
+			if err == nil {
+				err = out.Sync()
+			}
+			closed := out.Close()
+			if err != nil {
+				return err
+			}
+			return closed
+		}))
+	}
+}
+func stateHashes(root string) map[string]string {
+	result := make(map[string]string)
+	must(filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("non-regular state: %s", path)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		h := sha256.New()
+		if _, err = io.Copy(h, file); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		result[rel] = fmt.Sprintf("%x", h.Sum(nil))
+		return err
+	}))
+	return result
 }
 
 type api struct {
@@ -237,7 +325,7 @@ func (n *nats) request(subject string, v any) map[string]any {
 	}
 }
 
-func scenario(root, kind, bin, natsBin string) {
+func scenario(root, kind, bin, natsBin, baseline string) {
 	must(os.Mkdir(root, 0700))
 	c := newCapture()
 	defer c.server.Close()
@@ -268,6 +356,12 @@ func scenario(root, kind, bin, natsBin string) {
 	}
 	checkpoint := filepath.Join(root, "checkpoint")
 	var server *child
+	activeBin := bin
+	if baseline != "" {
+		activeBin = baseline
+	}
+	backup := filepath.Join(root, "upgrade-backup")
+	var backupHashes map[string]string
 	defer func() {
 		if server != nil {
 			server.stop()
@@ -285,7 +379,7 @@ func scenario(root, kind, bin, natsBin string) {
 			must(l.Close())
 			l = nil
 		}
-		server = launch(bin, filepath.Join(root, "server.log"), []string{"SPARROW_TOKEN=" + token, "SPARROW_SECRETS_KEY=0123456789abcdef0123456789abcdef", "SPARROW_REQUIRE_SECRETS_KEY=1", "SPARROW_DATA_ROOTS=" + root}, "--bind", fmt.Sprintf("127.0.0.1:%d", port), "--catalog", filepath.Join(root, "catalog.db"), "--safe-mode")
+		server = launch(activeBin, filepath.Join(root, "server.log"), []string{"SPARROW_TOKEN=" + token, "SPARROW_SECRETS_KEY=0123456789abcdef0123456789abcdef", "SPARROW_REQUIRE_SECRETS_KEY=1", "SPARROW_DATA_ROOTS=" + root}, "--bind", fmt.Sprintf("127.0.0.1:%d", port), "--catalog", filepath.Join(root, "catalog.db"), "--safe-mode")
 		until("health", func() bool { _, n := a.call("GET", "/v1/health", nil); return n == 200 })
 	}
 	start := func() { a.ok("POST", "/v1/pipelines/p/start", map[string]any{}) }
@@ -302,7 +396,15 @@ func scenario(root, kind, bin, natsBin string) {
 	a.ok("PUT", "/v1/allowlist", map[string]any{"host": "127.0.0.1", "port": c.port()})
 	if strings.HasPrefix(kind, "business-") {
 		businessScenario(kind, a, spec, paths, c, source, sink, start, func() {
-			server.stop()
+			if baseline == "" {
+				server.stop()
+			} else {
+				server.shutdown()
+				copyState(root, backup)
+				backupHashes = stateHashes(backup)
+				save(filepath.Join(root, "backup-sha256.json"), backupHashes)
+				activeBin = bin
+			}
 			startServer()
 			start()
 		}, waitCut, waitRows)
@@ -432,6 +534,45 @@ func scenario(root, kind, bin, natsBin string) {
 			require(version == 36, "File snapshot version")
 		}
 	}
+	if baseline != "" {
+		// Restore a real cold copy, not the migrated/live files. Keep the
+		// candidate's state separately: rollback never erases remote effects.
+		require(kind == "business-etref", "upgrade fixture scope")
+		server.shutdown()
+		preserved := filepath.Join(root, "after-upgrade")
+		must(os.Mkdir(preserved, 0700))
+		for _, name := range backupNames {
+			err := os.Rename(filepath.Join(root, name), filepath.Join(preserved, name))
+			if os.IsNotExist(err) && (strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-shm")) {
+				continue
+			}
+			must(err)
+		}
+		staging := filepath.Join(root, "restored-copy")
+		copyState(backup, staging)
+		require(bytes.Equal(encode(backupHashes), encode(stateHashes(staging))), "restored copy checksum mismatch")
+		for _, name := range backupNames {
+			err := os.Rename(filepath.Join(staging, name), filepath.Join(root, name))
+			if os.IsNotExist(err) && (strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-shm")) {
+				continue
+			}
+			must(err)
+		}
+		activeBin = baseline
+		startServer()
+		start()
+		appendRow(paths[0], map[string]any{"k": "a", "v": 4, "ts": 120})
+		waitCut(3)
+		appendRow(paths[1], map[string]any{"k": "a", "v": 8, "ts": 120})
+		waitRows(2)
+		waitCut(4)
+		rows := c.all()
+		require(len(rows) == 2 && bytes.Equal(encode(rows[0]), encode(rows[1])), "rollback replay changed data or stable output ID")
+		require(bytes.Equal(encode(backupHashes), encode(stateHashes(backup))), "backup was modified")
+		save(filepath.Join(root, "upgrade-summary.json"), map[string]any{"status": "PASS", "snapshot_version": 39,
+			"upgrade_from": baseline, "candidate": bin, "cold_backup_restored": true, "rollback_same_id": true,
+			"remote_effects_not_rolled_back": true, "scope": "same_catalog_v4_profile_v39; no_schema_converter_or_soak"})
+	}
 	a.ok("POST", "/v1/pipelines/p/stop", map[string]any{})
 	until("pipeline stopped", func() bool {
 		status, code := a.call("GET", "/v1/pipelines/p/status", nil)
@@ -553,9 +694,14 @@ func main() {
 	bin := flag.String("server-bin", "", "server with jetstream feature")
 	broker := flag.String("nats-server", "", "nats-server binary")
 	out := flag.String("out", "", "new evidence directory")
+	baseline := flag.String("upgrade-from", "", "optional older server with v39 support; run one cold-backup upgrade/rollback case only")
 	flag.Parse()
-	require(*bin != "" && *broker != "" && *out != "", "--server-bin --nats-server --out required")
+	require(*bin != "" && *out != "" && (*broker != "" || *baseline != ""), "--server-bin --out and either --nats-server or --upgrade-from required")
 	must(os.Mkdir(*out, 0700))
+	if *baseline != "" {
+		scenario(filepath.Join(*out, "upgrade"), "business-etref", *bin, "", *baseline)
+		return
+	}
 	var failures []string
 	for _, kind := range []string{"file", "jetstream", "join", "multi", "business-count", "business-alarm", "business-etref"} {
 		func() {
@@ -565,7 +711,7 @@ func main() {
 					fmt.Println("ANALYSIS_RECOVERY_FAILED", kind, why)
 				}
 			}()
-			scenario(filepath.Join(*out, kind), kind, *bin, *broker)
+			scenario(filepath.Join(*out, kind), kind, *bin, *broker, "")
 		}()
 	}
 	require(len(failures) == 0, strings.Join(failures, "\n"))
