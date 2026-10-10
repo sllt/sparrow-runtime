@@ -13,7 +13,7 @@ import { MODE_LABEL, parseDraft, type Draft } from "./model";
 import { IoEditor } from "./IoForm";
 import { connectorKinds } from "./caps";
 import { CheckPanel, type CheckResult } from "./CheckPanel";
-import { SamplePanel } from "./SamplePanel";
+import { PreviewPanel } from "./PreviewPanel";
 import { PublishDialog } from "./PublishDialog";
 import { parseBoundNodes } from "../graph/bound";
 const GraphDesigner = lazy(() => import("../graph/GraphDesigner"));
@@ -233,9 +233,10 @@ function Editor({ initial, caps, conns }: { initial: Draft; caps: Json; conns: J
         </Card>
         <div className="stack">
           <CheckPanel result={check} stale={check !== null && (check.etag !== server.etag || dirty)} onRun={() => void runCheck()} running={checking} />
-          <SamplePanel spec={parsed.ok ? parsed.value : null} />
         </div>
       </div>
+
+      <div style={{ marginTop: "var(--sp-5)" }}><PreviewPanel spec={parsed.ok ? parsed.value : null} /></div>
 
       {publishing && client && (
         <PublishDialog draft={server} onClose={() => setPublishing(false)}

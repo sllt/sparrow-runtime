@@ -104,7 +104,11 @@ pub fn check_plan(plan: &PhysicalPlan) -> Result<()> {
     if unsafe_plugin || plan.has_external_plugins() {
         return Err(unsupported("preview rejects native/external/non-preemptible functions"));
     }
-    CheckpointPlan::from_physical(plan).map(|_| ())
+    // Steps are synchronised by in-memory barriers, so the plan must have a
+    // checkpoint shape (scalar source columns, supported state kinds).
+    CheckpointPlan::from_physical(plan)
+        .map(|_| ())
+        .map_err(|e| unsupported(&format!("preview cannot step this plan: {}", e.message)))
 }
 
 /// Blocking boundary: call on a bounded worker thread.
