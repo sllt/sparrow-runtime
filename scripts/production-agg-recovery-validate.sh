@@ -31,7 +31,8 @@ old="$art/frozen/sparrow-server-old"
 nats="$art/frozen/nats-server"
 { printf 'commit %s\n' "$(git rev-parse HEAD)"; git status --porcelain | sed 's/^/dirty /'; } > "$art/source.txt"
 go build -o "$art/frozen/agg-recovery-process" tests/agg-recovery-process/main.go > "$art/go-build.log" 2>&1 || exit 3
-go vet tests/agg-recovery-process/main.go > "$art/go-vet.log" 2>&1 || exit 3
+go vet tests/agg-recovery-process/main.go tests/agg-recovery-process/main_test.go > "$art/go-vet.log" 2>&1 || exit 3
+go test -count=1 tests/agg-recovery-process/main.go tests/agg-recovery-process/main_test.go > "$art/go-test.log" 2>&1 || exit 3
 (cd "$art/frozen" && sha256sum * ) > "$art/binaries.sha256"
 driver="$art/frozen/agg-recovery-process"
 results="$art/results.tsv"; printf 'kind\tname\tround\texit\n' > "$results"

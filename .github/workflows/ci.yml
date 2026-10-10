@@ -41,6 +41,11 @@ jobs:
             echo '::warning::Legacy formatting debt remains; see format.log (not a blocking gate yet)'
           fi
           for script in scripts/*.sh; do bash -n "$script"; done
+          go version > artifacts/agg-recovery-go-version.txt
+          if ! go test -count=1 tests/agg-recovery-process/main.go tests/agg-recovery-process/main_test.go \
+            > artifacts/agg-recovery-go-test.log 2>&1; then
+            tail -n 40 artifacts/agg-recovery-go-test.log; exit 1
+          fi
           bash scripts/production-freeze-tests.sh artifacts core
       - name: Scheduled deterministic repetitions (not a soak certificate)
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

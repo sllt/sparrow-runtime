@@ -684,7 +684,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 
 **版本 / 依赖 / 恢复语义**
 
-- 一个目录只允许一种外层 profile；SPV1 v1/v2 不迁移；只有 v3 带 RCP2 下游前缀放宽，v29～v32 及 v8 之后的新 profile 严格匹配规范化语义与依赖身份（不是配置文本或 revision 号）。JetStream 改语义直接拒绝，无 fork/migration（子批7）。
+- 一个目录只允许一种外层 profile；SPV1 v1/v2 不迁移；File v3 保留 RCP2 下游前缀放宽，v29～v32 及 v8 之后的新 profile 严格匹配规范化语义与依赖身份（不是配置文本或 revision 号）。JetStream 即使旧 manifest 带有前缀标记，也要求完整语义不变；改语义直接拒绝，无 fork/migration（子批7）。
 - 恢复语义：File 为未提交后缀重放（at-least-once，无稳定输出 ID）；JetStream 为稳定 ID 的 at-least-once，ACK 不越过 CURRENT。都不是 exactly-once；SIGKILL 证据不等于断电/介质故障认证。
 - 恢复内存预留适用全部版本（见上节）；额度不足、profile/codec/语义不兼容均为不可回退错误。
 - 子批1 进程证据切点：输入已入窗口未输出、输出已确认未提交、输出请求在途、CURRENT 发布失败、MANIFEST 已改名但 CURRENT 未更新（该代不被提升）、提交后、恢复中（已预留额度未物化）、JetStream 提交后 ACK 丢失。旧二进制（424cf95）拒绝启动 v29 目录且不改 CURRENT/不输出；新二进制可继续旧 v3 目录。未覆盖：断电/介质故障、JetStream + ET、PT 窗口、恢复中其他位置。
