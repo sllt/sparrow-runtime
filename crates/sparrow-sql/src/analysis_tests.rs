@@ -27,7 +27,10 @@ fn bind(sql: &str) -> sparrow_model::Result<PhysicalPlan> {
 fn analysis_sql_unnest_aliases_projection_and_ordinal_bind() {
     for sql in ["SELECT s.k, u.item, u.unnest_ordinal FROM l s CROSS JOIN UNNEST(s.items) AS u(item)",
         "SELECT k, x, ord FROM l s CROSS JOIN UNNEST(s.items) WITH ORDINALITY AS u(x, ord) WHERE CAST(x AS BIGINT) > 0"]{
-        let plan=bind(sql).unwrap();assert!(plan.has_analysis());assert!(sparrow_plan::CheckpointPlan::from_physical(&plan).is_err());
+        let plan=bind(sql).unwrap();assert!(plan.has_analysis());
+        let checkpoint = sparrow_plan::CheckpointPlan::from_physical(&plan).unwrap();
+        assert!(checkpoint.has_analysis_state());
+        assert_eq!(checkpoint.states[0].codec, sparrow_plan::checkpoint::ANALYSIS_STATE_CODEC);
         assert!(plan.stages.iter().any(|s|matches!(s,PhysicalStage::Analysis{plan,..} if matches!(plan.as_ref(),AnalysisPlan::Unnest{..}))));
     }
     for sql in [
@@ -43,6 +46,8 @@ fn analysis_sql_unnest_aliases_projection_and_ordinal_bind() {
 }
 #[test]
 fn analysis_sql_join_range_window_left_and_strict_rejections() {
+    // This fixture retains an unrelated Dynamic payload column. Its live
+    // Join remains valid, but the scalar-row recovery profile refuses it.
     for sql in ["SELECT a.v AS lv, b.v AS rv FROM l a JOIN r b ON a.k=b.k AND INTERVAL_MATCH(a.ts,b.ts,3,5)",
         "SELECT a.v,b.v FROM l a LEFT JOIN r b ON a.k=b.k AND WINDOW_MATCH(a.ts,b.ts,10,100)"]{
         let plan=bind(sql).unwrap();assert_eq!(plan.source_times.len(),2);assert!(plan.edges.is_some());assert!(sparrow_plan::CheckpointPlan::from_physical(&plan).is_err());

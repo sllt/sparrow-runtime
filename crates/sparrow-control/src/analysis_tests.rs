@@ -170,6 +170,10 @@ fn analysis_control_two_real_files_join_to_required_http() {
 
 #[test]
 fn analysis_recovery_control_profiles_and_declared_limits() {
+    let inventory = crate::capability::inventory();
+    assert_eq!(inventory["analysis"]["aligned_profiles"]["unnest_file"], 36);
+    assert_eq!(inventory["analysis"]["aligned_profiles"]["ordered_file_graph"], 38);
+    assert_eq!(inventory["windows"]["new_families"]["aligned_profiles"]["processing_time_file"], 34);
     let store = store();
     let root = sparrow_connectors::ensure_default_data_root().join("analysis-profile-validation");
     let source = |name: &str| json!({"kind":"file","path":root.join(format!("{name}.ndjson")),"file_contract":"append_only"});
