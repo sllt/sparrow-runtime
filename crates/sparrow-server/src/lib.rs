@@ -30,6 +30,7 @@ mod plugins;
 mod reference_tables;
 pub mod auth;
 pub mod ui;
+mod authoring;
 pub use auth::{Auth, Principal, Role};
 pub use ui::UiAssets;
 
@@ -128,6 +129,7 @@ fn build_router(state: AppState, ui_assets: Option<Arc<UiAssets>>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
         .merge(plugins::router())
+        .merge(authoring::router())
         .layer(axum::middleware::from_fn_with_state(
             (state.clone(), ui_public),
             management_guard,
@@ -229,6 +231,8 @@ impl From<SparrowError> for ApiError {
             ErrorCode::MaxRecordSize | ErrorCode::BoundExceeded => StatusCode::PAYLOAD_TOO_LARGE,
             ErrorCode::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
             ErrorCode::Cancelled => StatusCode::CONFLICT,
+            ErrorCode::Conflict => StatusCode::PRECONDITION_FAILED,
+            ErrorCode::NotFound => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self { status, err }
@@ -248,6 +252,8 @@ fn public_error_context(error: &SparrowError) -> Vec<Value> {
         "snapshot_id",
         "revision",
         "expected_revision",
+        "current_etag",
+        "etag",
         "current_revision",
         "latest_revision",
         "table",
@@ -704,17 +710,23 @@ async fn put_stream(
         let json = serde_json::to_string(&spec).map_err(|e| {
             ApiError::from(SparrowError::new(ErrorCode::InvalidArgument, e.to_string()))
         })?;
-        state
-            .store
-            .put_stream(&name, &json)
-            .map_err(ApiError::from)?;
+        // K5.2: with If-Match the check and write share one transaction
+        // ("absent" = create only). Without it the legacy unconditional
+        // upsert is kept for CLI/API compatibility; the workbench always sends it.
+        let etag = match if_match(&headers) {
+            Some(want) => state.store.put_stream_if(&name, &json, &want).map_err(ApiError::from)?,
+            None => {
+                state.store.put_stream(&name, &json).map_err(ApiError::from)?;
+                Store::stream_etag(&json)
+            }
+        };
         state
             .store
             .audit(&actor, "put_stream", Some(&name), None, "ok")
             .map_err(ApiError::from)?;
         Ok((
             StatusCode::CREATED,
-            Json(json!({"name": name, "fields": spec.fields})),
+            Json(json!({"name": name, "fields": spec.fields, "etag": etag})),
         ))
     })
     .await
@@ -729,7 +741,7 @@ async fn get_stream(
     blocking_api(move || {
         let row = state.store.get_stream(&name).map_err(ApiError::from)?;
         let spec: Value = serde_json::from_str(&row.schema_json).unwrap_or(Value::Null);
-        Ok(Json(json!({"name": row.name, "schema": spec})))
+        Ok(Json(json!({"name": row.name, "schema": spec, "etag": Store::stream_etag(&row.schema_json)})))
     })
     .await
 }

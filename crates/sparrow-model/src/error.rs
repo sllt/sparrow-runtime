@@ -26,6 +26,10 @@ pub enum ErrorCode {
     SecretMissing,
     /// Checked integer overflow in incremental SUM/COUNT (never wrap, never silent).
     IntegerOverflow,
+    /// Optimistic-concurrency precondition failed (ETag/CAS); caller must reload.
+    Conflict,
+    /// Named author-side resource does not exist.
+    NotFound,
     Internal,
 }
 
@@ -47,6 +51,8 @@ impl ErrorCode {
             Self::PolicyDenied => "policy_denied",
             Self::SecretMissing => "secret_missing",
             Self::IntegerOverflow => "integer_overflow",
+            Self::Conflict => "conflict",
+            Self::NotFound => "not_found",
             Self::Internal => "internal",
         }
     }

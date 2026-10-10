@@ -6,11 +6,16 @@ import { Kbd, Pill } from "./ui";
 import { currentTheme, setTheme } from "./theme";
 import { CommandPalette } from "./CommandPalette";
 
-const NAV = [
-  { to: "/", label: "总览", icon: "dashboard", key: "1" },
-  { to: "/pipelines", label: "流水线", icon: "pipelines", key: "2" },
-  { to: "/audit", label: "审计摘要", icon: "audit", key: "3" },
-  { to: "/instance", label: "实例与权限", icon: "server", key: "4" },
+type NavItem = { to: string; label: string; icon: string; key: string; section: "ops" | "author"; need?: string };
+const ALL_NAV: NavItem[] = [
+  { to: "/", label: "总览", icon: "dashboard", key: "1", section: "ops" },
+  { to: "/pipelines", label: "流水线", icon: "pipelines", key: "2", section: "ops" },
+  { to: "/audit", label: "审计摘要", icon: "audit", key: "3", section: "ops" },
+  { to: "/instance", label: "实例与权限", icon: "server", key: "4", section: "ops" },
+  { to: "/drafts", label: "草稿与发布", icon: "file", key: "5", section: "author", need: "drafts.list" },
+  { to: "/streams", label: "Stream", icon: "stream", key: "6", section: "author", need: "streams.list" },
+  { to: "/connections", label: "连接模板", icon: "plug", key: "7", section: "author", need: "connections.list" },
+  { to: "/resources", label: "参考表与插件", icon: "puzzle", key: "8", section: "author", need: "tables.list" },
 ];
 
 const ROLE_LABEL = { viewer: "只读观察者", operator: "操作员", admin: "管理员" } as const;
@@ -21,11 +26,17 @@ function crumbs(path: string): { label: string; to?: string }[] {
   if (path.startsWith("/pipelines/")) return [{ label: "流水线", to: "/pipelines" }, { label: decodeURIComponent(path.slice(11)) }];
   if (path === "/audit") return [{ label: "审计摘要" }];
   if (path === "/instance") return [{ label: "实例与权限" }];
+  if (path === "/drafts") return [{ label: "草稿与发布" }];
+  if (path.startsWith("/drafts/")) return [{ label: "草稿与发布", to: "/drafts" }, { label: decodeURIComponent(path.slice(8)) }];
+  if (path === "/streams") return [{ label: "Stream 与 Schema" }];
+  if (path === "/connections") return [{ label: "连接模板" }];
+  if (path === "/resources") return [{ label: "参考表与插件" }];
   return [];
 }
 
 export function Shell({ children }: { children: ReactNode }) {
-  const { me, logout } = useAuth();
+  const { me, logout, can } = useAuth();
+  const NAV = ALL_NAV.filter((n) => !n.need || can(n.need));
   const nav = useNavigate();
   const loc = useLocation();
   const [theme, setT] = useState(currentTheme());
@@ -65,13 +76,17 @@ export function Shell({ children }: { children: ReactNode }) {
             <div className="brand-sub">运维工作台</div>
           </div>
         </div>
-        <div className="nav-section">运维</div>
-        {NAV.map((n) => (
+        {(["ops", "author"] as const).map((sec) => NAV.some((n) => n.section === sec) && (
+          <div key={sec} className="nav-group">
+        <div className="nav-section">{sec === "ops" ? "运维" : "配置"}</div>
+        {NAV.filter((n) => n.section === sec).map((n) => (
           <NavLink key={n.to} to={n.to} end={n.to === "/"} className={({ isActive }) => `nav-link ${isActive ? "active" : ""}`} title={n.label}>
             <Icon name={n.icon} />
             <span className="nav-label">{n.label}</span>
             <Kbd>{n.key}</Kbd>
           </NavLink>
+        ))}
+          </div>
         ))}
         <div className="sidebar-foot">
           <div className="row" style={{ padding: "0 8px" }}>

@@ -11,8 +11,9 @@ import { fmtBytes, fmtInt, fmtRate } from "../../lib/format";
 import { p99, quantileText, fmtUs } from "../../lib/histogram";
 import { RateSeries, type Rate } from "../../lib/rates";
 import { rateText } from "./useRates";
+import { RevisionsTab } from "./RevisionsTab";
 
-type TabKey = "overview" | "traffic" | "errors" | "checkpoint" | "diagnostics";
+type TabKey = "overview" | "traffic" | "errors" | "checkpoint" | "diagnostics" | "revisions";
 
 function v(x: Json | undefined): string {
   if (x === null || x === undefined) return "—";
@@ -147,7 +148,9 @@ export default function PipelineDetailPage() {
         { key: "errors", label: "错误", badge: view.hasError || view.health === "degraded" ? <Pill tone="bad">!</Pill> : undefined },
         { key: "checkpoint", label: "Checkpoint 风险" },
         { key: "diagnostics", label: "诊断" },
+        ...(me?.role !== "viewer" ? [{ key: "revisions" as const, label: "版本历史" }] : []),
       ]} />
+      {tab === "revisions" && <RevisionsTab name={name} />}
 
       {tab === "overview" && (
         <div className="grid two">
