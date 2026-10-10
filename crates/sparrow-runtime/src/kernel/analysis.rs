@@ -20,11 +20,12 @@ async fn charge(ctx: &JobCtx, mut units: u64) -> Result<()> {
 }
 pub(super) fn unnest_task<'a>(
     ctx: &'a JobCtx,
+    operator: sparrow_model::OperatorId,
     plan: Box<AnalysisPlan>,
     rx: &'a mut MailboxRx,
     tx: &'a MailboxTx,
 ) -> Result<ChargedWindowFuture<impl std::future::Future<Output = Result<usize>> + 'a>> {
-    let future = unnest(ctx, plan, rx, tx);
+    let future = unnest(ctx, operator, plan, rx, tx);
     let credit = ctx.owner.acquire(
         CreditKind::Reservation,
         std::mem::size_of_val(&future).saturating_add(64),
@@ -52,6 +53,7 @@ fn scalar(value: &DynamicValue, ty: &DataType) -> Scalar {
 }
 async fn unnest(
     ctx: &JobCtx,
+    operator: sparrow_model::OperatorId,
     plan: Box<AnalysisPlan>,
     rx: &mut MailboxRx,
     tx: &MailboxTx,
@@ -73,8 +75,12 @@ async fn unnest(
     };
     let expr = sparrow_expr::bind(&spec.expr, &input)?;
     let allocation = sparrow_expr::allocation::AllocationBound::for_expr(&expr);
-    let _metadata = ctx.owner.acquire(CreditKind::Retention, 64 * 512)?;
-    let mut sequences = std::collections::BTreeMap::<Option<sparrow_model::OperatorId>, i64>::new();
+    let prepared = ctx.aligned.as_ref().and_then(|a| a.analysis.lock().expect("prepared analysis").remove(&operator));
+    let mut state = match prepared {
+        Some(crate::analysis_state::PreparedAnalysis::Unnest(state)) => state,
+        None if ctx.aligned.is_none() => crate::analysis_state::UnnestState::new(&ctx.owner)?,
+        _ => return Err(crate::analysis_state::mismatch("UNNEST lacks its prepared recovery state")),
+    };
     let mut eof = false;
     loop {
         let env = tokio::select! {biased;_=ctx.cancel.cancelled()=>break,env=rx.recv()=>env?};
@@ -90,6 +96,21 @@ async fn unnest(
         let (batch, control) = env.take();
         if let Some(control) = control {
             match control {
+                StreamControl::CheckpointBarrier { checkpoint_id } if ctx.aligned.is_some() => {
+                    let acks = &ctx.aligned.as_ref().expect("checked").acks;
+                    if acks.is_active(checkpoint_id) {
+                        let frozen = crate::barrier::EncodedFreeze::from_analysis(&ctx.owner, crate::analysis_state::FIXED,
+                            |out| state.encode(operator, out, ctx.max_state_keys));
+                        acks.analysis_frozen(checkpoint_id, operator, frozen).await;
+                    }
+                }
+                StreamControl::ProcessingTime { .. } | StreamControl::GraphRoundEnd { .. }
+                    if ctx.graph_time.is_some() => {}
+                StreamControl::GraphProgress { watermark_micros, flags } if ctx.graph_time.is_some() => {
+                    let progress = crate::graph_cut::Progress::from_control(watermark_micros, flags)?;
+                    if eof && !progress.eof { return Err(crate::analysis_state::mismatch("UNNEST EOF moved backwards")); }
+                    eof = progress.eof;
+                }
                 StreamControl::CheckpointBarrier { .. }
                 | StreamControl::ProcessingTime { .. }
                 | StreamControl::FeedObservation { .. }
@@ -126,13 +147,14 @@ async fn unnest(
             }
             for row in batch.rows() {
                 charge(ctx, 1).await?;
-                if !sequences.contains_key(&batch.source_operator()) && sequences.len() >= 64 {
+                let limit = if ctx.aligned.is_some() { 64.min(ctx.max_state_keys) } else { 64 };
+                if !state.sequences.contains_key(&batch.source_operator()) && state.sequences.len() >= limit {
                     return Err(SparrowError::new(
                         ErrorCode::BoundExceeded,
                         "UNNEST source identity limit",
                     ));
                 }
-                let sequence = sequences.entry(batch.source_operator()).or_default();
+                let sequence = state.sequences.entry(batch.source_operator()).or_default();
                 *sequence = sequence.checked_add(1).ok_or_else(|| {
                     SparrowError::new(ErrorCode::IntegerOverflow, "UNNEST input ordinal exhausted")
                 })?;
@@ -286,11 +308,16 @@ async fn external(ctx: &JobCtx, plan: AnalysisPlan, rx: &mut MailboxRx, tx: &Mai
 
 pub(super) fn join_task<'a>(
     ctx: &'a JobCtx,
+    operator: sparrow_model::OperatorId,
     plan: Box<AnalysisPlan>,
     inputs: Vec<MailboxRx>,
     tx: MailboxTx,
 ) -> Result<ChargedWindowFuture<impl std::future::Future<Output = Result<usize>> + 'a>> {
-    let future = join(ctx, plan, inputs, tx);
+    let future = async move {
+        if ctx.aligned.is_some() {
+            super::ordered_join::run(ctx, operator, inputs, tx).await
+        } else { join(ctx, plan, inputs, tx).await }
+    };
     let credit = ctx.owner.acquire(
         CreditKind::Reservation,
         std::mem::size_of_val(&future).saturating_add(64),

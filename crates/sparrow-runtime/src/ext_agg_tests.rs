@@ -315,7 +315,7 @@ async fn segment(
     let (pipeline, acks) = match restore {
         None => {
             let acks = if reliable { AlignedAcks::default().with_output_sequence(first)? } else { AlignedAcks::default() };
-            (PipelineRestore { buffered: Vec::new(), sink: None, plan: manifest.clone(), generation: [5; 16], restore: None, iot: vec![] }, acks)
+            (PipelineRestore { analysis: Vec::new(), buffered: Vec::new(), sink: None, plan: manifest.clone(), generation: [5; 16], restore: None, iot: vec![] }, acks)
         }
         Some((snap, credit, admission)) => {
             request = request.with_source_admission(admission).with_restore_credit(credit);
@@ -323,7 +323,7 @@ async fn segment(
                 Some(next) => AlignedAcks::default().with_output_sequence(next)?,
                 None => AlignedAcks::default(),
             };
-            (PipelineRestore { buffered: Vec::new(), sink: None, plan: Arc::new(snap.plan), generation: snap.generation, restore: Some(snap.windows), iot: snap.iot }, acks)
+            (PipelineRestore { analysis: Vec::new(), buffered: Vec::new(), sink: None, plan: Arc::new(snap.plan), generation: snap.generation, restore: Some(snap.windows), iot: snap.iot }, acks)
         }
     };
     let (tx, rx) = sparrow_io::observed::channel(2);

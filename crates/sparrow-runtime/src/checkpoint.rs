@@ -163,6 +163,9 @@ impl CheckpointSnapshot {
         if freeze.buffered {
             return Err(crate::buffered_window::codec4_legacy());
         }
+        if crate::checkpoint::FreezeHeader::parse(&freeze.bytes)?.slot.raw() == 4 {
+            return Err(crate::analysis_state::mismatch("legacy SPV1 cannot carry analysis codec 5"));
+        }
         if freeze.bytes.len() < 11 {
             return Err(SparrowError::new(
                 ErrorCode::CodecViolation,
@@ -722,7 +725,7 @@ impl CheckpointStore {
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
         let mut metadata = SnapshotMetadata { version, revision: None, attempt: None, generation: None };
-        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35) {
+        if matches!(version,3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35|36|37|38) {
             for chunk in 1..=34 {
                 match PipelineSnapshot::provenance(&bytes) {
                     Ok((attempt, revision, generation)) => {
@@ -1420,6 +1423,7 @@ fn incompatible_or_credit(error: &SparrowError) -> bool {
                     | crate::pipeline_checkpoint::BUFFERED_PROFILE_GUARD
                     | crate::pipeline_checkpoint::PT_PROFILE_GUARD
                     | "buffered_state_mismatch"
+                    | "analysis_profile_mismatch"
                     | "extended_codec_mismatch"
                     | "extended_state_mismatch"
             )

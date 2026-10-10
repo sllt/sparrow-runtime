@@ -24,6 +24,38 @@ pub const WINDOW_EXT_STATE_CODEC: u16 = 3;
 /// inputs of the last `size` arrivals per key, never accumulators or raw rows.
 /// Only the strict single-state linear File v31 / JetStream v32 profiles.
 pub const BUFFERED_WINDOW_STATE_CODEC: u16 = 4;
+pub const ANALYSIS_STATE_CODEC: u16 = 5;
+
+fn validate_analysis_profile(plan: &PhysicalPlan, references: bool) -> Result<()> {
+    if !plan.has_analysis() { return Ok(()); }
+    if references || !plan.side_outputs.is_empty() || plan.stages.iter().any(|s| matches!(s,
+        PhysicalStage::WindowAgg { .. } | PhysicalStage::Iot { .. }
+        | PhysicalStage::Lookup { .. } | PhysicalStage::Deduplicate { .. })) {
+        return Err(rejected("analysis recovery excludes window/IoT/Lookup/Dedup combinations and side outputs"));
+    }
+    let mut joins = 0;
+    let mut analyses = 0;
+    for stage in &plan.stages {
+        if let PhysicalStage::Analysis { plan: analysis, .. } = stage {
+            analysis.validate()?;
+            analyses += 1;
+            match analysis.as_ref() {
+                crate::AnalysisPlan::External { .. } => return Err(rejected("external Transform has no recovery codec")),
+                crate::AnalysisPlan::Join { left, right, .. } => {
+                    joins += 1;
+                    validate_time_input_schema(left)?;
+                    validate_time_input_schema(right)?;
+                }
+                crate::AnalysisPlan::Unnest { .. } => {}
+            }
+        }
+    }
+    if joins > 1 || (joins > 0 && (plan.edges.is_none() || analyses != 1))
+        || (plan.edges.is_none() && (analyses != 1 || !plan.source_times.is_empty())) {
+        return Err(rejected("analysis recovery requires one linear UNNEST, or a File graph with UNNEST/Union or one direct two-source Join"));
+    }
+    Ok(())
+}
 
 /// Buffered window kinds with a codec 4 profile: sliding count (v31/v32),
 /// ET sliding and ET session (File v33). PT buffered kinds stay restart_fresh.
@@ -83,6 +115,10 @@ impl ParticipantId {
             shard: 0,
         }
     }
+
+    pub fn analysis(operator: OperatorId) -> Self {
+        Self::State { operator, slot: StateSlotId::new(4), shard: 0 }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +133,7 @@ impl StateParticipant {
         match self.codec {
             WINDOW_STATE_CODEC | WINDOW_EXT_STATE_CODEC => u8::from(self.window_kind == 1),
             BUFFERED_WINDOW_STATE_CODEC if matches!(self.window_kind, 5..=9) => self.window_kind,
+            ANALYSIS_STATE_CODEC if matches!(self.window_kind, 10 | 11) => self.window_kind,
             IOT_STATE_CODEC if matches!(self.window_kind, 4..=15) => self.window_kind,
             _ => 0,
         }
@@ -169,9 +206,7 @@ impl CheckpointPlan {
         reference_tables: Vec<ReferenceTableDependency>,
     ) -> Result<Self> {
         if plan.has_plugins() {return Err(rejected("plugin functions have no checkpoint/restore profile"));}
-        if plan.has_analysis() {
-            return Err(rejected("analysis has no published checkpoint profile; restart_fresh only"));
-        }
+        validate_analysis_profile(plan, !reference_tables.is_empty())?;
         let extended = plan.has_extended_aggs();
         // v34/v35: exactly one window stage, a PT profile window, and no
         // other state (no TTL/HoldFor/IoT), DAG, references or side inputs.
@@ -280,6 +315,15 @@ impl CheckpointPlan {
         let mut used_references = BTreeSet::new();
         for stage in &plan.stages[1..plan.stages.len() - 1] {
             match stage {
+                PhysicalStage::Analysis { operator, plan: analysis } => {
+                    register(*operator)?;
+                    if analysis.is_join() || current.fields != analysis.input().fields {
+                        return Err(rejected("linear analysis requires UNNEST with matching input schema"));
+                    }
+                    states.push(StateParticipant { id: ParticipantId::analysis(*operator),
+                        codec: ANALYSIS_STATE_CODEC, window_kind: 10 });
+                    current = analysis.output();
+                }
                 PhysicalStage::Transform { steps } => {
                     if steps.is_empty() {
                         return Err(rejected("empty checkpoint transform stage"));
@@ -536,7 +580,8 @@ impl CheckpointPlan {
                 && !has_references
                 && !plan.has_processing_time_state()
                 && !extended
-                && !sliding_count)
+                && !sliding_count
+                && !plan.has_analysis())
                 .then_some(recovery_prefix_len),
         };
         result.validate()?;
@@ -566,6 +611,9 @@ impl CheckpointPlan {
     /// A codec 4 participant selects the strict v31/v32/v33 profiles.
     pub fn has_buffered_state(&self) -> bool {
         self.states.iter().any(|s| s.codec == BUFFERED_WINDOW_STATE_CODEC)
+    }
+    pub fn has_analysis_state(&self) -> bool {
+        self.states.iter().any(|s| s.codec == ANALYSIS_STATE_CODEC)
     }
     /// Codec 4 ET sliding (kind 7) / ET session (kind 9): File v33 only.
     pub fn has_buffered_event_time_state(&self) -> bool {
@@ -676,7 +724,7 @@ impl CheckpointPlan {
                 "resample recovery currently requires a single linear state, not a DAG",
             ));
         }
-        let time_graph = plan.has_processing_time_state() || plan.has_event_time_window();
+        let time_graph = plan.is_recovery_time_graph();
         if plan.has_silence() {
             return Err(rejected(
                 "silence requires a linear Source->Silence->[Transform]->Sink plan, not a required DAG",
@@ -689,8 +737,8 @@ impl CheckpointPlan {
         }
         if time_graph
             && (!reference_tables.is_empty()
-                || (plan.has_event_time_window() && plan.has_processing_time_state())
-                || (!plan.has_event_time_window() && !plan.source_times.is_empty()))
+                || (plan.recovery_event_time() && plan.has_processing_time_state())
+                || (!plan.recovery_event_time() && !plan.source_times.is_empty()))
         {
             return Err(rejected(
                 "durable time DAG excludes references and mixed processing/event-time domains",
@@ -736,10 +784,14 @@ impl CheckpointPlan {
             stage_operators.push(ids);
             match stage {
                 PhysicalStage::MemorySource { operator, schema, .. } => {
-                    if time_graph { validate_time_input_schema(schema)?; }
+                    if time_graph && !plan.has_analysis() { validate_time_input_schema(schema)?; }
                     sources.push(*operator);
                 },
                 PhysicalStage::CaptureSink { operator, .. } => sinks.push(*operator),
+                PhysicalStage::Analysis { operator, plan: analysis } => {
+                    states.push(StateParticipant { id: ParticipantId::analysis(*operator),
+                        codec: ANALYSIS_STATE_CODEC, window_kind: if analysis.is_join() { 11 } else { 10 } });
+                }
                 PhysicalStage::WindowAgg { operator, spec, input, output } if time_graph || matches!(spec.kind, WindowKind::Count { .. }) => {
                     spec.validate()?;
                     if crate::window_output_schema(input,spec)?.fields!=output.fields {return Err(rejected("graph checkpoint window schema mismatch"));}
@@ -796,8 +848,19 @@ impl CheckpointPlan {
                     "graph aligned requires connected required edges without lossy edges",
                 ));
             }
-            if graph_stage_schema(&plan.stages[edge.from], true)?.fields
-                != graph_stage_schema(&plan.stages[edge.to], false)?.fields
+            let target = match &plan.stages[edge.to] {
+                PhysicalStage::Analysis { plan: analysis, .. } if analysis.is_join() => {
+                    let crate::AnalysisPlan::Join { spec, left, right, .. } = analysis.as_ref() else { unreachable!() };
+                    let PhysicalStage::MemorySource { operator, .. } = &plan.stages[edge.from] else {
+                        return Err(rejected("recoverable Join inputs must be direct Sources"));
+                    };
+                    if operator.raw() == spec.left_input { left }
+                    else if operator.raw() == spec.right_input { right }
+                    else { return Err(rejected("Join source identity mismatch")); }
+                }
+                stage => graph_stage_schema(stage, false)?,
+            };
+            if graph_stage_schema(&plan.stages[edge.from], true)?.fields != target.fields
             {
                 return Err(rejected("graph checkpoint edge schema mismatch"));
             }
@@ -835,6 +898,7 @@ impl CheckpointPlan {
                 PhysicalStage::UnionAll { .. } => {
                     !(2..=16).contains(&incoming[index]) || outgoing[index] != 1
                 }
+                PhysicalStage::Analysis { plan, .. } if plan.is_join() => incoming[index] != 2 || outgoing[index] != 1,
                 PhysicalStage::BestEffortSink { .. } => true,
                 _ => incoming[index] != 1 || outgoing[index] != 1,
             });
@@ -903,6 +967,13 @@ impl CheckpointPlan {
 
     pub fn validate(&self) -> Result<()> {
         validate_references(&self.reference_tables)?;
+        if self.has_analysis_state() && (self.has_references() || self.recovery_prefix_len.is_some()
+            || self.states.iter().any(|s| s.codec != ANALYSIS_STATE_CODEC)
+            || (self.is_graph() && !self.is_time_graph())
+            || (!self.is_graph() && (self.states.len() != 1 || self.states[0].window_kind != 10))) {
+            return Err(rejected("analysis requires strict v36/v37 UNNEST or v38 ordered File graph")
+                .context("checkpoint_guard", "analysis_profile_mismatch"));
+        }
         if self.has_pt_window_state()
             && (self.states.len() != 1
                 || self.is_graph()
@@ -949,7 +1020,7 @@ impl CheckpointPlan {
         {
             return Err(rejected("paused-time recovery requires a linear plan without references, event time or relaxed semantics"));
         }
-        if self.is_time_graph()
+        if self.is_time_graph() && !self.has_analysis_state()
             && (self.has_references()
                 || self.recovery_prefix_len.is_some()
                 || (self.has_event_time_state()
@@ -1030,7 +1101,9 @@ impl CheckpointPlan {
             let valid_iot = state.codec == IOT_STATE_CODEC
                 && slot.raw() == 3
                 && matches!(state.window_kind, 4..=15);
-            if shard != 0 || !ids.insert(operator) || !(valid_window || valid_iot || valid_buffered) {
+            let valid_analysis = state.codec == ANALYSIS_STATE_CODEC && slot.raw() == 4
+                && matches!(state.window_kind, 10 | 11);
+            if shard != 0 || !ids.insert(operator) || !(valid_window || valid_iot || valid_buffered || valid_analysis) {
                 return Err(rejected(
                     "duplicate/unsupported checkpoint participant, slot, shard or codec",
                 ));
@@ -1312,11 +1385,7 @@ fn validate_static_lookup_stage(
 
 fn graph_stage_schema(stage: &PhysicalStage, output: bool) -> Result<&sparrow_model::Schema> {
     Ok(match stage {
-        PhysicalStage::Analysis { .. } => {
-            return Err(rejected(
-                "analysis operators have no checkpoint schema contract",
-            ))
-        }
+        PhysicalStage::Analysis { plan, .. } => if output { plan.output() } else { plan.input() },
         PhysicalStage::MemorySource { schema, .. }
         | PhysicalStage::CaptureSink { schema, .. }
         | PhysicalStage::BestEffortSink { schema, .. } => schema,

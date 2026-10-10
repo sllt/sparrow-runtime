@@ -298,9 +298,9 @@ impl Supervisor {
         let next_checkpoint = opened.next_checkpoint_id();
         let store = Arc::new(std::sync::Mutex::new(opened));
         let guard: Arc<dyn Send + Sync> = Arc::new((store.clone(), startup_guard));
-        let (restore, iot) = snapshot
-            .map(|s| (Some(s.windows), s.iot))
-            .unwrap_or((None, Vec::new()));
+        let (restore, iot, analysis) = snapshot
+            .map(|s| (Some(s.windows), s.iot, s.analysis))
+            .unwrap_or((None, Vec::new(), Vec::new()));
         let request = request
             .with_source_admission(admission)
             .with_clock(sparrow_runtime::RuntimeClock::virtual_clock(
@@ -308,7 +308,7 @@ impl Supervisor {
             ))
             .with_aligned(AlignedJob {
                 restore: None,
-                pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                pipeline: Some(PipelineRestore { analysis, buffered: Vec::new(),
                     sink: None,
                     plan: manifest.clone(),
                     generation,
@@ -498,6 +498,9 @@ impl Actor {
             row.resident_bytes().saturating_mul(2).saturating_add(128),
         )?;
         let mut bytes = Vec::new();
+        if self.manifest.has_analysis_state() {
+            return Ok(digest(&sparrow_plan::canonical::analysis_row_bytes(&row.values)?));
+        }
         for value in &row.values {
             value.encode_value(&mut bytes)?;
         }

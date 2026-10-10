@@ -165,7 +165,7 @@ fn drive(
                     .with_live_out(out)
                     .with_aligned(AlignedJob {
                         restore: None,
-                        pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                        pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                             sink: None,
                             plan: manifest.clone(),
                             generation: [5; 16],

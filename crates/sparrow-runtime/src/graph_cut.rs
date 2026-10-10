@@ -406,7 +406,7 @@ impl GraphCut {
         {
             return Err(invalid("Union set/ports differ from graph"));
         }
-        if !plan.has_event_time_window()
+        if !plan.recovery_event_time()
             && (self
                 .sources
                 .values()
@@ -417,7 +417,7 @@ impl GraphCut {
         {
             return Err(invalid("processing-time graph cannot carry ET progress"));
         }
-        if plan.has_event_time_window() {
+        if plan.recovery_event_time() {
             for union in self.unions.values() {
                 let required = if union.emitted.eof {
                     Some(i64::MAX)
@@ -473,6 +473,10 @@ impl GraphCut {
                             }
                         }
                         (union.emitted.idle, union.emitted.eof)
+                    }
+                    PhysicalStage::Analysis { plan, .. } if plan.is_join() => {
+                        let eof = incoming.iter().all(|e| activity[&e.from].1);
+                        (eof, eof)
                     }
                     _ => *activity
                         .get(&incoming[0].from)
@@ -532,7 +536,7 @@ impl GraphRuntime {
         let observed = std::sync::atomic::AtomicI64::new(initial.observed_micros);
         Ok(Arc::new(Self {
             initial,
-            event_time: plan.has_event_time_window(),
+            event_time: plan.recovery_event_time(),
             generation,
             semantics,
             unions: Mutex::new(BTreeMap::new()),

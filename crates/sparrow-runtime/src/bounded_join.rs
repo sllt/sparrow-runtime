@@ -1,4 +1,4 @@
-//! Two-input ET joins with fixed row/key/byte/fan-out limits. No recovery codec.
+//! Two-input ET joins with fixed row/key/byte/fan-out limits.
 use sparrow_model::{
     CreditKind, ErrorCode, MemoryLease, MemoryOwner, Result, Row, RowBatch, Scalar, Schema,
     SparrowError,
@@ -38,6 +38,7 @@ pub(crate) struct BoundedJoin {
     owner: Arc<MemoryOwner>,
     max_keys: usize,
     bytes: usize,
+    durable: bool,
 }
 fn invalid(s: &str) -> SparrowError {
     SparrowError::new(ErrorCode::InvalidArgument, s)
@@ -81,10 +82,68 @@ impl BoundedJoin {
             max_keys: max_keys.min(owner.budget().max_state_keys),
             owner,
             bytes: 0,
+            durable: false,
         })
     }
     pub(crate) fn state(&self) -> (usize, usize) {
         (self.keys.len(), self.bytes)
+    }
+    pub(crate) fn set_durable(&mut self) { self.durable = true; }
+    pub(crate) fn encode_state(
+        &self, operator: sparrow_model::OperatorId, inputs: &[crate::graph_cut::Progress; 2],
+        emitted: &crate::graph_cut::Progress, out: &mut Vec<u8>, limit: usize,
+    ) -> Result<()> {
+        if !self.durable { return Err(crate::analysis_state::mismatch("fresh Join cannot encode recovery state")); }
+        crate::analysis_state::header(out, operator, 11, self.rows.iter().map(BTreeMap::len).sum(), limit)?;
+        for n in self.sequence { out.extend_from_slice(&n.to_le_bytes()); }
+        for p in inputs { crate::analysis_state::put_progress(out, p); }
+        crate::analysis_state::put_progress(out, emitted);
+        for rows in &self.rows {
+            out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            for record in rows.values() {
+                out.extend_from_slice(&record.ordinal.to_le_bytes());
+                out.push(u8::from(record.matched));
+                out.extend_from_slice(&(record.row.values.len() as u16).to_le_bytes());
+                for v in &record.row.values { v.encode_value(out)?; }
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn restore_state(&mut self, freeze: crate::analysis_state::AnalysisFreeze)
+        -> Result<([crate::graph_cut::Progress; 2], crate::graph_cut::Progress)> {
+        use crate::analysis_state::{AnalysisData, mismatch};
+        if !self.durable || self.rows.iter().any(|rows| !rows.is_empty()) {
+            return Err(mismatch("Join restore requires a fresh durable operator"));
+        }
+        let AnalysisData::Join { sequences, inputs, emitted, rows } = freeze.data else {
+            return Err(mismatch("Join received an UNNEST frame"));
+        };
+        for (side, rows) in rows.into_iter().enumerate() {
+            for saved in rows {
+                if saved.row.values.len() != self.schemas[side].fields.len()
+                    || saved.row.values.iter().zip(&self.schemas[side].fields).any(|(v, f)| {
+                        if v.is_null() { !f.nullable } else { !v.matches_type(&f.data_type) }
+                    }) {
+                    return Err(mismatch("Join restored row schema mismatch"));
+                }
+                self.sequence[side] = saved.ordinal - 1;
+                let mut pending = self.prepare(side, &saved.row, i64::MAX)?
+                    .ok_or_else(|| mismatch("Join restored row unexpectedly rejected"))?;
+                pending.record.matched = saved.matched;
+                if saved.matched && !pending.record.matchable {
+                    return Err(mismatch("unmatchable Join key marked matched"));
+                }
+                self.insert(side, pending);
+            }
+        }
+        self.sequence = sequences;
+        for (side, p) in inputs.iter().enumerate() {
+            if let Some(wm) = if p.eof { Some(i64::MAX) } else { p.watermark } { self.advance(side, wm)?; }
+        }
+        if self.expired().is_some() || emitted.watermark != self.progress() {
+            return Err(mismatch("Join state/expiry/output watermark disagrees with committed cut"));
+        }
+        Ok((inputs, emitted))
     }
     pub(crate) fn work(&self) -> u64 {
         ((self.rows[0].len() + self.rows[1].len() + 1) * (self.output.fields.len() + 4)) as u64
@@ -124,6 +183,9 @@ impl BoundedJoin {
         if self.rows[side].len() >= self.spec.max_rows_per_side {
             return Err(bound("join side row limit exceeded"));
         }
+        if self.durable && self.rows.iter().map(BTreeMap::len).sum::<usize>() >= self.max_keys {
+            return Err(bound("durable Join total retained rows exceed max_state_keys"));
+        }
         let ordinal = self.sequence[side]
             .checked_add(1)
             .filter(|n| *n <= i64::MAX as u64)
@@ -142,7 +204,8 @@ impl BoundedJoin {
         // Includes detach/key copies and singleton B-tree slack; acquired BEFORE allocation.
         let credit = self.owner.acquire(
             CreditKind::Retention,
-            row.resident_bytes().saturating_mul(4).saturating_add(2048),
+            if self.durable { crate::analysis_state::row_credit(&row.values) }
+            else { row.resident_bytes().saturating_mul(4).saturating_add(2048) },
         )?;
         let mut key = Vec::new();
         let mut matchable = true;
@@ -160,7 +223,7 @@ impl BoundedJoin {
             }
             Some(self.owner.acquire(
                 CreditKind::Retention,
-                key.len().saturating_mul(2).saturating_add(2048),
+                if self.durable { 1 } else { key.len().saturating_mul(2).saturating_add(2048) },
             )?)
         };
         Ok(Some(Pending {

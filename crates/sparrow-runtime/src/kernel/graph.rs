@@ -668,7 +668,7 @@ pub(super) async fn run(ctx: JobCtx, mut req: JobRequest) -> Result<JobStats> {
                 let tx = output.remove(0).1;
                 set.spawn(async move {
                     let _guard = guard;
-                    super::analysis::join_task(&child, plan, input, tx)?
+                    super::analysis::join_task(&child, operator, plan, input, tx)?
                         .await
                         .map_err(|e| e.at_operator(operator))
                 });

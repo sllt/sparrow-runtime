@@ -29,6 +29,20 @@ pub struct EncodedFreeze {
 }
 
 impl EncodedFreeze {
+    pub(crate) fn from_analysis(
+        owner: &Arc<MemoryOwner>, capacity: usize,
+        encode: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+    ) -> Result<Self> {
+        let capacity = capacity.saturating_add(1024);
+        if capacity as u64 > crate::checkpoint::MAX_SNAPSHOT_BYTES {
+            return Err(SparrowError::new(ErrorCode::BoundExceeded, "analysis freeze exceeds snapshot bound"));
+        }
+        let lease = owner.acquire(sparrow_model::CreditKind::Reservation, capacity)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        encode(&mut bytes)?;
+        if bytes.len() > capacity { return Err(SparrowError::new(ErrorCode::Internal, "analysis freeze estimate underflow")); }
+        Ok(Self { bytes, lease, ext: false, buffered: false })
+    }
     pub(crate) fn identity(&self) -> Result<(ParticipantId, u8, usize)> {
         let header = crate::checkpoint::FreezeHeader::parse(&self.bytes)?;
         Ok((
@@ -151,6 +165,7 @@ pub(crate) struct RuntimeAligned {
     pub iot: Mutex<BTreeMap<sparrow_model::OperatorId, crate::iot::IotOperator>>,
     /// Prepared v31/v32 sliding count operators (restored or fresh-durable).
     pub(crate) buffered: Mutex<BTreeMap<sparrow_model::OperatorId, crate::buffered_window::BufferedWindow>>,
+    pub(crate) analysis: Mutex<BTreeMap<sparrow_model::OperatorId, crate::analysis_state::PreparedAnalysis>>,
     pub acks: AlignedAcks,
     pub outbox: Arc<InflightCounter>,
     _sink_binding: Option<SinkRestoreBinding>,
@@ -191,6 +206,7 @@ impl RuntimeAligned {
             restore: Mutex::new(restore),
             windows: Mutex::new(BTreeMap::new()),
             buffered: Mutex::new(BTreeMap::new()),
+            analysis: Mutex::new(BTreeMap::new()),
             iot: Mutex::new(BTreeMap::new()),
             acks: job.acks,
             outbox: job.outbox,
@@ -262,14 +278,16 @@ impl RuntimeAligned {
         let mut restored = BTreeMap::new();
         let mut restored_iot = BTreeMap::new();
         let mut restored_buffered = BTreeMap::new();
-        if pipeline.restore.is_none() && (!pipeline.iot.is_empty() || !pipeline.buffered.is_empty()) {
+        let mut restored_analysis = BTreeMap::new();
+        if pipeline.restore.is_none() && (!pipeline.iot.is_empty() || !pipeline.buffered.is_empty() || !pipeline.analysis.is_empty()) {
             return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "IoT state supplied without restored participant envelope"));
         }
         if let Some(states) = pipeline.restore {
             if states.iter().any(|s| s.entries.len() > max_keys)
                 || pipeline.iot.iter().any(|s| s.entries.len() > max_keys)
                 || pipeline.buffered.iter().any(|s| s.groups.len() > max_keys)
-                || states.len().saturating_add(pipeline.iot.len()).saturating_add(pipeline.buffered.len()) != pipeline.plan.states.len()
+                || pipeline.analysis.iter().any(|s| s.entries() > max_keys)
+                || states.len().saturating_add(pipeline.iot.len()).saturating_add(pipeline.buffered.len()).saturating_add(pipeline.analysis.len()) != pipeline.plan.states.len()
             {
                 return Err(SparrowError::new(
                     ErrorCode::BoundExceeded,
@@ -321,11 +339,58 @@ impl RuntimeAligned {
                 let lease = restore_lease(&mut credit, owner, participant, freeze.resident_bytes())?;
                 restored_buffered.insert(freeze.operator, (freeze, lease));
             }
+            for freeze in pipeline.analysis {
+                let participant = ParticipantId::analysis(freeze.operator);
+                if !pipeline.plan.states.iter().any(|s| s.id == participant
+                    && s.codec == sparrow_plan::checkpoint::ANALYSIS_STATE_CODEC && s.freeze_kind() == freeze.kind())
+                    || restored_analysis.contains_key(&freeze.operator) {
+                    return Err(crate::analysis_state::mismatch("unknown or duplicate analysis participant"));
+                }
+                let lease = restore_lease(&mut credit, owner, participant, freeze.resident_bytes())?;
+                restored_analysis.insert(freeze.operator, (freeze, lease));
+            }
         }
         let mut windows = BTreeMap::new();
         let mut iot = BTreeMap::new();
         let mut buffered = BTreeMap::new();
+        let mut analysis = BTreeMap::new();
         for stage in &plan.stages {
+            if let sparrow_plan::PhysicalStage::Analysis { operator, plan: spec } = stage {
+                use crate::analysis_state::{PreparedAnalysis, UnnestState, mismatch};
+                let saved = restored_analysis.remove(operator);
+                let prepared = match spec.as_ref() {
+                    sparrow_plan::AnalysisPlan::Unnest { .. } => {
+                        let mut op = UnnestState::new(owner)?;
+                        if let Some((freeze, lease)) = saved { op.restore(freeze)?; drop(lease); }
+                        if let Some(graph) = job.acks.graph_time() {
+                            if op.sequences.keys().any(|id| id.is_none_or(|id| !graph.initial.sources.contains_key(&id.raw()))) {
+                                return Err(mismatch("UNNEST restored source identity differs from graph"));
+                            }
+                        }
+                        PreparedAnalysis::Unnest(op)
+                    }
+                    sparrow_plan::AnalysisPlan::Join { spec, left, right, .. } => {
+                        let graph = job.acks.graph_time().ok_or_else(|| mismatch("Join requires a durable graph cut"))?;
+                        let mut op = crate::bounded_join::BoundedJoin::new(spec.clone(), left.clone(), right.clone(), owner.clone(), max_keys)?;
+                        op.set_durable();
+                        let (inputs, emitted) = if let Some((freeze, lease)) = saved {
+                            let state = op.restore_state(freeze)?;
+                            drop(lease);
+                            state
+                        } else { (std::array::from_fn(|_| crate::graph_cut::Progress::default()), crate::graph_cut::Progress::default()) };
+                        for (side, id) in [spec.left_input, spec.right_input].into_iter().enumerate() {
+                            if graph.initial.sources.get(&id).is_none_or(|p| p.progress != inputs[side]) {
+                                return Err(mismatch("Join input progress differs from the durable source cut"));
+                            }
+                        }
+                        PreparedAnalysis::Join { op, inputs, emitted,
+                            _credit: owner.acquire(sparrow_model::CreditKind::Retention, crate::analysis_state::FIXED)? }
+                    }
+                    sparrow_plan::AnalysisPlan::External { .. } => return Err(mismatch("external Transform cannot recover")),
+                };
+                analysis.insert(*operator, prepared);
+                continue;
+            }
             if let sparrow_plan::PhysicalStage::WindowAgg { operator, spec, input, .. } = stage {
                 if spec.kind.is_buffered() {
                     let participant = ParticipantId::window(*operator);
@@ -391,7 +456,7 @@ impl RuntimeAligned {
                 iot.insert(*operator, op);
             }
         }
-        if !restored.is_empty() || !restored_iot.is_empty() || !restored_buffered.is_empty() {
+        if !restored.is_empty() || !restored_iot.is_empty() || !restored_buffered.is_empty() || !restored_analysis.is_empty() {
             return Err(SparrowError::new(ErrorCode::Internal, "unconsumed restored participant"));
         }
         job.acks
@@ -401,6 +466,7 @@ impl RuntimeAligned {
             restore: Mutex::new(None),
             windows: Mutex::new(windows),
             buffered: Mutex::new(buffered),
+            analysis: Mutex::new(analysis),
             iot: Mutex::new(iot),
             acks: job.acks,
             outbox: job.outbox,
@@ -430,6 +496,7 @@ fn restore_lease(
 }
 
 pub struct PipelineRestore {
+    pub analysis: Vec<crate::analysis_state::AnalysisFreeze>,
     pub plan: Arc<CheckpointPlan>,
     pub generation: [u8; 16],
     /// None is fresh; Some(empty) is a restored zero-state plan.
@@ -692,6 +759,14 @@ impl AlignedAcks {
             }
         };
         self.send(ack).await;
+    }
+
+    pub(crate) async fn analysis_frozen(&self, checkpoint_id: u64, operator: sparrow_model::OperatorId, freeze: Result<EncodedFreeze>) {
+        let Some(p) = self.participants.get() else { return; };
+        self.send(AlignedAck::Participant { attempt: p.attempt, checkpoint_id,
+            participant: ParticipantId::analysis(operator),
+            outcome: match freeze { Ok(f) => ParticipantOutcome::State(f), Err(e) => ParticipantOutcome::Failed(e) },
+        }).await;
     }
 
     pub(crate) async fn iot_frozen(&self, checkpoint_id: u64, operator: sparrow_model::OperatorId, freeze: Result<EncodedFreeze>) {

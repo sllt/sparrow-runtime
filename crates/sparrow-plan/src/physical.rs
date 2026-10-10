@@ -270,6 +270,23 @@ impl PhysicalPlan {
         )
     }
 
+    pub fn has_stream_join(&self) -> bool {
+        self.stages.iter().any(|s| matches!(s,
+            PhysicalStage::Analysis { plan, .. } if plan.is_join()))
+    }
+
+    /// Durable analysis graphs reuse the logged, ordered graph decisions,
+    /// including graphs with only UNNEST/Union and no time window.
+    pub fn is_recovery_time_graph(&self) -> bool {
+        self.edges.is_some()
+            && (self.has_processing_time_state() || self.has_event_time_window() || self.has_analysis())
+    }
+
+    pub fn recovery_event_time(&self) -> bool {
+        self.has_event_time_window() || self.has_stream_join()
+            || (self.has_analysis() && !self.source_times.is_empty())
+    }
+
     pub fn event_time_binding(&self) -> Option<sparrow_model::EventTimeBinding> {
         self.stages.iter().find_map(|s| match s {
             PhysicalStage::WindowAgg { spec, .. } => spec.binding(),

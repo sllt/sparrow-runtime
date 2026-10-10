@@ -8,6 +8,9 @@ use sparrow_model::{
 use sparrow_plan::{AnalysisPlan, JoinMode, StreamJoinSpec};
 use std::{collections::HashMap, time::Duration};
 
+#[path = "analysis_recovery_tests.rs"]
+mod analysis_recovery_tests;
+
 fn schema() -> Schema {
     Schema::new(
         1,

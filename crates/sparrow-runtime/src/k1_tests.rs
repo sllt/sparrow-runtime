@@ -354,7 +354,7 @@ fn r11_restore_rejects_wrong_keys_accumulators_and_bounds_before_input() {
         let request =
             JobRequest::new(physical, vec![row(99)], capture.clone()).with_aligned(AlignedJob {
                 restore: None,
-                pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                     sink: None,
                     iot: Vec::new(),
                     plan: manifest,
@@ -534,7 +534,7 @@ fn r11_restore_duplicate_unknown_legacy_combination_and_generation_zero_reject()
                     } else {
                         None
                     },
-                    pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                    pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                         sink: None,
                         iot: Vec::new(),
                         plan: manifest,
@@ -846,7 +846,7 @@ fn k1_real_kernel_zero_single_double_windows_recover_every_cut_against_raw_input
                                 .with_live_events(rx)
                                 .with_aligned(AlignedJob {
                                     restore: None,
-                                    pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                                    pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                                         sink: None,
                                         iot: Vec::new(),
                                         plan: manifest.clone(),
@@ -967,7 +967,7 @@ fn k1_real_kernel_zero_single_double_windows_recover_every_cut_against_raw_input
                             )
                             .with_aligned(AlignedJob {
                                 restore: None,
-                                pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                                pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                                     sink: None,
                                     iot: Vec::new(),
                                     plan: manifest,
@@ -1292,7 +1292,7 @@ fn k1_partial_restore_rejected_before_input_and_failed_preparation_refunds_all()
         let request = JobRequest::new(physical.clone(), vec![row(1)], capture.clone())
             .with_aligned(AlignedJob {
                 restore: None,
-                pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                     sink: None,
                     iot: Vec::new(),
                     plan: manifest.clone(),
@@ -1373,7 +1373,7 @@ fn k1_single_et_tumble_hop_restore_watermark_and_state_against_raw_buckets() {
                         .with_live_events(rx)
                         .with_aligned(AlignedJob {
                             restore: None,
-                            pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                            pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                                 sink: None,
                                 iot: Vec::new(),
                                 plan: manifest.clone(),
@@ -1433,7 +1433,7 @@ fn k1_single_et_tumble_hop_restore_watermark_and_state_against_raw_buckets() {
                         }])
                         .with_aligned(AlignedJob {
                             restore: None,
-                            pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                            pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                                 sink: None,
                                 iot: Vec::new(),
                                 plan: manifest,
@@ -1478,7 +1478,7 @@ fn k1_two_windows_checkpoint_waits_for_real_slow_sink_and_cancellation_releases_
                         .with_live_out(out)
                         .with_aligned(AlignedJob {
                             restore: None,
-                            pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                            pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                                 sink: None,
                                 iot: Vec::new(),
                                 plan: manifest,
@@ -1544,7 +1544,7 @@ fn k1_partial_freeze_budget_failure_is_retryable_without_job_loss_or_leases() {
                     .with_live_events(rx)
                     .with_aligned(AlignedJob {
                         restore: None,
-                        pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                        pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                             sink: None,
                             iot: Vec::new(),
                             plan: manifest,
@@ -1632,7 +1632,7 @@ fn k1_two_full_keyspaces_share_bytes_without_halving_per_operator_cardinality() 
                     .with_live_events(rx)
                     .with_aligned(AlignedJob {
                         restore: None,
-                        pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                        pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                             sink: None,
                             iot: Vec::new(),
                             plan: manifest.clone(),
@@ -1704,7 +1704,7 @@ fn k1_two_full_keyspaces_share_bytes_without_halving_per_operator_cardinality() 
             .submit(
                 JobRequest::new(physical, rows, capture.clone()).with_aligned(AlignedJob {
                     restore: None,
-                    pipeline: Some(PipelineRestore { buffered: Vec::new(),
+                    pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
                         sink: None,
                         iot: Vec::new(),
                         plan: manifest,

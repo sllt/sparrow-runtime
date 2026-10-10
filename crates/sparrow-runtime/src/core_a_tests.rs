@@ -113,7 +113,7 @@ fn aligned_job(
     };
     AlignedJob {
         restore: None,
-        pipeline: Some(PipelineRestore { buffered: Vec::new(),
+        pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered: Vec::new(),
             sink: None,
             plan,
             generation,

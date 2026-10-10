@@ -648,11 +648,11 @@ async fn segment(
     let manifest = Arc::new(CheckpointPlan::from_physical(physical).unwrap());
     let mut request = JobRequest::new(physical.clone(), vec![], SharedCapture::disabled());
     let pipeline = match restore {
-        None => PipelineRestore { buffered: Vec::new(), sink: None, plan: manifest.clone(), generation: [5; 16], restore: None, iot: vec![] },
+        None => PipelineRestore { analysis: Vec::new(), buffered: Vec::new(), sink: None, plan: manifest.clone(), generation: [5; 16], restore: None, iot: vec![] },
         Some((snap, credit, admission)) => {
             request = request.with_source_admission(admission).with_restore_credit(credit);
             assert!(snap.next_output.is_none());
-            PipelineRestore { buffered: snap.buffered, sink: None, plan: Arc::new(snap.plan), generation: snap.generation, restore: Some(snap.windows), iot: snap.iot }
+            PipelineRestore { analysis: Vec::new(), buffered: snap.buffered, sink: None, plan: Arc::new(snap.plan), generation: snap.generation, restore: Some(snap.windows), iot: snap.iot }
         }
     };
     let acks = AlignedAcks::default();

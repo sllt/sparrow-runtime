@@ -18,6 +18,15 @@ SQL 与 Graph 共用类型检查、函数 registry、NULL/错误和分配额度�
 
 ## UNNEST
 
+### 第11批子批3：恢复实现合同（开发中）
+
+- 单 UNNEST：File v36 / JetStream v37，保存每个来源的输入序号；一个输入的全部展开与下游输出完成后才允许屏障越过。空数组也消耗输入序号，重放保留 ordinal。
+- 多 File 分析图 v38：复用持久轮转决策、源 cursor/水位/idle/永久 EOF 与每 Sink 输出游标；不是 ready-order 合流。支持 UNNEST/Union 与直接双 Source 的 Interval/Window inner/left Join，纯转换和 required HTTP 输出。
+- Join codec 5 保存两侧保留行、匹配标志、序号、水位/EOF 和已发送进度；索引与过期边界按原规则重建。Idle 不证明无匹配，只有真实水位/永久 EOF 才产生 unmatched。Join 输入暂限定标量字段；UNNEST 仍可展开有界嵌套输入。
+- 独立版本和新目录、完整计算语义严格匹配；旧 codec 不迁移。恢复前按 Job owner 预留有界内存。输出仍可能重复，不承诺 exactly-once；v37/v38 提供稳定输出 ID。
+- 本子批不开放 JetStream DAG、任意上游 Join、多个 Join、插件、动态 Lookup、窗口/参考表/告警组合或输入 DLQ/outbox 组合；业务组合在子批4逐项接通。沿用原有限资源预算，不提高默认限额来通过测试。
+- 验证采用受影响回归、切点前后输出/序号对照、双源慢侧/EOF、一次进程恢复及取消/退款，不重复20轮矩阵。完成后在恢复矩阵记录实际通过范围。
+
 ```sql
 SELECT s.device, to_int64(u.item) AS value, u.ord
 FROM events s CROSS JOIN UNNEST(s.items) WITH ORDINALITY AS u(item, ord)

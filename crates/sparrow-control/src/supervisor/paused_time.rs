@@ -249,7 +249,7 @@ impl Supervisor {
             )))
             .with_aligned(AlignedJob {
                 restore: None,
-                pipeline: Some(PipelineRestore { buffered,
+                pipeline: Some(PipelineRestore { analysis: Vec::new(), buffered,
                     sink: None,
                     plan: manifest.clone(),
                     generation,

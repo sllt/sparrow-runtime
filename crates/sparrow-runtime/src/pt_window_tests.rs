@@ -283,7 +283,7 @@ fn drive(
                     .with_live_out(out)
                     .with_aligned(AlignedJob {
                         restore: None,
-                        pipeline: Some(PipelineRestore {
+                        pipeline: Some(PipelineRestore { analysis: Vec::new(),
                             buffered,
                             sink: None,
                             plan: manifest.clone(),
@@ -361,7 +361,7 @@ fn kernel_rejects_foreign_output_epoch_before_pt_window_activation() {
                 .with_live_out(out)
                 .with_aligned(AlignedJob {
                     restore: None,
-                    pipeline: Some(PipelineRestore {
+                    pipeline: Some(PipelineRestore { analysis: Vec::new(),
                         buffered: vec![],
                         sink: None,
                         plan: manifest,

@@ -22,6 +22,7 @@ pub use resample_iot::ResampleStats;
 #[cfg(test)]
 mod analysis_tests;
 mod bounded_join;
+pub mod analysis_state;
 pub mod buffered_window;
 pub mod external_lookup;
 #[cfg(test)]

@@ -1232,7 +1232,7 @@ impl Supervisor {
             self.start_live_silence(name, &spec, schema, plan, demo.as_ref(), &policy).await?
         } else if plan.has_silence() {
             self.start_observed_time(&spec,schema,plan,&policy).await?
-        } else if spec.recovery=="aligned" && plan.edges.is_some() && (plan.has_processing_time_state() || plan.has_event_time_window()) {
+        } else if spec.recovery=="aligned" && plan.is_recovery_time_graph() {
             self.start_time_graph(&spec,plan,&policy).await?
         } else if plan.has_timed_iot() || (spec.recovery == "aligned" && plan.has_processing_time_state()) {
             self.start_paused_time(&spec,schema,plan,&policy).await?
@@ -1941,6 +1941,7 @@ impl Supervisor {
             || layout.has_hysteresis()
             || layout.has_extended_state()
             || layout.has_buffered_state()
+            || layout.has_analysis_state()
             || sink_identity.is_some();
         // Fingerprinting, bounded snapshot reads and cursor verification are
         // cold filesystem work; never block a Tokio executor worker on them.
@@ -1992,6 +1993,8 @@ impl Supervisor {
                         "required sink checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else if reference_profile {
                         "reference checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
+                    } else if restore_layout.has_analysis_state() {
+                        "UNNEST checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else if restore_layout.has_extended_state() {
                         "extended aggregate (v29) checkpoint history requires resume_latest or an explicit checkpoint restore; use a new directory for fresh replay"
                     } else if restore_layout.has_buffered_event_time_state() {
@@ -2044,7 +2047,7 @@ impl Supervisor {
                     source.seek(&snap.source)?;
                     (
                         Some(snap.windows),
-                        (snap.iot, snap.buffered),
+                        (snap.iot, snap.buffered, snap.analysis),
                         snap.ingested_rows,
                         Some(snap.checkpoint_id),
                         snap.generation,
@@ -2057,7 +2060,7 @@ impl Supervisor {
                     use ring::rand::{SecureRandom,SystemRandom};
                     let mut generation=[0u8;16];
                     SystemRandom::new().fill(&mut generation).map_err(|_|SparrowError::new(sparrow_model::ErrorCode::Internal,"state generation randomness unavailable"))?;
-                    (None, (Vec::new(), Vec::new()), 0, None, generation, false, Arc::clone(&restore_layout), None, None)
+                    (None, (Vec::new(), Vec::new(), Vec::new()), 0, None, generation, false, Arc::clone(&restore_layout), None, None)
                 };
                 // Durable before Kernel/source activation. Fresh/reset gets a new
                 // random 128-bit identity; compatible recovery preserves its ID.
@@ -2112,7 +2115,7 @@ impl Supervisor {
             .with_live_out(tx_out)
             .with_aligned(AlignedJob {
                 restore: None,
-                pipeline: Some(PipelineRestore { buffered: restore_iot.1,
+                pipeline: Some(PipelineRestore { analysis: restore_iot.2, buffered: restore_iot.1,
                     // v27/v28 independently verify the saved full semantics at
                     // Kernel admission, rather than comparing live to itself.
                     plan: if sink_identity.is_some() { saved_plan } else { layout.clone() },

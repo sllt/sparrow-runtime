@@ -1747,10 +1747,7 @@ fn validate_aligned_plan_inner(
             || spec.checkpoint.is_some()
             || spec.checkpoint_dir.is_some())
     {
-        return Err(SparrowError::new(
-            ErrorCode::UnsupportedRestore,
-            "UNNEST/stream Join are restart_fresh only, without checkpoint or restore",
-        ));
+        validate_analysis_recovery_profile(spec, plan, recovery)?;
     }
     let wants_checkpoint = recovery.is_aligned()
         || spec.restore.is_some()
@@ -1819,8 +1816,7 @@ fn validate_aligned_plan_inner(
         .as_ref()
         .is_some_and(|io| io.idle_after_ms.is_some())
         && !(recovery.is_aligned()
-            && plan.edges.is_some()
-            && (plan.has_processing_time_state() || plan.has_event_time_window()))
+            && plan.is_recovery_time_graph())
     {
         return Err(SparrowError::new(
             ErrorCode::UnsupportedRestore,
@@ -1836,8 +1832,7 @@ fn validate_aligned_plan_inner(
             validate_observed_time_profile(spec, plan)?;
         }
     } else if recovery.is_aligned()
-        && plan.edges.is_some()
-        && (plan.has_processing_time_state() || plan.has_event_time_window())
+        && plan.is_recovery_time_graph()
     {
         validate_time_graph_profile(spec, plan)?;
     } else if plan.has_timed_iot() || (recovery.is_aligned() && plan.has_processing_time_state()) {
@@ -2340,6 +2335,37 @@ fn validate_paused_time_profile(spec: &PipelineSpec, plan: &PhysicalPlan) -> Res
         ));
     }
     sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    Ok(())
+}
+
+fn validate_analysis_recovery_profile(spec: &PipelineSpec, plan: &PhysicalPlan, recovery: RecoveryPolicy) -> Result<()> {
+    if !spec.source.payload_format()?.is_json() || !spec.sink.payload_format()?.is_json() {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "analysis recovery initially requires JSON input/output"));
+    }
+    if let Some(io) = &spec.graph_io {
+        for source in io.sources.values() {
+            if !source.payload_format()?.is_json() { return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "analysis graph input must be JSON")); }
+        }
+        for sink in io.sinks.values() {
+            if !sink.payload_format()?.is_json() { return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "analysis graph output must be JSON")); }
+        }
+    }
+    if !recovery.is_aligned() || spec.sink.kind != "http"
+        || spec.checkpoint_dir.as_deref().is_none_or(str::is_empty)
+        || !spec.reference_tables.is_empty() || spec.has_live_lookups()
+        || spec.source.input_dlq.is_some() || spec.source.replay_start.is_some()
+        || spec.sink.durable_outbox.is_some() || spec.sink.action.is_some()
+        || (plan.edges.is_none() && spec.graph_io.is_some()) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,
+            "analysis recovery requires aligned, independent directory and required HTTP; no Lookup/DLQ/outbox/replay-operation combinations"));
+    }
+    let manifest = sparrow_plan::CheckpointPlan::from_physical(plan)?;
+    if !manifest.has_analysis_state() { return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "analysis profile missing")); }
+    if plan.edges.is_some() { validate_time_graph_profile(spec, plan)?; }
+    else if !matches!(spec.source.kind.as_str(), "file" | "file_replay" | "replay")
+        && !(cfg!(feature = "jetstream") && spec.source.kind == "jetstream") {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore, "UNNEST recovery requires File or JetStream"));
+    }
     Ok(())
 }
 
@@ -2957,7 +2983,21 @@ fn effective_guarantees_with_plan_inner(
         });
         return value;
     }
-    if plan.has_analysis() || plan.has_extended_aggs() {
+    if plan.has_analysis() {
+        let mut candidate = spec.clone();
+        candidate.recovery = "aligned".into();
+        let checked = validate_analysis_recovery_profile(&candidate, plan, RecoveryPolicy::Aligned)
+            .and_then(|_| validate_aligned_plan(&candidate, plan));
+        value["aligned_eligible"] = serde_json::json!(checked.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(checked.err().map(|e| e.message));
+        value["analysis"] = serde_json::json!({"maturity":"development_preview","certified":false,
+            "recovery":spec.recovery,"profiles":"UNNEST_File_v36_JetStream_v37; ordered_File_analysis_graph_v38",
+            "state_codec":5,"join":"direct_two_sources; scalar_rows; one_Join; inner_or_left; watermark_or_permanent_EOF_closes_unmatched",
+            "multi_source_order":"persisted_decisions; fixed_port_order; not_original_device_total_order",
+            "output":"uncommitted_outputs_may_repeat; stable_OutputSequence_in_v37_v38; no_exactly_once"});
+        return value;
+    }
+    if plan.has_extended_aggs() {
         value["aligned_eligible"] = serde_json::json!(false);
         value["aligned_eligibility_reason"] =
             serde_json::json!("bounded analysis operators have no published checkpoint profile");

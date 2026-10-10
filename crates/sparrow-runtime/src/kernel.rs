@@ -29,6 +29,7 @@ use crate::transform::{build_source_batches, build_source_batches_shared, Compil
 use crate::window::WindowOperator;
 
 mod analysis;
+mod ordered_join;
 mod buffered_window;
 mod graph;
 mod live_silence;
@@ -848,10 +849,10 @@ impl Kernel {
             ));
         }
         if req.plan.has_analysis() && req.aligned.is_some() {
-            return Err(SparrowError::new(
-                ErrorCode::UnsupportedRestore,
-                "analysis is restart_fresh only",
-            ));
+            let manifest = sparrow_plan::CheckpointPlan::from_physical(&req.plan)?;
+            if !manifest.has_analysis_state() || req.aligned.as_ref().is_none_or(|a| a.pipeline.is_none()) {
+                return Err(crate::analysis_state::mismatch("analysis requires its participant recovery profile"));
+            }
         }
         // Extended aggregates are recoverable only through the strict
         // participant profile (codec 3, v29/v30); never legacy AlignedSession.
@@ -899,9 +900,7 @@ impl Kernel {
             .as_ref()
             .and_then(|a| a.acks.graph_time())
             .cloned();
-        let durable_graph = req.aligned.is_some()
-            && req.plan.edges.is_some()
-            && (req.plan.has_processing_time_state() || req.plan.has_event_time_window());
+        let durable_graph = req.aligned.is_some() && req.plan.is_recovery_time_graph();
         if req.live_silence.is_some() {
             live_silence::validate_request(&req)?;
         }
@@ -1099,6 +1098,7 @@ impl Kernel {
                         | crate::pipeline_checkpoint::SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::PT_WINDOW_FILE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::PT_WINDOW_RELIABLE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::ANALYSIS_RELIABLE_SNAPSHOT_VERSION
                 ) && aligned
                     .acks
                     .output_sequence()
@@ -1905,7 +1905,7 @@ async fn stage_loop(
             let rx = rx
                 .as_mut()
                 .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "analysis input absent"))?;
-            let result = analysis::unnest_task(&ctx, plan, rx, &tx)?
+            let result = analysis::unnest_task(&ctx, operator, plan, rx, &tx)?
                 .await
                 .map_err(|e| e.at_operator(operator));
             result

@@ -74,6 +74,9 @@ pub const BUFFERED_ET_FILE_SNAPSHOT_VERSION: u16 = 33;
 pub const PT_WINDOW_FILE_SNAPSHOT_VERSION: u16 = 34;
 /// Same as v34 on the paused-time JetStream source (v17 mechanism).
 pub const PT_WINDOW_RELIABLE_SNAPSHOT_VERSION: u16 = 35;
+pub const ANALYSIS_FILE_SNAPSHOT_VERSION: u16 = 36;
+pub const ANALYSIS_RELIABLE_SNAPSHOT_VERSION: u16 = 37;
+pub const ANALYSIS_GRAPH_SNAPSHOT_VERSION: u16 = 38;
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
 
 pub(crate) const EXTENDED_PROFILE_GUARD: &str = "extended_profile_mismatch";
@@ -217,6 +220,15 @@ pub fn snapshot_version_for(
     let graph = plan.is_graph();
     let references = plan.has_references();
     let hysteresis = plan.has_hysteresis();
+
+    if plan.has_analysis_state() {
+        return match (plan.is_graph(), source_kind) {
+            (false, "file") => Ok(ANALYSIS_FILE_SNAPSHOT_VERSION),
+            (false, "jetstream-v1") => Ok(ANALYSIS_RELIABLE_SNAPSHOT_VERSION),
+            (true, crate::graph_cut::KIND) => Ok(ANALYSIS_GRAPH_SNAPSHOT_VERSION),
+            _ => Err(crate::analysis_state::mismatch("analysis source/profile mismatch; use v36/v37 UNNEST or v38 ordered File graph")),
+        };
+    }
 
     if plan.has_pt_window_state() {
         // validate() already pins one linear PT window participant; it runs
@@ -407,6 +419,7 @@ pub fn snapshot_version_for(
 
 #[derive(Debug, PartialEq)]
 pub struct PipelineSnapshot {
+    pub analysis: Vec<crate::analysis_state::AnalysisFreeze>,
     pub checkpoint_id: u64,
     pub source: SourcePosition,
     pub ingested_rows: u64,
@@ -618,6 +631,7 @@ impl PipelineSnapshot {
                 | OBSERVED_FILE_SNAPSHOT_VERSION | OBSERVED_RELIABLE_SNAPSHOT_VERSION
                 | RESAMPLE_FILE_SNAPSHOT_VERSION | RESAMPLE_RELIABLE_SNAPSHOT_VERSION
                 | PT_WINDOW_FILE_SNAPSHOT_VERSION | PT_WINDOW_RELIABLE_SNAPSHOT_VERSION
+                | ANALYSIS_RELIABLE_SNAPSHOT_VERSION
         )
             && acks
                 .next_output
@@ -809,6 +823,7 @@ impl PipelineSnapshot {
                 | BUFFERED_ET_FILE_SNAPSHOT_VERSION
                 | PT_WINDOW_FILE_SNAPSHOT_VERSION
                 | PT_WINDOW_RELIABLE_SNAPSHOT_VERSION
+                | ANALYSIS_FILE_SNAPSHOT_VERSION | ANALYSIS_RELIABLE_SNAPSHOT_VERSION | ANALYSIS_GRAPH_SNAPSHOT_VERSION
         ) {
             return Err(invalid("unsupported pipeline snapshot version"));
         }
@@ -863,9 +878,12 @@ impl PipelineSnapshot {
             version,
             PT_WINDOW_FILE_SNAPSHOT_VERSION | PT_WINDOW_RELIABLE_SNAPSHOT_VERSION
         );
+        let analysis_version = matches!(version, ANALYSIS_FILE_SNAPSHOT_VERSION | ANALYSIS_RELIABLE_SNAPSHOT_VERSION | ANALYSIS_GRAPH_SNAPSHOT_VERSION);
         // v29-v35 envelopes are complete, checksummed records: identity and
         // profile disagreements are incompatibilities, never corruption.
-        let strict = |message: &str| if pt_version {
+        let strict = |message: &str| if analysis_version {
+            crate::analysis_state::mismatch(message)
+        } else if pt_version {
             pt_mismatch(message)
         } else if extended_version {
             extended_mismatch(message)
@@ -886,6 +904,7 @@ impl PipelineSnapshot {
                 | EXT_AGG_RELIABLE_SNAPSHOT_VERSION
                 | SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
                 | PT_WINDOW_FILE_SNAPSHOT_VERSION | PT_WINDOW_RELIABLE_SNAPSHOT_VERSION
+                | ANALYSIS_RELIABLE_SNAPSHOT_VERSION
         ) {
             let epoch=take(&mut bytes,16)?.try_into().unwrap();
             Some(sparrow_model::OutputSequence::new(epoch,u64_value(&mut bytes)?)
@@ -896,7 +915,9 @@ impl PipelineSnapshot {
         }
         let length = u32_value(&mut bytes)?;
         let plan = CheckpointPlan::decode(take(&mut bytes, length)?).map_err(|error| {
-            if pt_version && error.code == ErrorCode::UnsupportedRestore {
+            if analysis_version && error.code == ErrorCode::UnsupportedRestore {
+                error.context("checkpoint_guard", "analysis_profile_mismatch")
+            } else if pt_version && error.code == ErrorCode::UnsupportedRestore {
                 error.context("checkpoint_guard", PT_PROFILE_GUARD)
             } else if extended_version && error.code == ErrorCode::UnsupportedRestore {
                 error.context("checkpoint_guard", EXTENDED_PROFILE_GUARD)
@@ -904,6 +925,15 @@ impl PipelineSnapshot {
                 error.context("checkpoint_guard", BUFFERED_PROFILE_GUARD)
             } else { error }
         })?;
+        if analysis_version != plan.has_analysis_state() {
+            return Err(crate::analysis_state::mismatch("analysis outer version and participant codec disagree"));
+        }
+        if analysis_version {
+            if snapshot_version_for(&plan, &source.identity.kind)? != version
+                || (version == ANALYSIS_RELIABLE_SNAPSHOT_VERSION && next_output.is_none_or(|p| p.epoch() != generation)) {
+                return Err(crate::analysis_state::mismatch("analysis source/output identity mismatch"));
+            }
+        }
         // Codec 3 and the v29/v30 envelopes select each other exactly. A
         // mismatch is a version/profile incompatibility from a complete,
         // checksummed record; never classify it as corruption fallback.
@@ -1094,6 +1124,7 @@ impl PipelineSnapshot {
                 | HYSTERESIS_SNAPSHOT_VERSION
                 | TIME_GRAPH_PT_SNAPSHOT_VERSION | TIME_GRAPH_ET_SNAPSHOT_VERSION
                 | ALARM_GRAPH_SNAPSHOT_VERSION
+                | ANALYSIS_GRAPH_SNAPSHOT_VERSION
         ) && plan.is_graph()
         {
             return Err(invalid("graph checkpoint version/manifest mismatch"));
@@ -1141,6 +1172,7 @@ impl PipelineSnapshot {
         let mut windows = Vec::with_capacity(if materialize { n } else { 0 });
         let mut iot = Vec::with_capacity(if materialize { n } else { 0 });
         let mut buffered = Vec::with_capacity(if materialize { n } else { 0 });
+        let mut analysis = Vec::with_capacity(if materialize { n } else { 0 });
         let per_participant = crate::checkpoint::freeze_entry_cap(max_keys);
         let mut remaining = per_participant
             .checked_mul(plan.states.len())
@@ -1178,6 +1210,18 @@ impl PipelineSnapshot {
                 check_planned(resident)?;
                 meter.resident.push(resident);
                 if materialize { iot.push(freeze); }
+                continue;
+            }
+            if participant.codec == sparrow_plan::checkpoint::ANALYSIS_STATE_CODEC {
+                let freeze = crate::analysis_state::AnalysisFreeze::decode(&mut frame, per_participant, materialize)?;
+                remaining -= entries;
+                if !frame.is_empty() || participant.id != ParticipantId::analysis(freeze.operator)
+                    || freeze.kind() != participant.freeze_kind() {
+                    return Err(crate::analysis_state::mismatch("analysis frame does not match participant"));
+                }
+                check_planned(freeze.resident_bytes())?;
+                meter.resident.push(freeze.resident_bytes());
+                if materialize { analysis.push(freeze); }
                 continue;
             }
             if participant.codec == sparrow_plan::checkpoint::BUFFERED_WINDOW_STATE_CODEC {
@@ -1241,6 +1285,7 @@ impl PipelineSnapshot {
             windows,
             iot,
             buffered,
+            analysis,
             next_output,
         })
     }
@@ -1284,7 +1329,7 @@ impl StoredSnapshot {
         materialize: bool,
         meter: &mut RestoreMeter,
     ) -> Result<Self> {
-        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35,0])) {
+        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35|36|37|38,0])) {
             Ok(Self::Pipeline(PipelineSnapshot::decode_metered(
                 bytes,
                 max_keys,

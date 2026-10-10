@@ -278,6 +278,31 @@ pub(crate) fn checkpoint_pipeline(plan: &PhysicalPlan) -> Result<(Vec<u8>, usize
                 if let Some(name) = &spec.as_of_field { w.bytes(name.as_bytes())?; }
                 w.schema(input)?; w.schema(output)?;
             }
+            PhysicalStage::Analysis { operator, plan } => {
+                plan.validate()?;
+                w.tag(13)?;
+                w.raw(&operator.raw().to_le_bytes())?;
+                match plan.as_ref() {
+                    crate::AnalysisPlan::Unnest { spec, input, output, .. } => {
+                        w.tag(0)?;
+                        w.expr(&spec.expr, 0)?;
+                        w.bytes(spec.as_field.as_bytes())?;
+                        w.raw(&(spec.max_rows as u64).to_le_bytes())?;
+                        w.raw(&(spec.max_bytes as u64).to_le_bytes())?;
+                        w.schema(input)?;
+                        w.schema(output)?;
+                    }
+                    crate::AnalysisPlan::Join { spec, left, right, output } => {
+                        w.tag(1)?;
+                        let spec = serde_json::to_vec(spec).map_err(|_| bound())?;
+                        w.bytes(&spec)?;
+                        w.schema(left)?;
+                        w.schema(right)?;
+                        w.schema(output)?;
+                    }
+                    crate::AnalysisPlan::External { .. } => return Err(bound()),
+                }
+            }
             _ => return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"unsupported checkpoint computation")),
         }
     }
@@ -288,7 +313,7 @@ pub(crate) fn checkpoint_pipeline(plan: &PhysicalPlan) -> Result<(Vec<u8>, usize
 /// graphs: topology, routes, input schemas and every required sink are dependencies.
 pub(crate) fn checkpoint_graph(plan: &PhysicalPlan, sources: &[sparrow_model::OperatorId], sinks: &[sparrow_model::OperatorId]) -> Result<Vec<u8>> {
     let mut w = Writer::default();
-    let time_graph=plan.has_processing_time_state() || plan.has_event_time_window();
+    let time_graph=plan.is_recovery_time_graph();
     w.raw(if time_graph {b"CP01DAG2"} else {b"CP01DAG1"})?;
     for ids in [sources, sinks] {
         w.raw(&(ids.len() as u16).to_le_bytes())?;
@@ -328,6 +353,16 @@ pub(crate) fn checkpoint_graph(plan: &PhysicalPlan, sources: &[sparrow_model::Op
             w.raw(&binding.max_future_skew_micros.unwrap_or(-1).to_le_bytes())?;
         }
     }
+    Ok(w.0)
+}
+
+/// Exact bounded row fingerprint grammar for the new analysis graph profile.
+/// Unlike legacy time graphs this includes typed nested values and float bits.
+pub fn analysis_row_bytes(values: &[Scalar]) -> Result<Vec<u8>> {
+    let mut w = Writer::default();
+    w.raw(b"ARF1")?;
+    w.len(values.len())?;
+    for value in values { w.scalar(value, 0)?; }
     Ok(w.0)
 }
 
