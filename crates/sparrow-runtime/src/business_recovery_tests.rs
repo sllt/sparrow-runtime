@@ -32,7 +32,7 @@ fn business_recovery_join_event_window_restores_pending_matches_and_aggregate() 
         {"id":1,"kind":"memory_source","table":"s","event_time_field":"ts","out_of_orderness_micros":10,"out":[3]},
         {"id":2,"kind":"memory_source","table":"s","event_time_field":"ts","out_of_orderness_micros":10,"out":[3]},
         {"id":3,"kind":"interval_join","stream_join":super::super::spec(JoinMode::Left,false),"out":[4]},
-        {"id":4,"kind":"window_agg","window":{"kind":"event_time","size_micros":100,"event_time_field":"l_ts","lateness_micros":0},
+        {"id":4,"kind":"window_agg","event_time_field":"join_time","lateness_micros":0,"window":{"kind":"tumble_et","size_micros":100},
             "keys":["l_k"],"aggs":[{"fn":"sum","expr":{"k":"col","name":"l_v"},"alias":"total"}],"out":[5]},
         {"id":5,"kind":"change_detect","iot":{"keys":["l_k"],"fields":["total"],"emit_first":true,"ttl_micros":0,"max_keys":16,"invalid":"error"},"out":[6]},
         {"id":6,"kind":"capture_sink"}]),
@@ -175,6 +175,6 @@ fn business_recovery_pinned_reference_alarm_restores_deadline_episode_and_identi
     );
     assert_eq!(
         values(&plan, &whole, "sparrow_alarm_episode"),
-        vec![Scalar::Int64(1); 2]
+        vec![Scalar::UInt64(1); 2]
     );
 }
