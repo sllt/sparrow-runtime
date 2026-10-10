@@ -344,6 +344,50 @@ fn rendered(shape: Shape, out: &Out) -> Vec<String> {
 }
 
 #[test]
+fn kernel_rejects_foreign_output_epoch_before_pt_window_activation() {
+    let kernel = Kernel::new(KernelOptions::default()).unwrap();
+    for shape in SHAPES {
+        let plan = plan_with(spec(shape));
+        let manifest = Arc::new(CheckpointPlan::from_physical(&plan).unwrap());
+        let (_tx, rx) = sparrow_io::observed::channel(1);
+        let (out, _received) = sparrow_io::observed::channel::<RowBatch>(1);
+        let acks = AlignedAcks::default()
+            .with_output_sequence(OutputSequence::new([6; 16], 1).unwrap())
+            .unwrap();
+        let result = kernel.submit(
+            JobRequest::new(plan, vec![], SharedCapture::disabled())
+                .with_clock(crate::RuntimeClock::virtual_clock(SharedVirtualClock::new(0)))
+                .with_live_events(rx)
+                .with_live_out(out)
+                .with_aligned(AlignedJob {
+                    restore: None,
+                    pipeline: Some(PipelineRestore {
+                        buffered: vec![],
+                        sink: None,
+                        plan: manifest,
+                        generation: [5; 16],
+                        restore: None,
+                        iot: vec![],
+                    }),
+                    acks,
+                    outbox: Arc::new(InflightCounter::new()),
+                }),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(job) => {
+                kernel.block_on(job.stop()).unwrap();
+                panic!("{shape:?}: foreign output epoch admitted");
+            }
+        };
+        assert_eq!(error.code, ErrorCode::UnsupportedRestore, "{shape:?}");
+        assert!(error.message.contains("epoch differs from the state generation"));
+        assert_eq!(kernel.admitted_jobs(), 0);
+        assert_eq!(kernel.process_owner().usage().physical_bytes, 0);
+    }
+}
+
+#[test]
 fn kernel_uninterrupted_equals_oracle_for_every_pt_shape() {
     let d = decisions();
     for shape in SHAPES {

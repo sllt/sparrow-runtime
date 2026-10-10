@@ -1097,6 +1097,8 @@ impl Kernel {
                         | crate::pipeline_checkpoint::RESAMPLE_FILE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::EXT_AGG_RELIABLE_SNAPSHOT_VERSION
                         | crate::pipeline_checkpoint::SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::PT_WINDOW_FILE_SNAPSHOT_VERSION
+                        | crate::pipeline_checkpoint::PT_WINDOW_RELIABLE_SNAPSHOT_VERSION
                 ) && aligned
                     .acks
                     .output_sequence()
