@@ -245,5 +245,3 @@ function Editor({ initial, caps, conns }: { initial: Draft; caps: Json; conns: J
     </>
   );
 }
-
-
