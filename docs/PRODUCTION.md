@@ -648,7 +648,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 | PT 窗口 + 新聚合 | — | — | 暂不支持（子批2） |
 | FIRST/LAST 输入为 nested/Dynamic | — | — | 暂不支持（validate/start 拒绝，与 MIN/MAX 同规则） |
 | 滑动计数（单窗口，可含旧聚合与新聚合） | codec 4 `BWF1` | File v31、JetStream v32 | 已实现（子批2a：codec 黄金字节/逐前缀截断/结构不变量、恢复等价独立 oracle、Kernel 级 v31/v32 恢复含 OutputSequence 连续、owned 额度与低预算退款、不兼容不回退、Supervisor File v31 checkpoint→kill→恢复与 oracle 一致）；**已验证（子批2a 进程级 SIGKILL，冻结 `0b891be`（首轮 `02e1f99` 同样全过））**：File v31 与真实 nats-server JetStream v32 各 input_after/output_after/output_inflight/commit_before/manifest_renamed/commit_after/restore_kill + 空状态/窗口未满/恰在触发边界/低预算恢复退款（v32 另含 ack_lost）每项 20 轮全过，独立 ring-buffer oracle 逐位比对值、顺序、窗口区间、ID、重复/丢失、CURRENT/ACK 边界、资源归零；与 424cf95 及 #29 `adcbeae` 二进制兼容（旧二进制拒绝 v31、v29 目录由新二进制续写仍为 v29、size/step 变化拒绝） |
-| ET 滑动/会话（单窗口，可含旧聚合与新聚合） | codec 4 `BWF1` kind 7/9 + 水位尾 | File v33 | 已实现（子批2b：codec 黄金字节/逐前缀截断/结构与派生范围不变量、每个切点恢复与不中断及独立 oracle 一致、Kernel 级 v33 恢复（空状态/将关闭/乱序刚合并/有输出后仍有开放状态/无新输入）、owned 额度与低预算退款、伪造记录与不兼容不回退）；JetStream + ET 暂不支持 |
+| ET 滑动/会话（单窗口，可含旧聚合与新聚合） | codec 4 `BWF1` kind 7/9 + 水位尾 | File v33 | 已验证（子批2b 进程级 SIGKILL：会话/ET 滑动各 input_after/output_after/output_inflight/commit_before/manifest_renamed/commit_after/restore_kill/empty/about_to_close/no_new_input/low_budget，会话另含 ooo_merged，每切点 ×20 于冻结提交 4810988，独立 oracle 全通过；与 424cf95/#29 main/#30 二进制兼容性通过。单元：codec 黄金字节/逐前缀截断/结构与派生范围不变量、每个切点恢复与不中断及独立 oracle 一致、Kernel 级 v33 恢复（空状态/将关闭/乱序刚合并/有输出后仍有开放状态/无新输入）、owned 额度与低预算退款、伪造记录与不兼容不回退）；JetStream + ET 暂不支持 |
 | PT 跳跃/滑动/会话 | buffered | — | 暂不支持（子批2c，v34/v35） |
 | Join / UNNEST | 有界分析状态 | — | 暂不支持（子批3） |
 | IoT change/deadband/hysteresis/alarm/silence/resample | codec 2 | 各自 profile | 已验证（既有批次）；与新聚合组合暂不支持 |
@@ -659,7 +659,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 | 维度 | 范围 | 状态 |
 |---|---|---|
 | PT | TPD1/PTC1 逻辑钟（v14～v17）、GTD1/GTC1（v18） | 已验证（既有）；子批1 不扩时间协议 |
-| ET | frame 内 wm_in/wm_out/last_effective；v29 原样复用；v33 在 BWF1 尾部存单输入 activity/wm/max_event_time/last_effective | 已验证（既有 v3）；v29 已验证（ET 滚动/跳跃 File 进程级 SIGKILL，子批1）；v33 已实现（子批2b）。已知限制：future-skew 用重放时墙钟（v3/v29/v33 相同）；线性 File 无 idle 生成器，ET 只在新事件/EOF 时关闭 |
+| ET | frame 内 wm_in/wm_out/last_effective；v29 原样复用；v33 在 BWF1 尾部存单输入 activity/wm/max_event_time/last_effective | 已验证（既有 v3）；v29 已验证（ET 滚动/跳跃 File 进程级 SIGKILL，子批1）；v33 已验证（ET 滑动/会话 File 进程级 SIGKILL ×20，子批2b）。已知限制：future-skew 用重放时墙钟（v3/v29/v33 相同）；线性 File 无 idle 生成器，ET 只在新事件/EOF 时关闭 |
 | 图 ET idle/EOF | v19 | 已验证（既有）；与新聚合组合暂不支持 |
 | 观测时间 | OFD1/OFC1（v23/v24） | 已验证（既有）；与新聚合组合暂不支持 |
 
