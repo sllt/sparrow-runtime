@@ -644,7 +644,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 | ET 窗口 + 新聚合 | — | JetStream | 暂不支持（子批2 单独验证） |
 | PT 窗口 + 新聚合 | — | — | 暂不支持（子批2） |
 | FIRST/LAST 输入为 nested/Dynamic | — | — | 暂不支持（validate/start 拒绝，与 MIN/MAX 同规则） |
-| 滑动计数（单窗口，可含旧聚合与新聚合） | codec 4 `BWF1` | File v31、JetStream v32 | 已实现（子批2a：codec 黄金字节/逐前缀截断/结构不变量、恢复等价独立 oracle、Kernel 级 v31/v32 恢复含 OutputSequence 连续、owned 额度与低预算退款、不兼容不回退、Supervisor File v31 checkpoint→kill→恢复与 oracle 一致；进程级 SIGKILL 证据待 Phase B） |
+| 滑动计数（单窗口，可含旧聚合与新聚合） | codec 4 `BWF1` | File v31、JetStream v32 | 已实现（子批2a：codec 黄金字节/逐前缀截断/结构不变量、恢复等价独立 oracle、Kernel 级 v31/v32 恢复含 OutputSequence 连续、owned 额度与低预算退款、不兼容不回退、Supervisor File v31 checkpoint→kill→恢复与 oracle 一致）；**已验证（子批2a 进程级 SIGKILL，冻结 `02e1f99`）**：File v31 与真实 nats-server JetStream v32 各 input_after/output_after/output_inflight/commit_before/manifest_renamed/commit_after/restore_kill + 空状态/窗口未满/恰在触发边界/低预算恢复退款（v32 另含 ack_lost）每项 20 轮全过，独立 ring-buffer oracle 逐位比对值、顺序、窗口区间、ID、重复/丢失、CURRENT/ACK 边界、资源归零；与 424cf95 及 #29 `adcbeae` 二进制兼容（旧二进制拒绝 v31、v29 目录由新二进制续写仍为 v29、size/step 变化拒绝） |
 | ET 滑动/会话 | buffered | — | 暂不支持（子批2b，v33） |
 | PT 跳跃/滑动/会话 | buffered | — | 暂不支持（子批2c，v34/v35） |
 | Join / UNNEST | 有界分析状态 | — | 暂不支持（子批3） |
@@ -664,11 +664,11 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 
 | 端点 | 恢复位置与确认 | 状态 |
 |---|---|---|
-| File / replay | 身份 kind/path/size/指纹 + offset/record_index；CURRENT 即切点；只承诺未提交后缀重放 | 已验证（既有）；v29 已验证（子批1 进程级 SIGKILL）；v31 已实现（子批2a） |
-| JetStream Source | BND1/JOW1 绑定 + consumer 序号 + OutputSequence；HTTP 2xx 且 CURRENT 落盘后才 ACK | 已验证（既有）；v30 已验证（子批1 真实 NATS 进程级 SIGKILL）；v32 已实现（子批2a，Kernel 级；真实 NATS 待 Phase B） |
+| File / replay | 身份 kind/path/size/指纹 + offset/record_index；CURRENT 即切点；只承诺未提交后缀重放 | 已验证（既有）；v29 已验证（子批1 进程级 SIGKILL）；v31 已验证（子批2a 进程级 SIGKILL） |
+| JetStream Source | BND1/JOW1 绑定 + consumer 序号 + OutputSequence；HTTP 2xx 且 CURRENT 落盘后才 ACK | 已验证（既有）；v30 已验证（子批1 真实 NATS 进程级 SIGKILL）；v32 已验证（子批2a 真实 NATS 进程级 SIGKILL，含 ack_lost） |
 | MQTT / NATS Core / WS / TCP / HTTP Poll/Push / DataBus | 无可重放身份 | 暂不支持（restart_fresh；不因下游支持 checkpoint 获得重放） |
 | Kafka / Redis / Postgres | 尚未通过自身恢复协议验收 | 暂不支持 |
-| required HTTP JSON | v29/v31 无稳定 ID；v30/v32 带 OutputSequence | 已验证（既有 v3/v4）；v29/v30 已验证（含请求在途时 SIGKILL；子批1）；v31/v32 已实现（子批2a） |
+| required HTTP JSON | v29/v31 无稳定 ID；v30/v32 带 OutputSequence | 已验证（既有 v3/v4）；v29/v30 已验证（含请求在途时 SIGKILL；子批1）；v31/v32 已验证（含请求在途时 SIGKILL；子批2a） |
 | HTTP CSV（aligned） | — | 暂不支持 |
 | JetStream Sink v27/v28 | 线性 File | 已验证（既有）；与新聚合组合暂不支持 |
 | File/Action Sink 等其他 Sink | — | 暂不支持（子批5 outbox） |
@@ -677,7 +677,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 
 | 拓扑 | 状态 |
 |---|---|
-| 线性 ≤2 状态 | 已验证（既有）；v29 仅单 Count/ET 窗口或双 Count，v30 仅单/双 Count；双 Count 不以单窗口进程用例替代组合验收；v31/v32 只开放线性单状态（子批2a）|
+| 线性 ≤2 状态 | 已验证（既有）；v29 仅单 Count/ET 窗口或双 Count，v30 仅单/双 Count；双 Count 不以单窗口进程用例替代组合验收；v31/v32 只开放线性单状态，已验证（子批2a）|
 | File DAG ≤16 状态 / ≤16 required HTTP Sink | 已验证（既有）；含新聚合暂不支持 |
 | 双输入 / Join | 暂不支持（子批3） |
 | 侧路、有损边、source-time、参考表/Lookup + 新聚合 | 暂不支持 |
