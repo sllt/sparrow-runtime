@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       analysis_smoke_only:
-        description: Run only the three bounded analysis process recovery cases
+        description: Run only the bounded analysis process recovery cases (no repetitions)
         type: boolean
         default: false
 permissions:

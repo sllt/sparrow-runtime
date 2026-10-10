@@ -2,7 +2,7 @@
 
 第 7 批增加集合/编码函数、多行展开、两路事件时间关联、补充聚合和独立有限查询。它们不是完整 SQL 引擎，也不代表与 eKuiper 的全部语义/配置兼容。
 
-**状态：2026-09-27 限定实现、自查与服务器集中验证完成，尚未发行。** 新 UNNEST、Join 只开放 `restart_fresh`。补充聚合在限定组合下可恢复（见下文与 [恢复支持矩阵](PRODUCTION.md#recovery-support-matrix)）；其余组合 aligned/checkpoint/restore 显式拒绝，不改旧状态 codec。无新的吞吐、长稳或生产认证结论。
+**状态：限定 Preview，尚未发行。** 第11批子批3增加下述 UNNEST / Join 恢复；未声明的组合仍拒绝 aligned/checkpoint/restore。补充聚合与窗口的覆盖见[恢复支持矩阵](PRODUCTION.md#recovery-support-matrix)。不改旧状态 codec，无新的吞吐、长稳或生产认证结论。
 
 ## 纯函数
 
@@ -18,21 +18,25 @@ SQL 与 Graph 共用类型检查、函数 registry、NULL/错误和分配额度�
 
 ## UNNEST
 
-### 第11批子批3：恢复实现合同（开发中）
+### 第11批子批3：恢复范围
 
 - 单 UNNEST：File v36 / JetStream v37，保存每个来源的输入序号；一个输入的全部展开与下游输出完成后才允许屏障越过。空数组也消耗输入序号，重放保留 ordinal。
 - 多 File 分析图 v38：复用持久轮转决策、源 cursor/水位/idle/永久 EOF 与每 Sink 输出游标；不是 ready-order 合流。支持 UNNEST/Union 与直接双 Source 的 Interval/Window inner/left Join，纯转换和 required HTTP 输出。
 - Join codec 5 保存两侧保留行、匹配标志、序号、水位/EOF 和已发送进度；索引与过期边界按原规则重建。Idle 不证明无匹配，只有真实水位/永久 EOF 才产生 unmatched。Join 输入暂限定标量字段；UNNEST 仍可展开有界嵌套输入。
+- 输入/输出为 JSON，required HTTP；不开放 CSV/Protobuf 的新恢复组合。Join 的总保留行数另受 `max_state_keys` 限制，单侧仍受 `max_rows_per_side` 限制；满时明确失败，不静默截断。Join 在双侧永久 EOF 前保守保持下游 active，避免 idle 绕过未决 unmatched 行。
 - 独立版本和新目录、完整计算语义严格匹配；旧 codec 不迁移。恢复前按 Job owner 预留有界内存。输出仍可能重复，不承诺 exactly-once；v37/v38 提供稳定输出 ID。
+- v38 使用已有时间图的 File/HTTP 配置合同：`fail_on_decode:true`、`resume_latest:true`、`checkpoint.interval_ms=100..1000`，不开放历史快照回放。每个决策持久化并提交后才取下一个输入，属于可靠小状态链路，不是高吞吐 Join 认证；不会让旧 live/legacy 图自动承担这笔开销。
 - 本子批不开放 JetStream DAG、任意上游 Join、多个 Join、插件、动态 Lookup、窗口/参考表/告警组合或输入 DLQ/outbox 组合；业务组合在子批4逐项接通。沿用原有限资源预算，不提高默认限额来通过测试。
-- 验证采用受影响回归、切点前后输出/序号对照、双源慢侧/EOF、一次进程恢复及取消/退款，不重复20轮矩阵。完成后在恢复矩阵记录实际通过范围。
+- Rust 嵌入方须补 `PipelineRestore.analysis`，旧 profile 填空 Vec；新 profile 必须交接 Store 的 owned restore credit，不自行把旧帧改标签。
+
+验证入口：`analysis_recovery_` 定向用例和 `tests/analysis-recovery-process/main.go`。进程驱动使用同一个 no-demo + JetStream Server，覆盖展开中断重放（含空数组序号、v37 相同输出 ID）、双 File Join 的 matched/unmatched 状态恢复，以及多 File Union→UNNEST 的嵌套行指纹/来源序号；只跑一次，不做重复矩阵。现有 `nats-contracts` workflow 的手动参数 `analysis_smoke_only=true` 可单独运行，不加入默认 PR 门禁。掉电、长稳、容量和任意业务组合均不在该短验证的声明内。
 
 ```sql
 SELECT s.device, to_int64(u.item) AS value, u.ord
 FROM events s CROSS JOIN UNNEST(s.items) WITH ORDINALITY AS u(item, ord)
 ```
 
-首版一个数组表达式、一个展开节点。NULL/空数组产生 0 行，非数组 Dynamic 在运行时失败。输入列保留，追加元素列与 `unnest_source`、`unnest_input`、`unnest_ordinal`；名称冲突拒绝。元素顺序不变，ordinal 从 1 开始。`unnest_input` 是本算子按来源标签计数的已接收输入序号，不是 broker/file offset，重启归零；未知 source 标签为 NULL。展开全部完成后才传递后续控制消息。
+首版一个数组表达式、一个展开节点。NULL/空数组产生 0 行，非数组 Dynamic 在运行时失败。输入列保留，追加元素列与 `unnest_source`、`unnest_input`、`unnest_ordinal`；名称冲突拒绝。元素顺序不变，ordinal 从 1 开始。`unnest_input` 是本算子按来源标签计数的已接收输入序号，不是 broker/file offset；`restart_fresh` 重启归零，v36/v37/v38 从提交状态续接。未知 source 标签为 NULL。展开全部完成后才传递后续控制消息。
 
 Dynamic 元素转整数推荐 `to_int64`，支持解码为 UInt64 的正 JSON 整数并检查范围；旧 `CAST` 的受限转换语义未在本批改写。
 
@@ -54,7 +58,7 @@ AND INTERVAL_MATCH(a.ts, b.ts, 3000000, 5000000, 1000000)
 用于长期管线时，SQL Join 同样必须提供 `graph_io`：两个 Source ID 为 `1`/`2`，Sink ID 为 `6`；旧 `source`/`sink` 字段必须与各自最低 ID 的配置一致，不允许隐藏的第二份配置。普通线性 SQL 不能借此挂载多余 I/O，绑定阶段仍核对精确端口和图拓扑。有限查询只需 inputs，不启动上述连接器。
 
 - 两侧必须是两个直接 Source，且分别有非 NULL Int64/TimestampMicrosUTC 事件时间绑定；不接受任意上游 Transform/窗口改写后沿用旧水位。
-- 每对匹配在第二行到达时输出一次。跨两路总顺序不保证；每侧接收 ordinal 可观测但不是持久身份。
+- 每对匹配在第二行到达时输出一次。live 路径跨两路总顺序不保证、每侧接收 ordinal 重启归零；v38 保存已接受的决策顺序与两侧 ordinal，但不承诺原设备的全局时间排序。
 - Left 仅当**右侧真实水位严格超过包含式匹配上界**（Window 为到达窗口末端）或永久 EOF 后发 unmatched；绝不收到左行就先发 NULL。
 - Idle 不证明无匹配，不据此清理或提前输出。无水位前进时，状态可能达到额度并明确失败；不能无界等待/缓存。
 - 输出 `join_time=max(left_time,right_time)`，unmatched 为左时间；`join_left_ordinal`/`join_right_ordinal` 保留局部序号。Left 的右字段可 NULL。未决 unmatched 左行会约束输出水位。
@@ -94,4 +98,4 @@ SQL 使用已登记的 Stream schema；也可改用 `graph`（二选一，允许
 
 已验证：独立 Join 双重循环 oracle（两种到达顺序/inner/left/interval/window）、边界水位/unmatched、NULL key、fan-out/额度退款、UNNEST 顺序/空值/typed timestamp/取消、不同时间字段的 Join→ET Window、聚合独立数值答案、SQL/Graph 拒绝矩阵、有限查询限额/响应 admission、真实双 File→required HTTP 与 API 认证隔离。最终默认12成员/JetStream Release **957 passed / 21 ignored**，无 demo Server/CLI **45 passed**，新增20项重复5轮 **100 passed**。源码指纹、命令、初轮失败和未测项见[匹配证据](PRODUCTION.md#analysis-validation)。
 
-后续仍有：Join 恢复、新聚合与 PT/新窗口族/JetStream ET 的恢复组合、任意上游/多 Join 组合、近似聚合/UDAF、服务端历史文件查询和本批容量/长稳。这些不由“函数/SQL 可调用”自动视作完成。
+后续仍有：未声明的窗口/聚合/Join/参考表/告警恢复组合、JetStream ET/DAG、任意上游/多 Join 组合、近似聚合/UDAF、服务端历史文件查询和容量/长稳。这些不由“函数/SQL 可调用”自动视作完成。

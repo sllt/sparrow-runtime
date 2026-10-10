@@ -300,7 +300,41 @@ func scenario(root, kind, bin, natsBin string) {
 	spec := map[string]any{"version": 1, "stream": "l", "recovery": "aligned", "fail_on_decode": true, "checkpoint_dir": checkpoint, "checkpoint": map[string]any{"interval_ms": 100, "timeout_ms": 5000, "resume_latest": true}, "source": source(0), "sink": sink}
 	startServer()
 	a.ok("PUT", "/v1/allowlist", map[string]any{"host": "127.0.0.1", "port": c.port()})
-	if kind == "join" {
+	if kind == "multi" {
+		a.ok("PUT", "/v1/streams/l", map[string]any{"fields": []any{map[string]any{"name": "items", "type": "dynamic", "nullable": true}}})
+		spec["graph"] = map[string]any{"version": 1, "pipeline_id": 7, "revision_id": 1, "nodes": []any{
+			map[string]any{"id": 1, "kind": "memory_source", "table": "l", "out": []int{3}},
+			map[string]any{"id": 2, "kind": "memory_source", "table": "l", "out": []int{3}},
+			map[string]any{"id": 3, "kind": "union_all", "out": []int{4}},
+			map[string]any{"id": 4, "kind": "unnest", "unnest": map[string]any{"expr": map[string]any{"k": "col", "name": "items"}}, "out": []int{6}},
+			map[string]any{"id": 6, "kind": "capture_sink"},
+		}}
+		spec["graph_io"] = map[string]any{"sources": map[string]any{"1": source(0), "2": source(1)}, "sinks": map[string]any{"6": sink}}
+		a.ok("PUT", "/v1/pipelines/p", spec)
+		start()
+		appendRow(paths[0], map[string]any{"items": []int{7, 8}})
+		waitRows(2)
+		waitCut(1)
+		appendRow(paths[1], map[string]any{"items": []int{}})
+		waitCut(2)
+		server.stop()
+		startServer()
+		start()
+		appendRow(paths[0], map[string]any{"items": []int{9}})
+		waitCut(3)
+		appendRow(paths[1], map[string]any{"items": []int{10}})
+		waitRows(4)
+		waitCut(4)
+		rows := c.all()
+		require(len(rows) == 4, "multi-source UNNEST output count")
+		for i, want := range []int{7, 8, 9, 10} {
+			r := rows[i]
+			require(r.Data["item"] == float64(want) && r.Data["unnest_source"] == float64([]int{1, 1, 1, 2}[i]) && r.Data["unnest_input"] == float64([]int{1, 1, 2, 2}[i]), fmt.Sprintf("multi-source row %d: %v", i, r))
+			require(r.ID != "", "multi-source output lacks stable ID")
+		}
+		version, _ := cut(checkpoint)
+		require(version == 38, "multi-source snapshot version")
+	} else if kind == "join" {
 		fields := []any{map[string]any{"name": "k", "type": "utf8", "nullable": false}, map[string]any{"name": "v", "type": "int64", "nullable": false}, map[string]any{"name": "ts", "type": "int64", "nullable": false}}
 		for _, name := range []string{"l", "r"} {
 			a.ok("PUT", "/v1/streams/"+name, map[string]any{"fields": fields})
@@ -407,7 +441,7 @@ func main() {
 	flag.Parse()
 	require(*bin != "" && *broker != "" && *out != "", "--server-bin --nats-server --out required")
 	must(os.Mkdir(*out, 0700))
-	for _, kind := range []string{"file", "jetstream", "join"} {
+	for _, kind := range []string{"file", "jetstream", "join", "multi"} {
 		scenario(filepath.Join(*out, kind), kind, *bin, *broker)
 	}
 }

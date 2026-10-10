@@ -348,7 +348,10 @@ fn analysis_unnest_empty_null_order_bounds_and_control_admission() {
         )
         .is_err());
     }
-    assert!(sparrow_plan::CheckpointPlan::from_physical(&unnest(4, 65536)).is_err());
+    let manifest = sparrow_plan::CheckpointPlan::from_physical(&unnest(4, 65536)).unwrap();
+    assert!(manifest.has_analysis_state());
+    assert_eq!(crate::snapshot_version_for(&manifest, "file").unwrap(), 36);
+    assert!(unnest(4, 65536).aligned_window().is_err(), "legacy single-window API still excludes UNNEST");
     let mut bad = unnest(4, 65536);
     if let sparrow_plan::PhysicalStage::Analysis { plan, .. } = &mut bad.stages[1] {
         if let AnalysisPlan::Unnest { output, .. } = plan.as_mut() {
