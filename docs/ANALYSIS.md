@@ -2,16 +2,17 @@
 
 第 7 批增加集合/编码函数、多行展开、两路事件时间关联、补充聚合和独立有限查询。它们不是完整 SQL 引擎，也不代表与 eKuiper 的全部语义/配置兼容。
 
-**状态：限定 Preview，尚未发行。** 第11批子批3增加下述 UNNEST / Join 恢复；未声明的组合仍拒绝 aligned/checkpoint/restore。补充聚合与窗口的覆盖见[恢复支持矩阵](PRODUCTION.md#recovery-support-matrix)。不改旧状态 codec，无新的吞吐、长稳或生产认证结论。
+**状态：限定 Preview，尚未发行。** 第11批子批3增加 UNNEST / Join 恢复，子批4增加下述限定业务组合；未声明的组合仍拒绝 aligned/checkpoint/restore。补充聚合与窗口的覆盖见[恢复支持矩阵](PRODUCTION.md#recovery-support-matrix)。不改旧状态 codec，无新的吞吐、长稳或生产认证结论。
 
 ### 第11批子批4：业务组合恢复（v39）
 
 使用显式 Graph 和独立 checkpoint 目录，保留 v38 的有序 File 决策、每 Sink 输出 ID 与全部 required HTTP 完成后发布 CURRENT 的规则。不是给所有算子组合统一打开 aligned：
 
 - `File×N → Union/UNNEST → Count → TTL=0 Change/Deadband/Hysteresis`；Count 可使用 FIRST/LAST/VAR/STDDEV（标量输入，codec 3）。
-- `File×2 → 单个直接双源 Join → Count 或既有 ET 滚动/跳跃窗口 → TTL=0 IoT`。Join 的未匹配行、水位，以及下游窗口/IoT 状态在同一个提交切点恢复。
+- `File×2 → 单个直接双源 Join → Count 或既有 ET 滚动/跳跃窗口 → TTL=0 IoT`。Join 的未匹配行、水位，以及下游窗口/IoT 状态在同一个提交切点恢复。下游 ET 窗口在节点级设置 `event_time_field:"join_time"`（或仅重命名后的该列），不能改用左右输入的原时间列；IoT 的业务 key 仍须非 nullable。
 - 上述分析图可插入固定版本 Lookup；既有 PT/ET 时间图可组合固定参考表。`多 File → Union → 固定 Lookup → paused-PT Alarm` 保留告警阶段、逻辑截止时间、generation/episode 和输出游标，停机时间不推进 PT。
 - 参考表必须钉住 revision、规范内容 SHA-256 和运行时 CRC32；恢复加载实际表后再次核验。`TIME_PENDING` 从第一笔（即使尚无 CURRENT）就绑定完整 manifest，不能换表后重放旧决策。发布新表版本不会改变已绑定版本。
+- 快照保存参考表身份而非表内容；备份/恢复必须同时保留 catalog 中被引用的固定版本，不能只拷贝 checkpoint 目录。
 - 不支持 PT/ET 混合、Join/UNNEST 接 timed IoT/Alarm、buffered/new window 图、扩展 ET/PT 聚合、live/follow_latest/远程 Lookup、JetStream DAG、插件、输入 DLQ、持久 outbox 或历史快照回放。旧 v8～v38 字节/默认运行路径不变，不自动迁移目录。
 
 v39 仍是有界、小状态、逐决策持久化链路；不代表高吞吐或 exactly-once。范围由每条管线的 `aligned_eligible` / `business_recovery` 返回。验证入口为 `business_recovery_` 和现有进程驱动的 `business-count`、`business-alarm`、`business-etref`，不新增默认重复门禁。
@@ -107,6 +108,13 @@ SQL 使用已登记的 Stream schema；也可改用 `graph`（二选一，允许
 成功返回 rows、input_rows、output_rows、future_dropped、complete，以及 `execution=independent_bounded_kernel`、`side_effects=false`、`recovery=none`、`certified=false`。超限/错误不返回部分成功结果；`complete` 不意味着输入未来时间丢弃为 0，必须同时检查计数。它是有限 Preview，不是无界历史数据库或资源隔离进程。
 
 ## 验证范围
+
+### 2026-10-10 子批4恢复验证
+
+- [完整默认回归与 no-demo/生产包验证](https://github.com/sllt/sparrow-runtime/actions/runs/38050946555) 均通过，源码 `fe4976b`。新增用例验证 Join→ET 窗口→Change、双源 UNNEST→扩展 Count→Change、固定参考表→paused Alarm 的不中断/恢复输出与稳定 ID 一致，以及依赖变更拒绝、额度归还和控制面支持范围。
+- [七个真实进程场景](https://github.com/sllt/sparrow-runtime/actions/runs/38050356449) 均通过，源码 `e6aa228`：原四项 v36/v37/v38 回归，加 v39 `business-count`、`business-alarm`、`business-etref`。新场景各一次 SIGKILL；恢复保留窗口积累/变化检测状态、告警 episode 和固定表绑定。七条管线最后均为 stopped。
+- `e6aa228` 到 `fe4976b` 仅修正两处 Rust 测试声明（`join_time` 血缘、UInt64 episode），运行时代码未变。未放宽非 nullable key 或时间血缘校验；没有重复压力矩阵或新默认 CI 门禁。
+- 本轮运行于 GitHub Linux runner；`.21` SSH 重连超时，不宣称该服务器的性能/长稳通过。仍未覆盖断电、介质故障、吞吐容量、任意算子组合或 exactly-once。
 
 ### 2026-10-10 子批3恢复验证
 

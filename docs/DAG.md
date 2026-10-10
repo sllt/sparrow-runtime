@@ -1,6 +1,8 @@
 # K3：真实 DAG 执行与恢复
 
 <a id="time-graph-recovery"></a>
+**第11批组合扩展：** v38 为有序 File UNNEST/Join 图；v39 增加限定窗口/TTL=0 IoT 组合，以及固定版本参考表接时间图/paused Alarm。沿用下面的决策协议，但使用独立 profile/目录；旧 v18/v19/v22 不原地扩充依赖或混入新状态。范围与限制见 [业务组合](ANALYSIS.md#第11批子批4业务组合恢复v39)。
+
 ## 时间型 File DAG：v18 / v19（2026-09-23，限定 Preview 已验收）
 
 本节是独立新 profile，不修改下方历史 v5/v6/v11/v12 的合流和恢复合同。**本批实现、自查和匹配功能/故障/性能门禁已完成，不是生产长稳认证或正式发行。** [验收证据](PRODUCTION.md#time-graph-validation)。

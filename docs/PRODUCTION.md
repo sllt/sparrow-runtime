@@ -657,7 +657,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 | 单 UNNEST（JSON → required HTTP） | codec 5 `ANF1`，来源输入序号 | File v36 / JetStream v37 | 已验证（子批3限定范围）：保留空数组序号与展开 ordinal，未提交展开重放；v37 输出 ID 稳定。实现与验证记录见 [ANALYSIS](ANALYSIS.md#第11批子批3恢复范围)。 |
 | 多 File UNNEST/Union；单个直接双源 Interval/Window inner/left Join | codec 5 `ANF1`；GTC1 源位置/时间/EOF 与各 Sink 游标 | File 分析图 v38 | 已验证（子批3限定范围）：持久决策顺序，Join matched/unmatched 行与序号恢复，真实水位/EOF 关闭 unmatched；Join 暂限标量源字段。含嵌套输入的多源 UNNEST 使用独立行指纹。不是任意窗口/Lookup/告警组合或 JetStream DAG；见同上范围。 |
 | IoT change/deadband/hysteresis/alarm/silence/resample | codec 2 | 各自 profile | 已验证（既有批次）；与新聚合组合暂不支持 |
-| 业务组合：分析图接 Count/既有 ET 窗口/TTL=0 IoT；固定参考表接时间图/paused Alarm | 复用 codec 1/2/3/5，CPL3 固定参考依赖，GTC1/GTD1 有序决策 | File v39 | 限定子批4范围，非任意组合；需要独立目录、JSON 与 required HTTP。完整范围见 [ANALYSIS](ANALYSIS.md#第11批子批4业务组合恢复v39)。测试结果随本批验证记录更新，不据此宣称长稳/容量认证。 |
+| 业务组合：分析图接 Count/既有 ET 窗口/TTL=0 IoT；固定参考表接时间图/paused Alarm | 复用 codec 1/2/3/5，CPL3 固定参考依赖，GTC1/GTD1 有序决策 | File v39 | 已验证（子批4限定范围），非任意组合；需要独立目录、JSON 与 required HTTP。完整范围与默认/no-demo 回归、三条新增真实进程恢复证据见 [ANALYSIS](ANALYSIS.md#第11批子批4业务组合恢复v39)。不据此宣称长稳/容量认证。 |
 | Dedup | — | — | 暂不支持 |
 
 **时间域**
@@ -687,14 +687,14 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 | 拓扑 | 状态 |
 |---|---|
 | 线性 ≤2 状态 | 已验证（既有）；v29 仅单 Count/ET 窗口或双 Count，v30 仅单/双 Count；双 Count 不以单窗口进程用例替代组合验收；v31/v32 只开放线性单状态，已验证（子批2a）|
-| File DAG ≤16 状态 / ≤16 required HTTP Sink | 已验证（既有）；含新聚合暂不支持 |
-| 双输入 / Join | 暂不支持（子批3） |
-| 侧路、有损边、source-time、参考表/Lookup + 新聚合 | 暂不支持 |
+| File DAG ≤16 状态 / ≤16 required HTTP Sink | 既有 profile 保持不变；v39 限定业务图可包含 codec 3 Count，实际容量仍受 Job 预算约束 |
+| 双输入 / Join | v38 单直接双源 Join；v39 增加 Count/既有 ET 窗口/TTL=0 IoT 与固定参考表，不能接 timed IoT/Alarm |
+| 侧路、有损边、动态参考表、任意窗口组合 | 暂不支持；显式 source-time 与固定参考表仅按各 profile 声明开放 |
 
 **版本 / 依赖 / 恢复语义**
 
 - 一个目录只允许一种外层 profile；SPV1 v1/v2 不迁移；File v3 保留 RCP2 下游前缀放宽，v29～v32 及 v8 之后的新 profile 严格匹配规范化语义与依赖身份（不是配置文本或 revision 号）。JetStream 即使旧 manifest 带有前缀标记，也要求完整语义不变；改语义直接拒绝，无 fork/migration（子批7）。
-- 恢复语义：File 为未提交后缀重放（at-least-once，无稳定输出 ID）；JetStream 为稳定 ID 的 at-least-once，ACK 不越过 CURRENT。都不是 exactly-once；SIGKILL 证据不等于断电/介质故障认证。
+- 恢复语义：File 为未提交后缀重放，旧普通线性 profile 无稳定输出 ID；有序时间/分析/业务图按 generation + Sink 保存稳定输出 ID。JetStream 为稳定 ID 的 at-least-once，ACK 不越过 CURRENT。都不是 exactly-once；SIGKILL 证据不等于断电/介质故障认证。
 - 恢复内存预留适用全部版本（见上节）；额度不足、profile/codec/语义不兼容均为不可回退错误。
 - 子批1 进程证据切点：输入已入窗口未输出、输出已确认未提交、输出请求在途、CURRENT 发布失败、MANIFEST 已改名但 CURRENT 未更新（该代不被提升）、提交后、恢复中（已预留额度未物化）、JetStream 提交后 ACK 丢失。旧二进制（424cf95）拒绝启动 v29 目录且不改 CURRENT/不输出；新二进制可继续旧 v3 目录。未覆盖：断电/介质故障、JetStream + ET、PT 窗口、恢复中其他位置。
 - 本批保持既有 JSON 浮点解析语义，不启用全局 `serde_json/float_roundtrip`。进程测试改用可精确表示的二进制分数输入（步长 `0.375`），仍逐位核对恢复状态和输出；这是隔离解析器差异，不代表已修复十进制解析精度。
