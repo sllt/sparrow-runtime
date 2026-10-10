@@ -96,6 +96,14 @@ SQL 使用已登记的 Stream schema；也可改用 `graph`（二选一，允许
 
 ## 验证范围
 
+### 2026-10-10 子批3恢复验证
+
+- `a2b0389` 的 [core / production CI](https://github.com/sllt/sparrow-runtime/actions/runs/38045307073) 全部通过，包括新增恢复用例和旧路径回归。
+- [四个真实进程场景](https://github.com/sllt/sparrow-runtime/actions/runs/38044561981) 全通过：File v36、真实 JetStream v37 的展开输出中断→SIGKILL→重放（空数组序号、相同数据、v37 相同输出 ID），以及 File v38 Join 的 matched/unmatched 恢复、多 File Union→UNNEST 的嵌套行指纹和来源序号恢复。四条管线最后均为 stopped。进程测试源码为 `a89c06a`；之后 `a2b0389` 仅更新能力清单与测试断言，恢复执行代码未变。
+- 仅一次有限场景验证，不运行20轮矩阵；不代表掉电、磁盘故障、长稳、容量或跨 Sink 事务认证。`.21` SSH 本轮连接不稳定，进程验证在 GitHub Linux runner 完成，不冒充服务器性能复测。
+
+### 原第7批验证（2026-09-27）
+
 已验证：独立 Join 双重循环 oracle（两种到达顺序/inner/left/interval/window）、边界水位/unmatched、NULL key、fan-out/额度退款、UNNEST 顺序/空值/typed timestamp/取消、不同时间字段的 Join→ET Window、聚合独立数值答案、SQL/Graph 拒绝矩阵、有限查询限额/响应 admission、真实双 File→required HTTP 与 API 认证隔离。最终默认12成员/JetStream Release **957 passed / 21 ignored**，无 demo Server/CLI **45 passed**，新增20项重复5轮 **100 passed**。源码指纹、命令、初轮失败和未测项见[匹配证据](PRODUCTION.md#analysis-validation)。
 
 后续仍有：未声明的窗口/聚合/Join/参考表/告警恢复组合、JetStream ET/DAG、任意上游/多 Join 组合、近似聚合/UDAF、服务端历史文件查询和容量/长稳。这些不由“函数/SQL 可调用”自动视作完成。
