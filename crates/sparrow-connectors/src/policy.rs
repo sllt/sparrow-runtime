@@ -181,6 +181,12 @@ pub fn check_data_path_in(path: &Path, roots: &[PathBuf]) -> Result<()> {
     }
 }
 
+/// Cold configuration identity, including symlinked existing ancestors.
+pub fn checked_data_path_identity(path:&Path)->Result<PathBuf> {
+    check_data_path(path)?;
+    resolve_for_policy(path)
+}
+
 fn resolve_for_policy(path: &Path) -> Result<PathBuf> {
     let abs = if path.is_absolute() {
         path.to_path_buf()

@@ -25,6 +25,7 @@ use sparrow_runtime::Kernel;
 use tower_http::limit::RequestBodyLimitLayer;
 mod operations;
 mod outbox;
+mod input_recovery;
 mod plugins;
 mod reference_tables;
 
@@ -84,6 +85,16 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/pipelines/{name}/outbox/entries", get(outbox::entries))
         .route("/v1/pipelines/{name}/outbox/entries/{id}", get(outbox::entry))
         .route("/v1/pipelines/{name}/outbox/command", post(outbox::command))
+        .route("/v1/pipelines/{name}/input-dlq", get(input_recovery::status))
+        .route("/v1/pipelines/{name}/input-dlq/entries", get(input_recovery::entries))
+        .route("/v1/pipelines/{name}/input-dlq/entries/{position}", get(input_recovery::entry))
+        .route("/v1/pipelines/{name}/input-dlq/purge", post(input_recovery::purge))
+        .route("/v1/pipelines/{name}/recovery/preview", post(input_recovery::preview))
+        .route("/v1/pipelines/{name}/recovery/execute", post(input_recovery::execute))
+        .route("/v1/pipelines/{name}/recovery/operations", get(input_recovery::operations))
+        .route("/v1/pipelines/{name}/recovery/operations/{id}", get(input_recovery::operation))
+        .route("/v1/pipelines/{name}/recovery/operations/{id}/finish", post(input_recovery::finish))
+        .route("/v1/pipelines/{name}/recovery/operations/{id}/abort", post(input_recovery::abort))
         .route(
             "/v1/pipelines/{name}/checkpoints",
             get(operations::checkpoints),
@@ -974,6 +985,7 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
         value["delivery"]["completion_basis"] = json!("local_outbox_FULL_commit_not_remote_HTTP_2xx");
         value["latency_contract"]["http_completion"] = json!("independent_sender; inspect_pipeline_outbox_endpoint_for_remote_delivery");
     }
+    value["legacy_io_counters"]["input_quarantined"]=json!(io.input_quarantined);
     if s.source_kind == "nats" {
         value["nats_source"] = json!({"received":io.nats_source_received,"rows":io.nats_source_rows,
             "dropped_bad":io.nats_source_dropped_bad,"dropped_oversize":io.nats_source_dropped_oversize,
@@ -1220,6 +1232,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
     });
     io_fields["lookup_update_failed"]=json!(io.lookup_update_failed);
     io_fields["outbox_persisted_batches"]=json!(io.outbox_persisted_batches);
+    io_fields["input_quarantined"]=json!(io.input_quarantined);
     for (name, value) in [
         ("http_poll_requests", io.http_poll_requests),
         ("http_poll_ok", io.http_poll_ok),

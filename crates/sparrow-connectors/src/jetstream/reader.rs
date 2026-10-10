@@ -221,6 +221,7 @@ pub struct Reader {
     config: ReaderConfig,
     owner: Arc<MemoryOwner>,
     ledger: DeliveryLedger<AckToken>,
+    replay_end: Option<u64>,
     pull: Option<pull::Batch>,
     pull_started: Option<tokio::time::Instant>,
     pull_received: bool,
@@ -315,6 +316,7 @@ impl Reader {
                 ledger,
                 acknowledgements,
             )) => Ok(Self {
+                replay_end: None,
                 connection,
                 stream,
                 consumer,
@@ -345,6 +347,10 @@ impl Reader {
     pub fn position(&self, records: u64) -> sparrow_io::SourcePosition {
         self.identity
             .position_bound(self.ledger.published(), records, self.format_fingerprint)
+    }
+    pub fn set_replay_end(&mut self,end:Option<u64>)->Result<()> {
+        if end.is_some_and(|n|n<self.ledger.committed()) {return Err(error(ErrorCode::UnsupportedRestore,"replay end precedes committed cut"));}
+        self.replay_end=end;Ok(())
     }
     pub fn pending(&self) -> usize {
         self.ledger.pending()
@@ -468,10 +474,15 @@ impl Reader {
         if self.pull.is_some() {
             return Ok(true);
         }
-        let count = self
+        let mut count = self
             .ledger
             .remaining_messages()
             .min(self.config.pull_messages);
+        if let Some(end)=self.replay_end {
+            let remaining=end.saturating_sub(self.ledger.published());
+            if remaining==0 {return Ok(false);}
+            count=count.min(remaining.min(usize::MAX as u64) as usize);
+        }
         let retention = self
             .owner
             .budget()
@@ -556,6 +567,7 @@ impl Reader {
             ));
         }
         let sequence = info.stream_sequence;
+        if self.replay_end.is_some_and(|end|sequence>end) {return Err(error(ErrorCode::UnsupportedRestore,"broker delivered outside approved replay range"));}
         if message.payload.len() > MAX_MESSAGE_BYTES
             || message.length > MAX_MESSAGE_BYTES + 8192
             || message.subject.len() > MAX_SUBJECT_BYTES

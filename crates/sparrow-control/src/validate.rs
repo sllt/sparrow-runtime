@@ -1701,6 +1701,23 @@ fn validate_aligned_plan_inner(
     dependencies: Option<&[sparrow_plan::ReferenceTableDependency]>,
 ) -> sparrow_model::Result<()> {
     let recovery = RecoveryPolicy::parse(&spec.recovery)?;
+    if spec.source.input_dlq.is_some() || spec.source.replay_start.is_some() {crate::input_dlq::separate_storage(spec,None)?;}
+    if spec.source.replay_start.is_some() {crate::recovery_ops::scope(spec,plan)?;}
+    if spec.graph_io.as_ref().is_some_and(|g|g.sources.values().any(|s|s.replay_start.is_some())) {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"lineage range does not support graph sources"));}
+    if spec.source.input_dlq.is_some() || spec.graph_io.as_ref().is_some_and(|g|g.sources.values().any(|s|s.input_dlq.is_some())) {
+        let config=spec.source.input_dlq.as_ref().ok_or_else(||SparrowError::new(ErrorCode::UnsupportedRestore,"input DLQ does not support graph ports"))?;
+        config.validate()?;
+        if !recovery.is_aligned() || !matches!(spec.source.kind.as_str(),"file"|"file_replay"|"replay"|"jetstream")
+            || !spec.source.payload_format()?.is_json() || !spec.effective_fail_on_decode()
+            || spec.checkpoint_dir.as_deref().is_none_or(str::is_empty) || spec.graph_io.is_some()
+            || plan.edges.is_some() || !plan.side_outputs.is_empty() || !spec.reference_tables.is_empty()
+            || !plan.source_times.is_empty() || plan.has_iot() || plan.has_analysis() || plan.has_extended_aggs() || plan.has_new_windows()
+            || plan.stages.iter().filter(|s|matches!(s,sparrow_plan::PhysicalStage::WindowAgg{..})).count()>1
+            || plan.stages.iter().any(|s|matches!(s,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..}))) {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"input DLQ: aligned JSON File/JetStream, fail_on_decode=true, explicit checkpoint directory, zero state or one legacy Count window only"));
+        }
+        if spec.sink.durable_outbox.as_ref().is_some_and(|out|out.directory==config.directory) {return Err(SparrowError::new(ErrorCode::InvalidArgument,"input DLQ and output outbox require different directories"));}
+    }
     if spec.graph_io.as_ref().is_some_and(|g|g.sinks.values().any(|s|s.durable_outbox.is_some())) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"durable outbox initially supports a single linear HTTP sink, not graph ports"));
     }
@@ -2458,6 +2475,14 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
             "idempotency":"stable_per_stored_request; receiver_must_implement_dedup; source_replay_can_create_another_request",
             "input_poison_dlq":false,"automatic_eviction":false,"source_ACK":"still_requires_published_checkpoint_for_reliable_sources"});
     }
+    if spec.source.input_dlq.is_some() {
+        value["input_failure"]=serde_json::json!({"decode":"durable_quarantine_then_continue","resource_and_runtime_errors":"fail_or_held_no_skip","ack":"checkpoint_publication_after_quarantine_FULL_commit","purge":"explicit_stopped_committed_cut_approval_advances_replay_floor"});
+        if value["checkpoint_participants"].is_object() {value["checkpoint_participants"]["input_dlq"]=serde_json::json!(true);}
+        if value["sink_delivery"].is_object() {value["sink_delivery"]["input_poison_dlq"]=serde_json::json!(true);}
+    }
+    if let Some(start)=&spec.source.replay_start {
+        value["lineage"]=serde_json::json!({"operation":start.operation,"start":start.start.offset,"end":start.end,"state":"new_lineage_initially_empty_then_checkpoint_restore","replay_range_unit":if spec.source.kind=="jetstream"{"stream_sequence"}else{"byte_offset"},"exactly_once":false});
+    }
     value
 }
 
@@ -2520,6 +2545,11 @@ pub fn effective_guarantees_with_plan(
             value["checkpoint_participants"]["output_dlq"] = serde_json::json!(true);
             value["checkpoint_participants"]["backup_dependency"] = serde_json::json!("catalog_plus_checkpoint_plus_outbox_directory; never_restore_checkpoint_alone");
         }
+    }
+    if spec.source.input_dlq.is_some() && value["checkpoint_participants"].is_object() {
+        value["checkpoint_participants"]["input_dlq"]=serde_json::json!(true);
+        value["checkpoint_participants"]["dlq"]=serde_json::json!(true);
+        value["checkpoint_participants"]["poison"]=serde_json::json!("record_decode_quarantine_before_checkpoint; resource_runtime_failures_fail_or_held");
     }
     value
 }
@@ -3168,6 +3198,8 @@ mod tests {
             sql: Some("SELECT device_id FROM sensors".into()),
             graph: None,
             source: SourceSpec {
+                input_dlq: None,
+                replay_start: None,
                 plugin: None,
                 jetstream: None,
                 http_poll: None,
@@ -3272,6 +3304,8 @@ mod tests {
     #[test]
     fn v02_default_mqtt_client_id_is_unique_per_instance() {
         let src = SourceSpec {
+            input_dlq: None,
+            replay_start: None,
                 plugin: None,
             jetstream: None,
             http_poll: None,
@@ -3325,6 +3359,8 @@ mod tests {
     #[test]
     fn p0_11_mqtt_credentials_require_tls() {
         let mut src = SourceSpec {
+            input_dlq: None,
+            replay_start: None,
                 plugin: None,
             jetstream: None,
             http_poll: None,

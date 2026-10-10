@@ -97,12 +97,14 @@ pub(super) fn binding_owner(dir: &Path) -> Result<[u8; 32]> {
 impl Supervisor {
     pub(super) async fn start_jetstream(
         &self,
+        name: &str,
         spec: &crate::PipelineSpec,
         schema: Schema,
         plan: PhysicalPlan,
         target_policy: &sparrow_connectors::TargetPolicy,
     ) -> Result<RunningJob> {
         validate_aligned_plan(spec, &plan)?;
+        let input_dlq=self.prepare_input_dlq(name,spec).await?;
         let config = spec
             .source
             .jetstream
@@ -200,16 +202,27 @@ impl Supervisor {
         .await?;
         let mut reader_config = config.reader();
         reader_config.payload_format = spec.source.payload_format()?;
-        let reader = Reader::open(
+        let start_position=spec.source.replay_start.as_ref().map(|s|s.start.source());
+        let mut reader = Reader::open(
             connection,
             reader_config,
             owner.clone(),
             binding,
             nonce,
-            snapshot.as_ref().map(|s| &s.source),
+            snapshot.as_ref().map(|s| &s.source).or(start_position.as_ref()),
         )
         .await?;
         let ingested = snapshot.as_ref().map_or(0, |s| s.ingested_rows);
+        if let Some(range)=&spec.source.replay_start {
+            if reader.position(ingested).offset_bytes<range.start.offset {let _=reader.close().await;return Err(crate::input_dlq::invalid("checkpoint precedes lineage start"));}
+            if let Err(error)=reader.set_replay_end(range.end) {let _=reader.close().await;return Err(error);}
+        }
+        if let Some(queue)=&input_dlq {
+            use sparrow_io::poison::InputQuarantine;
+            if let Err(error)=queue.check_start(&reader.position(ingested)) {
+                let _=reader.close().await;return Err(error);
+            }
+        }
         let restored_from = snapshot.as_ref().map(|s| s.checkpoint_id);
         let (restore, restore_iot) = snapshot
             .map(|s| (Some(s.windows), s.iot))
@@ -280,6 +293,8 @@ impl Supervisor {
         let source = self.kernel.handle().spawn(
             Actor {
                 reader,
+                input_dlq,
+                quarantine_full: false,
                 tx,
                 commands,
                 schema: Arc::new(schema),
@@ -335,6 +350,8 @@ impl Supervisor {
 
 struct Actor {
     reader: Reader,
+    input_dlq: Option<Arc<crate::input_dlq::InputDlq>>,
+    quarantine_full: bool,
     tx: observed::Sender<IngressEvent>,
     commands: tokio::sync::mpsc::Receiver<AlignedCmd>,
     schema: Arc<Schema>,
@@ -462,7 +479,7 @@ impl Actor {
     async fn publish_input(&mut self, first: InputRecord) -> Result<()> {
         let started = std::time::Instant::now();
         let first_sequence = first.sequence();
-        let mut last_sequence = first_sequence;
+        let mut last_sequence = first_sequence-1;
         let mut builder = sparrow_model::RowBatchBuilder::new(
             self.schema.clone(),
             self.owner.clone(),
@@ -474,15 +491,46 @@ impl Actor {
         for _ in 0..self.batch_rows {
             if let Some(next) = record.take() {
                 let sequence = next.sequence();
-                let added = next
-                    .decode_into(&self.schema, &self.owner, &mut builder, self.row_limit)
-                    .map_err(|e| {
+                let decoded = next
+                    .decode_into(&self.schema, &self.owner, &mut builder, self.row_limit);
+                let added = match decoded {
+                    Ok(added)=>added,
+                    Err(e)=>{
                         self.diag.format_decode_error(next.payload_format(), &e);
                         self.diag
                             .decode_errors
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        decode_failure(sequence,e)
-                    })?;
+                        if sparrow_io::poison::record_error(e.code) {
+                            if let Some(queue)=&self.input_dlq {
+                                let queue=queue.clone();
+                                let mut position=self.reader.position(self.ingested);
+                                position.offset_bytes=sequence;
+                                let scratch=self.owner.acquire(sparrow_model::CreditKind::Reservation,next.payload().len().saturating_mul(2).saturating_add(65536))?;
+                                let (returned,result)=tokio::task::spawn_blocking(move || {
+                                    use sparrow_io::poison::InputQuarantine;
+                                    let _scratch=scratch;
+                                    let result=queue.capture(&position,next.payload(),e.code);
+                                    (next,result)
+                                }).await.map_err(|e|SparrowError::new(ErrorCode::Internal,format!("input quarantine task: {e}")))?;
+                                if let Err(error)=result {
+                                    if sparrow_io::poison::quarantine_full(&error) {
+                                        self.deferred=Some(returned);self.quarantine_full=true;
+                                        self.diag.observation.health(true,HealthState::Ready,"input_dlq_full_waiting_for_operator",Some(ErrorCode::ResourceExhausted));
+                                        break;
+                                    }
+                                    return Err(error);
+                                }
+                                self.quarantine_full=false;
+                                self.diag.input_quarantined.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                                last_sequence=sequence;
+                                // Preserve already-decoded rows in this batch, and
+                                // do not publish the poison cut before those rows.
+                                break;
+                            }
+                        }
+                        return Err(decode_failure(sequence,e));
+                    }
+                };
                 if !added {
                     self.deferred = Some(next);
                     break;
@@ -506,11 +554,13 @@ impl Actor {
         let batch = builder.finish()?;
         let rows = batch.num_rows();
         self.diag.observation.progress(true, rows);
-        let event = IngressEvent::admitted_batch(batch)?;
-        tokio::select! {
+        if rows>0 {
+          let event = IngressEvent::admitted_batch(batch)?;
+          tokio::select! {
             _=self.cancel.cancelled()=>return Ok(()),
             result=self.tx.send_with_origin(event,OriginSpan::at(started))=>result
                 .map_err(|_|SparrowError::new(ErrorCode::Cancelled,"JetStream Kernel ingress closed"))?,
+          }
         }
         for sequence in first_sequence..=last_sequence {
             self.reader.published(sequence)?;
@@ -541,12 +591,13 @@ impl Actor {
                 }
                 self.reader.service_acknowledgements()?;
                 let pull_due=tokio::time::Instant::now()>=idle.until;
-                let ready=if self.bootstrap || !pull_due {false}else if self.deferred.is_some(){true}else{tokio::select! {
+                let poison_cut_pending=self.quarantine_full && self.reader.position(self.ingested).offset_bytes>self.reader.committed();
+                let ready=if self.bootstrap || poison_cut_pending || !pull_due {false}else if self.deferred.is_some(){true}else{tokio::select! {
                     _=self.cancel.cancelled()=>return Ok(()),
                     result=tokio::time::timeout(Duration::from_secs(5),self.reader.prepare_pull())=>result
                         .map_err(|_|SparrowError::new(ErrorCode::JobFailed,"JetStream pull setup timed out; aborting attempt without ACK").retryable(true))??,
                 }};
-                let needs_cut=self.bootstrap || (!ready && pull_due && self.reader.position(self.ingested).offset_bytes>self.reader.committed());
+                let needs_cut=self.bootstrap || poison_cut_pending || (!ready && pull_due && self.reader.position(self.ingested).offset_bytes>self.reader.committed());
                 if needs_cut && workers.is_empty() && tokio::time::Instant::now()>=retry_after {
                     if let Some(admission)=self.control.try_begin(if self.bootstrap {"bootstrap"}else{"source_full"})? {
                         self.checkpoint(admission,None,&mut workers).await?;
@@ -583,6 +634,7 @@ impl Actor {
                         match input? {
                             ReaderPoll::Record(record)=>{
                                 idle.reset();self.publish_input(record).await?;
+                                if self.quarantine_full {idle.until=tokio::time::Instant::now()+Duration::from_millis(250);}
                             }
                             ReaderPoll::Empty=>idle.empty(),
                             ReaderPoll::BatchEnd=>idle.reset(),

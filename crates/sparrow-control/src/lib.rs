@@ -15,6 +15,10 @@ pub mod query;
 pub mod lookup;
 pub mod plugins;
 pub mod outbox;
+pub mod input_dlq;
+pub mod recovery_ops;
+#[cfg(test)]
+mod input_recovery_tests;
 pub mod postgres_spec;
 pub mod reference_table;
 pub mod spec;

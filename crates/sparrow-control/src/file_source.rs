@@ -86,6 +86,15 @@ pub(crate) async fn apply_file_poll(
     batch_ready: std::time::Instant,
 ) -> Result<FileProgress> {
     match poll {
+        FilePoll::QuarantineFull => {
+            diag.observation.health(true,HealthState::Ready,"input_dlq_full_waiting_for_operator",Some(ErrorCode::ResourceExhausted));
+            Ok(FileProgress::Wait)
+        }
+        FilePoll::Quarantined => {
+            diag.decode_errors.fetch_add(1,Ordering::Relaxed);
+            diag.input_quarantined.fetch_add(1,Ordering::Relaxed);
+            Ok(FileProgress::Continue)
+        }
         FilePoll::Pending => {
             tokio::task::yield_now().await;
             Ok(FileProgress::Continue)

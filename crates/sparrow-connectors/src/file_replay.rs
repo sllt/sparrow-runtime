@@ -51,6 +51,11 @@ pub enum FileContract {
 pub enum FilePoll {
     Row(sparrow_model::Row),
     DecodeError,
+    /// The raw record has reached the configured durable quarantine.
+    Quarantined,
+    /// Preserve the cursor BEFORE the unaccepted record; checkpoint/control
+    /// must remain available so operators can dispose committed quarantine.
+    QuarantineFull,
     /// Input scan budget exhausted, not terminal EOF. Poll again after yielding.
     Pending,
     Eof,
@@ -180,6 +185,8 @@ pub struct FileReplaySource {
     /// Payload format identity mixed into the checkpoint fingerprint
     /// (`None` for NDJSON, so JSON identities are unchanged).
     format_identity: Option<Vec<u8>>,
+    quarantine: Option<Arc<dyn sparrow_io::poison::InputQuarantine>>,
+    replay_end: Option<u64>,
 }
 
 impl FileReplaySource {
@@ -251,12 +258,36 @@ impl FileReplaySource {
             csv,
             diag: None,
             format_identity,
+            quarantine: None,
+            replay_end: None,
         })
     }
 
     /// Classify CSV record faults into these diagnostics (`csv_*` counters).
     pub fn set_diagnostics(&mut self, diag: Arc<IoDiagnostics>) {
         self.diag = Some(diag);
+    }
+
+    pub fn set_quarantine(&mut self, queue: Arc<dyn sparrow_io::poison::InputQuarantine>) -> ModelResult<()> {
+        if self.csv.is_some() {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"File quarantine currently requires JSON"));}
+        queue.check_start(&self.position())?;
+        self.codec.policy=sparrow_formats::BadRecordPolicy::FailJob;
+        self.quarantine=Some(queue);Ok(())
+    }
+
+    pub fn set_replay_end(&mut self,end:Option<u64>)->ModelResult<()> {
+        if let Some(end)=end {
+            if self.csv.is_some() || end<self.offset || end>self.file.get_ref().metadata().map_err(|_|SparrowError::new(ErrorCode::UnsupportedRestore,"replay input unavailable"))?.len() {
+                return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"invalid bounded JSON replay range"));
+            }
+            if end>0 {
+                let mut f=File::open(&self.path).map_err(|_|SparrowError::new(ErrorCode::UnsupportedRestore,"replay file unavailable"))?;
+                f.seek(SeekFrom::Start(end-1)).map_err(|_|SparrowError::new(ErrorCode::UnsupportedRestore,"replay end seek"))?;
+                let mut b=[0];f.read_exact(&mut b).map_err(|_|SparrowError::new(ErrorCode::UnsupportedRestore,"replay end read"))?;
+                if b[0]!=b'\n' {return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"replay end is not a message boundary"));}
+            }
+        }
+        self.replay_end=end;Ok(())
     }
 
     fn csv_fault(&self, error: &SparrowError) {
@@ -381,14 +412,28 @@ impl FileReplaySource {
     /// Read one NDJSON record and decode it. Decode failures are
     /// [`FilePoll::DecodeError`] (caller increments `IoDiagnostics`).
     pub fn poll_decoded(&mut self) -> ModelResult<FilePoll> {
+        let before=self.quarantine.as_ref().map(|_|self.position());
         match self.read_frame(2 * MAX_RECORD) {
             Ok(FramePoll::Frame(frame)) => match self.decode_frame(&frame) {
                 Ok(Some(row)) => Ok(FilePoll::Row(row)),
+                Err(e) if self.quarantine.is_some() => {
+                    if !sparrow_io::poison::record_error(e.code) {return Err(e);}
+                    if let Err(error)=self.quarantine.as_ref().unwrap().capture(&self.position(),&frame.payload,e.code) {
+                        if sparrow_io::poison::quarantine_full(&error) {
+                            self.seek(before.as_ref().expect("quarantine cursor"))?;
+                            return Ok(FilePoll::QuarantineFull);
+                        }
+                        return Err(error);
+                    }
+                    Ok(FilePoll::Quarantined)
+                }
                 Ok(None) | Err(_) => Ok(FilePoll::DecodeError),
             },
             Ok(FramePoll::Eof) => Ok(FilePoll::Eof),
             Ok(FramePoll::Pending) => Ok(FilePoll::Pending),
             Err(e) if e.code == ErrorCode::MaxRecordSize => {
+                // Framing discarded bytes: a prefix cannot replace the raw record.
+                if self.quarantine.is_some() {return Err(e);}
                 self.csv_fault(&e);
                 Ok(FilePoll::DecodeError)
             }
@@ -423,8 +468,8 @@ impl FileReplaySource {
                     bytes = bytes.saturating_add(sz);
                     out.push(poll);
                 }
-                FilePoll::DecodeError => out.push(poll),
-                FilePoll::Eof | FilePoll::Pending => {
+                FilePoll::DecodeError | FilePoll::Quarantined => out.push(poll),
+                FilePoll::Eof | FilePoll::Pending | FilePoll::QuarantineFull => {
                     out.push(poll);
                     break;
                 }
@@ -686,6 +731,7 @@ impl FileReplaySource {
     }
 
     fn read_frame(&mut self, mut scan_budget: usize) -> ModelResult<FramePoll> {
+        if self.replay_end.is_some_and(|end|self.offset>=end) {return Ok(FramePoll::Eof);}
         loop {
             if scan_budget == 0 {
                 return Ok(FramePoll::Pending);
@@ -761,6 +807,7 @@ impl ReplayableSource for FileReplaySource {
     }
 
     fn seek(&mut self, pos: &SourcePosition) -> sparrow_model::Result<()> {
+        if let Some(q)=&self.quarantine {q.check_start(pos)?;}
         self.check_identity(&pos.identity)
             .map_err(|e| SparrowError::new(e.code(), e.to_string()))?;
         let live = self

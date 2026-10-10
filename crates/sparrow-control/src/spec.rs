@@ -73,6 +73,10 @@ pub struct GraphIoSpec {
 pub struct SourceSpec {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_dlq: Option<Box<crate::input_dlq::InputDlqSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_start: Option<Box<crate::recovery_ops::ReplayStart>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<sparrow_expr::plugins::extension::Binding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jetstream: Option<JetStreamSpec>,
