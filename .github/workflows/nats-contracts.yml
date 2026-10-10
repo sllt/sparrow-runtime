@@ -4,6 +4,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      analysis_smoke_only:
+        description: Run only the three bounded analysis process recovery cases
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -35,6 +40,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/nats-broker.tar.gz" --strip-components=1 -C "$RUNNER_TEMP/nats-broker"
           "$RUNNER_TEMP/nats-broker/nats-server" --version
       - name: Feature regression and real-broker contracts
+        if: ${{ !inputs.analysis_smoke_only }}
         env:
           FEATURE: ${{ matrix.feature }}
           SPARROW_NATS_SERVER: ${{ runner.temp }}/nats-broker/nats-server
@@ -88,6 +94,28 @@ jobs:
               fi
             fi
           done
+      - name: Optional analysis process recovery (one run, not a matrix gate)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.analysis_smoke_only && matrix.feature == 'jetstream' }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          git rev-parse HEAD > artifacts/commit.txt
+          if ! cargo build --locked --release --quiet --no-default-features \
+            -p sparrow-server --bin sparrow-server --features jetstream \
+            > artifacts/analysis-build.log 2>&1; then
+            tail -n 80 artifacts/analysis-build.log; exit 1
+          fi
+          go vet tests/analysis-recovery-process/main.go
+          go build -o "$RUNNER_TEMP/analysis-recovery-process" tests/analysis-recovery-process/main.go
+          sha256sum target/release/sparrow-server "$RUNNER_TEMP/analysis-recovery-process" \
+            "$RUNNER_TEMP/nats-broker/nats-server" > artifacts/analysis-binaries.sha256
+          timeout 180s "$RUNNER_TEMP/analysis-recovery-process" \
+            --server-bin "$PWD/target/release/sparrow-server" \
+            --nats-server "$RUNNER_TEMP/nats-broker/nats-server" \
+            --out "$PWD/artifacts/analysis-process" > artifacts/analysis-process.log 2>&1 || {
+              tail -n 80 artifacts/analysis-process.log; exit 1;
+            }
+          tail -n 5 artifacts/analysis-process.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

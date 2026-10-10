@@ -204,7 +204,7 @@ fn k2_reliable_sink_cursor_is_cut_local_and_snapshot_v4_is_not_legacy() {
             let count=counter.clone();
             let handle=kernel.submit(JobRequest::new(physical,vec![],SharedCapture::disabled())
                 .with_live_events(rx).with_live_out(out).with_aligned(AlignedJob{restore:None,
-                    pipeline:Some(PipelineRestore{buffered:Vec::new(),sink:None,plan:manifest.clone(),generation:[3;16],restore:None,iot:vec![]}),acks:acks.clone(),outbox:counter})).unwrap();
+                    pipeline:Some(PipelineRestore{analysis:Vec::new(),buffered:Vec::new(),sink:None,plan:manifest.clone(),generation:[3;16],restore:None,iot:vec![]}),acks:acks.clone(),outbox:counter})).unwrap();
             let sink=tokio::spawn(async move {
                 let mut result=Vec::new();
                 while let Some(batch)=received.recv().await {
