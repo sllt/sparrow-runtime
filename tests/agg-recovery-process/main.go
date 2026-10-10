@@ -752,9 +752,31 @@ func setup(root, source, serverBin, natsBin string) *env {
 		v.producer.request("$JS.API.STREAM.CREATE.INPUT", encode(map[string]any{"name": "INPUT", "subjects": []string{"input.rows"}, "storage": "file", "retention": "limits", "max_bytes": 16 * 1024 * 1024, "max_msg_size": 65536, "max_consumers": 32, "num_replicas": 1, "deny_delete": true, "deny_purge": true}))
 		v.producer.request("$JS.API.STREAM.CREATE.KV_OWNERS", encode(map[string]any{"name": "KV_OWNERS", "subjects": []string{"$KV.OWNERS.>"}, "storage": "file", "retention": "limits", "max_bytes": 1024 * 1024, "max_msg_size": 1024, "max_msgs_per_subject": 1, "num_replicas": 1, "discard": "new", "allow_direct": true, "allow_rollup_hdrs": true}))
 		v.proxy = newProxy(np)
+	} else {
+		// FileReplaySource opens asynchronously after the start API returns.
+		// Provision the empty append-only input before start, not at publish:
+		// otherwise a fast opener can fail with ENOENT and enter safe-mode held.
+		f, e := os.OpenFile(v.file, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		must(e)
+		must(f.Close())
 	}
 	return v
 }
+
+// Run before close on panic, so a failed wait retains the actual lifecycle
+// error and observed output instead of only its generic deadline label.
+func (v *env) captureFailure() {
+	if cause := recover(); cause != nil {
+		status, code := v.a.call("GET", "/v1/pipelines/check/status", nil)
+		detail := map[string]any{"panic": fmt.Sprint(cause), "status_code": code, "status": status, "outputs": v.sink.rows()}
+		if raw, err := json.Marshal(detail); err == nil {
+			// Diagnostic I/O must not replace the original failure.
+			_ = os.WriteFile(filepath.Join(v.root, "failure.json"), append(raw, '\n'), 0600)
+		}
+		panic(cause)
+	}
+}
+
 func (v *env) close() {
 	v.server.stop(syscall.SIGKILL)
 	if v.proxy != nil {
@@ -805,6 +827,7 @@ func run(root, source, shape, cut, serverBin, natsBin string) map[string]any {
 	reliable := source == "jetstream"
 	v := setup(root, source, serverBin, natsBin)
 	defer v.close()
+	defer v.captureFailure()
 	want := oracle(shape, n)
 	wantText := make([]string, len(want))
 	for i, e := range want {
@@ -1080,6 +1103,7 @@ func (v *env) refused(label, reason string) map[string]any {
 func compat(root, serverBin, oldBin string) map[string]any {
 	v := setup(root, "file", serverBin, "")
 	defer v.close()
+	defer v.captureFailure()
 	result := map[string]any{}
 	// (1) New binary writes a v29 directory.
 	v.start(serverBin)
