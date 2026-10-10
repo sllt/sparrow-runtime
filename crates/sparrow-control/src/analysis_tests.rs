@@ -307,6 +307,7 @@ fn sliding_count_recovery_gate_admits_only_the_strict_profile() {
 /// (COUNT_WINDOW(3, 2)) -> required HTTP. A manual checkpoint publishes v31;
 /// after a kill the restored job replays only the uncommitted suffix and its
 /// outputs equal an independent per-key ring-buffer oracle.
+#[cfg(feature = "demo-io")]
 #[test]
 fn sliding_count_file_v31_checkpoint_kill_restore_matches_oracle() {
     use std::io::Write;
