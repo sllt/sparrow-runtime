@@ -9,7 +9,13 @@ export interface Me {
   authMode: string;
   safeMode: boolean;
   draining: boolean;
+  /** Server contract differs from this build: forced read-only. */
+  contractMismatch: string | null;
 }
+
+/** Must equal sparrow-server `ui::UI_CONTRACT`. */
+export const UI_CONTRACT = 1;
+const READ_ONLY = /(\.read|\.list|\.diagnose|^status\.|^audit\.)/;
 
 interface AuthValue {
   client: ApiClient | null;
@@ -29,10 +35,14 @@ export function parseMe(v: Json): Me {
   if (!o || !str(o.actor) || (role !== "viewer" && role !== "operator" && role !== "admin")) {
     throw new ApiError("bad_response", null, null, "auth/me 响应格式不符合合同", false);
   }
+  const allowed = Array.isArray(o.allowed_actions) ? o.allowed_actions.filter((a): a is string => typeof a === "string") : [];
+  const server = typeof o.ui_contract === "number" ? o.ui_contract : null;
+  const mismatch = server === UI_CONTRACT ? null : `界面合同版本 ${UI_CONTRACT} 与服务端 ${server ?? "未声明"} 不一致：已切换为只读，请部署与服务端同一构建的界面。`;
   return {
     actor: str(o.actor)!,
-    role,
-    allowed: Array.isArray(o.allowed_actions) ? o.allowed_actions.filter((a): a is string => typeof a === "string") : [],
+    role: mismatch ? "viewer" : role,
+    contractMismatch: mismatch,
+    allowed: mismatch ? allowed.filter((a) => READ_ONLY.test(a)) : allowed,
     authMode: str(o.auth_mode) ?? "unknown",
     safeMode: o.safe_mode === true,
     draining: o.draining === true,

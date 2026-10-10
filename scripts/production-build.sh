@@ -10,7 +10,9 @@ jetstream=${SPARROW_JETSTREAM:-0}
 nats=${SPARROW_NATS:-0}
 websocket=${SPARROW_WEBSOCKET:-0}
 postgres=${SPARROW_POSTGRES:-0}
-for flag in SPARROW_JETSTREAM SPARROW_NATS SPARROW_WEBSOCKET SPARROW_POSTGRES; do
+# Optional ops workbench UI (K5.6); off by default so Rust-only builds need no Node.
+ui=${SPARROW_UI:-0}
+for flag in SPARROW_JETSTREAM SPARROW_NATS SPARROW_WEBSOCKET SPARROW_POSTGRES SPARROW_UI; do
     value=${!flag:-0}
     case "$value" in 0|1) ;; *) printf '%s must be 0 or 1\n' "$flag" >&2; exit 2;; esac
 done
@@ -26,6 +28,10 @@ if [[ "$mode" == release ]]; then
     [[ $(git rev-parse --show-toplevel) == "$root" ]] || exit 2
     git diff --quiet HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml crates experiments scripts deploy .github tests sdk examples README.md docs
     test -z "$(git ls-files --others --exclude-standard -- Cargo.toml Cargo.lock rust-toolchain.toml crates experiments scripts deploy .github tests sdk examples README.md docs)"
+    if [[ "$ui" == 1 ]]; then
+        git diff --quiet HEAD -- web
+        test -z "$(git ls-files --others --exclude-standard -- web)"
+    fi
     if [[ -n ${SPARROW_BUILD_COMMIT:-} && "$SPARROW_BUILD_COMMIT" != "$(git rev-parse HEAD)" ]]; then
         printf 'release source commit must match HEAD\n' >&2; exit 2
     fi
@@ -163,17 +169,19 @@ if [[ "$jetstream" == 1 ]]; then
     cp deploy/pipeline-jetstream.json deploy/pipeline-jetstream-iot.json deploy/nats-jetstream-local.conf.example "$out/deploy/"
     cp docs/JETSTREAM.md "$out/docs/"
 fi
+if [[ "$ui" == 1 ]]; then bash scripts/build-ui.sh "$out/ui"; fi
 "$out/bin/sparrow-server" --version > "$out/evidence/server-version.txt"
 "$out/bin/sparrowctl" --version > "$out/evidence/cli-version.txt"
 jq -n --arg commit "$SPARROW_BUILD_COMMIT" --arg target "$host" --arg mode "$mode" \
     --argjson jetstream "$jetstream" --argjson nats "$nats" \
-    --argjson websocket "$websocket" --argjson postgres "$postgres" \
+    --argjson websocket "$websocket" --argjson postgres "$postgres" --argjson ui "$ui" \
     --arg source "$(sha256sum "$out/evidence/source-files.sha256" | cut -d' ' -f1)" \
     '{format:"sparrow-build-v1",source_commit:$commit,source_manifest_sha256:$source,
       target:$target,rust:"1.98.0",profile:"release",build_mode:$mode,default_features:false,
       nats_enabled:($nats==1),jetstream_enabled:($jetstream==1),
-      websocket_enabled:($websocket==1),postgres_enabled:($postgres==1),
+      websocket_enabled:($websocket==1),postgres_enabled:($postgres==1),ui_included:($ui==1),
       connector_maturity:"preview_not_profile_certified",jetstream_maturity:"preview_not_profile_certified",
       binaries:["sparrow-server","sparrowctl","sparrow-js-worker","sparrow-wasm-worker","sparrow-wasm-pack","sparrow-plugin-sign"],certification:"requires_matching_test_evidence"}' > "$out/build.json"
-(cd "$out" && find bin deploy docs evidence sdk examples scripts crates -type f -print | LC_ALL=C sort | while IFS= read -r file_path; do sha256sum "$file_path"; done; sha256sum build.json README.md) > "$out/SHA256SUMS"
+ui_dirs=(); if [[ "$ui" == 1 ]]; then ui_dirs=(ui); fi
+(cd "$out" && find bin deploy docs evidence sdk examples scripts crates "${ui_dirs[@]}" -type f -print | LC_ALL=C sort | while IFS= read -r file_path; do sha256sum "$file_path"; done; sha256sum build.json README.md) > "$out/SHA256SUMS"
 printf 'PRODUCTION_PACKAGE_OK %s\n' "$out"

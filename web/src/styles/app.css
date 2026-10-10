@@ -308,3 +308,8 @@ select.input { appearance: auto; }
 .btn.danger { background: var(--bad-dot); border-color: transparent; color: #fff; }
 .btn.danger:hover { filter: brightness(1.08); }
 .btn.ghost.on { background: var(--accent-soft); color: var(--accent); }
+
+/* K5.6 bundles */
+.bundle-pick { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: var(--sp-2, 8px); max-height: 240px; overflow: auto; padding: 4px 0; }
+.bundle-table { overflow-x: auto; }
+.bundle-table .fill-list { display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }

@@ -201,42 +201,78 @@ impl Store {
         if !input.metadata.is_empty() && serde_json::from_str::<serde_json::Value>(input.metadata).map(|v| !v.is_object()).unwrap_or(true) {
             return Err(invalid("draft metadata must be a JSON object"));
         }
-        self.write(|c| {
+        self.write(|c| Self::put_draft_in(c, id, expected, input, actor))
+    }
+
+    fn put_draft_in(c: &Connection, id: &str, expected: Option<&str>, input: &DraftInput<'_>, actor: &str) -> Result<DraftRow> {
             let current = load_draft(c, id)?;
-            let now = now_ms();
-            let version = match (&current, expected) {
-                (None, None) => 1,
-                (Some(cur), None) => return Err(conflict("draft already exists; send If-Match", Some(cur.etag.clone()))),
-                (None, Some(_)) => return Err(conflict("draft no longer exists", None)),
-                (Some(cur), Some(want)) => {
-                    if want.trim_matches('"') != cur.etag {
-                        return Err(conflict(format!("draft changed: If-Match `{want}` does not match `{}`", cur.etag), Some(cur.etag.clone())));
-                    }
-                    parse_version(&cur.etag, "draft-").unwrap_or(0) + 1
+        let now = now_ms();
+        let version = match (&current, expected) {
+            (None, None) => 1,
+            (Some(cur), None) => return Err(conflict("draft already exists; send If-Match", Some(cur.etag.clone()))),
+            (None, Some(_)) => return Err(conflict("draft no longer exists", None)),
+            (Some(cur), Some(want)) => {
+                if want.trim_matches('"') != cur.etag {
+                    return Err(conflict(format!("draft changed: If-Match `{want}` does not match `{}`", cur.etag), Some(cur.etag.clone())));
                 }
-            };
-            if current.is_none() {
-                let n: i64 = c.query_row("SELECT COUNT(*) FROM authoring_drafts", [], |r| r.get(0)).map_err(db)?;
-                if n as usize >= MAX_DRAFTS {
-                    return Err(SparrowError::new(ErrorCode::ResourceExhausted, "draft limit (64) reached; delete unused drafts"));
-                }
+                parse_version(&cur.etag, "draft-").unwrap_or(0) + 1
             }
-            let used: i64 = c
-                .query_row("SELECT COALESCE(SUM(LENGTH(text)+LENGTH(metadata)),0) FROM authoring_drafts WHERE id<>?1", [id], |r| r.get(0))
-                .map_err(db)?;
-            if used as usize + input.text.len() + input.metadata.len() > MAX_DRAFT_TOTAL {
-                return Err(SparrowError::new(ErrorCode::ResourceExhausted, "draft storage quota (8 MiB) exceeded"));
+        };
+        if current.is_none() {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM authoring_drafts", [], |r| r.get(0)).map_err(db)?;
+            if n as usize >= MAX_DRAFTS {
+                return Err(SparrowError::new(ErrorCode::ResourceExhausted, "draft limit (64) reached; delete unused drafts"));
             }
-            let created = current.as_ref().map(|d| d.created_at).unwrap_or(now);
-            c.execute(
-                "INSERT INTO authoring_drafts(id,version,pipeline,mode,text,metadata,base_etag,updated_by,updated_at,created_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-                 ON CONFLICT(id) DO UPDATE SET version=excluded.version,pipeline=excluded.pipeline,mode=excluded.mode,
-                   text=excluded.text,metadata=excluded.metadata,base_etag=excluded.base_etag,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
-                params![id, version as i64, input.pipeline, input.mode, input.text, input.metadata, input.base_etag, actor, now, created],
-            )
+        }
+        let used: i64 = c
+            .query_row("SELECT COALESCE(SUM(LENGTH(text)+LENGTH(metadata)),0) FROM authoring_drafts WHERE id<>?1", [id], |r| r.get(0))
             .map_err(db)?;
-            load_draft(c, id)?.ok_or_else(|| not_found("draft", id))
+        if used as usize + input.text.len() + input.metadata.len() > MAX_DRAFT_TOTAL {
+            return Err(SparrowError::new(ErrorCode::ResourceExhausted, "draft storage quota (8 MiB) exceeded"));
+        }
+        let created = current.as_ref().map(|d| d.created_at).unwrap_or(now);
+        c.execute(
+            "INSERT INTO authoring_drafts(id,version,pipeline,mode,text,metadata,base_etag,updated_by,updated_at,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(id) DO UPDATE SET version=excluded.version,pipeline=excluded.pipeline,mode=excluded.mode,
+               text=excluded.text,metadata=excluded.metadata,base_etag=excluded.base_etag,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+            params![id, version as i64, input.pipeline, input.mode, input.text, input.metadata, input.base_etag, actor, now, created],
+        )
+        .map_err(db)?;
+        load_draft(c, id)?.ok_or_else(|| not_found("draft", id))
+    }
+
+    /// K5.6 bundle import, in ONE transaction: missing streams are created
+    /// (an existing stream must have the identical schema), drafts are
+    /// create-only and each draft's base ETag must still be the target
+    /// pipeline's current ETag. Any failure leaves nothing behind. Nothing
+    /// is published or started.
+    pub fn import_bundle(&self, streams: &[(String, String)], drafts: &[(String, DraftInput<'_>)], actor: &str) -> Result<Vec<DraftRow>> {
+        for (n, _) in streams { check_name(n)?; }
+        for (id, d) in drafts {
+            check_name(id)?;
+            check_name(d.pipeline)?;
+            if d.text.len() > MAX_DRAFT_TEXT || d.metadata.len() > MAX_DRAFT_METADATA { return Err(SparrowError::new(ErrorCode::ResourceExhausted, "imported draft exceeds draft limits")); }
+        }
+        self.write(|c| {
+            for (name, schema) in streams {
+                let cur: Option<String> = c.query_row("SELECT schema_json FROM streams WHERE name=?1", [name], |r| r.get(0)).optional().map_err(db)?;
+                match cur {
+                    Some(cur) => {
+                        let same = serde_json::from_str::<serde_json::Value>(&cur).ok() == serde_json::from_str::<serde_json::Value>(schema).ok();
+                        if !same { return Err(conflict(format!("stream `{name}` exists with a different schema"), None)); }
+                    }
+                    None => { c.execute("INSERT INTO streams(name, schema_json, created_at) VALUES (?1, ?2, ?3)", params![name, schema, now_ms()]).map_err(db)?; }
+                }
+            }
+            let mut out = Vec::new();
+            for (id, d) in drafts {
+                let cur: Option<String> = c.query_row("SELECT etag FROM pipelines WHERE name=?1", [d.pipeline], |r| r.get(0)).optional().map_err(db)?;
+                if cur.as_deref() != d.base_etag { return Err(conflict(format!("pipeline `{}` changed since the import was reviewed", d.pipeline), cur)); }
+                out.push(Self::put_draft_in(c, id, None, d, actor)?);
+            }
+            self.inner.stream_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(out)
         })
     }
 

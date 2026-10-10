@@ -31,6 +31,7 @@ mod reference_tables;
 pub mod auth;
 pub mod ui;
 mod authoring;
+mod bundles;
 pub use auth::{Auth, Principal, Role};
 pub use ui::UiAssets;
 
@@ -130,6 +131,7 @@ fn build_router(state: AppState, ui_assets: Option<Arc<UiAssets>>) -> Router {
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
         .merge(plugins::router())
         .merge(authoring::router())
+        .merge(bundles::router())
         .merge(
             Router::<AppState>::new()
                 .route("/v1/preview", post(preview))
@@ -398,6 +400,7 @@ async fn auth_me(
         "role": p.role.as_str(),
         "allowed_actions": auth::allowed_actions(p.role),
         "auth_mode": state.token.mode(),
+        "ui_contract": ui::UI_CONTRACT,
         "safe_mode": state.safe_mode,
         "draining": state.supervisor.is_draining(),
         "status_projection": if p.role == Role::Viewer { "viewer_safe" } else { "full" },

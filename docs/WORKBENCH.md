@@ -149,3 +149,27 @@ Graph-mode drafts open in a three-pane designer: node palette, canvas (React Flo
     - a recovery wizard: preview → `approve_digest` (any edit invalidates it) → execute → explicit start of the target → finish/abort. A backend refusal is final.
   - Resources: reference table dependencies and revisions, admin rollback and GC; plugin signature, pins and status, admin install (raw bytes upload with a local SHA-256 display), enable with exact manifest hash approval, disable and uninstall.
 - **Not covered:** a real File→HTTP checkpoint and recovery run in the browser. The e2e fixture uses demo MQTT, so this suite only exercises the refusal paths for checkpoint and recovery. Outbox and input-DLQ success paths have backend tests only.
+
+## K5.6 Delivery: config bundles, diagnostics, packaging
+
+- **Config bundles** (`sparrow-config-bundle-v1`, operator+): `GET /v1/bundles/export?pipelines=a,b[&include_logic=true]`, `POST /v1/bundles/import/preview`, `POST /v1/bundles/import/execute`.
+  - A bundle holds author-side configuration only: stream schemas and allowlist-projected pipeline specs. It contains no secret values, plugin binaries, DLQ/outbox payloads or checkpoint state. It is **not** a disaster-recovery backup.
+  - Export is an allowlist. Connector keys outside a structural set (URLs, hosts, ports, headers, secret refs, TLS, paths, extras), unknown top-level keys and external lookups become `__SPARROW_FILL_IN__` and are listed in `fill_in`.
+  - SQL/Graph logic is replaced by the marker unless `include_logic=true`. The UI warns that literals can be sensitive.
+- **Import** is preview → `approve_digest` → execute.
+  - The digest binds the bundle bytes, draft prefix, per-pipeline target/base ETag and stream actions.
+  - Execute recomputes the digest, then in **one** transaction:
+    - creates missing streams; an existing stream must have an identical schema;
+    - creates drafts, which are create-only;
+    - re-checks that each target pipeline's ETag still equals the reviewed base.
+  - Any failure writes nothing. Nothing is published or started.
+  - A draft that still contains the marker is refused at publish (400).
+  - Limits: 1 MiB per bundle, 16 pipelines.
+- **Diagnostics** gain `config_summary` (mode, connector kinds, delivery/recovery, node kinds, counts; no destinations, topics, SQL or paths) and `error_codes`.
+- **UI/server contract:** `GET /v1/auth/me` returns `ui_contract` (`sparrow-server` `ui::UI_CONTRACT`). A UI built for a different contract forces itself read-only and shows a banner. Write actions are always authorized by the server regardless.
+- **Packaging:**
+  - `scripts/build-ui.sh NEW_DIR` checks the pinned Node from `web/.nvmrc`, runs `npm ci` (`SPARROW_UI_OFFLINE=1` installs from the npm cache only), builds, refuses remote asset references and a UI/server contract mismatch, and writes `ui-build.json` (source fingerprint, node/npm, contract) plus `SHA256SUMS`.
+  - `SPARROW_UI=1 scripts/production-build.sh` adds `ui/` to the package, records `ui_included` in `build.json` and includes `ui/` in `SHA256SUMS`. Release mode also requires a clean `web/`.
+  - The default stays Rust-only, so Rust builds need no Node.
+  - Serve with `sparrow-server --ui-dir <package>/ui`.
+- **Offline:** the e2e suites assert that the browser makes no request outside the local server; the bundle and contract scenarios check this explicitly.

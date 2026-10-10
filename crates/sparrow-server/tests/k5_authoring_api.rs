@@ -400,3 +400,66 @@ async fn k55_rollback_new_revision_and_conditional_start() {
     assert_eq!(r.st, StatusCode::NOT_FOUND, "{}", r.v);
     let _ = call(&s, Method::POST, "/v1/pipelines/rb/stop", OPERATOR, None, json!({})).await;
 }
+
+#[tokio::test]
+async fn k56_bundle_export_redacts_and_import_is_reviewed_and_atomic() {
+    let s = setup().await;
+    let stream: Value = serde_json::from_str(STREAM).unwrap();
+    assert_eq!(call(&s, Method::PUT, "/v1/streams/sensors", OPERATOR, None, stream).await.st, StatusCode::CREATED);
+    let mut spec: Value = serde_json::from_str(&spec_text("42")).unwrap();
+    spec["sink"] = json!({"kind":"http","use_demo_io":true,"url":"https://hooks.internal.example/p?token=abc","batch_rows":10});
+    let r = call(&s, Method::PUT, "/v1/pipelines/exp", OPERATOR, None, spec.clone()).await;
+    assert!(r.st.is_success(), "{}", r.v);
+    let r = call(&s, Method::GET, "/v1/bundles/export?pipelines=exp", OPERATOR, None, Value::Null).await;
+    assert_eq!(r.st, StatusCode::OK, "{}", r.v);
+    let text = r.v.to_string();
+    assert!(!text.contains("hooks.internal") && !text.contains("> 42"), "{text}");
+    let fill = r.v["pipelines"][0]["fill_in"].as_array().unwrap();
+    assert!(fill.iter().any(|x| x == "sink.url") && fill.iter().any(|x| x == "sql"), "{fill:?}");
+    assert_eq!(r.v["streams"]["sensors"]["fields"][0]["name"], "device_id");
+    let with_logic = call(&s, Method::GET, "/v1/bundles/export?pipelines=exp&include_logic=true", OPERATOR, None, Value::Null).await;
+    assert!(with_logic.v.to_string().contains("> 42"));
+    let bundle = r.v.clone();
+    assert_eq!(call(&s, Method::GET, "/v1/bundles/export?pipelines=exp", VIEWER, None, Value::Null).await.st, StatusCode::FORBIDDEN);
+    // Preview binds the digest; execute without/with a stale digest is refused.
+    let pv = call(&s, Method::POST, "/v1/bundles/import/preview", OPERATOR, None, json!({"bundle": bundle, "draft_prefix": "imp-"})).await;
+    assert_eq!(pv.st, StatusCode::OK, "{}", pv.v);
+    assert_eq!(pv.v["drafts"][0]["target"], "existing_pipeline");
+    assert_eq!(pv.v["drafts"][0]["publishable"], false);
+    assert_eq!(pv.v["streams"][0]["action"], "exists_identical");
+    let digest = pv.v["approve_digest"].as_str().unwrap().to_string();
+    let r = call(&s, Method::POST, "/v1/bundles/import/execute", OPERATOR, None, json!({"bundle": bundle, "draft_prefix": "imp-", "approve_digest": "x"})).await;
+    assert_eq!(r.st, StatusCode::PRECONDITION_FAILED, "{}", r.v);
+    // A concurrent publish after review changes the base ETag: refused, nothing created.
+    let r2 = call(&s, Method::PUT, "/v1/pipelines/exp", OPERATOR, Some("rev-1"), spec.clone()).await;
+    assert!(r2.st.is_success(), "{}", r2.v);
+    let r = call(&s, Method::POST, "/v1/bundles/import/execute", OPERATOR, None, json!({"bundle": bundle, "draft_prefix": "imp-", "approve_digest": digest})).await;
+    assert_eq!(r.st, StatusCode::PRECONDITION_FAILED, "{}", r.v);
+    assert_eq!(call(&s, Method::GET, "/v1/drafts/imp-exp", OPERATOR, None, Value::Null).await.st, StatusCode::NOT_FOUND);
+    let pv = call(&s, Method::POST, "/v1/bundles/import/preview", OPERATOR, None, json!({"bundle": bundle, "draft_prefix": "imp-"})).await;
+    let digest = pv.v["approve_digest"].as_str().unwrap().to_string();
+    let r = call(&s, Method::POST, "/v1/bundles/import/execute", OPERATOR, None, json!({"bundle": bundle, "draft_prefix": "imp-", "approve_digest": digest})).await;
+    assert_eq!(r.st, StatusCode::CREATED, "{}", r.v);
+    assert_eq!(r.v["published"], false);
+    // The imported draft cannot be published while fill-in markers remain.
+    let d = call(&s, Method::GET, "/v1/drafts/imp-exp", OPERATOR, None, Value::Null).await;
+    let etag = d.etag.clone().unwrap();
+    let r = call(&s, Method::POST, "/v1/drafts/imp-exp/publish", OPERATOR, None, json!({"operation_id":"imp-pub-0001","draft_etag": etag, "base_etag": "rev-2"})).await;
+    assert_eq!(r.st, StatusCode::BAD_REQUEST, "{}", r.v);
+    assert!(r.v["error"]["message"].as_str().unwrap().contains("fill-in"));
+    // Stream schema conflict blocks the whole import (no partial drafts).
+    let mut b2 = bundle.clone();
+    b2["streams"]["sensors"]["fields"][1]["type"] = json!("int64");
+    b2["pipelines"][0]["name"] = json!("other");
+    let pv = call(&s, Method::POST, "/v1/bundles/import/preview", OPERATOR, None, json!({"bundle": b2})).await;
+    assert!(!pv.v["blocked"].as_array().unwrap().is_empty(), "{}", pv.v);
+    let r = call(&s, Method::POST, "/v1/bundles/import/execute", OPERATOR, None, json!({"bundle": b2, "approve_digest": pv.v["approve_digest"]})).await;
+    assert_eq!(r.st, StatusCode::PRECONDITION_FAILED, "{}", r.v);
+    assert_eq!(call(&s, Method::GET, "/v1/drafts/import-other", OPERATOR, None, Value::Null).await.st, StatusCode::NOT_FOUND);
+    let r = call(&s, Method::POST, "/v1/bundles/import/preview", OPERATOR, None, json!({"bundle": {"format":"nope"}})).await;
+    assert_eq!(r.st, StatusCode::BAD_REQUEST);
+    // Diagnostics carry the structured summary but no destination/SQL.
+    let r = call(&s, Method::GET, "/v1/pipelines/exp/diagnose", VIEWER, None, Value::Null).await;
+    assert_eq!(r.v["config_summary"]["sink_kind"], "http", "{}", r.v);
+    assert!(!r.v.to_string().contains("hooks.internal") && !r.v.to_string().contains("> 42"));
+}
