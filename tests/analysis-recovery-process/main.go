@@ -466,11 +466,11 @@ func businessScenario(kind string, a api, spec map[string]any, paths []string, c
 		return map[string]any{"id": 6, "kind": "change_detect", "iot": map[string]any{"keys": []string{key}, "fields": []string{value}, "emit_first": true, "ttl_micros": 0, "max_keys": 16, "invalid": "error"}, "out": []int{7}}
 	}
 	if kind == "business-count" {
-		fields = []any{field("items", "array<int64>")}
+		fields = []any{field("items", "array<int64>"), field("k", "utf8")}
 		nodes = append(nodes,
 			map[string]any{"id": 4, "kind": "unnest", "unnest": map[string]any{"expr": col("items")}, "out": []int{5}},
-			map[string]any{"id": 5, "kind": "window_agg", "window": map[string]any{"kind": "count", "size": 3}, "keys": []string{"unnest_source"},
-				"aggs": []any{map[string]any{"fn": "first", "expr": col("item"), "alias": "first"}, map[string]any{"fn": "last", "expr": col("item"), "alias": "last"}}, "out": []int{6}}, change("unnest_source", "last"))
+			map[string]any{"id": 5, "kind": "window_agg", "window": map[string]any{"kind": "count", "size": 3}, "keys": []string{"k"},
+				"aggs": []any{map[string]any{"fn": "first", "expr": col("item"), "alias": "first"}, map[string]any{"fn": "last", "expr": col("item"), "alias": "last"}}, "out": []int{6}}, change("k", "last"))
 	} else {
 		binding = publish(10, 0)
 		spec["reference_tables"] = map[string]any{"limits": map[string]any{"revision": binding["revision"], "sha256": binding["sha256"]}}
@@ -497,17 +497,17 @@ func businessScenario(kind string, a api, spec map[string]any, paths []string, c
 	start()
 	switch kind {
 	case "business-count":
-		appendRow(paths[0], map[string]any{"items": []int{7, 8, 9}})
+		appendRow(paths[0], map[string]any{"k": "a", "items": []int{7, 8, 9}})
 		waitRows(1)
 		waitCut(1)
-		appendRow(paths[1], map[string]any{"items": []int{}})
+		appendRow(paths[1], map[string]any{"k": "b", "items": []int{}})
 		waitCut(2)
-		appendRow(paths[0], map[string]any{"items": []int{7, 8}})
+		appendRow(paths[0], map[string]any{"k": "a", "items": []int{7, 8}})
 		waitCut(3)
 		restart()
-		appendRow(paths[0], map[string]any{"items": []int{9}})
+		appendRow(paths[0], map[string]any{"k": "a", "items": []int{9}})
 		waitCut(4) // Identical LAST must be suppressed by the restored Change state.
-		appendRow(paths[1], map[string]any{"items": []int{10, 11, 12}})
+		appendRow(paths[1], map[string]any{"k": "b", "items": []int{10, 11, 12}})
 		waitRows(2)
 		waitCut(5)
 		rows := c.all()
@@ -556,7 +556,17 @@ func main() {
 	flag.Parse()
 	require(*bin != "" && *broker != "" && *out != "", "--server-bin --nats-server --out required")
 	must(os.Mkdir(*out, 0700))
+	var failures []string
 	for _, kind := range []string{"file", "jetstream", "join", "multi", "business-count", "business-alarm", "business-etref"} {
-		scenario(filepath.Join(*out, kind), kind, *bin, *broker)
+		func() {
+			defer func() {
+				if why := recover(); why != nil {
+					failures = append(failures, kind+": "+fmt.Sprint(why))
+					fmt.Println("ANALYSIS_RECOVERY_FAILED", kind, why)
+				}
+			}()
+			scenario(filepath.Join(*out, kind), kind, *bin, *broker)
+		}()
 	}
+	require(len(failures) == 0, strings.Join(failures, "\n"))
 }

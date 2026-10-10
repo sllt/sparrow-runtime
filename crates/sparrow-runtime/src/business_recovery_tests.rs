@@ -36,7 +36,7 @@ fn business_recovery_join_event_window_restores_pending_matches_and_aggregate() 
             "keys":["l_k"],"aggs":[{"fn":"sum","expr":{"k":"col","name":"l_v"},"alias":"total"}],"out":[5]},
         {"id":5,"kind":"change_detect","iot":{"keys":["l_k"],"fields":["total"],"emit_first":true,"ttl_micros":0,"max_keys":16,"invalid":"error"},"out":[6]},
         {"id":6,"kind":"capture_sink"}]),
-        json!([{"name":"k","type":"utf8","nullable":true},{"name":"v","type":"int64","nullable":false},{"name":"ts","type":"int64","nullable":false}]),
+        json!([{"name":"k","type":"utf8","nullable":false},{"name":"v","type":"int64","nullable":false},{"name":"ts","type":"int64","nullable":false}]),
     );
     let d = vec![
         input(1, row("a", 1, 12), Some(2)),
@@ -73,19 +73,24 @@ fn business_recovery_multi_unnest_extended_count_and_change_state() {
         {"id":2,"kind":"memory_source","table":"s","out":[3]},
         {"id":3,"kind":"union_all","out":[4]},
         {"id":4,"kind":"unnest","unnest":{"expr":{"k":"col","name":"items"}},"out":[5]},
-        {"id":5,"kind":"window_agg","window":{"kind":"count","size":3},"keys":["unnest_source"],
+        {"id":5,"kind":"window_agg","window":{"kind":"count","size":3},"keys":["k"],
             "aggs":[{"fn":"first","expr":{"k":"col","name":"item"},"alias":"first"},
                 {"fn":"last","expr":{"k":"col","name":"item"},"alias":"last"}],"out":[6]},
-        {"id":6,"kind":"change_detect","iot":{"keys":["unnest_source"],"fields":["last"],"emit_first":true,"ttl_micros":0,"max_keys":16,"invalid":"error"},"out":[7]},
+        {"id":6,"kind":"change_detect","iot":{"keys":["k"],"fields":["last"],"emit_first":true,"ttl_micros":0,"max_keys":16,"invalid":"error"},"out":[7]},
         {"id":7,"kind":"capture_sink"}]),
-        json!([{"name":"items","type":"array<int64>","nullable":true}]),
+        json!([{"name":"items","type":"array<int64>","nullable":true},{"name":"k","type":"utf8","nullable":false}]),
     );
+    let keyed = |key: &str, values: &[i64]| {
+        let mut row = array(values);
+        row.values.push(Scalar::utf8(key));
+        row
+    };
     let d = vec![
-        input(1, array(&[7, 8, 9]), None),
-        input(2, array(&[]), None),
-        input(1, array(&[7, 8]), None),
-        input(1, array(&[9]), None),
-        input(2, array(&[10, 11, 12]), None),
+        input(1, keyed("a", &[7, 8, 9]), None),
+        input(2, keyed("b", &[]), None),
+        input(1, keyed("a", &[7, 8]), None),
+        input(1, keyed("a", &[9]), None),
+        input(2, keyed("b", &[10, 11, 12]), None),
         end(1),
         end(2),
     ];
