@@ -275,6 +275,7 @@ impl WindowOperator {
     }
 
     /// Next scheduled PT timer (process-test hooks only).
+    #[cfg(feature = "process-fault-pause")]
     pub(crate) fn next_timer(&self) -> Option<i64> {
         self.timers.peek_deadline()
     }

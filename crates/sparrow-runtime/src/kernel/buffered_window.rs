@@ -153,7 +153,14 @@ async fn ordered_run(
                     }
                     // Process-test hook: the tick is applied, its due outputs
                     // are not yet emitted (timer-driven cuts).
-                    crate::process_fault::pt_time_applied(op.due(now), op.deadline().map(|d| d - now));
+                    #[cfg(feature = "process-fault-pause")]
+                    {
+                        let next = op.output_deadline();
+                        crate::process_fault::pt_time_applied(
+                            next.is_some_and(|d| d <= now),
+                            next.map(|d| d - now),
+                        );
+                    }
                     if !drain(ctx, &mut op, tx, now, &mut n).await? {
                         break;
                     }

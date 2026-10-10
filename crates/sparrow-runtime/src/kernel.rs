@@ -3121,8 +3121,9 @@ async fn ordered_window_stage(
                 .as_ref()
                 .filter(|g| g.event_time)
                 .map_or(now, |g| g.observed_micros());
-            let emission = op.on_batch_without_timers(&batch, observation)?;
+            // Harness log first: the window_rows_applied cut parks inside on_batch.
             crate::process_fault::pt_clock_log("rows", observation, batch.num_rows());
+            let emission = op.on_batch_without_timers(&batch, observation)?;
             n += emission.finals.len();
             if !emit_window(ctx, op, tx, capture, emission, Some(scratch)).await? {
                 break;
@@ -3148,11 +3149,14 @@ async fn ordered_window_stage(
                         continue;
                     }
                     crate::process_fault::pt_clock_log("tick", now, 0);
-                    let next = op.next_timer();
-                    crate::process_fault::pt_time_applied(
-                        next.is_some_and(|d| d <= now),
-                        next.map(|d| d - now),
-                    );
+                    #[cfg(feature = "process-fault-pause")]
+                    {
+                        let next = op.next_timer();
+                        crate::process_fault::pt_time_applied(
+                            next.is_some_and(|d| d <= now),
+                            next.map(|d| d - now),
+                        );
+                    }
                     op.begin_due(now);
                     while let Some(out) =
                         op.take_closed_batch(now, ctx.mailbox.max_items, ctx.mailbox.max_bytes)?

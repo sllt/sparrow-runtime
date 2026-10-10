@@ -1326,6 +1326,21 @@ impl BufferedWindow {
         }
     }
 
+    /// Harness-only (timer-driven cuts): the earliest deadline that emits a
+    /// final, excluding sliding history-eviction deadlines. O(keys).
+    #[cfg(feature = "process-fault-pause")]
+    pub(crate) fn output_deadline(&self) -> Option<i64> {
+        match self.spec.kind {
+            WindowKind::SlidingProcessingTime { delay_micros, .. }
+            | WindowKind::SlidingEventTime { delay_micros, .. } => self
+                .groups
+                .values()
+                .filter_map(|g| g.events.iter().find(|(_, e)| e.pending).map(|(&(t, _), _)| t + delay_micros + 1))
+                .min(),
+            _ => self.schedule.first().map(|(t, _)| *t),
+        }
+    }
+
     pub(crate) fn due(&self, time: i64) -> bool {
         self.schedule.first().is_some_and(|(t, _)| *t <= time)
     }
