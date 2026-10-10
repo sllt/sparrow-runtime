@@ -12,8 +12,10 @@ import { p99, quantileText, fmtUs } from "../../lib/histogram";
 import { RateSeries, type Rate } from "../../lib/rates";
 import { rateText } from "./useRates";
 import { RevisionsTab } from "./RevisionsTab";
+import { OpsTab, SafetyCard } from "./OpsTab";
+import { OutcomeBanner, outcomeOf, type Outcome } from "./RevisionActions";
 
-type TabKey = "overview" | "traffic" | "errors" | "checkpoint" | "diagnostics" | "revisions";
+type TabKey = "overview" | "traffic" | "errors" | "checkpoint" | "diagnostics" | "revisions" | "ops";
 
 function v(x: Json | undefined): string {
   if (x === null || x === undefined) return "—";
@@ -99,6 +101,19 @@ export default function PipelineDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.updatedAt]);
 
+  const [cpReq, setCpReq] = useState<{ busy: boolean; out: Outcome | null }>({ busy: false, out: null });
+  async function requestCheckpoint() {
+    if (!client) return;
+    setCpReq({ busy: true, out: null });
+    try {
+      const r = obj(await client.send("POST", `/v1/pipelines/${enc(name)}/checkpoint`, {}));
+      setCpReq({ busy: false, out: { kind: "ok", text: `checkpoint ${numText(r?.checkpoint_id)} 已提交。` } });
+    } catch (e) {
+      // A timeout is "pending confirmation": keep polling the real phase, never retry the mutation.
+      setCpReq({ busy: false, out: outcomeOf(e) });
+    } finally { refresh(); }
+  }
+
   const [dl, setDl] = useState<{ busy: boolean; msg: string | null; tone: Tone }>({ busy: false, msg: null, tone: "info" });
   async function download() {
     if (!client) return;
@@ -148,8 +163,14 @@ export default function PipelineDetailPage() {
         { key: "errors", label: "错误", badge: view.hasError || view.health === "degraded" ? <Pill tone="bad">!</Pill> : undefined },
         { key: "checkpoint", label: "Checkpoint 风险" },
         { key: "diagnostics", label: "诊断" },
-        ...(me?.role !== "viewer" ? [{ key: "revisions" as const, label: "版本历史" }] : []),
+        ...(me?.role !== "viewer" ? [{ key: "revisions" as const, label: "版本历史" }, { key: "ops" as const, label: "运维处置" }] : []),
       ]} />
+      {tab === "ops" && (
+        <div className="stack">
+          <SafetyCard safeMode={body.safe_mode === true} restartBlocked={view.restartBlocked} failures={view.failures === null ? null : String(view.failures)} lastError={str(actual?.last_error_code) ?? str(actual?.last_error)} />
+          <OpsTab name={name} admin={me?.role === "admin"} stopped={str(obj(body.desired)?.status) === "stopped" && str(actual?.status) !== "running"} revision={view.runningRevision ?? view.revision} />
+        </div>
+      )}
       {tab === "revisions" && <RevisionsTab name={name} />}
 
       {tab === "overview" && (
@@ -222,8 +243,9 @@ export default function PipelineDetailPage() {
 
       {tab === "checkpoint" && (
         <div className="grid two">
-          <Card title="恢复风险" actions={<Pill tone={risk.level}>{risk.label}</Pill>}>
+          <Card title="恢复风险" actions={<>{me?.role !== "viewer" && <button className="btn sm" disabled={cpReq.busy} onClick={() => void requestCheckpoint()}><Icon name="save" size={13} />{cpReq.busy ? "等待提交…" : "请求 checkpoint"}</button>}<Pill tone={risk.level}>{risk.label}</Pill></>}>
             <p style={{ marginTop: 0 }}>{risk.detail}</p>
+            <OutcomeBanner o={cpReq.out} />
             {cp?.available === true && (
               <dl className="kv">
                 <dt>策略</dt><dd className="mono">{v(cp.policy)}</dd>
