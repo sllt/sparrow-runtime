@@ -254,6 +254,31 @@ impl WatermarkHub {
         }
     }
 
+    /// Exact per-input generator state (activity, watermark, max event time)
+    /// for the v33 buffered ET frame.
+    pub fn input_state(&self, id: InputId) -> Option<(InputActivity, Option<i64>, Option<i64>)> {
+        self.inputs.get(&id).map(|s| (s.activity, s.wm, s.max_event_time))
+    }
+
+    /// Restore one registered input and the committed progress exactly as
+    /// frozen (v33). Callers validate the derived invariants first.
+    pub fn restore_input(
+        &mut self,
+        id: InputId,
+        activity: InputActivity,
+        wm: Option<i64>,
+        max_event_time: Option<i64>,
+        last_effective: Option<i64>,
+    ) -> Result<()> {
+        self.ensure(id)?;
+        let s = self.inputs.get_mut(&id).expect("registered");
+        s.activity = activity;
+        s.wm = wm;
+        s.max_event_time = max_event_time;
+        self.last_effective = last_effective;
+        Ok(())
+    }
+
     /// Restore the last committed effective watermark (experimental).
     pub fn restore_effective(&mut self, last: Option<i64>) {
         self.last_effective = last;

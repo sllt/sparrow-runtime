@@ -64,6 +64,9 @@ pub const EXT_AGG_RELIABLE_SNAPSHOT_VERSION: u16 = 30;
 pub const SLIDING_COUNT_FILE_SNAPSHOT_VERSION: u16 = 31;
 /// Linear reliable JetStream + output cursor + one codec 4 sliding count.
 pub const SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION: u16 = 32;
+/// Linear File with exactly one codec 4 ET sliding (kind 7) or ET session
+/// (kind 9) participant plus its restored watermark state. Strict identity.
+pub const BUFFERED_ET_FILE_SNAPSHOT_VERSION: u16 = 33;
 const MAX_SOURCE_METADATA: usize = 64 * 1024;
 
 pub(crate) const EXTENDED_PROFILE_GUARD: &str = "extended_profile_mismatch";
@@ -129,6 +132,11 @@ fn frame_scratch_bound(codec: u16, frame_len: usize, entries: usize) -> usize {
             .saturating_mul(5)
             .saturating_add(entries.saturating_mul(72))
             .saturating_add(1024)
+    } else if codec == sparrow_plan::checkpoint::BUFFERED_WINDOW_STATE_CODEC {
+        // Codec 4 decodes values straight into the (reserved) resident state;
+        // the only scan temporary is the ET per-group duplicate-sequence
+        // check, 8 bytes per event against >= 19 encoded bytes per event.
+        frame_len.saturating_add(1024)
     } else {
         frame_len.saturating_add(1024)
     }
@@ -201,6 +209,15 @@ pub fn snapshot_version_for(
         // validate() already pins a single linear codec 4 participant.
         if graph || references || plan.has_iot() || plan.requires_paused_time() || plan.states.len() != 1 {
             return Err(buffered_mismatch("sliding count state requires a strict single-state linear profile"));
+        }
+        if plan.has_buffered_event_time_state() {
+            // JetStream + ET stays refused (S2 Q6).
+            return match source_kind {
+                "file" => Ok(BUFFERED_ET_FILE_SNAPSHOT_VERSION),
+                _ => Err(buffered_mismatch(
+                    "ET sliding/session state requires a linear File source (v33); JetStream + event time is not supported",
+                )),
+            };
         }
         return match source_kind {
             "file" => Ok(SLIDING_COUNT_FILE_SNAPSHOT_VERSION),
@@ -372,7 +389,7 @@ pub struct PipelineSnapshot {
     pub plan: CheckpointPlan,
     pub windows: Vec<WindowFreeze>,
     pub iot: Vec<crate::iot::IotFreeze>,
-    /// Codec 4 sliding count participants (v31/v32 only).
+    /// Codec 4 buffered participants (v31/v32 sliding count, v33 ET).
     pub buffered: Vec<crate::buffered_window::BufferedFreeze>,
     pub next_output: Option<sparrow_model::OutputSequence>,
 }
@@ -760,6 +777,7 @@ impl PipelineSnapshot {
                 | EXT_AGG_RELIABLE_SNAPSHOT_VERSION
                 | SLIDING_COUNT_FILE_SNAPSHOT_VERSION
                 | SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
+                | BUFFERED_ET_FILE_SNAPSHOT_VERSION
         ) {
             return Err(invalid("unsupported pipeline snapshot version"));
         }
@@ -806,7 +824,9 @@ impl PipelineSnapshot {
         );
         let buffered_version = matches!(
             version,
-            SLIDING_COUNT_FILE_SNAPSHOT_VERSION | SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
+            SLIDING_COUNT_FILE_SNAPSHOT_VERSION
+                | SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
+                | BUFFERED_ET_FILE_SNAPSHOT_VERSION
         );
         // v29-v32 envelopes are complete, checksummed records: identity and
         // profile disagreements are incompatibilities, never corruption.
@@ -854,14 +874,14 @@ impl PipelineSnapshot {
         }
         if buffered_version != plan.has_buffered_state() {
             return Err(buffered_mismatch(
-                "checkpoint outer version and sliding count state codec disagree",
+                "checkpoint outer version and buffered (codec 4) state codec disagree",
             ));
         }
         if buffered_version {
             let expected = snapshot_version_for(&plan, &source.identity.kind)?;
             if expected != version {
                 return Err(buffered_mismatch(
-                    "sliding count checkpoint source/profile disagree",
+                    "buffered window checkpoint source/profile (v31/v32/v33) disagree",
                 ));
             }
             if version == SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION
@@ -1204,7 +1224,7 @@ impl StoredSnapshot {
         materialize: bool,
         meter: &mut RestoreMeter,
     ) -> Result<Self> {
-        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32,0])) {
+        if matches!(bytes.get(4..6),Some([3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33,0])) {
             Ok(Self::Pipeline(PipelineSnapshot::decode_metered(
                 bytes,
                 max_keys,

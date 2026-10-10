@@ -325,9 +325,9 @@ fn restore_validation_rejects_foreign_spec_types_and_duplicates() {
     let mut busy = operator(&owner);
     feed(&mut busy, 1..=1);
     assert!(restore(&mut busy, decode(&bytes, true).unwrap().0).is_err());
-    // Only sliding count is durable.
+    // PT buffered kinds have no codec (ET sliding/session are v33, 2b).
     let session = WindowSpec::new(
-        WindowKind::SessionEventTime { gap_micros: 10, max_duration_micros: 100 },
+        WindowKind::SessionProcessingTime { gap_micros: 10, max_duration_micros: 100 },
         vec!["device_id".into()], vec![AggCall::count_star("c")]);
     if let Ok(mut s) = BufferedWindow::new(session, schema(), owner.clone(), 16, 16, false) {
         assert_eq!(s.set_durable().unwrap_err().code, ErrorCode::UnsupportedRestore);
@@ -341,6 +341,7 @@ impl BufferedGroupFreezeClone {
             key: g.key.iter().map(Scalar::detach_copy).collect(),
             sequence: g.sequence,
             events: g.events.iter().map(|(s, v)| (*s, v.iter().map(Scalar::detach_copy).collect())).collect(),
+            times: g.times.clone(),
         }
     }
 }
@@ -657,11 +658,10 @@ fn plan_and_profile_gates_for_sliding_count() {
     assert_eq!(select(&plan, "file").unwrap(), crate::SLIDING_COUNT_FILE_SNAPSHOT_VERSION);
     assert_eq!(select(&plan, "jetstream-v1").unwrap(), crate::SLIDING_COUNT_RELIABLE_SNAPSHOT_VERSION);
     assert!(select(&plan, "file-dag-v1").is_err());
-    // Still restart_fresh only: ET/PT sliding, sessions, PT hopping.
+    // Still restart_fresh only: PT sliding, PT sessions, PT hopping (ET
+    // sliding/session are the v33 profile, see buffered_et_tests).
     for kind in [
-        WindowKind::SlidingEventTime { size_micros: 10, delay_micros: 0 },
         WindowKind::SlidingProcessingTime { size_micros: 10, delay_micros: 0 },
-        WindowKind::SessionEventTime { gap_micros: 10, max_duration_micros: 100 },
         WindowKind::SessionProcessingTime { gap_micros: 10, max_duration_micros: 100 },
         WindowKind::HoppingProcessingTime { size_micros: 20, slide_micros: 10 },
     ] {

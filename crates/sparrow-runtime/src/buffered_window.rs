@@ -91,6 +91,10 @@ pub(crate) struct BufferedWindow {
 pub(crate) const BWF_MAGIC: &[u8; 4] = b"BWF1";
 /// Freeze header kind for a sliding count frame (= window kind tag 5).
 pub(crate) const SLIDING_COUNT_FREEZE_KIND: u8 = 5;
+/// Freeze header kind for an ET sliding frame (= window kind tag 7, v33).
+pub(crate) const SLIDING_ET_FREEZE_KIND: u8 = 7;
+/// Freeze header kind for an ET session frame (= window kind tag 9, v33).
+pub(crate) const SESSION_ET_FREEZE_KIND: u8 = 9;
 const KEY_FIXED: usize = 4096;
 const EVENT_FIXED: usize = 1024;
 const MAX_ARITY: usize = 64;
@@ -132,6 +136,20 @@ pub struct BufferedGroupFreeze {
     pub sequence: u64,
     /// Retained inputs, oldest first: (sequence, evaluated agg inputs).
     pub events: Vec<(u64, Vec<Scalar>)>,
+    /// ET kinds only (v33), parallel to `events`: (event time, pending).
+    /// Empty for sliding count. Session events always carry pending=false
+    /// in the frame (the live executor never reads it for sessions).
+    pub times: Vec<(i64, bool)>,
+}
+
+/// v33 watermark generator state of the single linear input, restored
+/// exactly so late/close decisions after restore equal uninterrupted ones.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct BufferedClockFreeze {
+    pub idle: bool,
+    pub wm: Option<i64>,
+    pub max_event_time: Option<i64>,
+    pub last_effective: Option<i64>,
 }
 
 /// Decoded codec 4 participant. `resident` is the exact Retention the rebuild
@@ -142,8 +160,14 @@ pub struct BufferedFreeze {
     pub operator: sparrow_model::OperatorId,
     pub slot: sparrow_model::StateSlotId,
     pub kind: u8,
+    /// Sliding count size (kind 5); 0 for ET kinds.
     pub size: u64,
+    /// ET kinds: (size, delay) for sliding (7), (gap, max_duration) for
+    /// session (9); (0, 0) for sliding count.
+    pub params: (i64, i64),
     pub groups: Vec<BufferedGroupFreeze>,
+    /// ET kinds only.
+    pub clock: Option<BufferedClockFreeze>,
     resident: usize,
 }
 
@@ -180,9 +204,13 @@ impl BufferedFreeze {
         let u64v = |src: &mut &[u8]| -> Result<u64> {
             Ok(u64::from_le_bytes(take(src, 8)?.try_into().unwrap()))
         };
-        if header.kind != SLIDING_COUNT_FREEZE_KIND || header.slot.raw() != 1 {
-            return Err(codec("buffered window freeze kind/slot is not sliding count"));
+        let et = matches!(header.kind, SLIDING_ET_FREEZE_KIND | SESSION_ET_FREEZE_KIND);
+        if !(header.kind == SLIDING_COUNT_FREEZE_KIND || et) || header.slot.raw() != 1 {
+            return Err(codec("buffered window freeze kind/slot has no codec 4 grammar"));
         }
+        let i64v = |src: &mut &[u8]| -> Result<i64> {
+            Ok(i64::from_le_bytes(take(src, 8)?.try_into().unwrap()))
+        };
         if header.entries > max_groups {
             return Err(SparrowError::new(
                 ErrorCode::BoundExceeded,
@@ -192,16 +220,34 @@ impl BufferedFreeze {
         if take(src, 4)? != BWF_MAGIC {
             return Err(codec("buffered window freeze lacks BWF1 grammar"));
         }
-        let size = u64v(src)?;
-        if size == 0 || size > i64::MAX as u64 {
-            return Err(codec("invalid sliding count size in freeze"));
-        }
+        let (size, params) = if et {
+            // Same constructors as the live spec: a parameter the live window
+            // could never have is a codec violation, not a spec mismatch.
+            let (a, b) = (i64v(src)?, i64v(src)?);
+            let valid = if header.kind == SLIDING_ET_FREEZE_KIND {
+                WindowKind::sliding(a, b, true).is_ok()
+            } else {
+                WindowKind::session(a, b, true).is_ok()
+            };
+            if !valid {
+                return Err(codec("invalid ET sliding/session parameters in freeze"));
+            }
+            (0, (a, b))
+        } else {
+            let size = u64v(src)?;
+            if size == 0 || size > i64::MAX as u64 {
+                return Err(codec("invalid sliding count size in freeze"));
+            }
+            (size, (0, 0))
+        };
+        let event_min = if et { 8 + 8 + 1 + 2 } else { 8 + 2 };
         // Minimum per group: arity + sequence + event count + one event.
-        if src.len() < header.entries.saturating_mul(2 + 8 + 4 + 8 + 2) {
+        if src.len() < header.entries.saturating_mul(2 + 8 + 4 + event_min) {
             return Err(codec("declared buffered group count exceeds remaining bytes"));
         }
         let mut groups = Vec::with_capacity(if materialize { header.entries } else { 0 });
         let mut total = 0usize;
+        let mut max_time: Option<i64> = None;
         let value = |src: &mut &[u8], out: &mut Vec<Scalar>, n: &mut usize, key: bool| -> Result<()> {
             let before = *src;
             if materialize {
@@ -229,22 +275,58 @@ impl BufferedFreeze {
             total = total.saturating_add(key_bytes);
             let sequence = u64v(src)?;
             let ne = u32v(src)?;
-            // Exactly the last min(sequence, size) arrivals are retained.
+            // Sliding count: exactly the last min(sequence, size) arrivals.
+            // ET: 1..=sequence retained (empty groups are removed live).
             if sequence == 0
                 || sequence > i64::MAX as u64
-                || ne as u64 != sequence.min(size)
+                || (!et && ne as u64 != sequence.min(size))
+                || (et && (ne == 0 || ne as u64 > sequence))
             {
                 return Err(codec("buffered window retained input count disagrees with its sequence"));
             }
-            if src.len() < ne.saturating_mul(8 + 2) {
+            if src.len() < ne.saturating_mul(event_min) {
                 return Err(codec("declared buffered event count exceeds remaining bytes"));
             }
             let mut events = Vec::with_capacity(if materialize { ne } else { 0 });
+            let mut times = Vec::with_capacity(if materialize && et { ne } else { 0 });
+            let mut seqs = Vec::with_capacity(if et { ne } else { 0 });
+            let mut previous: Option<(i64, u64)> = None;
+            let mut seen_pending = false;
             let first = sequence - ne as u64 + 1;
             for i in 0..ne {
-                let seq = u64v(src)?;
-                if seq != first + i as u64 {
-                    return Err(codec("buffered window event sequences are not the contiguous tail"));
+                let (seq, time) = if et {
+                    let t = i64v(src)?;
+                    let seq = u64v(src)?;
+                    let pending = match take(src, 1)?[0] {
+                        0 => false,
+                        1 if header.kind == SLIDING_ET_FREEZE_KIND => true,
+                        _ => return Err(codec("invalid pending flag in buffered ET freeze")),
+                    };
+                    // Event times are nonnegative (push rejects < 0); (t, seq)
+                    // strictly ascending; seq within 1..=sequence and unique;
+                    // triggered (non-pending) inputs precede every pending one.
+                    if t < 0
+                        || seq == 0
+                        || seq > sequence
+                        || previous.is_some_and(|p| p >= (t, seq))
+                        || (seen_pending && !pending)
+                    {
+                        return Err(codec("buffered ET events are out of order or out of range"));
+                    }
+                    seen_pending |= pending;
+                    previous = Some((t, seq));
+                    max_time = max_time.max(Some(t));
+                    seqs.push(seq);
+                    (seq, Some((t, pending)))
+                } else {
+                    let seq = u64v(src)?;
+                    if seq != first + i as u64 {
+                        return Err(codec("buffered window event sequences are not the contiguous tail"));
+                    }
+                    (seq, None)
+                };
+                if let (true, Some(time)) = (materialize, time) {
+                    times.push(time);
                 }
                 let nv = u16v(src)?;
                 if nv > MAX_ARITY {
@@ -260,17 +342,65 @@ impl BufferedFreeze {
                     events.push((seq, values));
                 }
             }
+            if et {
+                seqs.sort_unstable();
+                if seqs.windows(2).any(|w| w[0] == w[1]) {
+                    return Err(codec("buffered ET event sequences are duplicated"));
+                }
+            }
             if materialize {
-                groups.push(BufferedGroupFreeze { key, sequence, events });
+                groups.push(BufferedGroupFreeze { key, sequence, events, times });
             }
         }
+        let clock = if et {
+            let idle = match take(src, 1)?[0] {
+                0 => false,
+                1 => true,
+                _ => return Err(codec("invalid input activity in buffered ET freeze")),
+            };
+            let opt = |src: &mut &[u8]| -> Result<Option<i64>> {
+                match take(src, 1)?[0] {
+                    0 => Ok(None),
+                    1 => {
+                        let v = i64v(src)?;
+                        if v < 0 {
+                            return Err(codec("negative watermark/event time in buffered ET freeze"));
+                        }
+                        Ok(Some(v))
+                    }
+                    _ => Err(codec("invalid optional tag in buffered ET freeze")),
+                }
+            };
+            let wm = opt(src)?;
+            let max_event_time = opt(src)?;
+            let last_effective = opt(src)?;
+            // Structural: a watermark never exceeds the max observed time,
+            // committed progress never exceeds a watermark, and retained
+            // state implies at least one observed event.
+            if wm.is_some() != max_event_time.is_some()
+                || wm.zip(max_event_time).is_some_and(|(w, m)| w > m)
+                || last_effective.zip(wm).is_some_and(|(l, w)| l > w)
+                || (last_effective.is_some() && wm.is_none())
+                || (header.entries > 0 && max_event_time.is_none())
+            {
+                return Err(codec("inconsistent watermark state in buffered ET freeze"));
+            }
+            if max_time.is_some_and(|t| max_event_time.is_none_or(|m| t > m)) {
+                return Err(codec("buffered ET event time exceeds max observed event time"));
+            }
+            Some(BufferedClockFreeze { idle, wm, max_event_time, last_effective })
+        } else {
+            None
+        };
         *resident = total.saturating_add(128);
         Ok(Self {
             operator: header.operator,
             slot: header.slot,
             kind: header.kind,
             size,
+            params,
             groups,
+            clock,
             resident: *resident,
         })
     }
@@ -357,20 +487,36 @@ impl BufferedWindow {
         })
     }
 
-    pub(crate) fn is_sliding_count(&self) -> bool {
-        matches!(self.spec.kind, WindowKind::SlidingCount { .. })
-    }
 
-    /// Checkpointed (v31/v32) operation; only sliding count has a codec.
+    /// Checkpointed operation: sliding count (v31/v32), ET sliding / ET
+    /// session (v33). PT buffered kinds and graph mode have no codec.
     pub(crate) fn set_durable(&mut self) -> Result<()> {
-        if !self.is_sliding_count() || self.external {
+        if !sparrow_plan::checkpoint::checkpointable_buffered(self.spec.kind) || self.external {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                "only linear sliding count windows have a buffered checkpoint codec",
+                "only linear sliding count / ET sliding / ET session windows have a buffered checkpoint codec",
             ));
         }
         self.durable = true;
         Ok(())
+    }
+
+    pub(crate) fn is_durable(&self) -> bool {
+        self.durable
+    }
+
+    fn freeze_kind(&self) -> u8 {
+        sparrow_plan::compat::window_kind_tag(self.spec.kind)
+    }
+
+    fn et_params(&self) -> Option<(i64, i64)> {
+        match self.spec.kind {
+            WindowKind::SlidingEventTime { size_micros, delay_micros } => Some((size_micros, delay_micros)),
+            WindowKind::SessionEventTime { gap_micros, max_duration_micros } => {
+                Some((gap_micros, max_duration_micros))
+            }
+            _ => None,
+        }
     }
 
     fn sliding_size(&self) -> Result<u64> {
@@ -396,7 +542,8 @@ impl BufferedWindow {
     /// Upper bound of the encoded frame (resident bytes bound every scalar's
     /// value encoding), so the caller can admit it before allocating.
     pub(crate) fn estimated_freeze_bytes(&self) -> usize {
-        self.groups.iter().fold(11 + 4 + 8 + 64, |n, (key, group)| {
+        // + ET params (16) and clock tail (1 + 3×9); per event t + pending (9).
+        self.groups.iter().fold(11 + 4 + 16 + 28 + 64, |n, (key, group)| {
             let n = key
                 .values
                 .iter()
@@ -404,7 +551,7 @@ impl BufferedWindow {
             group.events.values().fold(n, |n, e| {
                 e.values
                     .iter()
-                    .fold(n.saturating_add(8 + 2), |n, v| n.saturating_add(v.resident_bytes()))
+                    .fold(n.saturating_add(8 + 9 + 2), |n, v| n.saturating_add(v.resident_bytes()))
             })
         })
     }
@@ -421,18 +568,25 @@ impl BufferedWindow {
         if !self.durable {
             return Err(SparrowError::new(
                 ErrorCode::UnsupportedRestore,
-                "sliding count window is not checkpointable (restart_fresh); codec 4 requires v31/v32",
+                "buffered window is not checkpointable (restart_fresh); codec 4 requires v31/v32/v33",
             )
             .context("checkpoint_guard", "buffered_profile_mismatch"));
         }
         self.check_freeze_bound(max_keys)?;
-        let size = self.sliding_size()?;
+        let et = self.et_params();
         out.extend_from_slice(&operator.raw().to_le_bytes());
         out.extend_from_slice(&1u16.to_le_bytes());
-        out.push(SLIDING_COUNT_FREEZE_KIND);
+        out.push(self.freeze_kind());
         out.extend_from_slice(&(self.groups.len() as u32).to_le_bytes());
         out.extend_from_slice(BWF_MAGIC);
-        out.extend_from_slice(&size.to_le_bytes());
+        match et {
+            Some((a, b)) => {
+                out.extend_from_slice(&a.to_le_bytes());
+                out.extend_from_slice(&b.to_le_bytes());
+            }
+            None => out.extend_from_slice(&self.sliding_size()?.to_le_bytes()),
+        }
+        let sliding_et = matches!(self.spec.kind, WindowKind::SlidingEventTime { .. });
         for (key, group) in &self.groups {
             out.extend_from_slice(&(key.values.len() as u16).to_le_bytes());
             for value in &key.values {
@@ -440,11 +594,33 @@ impl BufferedWindow {
             }
             out.extend_from_slice(&group.sequence.to_le_bytes());
             out.extend_from_slice(&(group.events.len() as u32).to_le_bytes());
-            for (&(_, seq), event) in &group.events {
-                out.extend_from_slice(&seq.to_le_bytes());
+            for (&(t, seq), event) in &group.events {
+                if et.is_some() {
+                    out.extend_from_slice(&t.to_le_bytes());
+                    out.extend_from_slice(&seq.to_le_bytes());
+                    out.push(u8::from(sliding_et && event.pending));
+                } else {
+                    out.extend_from_slice(&seq.to_le_bytes());
+                }
                 out.extend_from_slice(&(event.values.len() as u16).to_le_bytes());
                 for value in &event.values {
                     value.encode_value(out)?;
+                }
+            }
+        }
+        if et.is_some() {
+            let (activity, wm, max_event_time) = self
+                .hub
+                .input_state(InputId::SINGLE)
+                .ok_or_else(|| SparrowError::new(ErrorCode::Internal, "ET window input not registered"))?;
+            out.push(u8::from(activity == sparrow_model::InputActivity::Idle));
+            for v in [wm, max_event_time, self.hub.last_effective()] {
+                match v {
+                    Some(v) => {
+                        out.push(1);
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    None => out.push(0),
                 }
             }
         }
@@ -464,11 +640,17 @@ impl BufferedWindow {
         if !self.groups.is_empty() {
             return Err(mismatch("buffered restore requires an empty operator"));
         }
-        if freeze.operator != operator
-            || freeze.kind != SLIDING_COUNT_FREEZE_KIND
-            || freeze.size != self.sliding_size()?
+        let params_match = match self.et_params() {
+            Some(p) => freeze.params == p && freeze.size == 0,
+            None => freeze.size == self.sliding_size()? && freeze.params == (0, 0),
+        };
+        if !self.durable
+            || freeze.operator != operator
+            || freeze.kind != self.freeze_kind()
+            || !params_match
+            || freeze.clock.is_some() != self.et_params().is_some()
         {
-            return Err(mismatch("buffered freeze operator/kind/size differs from the live window"));
+            return Err(mismatch("buffered freeze operator/kind/parameters differ from the live window"));
         }
         if freeze.groups.len() > self.max_keys {
             return Err(SparrowError::new(
@@ -499,6 +681,12 @@ impl BufferedWindow {
                 return Err(codec("buffered freeze keys are duplicated or out of order"));
             }
             previous = Some(encoded);
+            let et = freeze.clock.is_some();
+            if group.times.len() != if et { group.events.len() } else { 0 }
+                || (et && group.events.len() > self.spec.max_buffered_rows)
+            {
+                return Err(mismatch("buffered freeze event times/retained count differ from the live window"));
+            }
             for (_, values) in &group.events {
                 if values.len() != value_types.len()
                     || values.iter().zip(&value_types).any(|(v, t)| match t {
@@ -508,6 +696,62 @@ impl BufferedWindow {
                 {
                     return Err(mismatch("buffered freeze input arity/type differs from the live aggregates"));
                 }
+            }
+        }
+        if let Some(clock) = freeze.clock {
+            self.validate_et_cut(freeze, clock).map_err(|e| {
+                if e.code == ErrorCode::UnsupportedRestore { e } else { mismatch(&e.message) }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Derived v33 invariants: the generator state is exactly what the live
+    /// single linear input produces (no Idle/Watermark controls exist on a
+    /// linear File source), and nothing was due at the cut (the executor
+    /// drains every deadline <= progress before it handles a barrier).
+    fn validate_et_cut(&self, freeze: &BufferedFreeze, clock: BufferedClockFreeze) -> Result<()> {
+        let mismatch = |m: &str| {
+            Err(SparrowError::new(ErrorCode::UnsupportedRestore, m.to_owned())
+                .context("checkpoint_guard", "buffered_state_mismatch"))
+        };
+        let ooo = self.spec.binding().map(|b| b.out_of_orderness_micros);
+        if clock.idle {
+            return mismatch("linear File ET input cannot be idle at a cut");
+        }
+        let expected_wm = clock
+            .max_event_time
+            .map(|m| ooo.map_or(m, |o| m.saturating_sub(o).max(0)));
+        if clock.wm != expected_wm || clock.last_effective != clock.wm {
+            return mismatch("ET watermark state differs from its observed event times");
+        }
+        let Some(progress) = clock.last_effective else {
+            return Ok(()); // no event observed: groups are empty (decode check)
+        };
+        for group in &freeze.groups {
+            let deadline = match self.spec.kind {
+                WindowKind::SlidingEventTime { size_micros, delay_micros } => {
+                    match group.times.iter().find(|(_, p)| *p) {
+                        Some((t, _)) => t.checked_add(delay_micros).and_then(|t| t.checked_add(1)),
+                        None => group.times.first().and_then(|(t, _)| t.checked_add(size_micros)),
+                    }
+                }
+                WindowKind::SessionEventTime { gap_micros, max_duration_micros } => {
+                    let first = group.times.first().map(|(t, _)| *t).unwrap_or(0);
+                    let cap = first.saturating_add(max_duration_micros);
+                    let mut end = first.saturating_add(gap_micros).min(cap);
+                    for (t, _) in &group.times {
+                        if *t >= end {
+                            break;
+                        }
+                        end = t.saturating_add(gap_micros).min(cap);
+                    }
+                    Some(end)
+                }
+                _ => None,
+            };
+            if deadline.is_none_or(|d| d <= progress) {
+                return mismatch("buffered ET state has a deadline already due at the cut");
             }
         }
         Ok(())
@@ -531,19 +775,42 @@ impl BufferedWindow {
             self.bytes = self.bytes.saturating_add(credit.bytes());
             let key = Arc::new(Key { encoded, values: group.key, credit });
             let mut events = BTreeMap::new();
-            for (seq, values) in group.events {
+            let session = matches!(self.spec.kind, WindowKind::SessionEventTime { .. });
+            for (i, (seq, values)) in group.events.into_iter().enumerate() {
                 let credit = self.owner.acquire(CreditKind::Retention, event_credit(&values))?;
                 self.bytes = self.bytes.saturating_add(credit.bytes());
-                events.insert((seq as i64, seq), Event { values, pending: true, credit });
+                // Sliding count keys by sequence. ET keys by event time; live
+                // session events keep pending=true (never read for sessions).
+                let (t, pending) = match group.times.get(i) {
+                    Some(&(t, pending)) => (t, pending || session),
+                    None => (seq as i64, true),
+                };
+                events.insert((t, seq), Event { values, pending, credit });
             }
             self.max_group_rows_seen = self.max_group_rows_seen.max(events.len());
             if self
                 .groups
-                .insert(key, Group { events, sequence: group.sequence, deadline: None })
+                .insert(Arc::clone(&key), Group { events, sequence: group.sequence, deadline: None })
                 .is_some()
             {
                 return Err(codec("duplicate buffered freeze key"));
             }
+            // Deadlines are derived state: rebuild with the live rule.
+            self.reschedule(&key)?;
+        }
+        if let Some(clock) = freeze.clock {
+            let activity = if clock.idle {
+                sparrow_model::InputActivity::Idle
+            } else {
+                sparrow_model::InputActivity::Active
+            };
+            self.hub.restore_input(
+                InputId::SINGLE,
+                activity,
+                clock.wm,
+                clock.max_event_time,
+                clock.last_effective,
+            )?;
         }
         Ok(())
     }
