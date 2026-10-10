@@ -644,7 +644,7 @@ File checkpoint 会在阻塞工作线程上重新采样**实际已消费 cut** �
 | ET 窗口 + 新聚合 | — | JetStream | 暂不支持（子批2 单独验证） |
 | PT 窗口 + 新聚合 | — | — | 暂不支持（子批2） |
 | FIRST/LAST 输入为 nested/Dynamic | — | — | 暂不支持（validate/start 拒绝，与 MIN/MAX 同规则） |
-| 滑动计数（单窗口，可含旧聚合与新聚合） | codec 4 `BWF1` | File v31、JetStream v32 | 已实现（子批2a：codec 黄金字节/逐前缀截断/结构不变量、恢复等价独立 oracle、Kernel 级 v31/v32 恢复含 OutputSequence 连续、owned 额度与低预算退款、不兼容不回退、Supervisor File v31 checkpoint→kill→恢复与 oracle 一致）；**已验证（子批2a 进程级 SIGKILL，冻结 `02e1f99`）**：File v31 与真实 nats-server JetStream v32 各 input_after/output_after/output_inflight/commit_before/manifest_renamed/commit_after/restore_kill + 空状态/窗口未满/恰在触发边界/低预算恢复退款（v32 另含 ack_lost）每项 20 轮全过，独立 ring-buffer oracle 逐位比对值、顺序、窗口区间、ID、重复/丢失、CURRENT/ACK 边界、资源归零；与 424cf95 及 #29 `adcbeae` 二进制兼容（旧二进制拒绝 v31、v29 目录由新二进制续写仍为 v29、size/step 变化拒绝） |
+| 滑动计数（单窗口，可含旧聚合与新聚合） | codec 4 `BWF1` | File v31、JetStream v32 | 已实现（子批2a：codec 黄金字节/逐前缀截断/结构不变量、恢复等价独立 oracle、Kernel 级 v31/v32 恢复含 OutputSequence 连续、owned 额度与低预算退款、不兼容不回退、Supervisor File v31 checkpoint→kill→恢复与 oracle 一致）；**已验证（子批2a 进程级 SIGKILL，冻结 `0b891be`（首轮 `02e1f99` 同样全过））**：File v31 与真实 nats-server JetStream v32 各 input_after/output_after/output_inflight/commit_before/manifest_renamed/commit_after/restore_kill + 空状态/窗口未满/恰在触发边界/低预算恢复退款（v32 另含 ack_lost）每项 20 轮全过，独立 ring-buffer oracle 逐位比对值、顺序、窗口区间、ID、重复/丢失、CURRENT/ACK 边界、资源归零；与 424cf95 及 #29 `adcbeae` 二进制兼容（旧二进制拒绝 v31、v29 目录由新二进制续写仍为 v29、size/step 变化拒绝） |
 | ET 滑动/会话 | buffered | — | 暂不支持（子批2b，v33） |
 | PT 跳跃/滑动/会话 | buffered | — | 暂不支持（子批2c，v34/v35） |
 | Join / UNNEST | 有界分析状态 | — | 暂不支持（子批3） |
