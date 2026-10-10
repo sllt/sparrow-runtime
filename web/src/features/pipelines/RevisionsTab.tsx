@@ -9,6 +9,7 @@ import { Icon } from "../../components/Icon";
 import { DiffView } from "../../components/DiffView";
 import { fmtTime } from "../../lib/format";
 import { pretty } from "../../lib/specText";
+import { RollbackDialog, StartDialog, type RevState } from "./RevisionActions";
 
 export function RevisionsTab({ name }: { name: string }) {
   const { client } = useAuth();
@@ -17,10 +18,12 @@ export function RevisionsTab({ name }: { name: string }) {
   const [st, reload] = useLoad(async (c, s) => obj(await c.get(`/v1/pipelines/${enc(name)}/revisions?limit=20${before ? `&before=${before}` : ""}`, s)) ?? {}, `revs:${name}:${before}`);
   const [view, setView] = useState<{ rev: string; spec: Json; latest: Json } | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  const [act, setAct] = useState<{ kind: "start" | "rollback"; rev: string } | null>(null);
   if (st.loading && !st.data) return <Skeleton rows={5} />;
   if (st.error && !st.data) return <ErrorView error={st.error} onRetry={reload} />;
   const d = st.data!;
   const latest = numText(d.latest_revision), desired = numText(d.desired_revision), actual = numText(d.actual_revision);
+  const rs: RevState = { latest, latestEtag: str(d.latest_etag), desired, desiredStatus: str(d.desired_status), actual };
   const revs = ((d.revisions as Json[]) ?? []).map((r) => obj(r)!);
   async function open(rev: string) {
     if (!client) return;
@@ -54,7 +57,11 @@ export function RevisionsTab({ name }: { name: string }) {
                 <td>{fmtTime(Number(numText(r.created_at)))}</td>
                 <td className="num">{numText(r.spec_bytes)} B</td>
                 <td className="row" style={{ gap: 6 }}>{rev === latest && <Pill tone="info">latest</Pill>}{rev === desired && <Pill tone="idle">desired</Pill>}{rev === actual && <Pill tone="ok">actual</Pill>}</td>
-                <td><button className="btn ghost" onClick={() => void open(rev)}><Icon name="diff" size={14} />查看 / 对比</button></td>
+                <td className="row" style={{ gap: 4, justifyContent: "flex-end" }}>
+                  <button className="btn ghost sm" onClick={() => void open(rev)}><Icon name="diff" size={14} />对比</button>
+                  {rev !== latest && <button className="btn ghost sm" onClick={() => setAct({ kind: "rollback", rev })} aria-label={`回退到 rev ${rev}`}><Icon name="history" size={14} />回退</button>}
+                  <button className="btn ghost sm" onClick={() => setAct({ kind: "start", rev })} aria-label={`启动 rev ${rev}`}><Icon name="play" size={14} />启动</button>
+                </td>
               </tr>
             ); })}
           </tbody>
@@ -65,6 +72,8 @@ export function RevisionsTab({ name }: { name: string }) {
           {revs.length === 20 && <button className="btn" onClick={() => setBefore(numText(revs[revs.length - 1]!.revision))}>更早的版本</button>}
         </div>
       </Card>
+      {act?.kind === "start" && <StartDialog name={name} target={act.rev} s={rs} onClose={() => setAct(null)} onDone={reload} />}
+      {act?.kind === "rollback" && <RollbackDialog name={name} target={act.rev} s={rs} onClose={() => setAct(null)} onDone={() => reload()} />}
       {view && (
         <Card title={`rev ${view.rev} 与最新 rev ${latest} 的差异`} actions={<><button className="btn" onClick={() => void draftFrom(view.rev)}><Icon name="file" size={14} />基于此版本新建草稿</button><button className="btn ghost icon" aria-label="关闭" onClick={() => setView(null)}><Icon name="x" size={14} /></button></>}>
           {msg && <div className="banner tone-warn">{msg}</div>}

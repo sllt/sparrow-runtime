@@ -56,8 +56,12 @@ export function createClient(token: string, fetcher: Fetcher = (i, n) => fetch(i
     }
     const headers: Record<string, string> = { Authorization: `Bearer ${token}`, Accept: "application/json" };
     if (ifMatch !== undefined) headers["If-Match"] = `"${ifMatch.replace(/"/g, "")}"`;
-    let payload: string | undefined;
-    if (body !== undefined) {
+    let payload: string | Uint8Array | undefined;
+    if (body instanceof Uint8Array) {
+      // Opaque package bytes (plugin install); the server enforces size/signature.
+      headers["Content-Type"] = "application/octet-stream";
+      payload = body;
+    } else if (body !== undefined) {
       headers["Content-Type"] = "application/json";
       payload = stringifyJson(body);
     }
@@ -66,7 +70,7 @@ export function createClient(token: string, fetcher: Fetcher = (i, n) => fetch(i
       res = await fetcher(path, {
         method,
         headers,
-        body: payload,
+        body: payload as BodyInit | undefined,
         signal,
         credentials: "omit",
         cache: "no-store",

@@ -13,10 +13,10 @@ export const SQL_SENTINEL = "e2e_sql_sentinel_4412";
 
 export const sha = (t: string) => createHash("sha256").update(t).digest("hex");
 
-export async function api(method: string, path: string, token: string, body?: unknown) {
+export async function api(method: string, path: string, token: string, body?: unknown, extra: Record<string, string> = {}) {
   const res = await fetch(BASE + path, {
     method,
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...extra },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   return { status: res.status, text: await res.text(), headers: res.headers };

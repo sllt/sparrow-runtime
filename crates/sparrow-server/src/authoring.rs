@@ -24,6 +24,7 @@ pub fn router() -> Router<AppState> {
                 .route("/v1/publications/{id}", get(get_publication))
                 .route("/v1/pipelines/{name}/revisions", get(list_revisions))
                 .route("/v1/pipelines/{name}/revisions/{revision}", get(get_revision))
+                .route("/v1/pipelines/{name}/rollback", post(rollback_pipeline))
                 .route("/v1/secrets", get(list_secrets))
                 .route("/v1/connections", get(list_connections))
                 .route("/v1/connections/{name}", get(get_connection).put(put_connection).delete(delete_connection))
@@ -217,6 +218,46 @@ async fn publish_draft(
     .await
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollbackBody {
+    operation_id: String,
+    from_revision: u64,
+    expected_etag: String,
+    reason: String,
+}
+
+/// K5.5: configuration rollback creates a new revision from an old one.
+async fn rollback_pipeline(
+    State(state): State<AppState>,
+    axum::Extension(p): axum::Extension<Principal>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    blocking_api(move || {
+        let b: RollbackBody = serde_json::from_slice(&body).map_err(|e| bad(format!("rollback body: {e}")))?;
+        if b.reason.trim().is_empty() || b.reason.len() > 256 || b.reason.chars().any(char::is_control) {
+            return Err(bad("an audit reason of 1..256 characters is required"));
+        }
+        let digest = sparrow_plugin::sha256(format!("rollback\n{name}\n{}\n{}\n{}", b.from_revision, b.expected_etag, b.reason).as_bytes());
+        if let Some(r) = state.store.replay_publication(&b.operation_id, &digest).map_err(ApiError::from)? {
+            return Ok((StatusCode::OK, Json(json!({"receipt": r, "started": false}))));
+        }
+        // The old revision is re-validated against today's catalog/policy.
+        let old = state.store.get_pipeline_revision(&name, b.from_revision).map_err(ApiError::from)?;
+        run_validate(&state, &old.spec)?;
+        let r = state
+            .store
+            .rollback_pipeline(&b.operation_id, &digest, &p.actor, &name, b.from_revision, &b.expected_etag)
+            .map_err(ApiError::from)?;
+        let _ = state.store.audit(&p.actor, "rollback_pipeline", Some(&name),
+            Some(&format!("from_revision={} new={} reason={}", b.from_revision, r.etag, b.reason)), if r.replayed { "replayed" } else { "ok" });
+        Ok((if r.replayed { StatusCode::OK } else { StatusCode::CREATED },
+            Json(json!({"receipt": r, "started": false, "note": "a new revision was published from the old spec; nothing was started or stopped"}))))
+    })
+    .await
+}
+
 async fn get_publication(
     State(state): State<AppState>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -250,6 +291,7 @@ async fn list_revisions(State(state): State<AppState>, Path(name): Path<String>,
             "latest_revision": latest.latest_revision,
             "latest_etag": latest.etag,
             "desired_revision": desired.as_ref().and_then(|d| d.revision),
+            "desired_status": desired.as_ref().map(|d| d.status),
             "actual_revision": actual.as_ref().and_then(|a| a.revision),
             "revisions": revs,
             "scope": "all retained catalog revisions; the audit log is bounded and is not a publication history",
