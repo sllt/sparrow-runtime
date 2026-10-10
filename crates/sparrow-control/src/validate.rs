@@ -738,6 +738,15 @@ fn validate_sink_io(
     policy: &TargetPolicy,
     demo: Option<&DemoEndpoints>,
 ) -> Result<()> {
+    if let Some(config)=&sink.durable_outbox {
+        config.validate()?;
+        if sink.kind!="http" || sink.action.is_some() || sink.use_demo_io || !sink.payload_format()?.is_json()
+            || sink.max_inflight.unwrap_or(1)!=1 || sink.batch_rows.unwrap_or(1)!=1 || sink.linger_ms.unwrap_or(0)!=0
+            || sink.batch_bytes.unwrap_or(256*1024)>config.max_record_bytes {
+            return Err(SparrowError::new(ErrorCode::InvalidArgument,
+                "durable outbox requires plain explicit HTTP JSON, max_inflight=1, batch_rows=1, linger_ms=0, batch_bytes<=max_record_bytes"));
+        }
+    }
     if sink.file.is_some() && sink.kind != "file" {
         return Err(SparrowError::new(
             ErrorCode::InvalidArgument,
@@ -1692,6 +1701,23 @@ fn validate_aligned_plan_inner(
     dependencies: Option<&[sparrow_plan::ReferenceTableDependency]>,
 ) -> sparrow_model::Result<()> {
     let recovery = RecoveryPolicy::parse(&spec.recovery)?;
+    if spec.graph_io.as_ref().is_some_and(|g|g.sinks.values().any(|s|s.durable_outbox.is_some())) {
+        return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"durable outbox initially supports a single linear HTTP sink, not graph ports"));
+    }
+    if spec.sink.durable_outbox.is_some() {
+        if spec.graph_io.is_some() || plan.edges.is_some() || !plan.side_outputs.is_empty() {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"durable outbox requires a linear pipeline without side outputs"));
+        }
+        if recovery.is_aligned() && (
+            !matches!(spec.source.kind.as_str(),"file"|"file_replay"|"replay"|"jetstream")
+            || !spec.reference_tables.is_empty() || !plan.source_times.is_empty()
+            || plan.has_iot() || plan.has_analysis() || plan.has_extended_aggs() || plan.has_new_windows()
+            || plan.stages.iter().filter(|s|matches!(s,sparrow_plan::PhysicalStage::WindowAgg{..})).count()>1
+            || plan.stages.iter().any(|s|matches!(s,sparrow_plan::PhysicalStage::WindowAgg{spec,..} if !matches!(spec.kind,sparrow_model::WindowKind::Count{..})))
+        ) {
+            return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"durable outbox aligned scope: linear File/JetStream with zero state or one legacy Count window; other combinations remain disabled"));
+        }
+    }
     if spec.has_live_lookups() && (recovery.is_aligned()||spec.restore.is_some()||spec.checkpoint.is_some()||spec.checkpoint_dir.is_some()) {
         return Err(SparrowError::new(ErrorCode::UnsupportedRestore,"live/remote Lookup observations cannot enter aligned checkpoint profiles"));
     }
@@ -2424,6 +2450,14 @@ pub fn effective_guarantees(spec: &PipelineSpec) -> serde_json::Value {
             },
         });
     }
+    if let Some(config)=&spec.sink.durable_outbox {
+        value["sink_delivery"]=serde_json::json!({"kind":"durable_http_outbox","acknowledgement":"local_SQLite_FULL_commit_not_HTTP_2xx",
+            "remote_delivery":"at_least_once_or_explicit_durable_DLQ","pending_bytes":config.max_pending_bytes,"dlq_bytes":config.max_dlq_bytes,
+            "max_attempts":config.max_attempts,"max_retry_elapsed_ms":config.max_retry_elapsed_ms,
+            "delivery_lifecycle":"independent_of_input_job; use_outbox_pause_to_stop_sender",
+            "idempotency":"stable_per_stored_request; receiver_must_implement_dedup; source_replay_can_create_another_request",
+            "input_poison_dlq":false,"automatic_eviction":false,"source_ACK":"still_requires_published_checkpoint_for_reliable_sources"});
+    }
     value
 }
 
@@ -2468,6 +2502,29 @@ fn reference_snapshot_version(spec: &PipelineSpec, plan: &PhysicalPlan) -> Resul
 /// Eligibility is a property of both the replayable source and the bound plan,
 /// independent of whether the stored spec currently requests aligned recovery.
 pub fn effective_guarantees_with_plan(
+    spec: &PipelineSpec,
+    plan: &PhysicalPlan,
+) -> serde_json::Value {
+    let mut value = effective_guarantees_with_plan_inner(spec, plan);
+    if spec.sink.durable_outbox.is_some() {
+        let mut aligned = spec.clone();
+        aligned.recovery = "aligned".into();
+        let eligibility = validate_aligned_plan(&aligned, plan);
+        value["aligned_eligible"] = serde_json::json!(eligibility.is_ok());
+        value["aligned_eligibility_reason"] = serde_json::json!(eligibility.err().map_or_else(
+            || "durable_outbox_linear_File_or_JetStream_zero_or_single_legacy_Count".to_string(),
+            |e| e.message));
+        if value["checkpoint_participants"].is_object() {
+            value["checkpoint_participants"]["confirmation"] = serde_json::json!("local_outbox_FULL_commit_before_checkpoint_publication; not_remote_2xx");
+            value["checkpoint_participants"]["durable_outbox"] = serde_json::json!(true);
+            value["checkpoint_participants"]["output_dlq"] = serde_json::json!(true);
+            value["checkpoint_participants"]["backup_dependency"] = serde_json::json!("catalog_plus_checkpoint_plus_outbox_directory; never_restore_checkpoint_alone");
+        }
+    }
+    value
+}
+
+fn effective_guarantees_with_plan_inner(
     spec: &PipelineSpec,
     plan: &PhysicalPlan,
 ) -> serde_json::Value {
@@ -3143,6 +3200,7 @@ mod tests {
                 protobuf: None,
             },
             sink: crate::spec::SinkSpec {
+                durable_outbox: None,
                 nats: None,
                 databus: None,
                 influxdb: None,
@@ -3318,6 +3376,7 @@ mod tests {
     #[test]
     fn n16_http_header_secret_requires_https() {
         let mut sink = crate::spec::SinkSpec {
+                durable_outbox: None,
                 nats: None,
                 databus: None,
                 influxdb: None,

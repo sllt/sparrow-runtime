@@ -31,6 +31,10 @@ Non-blocking issues and optimization backlog: [`docs/OPTIMIZATION_BACKLOG.md`](d
 Action/File/function Preview: typed JSON output mapping, restricted HTTP query/MQTT topic templates, bounded Linux NDJSON File Sink, and 18 additional pure functions shared by SQL/Graph. These actions are **restart_fresh only**, not aligned output or cross-Sink transactions. See [`docs/ACTIONS.md`](docs/ACTIONS.md) and the [matching validation evidence](docs/PRODUCTION.md#actions-validation).
 MQTT ingress now has decoded-byte accounting and optional Linux QUICKACK;
 HTTP sinks support opt-in batch/linger and bounded concurrency (default serial).
+Optional [durable HTTP output](docs/DURABLE_OUTPUT.md) adds bounded local persistence,
+finite retries, output DLQ and authenticated replay/purge. Its receipt means local
+commit, **not remote 2xx**; aligned scope is initially File/JetStream with zero
+state or one legacy Count window. Default HTTP delivery remains unchanged.
 See the runtime contracts before changing queue, body or ordering settings.
 Server MQTT byte accounting is on by default (256 KiB payload credit); Linux
 QUICKACK remains off. For latency-sensitive colocated Mosquitto deployments,

@@ -117,6 +117,33 @@ pub struct AuditRow {
 }
 
 impl Store {
+    pub fn outbox_identity(&self, name: &str) -> Result<Option<String>> {
+        self.read(|c|c.query_row("SELECT value FROM meta WHERE key=?1",[format!("outbox_uuid:{name}")],|r|r.get(0)).optional().map_err(db))
+    }
+    pub fn pin_outbox_identity(&self, name: &str, uuid: &str) -> Result<()> {
+        self.write(|c| {
+            let key=format!("outbox_uuid:{name}");
+            c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?1,?2)",params![key,uuid]).map_err(db)?;
+            let saved:String=c.query_row("SELECT value FROM meta WHERE key=?1",[key],|r|r.get(0)).map_err(db)?;
+            if saved!=uuid {return Err(SparrowError::new(ErrorCode::CodecViolation,"durable outbox UUID does not match its catalog identity"));}
+            Ok(())
+        })
+    }
+    pub fn existing_outbox_namespace(&self) -> Result<Option<String>> {
+        self.read(|c|c.query_row("SELECT value FROM meta WHERE key='outbox_namespace'",[],|r|r.get(0)).optional().map_err(db))
+    }
+    pub fn outbox_namespace(&self) -> Result<String> {
+        self.write(|c| {
+            let existing:Option<String>=c.query_row("SELECT value FROM meta WHERE key='outbox_namespace'",[],|r|r.get(0)).optional().map_err(db)?;
+            if let Some(value)=existing {return Ok(value);}
+            use ring::rand::SecureRandom;
+            let mut bytes=[0u8;16];
+            ring::rand::SystemRandom::new().fill(&mut bytes).map_err(|_|SparrowError::new(ErrorCode::Internal,"outbox namespace entropy"))?;
+            let value:String=bytes.iter().map(|v|format!("{v:02x}")).collect();
+            c.execute("INSERT INTO meta(key,value) VALUES('outbox_namespace',?1)",[&value]).map_err(db)?;
+            Ok(value)
+        })
+    }
     pub fn configure_plugins(&self,manager:Arc<sparrow_expr::plugins::Manager>)->Result<()> {
         self.inner.plugins.set(manager).map_err(|_|SparrowError::new(ErrorCode::InvalidArgument,"plugin registry is already configured"))
     }
@@ -847,6 +874,25 @@ impl Store {
                         .context("etag", etag.clone()));
                     }
                     Some(_) => {}
+                }
+            }
+            if let Some((revision,_))=&current {
+                let raw:String=c.query_row("SELECT spec_json FROM pipeline_revisions WHERE name=?1 AND revision=?2",params![name,*revision as i64],|r|r.get(0)).map_err(db)?;
+                let old:PipelineSpec=serde_json::from_str(&raw).map_err(|_|SparrowError::new(ErrorCode::CodecViolation,"stored pipeline spec"))?;
+                crate::outbox::check_update(&old,spec)?;
+            }
+            if let Some(config)=&spec.sink.durable_outbox {
+                config.validate()?;
+                // Retained revisions keep a permanent directory ownership
+                // claim, just as they pin plugin/table dependencies.
+                let mut q=c.prepare("SELECT DISTINCT name,spec_json FROM pipeline_revisions WHERE name<>?1").map_err(db)?;
+                let rows=q.query_map([name],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(db)?;
+                for row in rows {
+                    let (_,raw)=row.map_err(db)?;
+                    let other:PipelineSpec=serde_json::from_str(&raw).map_err(|_|SparrowError::new(ErrorCode::CodecViolation,"stored pipeline spec"))?;
+                    if other.sink.durable_outbox.as_ref().is_some_and(|x|x.directory==config.directory) {
+                        return Err(SparrowError::new(ErrorCode::InvalidArgument,"outbox directory is already assigned to another pipeline"));
+                    }
                 }
             }
             let next = current.map(|(r, _)| r + 1).unwrap_or(1);
@@ -2649,6 +2695,7 @@ mod tests {
                 protobuf: None,
             },
             sink: SinkSpec {
+                durable_outbox: None,
                 nats: None,
                 databus: None,
                 influxdb: None,

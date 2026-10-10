@@ -1,0 +1,30 @@
+{
+  "stream": "sensors",
+  "sql": "SELECT device_id, SUM(v) AS total FROM sensors GROUP BY device_id, COUNT_WINDOW(2)",
+  "source": {"kind": "file", "path": "/var/lib/sparrow/data/sensors.jsonl", "file_contract": "append_only"},
+  "sink": {
+    "kind": "http",
+    "url": "http://127.0.0.1:8080/telemetry",
+    "max_inflight": 1,
+    "batch_rows": 1,
+    "batch_bytes": 262144,
+    "linger_ms": 0,
+    "durable_outbox": {
+      "directory": "/var/lib/sparrow/outboxes/telemetry",
+      "max_disk_bytes": 67108864,
+      "max_pending_bytes": 8388608,
+      "max_dlq_bytes": 8388608,
+      "max_pending_entries": 1000,
+      "max_dlq_entries": 1000,
+      "max_record_bytes": 262144,
+      "max_attempts": 16,
+      "max_retry_elapsed_ms": 86400000,
+      "retry_base_ms": 1000,
+      "retry_max_ms": 60000
+    }
+  },
+  "fail_on_decode": true,
+  "recovery": "aligned",
+  "checkpoint_dir": "/var/lib/sparrow/checkpoints/telemetry",
+  "checkpoint": {"interval_ms": 10000, "timeout_ms": 5000, "retain_generations": 3, "max_store_bytes": 33554432, "resume_latest": true}
+}

@@ -24,6 +24,7 @@ use sparrow_model::{ErrorCode, SparrowError};
 use sparrow_runtime::Kernel;
 use tower_http::limit::RequestBodyLimitLayer;
 mod operations;
+mod outbox;
 mod plugins;
 mod reference_tables;
 
@@ -79,6 +80,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/pipelines/{name}/start", post(start_pipeline))
         .route("/v1/pipelines/{name}/stop", post(stop_pipeline))
         .route("/v1/pipelines/{name}/checkpoint", post(checkpoint_pipeline))
+        .route("/v1/pipelines/{name}/outbox", get(outbox::status))
+        .route("/v1/pipelines/{name}/outbox/entries", get(outbox::entries))
+        .route("/v1/pipelines/{name}/outbox/entries/{id}", get(outbox::entry))
+        .route("/v1/pipelines/{name}/outbox/command", post(outbox::command))
         .route(
             "/v1/pipelines/{name}/checkpoints",
             get(operations::checkpoints),
@@ -964,6 +969,11 @@ fn flow_snapshot_json(s: &sparrow_control::supervisor::PipelineFlowSnapshot) -> 
             "origin_propagation":"conservative_input_batch_bounds; window_aggregate_outputs_unknown",
             "device_event_age_available":false,"broker_wait_available":false,"business_ack_available":false,
             "restored_monotonic_age_available":false,"payload_semantics_changed":false}});
+    if diag.durable_outbox_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        value["delivery"]["outbox_persisted_batches"] = json!(io.outbox_persisted_batches);
+        value["delivery"]["completion_basis"] = json!("local_outbox_FULL_commit_not_remote_HTTP_2xx");
+        value["latency_contract"]["http_completion"] = json!("independent_sender; inspect_pipeline_outbox_endpoint_for_remote_delivery");
+    }
     if s.source_kind == "nats" {
         value["nats_source"] = json!({"received":io.nats_source_received,"rows":io.nats_source_rows,
             "dropped_bad":io.nats_source_dropped_bad,"dropped_oversize":io.nats_source_dropped_oversize,
@@ -1209,6 +1219,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult
             "decode_errors": io.decode_errors,
     });
     io_fields["lookup_update_failed"]=json!(io.lookup_update_failed);
+    io_fields["outbox_persisted_batches"]=json!(io.outbox_persisted_batches);
     for (name, value) in [
         ("http_poll_requests", io.http_poll_requests),
         ("http_poll_ok", io.http_poll_ok),

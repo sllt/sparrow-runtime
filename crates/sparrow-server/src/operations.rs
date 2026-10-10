@@ -55,6 +55,12 @@ pub(super) fn checkpoint_status(state: &AppState, name: &str) -> Value {
         "pending_includes_unconfirmed_ACKs":true,"ack_basis":"durable_checkpoint_plus_required_HTTP_2xx",
         "business_completion_claimed":false})).unwrap_or(Value::Null);
     if s.reliable_source.is_some() {
+        let ack_basis=match state.store.get_pipeline_revision(name,revision) {
+            Ok(row) if row.spec.sink.durable_outbox.is_some()=>"durable_checkpoint_plus_local_outbox_FULL_commit",
+            Ok(_)=>"durable_checkpoint_plus_required_HTTP_2xx",
+            Err(_)=>"unknown_running_revision_receipt",
+        };
+        value["reliable_source"]["ack_basis"]=json!(ack_basis);
         value["restore_compatibility"] = json!(
             "full_computation_and_source_reader_binding; semantic_fork_and_fixed_replay_rejected"
         );

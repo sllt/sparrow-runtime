@@ -25,6 +25,7 @@ struct Command {
     body: Option<Value>,
     etag: Option<String>,
     output: Option<String>,
+    query: Vec<(String,String)>,
 }
 fn read_input(path: &str) -> Result<Value> {
     let mut bytes = Vec::new();
@@ -112,7 +113,19 @@ fn parse(args: &[String]) -> Result<Command> {
             "remote plaintext management requires --allow-insecure-http; prefer HTTPS".into(),
         );
     }
+    let mut query=Vec::new();
     let (method, segments, body) = match positional.as_slice() {
+        ["outbox",id] => (Method::GET,vec!["pipelines".into(),name(id)?,"outbox".into()],None),
+        ["outbox-entry",id,entry] => (Method::GET,vec!["pipelines".into(),name(id)?,"outbox".into(),"entries".into(),name(entry)?],None),
+        ["outbox-entries",id,state,after,limit] => {
+            if !matches!(*state,"pending"|"dlq"|"blocked") {return Err("state must be pending, dlq or blocked".into());}
+            let after=after.parse::<u64>().map_err(|_|"invalid cursor")?;
+            let limit=limit.parse::<usize>().map_err(|_|"invalid limit")?;
+            if after>i64::MAX as u64 || !(1..=100).contains(&limit) {return Err("cursor out of range or limit not in 1..100".into());}
+            query=vec![("state".into(),state.to_string()),("after".into(),after.to_string()),("limit".into(),limit.to_string())];
+            (Method::GET,vec!["pipelines".into(),name(id)?,"outbox".into(),"entries".into()],None)
+        },
+        ["outbox-command",id,file] => (Method::POST,vec!["pipelines".into(),name(id)?,"outbox".into(),"command".into()],Some(read_input(file)?)),
         ["plugins"] => (Method::GET,vec!["plugins".into()],None),
         ["plugin-install",manifest,artifact] => (Method::POST,vec!["plugins".into(),"install".into()],Some(read_plugin(manifest,artifact)?)),
         ["plugin-install",manifest,artifact,signature] => {
@@ -224,6 +237,7 @@ fn parse(args: &[String]) -> Result<Command> {
         body,
         etag,
         output,
+        query,
     })
 }
 fn table_revision(value: &str) -> Result<u64> {
@@ -242,6 +256,7 @@ async fn execute(command: Command, token: &str) -> Result<(Value, bool)> {
             path.push(&s);
         }
     }
+    if !command.query.is_empty() {url.query_pairs_mut().extend_pairs(command.query);}
     let client = reqwest::Client::builder()
         .timeout(command.timeout)
         .connect_timeout(command.timeout.min(Duration::from_secs(5)))
@@ -320,6 +335,8 @@ commands: health | capabilities | streams | pipelines\n\
   validate FILE | explain FILE | query FILE | put-stream NAME FILE\n\
   put-pipeline NAME FILE [--if-match ETAG]\n\
   status NAME | diagnose NAME [--output NEW_FILE] | checkpoints NAME\n\
+  outbox NAME | outbox-entries NAME pending|dlq|blocked AFTER LIMIT\n\
+  outbox-entry NAME UUID-SEQUENCE | outbox-command NAME COMMAND_JSON\n\
   start NAME [--revision N] | stop NAME | kill NAME\n\
   checkpoint NAME | restore NAME [--snapshot-id N]\n\
 options: --url ORIGIN (or SPARROW_URL), --timeout-ms 100..125000, --allow-insecure-http\n\
@@ -369,6 +386,15 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn outbox_cli_routes_and_bounded_page(){
+        let list=parse(&args(&["outbox-entries","p","dlq","7","20"])).unwrap();
+        assert_eq!(list.segments,vec!["pipelines","p","outbox","entries"]);
+        assert_eq!(list.query,vec![("state".into(),"dlq".into()),("after".into(),"7".into()),("limit".into(),"20".into())]);
+        assert!(parse(&args(&["outbox-entries","p","dlq","0","101"])).is_err());
+        assert!(parse(&args(&["outbox-entries","p","all","0","20"])).is_err());
+        assert_eq!(parse(&args(&["outbox","p"])).unwrap().method,Method::GET);
+    }
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| (*s).into()).collect()
     }
